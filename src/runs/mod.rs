@@ -41,6 +41,9 @@ pub enum RunsError {
         #[source]
         source: serde_json::Error,
     },
+    /// An ID cannot name a run directory.
+    #[error("{0} is not a valid run ID")]
+    InvalidId(String),
     /// No run has this ID.
     #[error("no run `{0}` in runs/")]
     NotFound(String),
@@ -117,9 +120,18 @@ impl Runs {
     }
 
     /// Local directory of the run `id`.
-    #[must_use]
-    pub fn run_dir(&self, id: &str) -> PathBuf {
-        self.dir.join(id)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunsError::InvalidId`] when `id` is not a valid run ID, so a
+    /// directory outside `runs/` (an absolute path, or one with `..` or `/`) is
+    /// never returned.
+    pub fn run_dir(&self, id: &str) -> Result<PathBuf, RunsError> {
+        if is_valid_run_id(id) {
+            Ok(self.dir.join(id))
+        } else {
+            Err(RunsError::InvalidId(id.to_string()))
+        }
     }
 
     /// Writes `record` to its `run.json`, replacing it atomically, and creates the
@@ -127,9 +139,11 @@ impl Runs {
     ///
     /// # Errors
     ///
-    /// Returns [`RunsError::Io`] when the file cannot be written.
+    /// Returns [`RunsError::InvalidId`] when `record.id` is not a valid run ID,
+    /// [`RunsError::Io`] when the file cannot be written, and [`RunsError::Invalid`]
+    /// when the record cannot be serialized to JSON.
     pub fn save(&self, record: &RunRecord) -> Result<(), RunsError> {
-        let dir = self.run_dir(&record.id);
+        let dir = self.run_dir(&record.id)?;
         fs::create_dir_all(&dir).map_err(io_error(&dir))?;
         let path = dir.join(RECORD_FILE);
         let tmp = dir.join(format!(".{RECORD_FILE}.tmp"));
@@ -147,14 +161,12 @@ impl Runs {
     ///
     /// # Errors
     ///
-    /// Returns [`RunsError::NotFound`] when `id` is not a valid run ID or has no
-    /// record, and [`RunsError::Io`] or [`RunsError::Invalid`] when the record cannot
-    /// be read.
+    /// Returns [`RunsError::InvalidId`] when `id` is not a valid run ID,
+    /// [`RunsError::NotFound`] when it is valid but has no record, and
+    /// [`RunsError::Io`] or [`RunsError::Invalid`] when the record cannot be read.
     pub fn load(&self, id: &str) -> Result<RunRecord, RunsError> {
-        if !is_valid_run_id(id) {
-            return Err(RunsError::NotFound(id.to_string()));
-        }
-        let path = self.run_dir(id).join(RECORD_FILE);
+        let dir = self.run_dir(id)?;
+        let path = dir.join(RECORD_FILE);
         let content = match fs::read(&path) {
             Ok(content) => content,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -165,12 +177,13 @@ impl Runs {
         serde_json::from_slice(&content).map_err(|source| RunsError::Invalid { path, source })
     }
 
-    /// Every run with a record, oldest first. Directories without `run.json` are
-    /// skipped.
+    /// Every run with a readable record, oldest first. Directories without
+    /// `run.json`, and records that fail to load ([`RunsError::Invalid`] or
+    /// [`RunsError::Io`]), are skipped and logged with `tracing::warn!`.
     ///
     /// # Errors
     ///
-    /// Returns an error when `runs/` or a record cannot be read.
+    /// Returns an error when `runs/` itself cannot be read.
     pub fn list(&self) -> Result<Vec<RunRecord>, RunsError> {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
@@ -186,7 +199,17 @@ impl Runs {
             }
         }
         ids.sort();
-        ids.iter().map(|id| self.load(id)).collect()
+        let mut records = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match self.load(id) {
+                Ok(record) => records.push(record),
+                Err(error @ (RunsError::Invalid { .. } | RunsError::Io { .. })) => {
+                    tracing::warn!("skipping unreadable run record for {id}: {error}");
+                },
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(records)
     }
 }
 
@@ -227,41 +250,90 @@ mod tests {
         let ids: Vec<String> = runs.list()?.into_iter().map(|run| run.id).collect();
         assert_eq!(ids, vec!["20260921-000000-aaaa", "20260922-143005-bbbb"]);
         assert_eq!(runs.load("20260921-000000-aaaa")?, first);
-        let json = fs::read_to_string(runs.run_dir(&first.id).join(RECORD_FILE))?;
+        let json = fs::read_to_string(runs.run_dir(&first.id)?.join(RECORD_FILE))?;
         assert!(json.contains("\"state\": \"succeeded\""), "{json}");
         Ok(())
     }
 
     #[test]
-    fn unknown_or_invalid_ids_are_not_found() -> Result<(), Box<dyn std::error::Error>> {
+    fn unknown_ids_are_not_found() -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
         assert!(matches!(runs.load("nope"), Err(RunsError::NotFound(_))));
-        assert!(matches!(runs.load("../etc"), Err(RunsError::NotFound(_))));
         Ok(())
     }
 
     #[test]
-    fn a_run_json_with_an_invalid_pid_fails_to_load() -> Result<(), Box<dyn std::error::Error>> {
+    fn invalid_ids_are_rejected_everywhere() -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
-        let id = "20260922-143005-cccc";
-        let dir = runs.run_dir(id);
-        fs::create_dir_all(&dir)?;
-        fs::write(
-            dir.join(RECORD_FILE),
-            r#"{
-  "id": "20260922-143005-cccc",
+        for id in ["../etc", "/tmp/x", "a/b"] {
+            assert!(
+                matches!(runs.run_dir(id), Err(RunsError::InvalidId(_))),
+                "{id}"
+            );
+            assert!(
+                matches!(runs.load(id), Err(RunsError::InvalidId(_))),
+                "{id}"
+            );
+            let result = runs.save(&record(id));
+            assert!(
+                matches!(result, Err(RunsError::InvalidId(_))),
+                "{id}: {result:?}"
+            );
+        }
+        assert!(!runs.dir().exists());
+        Ok(())
+    }
+
+    fn record_with_pid(id: &str, pid: u32) -> String {
+        format!(
+            r#"{{
+  "id": "{id}",
   "target": "box",
   "created": "2026-09-22T14:30:05Z",
-  "remote_dir": "/w/20260922-143005-cccc",
-  "job": {"dir": "/w/run", "pid": 1, "container": null},
+  "remote_dir": "/w/{id}",
+  "job": {{"dir": "/w/run", "pid": {pid}, "container": null}},
   "state": "running",
   "message": null
-}
-"#,
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn a_run_json_with_pid_0_or_1_fails_to_load() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        for (id, pid) in [("20260922-143005-cccc", 1), ("20260922-143005-dddd", 0)] {
+            let dir = runs.run_dir(id)?;
+            fs::create_dir_all(&dir)?;
+            fs::write(dir.join(RECORD_FILE), record_with_pid(id, pid))?;
+            assert!(
+                matches!(runs.load(id), Err(RunsError::Invalid { .. })),
+                "{id}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn list_skips_unreadable_records_and_keeps_the_rest() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        runs.save(&record("20260921-000000-good"))?;
+        let garbage_dir = runs.run_dir("20260922-000000-bad")?;
+        fs::create_dir_all(&garbage_dir)?;
+        fs::write(garbage_dir.join(RECORD_FILE), "not json")?;
+        let pid_dir = runs.run_dir("20260923-000000-pid1")?;
+        fs::create_dir_all(&pid_dir)?;
+        fs::write(
+            pid_dir.join(RECORD_FILE),
+            record_with_pid("20260923-000000-pid1", 1),
         )?;
-        assert!(matches!(runs.load(id), Err(RunsError::Invalid { .. })));
+        let ids: Vec<String> = runs.list()?.into_iter().map(|run| run.id).collect();
+        assert_eq!(ids, vec!["20260921-000000-good"]);
         Ok(())
     }
 }
