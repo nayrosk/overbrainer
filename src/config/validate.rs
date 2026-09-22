@@ -103,6 +103,30 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
     problems
 }
 
+/// Lists env-only keys that appear in the TOML file. Values are never included.
+pub(crate) fn env_only_in_file(file: &config::Config) -> Vec<String> {
+    let mut keys = Vec::new();
+    let table_names = |table: &str| -> Vec<String> {
+        file.get_table(table)
+            .map(|map| map.into_keys().collect())
+            .unwrap_or_default()
+    };
+    for name in table_names("providers") {
+        keys.push(format!("providers.{name}.base_url"));
+        keys.push(format!("providers.{name}.api_key"));
+    }
+    for name in table_names("targets") {
+        keys.push(format!("targets.{name}.host"));
+    }
+    keys.push("runpod.api_key".to_string());
+    keys.push("hf_token".to_string());
+
+    keys.into_iter()
+        .filter(|key| file.get::<config::Value>(key).is_ok())
+        .map(|key| format!("{key}: must be set through env, not in overbrainer.toml"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
