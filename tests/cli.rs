@@ -163,3 +163,73 @@ fn dependency_logs_stay_quiet_by_default() -> Result<(), Box<dyn std::error::Err
         .stderr(predicate::str::contains("ERROR").not());
     Ok(())
 }
+
+#[test]
+fn init_without_dir_uses_the_project_dir() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("demo");
+    overbrainer()?
+        .current_dir(dir.path())
+        .arg("-C")
+        .arg(&project)
+        .arg("init")
+        .assert()
+        .success();
+    for file in ["overbrainer.toml", ".env.example", ".gitignore"] {
+        assert!(project.join(file).is_file(), "{file} missing");
+        assert!(
+            !dir.path().join(file).exists(),
+            "{file} written to the current dir"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn init_appends_missing_gitignore_entries_once() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let gitignore = dir.path().join(".gitignore");
+    // No trailing newline, and one entry already present.
+    std::fs::write(&gitignore, "target/\n.env")?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .success();
+    let content = std::fs::read_to_string(&gitignore)?;
+    assert_eq!(content, "target/\n.env\n/data/\n/runs/\n");
+
+    // A second init (after removing the non-appendable files) adds nothing.
+    std::fs::remove_file(dir.path().join("overbrainer.toml"))?;
+    std::fs::remove_file(dir.path().join(".env.example"))?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .success();
+    assert_eq!(std::fs::read_to_string(&gitignore)?, content);
+    Ok(())
+}
+
+#[test]
+fn init_refusal_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join(".env.example"), "keep me\n")?;
+    std::fs::write(dir.path().join(".gitignore"), "target/\n")?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(".env.example already exists"));
+    assert!(!dir.path().join("overbrainer.toml").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".env.example"))?,
+        "keep me\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".gitignore"))?,
+        "target/\n"
+    );
+    Ok(())
+}

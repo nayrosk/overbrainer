@@ -25,9 +25,8 @@ pub struct Cli {
 pub enum Command {
     /// Create an example project (overbrainer.toml, .env.example, .gitignore).
     Init {
-        /// Target directory.
-        #[arg(default_value = ".")]
-        dir: PathBuf,
+        /// Target directory. Defaults to the project directory (`-C`).
+        dir: Option<PathBuf>,
     },
     /// Inspect the configuration.
     Config {
@@ -55,7 +54,7 @@ pub enum ConfigCommand {
 /// Returns an error if the selected subcommand fails.
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Init { dir } => init::run(&dir),
+        Command::Init { dir } => init::run(dir.as_deref().unwrap_or(&cli.project_dir)),
         Command::Config {
             command: ConfigCommand::Check { resolve },
         } => config_check::run(&cli.project_dir, resolve).await,
