@@ -92,13 +92,39 @@ pub(crate) async fn finish(child: Child, action: &'static str) -> Result<(), Exe
     }
 }
 
+/// Lines of a command's error output kept in an error message.
+const MAX_ERROR_LINES: usize = 20;
+/// Bytes of a command's error output kept in an error message.
+const MAX_ERROR_BYTES: usize = 4096;
+
 /// The error output of a failed command, or its exit status when it printed nothing.
+/// Only its first [`MAX_ERROR_LINES`] lines are kept, followed by how many more there
+/// were, and at most [`MAX_ERROR_BYTES`] of them (cut at a character boundary and
+/// marked with `...`), so a flood of warnings cannot bloat the error.
 pub(crate) fn failure(stderr: &[u8], status: std::process::ExitStatus) -> String {
-    let text = String::from_utf8_lossy(stderr).trim().to_string();
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
     if text.is_empty() {
-        status.to_string()
-    } else {
-        text
+        return status.to_string();
+    }
+    let total = text.lines().count();
+    let mut head = text
+        .lines()
+        .take(MAX_ERROR_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if head.len() > MAX_ERROR_BYTES {
+        let cut = (0..=MAX_ERROR_BYTES)
+            .rev()
+            .find(|index| head.is_char_boundary(*index))
+            .unwrap_or(0);
+        head.truncate(cut);
+        head.push_str("...");
+    }
+    match total.saturating_sub(MAX_ERROR_LINES) {
+        0 => head,
+        1 => format!("{head}\n(1 more line)"),
+        more => format!("{head}\n({more} more lines)"),
     }
 }
 
@@ -127,6 +153,48 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn exit(code: i32) -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+
+    #[test]
+    fn failure_keeps_the_first_lines_and_counts_the_rest() {
+        let text: Vec<String> = (1..=25).map(|n| format!("warning {n}")).collect();
+        let message = failure(text.join("\n").as_bytes(), exit(2));
+        let expected: Vec<String> = (1..=20).map(|n| format!("warning {n}")).collect();
+        assert_eq!(message, format!("{}\n(5 more lines)", expected.join("\n")));
+
+        let one_more: Vec<String> = (1..=21).map(|n| format!("w{n}")).collect();
+        assert!(failure(one_more.join("\n").as_bytes(), exit(2)).ends_with("\nw20\n(1 more line)"));
+
+        let exactly: Vec<String> = (1..=20).map(|n| format!("w{n}")).collect();
+        assert_eq!(
+            failure(exactly.join("\n").as_bytes(), exit(2)),
+            exactly.join("\n")
+        );
+    }
+
+    #[test]
+    fn failure_caps_its_bytes_at_a_char_boundary() {
+        // One huge line of 3 byte characters: the cap falls inside a character.
+        let line = "\u{20ac}".repeat(10_000);
+        let message = failure(line.as_bytes(), exit(2));
+        assert!(
+            message.len() <= MAX_ERROR_BYTES + 3,
+            "{} bytes",
+            message.len()
+        );
+        assert!(message.ends_with("..."), "{message}");
+        let kept = message.trim_end_matches("...");
+        assert!(kept.chars().all(|c| c == '\u{20ac}'));
+    }
+
+    #[test]
+    fn failure_falls_back_to_the_exit_status() {
+        assert_eq!(failure(b"  \n", exit(2)), exit(2).to_string());
+        assert_eq!(failure(b" tar: boom \n", exit(2)), "tar: boom");
+    }
 
     /// A name long enough that one `tar` warning about it takes a few hundred bytes.
     fn long_name(index: usize) -> String {
@@ -207,7 +275,8 @@ mod tests {
         match result {
             Err(_) => return Err("extract deadlocked on tar's error output".into()),
             Ok(Err(ExecError::Command { message, .. })) => {
-                assert!(message.len() > 64 * 1024, "{} bytes", message.len());
+                assert!(message.contains("more lines)"), "{message}");
+                assert!(message.len() < 8 * 1024, "{} bytes", message.len());
             },
             Ok(other) => return Err(format!("expected tar's warnings, got {other:?}").into()),
         }

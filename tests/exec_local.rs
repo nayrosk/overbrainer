@@ -348,7 +348,8 @@ async fn a_flood_of_tar_warnings_while_archiving_does_not_deadlock() -> TestResu
     match copied {
         Err(_) => return Err("the copy deadlocked on tar's error output".into()),
         Ok(Err(ExecError::Command { message, .. })) => {
-            assert!(message.len() > 64 * 1024, "{} bytes", message.len());
+            assert!(message.contains("more lines)"), "{message}");
+            assert!(message.len() < 8 * 1024, "{} bytes", message.len());
         },
         Ok(other) => return Err(format!("expected tar's warnings, got {other:?}").into()),
     }

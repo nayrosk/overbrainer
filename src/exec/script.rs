@@ -87,6 +87,12 @@ pub fn parse_status(output: &str) -> Option<JobStatus> {
 /// its real result, and a cancel is never sent to a process group whose ID may since
 /// have been recycled by the system. Exits `1` without signalling anything when
 /// `pid` is `0` or `1`, or when the job directory is gone.
+///
+/// After the `SIGKILL`, it waits (up to 10 more seconds) until the group is really
+/// gone before writing [`CANCEL_FILE`]: a killed leader stays a member of its group
+/// as a zombie until its parent reaps it. If the group outlives that wait, it exits
+/// `1` with a message and without [`CANCEL_FILE`]; [`CANCELLING_FILE`] stays, so
+/// `status` keeps following the group's liveness and a later cancel tries again.
 #[must_use]
 pub fn cancel_script(dir: &str, pid: u32, container: Option<&Container>) -> String {
     let stop = container.map_or_else(String::new, |container| {
@@ -107,6 +113,10 @@ pub fn cancel_script(dir: &str, pid: u32, container: Option<&Container>) -> Stri
          i=0\n\
          while kill -s 0 -\"$pid\" 2>/dev/null && [ \"$i\" -lt 10 ]; do sleep 1; i=$((i + 1)); done\n\
          kill -s KILL -\"$pid\" 2>/dev/null\n\
+         i=0\n\
+         while kill -s 0 -\"$pid\" 2>/dev/null; do\n\
+         [ \"$i\" -lt 10 ] || {{ echo \"process group $pid survived SIGKILL\" >&2; exit 1; }}\n\
+         sleep 1; i=$((i + 1)); done\n\
          : > {CANCEL_FILE}\n\
          exit 0\n",
         dir = quote(dir)
@@ -505,15 +515,17 @@ mod tests {
             eprintln!("skipped: sh is not installed");
             return Ok(());
         }
-        // Ignores SIGTERM, so death is driven by the unconditional SIGKILL at the
-        // end of the grace period: this makes the group's death deterministic
-        // rather than depending on how fast an ordinary process reacts to SIGTERM.
+        // Ignores SIGTERM, so it dies to the SIGKILL sent after the 10 second grace
+        // period. Its parent (this test) only reaps it at 12 seconds: until then the
+        // killed leader is a zombie, which still counts as a member of its process
+        // group. The marker must wait for that, not follow the SIGKILL at once.
         let child = Command::new("sh")
             .args(["-c", "trap '' TERM; sleep 30"])
             .process_group(0)
             .spawn()?;
         let pid = child.id();
         let reaper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(12));
             let mut child = child;
             child.wait()
         });
@@ -527,53 +539,35 @@ mod tests {
                 .output()
         });
 
-        // Poll the group's liveness and the marker's existence side by side, and
-        // record which this process observes first. Both are external observations
-        // of the same script (a different process), so this cannot prove they
-        // happen in the same instant the script sees them, but it does prove this
-        // process never observes the marker before the group is already gone.
+        // The moment the marker is seen, the group must already be gone. Checking it
+        // then, rather than comparing when each was first seen by separate polls,
+        // leaves no window between the two observations to race in.
         let marker_path = dir.path().join(CANCEL_FILE);
-        let mut group_dead_at = None;
-        let mut marker_seen_at = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while group_dead_at.is_none() || marker_seen_at.is_none() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !marker_path.exists() {
             if std::time::Instant::now() > deadline {
-                return Err(
-                    "timed out waiting for the group to die and the marker to appear".into(),
-                );
-            }
-            if group_dead_at.is_none() {
-                let alive = Command::new("sh")
-                    .arg("-c")
-                    .arg(format!("kill -s 0 -{pid} 2>/dev/null"))
-                    .status()?
-                    .success();
-                if !alive {
-                    group_dead_at = Some(std::time::Instant::now());
-                }
-            }
-            if marker_seen_at.is_none() && marker_path.exists() {
-                marker_seen_at = Some(std::time::Instant::now());
+                return Err("timed out waiting for the cancelled marker".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        let alive = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -s 0 -{pid} 2>/dev/null"))
+            .status()?
+            .success();
 
         let cancel_output = canceller
             .join()
             .map_err(|_| "canceller thread panicked")??;
+        reaper.join().map_err(|_| "reaper thread panicked")??;
+        assert!(
+            !alive,
+            "the cancelled marker appeared while the process group still existed"
+        );
         assert!(
             cancel_output.status.success(),
             "{}",
             String::from_utf8_lossy(&cancel_output.stderr)
-        );
-        reaper.join().map_err(|_| "reaper thread panicked")??;
-
-        let (Some(group_dead_at), Some(marker_seen_at)) = (group_dead_at, marker_seen_at) else {
-            return Err("both the group's death and the marker must have been observed".into());
-        };
-        assert!(
-            group_dead_at <= marker_seen_at,
-            "the process group must be observed gone no later than the cancelled marker"
         );
         Ok(())
     }
