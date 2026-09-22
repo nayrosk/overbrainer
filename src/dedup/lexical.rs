@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 
 use super::Deduplicator;
 use crate::llm::LlmError;
@@ -50,7 +51,10 @@ impl Lexical {
 }
 
 impl Deduplicator for Lexical {
-    async fn admit(&mut self, candidates: Vec<String>) -> Result<Vec<String>, LlmError> {
+    fn admit(
+        &mut self,
+        candidates: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<String>, LlmError>> + Send {
         let novel = self.novel(&candidates);
         let kept: Vec<String> = candidates
             .into_iter()
@@ -58,12 +62,12 @@ impl Deduplicator for Lexical {
             .filter_map(|(candidate, novel)| novel.then_some(candidate))
             .collect();
         self.insert(&kept);
-        Ok(kept)
+        std::future::ready(Ok(kept))
     }
 
-    async fn record(&mut self, accepted: &[String]) -> Result<(), LlmError> {
+    fn record(&mut self, accepted: &[String]) -> impl Future<Output = Result<(), LlmError>> + Send {
         self.insert(accepted);
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 
