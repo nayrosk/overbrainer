@@ -164,7 +164,11 @@ async fn cancel_run(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
     )?;
     let executor = run_executor(project_dir, &settings, &record).await?;
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
-    let (record, status) = cancel(&runs, &executor, &trainer, record).await?;
+    // Cancelling is never interrupted: dropping it between the `cancelling` marker
+    // and the signal would leave that marker on the target for ever.
+    let (record, status) = Interrupt::catch()
+        .shield(cancel(&runs, &executor, &trainer, record))
+        .await?;
     if status != JobStatus::Cancelled {
         println!(
             "train: the job of run {run_id} had already ended ({}): collect it with `overbrainer train attach {run_id}`",

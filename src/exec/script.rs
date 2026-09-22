@@ -32,13 +32,23 @@ pub fn job_script(script: &str) -> String {
 /// - [`CANCEL_FILE`] wins unconditionally: once it exists the result is always
 ///   `cancelled`, even if the process group's ID has since been recycled by an
 ///   unrelated, live process;
-/// - otherwise, while [`CANCELLING_FILE`] exists, the result follows the sampled
-///   liveness (`running` if it was alive, `cancelled` if not), ahead of
-///   [`EXIT_FILE`]: stopping a job's container can make its wrapper write an exit
-///   code while the cancel is still in flight, and that must not stick as
-///   `exited <code>` forever;
-/// - only once neither marker exists does an existing [`EXIT_FILE`] win;
-/// - failing that, the sampled liveness decides `running` or `lost`.
+/// - otherwise, while [`CANCELLING_FILE`] exists and the group is still alive, the
+///   result is `running`, ahead of [`EXIT_FILE`]: stopping a job's container makes
+///   its wrapper write an exit code while the cancel is still stopping the group,
+///   and that must not stick as `exited <code>`;
+/// - failing that, an existing [`EXIT_FILE`] wins;
+/// - otherwise [`CANCELLING_FILE`] with a group that is gone reads `cancelled`,
+///   which covers the window between the group's death and [`CANCEL_FILE`];
+/// - failing all that, the sampled liveness decides `running` or `lost`.
+///
+/// [`EXIT_FILE`] coming ahead of a [`CANCELLING_FILE`] whose group is gone is what
+/// keeps an abandoned marker (a cancel killed after writing it) from labelling a
+/// job that then finished normally as cancelled for ever. Its cost is a short
+/// window during a container cancel: between the wrapper writing [`EXIT_FILE`] and
+/// [`CANCEL_FILE`] landing, roughly a second (up to the `<engine> stop -t 30`
+/// timeout), this reads `exited <code>` instead of `running`. [`CANCEL_FILE`] still
+/// wins afterwards, since [`cancel_script`] waits for the group to be gone before
+/// writing it.
 ///
 /// Exits `1` without printing or signalling anything when `pid` is `0` or `1`.
 #[must_use]
@@ -50,9 +60,9 @@ pub fn status_script(dir: &str, pid: u32) -> String {
          alive=0\n\
          kill -s 0 -\"$pid\" 2>/dev/null && alive=1\n\
          if [ -f {CANCEL_FILE} ]; then echo cancelled\n\
-         elif [ -f {CANCELLING_FILE} ]; then\n\
-         if [ \"$alive\" -eq 1 ]; then echo running; else echo cancelled; fi\n\
+         elif [ -f {CANCELLING_FILE} ] && [ \"$alive\" -eq 1 ]; then echo running\n\
          elif [ -f {EXIT_FILE} ]; then echo \"exited $(cat {EXIT_FILE})\"\n\
+         elif [ -f {CANCELLING_FILE} ]; then echo cancelled\n\
          elif [ \"$alive\" -eq 1 ]; then echo running\n\
          else echo lost; fi\n",
         dir = quote(dir)
@@ -80,9 +90,10 @@ pub fn parse_status(output: &str) -> Option<JobStatus> {
 /// [`CANCEL_FILE`] is written only once the group is confirmed gone. Together with
 /// [`status_script`]'s marker priority, this keeps `status` reporting `running`
 /// while a cancel is in progress and `cancelled` as soon as the group dies, never
-/// `lost` and never stuck on an exit code that stopping the container causes the
-/// job's wrapper to write while the cancel is still in flight, and makes a repeated
-/// cancel a no-op. Does nothing but exit `0`, without signalling anything, when the
+/// `lost`, and makes a repeated cancel a no-op. Stopping a container is the one
+/// case where `status` can read `exited <code>` mid-cancel, for as long as the
+/// group takes to die after the wrapper has written its exit code; see
+/// [`status_script`]. Does nothing but exit `0`, without signalling anything, when the
 /// job already has an exit code or is already marked cancelled: a finished job keeps
 /// its real result, and a cancel is never sent to a process group whose ID may since
 /// have been recycled by the system. Exits `1` without signalling anything when
@@ -309,18 +320,17 @@ mod tests {
     }
 
     #[test]
-    fn status_prefers_cancelled_when_exit_code_appears_mid_cancel() -> TestResult {
+    fn status_stays_running_when_an_exit_code_appears_mid_cancel() -> TestResult {
         if !sh_available() {
             eprintln!("skipped: sh is not installed");
             return Ok(());
         }
         // A container-cancel race: `<engine> stop` makes the foreground
-        // `docker run --rm` exit, so the job's wrapper writes exit_code before the
-        // group TERM finishes it off. `cancelling` exists, `exit_code` exists,
-        // `cancelled` does not exist yet, and the group is already gone.
-        let mut child = Command::new("true").process_group(0).spawn()?;
+        // `docker run --rm` exit, so the job's wrapper writes exit_code while the
+        // group is still being stopped. `cancelling` exists, `exit_code` exists,
+        // `cancelled` does not exist yet, and the group is still alive.
+        let mut child = Command::new("sleep").arg("5").process_group(0).spawn()?;
         let pid = child.id();
-        child.wait()?;
 
         let dir = tempdir()?;
         fs::write(dir.path().join(CANCELLING_FILE), "")?;
@@ -332,7 +342,38 @@ mod tests {
             .output()?;
         assert_eq!(
             parse_status(&String::from_utf8_lossy(&output.stdout)),
-            Some(JobStatus::Cancelled)
+            Some(JobStatus::Running)
+        );
+
+        child.kill()?;
+        child.wait()?;
+        Ok(())
+    }
+
+    #[test]
+    fn status_reports_exited_for_an_abandoned_cancelling_marker() -> TestResult {
+        if !sh_available() {
+            eprintln!("skipped: sh is not installed");
+            return Ok(());
+        }
+        // A cancel killed between writing `cancelling` and signalling anything:
+        // the marker stays on disk for ever while the job finishes normally. Its
+        // real exit code must win, not the abandoned marker.
+        let mut child = Command::new("true").process_group(0).spawn()?;
+        let pid = child.id();
+        child.wait()?;
+
+        let dir = tempdir()?;
+        fs::write(dir.path().join(CANCELLING_FILE), "")?;
+        fs::write(dir.path().join(EXIT_FILE), "0\n")?;
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(status_script(&dir.path().display().to_string(), pid))
+            .output()?;
+        assert_eq!(
+            parse_status(&String::from_utf8_lossy(&output.stdout)),
+            Some(JobStatus::Exited(0))
         );
         Ok(())
     }

@@ -27,7 +27,8 @@ const REAP_EVERY: Duration = Duration::from_millis(150);
 const PRIVATE_PREFIXES: [&str; 2] = ["OVERBRAINER_", "VAULT_"];
 
 /// Runs jobs on this machine, each in its own process group so a Ctrl-C in the
-/// terminal does not reach it.
+/// terminal does not reach it. The status and cancel scripts get their own process
+/// group too, so an interrupted command cannot kill a cancel halfway through.
 ///
 /// A job inherits the environment of this process (`PATH`, CUDA, conda and so on)
 /// except every variable whose name starts with `OVERBRAINER_` or `VAULT_`; its
@@ -114,12 +115,16 @@ impl LocalExecutor {
     /// Runs `script` with `sh`, reaping this process's exited jobs before it starts
     /// and every [`REAP_EVERY`] until it ends. Fails with `action` when it exits
     /// non-zero.
+    ///
+    /// The script runs in its own process group, so a Ctrl-C in the terminal cannot
+    /// kill a cancel in flight and leave its `cancelling` marker behind.
     async fn run_script(&self, script: String, action: &'static str) -> Result<Output, ExecError> {
         self.reap();
         let output = Command::new("sh")
             .arg("-c")
             .arg(script)
             .stdin(Stdio::null())
+            .process_group(0)
             .output();
         tokio::pin!(output);
         let mut tick = tokio::time::interval(REAP_EVERY);

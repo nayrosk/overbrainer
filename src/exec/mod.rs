@@ -36,10 +36,16 @@ pub const PID_FILE: &str = "job.pid";
 pub const EXIT_FILE: &str = "exit_code";
 /// Marker written by [`Executor::cancel`] before it signals anything, in the run
 /// directory. While this exists and [`CANCEL_FILE`] does not, [`Executor::status`]
-/// reports [`JobStatus::Running`] for as long as the process group is alive and
-/// [`JobStatus::Cancelled`] once it is gone, even before [`CANCEL_FILE`] itself is
-/// written and even if [`EXIT_FILE`] also exists (stopping a job's container can
-/// make its wrapper write an exit code while the cancel is still in flight).
+/// reports [`JobStatus::Running`] for as long as the process group is alive, ahead
+/// of [`EXIT_FILE`] (stopping a job's container makes its wrapper write an exit
+/// code while the cancel is still stopping the group), and
+/// [`JobStatus::Cancelled`] once the group is gone and no [`EXIT_FILE`] was
+/// written, even before [`CANCEL_FILE`] itself lands.
+///
+/// [`EXIT_FILE`] deliberately wins over this marker once the group is gone: a
+/// cancel killed right after writing it (a Ctrl-C in its window) would otherwise
+/// leave it behind for ever and label a job that then finished normally as
+/// cancelled.
 pub const CANCELLING_FILE: &str = "cancelling";
 /// Marker written by [`Executor::cancel`] once the process group is confirmed gone,
 /// in the run directory. Once this exists, [`Executor::status`] reports
@@ -238,11 +244,21 @@ pub trait Executor: Send + Sync {
     /// Otherwise, [`CANCELLING_FILE`] is written before anything is signalled, so
     /// [`Executor::status`] reports [`JobStatus::Running`] while the group is being
     /// stopped and [`JobStatus::Cancelled`] as soon as it is gone, never
-    /// [`JobStatus::Lost`] and never stuck on an exit code that stopping the
-    /// container causes the job's wrapper to write while the cancel is still in
-    /// flight; [`CANCEL_FILE`] is written last, once the group is confirmed gone,
-    /// and then wins unconditionally over everything else. Calling `cancel` again
-    /// on an already cancelled job is a no-op.
+    /// [`JobStatus::Lost`]; [`CANCEL_FILE`] is written last, once the group is
+    /// confirmed gone, and then wins unconditionally over everything else. Calling
+    /// `cancel` again on an already cancelled job is a no-op.
+    ///
+    /// Cancelling a container job has a short window where the status is wrong:
+    /// once the engine's `stop` makes the job's wrapper write [`EXIT_FILE`] and
+    /// until the group is gone and [`CANCEL_FILE`] lands (roughly a second, up to
+    /// the `<engine> stop -t 30` timeout), [`Executor::status`] reports
+    /// [`JobStatus::Exited`] rather than [`JobStatus::Running`]. This is the price
+    /// of letting a real exit code win over a [`CANCELLING_FILE`] left behind by a
+    /// cancel that was killed; the final [`CANCEL_FILE`] still wins afterwards.
+    ///
+    /// The caller runs this to its end: an interrupted cancel can leave
+    /// [`CANCELLING_FILE`] behind, and over a local target the scripts run in their
+    /// own process group so a Ctrl-C at the terminal cannot reach them.
     ///
     /// # Errors
     ///
