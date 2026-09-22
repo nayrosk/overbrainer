@@ -359,3 +359,31 @@ fn split_offers_only_topic() -> TestResult {
         .failure();
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn split_warns_when_every_usable_answer_is_orphaned() -> TestResult {
+    let server = provider().await;
+    let dir = project()?;
+    std::fs::create_dir_all(dir.path().join("data"))?;
+    let answer = json!({
+        "id": "0123456789abcdef0123456789abcdef",
+        "topic": "ownership",
+        "subtopic": "Borrowing",
+        "messages": [
+            {"role": "user", "content": "What is a borrow?"},
+            {"role": "assistant", "content": "A reference.", "reasoning_content": "r"}
+        ],
+        "meta": {"model": "parent", "input_tokens": 1, "output_tokens": 1,
+                 "finish_reason": "stop", "reasoning_kind": "raw", "excluded": null}
+    });
+    std::fs::write(dir.path().join("data/answers.jsonl"), format!("{answer}\n"))?;
+    overbrainer(dir.path(), &server)?
+        .arg("split")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "split: 0 train, 0 eval, 0 excluded, 1 orphaned",
+        ))
+        .stderr(predicate::str::contains("usable answers are orphaned"));
+    Ok(())
+}

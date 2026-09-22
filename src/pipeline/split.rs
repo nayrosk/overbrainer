@@ -51,9 +51,11 @@ pub fn split(ctx: &Ctx<'_>) -> Result<SplitReport, PipelineError> {
     });
     let mut report = SplitReport::default();
     let mut usable = Vec::new();
+    let mut orphaned_usable = 0;
     for example in examples {
         if !configured(&example) || !known.contains(&example.id) {
             report.orphaned += usize::from(counted(&example));
+            orphaned_usable += usize::from(example.meta.excluded.is_none());
             continue;
         }
         match example.meta.excluded {
@@ -63,6 +65,9 @@ pub fn split(ctx: &Ctx<'_>) -> Result<SplitReport, PipelineError> {
             Some(_) => {},
             None => usable.push(example),
         }
+    }
+    if every_usable_answer_orphaned(orphaned_usable, usable.len()) {
+        warn_all_orphaned(orphaned_usable);
     }
     let settings = &ctx.settings.pipeline;
     let (train, eval) = stratify(usable, settings.eval_ratio, settings.seed);
@@ -152,6 +157,17 @@ fn eval_count(total: usize, ratio: f64) -> usize {
         .filter(|&index| rounded(index + 1) > rounded(index))
         .count();
     steps.clamp(1, total - 1)
+}
+
+/// Whether answers would have been usable but all of them are orphaned.
+fn every_usable_answer_orphaned(orphaned_usable: usize, usable: usize) -> bool {
+    orphaned_usable > 0 && usable == 0
+}
+
+fn warn_all_orphaned(count: usize) {
+    tracing::warn!(
+        "all {count} usable answers are orphaned (topic no longer configured or question no longer in data/questions.jsonl): train and eval will be empty"
+    );
 }
 
 /// Spreads `eval_total` over named groups of the given sizes by largest remainder,
@@ -324,6 +340,13 @@ mod tests {
         };
         assert_eq!(subtopics(1), subtopics(1));
         assert_ne!(subtopics(1), subtopics(2));
+    }
+
+    #[test]
+    fn a_warning_is_due_only_when_every_usable_answer_is_orphaned() {
+        assert!(every_usable_answer_orphaned(3, 0));
+        assert!(!every_usable_answer_orphaned(0, 0));
+        assert!(!every_usable_answer_orphaned(3, 1));
     }
 
     #[test]
