@@ -148,11 +148,15 @@ fn quote(text: &str) -> String {
 }
 
 /// The printable set of YAML 1.1, as `PyYAML` checks it, minus tab and line breaks.
+///
+/// U+0085 (NEL) is deliberately left out even though YAML 1.1 counts it as printable:
+/// `PyYAML` folds a bare NEL inside a double-quoted scalar as a line break (it reads
+/// back as a space, or a newline when doubled), so it must always be escaped rather
+/// than written literally.
 fn printable(c: char) -> bool {
     matches!(
         c,
         ' '..='~'
-            | '\u{85}'
             | '\u{A0}'..='\u{D7FF}'
             | '\u{E000}'..='\u{FFFD}'
             | '\u{10000}'..='\u{10FFFF}'
@@ -224,5 +228,24 @@ special_tokens:
             to_yaml(&json!({"on": true, "off": null, "key with space": 1, "ok_key": false})),
             "\"key with space\": 1\n\"off\": null\nok_key: false\n\"on\": true\n"
         );
+    }
+
+    #[test]
+    fn next_line_is_escaped_because_pyyaml_folds_it_into_a_space() {
+        // PyYAML (YAML 1.1) treats U+0085 (NEL) as a line break inside a double-quoted
+        // scalar and folds it away: `yaml.safe_load('"x\x85y"\n')` gives `'x y'`, and
+        // two in a row give `'x\ny'`. Left unescaped, a NEL byte in the source text
+        // would be silently corrupted on read-back, so it must always be escaped.
+        assert_eq!(to_yaml(&json!("x\u{85}y")), "\"x\\u0085y\"\n");
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_are_left_unescaped() {
+        // U+2028 and U+2029 are YAML 1.1 line-break characters too, but unlike NEL,
+        // PyYAML does not fold them inside a double-quoted scalar: they round-trip
+        // as themselves (verified with `yaml.safe_load`), so they stay in the
+        // printable set and are written out literally rather than escaped.
+        assert_eq!(to_yaml(&json!("x\u{2028}y")), "\"x\u{2028}y\"\n");
+        assert_eq!(to_yaml(&json!("x\u{2029}y")), "\"x\u{2029}y\"\n");
     }
 }
