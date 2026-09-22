@@ -1,0 +1,204 @@
+//! Running a training job on a target: the `Executor` trait and its `Local` and `Ssh`
+//! implementations.
+//!
+//! A job is detached from overbrainer: it runs in its own session (local process
+//! group, or `setsid nohup` over SSH), writes its output to `job.log`, its process ID
+//! to `job.pid` and, when it ends, its exit code to `exit_code`, all in its run
+//! directory. Any later overbrainer process can read its status, tail its files or
+//! cancel it from that directory alone.
+
+mod lines;
+mod script;
+
+use std::future::Future;
+use std::path::{Path, PathBuf};
+
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+
+pub use lines::{LineStream, complete_lines};
+pub use script::{cancel_script, job_script, parse_status, quote, status_script};
+
+use crate::config::Engine;
+
+/// Output of the job (stdout and stderr), in its run directory.
+pub const JOB_LOG: &str = "job.log";
+/// Process ID of the job's session leader, in its run directory.
+pub const PID_FILE: &str = "job.pid";
+/// Exit code of the job once it has ended, in its run directory.
+pub const EXIT_FILE: &str = "exit_code";
+/// Marker written by [`Executor::cancel`], in the run directory.
+pub const CANCEL_FILE: &str = "cancelled";
+
+/// Errors from running or reaching a job.
+#[derive(Debug, thiserror::Error)]
+pub enum ExecError {
+    /// A local file or directory could not be read or written.
+    #[error("cannot access {}", path.display())]
+    Io {
+        /// The file or directory.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A local program could not be started or waited for.
+    #[error("cannot run `{program}`")]
+    Spawn {
+        /// The program.
+        program: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A command on the target failed. The message is the command's error output,
+    /// which never holds a secret: secrets only travel on standard input.
+    #[error("{action} failed: {message}")]
+    Command {
+        /// What was attempted, for example `upload`.
+        action: &'static str,
+        /// Error output of the command, or its exit status.
+        message: String,
+    },
+    /// A secret cannot be passed to the job. The message names the variable only.
+    #[error("{0} cannot be passed to the job: it contains a line break")]
+    InvalidSecret(String),
+    /// The target answered something unexpected.
+    #[error("unexpected answer from the target: {0}")]
+    Protocol(String),
+}
+
+/// A container running the job, stopped by [`Executor::cancel`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Container {
+    /// Engine running it.
+    pub engine: Engine,
+    /// Container name.
+    pub name: String,
+}
+
+/// A job to start in the background.
+#[derive(Debug, Clone)]
+pub struct JobCommand {
+    /// Run directory on the target, absolute. The job runs there.
+    pub dir: String,
+    /// POSIX shell commands of the job.
+    pub script: String,
+    /// Secret env variables of the job. They reach the job's environment only: never
+    /// a command line, a file or a log.
+    pub secrets: Vec<(String, SecretString)>,
+    /// The container the script starts, if any.
+    pub container: Option<Container>,
+}
+
+/// Handle of a started job, enough to find it again from another process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobId {
+    /// Run directory on the target.
+    pub dir: String,
+    /// Process ID of the job's session leader, also its process group ID.
+    pub pid: u32,
+    /// The container the job runs in, if any.
+    pub container: Option<Container>,
+}
+
+/// What a job is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStatus {
+    /// Still running.
+    Running,
+    /// Ended with this exit code.
+    Exited(i32),
+    /// Stopped by [`Executor::cancel`].
+    Cancelled,
+    /// Neither running nor ended normally: killed without writing its exit code, or
+    /// its run directory is gone.
+    Lost,
+}
+
+impl JobStatus {
+    /// Whether the job has stopped for good.
+    #[must_use]
+    pub fn is_finished(self) -> bool {
+        self != Self::Running
+    }
+}
+
+/// Runs jobs on a target and moves files to and from it. Paths on the target are
+/// absolute strings; the target may be another machine.
+///
+/// Futures are `Send` so the CLI and the TUI can drive them from any task.
+pub trait Executor: Send + Sync {
+    /// Directory holding the run directories on the target, absolute.
+    fn workdir(&self) -> &str;
+
+    /// Copies the content of the local directory `local` into `remote`, creating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExecError`] when the directory cannot be read or copied.
+    fn upload(
+        &self,
+        local: &Path,
+        remote: &str,
+    ) -> impl Future<Output = Result<(), ExecError>> + Send;
+
+    /// Starts `job` in the background and returns its handle. The job keeps running
+    /// when this process exits or loses its connection to the target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExecError`] when the job cannot be started.
+    fn spawn(&self, job: &JobCommand) -> impl Future<Output = Result<JobId, ExecError>> + Send;
+
+    /// Bytes of the file `path` from byte `offset` to its current end. A missing file
+    /// reads as empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExecError`] when the file cannot be read.
+    fn read_from(
+        &self,
+        path: &str,
+        offset: u64,
+    ) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send;
+
+    /// What `job` is doing now.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExecError`] when the target cannot be asked.
+    fn status(&self, job: &JobId) -> impl Future<Output = Result<JobStatus, ExecError>> + Send;
+
+    /// Stops `job`: its container first, then its whole process group (`SIGTERM`, then
+    /// `SIGKILL` after 10 seconds). Its status becomes [`JobStatus::Cancelled`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExecError`] when the target cannot be reached.
+    fn cancel(&self, job: &JobId) -> impl Future<Output = Result<(), ExecError>> + Send;
+
+    /// Copies `entries` (files or directories, relative to the target directory
+    /// `remote`) into the local directory `local`, leaving out names matching an
+    /// `exclude` pattern at any depth. Missing entries are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExecError`] when the copy fails.
+    fn download(
+        &self,
+        remote: &str,
+        local: &Path,
+        entries: &[String],
+        exclude: &[String],
+    ) -> impl Future<Output = Result<(), ExecError>> + Send;
+
+    /// Follows the file `path` from byte `offset`, one complete line at a time.
+    fn tail(&self, path: &str, offset: u64) -> LineStream<'_, Self>
+    where
+        Self: Sized,
+    {
+        LineStream::new(self, path, offset)
+    }
+}
