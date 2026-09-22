@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::marker::PhantomData;
+use std::str::FromStr;
 
 use secrecy::SecretString;
-use serde::Deserialize;
+use serde::de::{self, Unexpected, Visitor};
+use serde::{Deserialize, Deserializer};
 
 /// Fully resolved configuration: `overbrainer.toml` layered with `OVERBRAINER_*` env vars.
 #[derive(Debug, Deserialize)]
@@ -231,18 +235,68 @@ pub enum Target {
         /// Runpod GPU type identifier.
         gpu_type: String,
         /// Number of GPUs to provision. Must be at least 1.
-        #[serde(default = "default_gpu_count")]
+        #[serde(default = "default_gpu_count", deserialize_with = "number")]
         gpu_count: u32,
         /// Container image to run.
         image: String,
         /// Container disk size, in gigabytes.
-        #[serde(default = "default_container_disk_gb")]
+        #[serde(default = "default_container_disk_gb", deserialize_with = "number")]
         container_disk_gb: u32,
         /// Maximum pod lifetime, in hours. Must be greater than 0.
+        #[serde(deserialize_with = "number")]
         max_hours: f64,
         /// Network volume to attach, if any.
         network_volume_id: Option<String>,
     },
+}
+
+/// Deserializes a number that may arrive as a string.
+///
+/// `Target` is an internally tagged enum, so serde buffers its fields before
+/// deserializing them, and the environment source (with `try_parsing(false)`, which
+/// keeps secrets such as `0123` intact) delivers every value as a string. The config
+/// crate's own string-to-number coercion is lost in that buffering, so numeric fields
+/// of a target accept both forms here.
+fn number<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+{
+    struct NumberVisitor<T>(PhantomData<T>);
+
+    impl<T: FromStr> NumberVisitor<T> {
+        fn parse<E: de::Error>(&self, text: &str, unexpected: Unexpected<'_>) -> Result<T, E> {
+            text.trim()
+                .parse()
+                .map_err(|_| E::invalid_value(unexpected, self))
+        }
+    }
+
+    impl<T: FromStr> Visitor<'_> for NumberVisitor<T> {
+        type Value = T;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a number")
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<T, E> {
+            self.parse(&value.to_string(), Unexpected::Unsigned(value))
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<T, E> {
+            self.parse(&value.to_string(), Unexpected::Signed(value))
+        }
+
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<T, E> {
+            self.parse(&value.to_string(), Unexpected::Float(value))
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<T, E> {
+            self.parse(value, Unexpected::Str(value))
+        }
+    }
+
+    deserializer.deserialize_any(NumberVisitor(PhantomData))
 }
 
 fn default_gpu_count() -> u32 {

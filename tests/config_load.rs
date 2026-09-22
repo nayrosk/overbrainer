@@ -1,6 +1,6 @@
 use std::fs;
 
-use overbrainer::config::{ConfigError, EnvSource, load};
+use overbrainer::config::{ConfigError, EnvSource, Target, load};
 use secrecy::ExposeSecret;
 
 const BASE: &str = r#"
@@ -116,6 +116,17 @@ fn unknown_env_variable_with_prefix_is_rejected() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn process_env_source_is_accepted() -> Result<(), Box<dyn std::error::Error>> {
+    // Exercises the `EnvSource::Process` code path (what a real binary uses) without
+    // depending on, or mutating, the actual process environment: `BASE` alone is a
+    // complete, valid configuration, so this only has to type-check and run, not
+    // assert on any particular outcome.
+    let dir = project(BASE)?;
+    let _ = load(dir.path(), EnvSource::Process);
+    Ok(())
+}
+
+#[test]
 fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     match load(dir.path(), env(&[])) {
@@ -127,13 +138,89 @@ fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+const TARGETS: &str = r#"
+[targets.gpu]
+kind = "runpod"
+gpu_type = "NVIDIA A40"
+image = "axolotl:latest"
+max_hours = 1.5
+
+[targets.box]
+kind = "ssh"
+runtime = "native"
+"#;
+
 #[test]
-fn process_env_source_is_accepted() -> Result<(), Box<dyn std::error::Error>> {
-    // Exercises the `EnvSource::Process` code path (what a real binary uses) without
-    // depending on, or mutating, the actual process environment: `BASE` alone is a
-    // complete, valid configuration, so this only has to type-check and run, not
-    // assert on any particular outcome.
-    let dir = project(BASE)?;
-    let _ = load(dir.path(), EnvSource::Process);
+fn env_overrides_numeric_and_string_fields_of_targets() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TARGETS}"))?;
+    let settings = load(
+        dir.path(),
+        env(&[
+            ("OVERBRAINER_TARGETS__GPU__MAX_HOURS", "2"),
+            ("OVERBRAINER_TARGETS__GPU__GPU_COUNT", "4"),
+            ("OVERBRAINER_TARGETS__GPU__CONTAINER_DISK_GB", "120"),
+            ("OVERBRAINER_TARGETS__BOX__HOST", "trainer@gpu-box"),
+        ]),
+    )?;
+    match settings.targets.get("gpu") {
+        Some(Target::Runpod {
+            max_hours,
+            gpu_count,
+            container_disk_gb,
+            ..
+        }) => {
+            assert!(
+                (max_hours - 2.0).abs() < f64::EPSILON,
+                "max_hours = {max_hours}"
+            );
+            assert_eq!(*gpu_count, 4);
+            assert_eq!(*container_disk_gb, 120);
+        }
+        other => return Err(format!("expected runpod target, got {other:?}").into()),
+    }
+    match settings.targets.get("box") {
+        Some(Target::Ssh { host, .. }) => {
+            assert_eq!(host.as_deref(), Some("trainer@gpu-box"));
+        }
+        other => return Err(format!("expected ssh target, got {other:?}").into()),
+    }
+    Ok(())
+}
+
+#[test]
+fn target_numbers_from_the_file_and_defaults_still_apply() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = project(&format!("{BASE}{TARGETS}"))?;
+    let settings = load(dir.path(), env(&[]))?;
+    match settings.targets.get("gpu") {
+        Some(Target::Runpod {
+            max_hours,
+            gpu_count,
+            container_disk_gb,
+            ..
+        }) => {
+            assert!(
+                (max_hours - 1.5).abs() < f64::EPSILON,
+                "max_hours = {max_hours}"
+            );
+            assert_eq!(*gpu_count, 1);
+            assert_eq!(*container_disk_gb, 50);
+            Ok(())
+        }
+        other => Err(format!("expected runpod target, got {other:?}").into()),
+    }
+}
+
+#[test]
+fn non_numeric_env_value_for_a_numeric_target_field_is_rejected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TARGETS}"))?;
+    assert!(matches!(
+        load(
+            dir.path(),
+            env(&[("OVERBRAINER_TARGETS__GPU__GPU_COUNT", "many")])
+        ),
+        Err(ConfigError::Parse(_))
+    ));
     Ok(())
 }
