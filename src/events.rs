@@ -1,12 +1,14 @@
-//! Progress events published by pipeline stages. The core never renders: the CLI turns
-//! events into log lines, the TUI (later) into views.
+//! Progress events published by pipeline stages and training runs. The core never
+//! renders: the CLI turns events into log lines, the TUI (later) into views.
 
 use std::fmt;
 
 use tokio::sync::broadcast;
 
+use crate::exec::JobStatus;
 use crate::llm::Usage;
 use crate::pricing::Price;
+use crate::train::TrainMetric;
 
 /// A pipeline stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -67,7 +69,7 @@ impl StageStats {
     }
 }
 
-/// Something that happened in a stage. Training and pod events join in later milestones.
+/// Something that happened in a stage or a training run. Pod events join in M4.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Event {
@@ -105,6 +107,10 @@ pub enum Event {
         /// Final counters.
         stats: StageStats,
     },
+    /// A training or evaluation log of the running job.
+    Metric(TrainMetric),
+    /// The training job is in a new state.
+    JobStatus(JobStatus),
 }
 
 /// Broadcast channel of [`Event`]s. Publishing never blocks and never fails: events
