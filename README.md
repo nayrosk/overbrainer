@@ -41,7 +41,7 @@ The pipeline runs in four stages. Each one reads the previous stage's file in `d
 Every stage resumes: items already on disk are skipped, and each new item is appended as soon as it is ready, so an interruption only loses the requests in flight. A topic left with fewer subtopics than configured, for example after a crash mid-topic, is resumed too: `subtopics` only asks for the missing count. `answers` counts a question as done once it has any answer, including one excluded from training; only `--force` asks the parent again for it. Options:
 
 - `--topic NAME` processes one topic only.
-- `--force` throws away the stage's output for the selected topics and generates it again. `split` always rewrites its files.
+- `--force`, accepted by every stage command except `split`, throws away the stage's output for the selected topics and generates it again. `split` has no `--force`: it always rewrites its files.
 
 Each stage prints one summary line on stdout, with token counts and the cost when the provider lists model prices (OpenRouter and NanoGPT do; otherwise the cost is shown as unknown). Prices come from the provider's `/models` listing, read once per provider per run and capped at 10 seconds; a slow, missing or unpriced listing just leaves the cost unknown. Progress goes to stderr. A stage that could not process some items exits with an error after writing everything else it produced; run it again to retry them. A fatal error, such as a rejected API key, stops the stage early, but it still prints its summary line with the tokens and cost spent so far, keeps the answers already received, and exits non-zero.
 
