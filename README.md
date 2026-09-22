@@ -104,7 +104,7 @@ A missing file falls back to the built-in default.
 
 A run gets an ID such as `20260922-143005-a1b2` and a directory `runs/<run-id>/` holding `axolotl.yaml`, copies of the train and eval files, the metrics plugin, `run.json` (target, job, state), and, once the job has ended, `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. Intermediate `checkpoint-*` directories stay on the target.
 
-The job runs detached from overbrainer: once it has started, Ctrl-C, a closed terminal or a lost SSH connection stop overbrainer from following it, not the training. Starting a run is never interrupted: a Ctrl-C pressed while a run is starting is only acted on once the job has actually started, so the command always finishes starting before it detaches. After Ctrl-C, overbrainer prints the `overbrainer train attach` command that follows the run again and exits with an error status; after five failed attempts in a row to reach the target, it does the same. `overbrainer runs ls` shows the state last recorded in `run.json`; `train attach` refreshes it. Progress (step, epoch, loss, learning rate, every evaluation) goes to stderr; the final summary goes to stdout:
+The job runs detached from overbrainer: once it has started, Ctrl-C, a closed terminal or a lost SSH connection stop overbrainer from following it, not the training. Starting a run is never interrupted: a Ctrl-C pressed while a run is starting is only acted on once the job has actually started, so the command always finishes starting before it detaches. After Ctrl-C, overbrainer prints the `overbrainer train attach` command that follows the run again and exits with an error status; after six failed attempts in a row to reach the target, it does the same. `overbrainer runs ls` shows the state last recorded in `run.json`; `train attach` refreshes it. Progress (step, epoch, loss, learning rate, every evaluation) goes to stderr; the final summary goes to stdout:
 
 ```
 train: run 20260922-143005-a1b2 succeeded; step 1200/1200, epoch 3.00, loss 0.4123, eval_loss 0.5012; output in runs/20260922-143005-a1b2/output
@@ -112,7 +112,7 @@ train: run 20260922-143005-a1b2 succeeded; step 1200/1200, epoch 3.00, loss 0.41
 
 A run fails when the job exits with a non-zero code or when it writes no metric line at all, which means Axolotl did not load the metrics plugin; `runs/<run-id>/job.log` holds the job's output.
 
-`overbrainer train cancel` needs a `[training]` section: cancelling a run also retrieves its artifacts, the same way a successful or failed run does. Cancelling a job that has already ended leaves it alone; overbrainer reports the state it found and tells you to run `overbrainer train attach RUN_ID` to collect it.
+`overbrainer train cancel` needs a `[training]` section: cancelling a run also retrieves its artifacts, the same way a successful or failed run does. Cancelling a run whose record already shows an end state fails with `run RUN_ID already ended: STATE` and a non-zero exit; nothing is touched. Only when the record still says the run is running but the job has already ended on the target does cancel report what it found and tell you to run `overbrainer train attach RUN_ID` to collect it.
 
 ### Targets
 
