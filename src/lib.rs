@@ -1,4 +1,6 @@
 //! overbrainer: distill a parent LLM into a smaller child model.
 
+pub mod cli;
 pub mod config;
+pub mod logging;
 pub mod secrets;

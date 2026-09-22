@@ -1,0 +1,35 @@
+# overbrainer project configuration.
+# URLs, hosts and secrets never go here: set them through OVERBRAINER_* env vars (see .env.example).
+
+[project]
+name = "my_project"
+
+[[topics]]
+name = "ownership"
+description = "Rust ownership, borrowing and lifetimes"
+subtopics = 10
+questions_per_subtopic = 30
+
+[providers.openrouter]
+protocol = "openai"
+
+[roles]
+generator = { provider = "openrouter", model = "qwen/qwen3-235b-a22b" }
+parent = { provider = "openrouter", model = "deepseek/deepseek-r1", reasoning = true }
+
+[pipeline]
+concurrency = 8
+max_retries = 5
+dedup_threshold = 0.8
+eval_ratio = 0.1
+seed = 42
+include_system_prompt = false
+
+[training]
+target = "local"
+base_model = "Qwen/Qwen3-4B"
+adapter = "qlora"
+
+[targets.local]
+kind = "local"
+runtime = "native"
