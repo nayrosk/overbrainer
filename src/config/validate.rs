@@ -1,4 +1,4 @@
-use super::types::{Protocol, Runtime, Settings, Target};
+use super::types::{Adapter, Protocol, Runtime, Settings, Target, Training};
 
 /// Highest `pipeline.concurrency`: far above what providers allow, and well within
 /// what a semaphore can hold.
@@ -190,15 +190,120 @@ fn check_pipeline(settings: &Settings, problems: &mut Vec<String>) {
     }
 }
 
-/// The training section must point at a declared target.
+/// Axolotl keys set from a typed `[training]` key, with the key to use instead.
+const TYPED_AXOLOTL_KEYS: [(&str, &str); 16] = [
+    ("base_model", "base_model"),
+    ("adapter", "adapter"),
+    ("num_epochs", "epochs"),
+    ("learning_rate", "learning_rate"),
+    ("lora_r", "lora_r"),
+    ("lora_alpha", "lora_alpha"),
+    ("lora_dropout", "lora_dropout"),
+    ("sequence_len", "sequence_len"),
+    ("micro_batch_size", "micro_batch_size"),
+    ("gradient_accumulation_steps", "gradient_accumulation_steps"),
+    ("optimizer", "optimizer"),
+    ("lr_scheduler", "lr_scheduler"),
+    ("sample_packing", "sample_packing"),
+    ("evals_per_epoch", "evals_per_epoch"),
+    ("saves_per_epoch", "saves_per_epoch"),
+    ("hub_model_id", "hub_model_id"),
+];
+
+/// Axolotl keys that overbrainer manages: the run layout and the metrics plugin
+/// depend on them.
+const MANAGED_AXOLOTL_KEYS: [&str; 6] = [
+    "datasets",
+    "test_datasets",
+    "val_set_size",
+    "output_dir",
+    "dataset_prepared_path",
+    "plugins",
+];
+
+/// The training section points at a declared target and its values are in range.
 fn check_training(settings: &Settings, problems: &mut Vec<String>) {
-    if let Some(training) = &settings.training
-        && !settings.targets.contains_key(&training.target)
-    {
+    let Some(training) = &settings.training else {
+        return;
+    };
+    if !settings.targets.contains_key(&training.target) {
         problems.push(format!(
             "training.target: unknown target `{}`",
             training.target
         ));
+    }
+    check_training_counts(training, problems);
+    check_training_rates(training, problems);
+    check_axolotl_extra(training, problems);
+}
+
+/// Counts are at least 1 and names are not empty.
+fn check_training_counts(training: &Training, problems: &mut Vec<String>) {
+    let counts = [
+        ("epochs", training.epochs),
+        ("lora_r", training.lora_r),
+        ("lora_alpha", training.lora_alpha),
+        ("sequence_len", training.sequence_len),
+        ("micro_batch_size", training.micro_batch_size),
+        (
+            "gradient_accumulation_steps",
+            training.gradient_accumulation_steps,
+        ),
+        ("evals_per_epoch", training.evals_per_epoch),
+        ("saves_per_epoch", training.saves_per_epoch),
+    ];
+    for (key, value) in counts {
+        if value == 0 {
+            problems.push(format!("training.{key}: must be at least 1"));
+        }
+    }
+    for (key, value) in [
+        ("optimizer", &training.optimizer),
+        ("lr_scheduler", &training.lr_scheduler),
+    ] {
+        if value.trim().is_empty() {
+            problems.push(format!("training.{key}: must not be empty"));
+        }
+    }
+    if training
+        .hub_model_id
+        .as_ref()
+        .is_some_and(|id| id.trim().is_empty())
+    {
+        problems.push("training.hub_model_id: must not be empty".to_string());
+    }
+}
+
+/// The learning rate and dropout are in range, and `merge` has an adapter to merge.
+fn check_training_rates(training: &Training, problems: &mut Vec<String>) {
+    if !(training.learning_rate > 0.0 && training.learning_rate.is_finite()) {
+        problems.push("training.learning_rate: must be greater than 0".to_string());
+    }
+    if !(0.0..1.0).contains(&training.lora_dropout) {
+        problems.push("training.lora_dropout: must be in [0, 1)".to_string());
+    }
+    if training.merge && training.adapter == Adapter::Full {
+        problems.push(
+            "training.merge: requires adapter = \"lora\" or \"qlora\" (a full fine-tune has no adapter to merge)"
+                .to_string(),
+        );
+    }
+}
+
+/// `axolotl_extra` must not set a key that has a typed equivalent or that
+/// overbrainer manages.
+fn check_axolotl_extra(training: &Training, problems: &mut Vec<String>) {
+    for key in training.axolotl_extra.keys() {
+        if let Some((_, typed)) = TYPED_AXOLOTL_KEYS.iter().find(|(name, _)| name == key) {
+            problems.push(format!(
+                "training.axolotl_extra.{key}: set training.{typed} instead"
+            ));
+        }
+        if MANAGED_AXOLOTL_KEYS.contains(&key.as_str()) {
+            problems.push(format!(
+                "training.axolotl_extra.{key}: managed by overbrainer, cannot be overridden"
+            ));
+        }
     }
 }
 
@@ -206,9 +311,35 @@ fn check_training(settings: &Settings, problems: &mut Vec<String>) {
 fn check_targets(settings: &Settings, problems: &mut Vec<String>) {
     for (name, target) in &settings.targets {
         match target {
-            Target::Local { runtime, image, .. } | Target::Ssh { runtime, image, .. } => {
-                if *runtime == Runtime::Docker && image.is_none() {
-                    problems.push(format!("targets.{name}: runtime `docker` requires `image`"));
+            Target::Local {
+                runtime,
+                engine,
+                image,
+                venv,
+            } => check_runtime(
+                name,
+                *runtime,
+                engine.is_some() || image.is_some(),
+                venv.is_some(),
+                problems,
+            ),
+            Target::Ssh {
+                runtime,
+                engine,
+                image,
+                venv,
+                workdir,
+                ..
+            } => {
+                check_runtime(
+                    name,
+                    *runtime,
+                    engine.is_some() || image.is_some(),
+                    venv.is_some(),
+                    problems,
+                );
+                if workdir.as_ref().is_some_and(|dir| dir.trim().is_empty()) {
+                    problems.push(format!("targets.{name}.workdir: must not be empty"));
                 }
             },
             Target::Runpod {
@@ -224,6 +355,27 @@ fn check_targets(settings: &Settings, problems: &mut Vec<String>) {
                 }
             },
         }
+    }
+}
+
+/// `engine` and `image` only apply to the `docker` runtime, `venv` only to `native`.
+fn check_runtime(
+    name: &str,
+    runtime: Runtime,
+    container: bool,
+    venv: bool,
+    problems: &mut Vec<String>,
+) {
+    match runtime {
+        Runtime::Docker if venv => {
+            problems.push(format!(
+                "targets.{name}.venv: only with runtime = \"native\""
+            ));
+        },
+        Runtime::Native if container => problems.push(format!(
+            "targets.{name}: engine and image only apply with runtime = \"docker\""
+        )),
+        Runtime::Docker | Runtime::Native => {},
     }
 }
 
@@ -345,12 +497,91 @@ mod tests {
     }
 
     #[test]
-    fn docker_runtime_requires_an_image() -> Result<(), config::ConfigError> {
+    fn runtime_options_match_the_runtime() -> Result<(), config::ConfigError> {
         let toml = VALID.replace(r#"runtime = "native""#, r#"runtime = "docker""#);
-        let problems = check(&settings(&toml)?);
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        let toml = VALID.replace(
+            r#"runtime = "native""#,
+            "runtime = \"docker\"\nvenv = \"/opt/venv\"",
+        );
         assert_eq!(
-            problems,
-            vec!["targets.local: runtime `docker` requires `image`".to_string()]
+            check(&settings(&toml)?),
+            vec!["targets.local.venv: only with runtime = \"native\"".to_string()]
+        );
+        let toml = VALID.replace(
+            r#"runtime = "native""#,
+            "runtime = \"native\"\nengine = \"podman\"",
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "targets.local: engine and image only apply with runtime = \"docker\"".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_workdir_must_not_be_empty() -> Result<(), config::ConfigError> {
+        let toml = format!(
+            "{VALID}\n[targets.box]\nkind = \"ssh\"\nruntime = \"native\"\nworkdir = \" \"\n"
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["targets.box.workdir: must not be empty".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn training_defaults_are_set() -> Result<(), Box<dyn std::error::Error>> {
+        let settings = settings(VALID)?;
+        let training = settings.training.ok_or("training missing")?;
+        assert_eq!(training.lora_alpha, 32);
+        assert!((training.lora_dropout - 0.05).abs() < f64::EPSILON);
+        assert_eq!(training.micro_batch_size, 2);
+        assert_eq!(training.gradient_accumulation_steps, 4);
+        assert_eq!(training.optimizer, "adamw_torch_fused");
+        assert_eq!(training.lr_scheduler, "cosine");
+        assert!(training.sample_packing);
+        assert_eq!(training.evals_per_epoch, 4);
+        assert_eq!(training.saves_per_epoch, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn training_values_are_checked() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            "adapter = \"qlora\"",
+            "adapter = \"full\"\nmerge = true\nepochs = 0\nmicro_batch_size = 0\nlearning_rate = -1.0\nlora_dropout = 1.0\noptimizer = \"\"\nhub_model_id = \"\"",
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "training.epochs: must be at least 1".to_string(),
+                "training.micro_batch_size: must be at least 1".to_string(),
+                "training.optimizer: must not be empty".to_string(),
+                "training.hub_model_id: must not be empty".to_string(),
+                "training.learning_rate: must be greater than 0".to_string(),
+                "training.lora_dropout: must be in [0, 1)".to_string(),
+                "training.merge: requires adapter = \"lora\" or \"qlora\" (a full fine-tune has no adapter to merge)".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn axolotl_extra_cannot_replace_typed_or_managed_keys() -> Result<(), config::ConfigError> {
+        let toml = format!(
+            "{VALID}\n[training.axolotl_extra]\nnum_epochs = 5\noutput_dir = \"/tmp/x\"\nwarmup_ratio = 0.05\n"
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "training.axolotl_extra.num_epochs: set training.epochs instead".to_string(),
+                "training.axolotl_extra.output_dir: managed by overbrainer, cannot be overridden"
+                    .to_string(),
+            ]
         );
         Ok(())
     }

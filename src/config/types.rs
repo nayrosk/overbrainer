@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use secrecy::SecretString;
 use serde::de::{self, Unexpected, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Fully resolved configuration: `overbrainer.toml` layered with `OVERBRAINER_*` env vars.
 #[derive(Debug, Deserialize)]
@@ -229,24 +229,53 @@ pub struct Training {
     pub base_model: String,
     /// Fine-tuning strategy.
     pub adapter: Adapter,
-    /// Number of training epochs.
+    /// Number of training epochs. Must be at least 1.
     #[serde(default = "default_epochs")]
     pub epochs: u32,
-    /// Optimizer learning rate.
+    /// Optimizer learning rate. Must be greater than 0.
     #[serde(default = "default_learning_rate")]
     pub learning_rate: f64,
-    /// `LoRA` rank.
+    /// `LoRA` rank. Must be at least 1.
     #[serde(default = "default_lora_r")]
     pub lora_r: u32,
-    /// Maximum training sequence length, in tokens.
+    /// `LoRA` scaling factor. Must be at least 1.
+    #[serde(default = "default_lora_alpha")]
+    pub lora_alpha: u32,
+    /// `LoRA` dropout probability, in [0, 1).
+    #[serde(default = "default_lora_dropout")]
+    pub lora_dropout: f64,
+    /// Maximum training sequence length, in tokens. Must be at least 1.
     #[serde(default = "default_sequence_len")]
     pub sequence_len: u32,
-    /// Whether to merge the adapter into the base model after training.
+    /// Examples per GPU per step. Must be at least 1.
+    #[serde(default = "default_micro_batch_size")]
+    pub micro_batch_size: u32,
+    /// Steps whose gradients are summed before each optimizer update. Must be at least 1.
+    #[serde(default = "default_gradient_accumulation_steps")]
+    pub gradient_accumulation_steps: u32,
+    /// Axolotl optimizer name, for example `adamw_torch_fused` or `paged_adamw_8bit`.
+    #[serde(default = "default_optimizer")]
+    pub optimizer: String,
+    /// Axolotl learning rate scheduler name, for example `cosine` or `linear`.
+    #[serde(default = "default_lr_scheduler")]
+    pub lr_scheduler: String,
+    /// Packs several short examples into one sequence.
+    #[serde(default = "default_sample_packing")]
+    pub sample_packing: bool,
+    /// Evaluations on `data/eval.jsonl` per epoch. Must be at least 1.
+    #[serde(default = "default_evals_per_epoch")]
+    pub evals_per_epoch: u32,
+    /// Checkpoints saved per epoch. Must be at least 1.
+    #[serde(default = "default_saves_per_epoch")]
+    pub saves_per_epoch: u32,
+    /// Whether to merge the adapter into the base model after training. Only with
+    /// `adapter = "lora"` or `"qlora"`.
     #[serde(default)]
     pub merge: bool,
     /// Hugging Face Hub repo ID to push the trained model to, if any.
     pub hub_model_id: Option<String>,
-    /// Passed through verbatim into the Axolotl YAML.
+    /// Merged into the Axolotl YAML: tables are merged key by key, any other value
+    /// replaces the generated one.
     #[serde(default)]
     pub axolotl_extra: BTreeMap<String, serde_json::Value>,
 }
@@ -260,8 +289,35 @@ fn default_learning_rate() -> f64 {
 fn default_lora_r() -> u32 {
     16
 }
+fn default_lora_alpha() -> u32 {
+    32
+}
+fn default_lora_dropout() -> f64 {
+    0.05
+}
 fn default_sequence_len() -> u32 {
     4096
+}
+fn default_micro_batch_size() -> u32 {
+    2
+}
+fn default_gradient_accumulation_steps() -> u32 {
+    4
+}
+fn default_optimizer() -> String {
+    "adamw_torch_fused".to_string()
+}
+fn default_lr_scheduler() -> String {
+    "cosine".to_string()
+}
+fn default_sample_packing() -> bool {
+    true
+}
+fn default_evals_per_epoch() -> u32 {
+    4
+}
+fn default_saves_per_epoch() -> u32 {
+    1
 }
 
 /// How a training target runs the fine-tuning job.
@@ -274,18 +330,50 @@ pub enum Runtime {
     Native,
 }
 
+/// Container engine used by the `docker` runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    /// Docker with the NVIDIA Container Toolkit (`--gpus all`).
+    Docker,
+    /// Podman with NVIDIA CDI devices (`--device nvidia.com/gpu=all`).
+    Podman,
+}
+
+impl Engine {
+    /// The command name: `docker` or `podman`.
+    #[must_use]
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
+}
+
+/// Image used by the `docker` runtime when a target sets none: Axolotl 0.19.0 for
+/// CUDA 13 (NVIDIA driver 580 or newer), pinned by digest.
+pub const DEFAULT_IMAGE: &str = "axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1@sha256:9de7c7a5b8830480a7d2eb3b6d49759586615f5f8eb1126d5df29f8bd9fa324b";
+
+/// Directory of an `ssh` target that holds the runs when `workdir` is unset,
+/// relative to the remote user's home directory.
+pub const DEFAULT_WORKDIR: &str = "overbrainer";
+
 /// Where a training job runs.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Target {
-    /// Runs on the machine executing overbrainer.
+    /// Runs on the machine executing overbrainer, in the project's `runs/` directory.
     Local {
         /// How the training job runs.
         runtime: Runtime,
-        /// Required with `runtime = "native"` unless `axolotl` is on PATH.
-        venv: Option<String>,
-        /// Required with `runtime = "docker"`.
+        /// Container engine, only with `runtime = "docker"`. Defaults to `docker`.
+        engine: Option<Engine>,
+        /// Container image, only with `runtime = "docker"`. Defaults to [`DEFAULT_IMAGE`].
         image: Option<String>,
+        /// Virtual environment holding `bin/axolotl`, only with `runtime = "native"`.
+        /// Without it, `axolotl` must be on `PATH`.
+        venv: Option<String>,
     },
     /// Runs on a remote machine reached over SSH.
     Ssh {
@@ -293,10 +381,16 @@ pub enum Target {
         runtime: Runtime,
         /// Env only. `user@host` or an alias from `~/.ssh/config`.
         host: Option<String>,
-        /// Required with `runtime = "native"` unless `axolotl` is on PATH.
-        venv: Option<String>,
-        /// Required with `runtime = "docker"`.
+        /// Directory holding the runs on the remote machine, absolute or relative to
+        /// the remote home directory. Defaults to [`DEFAULT_WORKDIR`].
+        workdir: Option<String>,
+        /// Container engine, only with `runtime = "docker"`. Defaults to `docker`.
+        engine: Option<Engine>,
+        /// Container image, only with `runtime = "docker"`. Defaults to [`DEFAULT_IMAGE`].
         image: Option<String>,
+        /// Virtual environment holding `bin/axolotl`, only with `runtime = "native"`.
+        /// Without it, `axolotl` must be on the remote `PATH`.
+        venv: Option<String>,
     },
     /// Runs on a Runpod-provisioned GPU pod.
     Runpod {

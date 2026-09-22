@@ -1,6 +1,6 @@
 use std::fs;
 
-use overbrainer::config::{ConfigError, EnvSource, Target, load};
+use overbrainer::config::{ConfigError, Engine, EnvSource, Target, load};
 use secrecy::ExposeSecret;
 
 const BASE: &str = r#"
@@ -346,5 +346,35 @@ not valid toml here = SK-LEAK-MARKER-999 !!broken!!
             Ok(())
         },
         other => Err(format!("expected Parse, got {other:?}").into()),
+    }
+}
+
+#[test]
+fn ssh_target_options_come_from_the_file_and_env() -> Result<(), Box<dyn std::error::Error>> {
+    let toml = format!(
+        "{BASE}{}",
+        TARGETS.replace(
+            "runtime = \"native\"",
+            "runtime = \"docker\"\nengine = \"podman\""
+        )
+    );
+    let dir = project(&toml)?;
+    let settings = load(
+        dir.path(),
+        env(&[("OVERBRAINER_TARGETS__BOX__WORKDIR", "/data/overbrainer")]),
+    )?;
+    match settings.targets.get("box") {
+        Some(Target::Ssh {
+            engine,
+            workdir,
+            image,
+            ..
+        }) => {
+            assert_eq!(*engine, Some(Engine::Podman));
+            assert_eq!(workdir.as_deref(), Some("/data/overbrainer"));
+            assert_eq!(*image, None);
+            Ok(())
+        },
+        other => Err(format!("expected ssh target, got {other:?}").into()),
     }
 }
