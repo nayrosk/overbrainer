@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use overbrainer::dedup::{Deduplicator, Embedding, Layered, Lexical, cosine};
-use overbrainer::llm::{Completion, CompletionRequest, LlmClient, LlmError};
+use overbrainer::llm::{Completion, CompletionRequest, LlmClient, LlmError, RetryPolicy};
 
 /// Embeds known texts to fixed vectors and remembers what it was asked to embed.
 struct FakeEmbedder {
@@ -54,6 +56,51 @@ fn texts(items: &[&str]) -> Vec<String> {
     items.iter().map(|item| (*item).to_string()).collect()
 }
 
+/// A fast policy for tests: no real waiting.
+fn fast_policy(max_retries: u32) -> RetryPolicy {
+    RetryPolicy {
+        max_retries,
+        base: Duration::from_millis(1),
+        cap: Duration::from_millis(2),
+    }
+}
+
+/// Embeds one fixed vector for every input, failing its first `fails` calls with a
+/// retryable server error.
+struct FlakyEmbedder {
+    fails: usize,
+    calls: AtomicUsize,
+    vector: Vec<f32>,
+}
+
+impl FlakyEmbedder {
+    fn new(fails: usize, vector: [f32; 2]) -> Self {
+        Self {
+            fails,
+            calls: AtomicUsize::new(0),
+            vector: vector.to_vec(),
+        }
+    }
+}
+
+impl LlmClient for &FlakyEmbedder {
+    async fn complete(&self, _request: CompletionRequest) -> Result<Completion, LlmError> {
+        Err(LlmError::Unsupported("completions"))
+    }
+
+    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call <= self.fails {
+            return Err(LlmError::Status {
+                status: 503,
+                message: String::new(),
+                retry_after: None,
+            });
+        }
+        Ok(inputs.iter().map(|_| self.vector.clone()).collect())
+    }
+}
+
 #[test]
 fn cosine_of_parallel_orthogonal_and_zero_vectors() {
     assert!((cosine(&[1.0, 0.0], &[2.0, 0.0]) - 1.0).abs() < 1e-9);
@@ -68,7 +115,7 @@ async fn embedding_drops_semantic_duplicates() -> Result<(), LlmError> {
         ("How come moving from a reference fails?", [0.99, 0.05]),
         ("What does Pin guarantee?", [0.0, 1.0]),
     ]);
-    let mut embedding = Embedding::new(&fake, 0.9);
+    let mut embedding = Embedding::new(&fake, 0.9, fast_policy(0));
     embedding
         .record(&texts(&["Why can't I move out of a borrow?"]))
         .await?;
@@ -88,7 +135,10 @@ async fn layered_embeds_only_lexically_new_candidates() -> Result<(), LlmError> 
         ("What is a borrow?", [1.0, 0.0]),
         ("Explain lifetimes.", [0.0, 1.0]),
     ]);
-    let mut layered = Layered::new(Lexical::new(0.8), Some(Embedding::new(&fake, 0.9)));
+    let mut layered = Layered::new(
+        Lexical::new(0.8),
+        Some(Embedding::new(&fake, 0.9, fast_policy(0))),
+    );
     let kept = layered
         .admit(texts(&[
             "What is a borrow?",
@@ -102,4 +152,30 @@ async fn layered_embeds_only_lexically_new_candidates() -> Result<(), LlmError> 
         texts(&["What is a borrow?", "Explain lifetimes."])
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn embedding_retries_a_transient_failure_then_succeeds() -> Result<(), LlmError> {
+    let fake = FlakyEmbedder::new(1, [1.0, 0.0]);
+    let mut embedding = Embedding::new(&fake, 0.9, fast_policy(2));
+    embedding.record(&texts(&["a"])).await?;
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        2,
+        "the first call fails and is retried once"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn embedding_gives_up_after_the_retry_budget() {
+    let fake = FlakyEmbedder::new(5, [1.0, 0.0]);
+    let mut embedding = Embedding::new(&fake, 0.9, fast_policy(1));
+    let result = embedding.record(&texts(&["a"])).await;
+    assert!(matches!(result, Err(LlmError::Status { status: 503, .. })));
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        2,
+        "one call plus one retry"
+    );
 }

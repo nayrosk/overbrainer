@@ -1,27 +1,33 @@
+use std::time::Duration;
+
 use super::Deduplicator;
-use crate::llm::{LlmClient, LlmError};
+use crate::llm::{LlmClient, LlmError, RetryPolicy, with_retry};
 
 /// Cosine similarity of embeddings against a threshold.
 #[derive(Debug)]
 pub struct Embedding<C> {
     client: C,
     threshold: f64,
+    policy: RetryPolicy,
     accepted: Vec<Vec<f32>>,
 }
 
 impl<C: LlmClient> Embedding<C> {
-    /// Texts whose cosine similarity is at least `threshold` are duplicates.
+    /// Texts whose cosine similarity is at least `threshold` are duplicates. Embed
+    /// requests are retried under `policy`, so a transient failure of the embeddings
+    /// endpoint does not fail the whole call on its own.
     #[must_use]
-    pub fn new(client: C, threshold: f64) -> Self {
+    pub fn new(client: C, threshold: f64, policy: RetryPolicy) -> Self {
         Self {
             client,
             threshold,
+            policy,
             accepted: Vec::new(),
         }
     }
 
     async fn vectors(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
-        let vectors = self.client.embed(texts).await?;
+        let vectors = with_retry(&self.policy, || self.client.embed(texts), log_retry).await?;
         if vectors.len() == texts.len() {
             Ok(vectors)
         } else {
@@ -32,6 +38,13 @@ impl<C: LlmClient> Embedding<C> {
             )))
         }
     }
+}
+
+fn log_retry(error: &LlmError, wait: Duration) {
+    tracing::debug!(
+        "embedding request failed ({error}); retrying in {:.1}s",
+        wait.as_secs_f64()
+    );
 }
 
 impl<C: LlmClient> Deduplicator for Embedding<C> {
