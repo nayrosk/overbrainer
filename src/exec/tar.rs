@@ -58,20 +58,28 @@ pub(crate) async fn extract<R: AsyncRead + Unpin>(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(spawn_error)?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let written = async {
-            stdin.write_all(&first).await?;
-            tokio::io::copy(reader, &mut stdin).await?;
-            stdin.shutdown().await
-        }
-        .await;
-        drop(stdin);
-        written.map_err(io_error(dir))?;
-    }
-    finish(child, "extract").await
+    let stdin = child.stdin.take();
+    // Fed while `finish` drains tar's error output, so a flood of warnings cannot
+    // fill that pipe and stall tar. `stdin` is dropped when the feeding ends, which
+    // is how tar sees the end of the stream.
+    let feed = async move {
+        let Some(mut stdin) = stdin else {
+            return Ok(());
+        };
+        stdin.write_all(&first).await?;
+        tokio::io::copy(reader, &mut stdin).await?;
+        stdin.shutdown().await
+    };
+    let (written, finished) = tokio::join!(feed, finish(child, "extract"));
+    // When tar dies early, feeding it fails with a broken pipe: its own error says why.
+    finished?;
+    written.map_err(io_error(dir))
 }
 
-/// Waits for a local `tar`, turning a failure into an error carrying its stderr.
+/// Waits for a local `tar` while reading its error output, turning a failure into
+/// an error carrying that output. Run it alongside whatever feeds or drains the
+/// process's other pipes, not after: otherwise enough warnings fill the error pipe
+/// and `tar` stalls.
 pub(crate) async fn finish(child: Child, action: &'static str) -> Result<(), ExecError> {
     let output = child.wait_with_output().await.map_err(spawn_error)?;
     if output.status.success() {
@@ -110,7 +118,101 @@ fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> ExecError + '_ {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// A name long enough that one `tar` warning about it takes a few hundred bytes.
+    fn long_name(index: usize) -> String {
+        format!("{index:05}-{}", "n".repeat(150))
+    }
+
+    /// Whether permissions are enforced for this user (they are not for root).
+    fn permissions_enforced(locked: &Path) -> bool {
+        fs::read_dir(locked).is_err()
+    }
+
+    #[tokio::test]
+    async fn extract_reports_the_tar_error_when_tar_dies_early() -> TestResult {
+        let root = tempdir()?;
+        let locked = root.path().join("locked");
+        fs::create_dir(&locked)?;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
+        if !permissions_enforced(&locked) {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))?;
+            eprintln!("skipped: permissions are not enforced for this user");
+            return Ok(());
+        }
+        // A real archive (tar only enters the directory for its first member) far
+        // larger than a pipe holds, so feeding it fails once tar has exited.
+        let source = root.path().join("source");
+        fs::create_dir(&source)?;
+        fs::write(source.join("big"), vec![b'x'; 4 * 1024 * 1024])?;
+        let entries = ["big".to_string()];
+        let mut create = spawn_create(&source, &entries, &[])?;
+        let mut archive = Vec::new();
+        if let Some(mut stdout) = create.stdout.take() {
+            stdout.read_to_end(&mut archive).await?;
+        }
+        finish(create, "archive").await?;
+        let result = extract(&mut archive.as_slice(), &locked).await;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))?;
+        match result {
+            Err(ExecError::Command { action, message }) => {
+                assert_eq!(action, "extract");
+                assert!(message.contains("Permission denied"), "{message}");
+            },
+            other => return Err(format!("expected tar's own error, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extract_survives_a_flood_of_tar_warnings() -> TestResult {
+        let root = tempdir()?;
+        let source = root.path().join("source");
+        fs::create_dir(&source)?;
+        let names: Vec<String> = (0..3000).map(long_name).collect();
+        for name in &names {
+            fs::write(source.join(name), "")?;
+        }
+        let mut create = spawn_create(&source, &names, &[])?;
+        let mut archive = Vec::new();
+        if let Some(mut stdout) = create.stdout.take() {
+            stdout.read_to_end(&mut archive).await?;
+        }
+        finish(create, "archive").await?;
+
+        // Enterable but not writable: tar warns once per entry and keeps reading.
+        let target = root.path().join("target");
+        fs::create_dir(&target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o555))?;
+        if fs::write(target.join("probe"), "").is_ok() {
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+            eprintln!("skipped: permissions are not enforced for this user");
+            return Ok(());
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            extract(&mut archive.as_slice(), &target),
+        )
+        .await;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+        match result {
+            Err(_) => return Err("extract deadlocked on tar's error output".into()),
+            Ok(Err(ExecError::Command { message, .. })) => {
+                assert!(message.len() > 64 * 1024, "{} bytes", message.len());
+            },
+            Ok(other) => return Err(format!("expected tar's warnings, got {other:?}").into()),
+        }
+        Ok(())
+    }
 
     #[test]
     fn create_args_exclude_before_the_entries() {

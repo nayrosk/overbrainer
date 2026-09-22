@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::future::{Future, ready};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -21,8 +22,16 @@ use super::{
 /// for its full grace period.
 const REAP_EVERY: Duration = Duration::from_millis(150);
 
+/// Prefixes of the variables of this process that never reach a job: overbrainer's
+/// own settings and the Vault client's, which can hold credentials.
+const PRIVATE_PREFIXES: [&str; 2] = ["OVERBRAINER_", "VAULT_"];
+
 /// Runs jobs on this machine, each in its own process group so a Ctrl-C in the
 /// terminal does not reach it.
+///
+/// A job inherits the environment of this process (`PATH`, CUDA, conda and so on)
+/// except every variable whose name starts with `OVERBRAINER_` or `VAULT_`; its
+/// secrets are then set explicitly, on its environment only.
 #[derive(Debug)]
 pub struct LocalExecutor {
     workdir: String,
@@ -73,6 +82,9 @@ impl LocalExecutor {
             .stderr(err)
             .process_group(0)
             .kill_on_drop(false);
+        for name in private_names(std::env::vars_os().map(|(name, _)| name)) {
+            command.env_remove(name);
+        }
         for (name, value) in &job.secrets {
             command.env(name, value.expose_secret());
         }
@@ -83,6 +95,8 @@ impl LocalExecutor {
         if let Ok(mut children) = self.children.lock() {
             children.push(child);
         }
+        // Cannot fail for a freshly spawned child, whose pid is never 0 or 1, so the
+        // running job is not left without a handle in practice.
         Ok(JobId {
             dir: job.dir.clone(),
             pid: Pid::new(raw)?,
@@ -149,6 +163,16 @@ impl LocalExecutor {
         if same_dir(from, to) {
             return Ok(());
         }
+        if nested(from, to) {
+            return Err(ExecError::Command {
+                action: "copy",
+                message: format!(
+                    "{} is inside {}: copying there would copy the destination into itself",
+                    to.display(),
+                    from.display()
+                ),
+            });
+        }
         let entries: Vec<String> = entries
             .iter()
             .filter(|entry| from.join(entry.as_str()).exists())
@@ -162,9 +186,10 @@ impl LocalExecutor {
             .stdout
             .take()
             .ok_or_else(|| ExecError::Protocol("tar has no output".into()))?;
-        let extracted = tar::extract(&mut stdout, to).await;
-        drop(stdout);
-        let created = tar::finish(create, "archive").await;
+        // Both run at once, so the archiving tar's error output is drained while its
+        // archive is extracted. `stdout` is dropped once the extraction ends.
+        let extract = async move { tar::extract(&mut stdout, to).await };
+        let (extracted, created) = tokio::join!(extract, tar::finish(create, "archive"));
         extracted.and(created)
     }
 }
@@ -233,6 +258,41 @@ fn same_dir(from: &Path, to: &Path) -> bool {
     }
 }
 
+/// Whether `to`, once resolved (it may not exist yet), is strictly inside the
+/// existing directory `from`.
+fn nested(from: &Path, to: &Path) -> bool {
+    match (fs::canonicalize(from), resolve(to)) {
+        (Ok(from), Some(to)) => to != from && to.starts_with(&from),
+        _ => false,
+    }
+}
+
+/// The absolute form of `path` with its longest existing prefix canonicalized.
+fn resolve(path: &Path) -> Option<PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
+    let mut missing = Vec::new();
+    let mut current = absolute.as_path();
+    loop {
+        if let Ok(real) = fs::canonicalize(current) {
+            return Some(missing.iter().rev().fold(real, |acc, part| acc.join(part)));
+        }
+        missing.push(current.file_name()?);
+        current = current.parent()?;
+    }
+}
+
+/// The names among `names` that must not reach a job (see [`PRIVATE_PREFIXES`]).
+fn private_names(names: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    names
+        .into_iter()
+        .filter(|name| {
+            PRIVATE_PREFIXES
+                .iter()
+                .any(|prefix| name.as_encoded_bytes().starts_with(prefix.as_bytes()))
+        })
+        .collect()
+}
+
 fn remove(path: &Path) -> Result<(), ExecError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -252,5 +312,42 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> ExecError + '_ {
     move |source| ExecError::Io {
         path: PathBuf::from(path),
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_overbrainer_and_vault_variables_are_private() {
+        let names = [
+            "OVERBRAINER_CONFIG",
+            "VAULT_TOKEN",
+            "VAULT_ADDR",
+            "PATH",
+            "CUDA_VISIBLE_DEVICES",
+            "HF_TOKEN",
+            "MY_OVERBRAINER_X",
+            "vault_token",
+        ]
+        .map(OsString::from);
+        assert_eq!(
+            private_names(names),
+            ["OVERBRAINER_CONFIG", "VAULT_TOKEN", "VAULT_ADDR"].map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn a_destination_inside_the_source_is_nested() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("existing"))?;
+        assert!(nested(&source, &source.join("existing")));
+        assert!(nested(&source, &source.join("missing/deeper")));
+        assert!(!nested(&source, &source));
+        assert!(!nested(&source, &root.path().join("sibling")));
+        assert!(!nested(&source, &root.path().join("source-2")));
+        Ok(())
     }
 }

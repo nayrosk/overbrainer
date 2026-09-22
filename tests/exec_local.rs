@@ -1,10 +1,11 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
 use overbrainer::exec::{
-    CANCEL_FILE, CANCELLING_FILE, Executor, JobCommand, JobId, JobStatus, LocalExecutor,
+    CANCEL_FILE, CANCELLING_FILE, ExecError, Executor, JobCommand, JobId, JobStatus, LocalExecutor,
 };
 use secrecy::SecretString;
 
@@ -181,15 +182,18 @@ async fn status_during_a_cancel_is_running_then_cancelled_never_lost() -> TestRe
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        Ok::<_, overbrainer::exec::ExecError>(seen)
+        Ok::<_, ExecError>(seen)
     };
     let (cancelled, seen) = tokio::join!(executor.cancel(&started), poll);
     cancelled?;
     let seen = seen?;
-    assert_eq!(
-        seen,
-        vec![JobStatus::Running, JobStatus::Cancelled],
-        "unexpected status sequence during the cancel"
+    // The first sample may already be `Cancelled` when `sleep` dies to SIGTERM
+    // quickly; what matters is that nothing else (`Lost`, `Exited`) ever shows up.
+    assert_eq!(seen.last(), Some(&JobStatus::Cancelled), "{seen:?}");
+    assert!(
+        seen.iter()
+            .all(|status| matches!(status, JobStatus::Running | JobStatus::Cancelled)),
+        "unexpected status during the cancel: {seen:?}"
     );
     assert_eq!(executor.status(&started).await?, JobStatus::Cancelled);
     Ok(())
@@ -273,5 +277,132 @@ async fn upload_and_download_copy_selected_trees() -> TestResult {
 
     // Same directory on both sides: nothing to copy.
     executor.upload(Path::new(&remote), &remote).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_copy_into_its_own_source_is_refused() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let executor = LocalExecutor::new(&root.path().join("work"))?;
+    let local = root.path().join("local");
+    fs::create_dir_all(&local)?;
+    fs::write(local.join("axolotl.yaml"), "a: 1\n")?;
+
+    let inside = local.join("nested/run");
+    let refused = executor
+        .upload(&local, &inside.to_string_lossy())
+        .await
+        .err()
+        .ok_or("a copy into its own source must be refused")?;
+    assert!(refused.to_string().contains("inside"), "{refused}");
+    assert!(!local.join("nested").exists());
+
+    let remote = format!("{}/r7", executor.workdir());
+    executor.upload(&local, &remote).await?;
+    let refused = executor
+        .download(
+            &remote,
+            &Path::new(&remote).join("back"),
+            &["axolotl.yaml".to_string()],
+            &[],
+        )
+        .await
+        .err()
+        .ok_or("a download into its own source must be refused")?;
+    assert!(refused.to_string().contains("inside"), "{refused}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_flood_of_tar_warnings_while_archiving_does_not_deadlock() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let executor = LocalExecutor::new(&root.path().join("work"))?;
+    let remote = Path::new(executor.workdir()).join("r8");
+    fs::create_dir_all(remote.join("output"))?;
+    let mut locked = Vec::new();
+    for index in 0..3000 {
+        let file = remote
+            .join("output")
+            .join(format!("{index:05}-{}", "n".repeat(150)));
+        fs::write(&file, "x")?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000))?;
+        locked.push(file);
+    }
+    if locked.first().is_some_and(|file| fs::read(file).is_ok()) {
+        eprintln!("skipped: permissions are not enforced for this user");
+        return Ok(());
+    }
+    let copied = tokio::time::timeout(
+        Duration::from_secs(30),
+        executor.download(
+            &remote.to_string_lossy(),
+            &root.path().join("back"),
+            &["output".to_string()],
+            &[],
+        ),
+    )
+    .await;
+    for file in &locked {
+        fs::set_permissions(file, fs::Permissions::from_mode(0o644))?;
+    }
+    match copied {
+        Err(_) => return Err("the copy deadlocked on tar's error output".into()),
+        Ok(Err(ExecError::Command { message, .. })) => {
+            assert!(message.len() > 64 * 1024, "{} bytes", message.len());
+        },
+        Ok(other) => return Err(format!("expected tar's warnings, got {other:?}").into()),
+    }
+    Ok(())
+}
+
+/// Set by [`private_parent_variables_do_not_reach_a_job`] on the copy of this test
+/// binary it runs: the run directory for [`private_parent_variables_child`].
+const CHILD_RUN_DIR: &str = "OB_EXEC_LOCAL_CHILD_RUN_DIR";
+
+#[test]
+fn private_parent_variables_do_not_reach_a_job() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let output = Command::new(std::env::current_exe()?)
+        .args(["--exact", "private_parent_variables_child", "--nocapture"])
+        .env(CHILD_RUN_DIR, root.path())
+        .env("OVERBRAINER_TEST_LEAK", "leak-one")
+        .env("VAULT_TOKEN", "leak-two")
+        .env("OB_TEST_KEPT", "kept")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = fs::read_to_string(root.path().join("work/r9/job.log"))?;
+    assert_eq!(
+        log, "secret=s3cr3t-value\nkept=kept\noverbrainer=\nvault=\n",
+        "the job saw the wrong environment"
+    );
+    assert!(!log.contains("leak"), "{log}");
+    Ok(())
+}
+
+/// The part of [`private_parent_variables_do_not_reach_a_job`] that runs with the
+/// parent environment it sets up. Does nothing in a normal test run.
+#[tokio::test]
+async fn private_parent_variables_child() -> TestResult {
+    let Some(root) = std::env::var_os(CHILD_RUN_DIR) else {
+        return Ok(());
+    };
+    let executor = LocalExecutor::new(&Path::new(&root).join("work"))?;
+    let dir = Path::new(executor.workdir()).join("r9");
+    let started = executor
+        .spawn(&job(
+            &dir,
+            "echo \"secret=$OB_TEST_SECRET\"; echo \"kept=$OB_TEST_KEPT\"; \
+             echo \"overbrainer=$OVERBRAINER_TEST_LEAK\"; echo \"vault=$VAULT_TOKEN\"",
+        ))
+        .await?;
+    assert_eq!(
+        wait_finished(&executor, &started).await?,
+        JobStatus::Exited(0)
+    );
     Ok(())
 }
