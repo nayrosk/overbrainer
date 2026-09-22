@@ -83,13 +83,10 @@ pub async fn answers<C: LlmClient + 'static>(
                     stage: Stage::Answers,
                     id: question.id.to_string(),
                 };
-                if let Err(mut stop) = item_error(ctx, &item, error, &mut stats) {
+                if let Err(stop) = item_error(ctx, &item, error, &mut stats) {
                     tasks.abort_all();
-                    keep_finished(ctx, &parent, &mut tasks, &mut out, &mut stats).await?;
-                    if let PipelineError::Llm { spent, .. } = &mut stop {
-                        **spent = stats;
-                    }
-                    return Err(stop);
+                    let kept = keep_finished(ctx, &parent, &mut tasks, &mut out, &mut stats).await;
+                    return Err(stopped(stop, kept, stats));
                 }
             },
         }
@@ -177,6 +174,31 @@ async fn keep_finished<C: LlmClient>(
         }
     }
     Ok(())
+}
+
+/// The error of a stage stopped by the fatal provider error `stop`, once the answers
+/// that had finished were saved (`kept`). When saving them failed, that disk error is
+/// returned, and the provider error, which would otherwise be lost, is logged.
+fn stopped(
+    mut stop: PipelineError,
+    kept: Result<(), PipelineError>,
+    stats: StageStats,
+) -> PipelineError {
+    if let Err(disk) = kept {
+        log_lost(&stop);
+        return disk;
+    }
+    if let PipelineError::Llm { spent, .. } = &mut stop {
+        **spent = stats;
+    }
+    stop
+}
+
+fn log_lost(stop: &PipelineError) {
+    let cause = std::error::Error::source(stop)
+        .map(|source| format!(": {source}"))
+        .unwrap_or_default();
+    tracing::error!("{stop}{cause}; saving the answers that had finished then failed too");
 }
 
 /// The system prompt of each topic, rendered once.
@@ -355,8 +377,81 @@ fn warn_about_reasoning<C>(ctx: &Ctx<'_>, parent: &RoleClient<C>) {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::Mutex;
+
+    use tracing_subscriber::fmt::MakeWriter;
+
     use super::*;
+    use crate::dataset::DatasetError;
     use crate::llm::{Reasoning, Usage};
+
+    /// Collects formatted log lines.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl Logs {
+        fn text(&self) -> String {
+            self.0
+                .lock()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        }
+    }
+
+    impl io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Ok(mut bytes) = self.0.lock() {
+                bytes.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl MakeWriter<'_> for Logs {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn a_disk_error_after_a_fatal_stop_still_logs_the_provider_error() {
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let stop = PipelineError::Llm {
+            stage: Stage::Answers,
+            source: LlmError::Status {
+                status: 401,
+                message: "authentication failed".to_string(),
+                retry_after: None,
+            },
+            spent: Box::default(),
+        };
+        let disk = PipelineError::Dataset(DatasetError::Io {
+            path: "data/answers.jsonl".into(),
+            source: io::Error::other("no space left"),
+        });
+        let returned = tracing::subscriber::with_default(subscriber, || {
+            stopped(stop, Err(disk), StageStats::default())
+        });
+        assert!(
+            matches!(returned, PipelineError::Dataset(_)),
+            "the disk error is returned"
+        );
+        let text = logs.text();
+        assert!(text.contains("ERROR"), "{text}");
+        assert!(text.contains("answers stopped"), "{text}");
+        assert!(text.contains("401"), "{text}");
+    }
 
     fn completion(content: &str, kind: ReasoningKind, finish: FinishReason) -> Completion {
         Completion {
