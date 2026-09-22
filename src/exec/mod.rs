@@ -8,7 +8,9 @@
 //! cancel it from that directory alone.
 
 mod lines;
+mod local;
 mod script;
+mod tar;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 pub use lines::{LineStream, MAX_TAIL_READ, complete_lines};
+pub use local::LocalExecutor;
 pub use script::{cancel_script, job_script, parse_status, quote, status_script};
 
 use crate::config::Engine;
