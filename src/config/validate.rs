@@ -397,13 +397,18 @@ fn check_target_workdir(name: &str, workdir: Option<&str>, problems: &mut Vec<St
     check_safe_path(name, "workdir", workdir, problems);
 }
 
-/// `venv`, when set, must be a safe path (see [`check_safe_path`]). It reaches remote
-/// shell commands, so unsafe characters are rejected here in addition to callers
-/// quoting it.
+/// `venv`, when set, must not be empty and must be a safe path (see
+/// [`check_safe_path`]). It reaches remote shell commands, so unsafe characters are
+/// rejected here in addition to callers quoting it.
 fn check_target_venv(name: &str, venv: Option<&str>, problems: &mut Vec<String>) {
-    if let Some(venv) = venv {
-        check_safe_path(name, "venv", venv, problems);
+    let Some(venv) = venv else {
+        return;
+    };
+    if venv.trim().is_empty() {
+        problems.push(format!("targets.{name}.venv: must not be empty"));
+        return;
     }
+    check_safe_path(name, "venv", venv, problems);
 }
 
 /// Characters allowed in a `workdir` or `venv` value.
@@ -442,13 +447,17 @@ fn valid_tilde_placement(value: &str) -> bool {
     }
 }
 
-/// `image`, when set, must use only `[A-Za-z0-9._/:@-]` and not start with `-`. It
-/// reaches remote shell commands, so unsafe characters are rejected here in addition
-/// to callers quoting it.
+/// `image`, when set, must not be empty and must use only `[A-Za-z0-9._/:@-]` and not
+/// start with `-`. It reaches remote shell commands, so unsafe characters are
+/// rejected here in addition to callers quoting it.
 fn check_target_image(name: &str, image: Option<&str>, problems: &mut Vec<String>) {
     let Some(image) = image else {
         return;
     };
+    if image.trim().is_empty() {
+        problems.push(format!("targets.{name}.image: must not be empty"));
+        return;
+    }
     if !image.chars().all(is_image_char) {
         problems.push(format!(
             "targets.{name}.image: only letters, digits and . _ / : @ - are allowed"
@@ -752,6 +761,32 @@ mod tests {
         assert_eq!(
             check(&settings(&toml)?),
             vec!["targets.local.image: must not start with -".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_image_must_not_be_empty() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            r#"runtime = "native""#,
+            "runtime = \"docker\"\nimage = \" \"",
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["targets.local.image: must not be empty".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_venv_must_not_be_empty() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            r#"runtime = "native""#,
+            "runtime = \"native\"\nvenv = \" \"",
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["targets.local.venv: must not be empty".to_string()]
         );
         Ok(())
     }
