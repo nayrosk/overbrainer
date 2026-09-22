@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en
+early_access: true
+
+reviews:
+  profile: "assertive"
+
+  auto_review:
+    enabled: true
+    drafts: false
+    ignore_title_keywords:
+      - "WIP"
+      - "Draft"
+      - "DO NOT MERGE"
+
+  high_level_summary: true
+  review_status: true
+  commit_status: true
+  sequence_diagrams: true
+  changed_files_summary: true
+  related_issues: true
+  request_changes_workflow: true
+
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: |
+        Review for compliance with project conventions:
+        - No unwrap(), expect(), panic!, todo!, unimplemented! or dbg! anywhere
+        - No #[allow(...)] attributes or lint allowances; fix lints at the cause
+        - Proper error handling with thiserror in modules, anyhow only in main.rs and cli/
+        - Secrets are secrecy::SecretString and never reach stdout, stderr, logs, Debug or error messages
+        - stdout only carries command output; logs and errors go to stderr
+        - Every public item is documented; public functions returning Result have an "# Errors" section
+        - Traits only at swap points (LlmClient, SecretSource, Deduplicator, Trainer, Executor); flag overengineering
+        - Functions limited to 5 parameters
+        - Code and comments in English only, no emoji, no em dashes
+        - Prefer borrowing over ownership
+        - Use iterators over manual loops where clearer
+
+    - path: "tests/**/*.rs"
+      instructions: |
+        - Tests return Result and use `?`; no unwrap(), expect() or panic!
+        - Never call std::env::set_var; inject environment through parameters or assert_cmd
+        - Tests must not depend on the developer's environment
+        - Each test asserts real behavior; flag tests that assert nothing
+
+    - path: ".github/workflows/**/*.yml"
+      instructions: |
+        - Third-party actions pinned by full commit SHA with a version comment
+        - Minimal permissions, persist-credentials false on checkout
+        - Untrusted values (branch names, commit subjects) passed through env, never interpolated into run scripts
+        - No secrets in logs
+
+    - path: "Cargo.toml"
+      instructions: |
+        - Dependencies are added with cargo add; flag unused features and unnecessary dependencies
+        - Lints section keeps clippy pedantic enabled
+
+  path_filters:
+    - "!**/*.md"
+    - "!**/*.mdx"
+    - "!**/target/**"
+    - "!**/Cargo.lock"
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/CLAUDE.md"
+      - "**/AGENTS.md"
