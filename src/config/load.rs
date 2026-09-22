@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use config::{Config, Environment, File, FileFormat};
+use serde_json::Value;
 
 use super::{Settings, validate};
 
@@ -124,7 +126,7 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
         .build()?;
     let mut problems = validate::env_only_in_file(&file_only);
 
-    let settings: Settings = Config::builder()
+    let mut settings: Settings = Config::builder()
         .add_source(File::from_str(&content, FileFormat::Toml))
         .add_source(
             Environment::with_prefix(ENV_PREFIX)
@@ -136,10 +138,79 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
         .build()?
         .try_deserialize()?;
 
+    if let Some(training) = settings.training.as_mut() {
+        let file_extra: BTreeMap<String, Value> =
+            file_only.get("training.axolotl_extra").unwrap_or_default();
+        coerce_env_scalars(&mut training.axolotl_extra, &file_extra);
+    }
+
     problems.extend(validate::check(&settings));
     if problems.is_empty() {
         Ok(settings)
     } else {
         Err(ConfigError::Invalid(problems))
+    }
+}
+
+/// Gives env-provided values of `training.axolotl_extra` a type.
+///
+/// Env variables are read without type parsing (`try_parsing(false)` keeps secrets
+/// such as `0123` intact), so every value set through
+/// `OVERBRAINER_TRAINING__AXOLOTL_EXTRA__*` arrives as a string. A string that is not
+/// the file's own value for the same key came from env and becomes a boolean
+/// (`true`, `false`), an integer or a finite float when it parses as one; any other
+/// text stays a string. Values from `overbrainer.toml` keep their TOML type, so a
+/// number-like string that must stay a string belongs in the file.
+fn coerce_env_scalars(extra: &mut BTreeMap<String, Value>, file: &BTreeMap<String, Value>) {
+    for (key, value) in extra.iter_mut() {
+        coerce(value, file.get(key));
+    }
+}
+
+fn coerce(value: &mut Value, file: Option<&Value>) {
+    if let Value::Object(map) = value {
+        for (key, inner) in map.iter_mut() {
+            coerce(inner, file.and_then(|file| file.get(key)));
+        }
+        return;
+    }
+    let parsed = match &*value {
+        Value::String(text) if file.and_then(Value::as_str) != Some(text.as_str()) => scalar(text),
+        _ => None,
+    };
+    if let Some(parsed) = parsed {
+        *value = parsed;
+    }
+}
+
+/// `text` as a boolean, an integer or a finite float, when it is one.
+fn scalar(text: &str) -> Option<Value> {
+    match text {
+        "true" => return Some(Value::Bool(true)),
+        "false" => return Some(Value::Bool(false)),
+        _ => {},
+    }
+    if let Ok(integer) = text.parse::<i64>() {
+        return Some(Value::from(integer));
+    }
+    text.parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map(Value::Number)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalars_parse_only_plain_values() {
+        assert_eq!(scalar("true"), Some(Value::Bool(true)));
+        assert_eq!(scalar("10"), Some(Value::from(10)));
+        assert_eq!(scalar("0.05"), Some(Value::from(0.05)));
+        assert_eq!(scalar("nan"), None);
+        assert_eq!(scalar("inf"), None);
+        assert_eq!(scalar("qwen3"), None);
+        assert_eq!(scalar("True"), None);
     }
 }

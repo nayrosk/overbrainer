@@ -378,3 +378,57 @@ fn ssh_target_options_come_from_the_file_and_env() -> Result<(), Box<dyn std::er
         other => Err(format!("expected ssh target, got {other:?}").into()),
     }
 }
+
+const TRAINING: &str = r#"
+[training]
+target = "box"
+base_model = "Qwen/Qwen3-4B"
+adapter = "qlora"
+
+[training.axolotl_extra]
+chat_template = "qwen3"
+revision = "0123"
+special_tokens = { pad_token = "<|endoftext|>" }
+
+[targets.box]
+kind = "ssh"
+runtime = "native"
+"#;
+
+#[test]
+fn env_values_in_axolotl_extra_get_their_types() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TRAINING}"))?;
+    let settings = load(
+        dir.path(),
+        env(&[
+            (
+                "OVERBRAINER_TRAINING__AXOLOTL_EXTRA__GRADIENT_CHECKPOINTING",
+                "true",
+            ),
+            ("OVERBRAINER_TRAINING__AXOLOTL_EXTRA__WARMUP_STEPS", "10"),
+            ("OVERBRAINER_TRAINING__AXOLOTL_EXTRA__WEIGHT_DECAY", "0.01"),
+            (
+                "OVERBRAINER_TRAINING__AXOLOTL_EXTRA__ATTN_IMPLEMENTATION",
+                "sdpa",
+            ),
+            (
+                "OVERBRAINER_TRAINING__AXOLOTL_EXTRA__SPECIAL_TOKENS__EOS_TOKEN",
+                "<|im_end|>",
+            ),
+        ]),
+    )?;
+    let extra = &settings.training.ok_or("training missing")?.axolotl_extra;
+    assert_eq!(
+        serde_json::to_value(extra)?,
+        serde_json::json!({
+            "attn_implementation": "sdpa",
+            "chat_template": "qwen3",
+            "gradient_checkpointing": true,
+            "revision": "0123",
+            "special_tokens": {"eos_token": "<|im_end|>", "pad_token": "<|endoftext|>"},
+            "warmup_steps": 10,
+            "weight_decay": 0.01
+        })
+    );
+    Ok(())
+}
