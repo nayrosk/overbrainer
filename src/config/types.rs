@@ -95,8 +95,20 @@ pub struct Roles {
     pub embedder: Option<RoleModel>,
 }
 
+impl Roles {
+    /// Every configured role with its name: `generator`, `parent`, then `embedder` when set.
+    #[must_use]
+    pub fn all(&self) -> Vec<(&'static str, &RoleModel)> {
+        let mut roles = vec![("generator", &self.generator), ("parent", &self.parent)];
+        if let Some(embedder) = &self.embedder {
+            roles.push(("embedder", embedder));
+        }
+        roles
+    }
+}
+
 /// A provider and model pair assigned to a pipeline role.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleModel {
     /// Name of the provider that serves this model.
@@ -106,6 +118,41 @@ pub struct RoleModel {
     /// Whether to request reasoning output from the model.
     #[serde(default)]
     pub reasoning: bool,
+    /// Upper bound on generated tokens per request, reasoning included. Must be at least 1.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    /// Sampling temperature in [0, 2]. The provider default applies when unset.
+    pub temperature: Option<f64>,
+    /// Reasoning effort. Only valid with `reasoning = true`.
+    pub reasoning_effort: Option<Effort>,
+}
+
+fn default_max_tokens() -> u32 {
+    16_384
+}
+
+/// Reasoning effort requested from a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    /// Short reasoning.
+    Low,
+    /// Balanced reasoning. Sent to `openai` providers when no effort is configured.
+    Medium,
+    /// Long reasoning.
+    High,
+}
+
+impl Effort {
+    /// The wire value: `low`, `medium` or `high`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 /// Tunables that control question generation and answer collection.
@@ -124,6 +171,13 @@ pub struct Pipeline {
     pub seed: u64,
     /// Whether to include the system prompt when collecting answers.
     pub include_system_prompt: bool,
+    /// Cosine similarity above which two questions are duplicates when `roles.embedder`
+    /// is set. Must be in (0, 1].
+    pub embedding_threshold: f64,
+    /// Number of questions requested per generation call. Must be at least 1.
+    pub question_batch_size: u32,
+    /// Timeout of one LLM request, in seconds. Must be at least 1.
+    pub request_timeout_secs: u64,
 }
 
 impl Default for Pipeline {
@@ -135,6 +189,9 @@ impl Default for Pipeline {
             eval_ratio: 0.1,
             seed: 42,
             include_system_prompt: false,
+            embedding_threshold: 0.9,
+            question_batch_size: 10,
+            request_timeout_secs: 600,
         }
     }
 }

@@ -16,6 +16,9 @@ protocol = "openai"
 [roles]
 generator = { provider = "openrouter", model = "qwen/qwen3-235b-a22b" }
 parent = { provider = "openrouter", model = "deepseek/deepseek-r1", reasoning = true }
+# Optional on every role: max_tokens (default 16384), temperature (0 to 2),
+# reasoning_effort ("low", "medium" or "high", only with reasoning = true).
+# embedder = { provider = "openrouter", model = "openai/text-embedding-3-small" }
 
 [pipeline]
 concurrency = 8
@@ -24,6 +27,9 @@ dedup_threshold = 0.8
 eval_ratio = 0.1
 seed = 42
 include_system_prompt = false
+# embedding_threshold = 0.9     # used only when roles.embedder is set
+# question_batch_size = 10
+# request_timeout_secs = 600
 
 [training]
 target = "local"

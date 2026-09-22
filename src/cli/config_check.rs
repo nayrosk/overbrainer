@@ -80,18 +80,11 @@ fn describe(settings: &Settings) -> Vec<String> {
             masked(provider.api_key.as_ref())
         ));
     }
-    let roles = [
-        ("generator", Some(&settings.roles.generator)),
-        ("parent", Some(&settings.roles.parent)),
-        ("embedder", settings.roles.embedder.as_ref()),
-    ];
-    for (role, model) in roles {
-        if let Some(model) = model {
-            lines.push(format!(
-                "roles.{role} = {}/{} (reasoning: {})",
-                model.provider, model.model, model.reasoning
-            ));
-        }
+    for (role, model) in settings.roles.all() {
+        lines.push(format!(
+            "roles.{role} = {}/{} (reasoning: {}, max_tokens: {})",
+            model.provider, model.model, model.reasoning, model.max_tokens
+        ));
     }
     lines.push(format!("pipeline = {:?}", settings.pipeline));
     if let Some(training) = &settings.training {

@@ -1,4 +1,4 @@
-use super::types::{Runtime, Settings, Target};
+use super::types::{Protocol, Runtime, Settings, Target};
 
 /// Returns true when `name` matches `^[a-z0-9_]+$`.
 pub(crate) fn is_valid_name(name: &str) -> bool {
@@ -13,6 +13,7 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
     let mut problems = Vec::new();
     check_names(settings, &mut problems);
     check_roles(settings, &mut problems);
+    check_role_params(settings, &mut problems);
     check_topics(settings, &mut problems);
     check_pipeline(settings, &mut problems);
     check_training(settings, &mut problems);
@@ -34,20 +35,43 @@ fn check_names(settings: &Settings, problems: &mut Vec<String>) {
     }
 }
 
-/// Every role must reference a declared provider.
+/// Every role must reference a declared provider; the embedder needs embeddings.
 fn check_roles(settings: &Settings, problems: &mut Vec<String>) {
-    let roles = [
-        ("generator", Some(&settings.roles.generator)),
-        ("parent", Some(&settings.roles.parent)),
-        ("embedder", settings.roles.embedder.as_ref()),
-    ];
-    for (role, model) in roles {
-        if let Some(model) = model
-            && !settings.providers.contains_key(&model.provider)
-        {
+    for (role, model) in settings.roles.all() {
+        if !settings.providers.contains_key(&model.provider) {
             problems.push(format!(
                 "roles.{role}: unknown provider `{}`",
                 model.provider
+            ));
+        }
+    }
+    if let Some(embedder) = &settings.roles.embedder
+        && settings
+            .providers
+            .get(&embedder.provider)
+            .is_some_and(|provider| provider.protocol == Protocol::Anthropic)
+    {
+        problems.push(
+            "roles.embedder: the anthropic protocol has no embeddings, use an openai provider"
+                .to_string(),
+        );
+    }
+}
+
+/// Per-role request parameters are within range.
+fn check_role_params(settings: &Settings, problems: &mut Vec<String>) {
+    for (role, model) in settings.roles.all() {
+        if model.max_tokens == 0 {
+            problems.push(format!("roles.{role}.max_tokens: must be at least 1"));
+        }
+        if let Some(temperature) = model.temperature
+            && !(0.0..=2.0).contains(&temperature)
+        {
+            problems.push(format!("roles.{role}.temperature: must be in [0, 2]"));
+        }
+        if model.reasoning_effort.is_some() && !model.reasoning {
+            problems.push(format!(
+                "roles.{role}.reasoning_effort: requires reasoning = true"
             ));
         }
     }
@@ -86,6 +110,15 @@ fn check_pipeline(settings: &Settings, problems: &mut Vec<String>) {
     }
     if !(pipeline.dedup_threshold > 0.0 && pipeline.dedup_threshold <= 1.0) {
         problems.push("pipeline.dedup_threshold: must be in (0, 1]".to_string());
+    }
+    if !(pipeline.embedding_threshold > 0.0 && pipeline.embedding_threshold <= 1.0) {
+        problems.push("pipeline.embedding_threshold: must be in (0, 1]".to_string());
+    }
+    if pipeline.question_batch_size == 0 {
+        problems.push("pipeline.question_batch_size: must be at least 1".to_string());
+    }
+    if pipeline.request_timeout_secs == 0 {
+        problems.push("pipeline.request_timeout_secs: must be at least 1".to_string());
     }
 }
 
@@ -267,6 +300,69 @@ mod tests {
         assert!(problems.contains(&"pipeline.concurrency: must be at least 1".to_string()));
         assert!(problems.contains(&"pipeline.eval_ratio: must be in (0, 1)".to_string()));
         assert!(problems.contains(&"pipeline.dedup_threshold: must be in (0, 1]".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn role_parameters_are_checked() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            r#"{ provider = "nanogpt", model = "m1" }"#,
+            r#"{ provider = "nanogpt", model = "m1", max_tokens = 0, temperature = 2.5, reasoning_effort = "high" }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec![
+                "roles.generator.max_tokens: must be at least 1".to_string(),
+                "roles.generator.temperature: must be in [0, 2]".to_string(),
+                "roles.generator.reasoning_effort: requires reasoning = true".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn embedder_must_use_the_openai_protocol() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            "[roles]",
+            "[providers.claude]\nprotocol = \"anthropic\"\n[roles]\nembedder = { provider = \"claude\", model = \"e\" }",
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec![
+                "roles.embedder: the anthropic protocol has no embeddings, use an openai provider"
+                    .to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn role_parameters_have_defaults() -> Result<(), config::ConfigError> {
+        let settings = settings(VALID)?;
+        assert_eq!(settings.roles.parent.max_tokens, 16_384);
+        assert_eq!(settings.roles.parent.temperature, None);
+        assert_eq!(settings.roles.parent.reasoning_effort, None);
+        assert_eq!(settings.pipeline.question_batch_size, 10);
+        assert_eq!(settings.pipeline.request_timeout_secs, 600);
+        Ok(())
+    }
+
+    #[test]
+    fn new_pipeline_fields_are_checked() -> Result<(), config::ConfigError> {
+        let toml = format!(
+            "{VALID}\n[pipeline]\nembedding_threshold = 1.5\nquestion_batch_size = 0\nrequest_timeout_secs = 0\n"
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec![
+                "pipeline.embedding_threshold: must be in (0, 1]".to_string(),
+                "pipeline.question_batch_size: must be at least 1".to_string(),
+                "pipeline.request_timeout_secs: must be at least 1".to_string(),
+            ]
+        );
         Ok(())
     }
 
