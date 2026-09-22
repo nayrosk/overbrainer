@@ -1,5 +1,7 @@
 //! Model prices read from the provider's `/models` listing, when it exposes them.
 
+use std::time::Duration;
+
 use serde_json::Value;
 
 use crate::llm::{LlmError, ProtocolClient, Usage};
@@ -61,13 +63,24 @@ pub fn find_price(models: &Value, model: &str) -> Option<Price> {
     })
 }
 
-/// Fetches the price of `model` from `client`'s provider. Never fails: an unreachable
-/// listing or an unknown shape only means the cost is not shown.
-pub async fn fetch_price(client: &ProtocolClient, model: &str) -> Option<Price> {
-    match client.models().await {
-        Ok(models) => find_price(&models, model).or_else(|| unlisted(model)),
-        Err(error) => unavailable(&error),
+/// Longest wait for a provider's model listing before costs are shown as unknown.
+pub const LISTING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Reads the model listing of `client`'s provider, giving up after `cap` (the CLI
+/// uses [`LISTING_TIMEOUT`]). Never fails: an unreachable, failing or slow listing
+/// only means costs are not shown, which is logged.
+pub async fn fetch_listing(client: &ProtocolClient, cap: Duration) -> Option<Value> {
+    match tokio::time::timeout(cap, client.models()).await {
+        Ok(Ok(models)) => Some(models),
+        Ok(Err(error)) => unavailable(&error),
+        Err(_) => too_slow(cap),
     }
+}
+
+/// Price of `model` in a listing read by [`fetch_listing`], logging when it has none.
+#[must_use]
+pub fn listed_price(listing: &Value, model: &str) -> Option<Price> {
+    find_price(listing, model).or_else(|| unlisted(model))
 }
 
 fn unlisted(model: &str) -> Option<Price> {
@@ -75,8 +88,16 @@ fn unlisted(model: &str) -> Option<Price> {
     None
 }
 
-fn unavailable(error: &LlmError) -> Option<Price> {
+fn unavailable(error: &LlmError) -> Option<Value> {
     tracing::warn!("cannot read model prices ({error}); showing tokens only");
+    None
+}
+
+fn too_slow(cap: Duration) -> Option<Value> {
+    tracing::warn!(
+        "model prices not received within {}s; showing tokens only",
+        cap.as_secs()
+    );
     None
 }
 

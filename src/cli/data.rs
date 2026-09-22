@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde_json::Value;
@@ -14,14 +13,11 @@ use crate::config::{EnvSource, RoleModel, Settings};
 use crate::dataset::{DataFiles, Subtopic, read};
 use crate::dedup::{Embedding, Layered, Lexical};
 use crate::events::{EventBus, Stage, StageStats};
-use crate::llm::{LlmError, ProtocolClient, connect};
+use crate::llm::{ProtocolClient, connect};
 use crate::pipeline::{self, Ctx, PipelineError, RoleClient, SplitReport};
-use crate::pricing::{Price, find_price};
+use crate::pricing::{LISTING_TIMEOUT, Price, fetch_listing, listed_price};
 use crate::prompts::Prompts;
 use crate::secrets::Resolver;
-
-/// Longest wait for a provider's model listing before costs are shown as unknown.
-const PRICE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Which pipeline command to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,39 +121,12 @@ impl Session {
     async fn price(&self, role: &RoleModel, client: &ProtocolClient) -> Option<Price> {
         let mut listings = self.listings.lock().await;
         if !listings.contains_key(&role.provider) {
-            let listing = list_models(client, PRICE_TIMEOUT).await;
+            let listing = fetch_listing(client, LISTING_TIMEOUT).await;
             listings.insert(role.provider.clone(), listing);
         }
         let listing = listings.get(&role.provider)?.as_ref()?;
-        find_price(listing, &role.model).or_else(|| unlisted(&role.model))
+        listed_price(listing, &role.model)
     }
-}
-
-/// The provider's model listing, or `None` when it fails or takes longer than `cap`.
-async fn list_models(client: &ProtocolClient, cap: Duration) -> Option<Value> {
-    match tokio::time::timeout(cap, client.models()).await {
-        Ok(Ok(models)) => Some(models),
-        Ok(Err(error)) => unavailable(&error),
-        Err(_) => too_slow(cap),
-    }
-}
-
-fn unlisted(model: &str) -> Option<Price> {
-    tracing::info!("no price listed for model {model}; showing tokens only");
-    None
-}
-
-fn unavailable(error: &LlmError) -> Option<Value> {
-    tracing::warn!("cannot read model prices ({error}); showing tokens only");
-    None
-}
-
-fn too_slow(cap: Duration) -> Option<Value> {
-    tracing::warn!(
-        "model prices not received within {}s; showing tokens only",
-        cap.as_secs()
-    );
-    None
 }
 
 /// Runs `command` in `project_dir`, logging progress to stderr and printing a usage
@@ -328,54 +297,9 @@ pub fn split_summary(report: &SplitReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
     use super::*;
-    use crate::config::Protocol;
     use crate::dataset::Exclusion;
     use crate::llm::Usage;
-
-    async fn listing_server(delay: Duration) -> Result<(MockServer, ProtocolClient), LlmError> {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"data": []}))
-                    .set_delay(delay),
-            )
-            .mount(&server)
-            .await;
-        let client = ProtocolClient::new(
-            Protocol::Openai,
-            &format!("{}/v1", server.uri()),
-            None,
-            "m",
-            Duration::from_secs(30),
-        )?;
-        Ok((server, client))
-    }
-
-    #[tokio::test]
-    async fn a_slow_listing_gives_up_at_the_cap() -> Result<(), LlmError> {
-        let (_server, client) = listing_server(Duration::from_secs(5)).await?;
-        let started = std::time::Instant::now();
-        assert_eq!(list_models(&client, Duration::from_millis(50)).await, None);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_prompt_listing_is_returned() -> Result<(), LlmError> {
-        let (_server, client) = listing_server(Duration::ZERO).await?;
-        assert_eq!(
-            list_models(&client, Duration::from_secs(5)).await,
-            Some(json!({"data": []}))
-        );
-        Ok(())
-    }
 
     #[test]
     fn summary_shows_cost_only_when_known() {
