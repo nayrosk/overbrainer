@@ -401,3 +401,75 @@ fn cancelling_a_job_that_already_ended_asks_to_attach() -> TestResult {
         )));
     Ok(())
 }
+
+/// The `[training]` section written by [`project`].
+const TRAINING: &str =
+    "[training]\ntarget = \"here\"\nbase_model = \"Qwen/Qwen3-4B\"\nadapter = \"qlora\"\n";
+
+/// Rewrites the `overbrainer.toml` of `dir` with `edit`.
+fn edit_config(dir: &Path, edit: impl FnOnce(String) -> String) -> TestResult {
+    let path = dir.join("overbrainer.toml");
+    let config = fs::read_to_string(&path)?;
+    fs::write(&path, edit(config))?;
+    Ok(())
+}
+
+#[test]
+fn a_hub_model_id_without_a_token_warns_and_still_trains() -> TestResult {
+    let dir = project("ok")?;
+    edit_config(dir.path(), |config| {
+        config.replace(
+            "adapter = \"qlora\"\n",
+            "adapter = \"qlora\"\nhub_model_id = \"me/demo\"\n",
+        )
+    })?;
+    overbrainer(dir.path())?
+        .env_remove("OVERBRAINER_HF_TOKEN")
+        .arg("train")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail",
+        ))
+        .stdout(predicate::str::contains("succeeded; step 2/2"));
+    let run = only_run(dir.path())?;
+    assert_eq!(fs::read_to_string(run.join("job.log"))?, "");
+    Ok(())
+}
+
+#[test]
+fn cancel_explains_that_it_needs_the_training_section() -> TestResult {
+    let dir = project("slow")?;
+    let (run, output) = interrupt_train(dir.path(), &["running"], Duration::from_millis(100))?;
+    assert_detached(&run, &output)?;
+    let id = run_id(&run)?;
+    let config = fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+    edit_config(dir.path(), |config| {
+        assert!(config.contains(TRAINING));
+        config.replace(TRAINING, "")
+    })?;
+    overbrainer(dir.path())?
+        .args(["train", "cancel", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "cancel needs [training] to retrieve the run's artifacts",
+        ));
+    fs::write(dir.path().join("overbrainer.toml"), &config)?;
+    overbrainer(dir.path())?
+        .args(["train", "cancel", &id])
+        .assert()
+        .success()
+        .stdout(format!("train: run {id} cancelled\n"));
+
+    // The record is checked first: a run that ended needs no [training] to say so.
+    edit_config(dir.path(), |_| config.replace(TRAINING, ""))?;
+    overbrainer(dir.path())?
+        .args(["train", "cancel", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "run {id} already ended: cancelled"
+        )));
+    Ok(())
+}

@@ -31,7 +31,10 @@ const POLL: Duration = Duration::from_secs(2);
 /// run fails, or when it is interrupted (the job keeps running).
 pub async fn run(project_dir: &Path, args: &TrainArgs) -> anyhow::Result<()> {
     match &args.command {
-        None => train(project_dir, args.target.as_deref()).await,
+        None => {
+            let settings = crate::config::load(project_dir, EnvSource::Process)?;
+            train(project_dir, &settings, args.target.as_deref()).await
+        },
         Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id).await,
         Some(TrainCommand::Cancel { run_id }) => cancel_run(project_dir, run_id).await,
     }
@@ -48,16 +51,19 @@ pub async fn after_run(project_dir: &Path) -> anyhow::Result<()> {
         no_training();
         return Ok(());
     }
-    train(project_dir, None).await
+    train(project_dir, &settings, None).await
 }
 
 fn no_training() {
     tracing::info!("no [training] section in overbrainer.toml: run stops after split");
 }
 
-async fn train(project_dir: &Path, target: Option<&str>) -> anyhow::Result<()> {
-    let settings = crate::config::load(project_dir, EnvSource::Process)?;
-    let training = training(&settings)?;
+async fn train(
+    project_dir: &Path,
+    settings: &Settings,
+    target: Option<&str>,
+) -> anyhow::Result<()> {
+    let training = training(settings)?;
     let name = target.unwrap_or(&training.target);
     let target = settings
         .targets
@@ -67,7 +73,7 @@ async fn train(project_dir: &Path, target: Option<&str>) -> anyhow::Result<()> {
     if let Some(warning) = reasoning_template_warning(training) {
         warn(&warning);
     }
-    let secrets = secrets(&settings).await?;
+    let secrets = secrets(settings).await?;
     let executor = executor(project_dir, name, target).await?;
     let runs = Runs::new(project_dir);
     // Caught from before the run exists, so Ctrl-C never kills the process while
@@ -139,7 +145,6 @@ async fn attach(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
 
 async fn cancel_run(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
-    let training = training(&settings)?;
     let runs = Runs::new(project_dir);
     let record = runs.load(run_id)?;
     match record.state {
@@ -147,6 +152,10 @@ async fn cancel_run(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
         RunState::Preparing => bail!("run {run_id} has not started"),
         state => bail!("run {run_id} already ended: {}", state.name()),
     }
+    let training = settings.training.as_ref().context(
+        "cancel needs [training] to retrieve the run's artifacts: \
+         no [training] section in overbrainer.toml",
+    )?;
     let executor = run_executor(project_dir, &settings, &record).await?;
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let (record, status) = cancel(&runs, &executor, &trainer, record).await?;
@@ -399,10 +408,11 @@ mod tests {
     use super::*;
 
     /// Sends SIGINT to this process, as Ctrl-C does.
-    fn ctrl_c() -> io::Result<()> {
-        let status = std::process::Command::new("kill")
+    async fn ctrl_c() -> io::Result<()> {
+        let status = tokio::process::Command::new("kill")
             .args(["-INT", &std::process::id().to_string()])
-            .status()?;
+            .status()
+            .await?;
         if status.success() {
             Ok(())
         } else {
@@ -419,7 +429,7 @@ mod tests {
         // Ctrl-C arrives while the flow waits: it still ends, and Ctrl-C is noted.
         let mut received = signal(SignalKind::interrupt())?;
         let shielded = async {
-            ctrl_c()?;
+            ctrl_c().await?;
             received.recv().await;
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok::<_, io::Error>("ended")
@@ -432,7 +442,7 @@ mod tests {
 
         let mut interrupt = Interrupt::catch();
         let raced = async {
-            ctrl_c()?;
+            ctrl_c().await?;
             std::future::pending::<()>().await;
             Ok::<_, io::Error>(())
         };
