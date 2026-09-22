@@ -58,11 +58,43 @@ impl<'a, E: Executor> LineStream<'a, E> {
     ///
     /// Returns an [`ExecError`] when the file cannot be read.
     pub async fn read(&mut self) -> Result<Vec<String>, ExecError> {
+        self.read_with_limit(MAX_TAIL_READ).await
+    }
+
+    /// Implements [`Self::read`], reading at most `limit` bytes. Split out so tests
+    /// can exercise the cap with a small `limit`, without allocating a multi
+    /// megabyte buffer.
+    ///
+    /// When the read returns exactly `limit` bytes with no terminator anywhere in
+    /// them, more data almost certainly remains past what was fetched: waiting for
+    /// a terminator would never advance the offset, so this instead cuts the chunk
+    /// into a line at its last complete UTF-8 character, keeping any trailing
+    /// partial character for the next read.
+    async fn read_with_limit(&mut self, limit: u64) -> Result<Vec<String>, ExecError> {
         let bytes = self
             .executor
-            .read_from(&self.path, self.offset, MAX_TAIL_READ)
+            .read_from(&self.path, self.offset, limit)
             .await?;
         let (lines, offset) = complete_lines(&bytes, self.offset);
+        if !lines.is_empty() || offset != self.offset {
+            self.offset = offset;
+            return Ok(lines);
+        }
+        let capped = u64::try_from(bytes.len()).unwrap_or(u64::MAX) >= limit;
+        if capped && !bytes.is_empty() {
+            let cut = match std::str::from_utf8(&bytes) {
+                Ok(_) => bytes.len(),
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid > 0 { valid } else { bytes.len() }
+                },
+            };
+            let line = String::from_utf8_lossy(&bytes[..cut]).into_owned();
+            self.offset = self
+                .offset
+                .saturating_add(u64::try_from(cut).unwrap_or(u64::MAX));
+            return Ok(vec![line]);
+        }
         self.offset = offset;
         Ok(lines)
     }
@@ -135,7 +167,8 @@ mod tests {
         ) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
             self.last_limit.store(limit, Ordering::SeqCst);
             let start = usize::try_from(offset).unwrap_or(self.content.len());
-            let bytes = self.content.get(start..).unwrap_or_default().to_vec();
+            let mut bytes = self.content.get(start..).unwrap_or_default().to_vec();
+            bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
             std::future::ready(Ok(bytes))
         }
 
@@ -170,6 +203,45 @@ mod tests {
         let mut stream = LineStream::new(&executor, "job.log", 0);
         stream.read().await?;
         assert_eq!(executor.last_limit.load(Ordering::SeqCst), MAX_TAIL_READ);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_never_livelocks_on_a_line_that_fills_the_whole_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let executor = RecordingExecutor {
+            content: b"0123456789abcdef".to_vec(),
+            last_limit: AtomicU64::new(0),
+        };
+        let mut stream = LineStream::new(&executor, "job.log", 0);
+
+        let first = stream.read_with_limit(8).await?;
+        assert_eq!(first, vec!["01234567".to_string()]);
+        assert_eq!(stream.offset(), 8);
+
+        let second = stream.read_with_limit(8).await?;
+        assert_eq!(second, vec!["89abcdef".to_string()]);
+        assert_eq!(stream.offset(), 16);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_cuts_a_capped_chunk_at_a_utf8_boundary() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut content = b"ab".to_vec();
+        content.extend_from_slice("\u{20ac}".as_bytes());
+        content.extend_from_slice(b"cd");
+        let executor = RecordingExecutor {
+            content,
+            last_limit: AtomicU64::new(0),
+        };
+        let mut stream = LineStream::new(&executor, "job.log", 0);
+
+        // Caps at 4 bytes: "ab" (2 bytes) plus the first two of the three bytes
+        // that encode the euro sign, cutting mid character.
+        let first = stream.read_with_limit(4).await?;
+        assert_eq!(first, vec!["ab".to_string()]);
+        assert_eq!(stream.offset(), 2);
         Ok(())
     }
 }

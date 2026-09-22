@@ -27,7 +27,13 @@ pub const JOB_LOG: &str = "job.log";
 pub const PID_FILE: &str = "job.pid";
 /// Exit code of the job once it has ended, in its run directory.
 pub const EXIT_FILE: &str = "exit_code";
-/// Marker written by [`Executor::cancel`], in the run directory.
+/// Marker written by [`Executor::cancel`] before it signals anything, in the run
+/// directory. Once this exists, [`Executor::status`] reports [`JobStatus::Running`]
+/// for as long as the process group is alive and [`JobStatus::Cancelled`] once it is
+/// gone, even before [`CANCEL_FILE`] itself is written.
+pub const CANCELLING_FILE: &str = "cancelling";
+/// Marker written by [`Executor::cancel`] once the process group is confirmed gone,
+/// in the run directory.
 pub const CANCEL_FILE: &str = "cancelled";
 
 /// Errors from running or reaching a job.
@@ -210,8 +216,15 @@ pub trait Executor: Send + Sync {
     /// Returns an [`ExecError`] when the target cannot be asked.
     fn status(&self, job: &JobId) -> impl Future<Output = Result<JobStatus, ExecError>> + Send;
 
-    /// Stops `job`: its container first, then its whole process group (`SIGTERM`, then
-    /// `SIGKILL` after 10 seconds). Its status becomes [`JobStatus::Cancelled`].
+    /// Stops `job`: its container first, then its whole process group (`SIGTERM`,
+    /// then `SIGKILL` after 10 seconds). A job that has already exited is left as
+    /// is: its status stays [`JobStatus::Exited`], it is never marked cancelled.
+    /// Otherwise, [`CANCELLING_FILE`] is written before anything is signalled, so
+    /// [`Executor::status`] reports [`JobStatus::Running`] while the group is being
+    /// stopped and [`JobStatus::Cancelled`] as soon as it is gone, never
+    /// [`JobStatus::Lost`]; [`CANCEL_FILE`] is written last, once the group is
+    /// confirmed gone. Calling `cancel` again on an already cancelled job is a
+    /// no-op.
     ///
     /// # Errors
     ///

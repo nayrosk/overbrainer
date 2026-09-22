@@ -1,6 +1,6 @@
 //! POSIX shell snippets shared by the executors. They run with `sh` on the target.
 
-use super::{CANCEL_FILE, Container, EXIT_FILE, JobStatus, PID_FILE};
+use super::{CANCEL_FILE, CANCELLING_FILE, Container, EXIT_FILE, JobStatus, PID_FILE};
 
 /// `text` as one single-quoted shell word.
 #[must_use]
@@ -23,16 +23,22 @@ pub fn job_script(script: &str) -> String {
 /// Prints one word describing the job in `dir` with session leader `pid`:
 /// `cancelled`, `exited <code>`, `running` or `lost`. Checks the whole process
 /// group, not only its leader, so a job whose leader has exited but whose children
-/// linger is still `running`. Exits `1` without printing or signalling anything when
-/// `pid` is `0` or `1`.
+/// linger is still `running`. Once a cancel has started or finished
+/// ([`CANCELLING_FILE`] or [`CANCEL_FILE`] exists), reports `running` for as long as
+/// the process group is still alive and `cancelled` as soon as it is gone, even
+/// before [`CANCEL_FILE`] itself is written: this closes the window between the
+/// group dying and that marker landing, during which the job would otherwise read as
+/// `lost`. Exits `1` without printing or signalling anything when `pid` is `0` or
+/// `1`.
 #[must_use]
 pub fn status_script(dir: &str, pid: u32) -> String {
     format!(
         "cd -- {dir} 2>/dev/null || {{ echo lost; exit 0; }}\n\
          pid={pid}\n\
          [ \"$pid\" -gt 1 ] || exit 1\n\
-         if [ -f {CANCEL_FILE} ]; then echo cancelled\n\
-         elif [ -f {EXIT_FILE} ]; then echo \"exited $(cat {EXIT_FILE})\"\n\
+         if [ -f {EXIT_FILE} ]; then echo \"exited $(cat {EXIT_FILE})\"\n\
+         elif [ -f {CANCELLING_FILE} ] || [ -f {CANCEL_FILE} ]; then\n\
+         if kill -s 0 -\"$pid\" 2>/dev/null; then echo running; else echo cancelled; fi\n\
          elif kill -s 0 -\"$pid\" 2>/dev/null; then echo running\n\
          else echo lost; fi\n",
         dir = quote(dir)
@@ -55,14 +61,17 @@ pub fn parse_status(output: &str) -> Option<JobStatus> {
 }
 
 /// Marks the job in `dir` as cancelled, stops its container, then its process group:
-/// `SIGTERM`, and `SIGKILL` if the group is still alive 10 seconds later. The
-/// `cancelled` marker is written only once the group is confirmed gone, so `status`
-/// keeps reporting `running` while a cancel is in progress, and a repeated cancel is
-/// a no-op. Does nothing but exit `0`, without signalling anything, when the job
-/// already has an exit code or is already marked cancelled: a finished job keeps its
-/// real result, and a cancel is never sent to a process group whose ID may since have
-/// been recycled by the system. Exits `1` without signalling anything when `pid` is
-/// `0` or `1`, or when the job directory is gone.
+/// `SIGTERM`, and `SIGKILL` if the group is still alive 10 seconds later.
+/// [`CANCELLING_FILE`] is written, atomically, before anything is signalled;
+/// [`CANCEL_FILE`] is written only once the group is confirmed gone. Together with
+/// [`status_script`] checking [`CANCELLING_FILE`], this keeps `status` reporting
+/// `running` while a cancel is in progress and `cancelled` as soon as the group
+/// dies, never `lost`, and makes a repeated cancel a no-op. Does nothing but exit
+/// `0`, without signalling anything, when the job already has an exit code or is
+/// already marked cancelled: a finished job keeps its real result, and a cancel is
+/// never sent to a process group whose ID may since have been recycled by the
+/// system. Exits `1` without signalling anything when `pid` is `0` or `1`, or when
+/// the job directory is gone.
 #[must_use]
 pub fn cancel_script(dir: &str, pid: u32, container: Option<&Container>) -> String {
     let stop = container.map_or_else(String::new, |container| {
@@ -77,6 +86,7 @@ pub fn cancel_script(dir: &str, pid: u32, container: Option<&Container>) -> Stri
          pid={pid}\n\
          [ \"$pid\" -gt 1 ] || exit 1\n\
          if [ -f {EXIT_FILE} ] || [ -f {CANCEL_FILE} ]; then exit 0; fi\n\
+         : > {CANCELLING_FILE}.tmp && mv -f {CANCELLING_FILE}.tmp {CANCELLING_FILE}\n\
          {stop}\
          kill -s TERM -\"$pid\" 2>/dev/null\n\
          i=0\n\
@@ -396,12 +406,18 @@ mod tests {
     }
 
     #[test]
-    fn cancel_kills_the_process_group_and_marks_cancelled_after_it_is_gone() -> TestResult {
+    fn cancel_kills_the_process_group_before_the_cancelled_marker_appears() -> TestResult {
         if !sh_available() {
             eprintln!("skipped: sh is not installed");
             return Ok(());
         }
-        let child = Command::new("sleep").arg("5").process_group(0).spawn()?;
+        // Ignores SIGTERM, so death is driven by the unconditional SIGKILL at the
+        // end of the grace period: this makes the group's death deterministic
+        // rather than depending on how fast an ordinary process reacts to SIGTERM.
+        let child = Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 30"])
+            .process_group(0)
+            .spawn()?;
         let pid = child.id();
         let reaper = std::thread::spawn(move || {
             let mut child = child;
@@ -409,24 +425,127 @@ mod tests {
         });
 
         let dir = tempdir()?;
-        let script = cancel_script(&dir.path().display().to_string(), pid, None);
-        let output = Command::new("sh").arg("-c").arg(&script).output()?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(dir.path().join(CANCEL_FILE).exists());
+        let cancel_dir = dir.path().display().to_string();
+        let canceller = std::thread::spawn(move || {
+            Command::new("sh")
+                .arg("-c")
+                .arg(cancel_script(&cancel_dir, pid, None))
+                .output()
+        });
 
-        let _status = reaper.join().map_err(|_| "reaper thread panicked")??;
-        let still_alive = Command::new("sh")
-            .arg("-c")
-            .arg(format!("kill -s 0 -{pid} 2>/dev/null"))
-            .status()?;
+        // Poll the group's liveness and the marker's existence side by side, and
+        // record which this process observes first. Both are external observations
+        // of the same script (a different process), so this cannot prove they
+        // happen in the same instant the script sees them, but it does prove this
+        // process never observes the marker before the group is already gone.
+        let marker_path = dir.path().join(CANCEL_FILE);
+        let mut group_dead_at = None;
+        let mut marker_seen_at = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while group_dead_at.is_none() || marker_seen_at.is_none() {
+            if std::time::Instant::now() > deadline {
+                return Err(
+                    "timed out waiting for the group to die and the marker to appear".into(),
+                );
+            }
+            if group_dead_at.is_none() {
+                let alive = Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("kill -s 0 -{pid} 2>/dev/null"))
+                    .status()?
+                    .success();
+                if !alive {
+                    group_dead_at = Some(std::time::Instant::now());
+                }
+            }
+            if marker_seen_at.is_none() && marker_path.exists() {
+                marker_seen_at = Some(std::time::Instant::now());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let cancel_output = canceller
+            .join()
+            .map_err(|_| "canceller thread panicked")??;
         assert!(
-            !still_alive.success(),
-            "the process group must be gone once cancelled is written"
+            cancel_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cancel_output.stderr)
         );
+        reaper.join().map_err(|_| "reaper thread panicked")??;
+
+        let (Some(group_dead_at), Some(marker_seen_at)) = (group_dead_at, marker_seen_at) else {
+            return Err("both the group's death and the marker must have been observed".into());
+        };
+        assert!(
+            group_dead_at <= marker_seen_at,
+            "the process group must be observed gone no later than the cancelled marker"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_never_reports_lost_during_a_normal_cancel() -> TestResult {
+        if !sh_available() {
+            eprintln!("skipped: sh is not installed");
+            return Ok(());
+        }
+        // Obeys SIGTERM (the default action), so the group can die well within the
+        // grace period: this is the race window finding 1 fixes. After the group
+        // dies but before the final `cancelled` marker lands, a fast poller must
+        // read `cancelled` (thanks to the `cancelling` marker written up front),
+        // never `lost`.
+        let child = Command::new("sleep").arg("10").process_group(0).spawn()?;
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || {
+            let mut child = child;
+            child.wait()
+        });
+
+        let dir = tempdir()?;
+        let cancel_dir = dir.path().display().to_string();
+        let canceller = std::thread::spawn(move || {
+            Command::new("sh")
+                .arg("-c")
+                .arg(cancel_script(&cancel_dir, pid, None))
+                .output()
+        });
+
+        let status_dir = dir.path().display().to_string();
+        let mut saw_cancelled = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if std::time::Instant::now() > deadline {
+                return Err("timed out waiting for the cancel to finish".into());
+            }
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(status_script(&status_dir, pid))
+                .output()?;
+            let status = parse_status(&String::from_utf8_lossy(&output.stdout));
+            assert_ne!(
+                status,
+                Some(JobStatus::Lost),
+                "status must never read lost while a cancel is in progress"
+            );
+            if status == Some(JobStatus::Cancelled) {
+                saw_cancelled = true;
+            }
+            if canceller.is_finished() && saw_cancelled {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let cancel_output = canceller
+            .join()
+            .map_err(|_| "canceller thread panicked")??;
+        assert!(
+            cancel_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cancel_output.stderr)
+        );
+        reaper.join().map_err(|_| "reaper thread panicked")??;
         Ok(())
     }
 }
