@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 
 use config::{Config, Environment, File, FileFormat};
@@ -10,6 +8,16 @@ use super::{Settings, validate};
 pub const CONFIG_FILE: &str = "overbrainer.toml";
 /// Prefix required on every environment variable read into the configuration.
 pub const ENV_PREFIX: &str = "OVERBRAINER";
+
+/// Where [`load`] reads `OVERBRAINER_*` environment variable overrides from.
+#[derive(Debug, Clone)]
+pub enum EnvSource {
+    /// Read from the current process environment. This is what a running binary uses.
+    Process,
+    /// Use these key-value pairs instead of the process environment. Tests use this
+    /// to inject environment variables without calling `std::env::set_var`.
+    Vars(Vec<(String, String)>),
+}
 
 /// Everything that can go wrong while loading configuration.
 #[derive(Debug, thiserror::Error)]
@@ -39,9 +47,8 @@ impl From<config::ConfigError> for ConfigError {
 
 /// Loads `<project_dir>/overbrainer.toml` layered with `OVERBRAINER_*` variables.
 ///
-/// `env: None` reads the process environment; tests pass an explicit map. The hasher
-/// is generic so callers are not forced into the default one; it is converted to
-/// `config`'s own map type internally.
+/// `env: EnvSource::Process` reads the process environment; tests pass
+/// `EnvSource::Vars` with an explicit list of key-value pairs.
 ///
 /// # Errors
 ///
@@ -49,16 +56,16 @@ impl From<config::ConfigError> for ConfigError {
 /// when the file or environment cannot be parsed into [`Settings`], and
 /// [`ConfigError::Invalid`] when the parsed settings fail semantic validation or
 /// when an env-only key is set in the file.
-pub fn load<S: BuildHasher>(
-    project_dir: &Path,
-    env: Option<HashMap<String, String, S>>,
-) -> Result<Settings, ConfigError> {
+pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError> {
     let path = project_dir.join(CONFIG_FILE);
     let content = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
         path: path.clone(),
         source,
     })?;
-    let env: Option<config::Map<String, String>> = env.map(|map| map.into_iter().collect());
+    let env: Option<config::Map<String, String>> = match env {
+        EnvSource::Process => None,
+        EnvSource::Vars(pairs) => Some(pairs.into_iter().collect()),
+    };
 
     let file_only = Config::builder()
         .add_source(File::from_str(&content, FileFormat::Toml))

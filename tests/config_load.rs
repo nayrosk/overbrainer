@@ -1,7 +1,6 @@
-use std::collections::HashMap;
 use std::fs;
 
-use overbrainer::config::{ConfigError, load};
+use overbrainer::config::{ConfigError, EnvSource, load};
 use secrecy::ExposeSecret;
 
 const BASE: &str = r#"
@@ -22,11 +21,13 @@ fn project(toml: &str) -> Result<tempfile::TempDir, std::io::Error> {
     Ok(dir)
 }
 
-fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect()
+fn env(pairs: &[(&str, &str)]) -> EnvSource {
+    EnvSource::Vars(
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+    )
 }
 
 #[test]
@@ -34,7 +35,7 @@ fn env_overrides_file_values() -> Result<(), Box<dyn std::error::Error>> {
     let dir = project(BASE)?;
     let settings = load(
         dir.path(),
-        Some(env(&[("OVERBRAINER_PIPELINE__CONCURRENCY", "16")])),
+        env(&[("OVERBRAINER_PIPELINE__CONCURRENCY", "16")]),
     )?;
     assert_eq!(settings.pipeline.concurrency, 16);
     Ok(())
@@ -45,13 +46,13 @@ fn secrets_from_env_keep_their_exact_text() -> Result<(), Box<dyn std::error::Er
     let dir = project(BASE)?;
     let settings = load(
         dir.path(),
-        Some(env(&[
+        env(&[
             ("OVERBRAINER_PROVIDERS__NANOGPT__API_KEY", "0123"),
             (
                 "OVERBRAINER_PROVIDERS__NANOGPT__BASE_URL",
                 "https://nano-gpt.com/api/v1",
             ),
-        ])),
+        ]),
     )?;
     let provider = settings
         .providers
@@ -76,7 +77,7 @@ fn env_only_keys_in_file_are_rejected() -> Result<(), Box<dyn std::error::Error>
             "protocol = \"openai\"\napi_key = \"sk-leak\"\nbase_url = \"https://x\"",
         );
     let dir = project(&toml)?;
-    match load(dir.path(), Some(env(&[]))) {
+    match load(dir.path(), env(&[])) {
         Err(ConfigError::Invalid(problems)) => {
             assert!(
                 problems.contains(
@@ -108,7 +109,7 @@ fn env_only_keys_in_file_are_rejected() -> Result<(), Box<dyn std::error::Error>
 fn unknown_env_variable_with_prefix_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let dir = project(BASE)?;
     assert!(matches!(
-        load(dir.path(), Some(env(&[("OVERBRAINER_TYPO", "1")]))),
+        load(dir.path(), env(&[("OVERBRAINER_TYPO", "1")])),
         Err(ConfigError::Parse(_))
     ));
     Ok(())
@@ -117,11 +118,22 @@ fn unknown_env_variable_with_prefix_is_rejected() -> Result<(), Box<dyn std::err
 #[test]
 fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
-    match load(dir.path(), Some(env(&[]))) {
+    match load(dir.path(), env(&[])) {
         Err(ConfigError::Read { path, .. }) => {
             assert!(path.ends_with("overbrainer.toml"));
             Ok(())
         }
         other => Err(format!("expected Read, got {other:?}").into()),
     }
+}
+
+#[test]
+fn process_env_source_is_accepted() -> Result<(), Box<dyn std::error::Error>> {
+    // Exercises the `EnvSource::Process` code path (what a real binary uses) without
+    // depending on, or mutating, the actual process environment: `BASE` alone is a
+    // complete, valid configuration, so this only has to type-check and run, not
+    // assert on any particular outcome.
+    let dir = project(BASE)?;
+    let _ = load(dir.path(), EnvSource::Process);
+    Ok(())
 }
