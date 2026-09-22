@@ -261,3 +261,22 @@ fn runpod_api_key_in_file_is_rejected() -> Result<(), Box<dyn std::error::Error>
     );
     Ok(())
 }
+
+#[test]
+fn log_in_file_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    // Prepended so that `log` lands in the root table.
+    let problems = env_only_problems(&format!("log = \"debug\"\n{BASE}"))?;
+    assert!(
+        problems.contains(&"log: must be set through env, not in overbrainer.toml".to_string()),
+        "{problems:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn log_from_env_is_accepted() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(BASE)?;
+    let settings = load(dir.path(), env(&[("OVERBRAINER_LOG", "debug")]))?;
+    assert_eq!(settings.log.as_deref(), Some("debug"));
+    Ok(())
+}

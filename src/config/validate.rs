@@ -120,6 +120,7 @@ pub(crate) fn env_only_in_file(file: &config::Config) -> Vec<String> {
     }
     keys.push("runpod.api_key".to_string());
     keys.push("hf_token".to_string());
+    keys.push("log".to_string());
 
     keys.into_iter()
         .filter(|key| file.get::<config::Value>(key).is_ok())

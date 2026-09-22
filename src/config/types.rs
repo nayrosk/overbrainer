@@ -34,8 +34,8 @@ pub struct Settings {
     pub runpod: Runpod,
     /// Hugging Face access token. Env only.
     pub hf_token: Option<SecretString>,
-    /// Log filter. Read directly from `OVERBRAINER_LOG` at startup; declared here so
-    /// strict parsing accepts the variable.
+    /// Log filter. Env only. Read directly from `OVERBRAINER_LOG` at startup; declared
+    /// here so strict parsing accepts the variable.
     pub log: Option<String>,
 }
 
