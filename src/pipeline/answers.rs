@@ -204,8 +204,11 @@ fn example<C: LlmClient>(
     parent: &RoleClient<C>,
     question: Question,
     system: String,
-    completion: Completion,
+    mut completion: Completion,
 ) -> Example {
+    if completion.reasoning.kind == ReasoningKind::Raw && hides_raw_reasoning(ctx, parent) {
+        completion.reasoning.kind = ReasoningKind::Summary;
+    }
     let mut meta = Meta {
         model: parent.model.model.clone(),
         input_tokens: completion.usage.input_tokens,
@@ -297,9 +300,12 @@ pub fn classify(completion: &Completion, reasoning_requested: bool) -> Option<Ex
 }
 
 /// Warning shown when reasoning is requested from a parent known not to return raw
-/// reasoning: the `anthropic` protocol always, and `OpenAI` or Claude models on the
-/// `openai` protocol, which hide or summarize it. The open-weight `gpt-oss` models
+/// reasoning: the `anthropic` protocol always, and `OpenAI`, Claude or Gemini models on
+/// the `openai` protocol, which hide or summarize it. The open-weight `gpt-oss` models
 /// return raw reasoning and get no warning.
+///
+/// The answers stage never trusts reasoning from such a parent: what it reports as raw
+/// is stored as a summary, so it is never trained on.
 #[must_use]
 pub fn raw_reasoning_warning(protocol: Protocol, model: &str) -> Option<&'static str> {
     if protocol == Protocol::Anthropic {
@@ -318,10 +324,22 @@ pub fn raw_reasoning_warning(protocol: Protocol, model: &str) -> Option<&'static
         || model.starts_with("anthropic/")
         || name.starts_with("gpt-")
         || name.starts_with("claude")
+        || name.starts_with("gemini")
         || o_series;
     hidden.then_some(
-        "this model hides or summarizes its reasoning: answers without raw reasoning will be excluded from training",
+        "this model hides or summarizes its reasoning, so none of it is treated as raw: every answer will be excluded from training",
     )
+}
+
+/// Whether the parent is known not to return raw reasoning (see
+/// [`raw_reasoning_warning`]), whatever the response claims.
+fn hides_raw_reasoning<C>(ctx: &Ctx<'_>, parent: &RoleClient<C>) -> bool {
+    ctx.settings
+        .providers
+        .get(&parent.model.provider)
+        .is_some_and(|provider| {
+            raw_reasoning_warning(provider.protocol, &parent.model.model).is_some()
+        })
 }
 
 fn warn_about_reasoning<C>(ctx: &Ctx<'_>, parent: &RoleClient<C>) {
@@ -388,13 +406,20 @@ mod tests {
             "gpt-5-mini",
             "o3",
             "anthropic/claude-sonnet-5",
+            "google/gemini-3-pro",
+            "gemini-2.5-flash",
         ] {
             assert!(
                 raw_reasoning_warning(Protocol::Openai, model).is_some(),
                 "{model}"
             );
         }
-        for model in ["deepseek-r1", "qwen/qwen3-235b-a22b", "ollama3"] {
+        for model in [
+            "deepseek-r1",
+            "qwen/qwen3-235b-a22b",
+            "ollama3",
+            "google/gemma-3-27b-it",
+        ] {
             assert!(
                 raw_reasoning_warning(Protocol::Openai, model).is_none(),
                 "{model}"

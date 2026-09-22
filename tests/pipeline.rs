@@ -1083,3 +1083,71 @@ async fn a_fully_filled_topic_is_not_embedded_again() -> TestResult {
     );
     Ok(())
 }
+
+/// Answers every question with content and reasoning reported as raw.
+fn raw_answer() -> Reply {
+    Box::new(|_, _| {
+        let mut completion = text("An answer.");
+        completion.reasoning = Reasoning {
+            text: Some("thinking".into()),
+            kind: ReasoningKind::Raw,
+        };
+        Ok(completion)
+    })
+}
+
+/// Answers one question with a parent `model` and `reasoning` setting, returning the
+/// stored example.
+async fn answer_with_parent(
+    model: &str,
+    reasoning: bool,
+) -> Result<Example, Box<dyn std::error::Error>> {
+    let project = Project::with_toml(&PROJECT.replace(
+        r#"parent = { provider = "fake", model = "parent", reasoning = true }"#,
+        &format!(r#"parent = {{ provider = "fake", model = "{model}", reasoning = {reasoning} }}"#),
+    ))?;
+    project.write_questions(1)?;
+    let parent = Arc::new(project.role(FakeLlm::new(raw_answer()), true));
+    pipeline::answers(&project.ctx(false), parent).await?;
+    let examples: Vec<Example> = read(&project.files.answers)?;
+    Ok(examples.into_iter().next().ok_or("no answer")?)
+}
+
+#[tokio::test]
+async fn raw_reasoning_from_a_model_that_hides_it_is_a_summary() -> TestResult {
+    let example = answer_with_parent("anthropic/claude-sonnet-5", true).await?;
+    assert_eq!(example.meta.reasoning_kind, ReasoningKind::Summary);
+    assert_eq!(example.meta.excluded, Some(Exclusion::NoRawReasoning));
+
+    let example = answer_with_parent("anthropic/claude-sonnet-5", false).await?;
+    assert_eq!(example.meta.reasoning_kind, ReasoningKind::Summary);
+    assert_eq!(example.meta.excluded, None);
+    assert_eq!(
+        example.messages[1].reasoning_content, None,
+        "a summary is never trained on"
+    );
+
+    let example = answer_with_parent("openai/gpt-oss-120b", true).await?;
+    assert_eq!(example.meta.reasoning_kind, ReasoningKind::Raw);
+    assert_eq!(example.meta.excluded, None);
+    assert_eq!(
+        example.messages[1].reasoning_content.as_deref(),
+        Some("thinking")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_reasoning_over_the_anthropic_protocol_is_a_summary() -> TestResult {
+    let project = Project::with_toml(
+        &PROJECT.replace(r#"protocol = "openai""#, r#"protocol = "anthropic""#),
+    )?;
+    project.write_questions(1)?;
+    let parent = Arc::new(project.role(FakeLlm::new(raw_answer()), true));
+    pipeline::answers(&project.ctx(false), parent).await?;
+    let examples: Vec<Example> = read(&project.files.answers)?;
+    let example = examples.first().ok_or("no answer")?;
+    assert_eq!(example.meta.reasoning_kind, ReasoningKind::Summary);
+    assert_eq!(example.meta.excluded, Some(Exclusion::NoRawReasoning));
+    Ok(())
+}

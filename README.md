@@ -71,7 +71,9 @@ Only raw reasoning is used for training: a usable example keeps `reasoning_conte
 With `reasoning = true` on the parent:
 
 - `openai` protocol: overbrainer sends `reasoning: {"effort": ...}` (`medium` unless `reasoning_effort` is set) and reads the reasoning from `reasoning`, `reasoning_content`, `reasoning_details`, or a `<think>` block in the answer.
-- `anthropic` protocol: overbrainer asks for adaptive thinking. Anthropic models only return summaries, so these answers are all excluded; overbrainer warns about it at startup, and also for OpenAI and Claude models reached through the `openai` protocol.
+- `anthropic` protocol: overbrainer asks for adaptive thinking.
+
+Some parents never return their raw reasoning, whatever their responses claim: any model on the `anthropic` protocol, and Claude, Gemini and OpenAI models on the `openai` protocol (except the open-weight `gpt-oss` models, whose reasoning is raw). overbrainer stores their reasoning as a summary (`reasoning_kind = "summary"`). With `reasoning = true`, every answer from such a parent is therefore excluded as `no_raw_reasoning`, and overbrainer warns about it at startup. With `reasoning = false`, the answers stay usable, without their reasoning.
 
 ### Prompt templates
 
