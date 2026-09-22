@@ -300,7 +300,7 @@ pub fn summary(stage: Stage, stats: &StageStats) -> String {
     )
 }
 
-/// One line: train and eval sizes, then exclusions by reason.
+/// One line: train and eval sizes, exclusions by reason, then orphaned examples.
 #[must_use]
 pub fn split_summary(report: &SplitReport) -> String {
     let excluded: usize = report.excluded.values().sum();
@@ -321,8 +321,8 @@ pub fn split_summary(report: &SplitReport) -> String {
         format!(" ({})", reasons.join(", "))
     };
     format!(
-        "split: {} train, {} eval, {excluded} excluded{detail}",
-        report.train, report.eval
+        "split: {} train, {} eval, {excluded} excluded{detail}, {} orphaned",
+        report.train, report.eval, report.orphaned
     )
 }
 
@@ -401,10 +401,11 @@ mod tests {
             train: 9,
             eval: 1,
             excluded: BTreeMap::from([(Exclusion::Truncated, 2), (Exclusion::NoRawReasoning, 1)]),
+            orphaned: 4,
         };
         assert_eq!(
             split_summary(&report),
-            "split: 9 train, 1 eval, 3 excluded (truncated 2, no_raw_reasoning 1)"
+            "split: 9 train, 1 eval, 3 excluded (truncated 2, no_raw_reasoning 1), 4 orphaned"
         );
     }
 }

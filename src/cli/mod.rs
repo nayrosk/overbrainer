@@ -55,7 +55,10 @@ pub enum Command {
     /// Split usable answers into data/train.jsonl and data/eval.jsonl.
     ///
     /// Both files are always rewritten from scratch with the usable examples of every
-    /// topic: `--topic` only limits the counts printed.
+    /// topic: `--topic` only limits the counts printed. Answers whose topic is no longer
+    /// in overbrainer.toml, or whose question is no longer in data/questions.jsonl (for
+    /// example after the questions were regenerated), are left out and counted as
+    /// orphaned; they stay in data/answers.jsonl.
     Split(SplitArgs),
     /// Run subtopics, questions, answers and split in order.
     Run,

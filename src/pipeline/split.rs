@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use twox_hash::XxHash3_64;
 
 use super::{Ctx, PipelineError};
-use crate::dataset::{Example, Exclusion, read, rewrite};
+use crate::dataset::{Example, Exclusion, Id, Question, read, rewrite};
 use crate::events::{Event, Stage, StageStats};
 
 /// Outcome of [`split`].
@@ -15,30 +15,49 @@ pub struct SplitReport {
     pub eval: usize,
     /// Examples left out, by reason.
     pub excluded: BTreeMap<Exclusion, usize>,
+    /// Examples left out because their topic is no longer configured or their
+    /// question is no longer in `data/questions.jsonl`.
+    pub orphaned: usize,
 }
 
 /// Rewrites `data/train.jsonl` and `data/eval.jsonl` from the usable examples of
 /// `data/answers.jsonl` (those with `meta.excluded = null`), stratified by subtopic.
-/// Both files always hold every topic's usable examples: `--topic` only limits the
-/// report and the event counts to that topic. Excluded examples stay in
-/// `answers.jsonl`. The split always rewrites both files, so `--force` changes nothing.
+///
+/// Only examples whose topic is configured in `overbrainer.toml` and whose question is
+/// still in `data/questions.jsonl` are used; the others (a removed topic, a question
+/// replaced by `questions --force`) are counted as orphaned. Both files always hold
+/// every topic's usable examples: `--topic` only limits the report and the event
+/// counts to that topic. Excluded and orphaned examples stay in `answers.jsonl`. The
+/// split always rewrites both files, so `--force` changes nothing.
 ///
 /// # Errors
 ///
 /// Returns a [`PipelineError`] when a file cannot be read or written.
 pub fn split(ctx: &Ctx<'_>) -> Result<SplitReport, PipelineError> {
-    let topics = ctx.topics()?;
-    let selected = |example: &Example| topics.iter().any(|topic| topic.name == example.topic);
+    ctx.topics()?;
+    let counted = |example: &Example| ctx.topic.is_none_or(|name| example.topic == name);
     let examples: Vec<Example> = read(&ctx.files.answers)?;
+    let questions: Vec<Question> = read(&ctx.files.questions)?;
+    let known: BTreeSet<&Id> = questions.iter().map(|question| &question.id).collect();
+    let configured = |example: &Example| {
+        ctx.settings
+            .topics
+            .iter()
+            .any(|topic| topic.name == example.topic)
+    };
     ctx.bus.publish(Event::StageStarted {
         stage: Stage::Split,
-        total: examples.iter().filter(|example| selected(example)).count(),
+        total: examples.iter().filter(|example| counted(example)).count(),
     });
     let mut report = SplitReport::default();
     let mut usable = Vec::new();
     for example in examples {
+        if !configured(&example) || !known.contains(&example.id) {
+            report.orphaned += usize::from(counted(&example));
+            continue;
+        }
         match example.meta.excluded {
-            Some(reason) if selected(&example) => {
+            Some(reason) if counted(&example) => {
                 *report.excluded.entry(reason).or_default() += 1;
             },
             Some(_) => {},
@@ -49,12 +68,13 @@ pub fn split(ctx: &Ctx<'_>) -> Result<SplitReport, PipelineError> {
     let (train, eval) = stratify(usable, settings.eval_ratio, settings.seed);
     rewrite(&ctx.files.train, &train)?;
     rewrite(&ctx.files.eval, &eval)?;
-    report.train = train.iter().filter(|example| selected(example)).count();
-    report.eval = eval.iter().filter(|example| selected(example)).count();
+    report.train = train.iter().filter(|example| counted(example)).count();
+    report.eval = eval.iter().filter(|example| counted(example)).count();
     ctx.bus.publish(Event::StageFinished {
         stage: Stage::Split,
         stats: StageStats {
             done: report.train + report.eval,
+            skipped: report.orphaned,
             excluded: report.excluded.values().sum(),
             ..StageStats::default()
         },

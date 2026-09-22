@@ -118,7 +118,7 @@ async fn run_chains_the_data_stages_and_prints_costs() -> TestResult {
             "answers: 4 done, 0 skipped, 0 failed",
         ))
         .stdout(predicate::str::contains(
-            "split: 3 train, 1 eval, 0 excluded",
+            "split: 3 train, 1 eval, 0 excluded, 0 orphaned",
         ))
         .stdout(predicate::str::contains("cost $"))
         .stdout(predicate::str::contains(KEY).not())
@@ -350,6 +350,7 @@ fn split_offers_only_topic() -> TestResult {
         .assert()
         .success()
         .stdout(predicate::str::contains("--topic"))
+        .stdout(predicate::str::contains("orphaned"))
         .stdout(predicate::str::contains("--force").not());
     Command::cargo_bin("overbrainer")?
         .env_clear()

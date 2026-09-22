@@ -1151,3 +1151,70 @@ async fn raw_reasoning_over_the_anthropic_protocol_is_a_summary() -> TestResult 
     assert_eq!(example.meta.excluded, Some(Exclusion::NoRawReasoning));
     Ok(())
 }
+
+#[tokio::test]
+async fn split_leaves_out_and_counts_answers_of_removed_topics() -> TestResult {
+    let project = Project::with_toml(TWO_TOPICS)?;
+    project.write_questions(2)?;
+    let loops = Id::subtopic("control_flow", "Loops");
+    let mut out = overbrainer::dataset::Appender::open(&project.files.questions)?;
+    for text in ["What is a loop?", "When does a loop end?"] {
+        out.append(&Question {
+            id: Id::question(&loops, text),
+            topic: "control_flow".into(),
+            subtopic_id: loops.clone(),
+            subtopic: "Loops".into(),
+            text: text.into(),
+        })?;
+    }
+    let parent = Arc::new(project.role(FakeLlm::new(Box::new(|_, _| Ok(text("ok")))), false));
+    pipeline::answers(&project.ctx(false), parent).await?;
+
+    let removed = Project::with_toml(&TWO_TOPICS.replace(
+        "[[topics]]\nname = \"control_flow\"\nsubtopics = 2\nquestions_per_subtopic = 2\n",
+        "",
+    ))?;
+    std::fs::create_dir_all(removed.dir.path().join("data"))?;
+    std::fs::copy(&project.files.questions, &removed.files.questions)?;
+    std::fs::copy(&project.files.answers, &removed.files.answers)?;
+    let report = pipeline::split(&removed.ctx(false))?;
+    assert_eq!(report.orphaned, 2, "both control_flow answers are orphans");
+    let train: Vec<Example> = read(&removed.files.train)?;
+    let eval: Vec<Example> = read(&removed.files.eval)?;
+    assert!(
+        train.iter().chain(&eval).all(|e| e.topic == "ownership"),
+        "the removed topic is not trained"
+    );
+    assert_eq!(train.len() + eval.len(), 2);
+    let answers: Vec<Example> = read(&removed.files.answers)?;
+    assert_eq!(answers.len(), 4, "orphans stay in answers.jsonl");
+    Ok(())
+}
+
+#[tokio::test]
+async fn split_leaves_out_and_counts_answers_of_replaced_questions() -> TestResult {
+    let project = Project::new()?;
+    project.write_questions(3)?;
+    let parent = Arc::new(project.role(FakeLlm::new(Box::new(|_, _| Ok(text("ok")))), false));
+    pipeline::answers(&project.ctx(false), parent).await?;
+
+    let questions: Vec<Question> = read(&project.files.questions)?;
+    let kept: Vec<Question> = questions
+        .into_iter()
+        .filter(|question| question.text != "Question 0?")
+        .collect();
+    overbrainer::dataset::rewrite(&project.files.questions, &kept)?;
+    let report = pipeline::split(&project.ctx(false))?;
+    assert_eq!(report.orphaned, 1);
+    assert_eq!(report.train + report.eval, 2);
+    let train: Vec<Example> = read(&project.files.train)?;
+    let eval: Vec<Example> = read(&project.files.eval)?;
+    assert!(
+        train
+            .iter()
+            .chain(&eval)
+            .all(|e| e.messages[0].content != "Question 0?"),
+        "the answer of the replaced question is not trained"
+    );
+    Ok(())
+}
