@@ -154,13 +154,18 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
 
 /// Gives env-provided values of `training.axolotl_extra` a type.
 ///
-/// Env variables are read without type parsing (`try_parsing(false)` keeps secrets
-/// such as `0123` intact), so every value set through
-/// `OVERBRAINER_TRAINING__AXOLOTL_EXTRA__*` arrives as a string. A string that is not
-/// the file's own value for the same key came from env and becomes a boolean
-/// (`true`, `false`), an integer or a finite float when it parses as one; any other
-/// text stays a string. Values from `overbrainer.toml` keep their TOML type, so a
-/// number-like string that must stay a string belongs in the file.
+/// The `Environment` source above is built with `try_parsing(false)`, the config-wide
+/// default that keeps every env value a string (so a secret such as `0123` is never
+/// silently type-parsed). This function is where `axolotl_extra` alone deliberately
+/// relaxes that default: every value set through
+/// `OVERBRAINER_TRAINING__AXOLOTL_EXTRA__*` arrives as a string, and a string that is
+/// not the file's own value for the same key came from env and becomes a boolean
+/// (`true`, `false`), a canonical integer, or a finite float when it parses as one
+/// (see [`scalar`]); any other text stays a string. Values from `overbrainer.toml`
+/// keep their TOML type. A value that must stay a string, such as a revision with
+/// leading zeros (`"0123"`) or a version-like `"3.14"`, belongs in the file; env has
+/// no way to know a key means "always a string", so an override of that key with
+/// different text is still coerced by this function.
 fn coerce_env_scalars(extra: &mut BTreeMap<String, Value>, file: &BTreeMap<String, Value>) {
     for (key, value) in extra.iter_mut() {
         coerce(value, file.get(key));
@@ -184,6 +189,12 @@ fn coerce(value: &mut Value, file: Option<&Value>) {
 }
 
 /// `text` as a boolean, an integer or a finite float, when it is one.
+///
+/// An integer is only recognized when `text` is its own canonical rendering (no
+/// leading zero, no leading `+`), so a padded value such as a revision (`"0123"`)
+/// is not silently read as `123`. When `text` parses as an integer but is not
+/// canonical, it is left as a string outright, it is not tried as a float either.
+/// Floats have no such check: any text that parses as a finite `f64` is accepted.
 fn scalar(text: &str) -> Option<Value> {
     match text {
         "true" => return Some(Value::Bool(true)),
@@ -191,7 +202,7 @@ fn scalar(text: &str) -> Option<Value> {
         _ => {},
     }
     if let Ok(integer) = text.parse::<i64>() {
-        return Some(Value::from(integer));
+        return (integer.to_string() == text).then_some(Value::from(integer));
     }
     text.parse::<f64>()
         .ok()
@@ -212,5 +223,19 @@ mod tests {
         assert_eq!(scalar("inf"), None);
         assert_eq!(scalar("qwen3"), None);
         assert_eq!(scalar("True"), None);
+    }
+
+    #[test]
+    fn non_canonical_integers_stay_strings() {
+        assert_eq!(scalar("0123"), None, "leading zero");
+        assert_eq!(scalar("+5"), None, "leading plus");
+        assert_eq!(scalar("007"), None, "leading zeros");
+    }
+
+    #[test]
+    fn canonical_integers_and_floats_still_parse() {
+        assert_eq!(scalar("0"), Some(Value::from(0)));
+        assert_eq!(scalar("-3"), Some(Value::from(-3)));
+        assert_eq!(scalar("1e-7"), Some(Value::from(1e-7)));
     }
 }
