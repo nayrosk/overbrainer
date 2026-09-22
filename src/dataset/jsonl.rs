@@ -71,9 +71,10 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> DatasetError + '_ {
 ///
 /// A last line without its trailing newline is read like any other line when it is
 /// valid JSON: the crash that interrupted the write only missed the newline, and
-/// [`Appender::open`] adds it back. When it is not valid JSON it is the incomplete
-/// start of a record, left by a crash during a write: it is skipped with a warning,
-/// and [`Appender::open`] removes it before appending.
+/// [`Appender::open`] adds it back. When it is not valid JSON (or not valid UTF-8,
+/// when the crash cut a multi-byte character) it is the incomplete start of a record,
+/// left by a crash during a write: it is skipped with a warning, and
+/// [`Appender::open`] removes it before appending.
 ///
 /// # Errors
 ///
@@ -81,21 +82,24 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> DatasetError + '_ {
 /// if a line is valid JSON but not a valid record, or if a complete line is not valid
 /// JSON.
 pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, DatasetError> {
-    let content = match fs::read_to_string(path) {
+    let content = match fs::read(path) {
         Ok(content) => content,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(io_error(path)(e)),
     };
-    let complete = content.is_empty() || content.ends_with('\n');
-    let lines: Vec<&str> = content.lines().collect();
+    let complete = content.is_empty() || content.ends_with(b"\n");
+    let mut lines: Vec<&[u8]> = content.split(|byte| *byte == b'\n').collect();
+    if complete {
+        lines.pop();
+    }
     let mut items = Vec::with_capacity(lines.len());
     for (index, line) in lines.iter().enumerate() {
-        if line.trim().is_empty() {
+        if line.trim_ascii().is_empty() {
             continue;
         }
-        match serde_json::from_str(line) {
+        match serde_json::from_slice(line) {
             Ok(item) => items.push(item),
-            Err(_) if !complete && index + 1 == lines.len() && !is_json(line.as_bytes()) => {
+            Err(_) if !complete && index + 1 == lines.len() && !is_json(line) => {
                 tracing::warn!("{}: ignoring an incomplete last line", path.display());
             },
             Err(source) => {
@@ -185,8 +189,8 @@ fn end_last_line(file: &mut File) -> io::Result<()> {
     file.set_len(u64::try_from(keep).map_err(io::Error::other)?)
 }
 
-/// Whether `line` is one complete JSON value. A record cut short by a crash never is,
-/// since every record is a JSON object.
+/// Whether `line` is one complete JSON value, in valid UTF-8. A record cut short by a
+/// crash never is, since every record is a JSON object.
 fn is_json(line: &[u8]) -> bool {
     serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok()
 }
