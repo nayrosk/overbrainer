@@ -245,12 +245,50 @@ fn train_runs_the_job_and_prints_a_summary() -> TestResult {
         .stdout(predicate::str::contains(format!(
             "train: run {id} succeeded; step 2/2"
         )));
+    // A finished run still accepts a cancel, which stops anything left on the
+    // target; its job wrote an exit code, so the cancel signals nothing.
+    overbrainer(dir.path())?
+        .args(["train", "cancel", &id])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "run {id} already ended: succeeded; stopping any job left on the target"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "train: the job of run {id} had already ended (exited with code 0)"
+        )));
+    Ok(())
+}
+
+#[test]
+fn cancel_stops_the_job_of_a_run_already_recorded_as_failed() -> TestResult {
+    let dir = project("slow")?;
+    let (run, output) = interrupt_train(dir.path(), &["running"], Duration::from_millis(100))?;
+    assert_detached(&run, &output)?;
+    let id = run_id(&run)?;
+    // As if the job had been reported lost while it, or its container, kept
+    // running: the record says failed, the job is still on the target.
+    let record = fs::read_to_string(run.join("run.json"))?;
+    fs::write(
+        run.join("run.json"),
+        record.replace("\"running\"", "\"failed\""),
+    )?;
+
+    overbrainer(dir.path())?
+        .args(["train", "cancel", &id])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "run {id} already ended: failed; stopping any job left on the target"
+        )))
+        .stdout(format!("train: run {id} cancelled\n"));
+    // Only a record already cancelled is refused.
     overbrainer(dir.path())?
         .args(["train", "cancel", &id])
         .assert()
         .failure()
         .stderr(predicate::str::contains(format!(
-            "run {id} already ended: succeeded"
+            "run {id} already ended: cancelled"
         )));
     Ok(())
 }

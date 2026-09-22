@@ -147,10 +147,16 @@ async fn cancel_run(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
     let runs = Runs::new(project_dir);
     let record = runs.load(run_id)?;
-    match record.state {
-        RunState::Running => {},
-        RunState::Preparing => bail!("run {run_id} has not started"),
-        state => bail!("run {run_id} already ended: {}", state.name()),
+    match (record.state, record.job.is_some()) {
+        (RunState::Cancelled, _) => bail!("run {run_id} already ended: cancelled"),
+        (_, false) => bail!("run {run_id} has not started"),
+        (RunState::Preparing | RunState::Running, true) => {},
+        // A run recorded as ended can still have a job left on the target: a
+        // container that outlived its wrapper keeps the GPU until it is stopped.
+        (state, true) => tracing::info!(
+            "train: run {run_id} already ended: {}; stopping any job left on the target",
+            state.name()
+        ),
     }
     let training = settings.training.as_ref().context(
         "cancel needs [training] to retrieve the run's artifacts: \

@@ -366,9 +366,13 @@ fn local_summary(path: &Path) -> Result<MetricsSummary, RunError> {
 ///
 /// A job that had already ended before the cancel is left alone by the target, so
 /// its status stays [`JobStatus::Exited`] or [`JobStatus::Lost`]; the record is
-/// then returned unchanged (still `Running`), so a later watch or attach records
-/// the real outcome and retrieves its artifacts. The status is returned with the
-/// record so the caller can tell which case happened.
+/// then returned unchanged, keeping whatever state it held (`Running`, or a final
+/// state for a run cancelled after it was recorded as ended), so a later watch or
+/// attach records the real outcome and retrieves its artifacts. The status is
+/// returned with the record so the caller can tell which case happened.
+///
+/// The record's state is not looked at: a run recorded as ended may still have a
+/// job, or a container, left on the target, and cancelling it stops that.
 ///
 /// # Errors
 ///
