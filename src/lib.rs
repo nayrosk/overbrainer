@@ -5,4 +5,5 @@ pub mod config;
 pub mod dataset;
 pub mod llm;
 pub mod logging;
+pub mod pricing;
 pub mod secrets;
