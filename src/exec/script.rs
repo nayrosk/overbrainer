@@ -115,7 +115,7 @@ pub fn cancel_script(dir: &str, pid: u32, container: Option<&Container>) -> Stri
          kill -s KILL -\"$pid\" 2>/dev/null\n\
          i=0\n\
          while kill -s 0 -\"$pid\" 2>/dev/null; do\n\
-         [ \"$i\" -lt 10 ] || {{ echo \"process group $pid survived SIGKILL\" >&2; exit 1; }}\n\
+         [ \"$i\" -lt 10 ] || {{ echo \"process group $pid is still present after SIGKILL (its leader may be waiting for its parent process to reap it); the job stays marked cancelling, retry the cancel\" >&2; exit 1; }}\n\
          sleep 1; i=$((i + 1)); done\n\
          : > {CANCEL_FILE}\n\
          exit 0\n",
