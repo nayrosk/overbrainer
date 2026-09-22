@@ -93,6 +93,15 @@ impl Prompts {
         Ok(Self { env })
     }
 
+    /// No template at all: every render fails. For stages that render none, such as
+    /// the split, so a broken override cannot stop them.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            env: Environment::new(),
+        }
+    }
+
     /// Renders template `name` with `context`.
     ///
     /// # Errors
@@ -156,6 +165,12 @@ mod tests {
         )?;
         assert!(text.starts_with("You are an expert in ownership."));
         Ok(())
+    }
+
+    #[test]
+    fn empty_prompts_render_nothing() {
+        let rendered = Prompts::empty().render(SUBTOPICS, context! { topic => "t" });
+        assert!(matches!(rendered, Err(PromptError::Render { .. })));
     }
 
     #[test]

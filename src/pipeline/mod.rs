@@ -38,6 +38,8 @@ pub enum PipelineError {
         /// The provider error.
         #[source]
         source: LlmError,
+        /// What the stage produced and spent before it stopped.
+        spent: Box<StageStats>,
     },
     /// `--topic` names a topic that is not configured.
     #[error("unknown topic `{0}`")]
@@ -194,6 +196,7 @@ pub(crate) fn item_error(
         return Err(PipelineError::Llm {
             stage: item.stage,
             source: error,
+            spent: Box::new(stats.clone()),
         });
     }
     stats.failed += 1;

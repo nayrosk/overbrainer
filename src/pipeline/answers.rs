@@ -83,9 +83,12 @@ pub async fn answers<C: LlmClient + 'static>(
                     stage: Stage::Answers,
                     id: question.id.to_string(),
                 };
-                if let Err(stop) = item_error(ctx, &item, error, &mut stats) {
+                if let Err(mut stop) = item_error(ctx, &item, error, &mut stats) {
                     tasks.abort_all();
                     keep_finished(ctx, &parent, &mut tasks, &mut out, &mut stats).await?;
+                    if let PipelineError::Llm { spent, .. } = &mut stop {
+                        **spent = stats;
+                    }
                     return Err(stop);
                 }
             },

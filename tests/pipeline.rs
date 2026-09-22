@@ -488,6 +488,7 @@ async fn subtopics_stage_stops_on_a_fatal_provider_error() -> TestResult {
         Err(pipeline::PipelineError::Llm {
             stage: Stage::Subtopics,
             source: LlmError::Status { status: 401, .. },
+            ..
         })
     ));
     Ok(())
@@ -510,6 +511,7 @@ async fn questions_stage_stops_on_a_fatal_provider_error() -> TestResult {
         Err(pipeline::PipelineError::Llm {
             stage: Stage::Questions,
             source: LlmError::Status { status: 401, .. },
+            ..
         })
     ));
     Ok(())
@@ -706,6 +708,7 @@ async fn questions_stage_stops_when_dedup_admit_fails_fatally() -> TestResult {
         Err(pipeline::PipelineError::Llm {
             stage: Stage::Questions,
             source: LlmError::Unsupported(_),
+            ..
         })
     ));
     Ok(())

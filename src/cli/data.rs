@@ -1,20 +1,27 @@
 //! The pipeline commands: `subtopics`, `questions`, `answers`, `split` and `run`.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
+use serde_json::Value;
+use tokio::sync::{Mutex, OnceCell};
 
-use super::StageArgs;
+use super::{LazyVault, StageArgs};
 use crate::config::{EnvSource, RoleModel, Settings};
 use crate::dataset::{DataFiles, Subtopic, read};
 use crate::dedup::{Embedding, Layered, Lexical};
 use crate::events::{EventBus, Stage, StageStats};
-use crate::llm::{ProtocolClient, connect};
-use crate::pipeline::{self, Ctx, RoleClient, SplitReport};
-use crate::pricing::fetch_price;
+use crate::llm::{LlmError, ProtocolClient, connect};
+use crate::pipeline::{self, Ctx, PipelineError, RoleClient, SplitReport};
+use crate::pricing::{Price, find_price};
 use crate::prompts::Prompts;
-use crate::secrets::{Resolver, VaultSource};
+use crate::secrets::Resolver;
+
+/// Longest wait for a provider's model listing before costs are shown as unknown.
+const PRICE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Which pipeline command to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,45 +38,126 @@ pub enum Command {
     Run,
 }
 
-/// Everything a pipeline command needs, loaded once.
+type Client = RoleClient<ProtocolClient>;
+
+/// Everything a pipeline command needs. Role clients are built on first use and at
+/// most once per command, and each provider's model listing is read at most once.
 struct Session {
+    project_dir: PathBuf,
     settings: Settings,
     files: DataFiles,
-    prompts: Prompts,
-    resolver: Resolver<VaultSource>,
+    resolver: Resolver<LazyVault>,
+    generator: OnceCell<Client>,
+    parent: OnceCell<Arc<Client>>,
+    embedder: OnceCell<Option<ProtocolClient>>,
+    listings: Mutex<BTreeMap<String, Option<Value>>>,
 }
 
 impl Session {
     fn open(project_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
+            project_dir: project_dir.to_path_buf(),
             settings: crate::config::load(project_dir, EnvSource::Process)?,
             files: DataFiles::new(project_dir),
-            prompts: Prompts::load(project_dir)?,
-            resolver: super::resolver()?,
+            resolver: super::resolver(),
+            generator: OnceCell::new(),
+            parent: OnceCell::new(),
+            embedder: OnceCell::new(),
+            listings: Mutex::new(BTreeMap::new()),
         })
     }
 
-    fn ctx<'a>(&'a self, bus: &'a EventBus, args: &'a StageArgs) -> Ctx<'a> {
+    fn ctx<'a>(&'a self, bus: &'a EventBus, args: &'a StageArgs, prompts: &'a Prompts) -> Ctx<'a> {
         Ctx {
             settings: &self.settings,
             files: &self.files,
-            prompts: &self.prompts,
+            prompts,
             bus,
             topic: args.topic.as_deref(),
             force: args.force,
         }
     }
 
+    async fn generator(&self) -> anyhow::Result<&Client> {
+        self.generator
+            .get_or_try_init(|| self.role(&self.settings.roles.generator))
+            .await
+    }
+
+    async fn parent(&self) -> anyhow::Result<Arc<Client>> {
+        let parent = self
+            .parent
+            .get_or_try_init(|| async {
+                Ok::<_, anyhow::Error>(Arc::new(self.role(&self.settings.roles.parent).await?))
+            })
+            .await?;
+        Ok(Arc::clone(parent))
+    }
+
+    async fn embedder(&self) -> anyhow::Result<Option<ProtocolClient>> {
+        let embedder = self
+            .embedder
+            .get_or_try_init(|| async {
+                match &self.settings.roles.embedder {
+                    Some(role) => connect(&self.settings, role, &self.resolver)
+                        .await
+                        .map(Some)
+                        .context("cannot set up the embedder"),
+                    None => Ok(None),
+                }
+            })
+            .await?;
+        Ok(embedder.clone())
+    }
+
     /// Connects to the provider of `role` and looks up the model price.
-    async fn role(&self, role: &RoleModel) -> anyhow::Result<RoleClient<ProtocolClient>> {
+    async fn role(&self, role: &RoleModel) -> anyhow::Result<Client> {
         let client = connect(&self.settings, role, &self.resolver).await?;
-        let price = fetch_price(&client, &role.model).await;
+        let price = self.price(role, &client).await;
         Ok(RoleClient {
             client,
             model: role.clone(),
             price,
         })
     }
+
+    /// Price of `role`'s model, from its provider's listing read once per command.
+    async fn price(&self, role: &RoleModel, client: &ProtocolClient) -> Option<Price> {
+        let mut listings = self.listings.lock().await;
+        if !listings.contains_key(&role.provider) {
+            let listing = list_models(client, PRICE_TIMEOUT).await;
+            listings.insert(role.provider.clone(), listing);
+        }
+        let listing = listings.get(&role.provider)?.as_ref()?;
+        find_price(listing, &role.model).or_else(|| unlisted(&role.model))
+    }
+}
+
+/// The provider's model listing, or `None` when it fails or takes longer than `cap`.
+async fn list_models(client: &ProtocolClient, cap: Duration) -> Option<Value> {
+    match tokio::time::timeout(cap, client.models()).await {
+        Ok(Ok(models)) => Some(models),
+        Ok(Err(error)) => unavailable(&error),
+        Err(_) => too_slow(cap),
+    }
+}
+
+fn unlisted(model: &str) -> Option<Price> {
+    tracing::info!("no price listed for model {model}; showing tokens only");
+    None
+}
+
+fn unavailable(error: &LlmError) -> Option<Value> {
+    tracing::warn!("cannot read model prices ({error}); showing tokens only");
+    None
+}
+
+fn too_slow(cap: Duration) -> Option<Value> {
+    tracing::warn!(
+        "model prices not received within {}s; showing tokens only",
+        cap.as_secs()
+    );
+    None
 }
 
 /// Runs `command` in `project_dir`, logging progress to stderr and printing a usage
@@ -78,7 +166,8 @@ impl Session {
 /// # Errors
 ///
 /// Returns an error if the configuration, a template or a data file cannot be loaded,
-/// if a provider cannot be reached, or if items failed (they are retried on the next run).
+/// if `--topic` names no configured topic, if a provider cannot be reached, or if
+/// items failed (they are retried on the next run).
 pub async fn run(project_dir: &Path, command: Command, args: &StageArgs) -> anyhow::Result<()> {
     let session = Session::open(project_dir)?;
     let bus = EventBus::new();
@@ -95,11 +184,27 @@ async fn execute(
     command: Command,
     args: &StageArgs,
 ) -> anyhow::Result<()> {
-    let ctx = session.ctx(bus, args);
+    let empty = Prompts::empty();
+    session.ctx(bus, args, &empty).topics()?;
+    let prompts = if command == Command::Split {
+        empty
+    } else {
+        Prompts::load(&session.project_dir)?
+    };
+    let ctx = session.ctx(bus, args, &prompts);
     match command {
-        Command::Subtopics => report(Stage::Subtopics, &subtopics(session, &ctx).await?),
-        Command::Questions => report(Stage::Questions, &questions(session, &ctx).await?),
-        Command::Answers => report(Stage::Answers, &answers(session, &ctx).await?),
+        Command::Subtopics => report(Stage::Subtopics, subtopics(session, &ctx).await),
+        Command::Questions => {
+            if missing_subtopics(&ctx)? {
+                let first = Ctx {
+                    force: false,
+                    ..ctx
+                };
+                report(Stage::Subtopics, subtopics(session, &first).await)?;
+            }
+            report(Stage::Questions, questions(session, &ctx).await)
+        },
+        Command::Answers => report(Stage::Answers, answers(session, &ctx).await),
         Command::Split => {
             print_split(&pipeline::split(&ctx)?);
             Ok(())
@@ -109,42 +214,31 @@ async fn execute(
 }
 
 async fn run_all(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<()> {
-    report(Stage::Subtopics, &subtopics(session, ctx).await?)?;
-    report(Stage::Questions, &questions(session, ctx).await?)?;
-    report(Stage::Answers, &answers(session, ctx).await?)?;
+    report(Stage::Subtopics, subtopics(session, ctx).await)?;
+    report(Stage::Questions, questions(session, ctx).await)?;
+    report(Stage::Answers, answers(session, ctx).await)?;
     print_split(&pipeline::split(ctx)?);
     tracing::info!("training is not available yet: run stops after split");
     Ok(())
 }
 
-async fn subtopics(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<StageStats> {
-    let generator = session.role(&session.settings.roles.generator).await?;
-    Ok(pipeline::subtopics(ctx, &generator).await?)
-}
-
-/// Runs `subtopics` first when a selected topic has none, then generates questions.
-async fn questions(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<StageStats> {
-    let existing: Vec<Subtopic> = read(&session.files.subtopics)?;
-    let missing = ctx
+/// Whether a selected topic has no subtopic yet (`questions` then generates them).
+fn missing_subtopics(ctx: &Ctx<'_>) -> anyhow::Result<bool> {
+    let existing: Vec<Subtopic> = read(&ctx.files.subtopics)?;
+    Ok(ctx
         .topics()?
         .iter()
-        .any(|topic| !existing.iter().any(|subtopic| subtopic.topic == topic.name));
-    if missing {
-        let first = Ctx {
-            force: false,
-            ..*ctx
-        };
-        report(Stage::Subtopics, &subtopics(session, &first).await?)?;
-    }
-    let generator = session.role(&session.settings.roles.generator).await?;
-    let embedder = match &session.settings.roles.embedder {
-        Some(role) => Some(
-            connect(&session.settings, role, &session.resolver)
-                .await
-                .context("cannot set up the embedder")?,
-        ),
-        None => None,
-    };
+        .any(|topic| !existing.iter().any(|subtopic| subtopic.topic == topic.name)))
+}
+
+async fn subtopics(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<StageStats> {
+    let generator = session.generator().await?;
+    Ok(pipeline::subtopics(ctx, generator).await?)
+}
+
+async fn questions(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<StageStats> {
+    let generator = session.generator().await?;
+    let embedder = session.embedder().await?;
     let pipeline = &session.settings.pipeline;
     let policy = ctx.policy();
     let new_dedup = || {
@@ -155,17 +249,26 @@ async fn questions(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<StageStat
                 .map(|client| Embedding::new(client, pipeline.embedding_threshold, policy)),
         )
     };
-    Ok(pipeline::questions(ctx, &generator, new_dedup).await?)
+    Ok(pipeline::questions(ctx, generator, new_dedup).await?)
 }
 
 async fn answers(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<StageStats> {
-    let parent = Arc::new(session.role(&session.settings.roles.parent).await?);
-    Ok(pipeline::answers(ctx, parent).await?)
+    Ok(pipeline::answers(ctx, session.parent().await?).await?)
 }
 
-/// Prints the stage summary on stdout and fails when items failed.
-fn report(stage: Stage, stats: &StageStats) -> anyhow::Result<()> {
-    println!("{}", summary(stage, stats));
+/// Prints the stage summary on stdout and fails when items failed. A stage stopped by
+/// a fatal provider error still prints what it produced and spent before stopping.
+fn report(stage: Stage, result: anyhow::Result<StageStats>) -> anyhow::Result<()> {
+    let stats = match result {
+        Ok(stats) => stats,
+        Err(error) => {
+            if let Some(PipelineError::Llm { stage, spent, .. }) = error.downcast_ref() {
+                println!("{}", summary(*stage, spent));
+            }
+            return Err(error);
+        },
+    };
+    println!("{}", summary(stage, &stats));
     if stats.failed > 0 {
         bail!(
             "{} {stage} item(s) failed; run the command again to retry them",
@@ -225,11 +328,54 @@ pub fn split_summary(report: &SplitReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::config::Protocol;
     use crate::dataset::Exclusion;
     use crate::llm::Usage;
+
+    async fn listing_server(delay: Duration) -> Result<(MockServer, ProtocolClient), LlmError> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": []}))
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        let client = ProtocolClient::new(
+            Protocol::Openai,
+            &format!("{}/v1", server.uri()),
+            None,
+            "m",
+            Duration::from_secs(30),
+        )?;
+        Ok((server, client))
+    }
+
+    #[tokio::test]
+    async fn a_slow_listing_gives_up_at_the_cap() -> Result<(), LlmError> {
+        let (_server, client) = listing_server(Duration::from_secs(5)).await?;
+        let started = std::time::Instant::now();
+        assert_eq!(list_models(&client, Duration::from_millis(50)).await, None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_prompt_listing_is_returned() -> Result<(), LlmError> {
+        let (_server, client) = listing_server(Duration::ZERO).await?;
+        assert_eq!(
+            list_models(&client, Duration::from_secs(5)).await,
+            Some(json!({"data": []}))
+        );
+        Ok(())
+    }
 
     #[test]
     fn summary_shows_cost_only_when_known() {

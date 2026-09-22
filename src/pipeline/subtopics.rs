@@ -136,6 +136,7 @@ async fn generate<C: LlmClient>(
         .map_err(|source| PipelineError::Llm {
             stage: Stage::Subtopics,
             source,
+            spent: Box::default(),
         })?;
     let mut seen = plan.existing_ids.clone();
     let subtopics = names

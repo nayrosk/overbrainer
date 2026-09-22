@@ -21,7 +21,7 @@ pub async fn run(project_dir: &Path, resolve: bool) -> anyhow::Result<()> {
         println!("{line}");
     }
     if resolve {
-        let resolver = super::resolver()?;
+        let resolver = super::resolver();
         for (key, secret) in secrets(&settings) {
             resolver
                 .resolve(secret)

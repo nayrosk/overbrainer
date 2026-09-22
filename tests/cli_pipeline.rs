@@ -210,3 +210,151 @@ async fn failed_items_exit_non_zero_after_the_summary() -> TestResult {
     assert_eq!(stdout.lines().count(), 1, "stdout holds only the summary");
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn literal_keys_need_no_vault_token() -> TestResult {
+    let server = provider().await;
+    let dir = project()?;
+    overbrainer(dir.path(), &server)?
+        .env("VAULT_ADDR", "http://127.0.0.1:1")
+        .arg("split")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("split: 0 train, 0 eval"));
+    overbrainer(dir.path(), &server)?
+        .env("VAULT_ADDR", "http://127.0.0.1:1")
+        .arg("subtopics")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("subtopics: 1 done"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_lists_models_once_per_provider() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [
+            {"id": "gen", "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
+            {"id": "parent", "pricing": {"prompt": "0.000003", "completion": "0.000015"}}
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Script {
+            calls: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    let dir = project()?;
+    overbrainer(dir.path(), &server)?
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("answers: 4 done"));
+    server.verify().await;
+    Ok(())
+}
+
+#[test]
+fn unknown_topic_is_reported_before_connecting() -> TestResult {
+    let dir = project()?;
+    Command::cargo_bin("overbrainer")?
+        .env_clear()
+        .env("HOME", "/nonexistent")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["subtopics", "--topic", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown topic `nope`"));
+    Ok(())
+}
+
+/// Parent that answers the first request, then rejects the key after a delay, so the
+/// first answer is saved before the stage stops.
+struct RejectAfterFirst {
+    calls: AtomicUsize,
+}
+
+impl Respond for RejectAfterFirst {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"index": 0, "message": {"content": "Borrow it.", "reasoning": "Why."}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+            }))
+        } else {
+            ResponseTemplate::new(401)
+                .set_delay(std::time::Duration::from_millis(300))
+                .set_body_json(json!({"error": {"message": format!("bad key {KEY}")}}))
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fatal_stop_still_prints_what_was_spent() -> TestResult {
+    let server = provider().await;
+    let dir = project()?;
+    overbrainer(dir.path(), &server)?
+        .arg("questions")
+        .assert()
+        .success();
+    let rejecting = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(RejectAfterFirst {
+            calls: AtomicUsize::new(0),
+        })
+        .mount(&rejecting)
+        .await;
+    let output = overbrainer(dir.path(), &rejecting)?
+        .arg("answers")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "answers: 1 done, 0 skipped, 0 failed, 0 excluded; tokens 100 in, 50 out",
+        ))
+        .stderr(predicate::str::contains("authentication failed"))
+        .stderr(predicate::str::contains(KEY).not())
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains(KEY));
+    assert_eq!(stdout.lines().count(), 1, "stdout holds only the summary");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn split_ignores_prompt_templates() -> TestResult {
+    let server = provider().await;
+    let dir = project()?;
+    std::fs::create_dir_all(dir.path().join("prompts"))?;
+    std::fs::write(dir.path().join("prompts/questions.txt"), "{% if broken")?;
+    overbrainer(dir.path(), &server)?
+        .arg("split")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("split: 0 train"));
+    Ok(())
+}
+
+#[test]
+fn split_offers_only_topic() -> TestResult {
+    Command::cargo_bin("overbrainer")?
+        .env_clear()
+        .args(["split", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--topic"))
+        .stdout(predicate::str::contains("--force").not());
+    Command::cargo_bin("overbrainer")?
+        .env_clear()
+        .args(["split", "--force"])
+        .assert()
+        .failure();
+    Ok(())
+}
