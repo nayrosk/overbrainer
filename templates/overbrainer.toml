@@ -61,7 +61,8 @@ kind = "local"
 runtime = "native"             # native | docker
 # venv = "~/.venvs/axolotl"    # native: directory holding bin/axolotl
 # engine = "docker"            # docker: docker | podman
-# image = "axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1"
+# image = "axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1@sha256:9de7c7a5b8830480a7d2eb3b6d49759586615f5f8eb1126d5df29f8bd9fa324b"
+# pin by digest: this container runs untrusted training code and receives secrets such as HF_TOKEN
 
 # [targets.homelab]
 # kind = "ssh"                 # host comes from OVERBRAINER_TARGETS__HOMELAB__HOST
