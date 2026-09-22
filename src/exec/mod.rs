@@ -11,6 +11,7 @@ mod lines;
 mod local;
 mod runtime;
 mod script;
+mod ssh;
 mod tar;
 
 use std::future::Future;
@@ -23,6 +24,7 @@ pub use lines::{LineStream, MAX_TAIL_READ, complete_lines};
 pub use local::LocalExecutor;
 pub use runtime::{CONTAINER_ROOT, JobRuntime, JobSpec, shell_path};
 pub use script::{cancel_script, job_script, parse_status, quote, status_script};
+pub use ssh::SshExecutor;
 
 use crate::config::Engine;
 
@@ -75,8 +77,13 @@ pub enum ExecError {
         /// Error output of the command, or its exit status.
         message: String,
     },
-    /// A secret cannot be passed to the job. The message names the variable only.
-    #[error("{0} cannot be passed to the job: it contains a line break")]
+    /// The SSH connection failed or broke.
+    #[error("ssh failed")]
+    Ssh(#[source] openssh::Error),
+    /// A secret cannot be passed to the job: its name is not an env variable name, or
+    /// its value holds a line break or a NUL byte. The message names the variable
+    /// only.
+    #[error("{0} cannot be passed to the job")]
     InvalidSecret(String),
     /// The target answered something unexpected.
     #[error("unexpected answer from the target: {0}")]
@@ -266,9 +273,86 @@ pub trait Executor: Send + Sync {
     }
 }
 
+/// The executor of a local or SSH target.
+#[derive(Debug)]
+pub enum AnyExecutor {
+    /// Runs on this machine.
+    Local(LocalExecutor),
+    /// Runs over SSH.
+    Ssh(SshExecutor),
+}
+
+impl Executor for AnyExecutor {
+    fn workdir(&self) -> &str {
+        match self {
+            Self::Local(executor) => executor.workdir(),
+            Self::Ssh(executor) => executor.workdir(),
+        }
+    }
+
+    async fn upload(&self, local: &Path, remote: &str) -> Result<(), ExecError> {
+        match self {
+            Self::Local(executor) => executor.upload(local, remote).await,
+            Self::Ssh(executor) => executor.upload(local, remote).await,
+        }
+    }
+
+    async fn spawn(&self, job: &JobCommand) -> Result<JobId, ExecError> {
+        match self {
+            Self::Local(executor) => executor.spawn(job).await,
+            Self::Ssh(executor) => executor.spawn(job).await,
+        }
+    }
+
+    async fn read_from(&self, path: &str, offset: u64, limit: u64) -> Result<Vec<u8>, ExecError> {
+        match self {
+            Self::Local(executor) => executor.read_from(path, offset, limit).await,
+            Self::Ssh(executor) => executor.read_from(path, offset, limit).await,
+        }
+    }
+
+    async fn status(&self, job: &JobId) -> Result<JobStatus, ExecError> {
+        match self {
+            Self::Local(executor) => executor.status(job).await,
+            Self::Ssh(executor) => executor.status(job).await,
+        }
+    }
+
+    async fn cancel(&self, job: &JobId) -> Result<(), ExecError> {
+        match self {
+            Self::Local(executor) => executor.cancel(job).await,
+            Self::Ssh(executor) => executor.cancel(job).await,
+        }
+    }
+
+    async fn download(
+        &self,
+        remote: &str,
+        local: &Path,
+        entries: &[String],
+        exclude: &[String],
+    ) -> Result<(), ExecError> {
+        match self {
+            Self::Local(executor) => executor.download(remote, local, entries, exclude).await,
+            Self::Ssh(executor) => executor.download(remote, local, entries, exclude).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn any_executor_delegates_with_the_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let executor = AnyExecutor::Local(LocalExecutor::new(root.path())?);
+        let file = Path::new(executor.workdir()).join("data.txt");
+        std::fs::write(&file, "0123456789")?;
+        let path = file.to_string_lossy().into_owned();
+        assert_eq!(executor.read_from(&path, 2, 3).await?, b"234");
+        Ok(())
+    }
 
     #[test]
     fn pid_rejects_zero_and_one() {
