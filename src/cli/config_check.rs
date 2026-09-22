@@ -6,7 +6,6 @@ use anyhow::Context;
 use secrecy::SecretString;
 
 use crate::config::{EnvSource, Settings, Target};
-use crate::secrets::{Resolver, VaultSettings, VaultSource};
 
 /// Prints the resolved configuration with secrets masked. With `resolve`, also
 /// resolves every secret (testing Vault access) and fails on the first error.
@@ -22,11 +21,7 @@ pub async fn run(project_dir: &Path, resolve: bool) -> anyhow::Result<()> {
         println!("{line}");
     }
     if resolve {
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let vault = VaultSettings::from_env(|key| std::env::var(key).ok(), home.as_deref())?
-            .map(|settings| VaultSource::new(&settings))
-            .transpose()?;
-        let resolver = Resolver::new(vault);
+        let resolver = super::resolver()?;
         for (key, secret) in secrets(&settings) {
             resolver
                 .resolve(secret)

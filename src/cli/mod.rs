@@ -1,11 +1,15 @@
 //! Command line interface.
 
 mod config_check;
+mod data;
 mod init;
+mod progress;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+
+use crate::secrets::{Resolver, VaultSettings, VaultSource};
 
 /// The `overbrainer` command line interface.
 #[derive(Debug, Parser)]
@@ -34,6 +38,36 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Generate the subtopics of each topic into data/subtopics.jsonl.
+    Subtopics(StageArgs),
+    /// Generate questions for each subtopic into data/questions.jsonl.
+    ///
+    /// Topics without subtopics get them first, as `overbrainer subtopics` would.
+    Questions(StageArgs),
+    /// Ask the parent model to answer each question into data/answers.jsonl.
+    ///
+    /// Resuming skips every question that already has an answer, including answers
+    /// excluded from training (truncated, refused, empty, no raw reasoning). Only
+    /// `--force` asks the parent again for them.
+    Answers(StageArgs),
+    /// Split usable answers into data/train.jsonl and data/eval.jsonl.
+    ///
+    /// Both files are always rewritten with the usable examples of every topic:
+    /// `--topic` only limits the counts printed, and `--force` changes nothing.
+    Split(StageArgs),
+    /// Run subtopics, questions, answers and split in order.
+    Run,
+}
+
+/// Options shared by the pipeline stage commands.
+#[derive(Debug, Default, Args)]
+pub struct StageArgs {
+    /// Only process this topic.
+    #[arg(long)]
+    pub topic: Option<String>,
+    /// Regenerate this stage's output for the selected topics instead of resuming.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Subcommands of `overbrainer config`.
@@ -53,10 +87,26 @@ pub enum ConfigCommand {
 ///
 /// Returns an error if the selected subcommand fails.
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    let dir = &cli.project_dir;
     match cli.command {
-        Command::Init { dir } => init::run(dir.as_deref().unwrap_or(&cli.project_dir)),
+        Command::Init { dir: target } => init::run(target.as_deref().unwrap_or(dir)),
         Command::Config {
             command: ConfigCommand::Check { resolve },
-        } => config_check::run(&cli.project_dir, resolve).await,
+        } => config_check::run(dir, resolve).await,
+        Command::Subtopics(args) => data::run(dir, data::Command::Subtopics, &args).await,
+        Command::Questions(args) => data::run(dir, data::Command::Questions, &args).await,
+        Command::Answers(args) => data::run(dir, data::Command::Answers, &args).await,
+        Command::Split(args) => data::run(dir, data::Command::Split, &args).await,
+        Command::Run => data::run(dir, data::Command::Run, &StageArgs::default()).await,
     }
+}
+
+/// Secret resolver from `VAULT_ADDR`, `VAULT_TOKEN` and `~/.vault-token`. Without
+/// `VAULT_ADDR`, literal secrets still work and `vault:` references fail when used.
+fn resolver() -> anyhow::Result<Resolver<VaultSource>> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let vault = VaultSettings::from_env(|key| std::env::var(key).ok(), home.as_deref())?
+        .map(|settings| VaultSource::new(&settings))
+        .transpose()?;
+    Ok(Resolver::new(vault))
 }
