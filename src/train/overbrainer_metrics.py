@@ -28,6 +28,7 @@ class OverbrainerMetricsCallback(TrainerCallback):
         self.path = path
 
     def _write(self, record):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as file:
             file.write(json.dumps(record) + "\n")
             file.flush()

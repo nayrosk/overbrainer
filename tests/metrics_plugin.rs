@@ -27,6 +27,17 @@ callback.on_log(None, other, None, logs={"loss": 9.0})
 callback.on_log(None, main, None, logs={"eval_loss": 1.75, "eval_runtime": 3.0})
 "#;
 
+const BEGIN_DRIVER: &str = r"
+from types import SimpleNamespace
+from overbrainer_metrics import OverbrainerMetricsPlugin
+
+callbacks = OverbrainerMetricsPlugin().add_callbacks_pre_trainer(cfg=None, model=None)
+assert len(callbacks) == 1
+callback = callbacks[0]
+main = SimpleNamespace(is_world_process_zero=True, max_steps=1, global_step=0, epoch=None)
+callback.on_train_begin(None, main, None)
+";
+
 fn write(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -34,14 +45,10 @@ fn write(path: &Path, content: &str) -> std::io::Result<()> {
     fs::write(path, content)
 }
 
-#[test]
-fn the_plugin_writes_parseable_lines_from_the_main_process_only() -> TestResult {
-    if Command::new("python3").arg("--version").output().is_err() {
-        eprintln!("skipped: python3 is not installed");
-        return Ok(());
-    }
-    let dir = tempfile::tempdir()?;
-    let stubs = dir.path().join("stubs");
+/// Stub `axolotl` and `transformers` modules, and the real plugin, under `dir`.
+/// Returns the `PYTHONPATH` entries to run it with.
+fn stage_plugin(dir: &std::path::Path) -> std::io::Result<String> {
+    let stubs = dir.join("stubs");
     write(
         &stubs.join("transformers/__init__.py"),
         "class TrainerCallback:\n    pass\n",
@@ -52,17 +59,25 @@ fn the_plugin_writes_parseable_lines_from_the_main_process_only() -> TestResult 
         &stubs.join("axolotl/integrations/base.py"),
         "class BasePlugin:\n    pass\n",
     )?;
-    let plugin = dir.path().join("plugin");
+    let plugin = dir.join("plugin");
     write(&plugin.join(PLUGIN_FILE), METRICS_PLUGIN)?;
+    Ok(format!("{}:{}", plugin.display(), stubs.display()))
+}
+
+#[test]
+fn the_plugin_writes_parseable_lines_from_the_main_process_only() -> TestResult {
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: python3 is not installed");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let python_path = stage_plugin(dir.path())?;
     let metrics = dir.path().join("metrics.jsonl");
 
     let output = Command::new("python3")
         .arg("-c")
         .arg(DRIVER)
-        .env(
-            "PYTHONPATH",
-            format!("{}:{}", plugin.display(), stubs.display()),
-        )
+        .env("PYTHONPATH", python_path)
         .env("OVERBRAINER_METRICS", &metrics)
         .output()?;
     assert!(
@@ -98,5 +113,31 @@ fn the_plugin_writes_parseable_lines_from_the_main_process_only() -> TestResult 
         return Err("expected a log line".into());
     };
     assert_eq!((*eval_loss, *loss), (Some(1.75), None));
+    Ok(())
+}
+
+#[test]
+fn the_plugin_creates_a_missing_metrics_directory() -> TestResult {
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: python3 is not installed");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let python_path = stage_plugin(dir.path())?;
+    // Neither `runs` nor `r1` exists yet: the plugin must create them itself.
+    let metrics = dir.path().join("runs/r1/metrics.jsonl");
+
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(BEGIN_DRIVER)
+        .env("PYTHONPATH", python_path)
+        .env("OVERBRAINER_METRICS", &metrics)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(metrics.is_file());
     Ok(())
 }
