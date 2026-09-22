@@ -108,7 +108,7 @@ fn describe(settings: &Settings) -> Vec<String> {
                     "ssh {}, {runtime:?}",
                     host.as_deref().unwrap_or("(host unset)")
                 )
-            }
+            },
             Target::Runpod {
                 gpu_type,
                 gpu_count,

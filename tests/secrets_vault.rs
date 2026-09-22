@@ -80,7 +80,7 @@ async fn missing_field_is_reported_without_value() -> Result<(), Box<dyn std::er
         Err(SecretError::MissingField { reference }) => {
             assert_eq!(reference, "vault:secret/overbrainer/nanogpt#api_key");
             Ok(())
-        }
+        },
         other => Err(format!("expected MissingField, got {:?}", other.map(|_| "***")).into()),
     }
 }
@@ -195,7 +195,7 @@ async fn connection_failure_keeps_its_source_chain() -> Result<(), Box<dyn std::
             assert!(!chain.contains("test-token"), "token leaked: {chain}");
             assert!(!format!("{error:?}").contains("test-token"), "token leaked");
             Ok(())
-        }
+        },
         other => Err(format!("expected Vault, got {:?}", other.map(|_| "***")).into()),
     }
 }
@@ -221,7 +221,7 @@ async fn unparsable_response_does_not_echo_its_content() -> Result<(), Box<dyn s
                 "secret leaked in Debug"
             );
             Ok(())
-        }
+        },
         Ok(_) => Err("expected an error".into()),
     }
 }
@@ -239,7 +239,7 @@ fn unreadable_token_file_is_not_reported_as_missing() -> Result<(), Box<dyn std:
         Err(error @ SecretError::VaultTokenFile { .. }) => {
             assert!(std::error::Error::source(&error).is_some());
             Ok(())
-        }
+        },
         other => Err(format!("expected VaultTokenFile, got {:?}", other.map(|_| "***")).into()),
     }
 }

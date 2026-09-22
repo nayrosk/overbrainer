@@ -62,7 +62,7 @@ fn update_gitignore(path: &Path) -> anyhow::Result<()> {
         Ok(existing) => existing,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return create_new(path, GITIGNORE_TEMPLATE);
-        }
+        },
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
     };
     let missing = missing_entries(&existing, GITIGNORE_TEMPLATE);

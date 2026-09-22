@@ -26,7 +26,7 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("error: cannot start async runtime: {e}");
             return ExitCode::FAILURE;
-        }
+        },
     };
 
     match runtime.block_on(cli::run(cli)) {
@@ -34,7 +34,7 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
-        }
+        },
     }
 }
 
@@ -49,7 +49,7 @@ fn load_dotenv(path: &Path) -> Result<(), String> {
         Err(dotenvy::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(dotenvy::Error::LineParse(_, index)) => {
             Err(format!("cannot parse .env (syntax error at index {index})"))
-        }
+        },
         Err(dotenvy::Error::Io(e)) => Err(format!("cannot load .env: {e}")),
         Err(_) => Err("cannot load .env".to_string()),
     }

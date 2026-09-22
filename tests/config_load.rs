@@ -100,7 +100,7 @@ fn env_only_keys_in_file_are_rejected() -> Result<(), Box<dyn std::error::Error>
                 "values must not leak"
             );
             Ok(())
-        }
+        },
         other => Err(format!("expected Invalid, got {other:?}").into()),
     }
 }
@@ -122,7 +122,7 @@ fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
         Err(ConfigError::Read { path, .. }) => {
             assert!(path.ends_with("overbrainer.toml"));
             Ok(())
-        }
+        },
         other => Err(format!("expected Read, got {other:?}").into()),
     }
 }
@@ -164,13 +164,13 @@ fn env_overrides_numeric_and_string_fields_of_targets() -> Result<(), Box<dyn st
             );
             assert_eq!(*gpu_count, 4);
             assert_eq!(*container_disk_gb, 120);
-        }
+        },
         other => return Err(format!("expected runpod target, got {other:?}").into()),
     }
     match settings.targets.get("box") {
         Some(Target::Ssh { host, .. }) => {
             assert_eq!(host.as_deref(), Some("trainer@gpu-box"));
-        }
+        },
         other => return Err(format!("expected ssh target, got {other:?}").into()),
     }
     Ok(())
@@ -195,7 +195,7 @@ fn target_numbers_from_the_file_and_defaults_still_apply() -> Result<(), Box<dyn
             assert_eq!(*gpu_count, 1);
             assert_eq!(*container_disk_gb, 50);
             Ok(())
-        }
+        },
         other => Err(format!("expected runpod target, got {other:?}").into()),
     }
 }

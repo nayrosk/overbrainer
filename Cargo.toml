@@ -22,6 +22,7 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
+cognitive_complexity = "warn"
 
 [dependencies]
 anyhow = "1.0.104"
