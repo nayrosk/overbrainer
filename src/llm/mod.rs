@@ -1,14 +1,20 @@
 //! LLM clients for the `openai` and `anthropic` wire protocols.
 
+mod anthropic;
+mod client;
 mod error;
 mod http;
 mod openai;
 mod retry;
+mod setup;
 mod types;
 
+pub use anthropic::AnthropicClient;
+pub use client::ProtocolClient;
 pub use error::LlmError;
 pub use openai::OpenAiClient;
 pub use retry::{RetryPolicy, with_retry};
+pub use setup::{SetupError, connect};
 pub use types::{Completion, CompletionRequest, Reasoning, Usage};
 
 use std::future::Future;
