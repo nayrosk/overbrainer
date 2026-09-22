@@ -10,6 +10,7 @@ permissions:
 jobs:
   release-pr:
     runs-on: ubuntu-latest
+    environment: production
     concurrency:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
