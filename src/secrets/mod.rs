@@ -20,12 +20,28 @@ pub enum SecretError {
     /// `VAULT_ADDR` is set but no token was found in `VAULT_TOKEN` or `~/.vault-token`.
     #[error("VAULT_ADDR is set but no token was found in VAULT_TOKEN or ~/.vault-token")]
     MissingVaultToken,
+    /// `~/.vault-token` exists but could not be read. The file content is never shown.
+    #[error("cannot read {}", path.display())]
+    VaultTokenFile {
+        /// Path of the token file.
+        path: std::path::PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
     /// A `vault:` reference was found but `VAULT_ADDR` is not set.
     #[error("a vault: reference was found but VAULT_ADDR is not set")]
     VaultNotConfigured,
-    /// The Vault request failed.
-    #[error("vault request failed: {0}")]
-    Vault(String),
+    /// The Vault client could not be built or the Vault request failed. The source
+    /// chain carries the cause (for example a refused connection). It never holds the
+    /// token, which only travels in a request header, nor response content: responses
+    /// that cannot be parsed are reported as [`SecretError::VaultResponse`] instead.
+    #[error("vault request failed")]
+    Vault(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Vault answered with a response that could not be parsed. The parse error is
+    /// dropped on purpose: it can quote response content, which may hold secrets.
+    #[error("vault returned a response that could not be parsed")]
+    VaultResponse,
     /// The referenced field is missing or not a string.
     #[error("field missing or not a string at {reference}")]
     MissingField {

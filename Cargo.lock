@@ -1076,6 +1076,7 @@ dependencies = [
  "config",
  "dotenvy",
  "predicates",
+ "rustify",
  "secrecy",
  "serde",
  "serde_json",

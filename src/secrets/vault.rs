@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 
+use rustify::errors::ClientError as RestError;
 use secrecy::{ExposeSecret, SecretString};
 use vaultrs::client::{VaultClient, VaultClientSettingsBuilder};
+use vaultrs::error::ClientError;
 
 use super::{SecretError, VaultRef};
 
@@ -46,19 +48,42 @@ impl VaultSettings {
         };
         let address = url::Url::parse(&raw_address)
             .map_err(|e| SecretError::InvalidVaultAddress(e.to_string()))?;
-        let token = match get("VAULT_TOKEN") {
+        let from_env = get("VAULT_TOKEN")
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        let token = match from_env {
             Some(token) => token,
-            None => home
-                .map(|home| home.join(".vault-token"))
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .map(|token| token.trim().to_string())
-                .filter(|token| !token.is_empty())
-                .ok_or(SecretError::MissingVaultToken)?,
+            None => read_token_file(home)?.ok_or(SecretError::MissingVaultToken)?,
         };
         Ok(Some(Self {
             address,
             token: SecretString::from(token),
         }))
+    }
+}
+
+/// Reads `<home>/.vault-token`. Returns `Ok(None)` when there is no home directory,
+/// when the file does not exist, or when it is empty.
+fn read_token_file(home: Option<&Path>) -> Result<Option<String>, SecretError> {
+    let Some(path) = home.map(|home| home.join(".vault-token")) else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(token) => Ok(Some(token.trim().to_string()).filter(|token| !token.is_empty())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(SecretError::VaultTokenFile { path, source }),
+    }
+}
+
+/// Maps a vaultrs error to a [`SecretError`], keeping its source chain unless the
+/// error may quote response content.
+fn vault_error(error: ClientError) -> SecretError {
+    match error {
+        ClientError::JsonParseError { .. }
+        | ClientError::RestClientError {
+            source: RestError::ResponseParseError { .. } | RestError::ResponseConversionError { .. },
+        } => SecretError::VaultResponse,
+        other => SecretError::Vault(Box::new(other)),
     }
 }
 
@@ -79,9 +104,8 @@ impl VaultSource {
             .address(settings.address.as_str())
             .token(settings.token.expose_secret())
             .build()
-            .map_err(|e| SecretError::Vault(e.to_string()))?;
-        let client =
-            VaultClient::new(client_settings).map_err(|e| SecretError::Vault(e.to_string()))?;
+            .map_err(|e| SecretError::Vault(Box::new(e)))?;
+        let client = VaultClient::new(client_settings).map_err(vault_error)?;
         Ok(Self { client })
     }
 }
@@ -91,7 +115,7 @@ impl SecretSource for VaultSource {
         let data: HashMap<String, serde_json::Value> =
             vaultrs::kv2::read(&self.client, &reference.mount, &reference.path)
                 .await
-                .map_err(|e| SecretError::Vault(e.to_string()))?;
+                .map_err(vault_error)?;
         match data.get(&reference.field) {
             Some(serde_json::Value::String(value)) => Ok(SecretString::from(value.clone())),
             _ => Err(SecretError::MissingField {

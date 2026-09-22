@@ -158,3 +158,117 @@ fn settings_come_from_env_and_token_file() -> Result<(), Box<dyn std::error::Err
     assert!(matches!(bad_addr, Err(SecretError::InvalidVaultAddress(_))));
     Ok(())
 }
+
+/// Renders `error` and every source below it, the way `{:#}` does in main.
+fn full_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut current = error.source();
+    while let Some(source) = current {
+        text.push_str(": ");
+        text.push_str(&source.to_string());
+        current = source.source();
+    }
+    text
+}
+
+#[tokio::test]
+async fn connection_failure_keeps_its_source_chain() -> Result<(), Box<dyn std::error::Error>> {
+    // Reserve a free port, then close it so the connection is refused.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let source = VaultSource::new(&VaultSettings {
+        address: url::Url::parse(&format!("http://127.0.0.1:{port}"))?,
+        token: SecretString::from("test-token"),
+    })?;
+    match source.fetch(&nanogpt_ref()).await {
+        Err(error @ SecretError::Vault(_)) => {
+            let chain = full_chain(&error);
+            assert!(
+                std::error::Error::source(&error).is_some(),
+                "source missing: {chain}"
+            );
+            assert!(
+                chain.to_lowercase().contains("connection refused"),
+                "cause missing: {chain}"
+            );
+            assert!(!chain.contains("test-token"), "token leaked: {chain}");
+            assert!(!format!("{error:?}").contains("test-token"), "token leaked");
+            Ok(())
+        }
+        other => Err(format!("expected Vault, got {:?}", other.map(|_| "***")).into()),
+    }
+}
+
+#[tokio::test]
+async fn unparsable_response_does_not_echo_its_content() -> Result<(), Box<dyn std::error::Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/overbrainer/nanogpt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(kv2_body(&serde_json::json!("sk-leak-42"))),
+        )
+        .mount(&server)
+        .await;
+
+    let source = VaultSource::new(&settings(&server)?)?;
+    match source.fetch(&nanogpt_ref()).await {
+        Err(error) => {
+            let chain = full_chain(&error);
+            assert!(!chain.contains("sk-leak-42"), "secret leaked: {chain}");
+            assert!(
+                !format!("{error:?}").contains("sk-leak-42"),
+                "secret leaked in Debug"
+            );
+            Ok(())
+        }
+        Ok(_) => Err("expected an error".into()),
+    }
+}
+
+#[test]
+fn unreadable_token_file_is_not_reported_as_missing() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    // A directory where the token file should be: it exists but cannot be read.
+    std::fs::create_dir(home.path().join(".vault-token"))?;
+    let result = VaultSettings::from_env(
+        |key| (key == "VAULT_ADDR").then(|| "http://127.0.0.1:8200".to_string()),
+        Some(home.path()),
+    );
+    match result {
+        Err(error @ SecretError::VaultTokenFile { .. }) => {
+            assert!(std::error::Error::source(&error).is_some());
+            Ok(())
+        }
+        other => Err(format!("expected VaultTokenFile, got {:?}", other.map(|_| "***")).into()),
+    }
+}
+
+#[test]
+fn empty_vault_token_falls_back_to_the_token_file() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    std::fs::write(home.path().join(".vault-token"), "file-token\n")?;
+    for empty in ["", "  \n"] {
+        let settings = VaultSettings::from_env(
+            |key| match key {
+                "VAULT_ADDR" => Some("http://127.0.0.1:8200".to_string()),
+                "VAULT_TOKEN" => Some(empty.to_string()),
+                _ => None,
+            },
+            Some(home.path()),
+        )?
+        .ok_or("settings expected")?;
+        assert_eq!(settings.token.expose_secret(), "file-token");
+    }
+
+    let no_file = VaultSettings::from_env(
+        |key| match key {
+            "VAULT_ADDR" => Some("http://127.0.0.1:8200".to_string()),
+            "VAULT_TOKEN" => Some(String::new()),
+            _ => None,
+        },
+        Some(Path::new("/nonexistent")),
+    );
+    assert!(matches!(no_file, Err(SecretError::MissingVaultToken)));
+    Ok(())
+}
