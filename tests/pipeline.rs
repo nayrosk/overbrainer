@@ -1,13 +1,15 @@
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use overbrainer::config::{EnvSource, Settings, load};
-use overbrainer::dataset::{DataFiles, FinishReason, Id, Question, Subtopic, read};
+use overbrainer::dataset::{
+    DataFiles, Example, Exclusion, FinishReason, Id, Question, ReasoningKind, Subtopic, read,
+};
 use overbrainer::dedup::{Deduplicator, Lexical};
 use overbrainer::events::{Event, EventBus, Stage};
 use overbrainer::llm::{Completion, CompletionRequest, LlmClient, LlmError, Reasoning, Usage};
-use overbrainer::pipeline::{self, Ctx, RoleClient};
+use overbrainer::pipeline::{self, Ctx, PipelineError, RoleClient};
 use overbrainer::prompts::Prompts;
 use tokio::sync::broadcast;
 
@@ -179,6 +181,22 @@ impl Project {
             model: model.clone(),
             price: None,
         }
+    }
+
+    fn write_questions(&self, count: usize) -> TestResult {
+        let subtopic = Id::subtopic("ownership", "Borrowing");
+        let mut out = overbrainer::dataset::Appender::open(&self.files.questions)?;
+        for n in 0..count {
+            let text = format!("Question {n}?");
+            out.append(&Question {
+                id: Id::question(&subtopic, &text),
+                topic: "ownership".into(),
+                subtopic_id: subtopic.clone(),
+                subtopic: "Borrowing".into(),
+                text,
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -690,5 +708,184 @@ async fn questions_stage_stops_when_dedup_admit_fails_fatally() -> TestResult {
             source: LlmError::Unsupported(_),
         })
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn answers_run_concurrently_classify_and_resume() -> TestResult {
+    let project = Project::new()?;
+    project.write_questions(6)?;
+    let mut fake = FakeLlm::new(Box::new(|request, _| {
+        let mut completion = text("An answer.");
+        if request.prompt == "Question 0?" {
+            completion.finish = FinishReason::Length;
+        } else if request.prompt != "Question 1?" {
+            completion.reasoning = Reasoning {
+                text: Some("step by step".into()),
+                kind: ReasoningKind::Raw,
+            };
+        }
+        Ok(completion)
+    }));
+    fake.delay = Duration::from_millis(20);
+    let parent = Arc::new(project.role(fake, true));
+    let stats = pipeline::answers(&project.ctx(false), Arc::clone(&parent)).await?;
+    assert_eq!((stats.done, stats.excluded, stats.failed), (4, 2, 0));
+    assert_eq!(stats.usage.input_tokens, 60);
+    assert_eq!(stats.cost, None);
+    let peak = parent.client.peak.load(Ordering::SeqCst);
+    assert!((2..=2).contains(&peak), "peak concurrency {peak}");
+
+    let examples: Vec<Example> = read(&project.files.answers)?;
+    assert_eq!(examples.len(), 6);
+    let by_question = |text: &str| {
+        examples
+            .iter()
+            .find(|example| example.messages[0].content == text)
+    };
+    let truncated = by_question("Question 0?").ok_or("missing Question 0")?;
+    assert_eq!(truncated.meta.excluded, Some(Exclusion::Truncated));
+    let no_reasoning = by_question("Question 1?").ok_or("missing Question 1")?;
+    assert_eq!(no_reasoning.meta.excluded, Some(Exclusion::NoRawReasoning));
+    let good = by_question("Question 2?").ok_or("missing Question 2")?;
+    assert_eq!(good.messages.len(), 2, "no system message by default");
+    assert_eq!(
+        good.messages[1].reasoning_content.as_deref(),
+        Some("step by step")
+    );
+    let system = &parent.client.requests()[0].system;
+    assert!(
+        system
+            .as_deref()
+            .is_some_and(|s| s.contains("expert in ownership"))
+    );
+
+    let again = pipeline::answers(&project.ctx(false), Arc::clone(&parent)).await?;
+    assert_eq!((again.done, again.skipped), (0, 6));
+    assert_eq!(parent.client.requests().len(), 6, "nothing asked twice");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rejected_key_stops_the_answers_stage() -> TestResult {
+    let project = Project::new()?;
+    project.write_questions(6)?;
+    let fake = FakeLlm::new(Box::new(|_, _| {
+        Err(LlmError::Status {
+            status: 401,
+            message: "authentication failed".into(),
+            retry_after: None,
+        })
+    }));
+    let parent = Arc::new(project.role(fake, true));
+    let result = pipeline::answers(&project.ctx(false), Arc::clone(&parent)).await;
+    assert!(matches!(result, Err(PipelineError::Llm { .. })));
+    let examples: Vec<Example> = read(&project.files.answers)?;
+    assert!(examples.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn split_writes_usable_examples_only() -> TestResult {
+    let project = Project::new()?;
+    project.write_questions(4)?;
+    let fake = FakeLlm::new(Box::new(|request, _| {
+        let mut completion = text("An answer.");
+        if request.prompt != "Question 3?" {
+            completion.reasoning = Reasoning {
+                text: Some("thinking".into()),
+                kind: ReasoningKind::Raw,
+            };
+        }
+        Ok(completion)
+    }));
+    let parent = Arc::new(project.role(fake, true));
+    pipeline::answers(&project.ctx(false), parent).await?;
+    let report = pipeline::split(&project.ctx(false))?;
+    assert_eq!(report.train + report.eval, 3);
+    assert_eq!(report.eval, 2, "round(3 * 0.5) = 2");
+    assert_eq!(report.excluded.get(&Exclusion::NoRawReasoning), Some(&1));
+    let train: Vec<Example> = read(&project.files.train)?;
+    let eval: Vec<Example> = read(&project.files.eval)?;
+    assert_eq!((train.len(), eval.len()), (1, 2));
+    assert!(project.dir.path().join("data/answers.jsonl").is_file());
+    Ok(())
+}
+
+#[tokio::test]
+async fn answers_events_follow_the_stage_conventions() -> TestResult {
+    let project = Project::new()?;
+    project.write_questions(3)?;
+    let first = Arc::new(project.role(
+        FakeLlm::new(Box::new(|request, _| {
+            if request.prompt == "Question 0?" {
+                let mut completion = text("An answer.");
+                completion.reasoning = Reasoning {
+                    text: Some("r".into()),
+                    kind: ReasoningKind::Raw,
+                };
+                Ok(completion)
+            } else {
+                Err(non_fatal())
+            }
+        })),
+        true,
+    ));
+    let mut receiver = project.bus.subscribe();
+    let stats = pipeline::answers(&project.ctx(false), first).await?;
+    assert_eq!((stats.done, stats.failed), (1, 2));
+    let events = drain(&mut receiver);
+    assert_eq!(started_total(&events, Stage::Answers), Some(3));
+    assert_eq!(
+        item_done_usage(&events, Stage::Answers),
+        Some(Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+        }),
+        "ItemDone carries the item's usage"
+    );
+    assert_eq!(
+        count_item_failed(&events, false),
+        2,
+        "one final failure per failed question"
+    );
+
+    let second = Arc::new(project.role(FakeLlm::new(Box::new(|_, _| Ok(text("ok")))), true));
+    let mut receiver = project.bus.subscribe();
+    let again = pipeline::answers(&project.ctx(false), second).await?;
+    assert_eq!((again.skipped, again.excluded), (1, 2));
+    let events = drain(&mut receiver);
+    assert_eq!(
+        started_total(&events, Stage::Answers),
+        Some(2),
+        "the already-answered question is not counted"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn split_only_counts_the_selected_topics() -> TestResult {
+    let project = Project::with_toml(TWO_TOPICS)?;
+    project.write_questions(2)?;
+    let loops = Id::subtopic("control_flow", "Loops");
+    let mut out = overbrainer::dataset::Appender::open(&project.files.questions)?;
+    out.append(&Question {
+        id: Id::question(&loops, "What is a loop?"),
+        topic: "control_flow".into(),
+        subtopic_id: loops.clone(),
+        subtopic: "Loops".into(),
+        text: "What is a loop?".into(),
+    })?;
+    let parent = Arc::new(project.role(FakeLlm::new(Box::new(|_, _| Ok(text("ok")))), false));
+    pipeline::answers(&project.ctx(false), parent).await?;
+    let mut receiver = project.bus.subscribe();
+    let report = pipeline::split(&project.ctx_topic(Some("ownership"), false))?;
+    assert_eq!((report.train, report.eval), (1, 1));
+    let events = drain(&mut receiver);
+    assert_eq!(
+        started_total(&events, Stage::Split),
+        Some(2),
+        "the other topic's answer is not counted"
+    );
     Ok(())
 }

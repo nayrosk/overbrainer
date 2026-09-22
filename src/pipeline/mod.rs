@@ -1,11 +1,15 @@
 //! Pipeline stages: subtopics, questions, answers, split.
 
+mod answers;
 mod parse;
 mod questions;
+mod split;
 mod subtopics;
 
+pub use answers::{answers, classify, raw_reasoning_warning};
 pub use parse::string_array;
 pub use questions::questions;
+pub use split::{SplitReport, split, stratify};
 pub use subtopics::subtopics;
 
 use crate::config::{RoleModel, Settings, Topic};
