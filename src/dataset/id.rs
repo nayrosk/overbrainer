@@ -2,7 +2,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Separator between the parts hashed into an [`Id`]. It cannot appear in normalized text.
+/// Separator between the parts hashed into an [`Id`]. [`normalize`] turns control
+/// characters into spaces, so it never appears in a normalized part and parts cannot
+/// run together. The guarantee holds for normalized parts only: a part passed to
+/// [`Id::of`] as is (a fixed label, an ID) must not contain it either.
 const SEPARATOR: char = '\u{1f}';
 
 /// Stable identifier: xxh3 128-bit hash of normalized content, as 32 lowercase hex chars.
@@ -11,7 +14,8 @@ const SEPARATOR: char = '\u{1f}';
 pub struct Id(String);
 
 impl Id {
-    /// Hashes `parts`, joined by a separator that normalized text never contains.
+    /// Hashes `parts`, joined by a separator (U+001F) that normalized text never
+    /// contains. Parts that are not normalized must not contain it either.
     #[must_use]
     pub fn of(parts: &[&str]) -> Self {
         let joined = parts.join(&SEPARATOR.to_string());
