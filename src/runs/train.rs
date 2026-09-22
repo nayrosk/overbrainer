@@ -360,17 +360,20 @@ fn local_summary(path: &Path) -> Result<MetricsSummary, RunError> {
 /// job log are then copied into the local run directory, since nobody may be
 /// watching the run to do it. That copy is best effort: when it fails, the failure
 /// is logged and the record stays `Cancelled` with
-/// `artifacts not retrieved: <error>` as its message. A job that had already ended before
-/// the cancel is left alone by the target, so its status stays
-/// [`JobStatus::Exited`] or [`JobStatus::Lost`]; the record is then returned
-/// unchanged (still `Running`), so a later watch or attach records the real
-/// outcome and retrieves its artifacts. The status is returned with the record so
-/// the caller can tell which case happened.
+/// `artifacts not retrieved: <error>` as its message. Saving that message is best
+/// effort too: `Cancelled` is already on disk, so a failure to save it is logged
+/// and the cancel still succeeds.
+///
+/// A job that had already ended before the cancel is left alone by the target, so
+/// its status stays [`JobStatus::Exited`] or [`JobStatus::Lost`]; the record is
+/// then returned unchanged (still `Running`), so a later watch or attach records
+/// the real outcome and retrieves its artifacts. The status is returned with the
+/// record so the caller can tell which case happened.
 ///
 /// # Errors
 ///
 /// Returns [`RunError::NotStarted`] for a run without a job, and an error when the
-/// target cannot be reached or the record cannot be saved.
+/// target cannot be reached or the `Cancelled` record cannot be saved.
 pub async fn cancel<E: Executor, T: Trainer>(
     runs: &Runs,
     executor: &E,
@@ -387,22 +390,39 @@ pub async fn cancel<E: Executor, T: Trainer>(
         record.state = RunState::Cancelled;
         record.message = None;
         runs.save(&record)?;
-        let local = runs.run_dir(&record.id)?;
-        if let Err(error) = retrieve(executor, trainer, &record.remote_dir, &local).await {
-            tracing::warn!(
-                "cannot retrieve the artifacts of cancelled run {}: {error}",
-                record.id
-            );
-            record.message = Some(not_retrieved(None, &error));
-            runs.save(&record)?;
-        }
+        retrieve_cancelled(runs, executor, trainer, &mut record).await?;
     }
     Ok((record, status))
+}
+
+/// Copies the artifacts of the cancelled run `record`, best effort: a failure is
+/// logged and noted in its message, which is saved when possible.
+async fn retrieve_cancelled<E: Executor, T: Trainer>(
+    runs: &Runs,
+    executor: &E,
+    trainer: &T,
+    record: &mut RunRecord,
+) -> Result<(), RunError> {
+    let local = runs.run_dir(&record.id)?;
+    let Err(error) = retrieve(executor, trainer, &record.remote_dir, &local).await else {
+        return Ok(());
+    };
+    cancelled_warning("retrieve the artifacts of", &record.id, &error);
+    record.message = Some(not_retrieved(None, &error));
+    if let Err(save_error) = runs.save(record) {
+        cancelled_warning("note the missing artifacts of", &record.id, &save_error);
+    }
+    Ok(())
+}
+
+fn cancelled_warning(what: &str, id: &str, error: &dyn std::fmt::Display) {
+    tracing::warn!("cannot {what} cancelled run {id}: {error}");
 }
 
 #[cfg(test)]
 mod tests {
     use std::future::{Future, ready};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
@@ -461,6 +481,8 @@ mod tests {
         spawn_fails: bool,
         download_fails: bool,
         failing_read: Option<u32>,
+        /// A directory created when a download is asked for, before it fails.
+        dir_on_download: Option<PathBuf>,
         reads: AtomicU32,
         cancels: AtomicU32,
     }
@@ -472,6 +494,7 @@ mod tests {
                 spawn_fails: false,
                 download_fails: false,
                 failing_read: None,
+                dir_on_download: None,
                 reads: AtomicU32::new(0),
                 cancels: AtomicU32::new(0),
             }
@@ -551,6 +574,9 @@ mod tests {
             _entries: &[String],
             _exclude: &[String],
         ) -> impl Future<Output = Result<(), ExecError>> + Send {
+            if let Some(dir) = &self.dir_on_download {
+                std::fs::create_dir(dir).ok();
+            }
             ready(if self.download_fails {
                 Err(broken("download"))
             } else {
@@ -722,6 +748,57 @@ mod tests {
             Some("artifacts not retrieved: download failed: connection reset")
         );
         assert_eq!(runs.load(&cancelled.id)?, cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancel_is_reported_even_when_its_note_cannot_be_saved()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let record = running()?;
+        runs.save(&record)?;
+        // The download breaks every later save, after `Cancelled` is on disk.
+        let fake = Fake {
+            download_fails: true,
+            dir_on_download: Some(runs.run_dir(RUN_ID)?.join(format!(".{RECORD_FILE}.tmp"))),
+            ..Fake::new(JobStatus::Cancelled)
+        };
+        let (cancelled, status) = cancel(&runs, &fake, &NoFiles, record).await?;
+        assert_eq!(status, JobStatus::Cancelled);
+        assert_eq!(cancelled.state, RunState::Cancelled);
+        assert!(
+            cancelled
+                .message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("artifacts not retrieved: ")),
+            "{:?}",
+            cancelled.message
+        );
+        let saved = runs.load(RUN_ID)?;
+        assert_eq!(saved.state, RunState::Cancelled);
+        assert_eq!(saved.message, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_that_ended_before_the_first_poll_reports_only_its_end()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let mut receiver = bus.subscribe();
+        let fake = Fake::new(JobStatus::Exited(0));
+        let record = running()?;
+        runs.save(&record)?;
+        watch(&ctx(&runs, &fake, &bus), &NoFiles, record).await?;
+        let mut statuses = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let Event::JobStatus(status) = event {
+                statuses.push(status);
+            }
+        }
+        assert_eq!(statuses, vec![JobStatus::Exited(0)]);
         Ok(())
     }
 }
