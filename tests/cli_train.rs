@@ -14,6 +14,11 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const TOKEN: &str = "hf_cli_secret_17";
 
+/// Fixed `PATH` for every spawned `overbrainer`, so the fake `axolotl` script's own
+/// use of `mkdir` and `cat` resolves deterministically. Never the developer's PATH:
+/// tests must not depend on the developer environment.
+const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
 /// `mode` next to `bin/` picks the behavior of `axolotl train`: `ok` trains at
 /// once, `fail` exits 1, and `slow` waits (at most a minute) for a `release` file
 /// next to `bin/`, then trains.
@@ -90,7 +95,7 @@ fn overbrainer(dir: &Path) -> Result<Command, Box<dyn std::error::Error>> {
     cmd.env_clear()
         .env("NO_COLOR", "1")
         .env("HOME", "/nonexistent")
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", PATH)
         .env("OVERBRAINER_HF_TOKEN", TOKEN)
         .arg("-C")
         .arg(dir);
@@ -144,7 +149,7 @@ fn interrupt_train(
         .env_clear()
         .env("NO_COLOR", "1")
         .env("HOME", "/nonexistent")
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", PATH)
         .env("OVERBRAINER_HF_TOKEN", TOKEN)
         .arg("-C")
         .arg(dir)

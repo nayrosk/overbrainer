@@ -415,6 +415,10 @@ async fn run_trains_after_split_when_training_is_configured() -> TestResult {
     );
     std::fs::write(dir.path().join("overbrainer.toml"), config)?;
     overbrainer(dir.path(), &server)?
+        // The fake axolotl script calls `mkdir`; without PATH its lookup would be
+        // implementation-defined. A fixed PATH keeps the test deterministic and
+        // independent of the developer's own PATH.
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .arg("run")
         .assert()
         .success()
