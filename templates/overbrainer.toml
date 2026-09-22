@@ -18,6 +18,8 @@ generator = { provider = "openrouter", model = "qwen/qwen3-235b-a22b" }
 parent = { provider = "openrouter", model = "deepseek/deepseek-r1", reasoning = true }
 # Optional on every role: max_tokens (default 16384), temperature (0 to 2),
 # reasoning_effort ("low", "medium" or "high", only with reasoning = true).
+# thinking_budget = 8000  # anthropic only; Claude Opus 4.5, Sonnet 4.5 and Haiku 4.5 need this
+# (fixed budget) instead of adaptive thinking; leave unset for newer Claude models.
 # embedder = { provider = "openrouter", model = "openai/text-embedding-3-small" }
 
 [pipeline]

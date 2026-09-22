@@ -18,6 +18,11 @@ pub struct CompletionRequest {
     pub reasoning: bool,
     /// Reasoning effort, used only when `reasoning` is true.
     pub effort: Option<Effort>,
+    /// Fixed extended-thinking token budget, used only when `reasoning` is true and
+    /// only by the `anthropic` protocol client. When set, it takes precedence over
+    /// `effort` for that client: the request asks for a fixed thinking budget instead
+    /// of adaptive thinking, and omits `output_config.effort`.
+    pub thinking_budget: Option<u32>,
 }
 
 impl CompletionRequest {
@@ -31,6 +36,7 @@ impl CompletionRequest {
             temperature: role.temperature,
             reasoning: role.reasoning,
             effort: role.reasoning_effort,
+            thinking_budget: role.thinking_budget,
         }
     }
 }

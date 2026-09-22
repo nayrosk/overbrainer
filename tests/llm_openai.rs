@@ -28,6 +28,7 @@ fn request(reasoning: bool) -> CompletionRequest {
         temperature: Some(0.2),
         reasoning,
         effort: None,
+        thinking_budget: None,
     }
 }
 

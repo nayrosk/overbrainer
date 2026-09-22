@@ -33,6 +33,14 @@ fn request(effort: Option<Effort>) -> CompletionRequest {
         temperature: None,
         reasoning: true,
         effort,
+        thinking_budget: None,
+    }
+}
+
+fn request_with_budget(budget_tokens: u32) -> CompletionRequest {
+    CompletionRequest {
+        thinking_budget: Some(budget_tokens),
+        ..request(None)
     }
 }
 
@@ -99,6 +107,36 @@ async fn no_output_config_without_effort() -> TestResult {
     let completion = client(&server)?.complete(request(None)).await?;
     assert_eq!(completion.reasoning.kind, ReasoningKind::Redacted);
     assert_eq!(completion.finish, FinishReason::Length);
+    let requests = server.received_requests().await.ok_or("recording off")?;
+    let body: Value = serde_json::from_slice(&requests.first().ok_or("no request")?.body)?;
+    assert!(body.get("output_config").is_none(), "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn sends_enabled_thinking_with_a_budget_and_no_output_config() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-api-key", KEY))
+        .and(body_partial_json(json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 2048,
+            "system": "Be precise.",
+            "messages": [{"role": "user", "content": "Why borrow?"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1024}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(message_body(
+            &json!([{"type": "text", "text": "Borrow to avoid a move."}]),
+            "end_turn",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let completion = client(&server)?.complete(request_with_budget(1024)).await?;
+    assert_eq!(completion.content, "Borrow to avoid a move.");
+
     let requests = server.received_requests().await.ok_or("recording off")?;
     let body: Value = serde_json::from_slice(&requests.first().ok_or("no request")?.body)?;
     assert!(body.get("output_config").is_none(), "{body}");

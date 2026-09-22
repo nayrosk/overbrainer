@@ -71,7 +71,9 @@ Only raw reasoning is used for training: a usable example keeps `reasoning_conte
 With `reasoning = true` on the parent:
 
 - `openai` protocol: overbrainer sends `reasoning: {"effort": ...}` (`medium` unless `reasoning_effort` is set) and reads the reasoning from `reasoning`, `reasoning_content`, `reasoning_details`, or a `<think>` block in the answer.
-- `anthropic` protocol: overbrainer asks for adaptive thinking.
+- `anthropic` protocol: overbrainer asks for adaptive thinking (`thinking: {"type": "adaptive"}`), unless the role sets `thinking_budget`.
+
+Claude Sonnet 5, Opus 5, Opus 4.8, Opus 4.7 and Fable 5.x require adaptive thinking and reject a fixed budget, so leave `thinking_budget` unset for them. Claude Opus 4.5, Sonnet 4.5 and Haiku 4.5 do the opposite: they reject adaptive thinking (`400 adaptive thinking is not supported on this model`) and need a fixed budget instead. Set `roles.<role>.thinking_budget` to a value in `[1024, max_tokens)` to switch that role to `thinking: {"type": "enabled", "budget_tokens": ...}`, which also drops `output_config.effort` from the request (`thinking_budget` cannot combine with `reasoning_effort`).
 
 Some parents never return their raw reasoning, whatever their responses claim: any model on the `anthropic` protocol, and Claude, Gemini and OpenAI models on the `openai` protocol (except the open-weight `gpt-oss` models, whose reasoning is raw). overbrainer stores their reasoning as a summary (`reasoning_kind = "summary"`). With `reasoning = true`, every answer from such a parent is therefore excluded as `no_raw_reasoning`, and overbrainer warns about it at startup. With `reasoning = false`, the answers stay usable, without their reasoning.
 
@@ -113,6 +115,7 @@ Each role (`generator`, `parent`, optional `embedder`) names a provider and a mo
 | `max_tokens` | `16384` | Upper bound on generated tokens, reasoning included. |
 | `temperature` | provider default | Sampling temperature, 0 to 2. Not allowed with `reasoning = true` on the `anthropic` protocol, which rejects it. |
 | `reasoning_effort` | `medium` on `openai` | `low`, `medium` or `high`. Only with `reasoning = true`. |
+| `thinking_budget` | none (adaptive thinking) | `anthropic` protocol only. Fixed extended-thinking token budget, `[1024, max_tokens)`. Only with `reasoning = true`, and cannot combine with `reasoning_effort`. Required by Claude Opus 4.5, Sonnet 4.5 and Haiku 4.5; leave unset for newer Claude models. |
 
 The embedder must use the `openai` protocol: Anthropic has no embeddings endpoint.
 

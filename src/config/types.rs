@@ -125,6 +125,17 @@ pub struct RoleModel {
     pub temperature: Option<f64>,
     /// Reasoning effort. Only valid with `reasoning = true`.
     pub reasoning_effort: Option<Effort>,
+    /// Fixed extended-thinking token budget, for the `anthropic` protocol only. Only
+    /// valid with `reasoning = true`, must be at least 1024 and less than `max_tokens`,
+    /// and cannot be combined with `reasoning_effort`.
+    ///
+    /// Absent (the default), overbrainer asks for adaptive thinking
+    /// (`thinking: {"type": "adaptive"}`), which Claude Sonnet 5, Opus 5, Opus 4.8,
+    /// Opus 4.7 and Fable 5.x require. Claude Opus 4.5, Sonnet 4.5 and Haiku 4.5 reject
+    /// adaptive thinking instead and need this key set, which sends
+    /// `thinking: {"type": "enabled", "budget_tokens": ...}` and omits
+    /// `output_config.effort`.
+    pub thinking_budget: Option<u32>,
 }
 
 fn default_max_tokens() -> u32 {

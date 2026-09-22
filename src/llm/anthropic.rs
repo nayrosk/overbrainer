@@ -50,12 +50,15 @@ impl AnthropicClient {
     }
 
     /// Sends one message request. With reasoning, asks for adaptive thinking and, when
-    /// an effort is configured, sets `output_config.effort`.
+    /// an effort is configured, sets `output_config.effort` — unless the role set a
+    /// `thinking_budget`, in which case it asks for a fixed thinking budget instead and
+    /// omits `output_config` entirely. See [`thinking_config`].
     ///
     /// # Errors
     ///
     /// Returns an [`LlmError`] when the request fails or the response is invalid.
     pub async fn complete(&self, request: &CompletionRequest) -> Result<Completion, LlmError> {
+        let (thinking, output_config) = thinking_config(request);
         let body = MessagesRequest {
             model: &self.model,
             max_tokens: request.max_tokens,
@@ -65,12 +68,8 @@ impl AnthropicClient {
                 content: &request.prompt,
             }],
             temperature: request.temperature,
-            thinking: request.reasoning.then_some(Thinking { kind: "adaptive" }),
-            output_config: request.effort.filter(|_| request.reasoning).map(|effort| {
-                OutputConfig {
-                    effort: effort.as_str(),
-                }
-            }),
+            thinking,
+            output_config,
         };
         let response: MessagesResponse = self.endpoint.post("messages", &body).await?;
         let usage = response.usage.map_or_else(Usage::default, |usage| Usage {
@@ -118,15 +117,44 @@ struct WireMessage<'a> {
     content: &'a str,
 }
 
-#[derive(Serialize)]
-struct Thinking {
-    #[serde(rename = "type")]
-    kind: &'static str,
+/// The `thinking` request block.
+///
+/// `Adaptive` lets the model decide when and how much to think and is required by
+/// Claude Sonnet 5, Opus 5, Opus 4.8, Opus 4.7 and Fable 5.x, which reject a fixed
+/// budget. `Enabled` asks for a fixed token budget and is required by Claude Opus 4.5,
+/// Sonnet 4.5 and Haiku 4.5, which reject adaptive thinking.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Thinking {
+    Adaptive,
+    Enabled { budget_tokens: u32 },
 }
 
 #[derive(Serialize)]
 struct OutputConfig {
     effort: &'static str,
+}
+
+/// Builds the `thinking` and `output_config` fields of a message request from
+/// `request.reasoning`, `request.effort` and `request.thinking_budget`.
+///
+/// Without reasoning, both are `None`. With reasoning and no `thinking_budget`, sends
+/// adaptive thinking plus `output_config.effort` when an effort is configured. With a
+/// `thinking_budget`, sends a fixed-budget `enabled` thinking block instead and always
+/// omits `output_config`, since the two are mutually exclusive on the wire.
+fn thinking_config(request: &CompletionRequest) -> (Option<Thinking>, Option<OutputConfig>) {
+    if !request.reasoning {
+        return (None, None);
+    }
+    match request.thinking_budget {
+        Some(budget_tokens) => (Some(Thinking::Enabled { budget_tokens }), None),
+        None => (
+            Some(Thinking::Adaptive),
+            request.effort.map(|effort| OutputConfig {
+                effort: effort.as_str(),
+            }),
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -204,9 +232,78 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::config::Effort;
 
     fn blocks(value: &serde_json::Value) -> Result<(String, Reasoning), serde_json::Error> {
         Ok(split_blocks(serde_json::from_value(value.clone())?))
+    }
+
+    fn reasoning_request(
+        effort: Option<Effort>,
+        thinking_budget: Option<u32>,
+    ) -> CompletionRequest {
+        CompletionRequest {
+            system: None,
+            prompt: "p".into(),
+            max_tokens: 4096,
+            temperature: None,
+            reasoning: true,
+            effort,
+            thinking_budget,
+        }
+    }
+
+    #[test]
+    fn adaptive_thinking_is_the_default() -> Result<(), serde_json::Error> {
+        let request = reasoning_request(Some(Effort::High), None);
+        let (thinking, output_config) = thinking_config(&request);
+        assert_eq!(serde_json::to_value(thinking)?, json!({"type": "adaptive"}));
+        assert_eq!(
+            serde_json::to_value(output_config)?,
+            json!({"effort": "high"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_thinking_budget_sends_an_enabled_block_and_no_output_config()
+    -> Result<(), serde_json::Error> {
+        let request = reasoning_request(None, Some(2048));
+        let (thinking, output_config) = thinking_config(&request);
+        assert_eq!(
+            serde_json::to_value(thinking)?,
+            json!({"type": "enabled", "budget_tokens": 2048})
+        );
+        assert!(output_config.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_thinking_budget_wins_over_an_effort() -> Result<(), serde_json::Error> {
+        let request = reasoning_request(Some(Effort::High), Some(2048));
+        let (thinking, output_config) = thinking_config(&request);
+        assert_eq!(
+            serde_json::to_value(thinking)?,
+            json!({"type": "enabled", "budget_tokens": 2048})
+        );
+        assert!(output_config.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn no_reasoning_means_no_thinking_block() {
+        let request = CompletionRequest {
+            system: None,
+            prompt: "p".into(),
+            max_tokens: 4096,
+            temperature: None,
+            reasoning: false,
+            effort: None,
+            thinking_budget: None,
+        };
+        let (thinking, output_config) = thinking_config(&request);
+        assert!(thinking.is_none());
+        assert!(output_config.is_none());
     }
 
     #[test]

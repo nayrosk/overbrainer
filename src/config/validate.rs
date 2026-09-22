@@ -4,6 +4,9 @@ use super::types::{Protocol, Runtime, Settings, Target};
 /// what a semaphore can hold.
 const MAX_CONCURRENCY: usize = 1024;
 
+/// Lowest `thinking_budget`: the smallest `budget_tokens` the `anthropic` protocol accepts.
+const MIN_THINKING_BUDGET: u32 = 1024;
+
 /// Returns true when `name` matches `^[a-z0-9_]+$`.
 pub(crate) fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -80,6 +83,46 @@ fn check_role_params(settings: &Settings, problems: &mut Vec<String>) {
         }
     }
     check_thinking_temperature(settings, problems);
+    check_thinking_budget(settings, problems);
+}
+
+/// `thinking_budget` requires reasoning, a value in `[1024, max_tokens)`, no
+/// `reasoning_effort`, and the `anthropic` protocol (the only one that has it).
+fn check_thinking_budget(settings: &Settings, problems: &mut Vec<String>) {
+    for (role, model) in settings.roles.all() {
+        let Some(budget) = model.thinking_budget else {
+            continue;
+        };
+        if !model.reasoning {
+            problems.push(format!(
+                "roles.{role}.thinking_budget: requires reasoning = true"
+            ));
+        }
+        if model.reasoning_effort.is_some() {
+            problems.push(format!(
+                "roles.{role}.thinking_budget: cannot be combined with reasoning_effort"
+            ));
+        }
+        let anthropic = settings
+            .providers
+            .get(&model.provider)
+            .is_some_and(|provider| provider.protocol == Protocol::Anthropic);
+        if !anthropic {
+            problems.push(format!(
+                "roles.{role}.thinking_budget: only valid on the anthropic protocol"
+            ));
+        }
+        if budget < MIN_THINKING_BUDGET {
+            problems.push(format!(
+                "roles.{role}.thinking_budget: must be at least {MIN_THINKING_BUDGET}"
+            ));
+        }
+        if budget >= model.max_tokens {
+            problems.push(format!(
+                "roles.{role}.thinking_budget: must be less than max_tokens"
+            ));
+        }
+    }
 }
 
 /// The `anthropic` protocol rejects a temperature when thinking is enabled.
@@ -433,6 +476,98 @@ mod tests {
                 "{parent}"
             );
         }
+        Ok(())
+    }
+
+    /// Applies `generator` in place of the default `nanogpt`-backed generator, and
+    /// declares a `claude` provider on the `anthropic` protocol for it to reference.
+    fn with_anthropic_generator(generator: &str) -> String {
+        format!(
+            "{}\n[providers.claude]\nprotocol = \"anthropic\"",
+            VALID.replace(
+                r#"generator = { provider = "nanogpt", model = "m1" }"#,
+                &format!("generator = {generator}"),
+            )
+        )
+    }
+
+    #[test]
+    fn thinking_budget_requires_reasoning() -> Result<(), config::ConfigError> {
+        let toml = with_anthropic_generator(
+            r#"{ provider = "claude", model = "m1", thinking_budget = 2048 }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec!["roles.generator.thinking_budget: requires reasoning = true".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_budget_has_a_minimum() -> Result<(), config::ConfigError> {
+        let toml = with_anthropic_generator(
+            r#"{ provider = "claude", model = "m1", reasoning = true, thinking_budget = 512, max_tokens = 4096 }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec!["roles.generator.thinking_budget: must be at least 1024".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_budget_must_be_below_max_tokens() -> Result<(), config::ConfigError> {
+        let toml = with_anthropic_generator(
+            r#"{ provider = "claude", model = "m1", reasoning = true, thinking_budget = 4096, max_tokens = 4096 }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec!["roles.generator.thinking_budget: must be less than max_tokens".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_budget_cannot_combine_with_reasoning_effort() -> Result<(), config::ConfigError> {
+        let toml = with_anthropic_generator(
+            r#"{ provider = "claude", model = "m1", reasoning = true, thinking_budget = 2048, reasoning_effort = "high", max_tokens = 4096 }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec![
+                "roles.generator.thinking_budget: cannot be combined with reasoning_effort"
+                    .to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_budget_is_rejected_on_the_openai_protocol() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            r#"generator = { provider = "nanogpt", model = "m1" }"#,
+            r#"generator = { provider = "nanogpt", model = "m1", reasoning = true, thinking_budget = 2048 }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec![
+                "roles.generator.thinking_budget: only valid on the anthropic protocol".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_budget_is_accepted_when_valid() -> Result<(), config::ConfigError> {
+        let toml = with_anthropic_generator(
+            r#"{ provider = "claude", model = "m1", reasoning = true, thinking_budget = 2048, max_tokens = 4096 }"#,
+        );
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
         Ok(())
     }
 
