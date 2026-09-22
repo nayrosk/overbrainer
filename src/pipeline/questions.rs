@@ -5,7 +5,7 @@ use crate::config::Topic;
 use crate::dataset::{Appender, Id, Question, Subtopic, read, rewrite};
 use crate::dedup::Deduplicator;
 use crate::events::{Event, Stage, StageStats};
-use crate::llm::{LlmClient, LlmError};
+use crate::llm::{LlmClient, Usage};
 use crate::prompts;
 
 #[derive(Serialize)]
@@ -25,12 +25,15 @@ struct Context<'a> {
 /// through a deduplicator shared by the whole topic, created by `new_dedup` and seeded
 /// with the questions already on disk. A subtopic stops at `questions_per_subtopic`
 /// or after `pipeline.max_retries` batches without a new question (at least one).
-/// Batches run one after the other because each depends on the previous ones.
+/// Batches run one after the other because each depends on the previous ones. A
+/// deduplicator error that survives its own retries stops the whole stage when it is
+/// fatal; otherwise it fails only the subtopic being filled, or, when it happens while
+/// seeding a topic's deduplicator from the questions already on disk, the whole topic.
 ///
 /// # Errors
 ///
 /// Returns a [`PipelineError`] when a file or template fails, when deduplication
-/// fails, or when the provider rejects the requests.
+/// fails fatally, or when the provider rejects the requests.
 pub async fn questions<C, D, F>(
     ctx: &Ctx<'_>,
     generator: &RoleClient<C>,
@@ -48,13 +51,9 @@ where
         existing = without_topics(existing, &topics, |question| &question.topic);
         rewrite(&ctx.files.questions, &existing)?;
     }
-    let total = subtopics
-        .iter()
-        .filter(|subtopic| topics.iter().any(|topic| topic.name == subtopic.topic))
-        .count();
     ctx.bus.publish(Event::StageStarted {
         stage: Stage::Questions,
-        total,
+        total: remaining_subtopics(&subtopics, &existing, &topics),
     });
     let mut filler = Filler {
         ctx,
@@ -69,7 +68,14 @@ where
             .filter(|question| question.topic == topic.name)
             .map(|question| question.text.clone())
             .collect();
-        dedup.record(&known).await.map_err(stage_error)?;
+        let seed = Item {
+            stage: Stage::Questions,
+            id: topic.name.clone(),
+        };
+        if let Err(error) = dedup.record(&known).await {
+            item_error(ctx, &seed, error, &mut filler.stats)?;
+            continue;
+        }
         for subtopic in subtopics.iter().filter(|s| s.topic == topic.name) {
             let accepted: Vec<String> = existing
                 .iter()
@@ -88,11 +94,24 @@ where
     Ok(filler.stats)
 }
 
-fn stage_error(source: LlmError) -> PipelineError {
-    PipelineError::Llm {
-        stage: Stage::Questions,
-        source,
-    }
+/// Subtopics of `topics` not yet filled to their `questions_per_subtopic` target.
+fn remaining_subtopics(subtopics: &[Subtopic], existing: &[Question], topics: &[&Topic]) -> usize {
+    subtopics
+        .iter()
+        .filter(|subtopic| needs_filling(subtopic, existing, topics))
+        .count()
+}
+
+/// Whether `subtopic` still needs questions, given what is already accepted for it.
+fn needs_filling(subtopic: &Subtopic, existing: &[Question], topics: &[&Topic]) -> bool {
+    let Some(topic) = topics.iter().find(|topic| topic.name == subtopic.topic) else {
+        return false;
+    };
+    let accepted = existing
+        .iter()
+        .filter(|question| question.subtopic_id == subtopic.id)
+        .count();
+    accepted < usize::try_from(topic.questions_per_subtopic).unwrap_or(usize::MAX)
 }
 
 /// One subtopic being filled.
@@ -138,10 +157,12 @@ impl<C: LlmClient> Filler<'_, C> {
         }
         let patience = self.ctx.settings.pipeline.max_retries.max(1);
         let mut stalls = 0;
+        let mut usage = Usage::default();
         while slot.accepted.len() < slot.target && stalls < patience {
-            let Some(added) = self.batch(&slot, dedup).await? else {
+            let Some((added, batch_usage)) = self.batch(&slot, dedup).await? else {
                 return Ok(());
             };
+            usage += batch_usage;
             stalls = if added.is_empty() { stalls + 1 } else { 0 };
             slot.accepted.extend(added);
         }
@@ -152,18 +173,18 @@ impl<C: LlmClient> Filler<'_, C> {
         self.ctx.bus.publish(Event::ItemDone {
             stage: Stage::Questions,
             id: slot.item.id,
-            usage: None,
+            usage: Some(usage),
         });
         Ok(())
     }
 
-    /// Generates, deduplicates and writes one batch. Returns the accepted texts, or
-    /// `None` when the subtopic failed and was reported.
+    /// Generates, deduplicates and writes one batch. Returns the accepted texts with
+    /// their token usage, or `None` when the subtopic failed and was reported.
     async fn batch<D: Deduplicator>(
         &mut self,
         slot: &Slot<'_>,
         dedup: &mut D,
-    ) -> Result<Option<Vec<String>>, PipelineError> {
+    ) -> Result<Option<(Vec<String>, Usage)>, PipelineError> {
         let batch_size =
             usize::try_from(self.ctx.settings.pipeline.question_batch_size).unwrap_or(usize::MAX);
         let count = batch_size.min(slot.target - slot.accepted.len());
@@ -185,15 +206,21 @@ impl<C: LlmClient> Filler<'_, C> {
             &mut self.stats,
         )
         .await;
-        let candidates = match asked {
-            Ok(candidates) => candidates,
+        let (candidates, usage) = match asked {
+            Ok(asked) => asked,
             Err(error) => {
                 item_error(self.ctx, &slot.item, error, &mut self.stats)?;
                 return Ok(None);
             },
         };
         let candidates = candidates.into_iter().take(count).collect();
-        let added = dedup.admit(candidates).await.map_err(stage_error)?;
+        let added = match dedup.admit(candidates).await {
+            Ok(added) => added,
+            Err(error) => {
+                item_error(self.ctx, &slot.item, error, &mut self.stats)?;
+                return Ok(None);
+            },
+        };
         for text in &added {
             self.out.append(&Question {
                 id: Id::question(&slot.subtopic.id, text),
@@ -203,7 +230,7 @@ impl<C: LlmClient> Filler<'_, C> {
                 text: text.clone(),
             })?;
         }
-        Ok(Some(added))
+        Ok(Some((added, usage)))
     }
 }
 

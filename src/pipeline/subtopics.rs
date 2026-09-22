@@ -6,7 +6,7 @@ use super::{Ctx, Item, PipelineError, RoleClient, ask_list, item_error, without_
 use crate::config::Topic;
 use crate::dataset::{Appender, Id, Subtopic, read, rewrite};
 use crate::events::{Event, Stage, StageStats};
-use crate::llm::LlmClient;
+use crate::llm::{LlmClient, Usage};
 use crate::prompts;
 
 #[derive(Serialize)]
@@ -16,10 +16,22 @@ struct Context<'a> {
     count: u32,
 }
 
+/// One topic's remaining subtopics to generate: how many are still missing and which
+/// IDs (stored or already generated in this run) must not be repeated.
+struct Plan<'a> {
+    topic: &'a Topic,
+    existing_ids: BTreeSet<Id>,
+    missing: usize,
+    item: Item,
+}
+
 /// Generates the subtopics of each selected topic into `data/subtopics.jsonl`.
 ///
-/// A topic that already has subtopics is skipped unless `--force` is set, which first
-/// removes the topic's subtopics. An unparseable answer is asked again.
+/// A topic is skipped once it has `topic.subtopics` stored subtopics; `--force` first
+/// removes the topic's subtopics. A topic with fewer stored subtopics than configured,
+/// for example after a crash mid-topic, is resumed: only the missing count is
+/// requested, and generated names that normalize to an ID already stored or already
+/// generated in this batch are dropped. An unparseable answer is asked again.
 ///
 /// # Errors
 ///
@@ -36,34 +48,49 @@ pub async fn subtopics<C: LlmClient>(
         rewrite(&ctx.files.subtopics, &existing)?;
     }
     let mut out = Appender::open(&ctx.files.subtopics)?;
+    let total = topics
+        .iter()
+        .filter(|topic| stored_count(&existing, &topic.name) < target_count(topic))
+        .count();
     ctx.bus.publish(Event::StageStarted {
         stage: Stage::Subtopics,
-        total: topics.len(),
+        total,
     });
     let mut stats = StageStats::default();
     for topic in topics {
-        if existing.iter().any(|subtopic| subtopic.topic == topic.name) {
+        let have = stored_count(&existing, &topic.name);
+        let target = target_count(topic);
+        if have >= target {
             stats.skipped += 1;
             continue;
         }
-        let item = Item {
-            stage: Stage::Subtopics,
-            id: topic.name.clone(),
+        let plan = Plan {
+            existing_ids: existing
+                .iter()
+                .filter(|subtopic| subtopic.topic == topic.name)
+                .map(|subtopic| subtopic.id.clone())
+                .collect(),
+            missing: target - have,
+            item: Item {
+                stage: Stage::Subtopics,
+                id: topic.name.clone(),
+            },
+            topic,
         };
-        match generate(ctx, generator, topic, &item, &mut stats).await {
-            Ok(subtopics) => {
-                for subtopic in &subtopics {
+        match generate(ctx, generator, &plan, &mut stats).await {
+            Ok((new_subtopics, usage)) => {
+                for subtopic in &new_subtopics {
                     out.append(subtopic)?;
                 }
                 stats.done += 1;
                 ctx.bus.publish(Event::ItemDone {
                     stage: Stage::Subtopics,
-                    id: item.id,
-                    usage: None,
+                    id: plan.item.id,
+                    usage: Some(usage),
                 });
             },
             Err(PipelineError::Llm { source, .. }) => {
-                item_error(ctx, &item, source, &mut stats)?;
+                item_error(ctx, &plan.item, source, &mut stats)?;
             },
             Err(error) => return Err(error),
         }
@@ -75,39 +102,51 @@ pub async fn subtopics<C: LlmClient>(
     Ok(stats)
 }
 
-/// Asks for `topic.subtopics` names and turns them into records, dropping names that
-/// normalize to the same ID and anything beyond the requested count.
+/// Subtopics of `topic_name` already stored.
+fn stored_count(existing: &[Subtopic], topic_name: &str) -> usize {
+    existing
+        .iter()
+        .filter(|subtopic| subtopic.topic == topic_name)
+        .count()
+}
+
+/// Configured subtopic count of `topic`.
+fn target_count(topic: &Topic) -> usize {
+    usize::try_from(topic.subtopics).unwrap_or(usize::MAX)
+}
+
+/// Asks for `plan.missing` names and turns them into records, dropping names that
+/// normalize to an ID already stored or already generated earlier in this batch.
 async fn generate<C: LlmClient>(
     ctx: &Ctx<'_>,
     generator: &RoleClient<C>,
-    topic: &Topic,
-    item: &Item,
+    plan: &Plan<'_>,
     stats: &mut StageStats,
-) -> Result<Vec<Subtopic>, PipelineError> {
+) -> Result<(Vec<Subtopic>, Usage), PipelineError> {
     let prompt = ctx.prompts.render(
         prompts::SUBTOPICS,
         Context {
-            topic: &topic.name,
-            description: topic.description.as_deref(),
-            count: topic.subtopics,
+            topic: &plan.topic.name,
+            description: plan.topic.description.as_deref(),
+            count: u32::try_from(plan.missing).unwrap_or(u32::MAX),
         },
     )?;
-    let names = ask_list(ctx, generator, prompt, item, stats)
+    let (names, usage) = ask_list(ctx, generator, prompt, &plan.item, stats)
         .await
         .map_err(|source| PipelineError::Llm {
             stage: Stage::Subtopics,
             source,
         })?;
-    let limit = usize::try_from(topic.subtopics).unwrap_or(usize::MAX);
-    let mut seen = BTreeSet::new();
-    Ok(names
+    let mut seen = plan.existing_ids.clone();
+    let subtopics = names
         .into_iter()
         .map(|name| Subtopic {
-            id: Id::subtopic(&topic.name, &name),
-            topic: topic.name.clone(),
+            id: Id::subtopic(&plan.topic.name, &name),
+            topic: plan.topic.name.clone(),
             name,
         })
         .filter(|subtopic| seen.insert(subtopic.id.clone()))
-        .take(limit)
-        .collect())
+        .take(plan.missing)
+        .collect();
+    Ok((subtopics, usage))
 }
