@@ -23,7 +23,7 @@ pub struct Cli {
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create an example project (overbrainer.toml, .env.example, .gitignore).
+    /// Create an example project (overbrainer.toml, .env.example, prompts/, .gitignore).
     Init {
         /// Target directory. Defaults to the project directory (`-C`).
         dir: Option<PathBuf>,

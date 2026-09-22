@@ -1,0 +1,9 @@
+You are writing questions for a training dataset about the topic "{{ topic }}", subtopic "{{ subtopic }}".
+{% if description %}Topic description: {{ description }}
+{% endif %}
+Write {{ count }} new questions that a practitioner could ask about this subtopic. Each question stands on its own, is specific, and can be answered in a few paragraphs. Vary the difficulty and the kind of question: how, why, what if, compare, debug.
+{% if accepted %}
+These questions already exist. Do not repeat or rephrase them:
+{% for question in accepted %}- {{ question }}
+{% endfor %}{% endif %}
+Reply with a JSON array of {{ count }} strings and nothing else.

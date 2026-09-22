@@ -1,0 +1,6 @@
+You are planning a training dataset about the topic "{{ topic }}".
+{% if description %}Topic description: {{ description }}
+{% endif %}
+List {{ count }} distinct subtopics that together cover this topic. Each subtopic is a short noun phrase, specific enough to generate many questions from, and no two subtopics overlap.
+
+Reply with a JSON array of {{ count }} strings and nothing else.

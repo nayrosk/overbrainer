@@ -18,7 +18,14 @@ fn init_creates_project_files_and_refuses_to_overwrite() -> Result<(), Box<dyn s
         .arg(dir.path())
         .assert()
         .success();
-    for file in ["overbrainer.toml", ".env.example", ".gitignore"] {
+    for file in [
+        "overbrainer.toml",
+        ".env.example",
+        ".gitignore",
+        "prompts/subtopics.txt",
+        "prompts/questions.txt",
+        "prompts/answer_system.txt",
+    ] {
         assert!(dir.path().join(file).is_file(), "{file} missing");
     }
     overbrainer()?
@@ -202,6 +209,7 @@ fn init_appends_missing_gitignore_entries_once() -> Result<(), Box<dyn std::erro
     // A second init (after removing the non-appendable files) adds nothing.
     std::fs::remove_file(dir.path().join("overbrainer.toml"))?;
     std::fs::remove_file(dir.path().join(".env.example"))?;
+    std::fs::remove_dir_all(dir.path().join("prompts"))?;
     overbrainer()?
         .arg("init")
         .arg(dir.path())
@@ -223,6 +231,7 @@ fn init_refusal_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
         .failure()
         .stderr(predicate::str::contains(".env.example already exists"));
     assert!(!dir.path().join("overbrainer.toml").exists());
+    assert!(!dir.path().join("prompts").exists());
     assert_eq!(
         std::fs::read_to_string(dir.path().join(".env.example"))?,
         "keep me\n"

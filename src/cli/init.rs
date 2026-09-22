@@ -2,40 +2,56 @@
 
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
-/// Files that are never overwritten: `init` refuses when any of them exists.
-const FILES: [(&str, &str); 2] = [
-    (
-        "overbrainer.toml",
-        include_str!("../../templates/overbrainer.toml"),
-    ),
-    (".env.example", include_str!("../../templates/env.example")),
-];
+use crate::prompts;
+
+/// Files that are never overwritten, relative to the project directory: `init`
+/// refuses when any of them exists.
+fn files() -> Vec<(PathBuf, &'static str)> {
+    let mut files = vec![
+        (
+            PathBuf::from("overbrainer.toml"),
+            include_str!("../../templates/overbrainer.toml"),
+        ),
+        (
+            PathBuf::from(".env.example"),
+            include_str!("../../templates/env.example"),
+        ),
+    ];
+    for (name, content) in prompts::DEFAULTS {
+        files.push((Path::new(prompts::DIR).join(name), content));
+    }
+    files
+}
 
 const GITIGNORE: &str = ".gitignore";
 const GITIGNORE_TEMPLATE: &str = include_str!("../../templates/gitignore");
 
-/// Writes the example project files into `dir`.
+/// Writes the example project files into `dir`: `overbrainer.toml`, `.env.example`,
+/// the default prompt templates in `prompts/`, and `.gitignore`.
 ///
-/// `overbrainer.toml` and `.env.example` are never overwritten: if either exists,
-/// nothing is written. An existing `.gitignore` gets only the entries it lacks.
+/// None of these files is ever overwritten: if one exists, nothing is written. An
+/// existing `.gitignore` gets only the entries it lacks.
 ///
 /// # Errors
 ///
-/// Returns an error if `dir` cannot be created, if `overbrainer.toml` or
-/// `.env.example` already exists, or if a file cannot be read or written.
+/// Returns an error if `dir` cannot be created, if one of the files already exists,
+/// or if a file cannot be read or written.
 pub fn run(dir: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    for (name, _) in FILES {
+    let files = files();
+    for (name, _) in &files {
         let path = dir.join(name);
         if path.exists() {
             bail!("{} already exists", path.display());
         }
     }
-    for (name, content) in FILES {
+    let prompts_dir = dir.join(prompts::DIR);
+    std::fs::create_dir_all(&prompts_dir)
+        .with_context(|| format!("cannot create {}", prompts_dir.display()))?;
+    for (name, content) in &files {
         create_new(&dir.join(name), content)?;
     }
     update_gitignore(&dir.join(GITIGNORE))
