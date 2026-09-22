@@ -136,7 +136,7 @@ engine = "podman"              # docker (default) | podman
 
 ### The Hugging Face token
 
-`OVERBRAINER_HF_TOKEN` (a literal or a `vault:` reference) is resolved only when a run starts and reaches the job only as its `HF_TOKEN` environment variable: it is never written to `axolotl.yaml`, `run.json` or any other file, never put on a command line, and sent over SSH on the command's standard input. It is needed for gated or private base models and for `hub_model_id`, which pushes the adapter (not the merged model) to a private Hub repository.
+`OVERBRAINER_HF_TOKEN` (a literal or a `vault:` reference) is resolved only when a run starts and reaches the job only as its `HF_TOKEN` environment variable: it is never written to `axolotl.yaml`, `run.json` or any file overbrainer writes, never put on a command line, and sent over SSH on the command's standard input. With the `docker` runtime it does reach one file overbrainer does not write: the container engine stores the environment it was started with in the container's own configuration, where `docker inspect` (or `podman inspect`) shows it until the container is removed. It is needed for gated or private base models and for `hub_model_id`, which pushes the adapter (not the merged model) to a private Hub repository.
 
 ### Reasoning in the chat template
 
