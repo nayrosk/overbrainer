@@ -3,6 +3,7 @@
 
 mod id;
 mod summary;
+mod train;
 
 use std::fs;
 use std::io;
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub use id::{is_valid_run_id, new_run_id, rfc3339};
 pub use summary::MetricsSummary;
+pub use train::{HF_CACHE_DIR, Launch, Outcome, RunCtx, RunError, cancel, create, start, watch};
 
 use crate::exec::JobId;
 
