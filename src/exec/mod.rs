@@ -28,12 +28,16 @@ pub const PID_FILE: &str = "job.pid";
 /// Exit code of the job once it has ended, in its run directory.
 pub const EXIT_FILE: &str = "exit_code";
 /// Marker written by [`Executor::cancel`] before it signals anything, in the run
-/// directory. Once this exists, [`Executor::status`] reports [`JobStatus::Running`]
-/// for as long as the process group is alive and [`JobStatus::Cancelled`] once it is
-/// gone, even before [`CANCEL_FILE`] itself is written.
+/// directory. While this exists and [`CANCEL_FILE`] does not, [`Executor::status`]
+/// reports [`JobStatus::Running`] for as long as the process group is alive and
+/// [`JobStatus::Cancelled`] once it is gone, even before [`CANCEL_FILE`] itself is
+/// written and even if [`EXIT_FILE`] also exists (stopping a job's container can
+/// make its wrapper write an exit code while the cancel is still in flight).
 pub const CANCELLING_FILE: &str = "cancelling";
 /// Marker written by [`Executor::cancel`] once the process group is confirmed gone,
-/// in the run directory.
+/// in the run directory. Once this exists, [`Executor::status`] reports
+/// [`JobStatus::Cancelled`] unconditionally: not even a live process at a recycled
+/// `pid`, or an [`EXIT_FILE`] written before the cancel finished, can change it.
 pub const CANCEL_FILE: &str = "cancelled";
 
 /// Errors from running or reaching a job.
@@ -222,9 +226,11 @@ pub trait Executor: Send + Sync {
     /// Otherwise, [`CANCELLING_FILE`] is written before anything is signalled, so
     /// [`Executor::status`] reports [`JobStatus::Running`] while the group is being
     /// stopped and [`JobStatus::Cancelled`] as soon as it is gone, never
-    /// [`JobStatus::Lost`]; [`CANCEL_FILE`] is written last, once the group is
-    /// confirmed gone. Calling `cancel` again on an already cancelled job is a
-    /// no-op.
+    /// [`JobStatus::Lost`] and never stuck on an exit code that stopping the
+    /// container causes the job's wrapper to write while the cancel is still in
+    /// flight; [`CANCEL_FILE`] is written last, once the group is confirmed gone,
+    /// and then wins unconditionally over everything else. Calling `cancel` again
+    /// on an already cancelled job is a no-op.
     ///
     /// # Errors
     ///
