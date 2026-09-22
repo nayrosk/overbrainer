@@ -1,0 +1,23 @@
+# release-plz only opens and updates the release pull request: version bump,
+# CHANGELOG.md and cargo-semver-checks. It never tags, releases or publishes.
+# After merging the release PR, a maintainer pushes a signed `v<version>` tag, and
+# .github/workflows/release.yml publishes the crate and the GitHub release.
+
+[workspace]
+changelog_update = true
+semver_check = true
+git_tag_enable = false
+git_release_enable = false
+publish = false
+
+[changelog]
+commit_parsers = [
+    { message = "^Merge", skip = true },
+    { message = "^feat", group = "added" },
+    { message = "^fix", group = "fixed" },
+    { message = "^perf", group = "changed" },
+    { message = "^refactor", group = "changed" },
+    { message = "^docs", group = "documentation" },
+    { message = "^(build|chore|ci|style|test)", skip = true },
+    { message = "^.*", group = "other" },
+]
