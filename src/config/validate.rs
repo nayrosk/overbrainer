@@ -79,6 +79,22 @@ fn check_role_params(settings: &Settings, problems: &mut Vec<String>) {
             ));
         }
     }
+    check_thinking_temperature(settings, problems);
+}
+
+/// The `anthropic` protocol rejects a temperature when thinking is enabled.
+fn check_thinking_temperature(settings: &Settings, problems: &mut Vec<String>) {
+    for (role, model) in settings.roles.all() {
+        let anthropic = settings
+            .providers
+            .get(&model.provider)
+            .is_some_and(|provider| provider.protocol == Protocol::Anthropic);
+        if anthropic && model.reasoning && model.temperature.is_some() {
+            problems.push(format!(
+                "roles.{role}.temperature: the anthropic protocol does not accept a temperature with reasoning = true"
+            ));
+        }
+    }
 }
 
 /// Topic names are unique and their counts are at least 1.
@@ -384,6 +400,39 @@ mod tests {
         );
         let toml = format!("{VALID}\n[pipeline]\nconcurrency = 1024\n");
         assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn temperature_with_reasoning_is_rejected_on_the_anthropic_protocol()
+    -> Result<(), config::ConfigError> {
+        let with_claude = |parent: &str| {
+            VALID.replace(
+                r#"parent = { provider = "nanogpt", model = "m2", reasoning = true }"#,
+                &format!("parent = {parent}\n[providers.claude]\nprotocol = \"anthropic\""),
+            )
+        };
+        let toml = with_claude(
+            r#"{ provider = "claude", model = "m2", reasoning = true, temperature = 0.7 }"#,
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "roles.parent.temperature: the anthropic protocol does not accept a temperature with reasoning = true"
+                    .to_string()
+            ]
+        );
+        for parent in [
+            r#"{ provider = "claude", model = "m2", temperature = 0.7 }"#,
+            r#"{ provider = "claude", model = "m2", reasoning = true }"#,
+            r#"{ provider = "nanogpt", model = "m2", reasoning = true, temperature = 0.7 }"#,
+        ] {
+            assert_eq!(
+                check(&settings(&with_claude(parent))?),
+                Vec::<String>::new(),
+                "{parent}"
+            );
+        }
         Ok(())
     }
 

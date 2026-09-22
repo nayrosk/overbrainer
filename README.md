@@ -111,7 +111,7 @@ Each role (`generator`, `parent`, optional `embedder`) names a provider and a mo
 |---|---|---|
 | `reasoning` | `false` | Ask the model for its reasoning. |
 | `max_tokens` | `16384` | Upper bound on generated tokens, reasoning included. |
-| `temperature` | provider default | Sampling temperature, 0 to 2. |
+| `temperature` | provider default | Sampling temperature, 0 to 2. Not allowed with `reasoning = true` on the `anthropic` protocol, which rejects it. |
 | `reasoning_effort` | `medium` on `openai` | `low`, `medium` or `high`. Only with `reasoning = true`. |
 
 The embedder must use the `openai` protocol: Anthropic has no embeddings endpoint.
