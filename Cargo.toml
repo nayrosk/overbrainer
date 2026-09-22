@@ -1,0 +1,26 @@
+[package]
+name = "overbrainer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Distill a large LLM into a smaller open-weights model: generate questions, collect answers, fine-tune, visualize."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nayrosk/overbrainer"
+readme = "README.md"
+keywords = ["llm", "distillation", "fine-tuning", "cli", "tui"]
+categories = ["command-line-utilities", "science"]
+include = ["src/**/*", "templates/**/*", "LICENSE-*", "README.md"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[dependencies]
