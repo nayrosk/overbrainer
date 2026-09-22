@@ -11,8 +11,8 @@ use tokio::process::Child;
 use super::tar;
 use super::{
     CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, JOB_LOG, JobCommand, JobId,
-    JobStatus, PID_FILE, Pid, cancel_script, job_script, parse_status, quote, shell_path,
-    status_script,
+    JobStatus, PID_FILE, Pid, cancel_script, check_secrets, job_script, parse_status, quote,
+    shell_path, status_script,
 };
 
 /// Runs jobs on a remote Linux machine through the user's `ssh`: `~/.ssh/config`, the
@@ -202,16 +202,15 @@ impl Executor for SshExecutor {
 /// The command starting `job` detached from the SSH session, printing its process ID.
 /// It first reads one line per secret from its standard input into the environment
 /// variable of that name: secret values are never written here.
+///
+/// # Errors
+///
+/// Returns [`ExecError::InvalidSecret`] when a secret cannot be passed to a job
+/// (see [`check_secrets`]).
 fn launcher(job: &JobCommand) -> Result<String, ExecError> {
+    check_secrets(&job.secrets)?;
     let mut parts = Vec::new();
-    for (name, value) in &job.secrets {
-        let valid_name = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && name.chars().next().is_some_and(|c| !c.is_ascii_digit());
-        // A line break would end the `read` early and a NUL byte cannot live in the
-        // environment: either would hand the job a different value.
-        if !valid_name || value.expose_secret().contains(['\n', '\r', '\0']) {
-            return Err(ExecError::InvalidSecret(name.clone()));
-        }
+    for (name, _) in &job.secrets {
         parts.push(format!("IFS= read -r {name} && export {name}"));
     }
     parts.push(format!(

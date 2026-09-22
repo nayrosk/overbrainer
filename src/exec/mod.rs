@@ -17,7 +17,7 @@ mod tar;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 pub use lines::{LineStream, MAX_TAIL_READ, complete_lines};
@@ -103,6 +103,27 @@ pub struct Container {
     pub engine: Engine,
     /// Container name.
     pub name: String,
+}
+
+/// Checks that every secret can be handed to a job, whatever the target: its name
+/// must be an environment variable name (letters, digits and `_`, not starting with
+/// a digit, not empty), and its value must hold no line break and no NUL byte. A
+/// line break would end the `read` that feeds a remote job early, and a NUL byte
+/// cannot live in an environment: either would hand the job a different value.
+///
+/// # Errors
+///
+/// Returns [`ExecError::InvalidSecret`], naming the variable and never its value,
+/// for the first secret that cannot be passed.
+fn check_secrets(secrets: &[(String, SecretString)]) -> Result<(), ExecError> {
+    for (name, value) in secrets {
+        let valid_name = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && name.chars().next().is_some_and(|c| !c.is_ascii_digit());
+        if !valid_name || value.expose_secret().contains(['\n', '\r', '\0']) {
+            return Err(ExecError::InvalidSecret(name.clone()));
+        }
+    }
+    Ok(())
 }
 
 /// A job's process ID, validated to be neither `0` nor `1`. Process group `0` is a
@@ -215,7 +236,10 @@ pub trait Executor: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an [`ExecError`] when the job cannot be started.
+    /// Returns [`ExecError::InvalidSecret`], naming the variable only, when a
+    /// secret's name is not an environment variable name or its value holds a line
+    /// break or a NUL byte (see [`check_secrets`]); nothing is started then. Returns
+    /// another [`ExecError`] when the job cannot be started.
     fn spawn(&self, job: &JobCommand) -> impl Future<Output = Result<JobId, ExecError>> + Send;
 
     /// Bytes of the file `path` from byte `offset`, up to `limit` bytes: fewer when

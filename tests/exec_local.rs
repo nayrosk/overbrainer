@@ -108,6 +108,31 @@ async fn a_new_job_starts_without_stale_markers() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_secret_that_cannot_be_passed_is_refused_before_anything_starts() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let executor = LocalExecutor::new(root.path())?;
+    let dir = Path::new(executor.workdir()).join("r7");
+    for (name, value) in [
+        ("A-B", "v"),
+        ("1ABC", "v"),
+        ("", "v"),
+        ("HF_TOKEN", "line\nbreak"),
+        ("HF_TOKEN", "nul\0byte"),
+    ] {
+        let refused = JobCommand {
+            secrets: vec![(name.to_string(), SecretString::from(value.to_string()))],
+            ..job(&dir, "true")
+        };
+        match executor.spawn(&refused).await {
+            Err(ExecError::InvalidSecret(refused)) => assert_eq!(refused, name),
+            other => return Err(format!("{name:?} was accepted: {other:?}").into()),
+        }
+    }
+    assert!(!dir.exists(), "a refused job left its run directory behind");
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancel_stops_the_whole_process_group() -> TestResult {
     let root = tempfile::tempdir()?;
     let executor = LocalExecutor::new(root.path())?;

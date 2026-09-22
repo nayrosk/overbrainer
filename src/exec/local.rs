@@ -13,7 +13,8 @@ use tokio::process::{Child, Command};
 use super::tar;
 use super::{
     CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, JOB_LOG, JobCommand, JobId,
-    JobStatus, PID_FILE, Pid, cancel_script, job_script, parse_status, status_script,
+    JobStatus, PID_FILE, Pid, cancel_script, check_secrets, job_script, parse_status,
+    status_script,
 };
 
 /// How often this process reaps its exited jobs while a status or cancel script runs.
@@ -65,6 +66,7 @@ impl LocalExecutor {
     }
 
     fn start(&self, job: &JobCommand) -> Result<JobId, ExecError> {
+        check_secrets(&job.secrets)?;
         let dir = Path::new(&job.dir);
         fs::create_dir_all(dir).map_err(io_error(dir))?;
         for stale in [EXIT_FILE, CANCELLING_FILE, CANCEL_FILE, PID_FILE] {
