@@ -19,7 +19,8 @@ pub struct SplitReport {
 
 /// Rewrites `data/train.jsonl` and `data/eval.jsonl` from the usable examples of
 /// `data/answers.jsonl` (those with `meta.excluded = null`), stratified by subtopic.
-/// With `--topic`, only that topic's examples are written. Excluded examples stay in
+/// Both files always hold every topic's usable examples: `--topic` only limits the
+/// report and the event counts to that topic. Excluded examples stay in
 /// `answers.jsonl`. The split always rewrites both files, so `--force` changes nothing.
 ///
 /// # Errors
@@ -27,20 +28,20 @@ pub struct SplitReport {
 /// Returns a [`PipelineError`] when a file cannot be read or written.
 pub fn split(ctx: &Ctx<'_>) -> Result<SplitReport, PipelineError> {
     let topics = ctx.topics()?;
+    let selected = |example: &Example| topics.iter().any(|topic| topic.name == example.topic);
     let examples: Vec<Example> = read(&ctx.files.answers)?;
-    let selected: Vec<Example> = examples
-        .into_iter()
-        .filter(|example| topics.iter().any(|topic| topic.name == example.topic))
-        .collect();
     ctx.bus.publish(Event::StageStarted {
         stage: Stage::Split,
-        total: selected.len(),
+        total: examples.iter().filter(|example| selected(example)).count(),
     });
     let mut report = SplitReport::default();
     let mut usable = Vec::new();
-    for example in selected {
+    for example in examples {
         match example.meta.excluded {
-            Some(reason) => *report.excluded.entry(reason).or_default() += 1,
+            Some(reason) if selected(&example) => {
+                *report.excluded.entry(reason).or_default() += 1;
+            },
+            Some(_) => {},
             None => usable.push(example),
         }
     }
@@ -48,8 +49,8 @@ pub fn split(ctx: &Ctx<'_>) -> Result<SplitReport, PipelineError> {
     let (train, eval) = stratify(usable, settings.eval_ratio, settings.seed);
     rewrite(&ctx.files.train, &train)?;
     rewrite(&ctx.files.eval, &eval)?;
-    report.train = train.len();
-    report.eval = eval.len();
+    report.train = train.iter().filter(|example| selected(example)).count();
+    report.eval = eval.iter().filter(|example| selected(example)).count();
     ctx.bus.publish(Event::StageFinished {
         stage: Stage::Split,
         stats: StageStats {

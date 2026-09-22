@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use overbrainer::config::{EnvSource, Settings, load};
 use overbrainer::dataset::{
-    DataFiles, Example, Exclusion, FinishReason, Id, Question, ReasoningKind, Subtopic, read,
+    DataFiles, Example, Exclusion, FinishReason, Id, Question, ReasoningKind, Role, Subtopic, read,
 };
 use overbrainer::dedup::{Deduplicator, Lexical};
 use overbrainer::events::{Event, EventBus, Stage};
@@ -887,5 +887,105 @@ async fn split_only_counts_the_selected_topics() -> TestResult {
         Some(2),
         "the other topic's answer is not counted"
     );
+    Ok(())
+}
+
+/// Question 0 wakes Question 1 then fails with a rejected key, so Question 1 finishes
+/// before the stage handles the fatal error.
+struct RacingLlm {
+    released: tokio::sync::Notify,
+}
+
+impl LlmClient for RacingLlm {
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion, LlmError> {
+        if request.prompt == "Question 0?" {
+            self.released.notify_one();
+            return Err(unauthorized());
+        }
+        self.released.notified().await;
+        Ok(text("An answer."))
+    }
+
+    async fn embed(&self, _inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+        Err(LlmError::Unsupported("embeddings"))
+    }
+}
+
+#[tokio::test]
+async fn a_fatal_stop_keeps_answers_that_already_finished() -> TestResult {
+    let project = Project::new()?;
+    project.write_questions(2)?;
+    let fake = RacingLlm {
+        released: tokio::sync::Notify::new(),
+    };
+    let parent = Arc::new(project.role(fake, false));
+    let result = pipeline::answers(&project.ctx(false), parent).await;
+    assert!(matches!(
+        result,
+        Err(PipelineError::Llm {
+            stage: Stage::Answers,
+            ..
+        })
+    ));
+    let examples: Vec<Example> = read(&project.files.answers)?;
+    let questions: Vec<&str> = examples
+        .iter()
+        .map(|example| example.messages[0].content.as_str())
+        .collect();
+    assert_eq!(questions, ["Question 1?"], "the finished answer is kept");
+    Ok(())
+}
+
+#[tokio::test]
+async fn include_system_prompt_puts_the_system_prompt_first() -> TestResult {
+    let project = Project::with_toml(&PROJECT.replace(
+        "eval_ratio = 0.5",
+        "eval_ratio = 0.5\ninclude_system_prompt = true",
+    ))?;
+    project.write_questions(1)?;
+    let parent = Arc::new(project.role(FakeLlm::new(Box::new(|_, _| Ok(text("ok")))), false));
+    pipeline::answers(&project.ctx(false), Arc::clone(&parent)).await?;
+    let examples: Vec<Example> = read(&project.files.answers)?;
+    let example = examples.first().ok_or("no answer")?;
+    let roles: Vec<Role> = example.messages.iter().map(|m| m.role).collect();
+    assert_eq!(roles, [Role::System, Role::User, Role::Assistant]);
+    let sent = parent.client.requests()[0].system.clone();
+    assert_eq!(Some(example.messages[0].content.clone()), sent);
+    assert!(example.messages[0].content.contains("expert in ownership"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn split_with_a_topic_still_writes_every_topic() -> TestResult {
+    let project = Project::with_toml(TWO_TOPICS)?;
+    project.write_questions(2)?;
+    let loops = Id::subtopic("control_flow", "Loops");
+    let mut out = overbrainer::dataset::Appender::open(&project.files.questions)?;
+    for text in ["What is a loop?", "When does a loop end?"] {
+        out.append(&Question {
+            id: Id::question(&loops, text),
+            topic: "control_flow".into(),
+            subtopic_id: loops.clone(),
+            subtopic: "Loops".into(),
+            text: text.into(),
+        })?;
+    }
+    let parent = Arc::new(project.role(FakeLlm::new(Box::new(|_, _| Ok(text("ok")))), false));
+    pipeline::answers(&project.ctx(false), parent).await?;
+    let report = pipeline::split(&project.ctx_topic(Some("ownership"), false))?;
+    assert_eq!(
+        (report.train, report.eval),
+        (1, 1),
+        "the report covers ownership only"
+    );
+    let train: Vec<Example> = read(&project.files.train)?;
+    let eval: Vec<Example> = read(&project.files.eval)?;
+    assert_eq!((train.len(), eval.len()), (2, 2));
+    let control_flow = train
+        .iter()
+        .chain(&eval)
+        .filter(|example| example.topic == "control_flow")
+        .count();
+    assert_eq!(control_flow, 2, "the other topic stays in train and eval");
     Ok(())
 }

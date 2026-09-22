@@ -70,19 +70,22 @@ pub async fn answers<C: LlmClient + 'static>(
     let mut out = Appender::open(&ctx.files.answers)?;
     while let Some(joined) = tasks.join_next().await {
         let (question, system, result) = joined.map_err(PipelineError::Task)?;
-        let item = Item {
-            stage: Stage::Answers,
-            id: question.id.to_string(),
-        };
         match result {
-            Ok(completion) => {
-                let example = example(ctx, &parent, question, system, completion);
-                record(ctx, &parent, &example, &mut stats);
-                out.append(&example)?;
-            },
+            Ok(completion) => save(
+                ctx,
+                &parent,
+                &mut out,
+                &mut stats,
+                (question, system, completion),
+            )?,
             Err(error) => {
+                let item = Item {
+                    stage: Stage::Answers,
+                    id: question.id.to_string(),
+                };
                 if let Err(stop) = item_error(ctx, &item, error, &mut stats) {
                     tasks.abort_all();
+                    keep_finished(ctx, &parent, &mut tasks, &mut out, &mut stats).await?;
                     return Err(stop);
                 }
             },
@@ -141,6 +144,38 @@ async fn ask<C: LlmClient>(
     (question, system, result)
 }
 
+/// Builds the example of an answered question, records it and appends it.
+fn save<C: LlmClient>(
+    ctx: &Ctx<'_>,
+    parent: &RoleClient<C>,
+    out: &mut Appender,
+    stats: &mut StageStats,
+    (question, system, completion): (Question, String, Completion),
+) -> Result<(), PipelineError> {
+    let example = example(ctx, parent, question, system, completion);
+    record(ctx, parent, &example, stats);
+    out.append(&example)?;
+    Ok(())
+}
+
+/// After a fatal error, waits for the aborted tasks and saves the answers that had
+/// already finished, so they are not paid for twice. Cancelled tasks and failed
+/// requests are left for the next run.
+async fn keep_finished<C: LlmClient>(
+    ctx: &Ctx<'_>,
+    parent: &RoleClient<C>,
+    tasks: &mut JoinSet<Outcome>,
+    out: &mut Appender,
+    stats: &mut StageStats,
+) -> Result<(), PipelineError> {
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((question, system, Ok(completion))) = joined {
+            save(ctx, parent, out, stats, (question, system, completion))?;
+        }
+    }
+    Ok(())
+}
+
 /// The system prompt of each topic, rendered once.
 fn system_prompts(
     ctx: &Ctx<'_>,
@@ -168,7 +203,16 @@ fn example<C: LlmClient>(
     system: String,
     completion: Completion,
 ) -> Example {
-    let excluded = classify(&completion, parent.model.reasoning);
+    let mut meta = Meta {
+        model: parent.model.model.clone(),
+        input_tokens: completion.usage.input_tokens,
+        output_tokens: completion.usage.output_tokens,
+        finish_reason: completion.finish,
+        reasoning_kind: completion.reasoning.kind,
+        excluded: None,
+    };
+    let (reply, excluded) = assistant(completion, parent.model.reasoning);
+    meta.excluded = excluded;
     let mut messages = Vec::with_capacity(3);
     if ctx.settings.pipeline.include_system_prompt {
         messages.push(Message {
@@ -182,25 +226,32 @@ fn example<C: LlmClient>(
         content: question.text,
         reasoning_content: None,
     });
-    messages.push(Message {
-        role: Role::Assistant,
-        content: completion.content,
-        reasoning_content: completion.reasoning.text,
-    });
+    messages.push(reply);
     Example {
         id: question.id,
         topic: question.topic,
         subtopic: question.subtopic,
         messages,
-        meta: Meta {
-            model: parent.model.model.clone(),
-            input_tokens: completion.usage.input_tokens,
-            output_tokens: completion.usage.output_tokens,
-            finish_reason: completion.finish,
-            reasoning_kind: completion.reasoning.kind,
-            excluded,
-        },
+        meta,
     }
+}
+
+/// The assistant message of `completion` and why it cannot be trained on, if it
+/// cannot. A usable answer keeps its reasoning only when it is raw, so a summary is
+/// never trained on; an excluded answer keeps whatever it got, for inspection.
+fn assistant(completion: Completion, reasoning_requested: bool) -> (Message, Option<Exclusion>) {
+    let excluded = classify(&completion, reasoning_requested);
+    let raw = completion.reasoning.kind == ReasoningKind::Raw;
+    let reasoning_content = completion
+        .reasoning
+        .text
+        .filter(|_| raw || excluded.is_some());
+    let reply = Message {
+        role: Role::Assistant,
+        content: completion.content,
+        reasoning_content,
+    };
+    (reply, excluded)
 }
 
 fn record<C: LlmClient>(
@@ -244,7 +295,8 @@ pub fn classify(completion: &Completion, reasoning_requested: bool) -> Option<Ex
 
 /// Warning shown when reasoning is requested from a parent known not to return raw
 /// reasoning: the `anthropic` protocol always, and `OpenAI` or Claude models on the
-/// `openai` protocol, which hide or summarize it.
+/// `openai` protocol, which hide or summarize it. The open-weight `gpt-oss` models
+/// return raw reasoning and get no warning.
 #[must_use]
 pub fn raw_reasoning_warning(protocol: Protocol, model: &str) -> Option<&'static str> {
     if protocol == Protocol::Anthropic {
@@ -254,6 +306,9 @@ pub fn raw_reasoning_warning(protocol: Protocol, model: &str) -> Option<&'static
     }
     let model = model.to_ascii_lowercase();
     let name = model.rsplit('/').next().unwrap_or(&model);
+    if name.starts_with("gpt-oss") {
+        return None;
+    }
     let mut chars = name.chars();
     let o_series = chars.next() == Some('o') && chars.next().is_some_and(|c| c.is_ascii_digit());
     let hidden = model.starts_with("openai/")
@@ -340,6 +395,48 @@ mod tests {
             assert!(
                 raw_reasoning_warning(Protocol::Openai, model).is_none(),
                 "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpt_oss_models_return_raw_reasoning() {
+        for model in [
+            "openai/gpt-oss-120b",
+            "gpt-oss-20b",
+            "groq/openai/gpt-oss-20b",
+        ] {
+            assert!(
+                raw_reasoning_warning(Protocol::Openai, model).is_none(),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_raw_reasoning_is_kept_on_usable_answers() {
+        use FinishReason::Stop;
+        use ReasoningKind::{Raw, Redacted, Summary};
+        for kind in [Summary, Redacted] {
+            let (reply, excluded) = assistant(completion("a", kind, Stop), false);
+            assert_eq!(excluded, Option::None, "{kind:?} stays usable");
+            assert_eq!(
+                reply.reasoning_content,
+                Option::None,
+                "{kind:?} is not trained"
+            );
+        }
+        let (reply, excluded) = assistant(completion("a", Raw, Stop), false);
+        assert_eq!(excluded, Option::None);
+        assert_eq!(reply.reasoning_content.as_deref(), Some("r"));
+        assert_eq!(reply.content, "a");
+        for kind in [Summary, Redacted] {
+            let (reply, excluded) = assistant(completion("a", kind, Stop), true);
+            assert_eq!(excluded, Some(Exclusion::NoRawReasoning));
+            assert_eq!(
+                reply.reasoning_content.as_deref(),
+                Some("r"),
+                "an excluded answer keeps its reasoning for inspection"
             );
         }
     }
