@@ -36,7 +36,7 @@ OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY=sk-...
 OVERBRAINER_PIPELINE__CONCURRENCY=16
 ```
 
-Precedence: command line flags, then environment, then `overbrainer.toml`, then defaults. A `.env` file in the project directory is loaded if present.
+Precedence: environment, then `overbrainer.toml`, then defaults. A `.env` file in the project directory is loaded if present.
 
 Provider and target names may only use lowercase letters, digits and `_`, so they map cleanly to environment variable names.
 
@@ -45,14 +45,14 @@ Provider and target names may only use lowercase letters, digits and `_`, so the
 Any secret value can be a literal or a reference to a Vault or OpenBao KV v2 secret:
 
 ```bash
-OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY=vault:secret/overrouter/openrouter#api_key
+OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY=vault:secret/overbrainer/openrouter#api_key
 ```
 
-overbrainer reads `VAULT_ADDR` and `VAULT_TOKEN` (or `~/.vault-token`, as written by `vault login`). Secrets are never printed or logged.
+overbrainer reads `VAULT_ADDR` and `VAULT_TOKEN` (or `~/.vault-token`, as written by `vault login`). Secrets are never printed or logged. One known limitation: when a configuration value has the wrong type, the error message quotes that value, so put secrets only in the variables meant for them.
 
 ### Logs
 
-Logs go to stderr. Set the level with `OVERBRAINER_LOG` (for example `debug`). `NO_COLOR` disables colors.
+Logs go to stderr. Set the filter with `OVERBRAINER_LOG` (for example `debug`); by default overbrainer logs at `info` and its dependencies at `warn`. `NO_COLOR` disables colors.
 
 ## Terms of service
 
