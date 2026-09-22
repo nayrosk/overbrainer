@@ -84,42 +84,62 @@ pub fn split(ctx: &Ctx<'_>) -> Result<SplitReport, PipelineError> {
 
 /// Splits `examples` into `(train, eval)`.
 ///
-/// The eval set holds `max(1, round(n * ratio))` of the `n` examples (none when `n` is
-/// below 2), with `ratio` in (0, 1). It is spread over the (topic, subtopic) groups in
-/// proportion to their size: each group gets the integer part of its share, and the
-/// examples left over go to the groups with the largest remainders, ties broken by
-/// group key. Within a group, examples are ordered by a hash of their ID seeded with
-/// `seed` and the first ones go to eval. The result depends only on the IDs, the ratio
-/// and the seed, not on file order.
+/// The eval set holds `max(1, round(n * ratio))` of the `n` examples, at most `n - 1`
+/// so train is never empty, and none when `n` is below 2 (`ratio` in (0, 1)). It is
+/// spread in proportion to size in two steps: across topics, then within each topic
+/// across its subtopics. At each step a group gets the integer part of its share, and
+/// what is left over goes to the groups with the largest remainders, ties broken by a
+/// hash of the group name seeded with `seed`. Within a subtopic, examples are ordered
+/// by a hash of their ID seeded with `seed` and the first ones go to eval. The result
+/// depends only on the topics, subtopics, IDs, the ratio and the seed, not on file
+/// order.
 #[must_use]
 pub fn stratify(examples: Vec<Example>, ratio: f64, seed: u64) -> (Vec<Example>, Vec<Example>) {
     let eval_total = eval_count(examples.len(), ratio);
-    let mut groups: BTreeMap<(String, String), Vec<Example>> = BTreeMap::new();
+    let mut topics: BTreeMap<String, BTreeMap<String, Vec<Example>>> = BTreeMap::new();
     for example in examples {
-        groups
-            .entry((example.topic.clone(), example.subtopic.clone()))
+        topics
+            .entry(example.topic.clone())
+            .or_default()
+            .entry(example.subtopic.clone())
             .or_default()
             .push(example);
     }
-    let sizes: Vec<usize> = groups.values().map(Vec::len).collect();
-    let quotas = allocate(&sizes, eval_total);
+    let sizes: Vec<(&str, usize)> = topics
+        .iter()
+        .map(|(topic, subtopics)| (topic.as_str(), subtopics.values().map(Vec::len).sum()))
+        .collect();
+    let topic_quotas = allocate(&sizes, eval_total, seed);
     let (mut train, mut eval) = (Vec::new(), Vec::new());
-    for (mut group, quota) in groups.into_values().zip(quotas) {
-        group.sort_by_key(|example| {
-            (
-                XxHash3_64::oneshot_with_seed(seed, example.id.as_str().as_bytes()),
-                example.id.clone(),
-            )
-        });
-        let rest = group.split_off(quota.min(group.len()));
-        eval.extend(group);
-        train.extend(rest);
+    for (subtopics, topic_quota) in topics.into_values().zip(topic_quotas) {
+        let sizes: Vec<(&str, usize)> = subtopics
+            .iter()
+            .map(|(subtopic, group)| (subtopic.as_str(), group.len()))
+            .collect();
+        let quotas = allocate(&sizes, topic_quota, seed);
+        for (group, quota) in subtopics.into_values().zip(quotas) {
+            let (to_eval, to_train) = pick(group, quota, seed);
+            eval.extend(to_eval);
+            train.extend(to_train);
+        }
     }
     (train, eval)
 }
 
-/// Size of the eval set for `total` usable examples: `max(1, round(total * ratio))`,
-/// or 0 below 2 examples.
+/// The first `quota` examples of `group` in seeded hash order, then the others.
+fn pick(mut group: Vec<Example>, quota: usize, seed: u64) -> (Vec<Example>, Vec<Example>) {
+    group.sort_by_key(|example| {
+        (
+            XxHash3_64::oneshot_with_seed(seed, example.id.as_str().as_bytes()),
+            example.id.clone(),
+        )
+    });
+    let rest = group.split_off(quota.min(group.len()));
+    (group, rest)
+}
+
+/// Size of the eval set for `total` usable examples: `max(1, round(total * ratio))`
+/// capped at `total - 1`, or 0 below 2 examples.
 fn eval_count(total: usize, ratio: f64) -> usize {
     if total < 2 {
         return 0;
@@ -131,22 +151,32 @@ fn eval_count(total: usize, ratio: f64) -> usize {
     let steps = (0..total)
         .filter(|&index| rounded(index + 1) > rounded(index))
         .count();
-    steps.clamp(1, total)
+    steps.clamp(1, total - 1)
 }
 
-/// Spreads `eval_total` over groups of `sizes` by largest remainder, ties going to the
-/// earlier group.
-fn allocate(sizes: &[usize], eval_total: usize) -> Vec<usize> {
-    let total: usize = sizes.iter().sum();
+/// Spreads `eval_total` over named groups of the given sizes by largest remainder,
+/// ties broken by a hash of the name seeded with `seed`, then by name.
+fn allocate(groups: &[(&str, usize)], eval_total: usize, seed: u64) -> Vec<usize> {
+    let total: usize = groups.iter().map(|(_, size)| size).sum();
     if total == 0 {
-        return vec![0; sizes.len()];
+        return vec![0; groups.len()];
     }
-    let mut quotas: Vec<usize> = sizes.iter().map(|size| size * eval_total / total).collect();
-    let mut order: Vec<usize> = (0..sizes.len()).collect();
-    order.sort_by_key(|&group| std::cmp::Reverse(sizes[group] * eval_total % total));
+    let mut quotas: Vec<usize> = groups
+        .iter()
+        .map(|(_, size)| size * eval_total / total)
+        .collect();
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    order.sort_by_key(|&index| {
+        let (name, size) = groups[index];
+        (
+            std::cmp::Reverse(size * eval_total % total),
+            XxHash3_64::oneshot_with_seed(seed, name.as_bytes()),
+            name,
+        )
+    });
     let left = eval_total.saturating_sub(quotas.iter().sum());
-    for &group in order.iter().take(left) {
-        quotas[group] += 1;
+    for &index in order.iter().take(left) {
+        quotas[index] += 1;
     }
     quotas
 }
@@ -226,9 +256,74 @@ mod tests {
 
     #[test]
     fn at_least_one_eval_example_from_two_usable_ones() {
-        assert_eq!(stratify(uniform(1, 1), 0.1, 42).1.len(), 0);
-        assert_eq!(stratify(uniform(2, 1), 0.1, 42).1.len(), 1);
+        let sizes = |(train, eval): (Vec<Example>, Vec<Example>)| (train.len(), eval.len());
+        assert_eq!(sizes(stratify(uniform(1, 1), 0.1, 42)), (1, 0));
+        assert_eq!(sizes(stratify(uniform(2, 1), 0.1, 42)), (1, 1));
         assert_eq!(stratify(Vec::new(), 0.1, 42), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn train_is_never_empty() {
+        let sizes = |(train, eval): (Vec<Example>, Vec<Example>)| (train.len(), eval.len());
+        assert_eq!(sizes(stratify(uniform(2, 1), 0.9, 42)), (1, 1));
+        assert_eq!(sizes(stratify(uniform(1, 1), 0.9, 42)), (1, 0));
+        assert_eq!(sizes(stratify(uniform(1, 10), 0.99, 42)), (1, 9));
+    }
+
+    /// `topics` topics of `subtopics` subtopics of `size` examples each.
+    fn grid(topics: &[&str], subtopics: usize, size: usize) -> Vec<Example> {
+        let mut examples = Vec::new();
+        for topic in topics {
+            for subtopic in 0..subtopics {
+                for n in 0..size {
+                    let mut example = example(&format!("{topic}{subtopic}"), n);
+                    example.topic = (*topic).to_string();
+                    examples.push(example);
+                }
+            }
+        }
+        examples
+    }
+
+    fn per_topic(eval: &[Example]) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for example in eval {
+            *counts.entry(example.topic.clone()).or_default() += 1;
+        }
+        counts
+    }
+
+    #[test]
+    fn every_topic_gets_its_share_of_small_subtopics() {
+        let (_, eval) = stratify(grid(&["a", "b", "c", "d"], 10, 5), 0.1, 42);
+        assert_eq!(
+            per_topic(&eval),
+            BTreeMap::from([
+                ("a".to_string(), 5),
+                ("b".to_string(), 5),
+                ("c".to_string(), 5),
+                ("d".to_string(), 5),
+            ])
+        );
+        let (_, eval) = stratify(grid(&["a", "b", "c"], 30, 3), 0.1, 42);
+        assert_eq!(
+            per_topic(&eval),
+            BTreeMap::from([
+                ("a".to_string(), 9),
+                ("b".to_string(), 9),
+                ("c".to_string(), 9),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_seed_picks_which_small_subtopics_go_to_eval() {
+        let subtopics = |seed| -> BTreeSet<String> {
+            let (_, eval) = stratify(grid(&["a", "b", "c"], 30, 3), 0.1, seed);
+            eval.into_iter().map(|example| example.subtopic).collect()
+        };
+        assert_eq!(subtopics(1), subtopics(1));
+        assert_ne!(subtopics(1), subtopics(2));
     }
 
     #[test]
