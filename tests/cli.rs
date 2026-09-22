@@ -134,3 +134,32 @@ fn malformed_dotenv_does_not_leak_its_content() -> Result<(), Box<dyn std::error
         .stdout(predicate::str::contains("hf_marker").not());
     Ok(())
 }
+
+#[test]
+fn dependency_logs_stay_quiet_by_default() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .success();
+    // Reserve a free port, then close it so the Vault request is refused.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["config", "check", "--resolve"])
+        .env("VAULT_ADDR", format!("http://127.0.0.1:{port}"))
+        .env("VAULT_TOKEN", "test-token")
+        .env(
+            "OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY",
+            "vault:secret/overbrainer/openrouter#api_key",
+        )
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("error: cannot resolve"))
+        .stderr(predicate::str::contains("ERROR").not());
+    Ok(())
+}
