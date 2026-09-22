@@ -234,6 +234,16 @@ pub trait Executor: Send + Sync {
     /// Starts `job` in the background and returns its handle. The job keeps running
     /// when this process exits or loses its connection to the target.
     ///
+    /// The environment the job starts with depends on the target. A local job
+    /// inherits overbrainer's own environment, minus every variable whose name
+    /// starts with `OVERBRAINER_` or `VAULT_` (see [`LocalExecutor`]). A job over
+    /// SSH gets whatever the remote non-interactive `sh -c` gives it, which is the
+    /// SSH server's environment for that user: no login shell and no interactive
+    /// startup file are read (see [`SshExecutor`]). The job's secrets are then set
+    /// on top of that, on its environment only. A `native` target whose `axolotl`
+    /// relies on the caller's shell setup, such as a conda activation or a `PATH`
+    /// entry from a profile, can therefore behave differently on each.
+    ///
     /// # Errors
     ///
     /// Returns [`ExecError::InvalidSecret`], naming the variable only, when a

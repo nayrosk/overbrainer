@@ -23,6 +23,15 @@ use super::{
 /// read into the job's environment there: they never appear on a command line,
 /// remote or local, in a file or in an error.
 ///
+/// A job starts with whatever environment the remote non-interactive `sh -c` gives
+/// it: the SSH server's environment for that user, without a login shell and
+/// without any interactive startup file, plus the job's secrets. Nothing of
+/// overbrainer's own environment crosses the connection. A `native` target whose
+/// `axolotl` relies on a shell setup, such as a conda activation or a `PATH` entry
+/// written by a profile, therefore needs that setup in the job's own commands or in
+/// the server's environment; the same target run locally would inherit it from the
+/// caller.
+///
 /// The user `destination` logs in as must own the jobs it checks and cancels: status
 /// and cancel signal the job's process group with `kill`. When that group belongs to
 /// another user (for example a job started as root, or inside a rootful container
