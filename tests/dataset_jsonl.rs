@@ -87,3 +87,41 @@ fn rewrite_replaces_content_and_leaves_no_temp_file() -> Result<(), Box<dyn std:
     assert!(leftovers.is_empty());
     Ok(())
 }
+
+#[test]
+fn a_valid_last_line_without_newline_survives_open_and_append()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("subtopics.jsonl");
+    let first = serde_json::to_string(&subtopic("borrowing"))?;
+    let last = serde_json::to_string(&subtopic("lifetimes"))?;
+    std::fs::write(&path, format!("{first}\n{last}"))?;
+    let items: Vec<Subtopic> = read(&path)?;
+    assert_eq!(items.len(), 2, "the unterminated but valid line is read");
+
+    let mut appender = Appender::open(&path)?;
+    appender.append(&subtopic("moves"))?;
+    let items: Vec<Subtopic> = read(&path)?;
+    let names: Vec<&str> = items.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["borrowing", "lifetimes", "moves"]);
+    let content = std::fs::read_to_string(&path)?;
+    assert_eq!(content.lines().count(), 3);
+    assert!(content.ends_with('\n'));
+    Ok(())
+}
+
+#[test]
+fn an_unterminated_last_line_that_is_json_but_not_a_record_is_an_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("subtopics.jsonl");
+    let complete = serde_json::to_string(&subtopic("borrowing"))?;
+    std::fs::write(&path, format!("{complete}\n{{\"other\":1}}"))?;
+    match read::<Subtopic>(&path) {
+        Err(DatasetError::Parse { line, .. }) => {
+            assert_eq!(line, 2);
+            Ok(())
+        },
+        other => Err(format!("expected Parse, got {other:?}").into()),
+    }
+}

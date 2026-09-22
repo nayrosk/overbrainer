@@ -992,3 +992,32 @@ async fn split_with_a_topic_still_writes_every_topic() -> TestResult {
     assert_eq!(control_flow, 2, "the other topic stays in train and eval");
     Ok(())
 }
+
+#[tokio::test]
+async fn an_answer_saved_without_its_newline_is_kept_and_not_asked_again() -> TestResult {
+    let project = Project::new()?;
+    project.write_questions(2)?;
+    let raw = |_: &CompletionRequest, _| {
+        let mut completion = text("An answer.");
+        completion.reasoning = Reasoning {
+            text: Some("r".into()),
+            kind: ReasoningKind::Raw,
+        };
+        Ok(completion)
+    };
+    let first = Arc::new(project.role(FakeLlm::new(Box::new(raw)), true));
+    pipeline::answers(&project.ctx(false), first).await?;
+    let content = std::fs::read_to_string(&project.files.answers)?;
+    std::fs::write(
+        &project.files.answers,
+        content.strip_suffix('\n').ok_or("no trailing newline")?,
+    )?;
+
+    let second = Arc::new(project.role(FakeLlm::new(Box::new(raw)), true));
+    let again = pipeline::answers(&project.ctx(false), Arc::clone(&second)).await?;
+    assert_eq!((again.done, again.skipped), (0, 2));
+    assert!(second.client.requests().is_empty(), "nothing asked again");
+    let examples: Vec<Example> = read(&project.files.answers)?;
+    assert_eq!(examples.len(), 2, "the paid answer is still on disk");
+    Ok(())
+}

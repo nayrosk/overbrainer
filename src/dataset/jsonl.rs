@@ -69,13 +69,17 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> DatasetError + '_ {
 
 /// Reads every record of `path`. A missing file reads as empty.
 ///
-/// An incomplete last line (no trailing newline), left by a crash during a write, is
-/// skipped with a warning; [`Appender::open`] removes it before appending.
+/// A last line without its trailing newline is read like any other line when it is
+/// valid JSON: the crash that interrupted the write only missed the newline, and
+/// [`Appender::open`] adds it back. When it is not valid JSON it is the incomplete
+/// start of a record, left by a crash during a write: it is skipped with a warning,
+/// and [`Appender::open`] removes it before appending.
 ///
 /// # Errors
 ///
 /// Returns [`DatasetError::Io`] if the file cannot be read and [`DatasetError::Parse`]
-/// if a complete line is not a valid record.
+/// if a line is valid JSON but not a valid record, or if a complete line is not valid
+/// JSON.
 pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, DatasetError> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -91,7 +95,7 @@ pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, DatasetError> {
         }
         match serde_json::from_str(line) {
             Ok(item) => items.push(item),
-            Err(_) if !complete && index + 1 == lines.len() => {
+            Err(_) if !complete && index + 1 == lines.len() && !is_json(line.as_bytes()) => {
                 tracing::warn!("{}: ignoring an incomplete last line", path.display());
             },
             Err(source) => {
@@ -115,8 +119,9 @@ pub struct Appender {
 }
 
 impl Appender {
-    /// Opens `path` for appending, creating it and its directory if needed. An
-    /// incomplete last line left by a crash is removed first.
+    /// Opens `path` for appending, creating it and its directory if needed. A last
+    /// line without its trailing newline gets it back when it is valid JSON, and is
+    /// removed when it is not (an incomplete record left by a crash).
     ///
     /// # Errors
     ///
@@ -132,7 +137,7 @@ impl Appender {
             .append(true)
             .open(path)
             .map_err(io_error(path))?;
-        drop_incomplete_line(&mut file).map_err(io_error(path))?;
+        end_last_line(&mut file).map_err(io_error(path))?;
         Ok(Self {
             path: path.to_path_buf(),
             file,
@@ -154,8 +159,9 @@ impl Appender {
     }
 }
 
-/// Truncates `file` after its last newline when it does not end with one.
-fn drop_incomplete_line(file: &mut File) -> io::Result<()> {
+/// Makes `file` end with a newline: an unterminated last line that is valid JSON is
+/// kept and terminated, anything else after the last newline is truncated.
+fn end_last_line(file: &mut File) -> io::Result<()> {
     let len = file.metadata()?.len();
     if len == 0 {
         return Ok(());
@@ -173,7 +179,16 @@ fn drop_incomplete_line(file: &mut File) -> io::Result<()> {
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |index| index + 1);
+    if is_json(&content[keep..]) {
+        return file.write_all(b"\n");
+    }
     file.set_len(u64::try_from(keep).map_err(io::Error::other)?)
+}
+
+/// Whether `line` is one complete JSON value. A record cut short by a crash never is,
+/// since every record is a JSON object.
+fn is_json(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok()
 }
 
 /// Replaces `path` with `items`: writes a temp file in the same directory, syncs it,
