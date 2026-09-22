@@ -192,22 +192,52 @@ fn coerce(value: &mut Value, file: Option<&Value>) {
 ///
 /// An integer is only recognized when `text` is its own canonical rendering (no
 /// leading zero, no leading `+`), so a padded value such as a revision (`"0123"`)
-/// is not silently read as `123`. When `text` parses as an integer but is not
-/// canonical, it is left as a string outright, it is not tried as a float either.
-/// Floats have no such check: any text that parses as a finite `f64` is accepted.
+/// is not silently read as `123`. `text` is first tried as an `i64`, then, for a
+/// positive value that overflows it, as a `u64`, so a value up to [`u64::MAX`]
+/// keeps its exact precision. When `text` reads as an integer (an optional sign
+/// followed only by digits) but is not the canonical rendering of an `i64` or
+/// `u64`, either because it overflows both or because of a leading zero or `+`, it
+/// is left as a string: it is never tried as a float, which would silently lose
+/// precision for a value outside the `i64`/`u64` range. Floats have no such check:
+/// any other text that parses as a finite `f64` is accepted.
 fn scalar(text: &str) -> Option<Value> {
     match text {
         "true" => return Some(Value::Bool(true)),
         "false" => return Some(Value::Bool(false)),
         _ => {},
     }
-    if let Ok(integer) = text.parse::<i64>() {
-        return (integer.to_string() == text).then_some(Value::from(integer));
+    if let Some(integer) = canonical_integer(text) {
+        return Some(integer);
+    }
+    if looks_like_integer(text) {
+        return None;
     }
     text.parse::<f64>()
         .ok()
         .and_then(serde_json::Number::from_f64)
         .map(Value::Number)
+}
+
+/// `text` as an `i64`, or, for a positive value that overflows `i64`, as a `u64`,
+/// but only when `text` is that integer's own canonical rendering (no leading
+/// zero, no leading `+`).
+fn canonical_integer(text: &str) -> Option<Value> {
+    if let Ok(integer) = text.parse::<i64>() {
+        return (integer.to_string() == text).then_some(Value::from(integer));
+    }
+    if let Ok(integer) = text.parse::<u64>() {
+        return (integer.to_string() == text).then_some(Value::from(integer));
+    }
+    None
+}
+
+/// True when `text` reads as an integer: an optional leading `+` or `-` followed by
+/// one or more ASCII digits. This is broader than [`canonical_integer`], which also
+/// requires `text` to be that integer's canonical rendering and to fit in an `i64`
+/// or `u64`.
+fn looks_like_integer(text: &str) -> bool {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -237,5 +267,42 @@ mod tests {
         assert_eq!(scalar("0"), Some(Value::from(0)));
         assert_eq!(scalar("-3"), Some(Value::from(-3)));
         assert_eq!(scalar("1e-7"), Some(Value::from(1e-7)));
+    }
+
+    #[test]
+    fn i64_max_still_parses_as_an_integer() {
+        assert_eq!(scalar("9223372036854775807"), Some(Value::from(i64::MAX)));
+    }
+
+    #[test]
+    fn i64_max_plus_one_becomes_a_u64_not_a_float() {
+        assert_eq!(
+            scalar("9223372036854775808"),
+            Some(Value::from(9_223_372_036_854_775_808_u64)),
+            "one past i64::MAX must not lose precision as an f64"
+        );
+    }
+
+    #[test]
+    fn u64_max_still_parses_as_an_integer() {
+        assert_eq!(scalar("18446744073709551615"), Some(Value::from(u64::MAX)));
+    }
+
+    #[test]
+    fn u64_max_plus_one_stays_a_string() {
+        assert_eq!(
+            scalar("18446744073709551616"),
+            None,
+            "an integer past u64::MAX must stay a string, not become an imprecise float"
+        );
+    }
+
+    #[test]
+    fn a_negative_integer_below_i64_min_stays_a_string() {
+        assert_eq!(
+            scalar("-9223372036854775809"),
+            None,
+            "a negative integer past i64::MIN must stay a string, not become an imprecise float"
+        );
     }
 }
