@@ -48,7 +48,7 @@ Any secret value can be a literal or a reference to a Vault or OpenBao KV v2 sec
 OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY=vault:secret/overbrainer/openrouter#api_key
 ```
 
-overbrainer reads `VAULT_ADDR` and `VAULT_TOKEN` (or `~/.vault-token`, as written by `vault login`). Secrets are never printed or logged. One known limitation: when a configuration value has the wrong type, the error message quotes that value, so put secrets only in the variables meant for them.
+overbrainer reads `VAULT_ADDR` and `VAULT_TOKEN` (or `~/.vault-token`, as written by `vault login`). Secrets are never printed or logged. When a configuration value has the wrong type, the error names the key and the expected type, never the value.
 
 ### Logs
 

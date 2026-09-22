@@ -280,3 +280,39 @@ fn log_from_env_is_accepted() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(settings.log.as_deref(), Some("debug"));
     Ok(())
 }
+
+#[test]
+fn type_errors_name_the_key_but_not_the_value() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TARGETS}"))?;
+    for (key, path) in [
+        ("OVERBRAINER_PIPELINE__CONCURRENCY", "pipeline.concurrency"),
+        (
+            "OVERBRAINER_ROLES__PARENT__REASONING",
+            "roles.parent.reasoning",
+        ),
+        (
+            "OVERBRAINER_ROLES__PARENT__MAX_TOKENS",
+            "roles.parent.max_tokens",
+        ),
+        (
+            "OVERBRAINER_PROVIDERS__NANOGPT__PROTOCOL",
+            "providers.nanogpt.protocol",
+        ),
+        ("OVERBRAINER_TARGETS__GPU__GPU_COUNT", "targets.gpu"),
+        ("OVERBRAINER_TARGETS__GPU__KIND", "targets.gpu.kind"),
+    ] {
+        match load(dir.path(), env(&[(key, "sk-leak-7")])) {
+            Err(error @ ConfigError::Parse(_)) => {
+                let text = error.to_string();
+                assert!(text.contains(path), "{key}: {text}");
+                assert!(!text.contains("sk-leak-7"), "{key} leaked: {text}");
+                assert!(
+                    !format!("{error:?}").contains("sk-leak-7"),
+                    "{key} leaked in Debug"
+                );
+            },
+            other => return Err(format!("{key}: expected Parse, got {other:?}").into()),
+        }
+    }
+    Ok(())
+}
