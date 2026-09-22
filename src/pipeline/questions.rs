@@ -23,8 +23,10 @@ struct Context<'a> {
 /// Subtopics are filled one batch at a time (`pipeline.question_batch_size`), each
 /// prompt listing the questions already accepted for the subtopic. Every batch goes
 /// through a deduplicator shared by the whole topic, created by `new_dedup` and seeded
-/// with the questions already on disk. A subtopic stops at `questions_per_subtopic`
-/// or after `pipeline.max_retries` batches without a new question (at least one).
+/// with the questions already on disk; a topic with nothing left to fill is not
+/// seeded, so its stored questions are not embedded again. A subtopic stops at
+/// `questions_per_subtopic` or after `pipeline.max_retries` batches without a new
+/// question (at least one).
 /// Batches run one after the other because each depends on the previous ones. A
 /// deduplicator error that survives its own retries stops the whole stage when it is
 /// fatal; otherwise it fails only the subtopic being filled, or, when it happens while
@@ -63,17 +65,10 @@ where
     };
     for topic in topics {
         let mut dedup = new_dedup();
-        let known: Vec<String> = existing
-            .iter()
-            .filter(|question| question.topic == topic.name)
-            .map(|question| question.text.clone())
-            .collect();
-        let seed = Item {
-            stage: Stage::Questions,
-            id: topic.name.clone(),
-        };
-        if let Err(error) = dedup.record(&known).await {
-            item_error(ctx, &seed, error, &mut filler.stats)?;
+        let pending = subtopics.iter().any(|subtopic| {
+            subtopic.topic == topic.name && needs_filling(subtopic, &existing, &[topic])
+        });
+        if pending && !seed(ctx, topic, &existing, &mut dedup, &mut filler.stats).await? {
             continue;
         }
         for subtopic in subtopics.iter().filter(|s| s.topic == topic.name) {
@@ -92,6 +87,31 @@ where
         stats: filler.stats.clone(),
     });
     Ok(filler.stats)
+}
+
+/// Records the questions of `topic` already on disk in `dedup`. Returns `false` when
+/// that failed without stopping the stage (the topic is then reported as failed).
+async fn seed<D: Deduplicator>(
+    ctx: &Ctx<'_>,
+    topic: &Topic,
+    existing: &[Question],
+    dedup: &mut D,
+    stats: &mut StageStats,
+) -> Result<bool, PipelineError> {
+    let known: Vec<String> = existing
+        .iter()
+        .filter(|question| question.topic == topic.name)
+        .map(|question| question.text.clone())
+        .collect();
+    let Err(error) = dedup.record(&known).await else {
+        return Ok(true);
+    };
+    let item = Item {
+        stage: Stage::Questions,
+        id: topic.name.clone(),
+    };
+    item_error(ctx, &item, error, stats)?;
+    Ok(false)
 }
 
 /// Subtopics of `topics` not yet filled to their `questions_per_subtopic` target.

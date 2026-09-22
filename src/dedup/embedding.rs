@@ -3,6 +3,10 @@ use std::time::Duration;
 use super::Deduplicator;
 use crate::llm::{LlmClient, LlmError, RetryPolicy, with_retry};
 
+/// Most inputs sent in one embeddings request. Providers cap the batch size (2048 on
+/// `OpenAI`), so larger sets are split into several requests.
+const MAX_INPUTS_PER_REQUEST: usize = 256;
+
 /// Cosine similarity of embeddings against a threshold.
 #[derive(Debug)]
 pub struct Embedding<C> {
@@ -26,17 +30,22 @@ impl<C: LlmClient> Embedding<C> {
         }
     }
 
+    /// Embeds `texts` in order, [`MAX_INPUTS_PER_REQUEST`] at a time, each request
+    /// retried on its own.
     async fn vectors(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
-        let vectors = with_retry(&self.policy, || self.client.embed(texts), log_retry).await?;
-        if vectors.len() == texts.len() {
-            Ok(vectors)
-        } else {
-            Err(LlmError::InvalidResponse(format!(
-                "{} embeddings for {} texts",
-                vectors.len(),
-                texts.len()
-            )))
+        let mut all = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(MAX_INPUTS_PER_REQUEST) {
+            let vectors = with_retry(&self.policy, || self.client.embed(chunk), log_retry).await?;
+            if vectors.len() != chunk.len() {
+                return Err(LlmError::InvalidResponse(format!(
+                    "{} embeddings for {} texts",
+                    vectors.len(),
+                    chunk.len()
+                )));
+            }
+            all.extend(vectors);
         }
+        Ok(all)
     }
 }
 

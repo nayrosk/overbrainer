@@ -179,3 +179,40 @@ async fn embedding_gives_up_after_the_retry_budget() {
         "one call plus one retry"
     );
 }
+
+/// Embeds every input to the same vector and records the inputs of each request.
+struct BatchRecorder {
+    batches: Mutex<Vec<Vec<String>>>,
+}
+
+impl LlmClient for &BatchRecorder {
+    async fn complete(&self, _request: CompletionRequest) -> Result<Completion, LlmError> {
+        Err(LlmError::Unsupported("completions"))
+    }
+
+    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+        if let Ok(mut batches) = self.batches.lock() {
+            batches.push(inputs.to_vec());
+        }
+        Ok(inputs.iter().map(|_| vec![1.0, 0.0]).collect())
+    }
+}
+
+#[tokio::test]
+async fn embeddings_are_requested_in_chunks_of_at_most_256_in_order() -> Result<(), LlmError> {
+    let recorder = BatchRecorder {
+        batches: Mutex::new(Vec::new()),
+    };
+    let inputs: Vec<String> = (0..600).map(|n| format!("question {n}")).collect();
+    let mut embedding = Embedding::new(&recorder, 0.9, fast_policy(0));
+    embedding.record(&inputs).await?;
+    let batches = recorder
+        .batches
+        .lock()
+        .map(|batches| batches.clone())
+        .unwrap_or_default();
+    let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [256, 256, 88]);
+    assert_eq!(batches.concat(), inputs, "chunks keep the input order");
+    Ok(())
+}

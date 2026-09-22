@@ -6,9 +6,11 @@ use overbrainer::config::{EnvSource, Settings, load};
 use overbrainer::dataset::{
     DataFiles, Example, Exclusion, FinishReason, Id, Question, ReasoningKind, Role, Subtopic, read,
 };
-use overbrainer::dedup::{Deduplicator, Lexical};
+use overbrainer::dedup::{Deduplicator, Embedding, Layered, Lexical};
 use overbrainer::events::{Event, EventBus, Stage};
-use overbrainer::llm::{Completion, CompletionRequest, LlmClient, LlmError, Reasoning, Usage};
+use overbrainer::llm::{
+    Completion, CompletionRequest, LlmClient, LlmError, Reasoning, RetryPolicy, Usage,
+};
 use overbrainer::pipeline::{self, Ctx, PipelineError, RoleClient};
 use overbrainer::prompts::Prompts;
 use tokio::sync::broadcast;
@@ -1019,5 +1021,65 @@ async fn an_answer_saved_without_its_newline_is_kept_and_not_asked_again() -> Te
     assert!(second.client.requests().is_empty(), "nothing asked again");
     let examples: Vec<Example> = read(&project.files.answers)?;
     assert_eq!(examples.len(), 2, "the paid answer is still on disk");
+    Ok(())
+}
+
+/// Counts embedding requests; every input embeds to the same vector.
+struct CountingEmbedder {
+    calls: AtomicUsize,
+}
+
+impl LlmClient for &CountingEmbedder {
+    async fn complete(&self, _request: CompletionRequest) -> Result<Completion, LlmError> {
+        Err(LlmError::Unsupported("completions"))
+    }
+
+    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(inputs.iter().map(|_| vec![1.0, 0.0]).collect())
+    }
+}
+
+#[tokio::test]
+async fn a_fully_filled_topic_is_not_embedded_again() -> TestResult {
+    let project = Project::new()?;
+    let mut subtopics = overbrainer::dataset::Appender::open(&project.files.subtopics)?;
+    let mut questions = overbrainer::dataset::Appender::open(&project.files.questions)?;
+    for name in ["Borrowing", "Lifetimes"] {
+        let id = Id::subtopic("ownership", name);
+        subtopics.append(&Subtopic {
+            id: id.clone(),
+            topic: "ownership".into(),
+            name: name.into(),
+        })?;
+        for n in 0..3 {
+            let text = format!("{name} question {n}?");
+            questions.append(&Question {
+                id: Id::question(&id, &text),
+                topic: "ownership".into(),
+                subtopic_id: id.clone(),
+                subtopic: name.into(),
+                text,
+            })?;
+        }
+    }
+    let embedder = CountingEmbedder {
+        calls: AtomicUsize::new(0),
+    };
+    let generator = project.role(FakeLlm::new(Box::new(|_, _| Ok(text("[]")))), false);
+    let stats = pipeline::questions(&project.ctx(false), &generator, || {
+        Layered::new(
+            Lexical::new(0.8),
+            Some(Embedding::new(&embedder, 0.9, RetryPolicy::new(0))),
+        )
+    })
+    .await?;
+    assert_eq!((stats.done, stats.skipped), (0, 2));
+    assert!(generator.client.requests().is_empty());
+    assert_eq!(
+        embedder.calls.load(Ordering::SeqCst),
+        0,
+        "nothing to fill, so the stored questions are not embedded"
+    );
     Ok(())
 }
