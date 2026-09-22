@@ -281,6 +281,26 @@ async fn upload_and_download_copy_selected_trees() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_download_from_a_missing_run_dir_is_an_error() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let executor = LocalExecutor::new(&root.path().join("work"))?;
+    let remote = format!("{}/never-created", executor.workdir());
+    let back = root.path().join("back");
+    let result = executor
+        .download(&remote, &back, &["output".to_string()], &[])
+        .await;
+    match result {
+        Err(ExecError::Command { action, message }) => {
+            assert_eq!(action, "download");
+            assert_eq!(message, format!("{remote} does not exist"));
+        },
+        other => return Err(format!("expected a missing directory error, got {other:?}").into()),
+    }
+    assert!(!back.exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_copy_into_its_own_source_is_refused() -> TestResult {
     let root = tempfile::tempdir()?;
     let executor = LocalExecutor::new(&root.path().join("work"))?;

@@ -102,10 +102,16 @@ const MAX_ERROR_BYTES: usize = 4096;
 /// were, and at most [`MAX_ERROR_BYTES`] of them (cut at a character boundary and
 /// marked with `...`), so a flood of warnings cannot bloat the error.
 pub(crate) fn failure(stderr: &[u8], status: std::process::ExitStatus) -> String {
+    error_text(stderr).unwrap_or_else(|| status.to_string())
+}
+
+/// The error output of a command, capped as [`failure`] describes, or `None` when
+/// it printed nothing but whitespace.
+pub(crate) fn error_text(stderr: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stderr);
     let text = text.trim();
     if text.is_empty() {
-        return status.to_string();
+        return None;
     }
     let total = text.lines().count();
     let mut head = text
@@ -121,11 +127,11 @@ pub(crate) fn failure(stderr: &[u8], status: std::process::ExitStatus) -> String
         head.truncate(cut);
         head.push_str("...");
     }
-    match total.saturating_sub(MAX_ERROR_LINES) {
+    Some(match total.saturating_sub(MAX_ERROR_LINES) {
         0 => head,
         1 => format!("{head}\n(1 more line)"),
         more => format!("{head}\n({more} more lines)"),
-    }
+    })
 }
 
 fn spawn_error(source: std::io::Error) -> ExecError {

@@ -232,7 +232,14 @@ impl Executor for LocalExecutor {
         entries: &[String],
         exclude: &[String],
     ) -> Result<(), ExecError> {
-        self.copy(Path::new(remote), local, entries, exclude).await
+        let from = Path::new(remote);
+        if !from.is_dir() {
+            return Err(ExecError::Command {
+                action: "download",
+                message: format!("{remote} does not exist"),
+            });
+        }
+        self.copy(from, local, entries, exclude).await
     }
 }
 

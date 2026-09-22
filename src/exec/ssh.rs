@@ -249,7 +249,8 @@ fn read_script(path: &str, offset: u64, limit: u64) -> String {
 }
 
 /// Writes to stdout a `tar` archive of the `entries` of `remote` that exist, without
-/// the names matching an `exclude` pattern, or nothing when none exists.
+/// the names matching an `exclude` pattern, or nothing when none exists. Fails, saying
+/// so, when `remote` itself is not a directory.
 fn archive_script(remote: &str, entries: &[String], exclude: &[String]) -> String {
     let candidates: Vec<String> = entries.iter().map(|entry| quote(entry)).collect();
     let args: Vec<String> = tar::create_args(".", &[], exclude)
@@ -257,7 +258,7 @@ fn archive_script(remote: &str, entries: &[String], exclude: &[String]) -> Strin
         .map(|arg| quote(arg))
         .collect();
     format!(
-        "cd -- {dir} || exit 1\nset --\nfor entry in {candidates}; do [ -e \"$entry\" ] && set -- \"$@\" \"$entry\"; done\n[ \"$#\" -gt 0 ] || exit 0\nexec tar {args} \"$@\"\n",
+        "[ -d {dir} ] || {{ printf '%s does not exist\\n' {dir} >&2; exit 1; }}\ncd -- {dir} || exit 1\nset --\nfor entry in {candidates}; do [ -e \"$entry\" ] && set -- \"$@\" \"$entry\"; done\n[ \"$#\" -gt 0 ] || exit 0\nexec tar {args} \"$@\"\n",
         dir = quote(remote),
         candidates = candidates.join(" "),
         args = args.join(" "),
@@ -325,14 +326,27 @@ async fn drain<E: AsyncRead + Unpin>(errors: Option<E>) -> Vec<u8> {
 }
 
 /// The result of an upload. The receiving `tar`'s own failure comes first: when it
-/// dies early, the local `tar` and the copy only fail on a broken pipe.
+/// dies early, the local `tar` and the copy only fail on a broken pipe. A receiver
+/// killed by a signal has no exit status: its error output, when it printed any,
+/// says more than openssh's bare [`openssh::Error::RemoteProcessTerminated`].
 fn upload_outcome(
     received: Result<ExitStatus, ExecError>,
     errors: &[u8],
     created: Result<(), ExecError>,
     copied: io::Result<()>,
 ) -> Result<(), ExecError> {
-    let status = received?;
+    let status = match received {
+        Err(ExecError::Ssh(openssh::Error::RemoteProcessTerminated)) => {
+            return Err(tar::error_text(errors).map_or(
+                ExecError::Ssh(openssh::Error::RemoteProcessTerminated),
+                |message| ExecError::Command {
+                    action: "upload",
+                    message,
+                },
+            ));
+        },
+        other => other?,
+    };
     if !status.success() {
         return Err(ExecError::Command {
             action: "upload",
@@ -446,6 +460,16 @@ mod tests {
         assert!(launcher(&with_name("_A1")).is_ok());
     }
 
+    /// Whether `setsid` (util-linux or busybox), which the launcher runs, is on `PATH`.
+    fn setsid_available() -> bool {
+        StdCommand::new("sh")
+            .arg("-c")
+            .arg("command -v setsid")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     /// Runs `script` with the local `sh`, feeding it `stdin`, and returns its stdout.
     fn sh(script: &str, stdin: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         use std::io::Write;
@@ -467,6 +491,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_launcher_hands_secrets_to_the_job_verbatim() -> TestResult {
+        if !setsid_available() {
+            eprintln!("skipped: setsid is not installed");
+            return Ok(());
+        }
         let root = tempdir()?;
         let dir = root.path().join("r1");
         let job = JobCommand {
@@ -535,6 +563,18 @@ mod tests {
         assert!(listing.contains("output/adapter.bin"), "{listing}");
         assert!(!listing.contains("checkpoint"), "{listing}");
         assert!(sh(&archive_script(&remote, &["missing".into()], &[]), b"")?.is_empty());
+
+        let gone = format!("{remote}/never-created");
+        let output = StdCommand::new("sh")
+            .arg("-c")
+            .arg(archive_script(&gone, &["output".into()], &[]))
+            .output()?;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr)?,
+            format!("{gone} does not exist\n")
+        );
         Ok(())
     }
 
@@ -720,6 +760,27 @@ mod tests {
         }
         assert_eq!(fs::read_to_string(local.join("file"))?, "content\n");
         Ok(())
+    }
+
+    #[test]
+    fn a_receiver_killed_by_a_signal_is_reported_with_its_error_output() {
+        let killed = || Err(ExecError::Ssh(openssh::Error::RemoteProcessTerminated));
+        let result = upload_outcome(killed(), b"tar: write error\n", Ok(()), Ok(()));
+        assert!(
+            matches!(
+                &result,
+                Err(ExecError::Command { action: "upload", message }) if message == "tar: write error"
+            ),
+            "{result:?}"
+        );
+        let silent = upload_outcome(killed(), b" \n", Ok(()), Ok(()));
+        assert!(
+            matches!(
+                silent,
+                Err(ExecError::Ssh(openssh::Error::RemoteProcessTerminated))
+            ),
+            "{silent:?}"
+        );
     }
 
     #[test]

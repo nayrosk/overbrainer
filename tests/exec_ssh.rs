@@ -11,6 +11,7 @@ use overbrainer::exec::{
     ExecError, Executor, JobCommand, JobId, JobStatus, MAX_TAIL_READ, SshExecutor,
 };
 use secrecy::SecretString;
+use tokio::sync::Semaphore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -28,15 +29,26 @@ fn skip() {
     eprintln!("skipped: OVERBRAINER_TEST_SSH_HOST and OVERBRAINER_TEST_SSH_CONFIG are not set");
 }
 
+/// Connections being set up at once. sshd's default `MaxStartups 10:30:100` starts
+/// dropping unauthenticated connections past 10, and the tests run in parallel.
+static HANDSHAKES: Semaphore = Semaphore::const_new(4);
+
+/// Connects to `host` with at most [`HANDSHAKES`] connections being set up at once.
+async fn open(host: &str, workdir: &str, config: &Path) -> Result<SshExecutor, ExecError> {
+    let _permit = HANDSHAKES
+        .acquire()
+        .await
+        .map_err(|_| ExecError::Protocol("the handshake limit is closed".into()))?;
+    SshExecutor::connect(host, workdir, Some(config)).await
+}
+
 /// A work directory unique to the test, so tests can run in parallel.
 async fn connect(name: &str) -> Result<Option<SshExecutor>, Box<dyn std::error::Error>> {
     let Some((host, config)) = target() else {
         return Ok(None);
     };
     let workdir = format!("overbrainer-tests/{name}-{}", fastrand::u32(..));
-    Ok(Some(
-        SshExecutor::connect(&host, &workdir, Some(&config)).await?,
-    ))
+    Ok(Some(open(&host, &workdir, &config).await?))
 }
 
 async fn wait_finished(
@@ -362,6 +374,55 @@ async fn a_download_into_an_unwritable_directory_reports_tar_and_does_not_hang()
 }
 
 #[tokio::test]
+async fn a_download_from_a_missing_run_dir_is_an_error() -> TestResult {
+    let Some(executor) = connect("missing").await? else {
+        skip();
+        return Ok(());
+    };
+    let remote = format!("{}/never-created", executor.workdir());
+    let local = tempfile::tempdir()?;
+    let back = local.path().join("back");
+    let result = executor
+        .download(&remote, &back, &["output".to_string()], &[])
+        .await;
+    match result {
+        Err(ExecError::Command { action, message }) => {
+            assert_eq!(action, "download");
+            assert_eq!(message, format!("{remote} does not exist"));
+        },
+        other => return Err(format!("expected a missing directory error, got {other:?}").into()),
+    }
+    assert!(!back.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_job_outlives_its_connection() -> TestResult {
+    let Some((host, config)) = target() else {
+        skip();
+        return Ok(());
+    };
+    let Some(first) = connect("reconnect").await? else {
+        skip();
+        return Ok(());
+    };
+    let workdir = first.workdir().to_string();
+    let started = first
+        .spawn(&job(format!("{workdir}/r8"), "sleep 60"))
+        .await?;
+    assert_eq!(first.status(&started).await?, JobStatus::Running);
+    // Closes the master connection and its control socket.
+    drop(first);
+
+    let second = open(&host, &workdir, &config).await?;
+    assert_eq!(second.workdir(), workdir);
+    assert_eq!(second.status(&started).await?, JobStatus::Running);
+    second.cancel(&started).await?;
+    assert_eq!(second.status(&started).await?, JobStatus::Cancelled);
+    Ok(())
+}
+
+#[tokio::test]
 async fn an_unknown_host_key_is_refused() -> TestResult {
     let Some((host, config)) = target() else {
         skip();
@@ -380,7 +441,7 @@ async fn an_unknown_host_key_is_refused() -> TestResult {
             config.display()
         ),
     )?;
-    let result = SshExecutor::connect(&host, "overbrainer-tests", Some(&strict)).await;
+    let result = open(&host, "overbrainer-tests", &strict).await;
     assert!(
         result.is_err(),
         "connected to a host missing from known_hosts"

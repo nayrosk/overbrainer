@@ -251,11 +251,14 @@ pub trait Executor: Send + Sync {
 
     /// Copies `entries` (files or directories, relative to the target directory
     /// `remote`) into the local directory `local`, leaving out names matching an
-    /// `exclude` pattern at any depth. Missing entries are skipped.
+    /// `exclude` pattern at any depth. Missing entries are skipped, and `local` is
+    /// not created when none exists.
     ///
     /// # Errors
     ///
-    /// Returns an [`ExecError`] when the copy fails.
+    /// Returns [`ExecError::Command`] (action `download`, message
+    /// `<remote> does not exist`) when `remote` itself is not a directory, and an
+    /// [`ExecError`] when the copy fails.
     fn download(
         &self,
         remote: &str,
