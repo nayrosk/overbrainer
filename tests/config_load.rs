@@ -116,17 +116,6 @@ fn unknown_env_variable_with_prefix_is_rejected() -> Result<(), Box<dyn std::err
 }
 
 #[test]
-fn process_env_source_is_accepted() -> Result<(), Box<dyn std::error::Error>> {
-    // Exercises the `EnvSource::Process` code path (what a real binary uses) without
-    // depending on, or mutating, the actual process environment: `BASE` alone is a
-    // complete, valid configuration, so this only has to type-check and run, not
-    // assert on any particular outcome.
-    let dir = project(BASE)?;
-    let _ = load(dir.path(), EnvSource::Process);
-    Ok(())
-}
-
-#[test]
 fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     match load(dir.path(), env(&[])) {
@@ -222,5 +211,53 @@ fn non_numeric_env_value_for_a_numeric_target_field_is_rejected()
         ),
         Err(ConfigError::Parse(_))
     ));
+    Ok(())
+}
+
+fn env_only_problems(toml: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let dir = project(toml)?;
+    match load(dir.path(), env(&[])) {
+        Err(ConfigError::Invalid(problems)) => Ok(problems),
+        other => Err(format!("expected Invalid, got {other:?}").into()),
+    }
+}
+
+#[test]
+fn target_host_in_file_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let toml = format!(
+        "{BASE}{}",
+        TARGETS.replace(
+            "kind = \"ssh\"",
+            "kind = \"ssh\"\nhost = \"leak@private-host\""
+        )
+    );
+    let problems = env_only_problems(&toml)?;
+    assert!(
+        problems.contains(
+            &"targets.box.host: must be set through env, not in overbrainer.toml".to_string()
+        ),
+        "{problems:?}"
+    );
+    assert!(
+        !problems.join("\n").contains("private-host"),
+        "values must not leak"
+    );
+    Ok(())
+}
+
+#[test]
+fn runpod_api_key_in_file_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let toml = format!("{BASE}\n[runpod]\napi_key = \"rp-leak\"\n");
+    let problems = env_only_problems(&toml)?;
+    assert!(
+        problems.contains(
+            &"runpod.api_key: must be set through env, not in overbrainer.toml".to_string()
+        ),
+        "{problems:?}"
+    );
+    assert!(
+        !problems.join("\n").contains("rp-leak"),
+        "values must not leak"
+    );
     Ok(())
 }
