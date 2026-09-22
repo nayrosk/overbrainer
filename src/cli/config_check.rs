@@ -6,7 +6,6 @@ use anyhow::Context;
 use secrecy::SecretString;
 
 use crate::config::{EnvSource, Settings, Target};
-use crate::secrets::{Resolver, VaultSettings, VaultSource};
 
 /// Prints the resolved configuration with secrets masked. With `resolve`, also
 /// resolves every secret (testing Vault access) and fails on the first error.
@@ -22,11 +21,7 @@ pub async fn run(project_dir: &Path, resolve: bool) -> anyhow::Result<()> {
         println!("{line}");
     }
     if resolve {
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let vault = VaultSettings::from_env(|key| std::env::var(key).ok(), home.as_deref())?
-            .map(|settings| VaultSource::new(&settings))
-            .transpose()?;
-        let resolver = Resolver::new(vault);
+        let resolver = super::resolver();
         for (key, secret) in secrets(&settings) {
             resolver
                 .resolve(secret)
@@ -80,18 +75,11 @@ fn describe(settings: &Settings) -> Vec<String> {
             masked(provider.api_key.as_ref())
         ));
     }
-    let roles = [
-        ("generator", Some(&settings.roles.generator)),
-        ("parent", Some(&settings.roles.parent)),
-        ("embedder", settings.roles.embedder.as_ref()),
-    ];
-    for (role, model) in roles {
-        if let Some(model) = model {
-            lines.push(format!(
-                "roles.{role} = {}/{} (reasoning: {})",
-                model.provider, model.model, model.reasoning
-            ));
-        }
+    for (role, model) in settings.roles.all() {
+        lines.push(format!(
+            "roles.{role} = {}/{} (reasoning: {}, max_tokens: {})",
+            model.provider, model.model, model.reasoning, model.max_tokens
+        ));
     }
     lines.push(format!("pipeline = {:?}", settings.pipeline));
     if let Some(training) = &settings.training {

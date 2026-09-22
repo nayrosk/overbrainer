@@ -1,4 +1,11 @@
-use super::types::{Runtime, Settings, Target};
+use super::types::{Protocol, Runtime, Settings, Target};
+
+/// Highest `pipeline.concurrency`: far above what providers allow, and well within
+/// what a semaphore can hold.
+const MAX_CONCURRENCY: usize = 1024;
+
+/// Lowest `thinking_budget`: the smallest `budget_tokens` the `anthropic` protocol accepts.
+const MIN_THINKING_BUDGET: u32 = 1024;
 
 /// Returns true when `name` matches `^[a-z0-9_]+$`.
 pub(crate) fn is_valid_name(name: &str) -> bool {
@@ -13,6 +20,7 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
     let mut problems = Vec::new();
     check_names(settings, &mut problems);
     check_roles(settings, &mut problems);
+    check_role_params(settings, &mut problems);
     check_topics(settings, &mut problems);
     check_pipeline(settings, &mut problems);
     check_training(settings, &mut problems);
@@ -34,20 +42,99 @@ fn check_names(settings: &Settings, problems: &mut Vec<String>) {
     }
 }
 
-/// Every role must reference a declared provider.
+/// Every role must reference a declared provider; the embedder needs embeddings.
 fn check_roles(settings: &Settings, problems: &mut Vec<String>) {
-    let roles = [
-        ("generator", Some(&settings.roles.generator)),
-        ("parent", Some(&settings.roles.parent)),
-        ("embedder", settings.roles.embedder.as_ref()),
-    ];
-    for (role, model) in roles {
-        if let Some(model) = model
-            && !settings.providers.contains_key(&model.provider)
-        {
+    for (role, model) in settings.roles.all() {
+        if !settings.providers.contains_key(&model.provider) {
             problems.push(format!(
                 "roles.{role}: unknown provider `{}`",
                 model.provider
+            ));
+        }
+    }
+    if let Some(embedder) = &settings.roles.embedder
+        && settings
+            .providers
+            .get(&embedder.provider)
+            .is_some_and(|provider| provider.protocol == Protocol::Anthropic)
+    {
+        problems.push(
+            "roles.embedder: the anthropic protocol has no embeddings, use an openai provider"
+                .to_string(),
+        );
+    }
+}
+
+/// Per-role request parameters are within range.
+fn check_role_params(settings: &Settings, problems: &mut Vec<String>) {
+    for (role, model) in settings.roles.all() {
+        if model.max_tokens == 0 {
+            problems.push(format!("roles.{role}.max_tokens: must be at least 1"));
+        }
+        if let Some(temperature) = model.temperature
+            && !(0.0..=2.0).contains(&temperature)
+        {
+            problems.push(format!("roles.{role}.temperature: must be in [0, 2]"));
+        }
+        if model.reasoning_effort.is_some() && !model.reasoning {
+            problems.push(format!(
+                "roles.{role}.reasoning_effort: requires reasoning = true"
+            ));
+        }
+    }
+    check_thinking_temperature(settings, problems);
+    check_thinking_budget(settings, problems);
+}
+
+/// `thinking_budget` requires reasoning, a value in `[1024, max_tokens)`, no
+/// `reasoning_effort`, and the `anthropic` protocol (the only one that has it).
+fn check_thinking_budget(settings: &Settings, problems: &mut Vec<String>) {
+    for (role, model) in settings.roles.all() {
+        let Some(budget) = model.thinking_budget else {
+            continue;
+        };
+        if !model.reasoning {
+            problems.push(format!(
+                "roles.{role}.thinking_budget: requires reasoning = true"
+            ));
+        }
+        if model.reasoning_effort.is_some() {
+            problems.push(format!(
+                "roles.{role}.thinking_budget: cannot be combined with reasoning_effort"
+            ));
+        }
+        let anthropic = settings
+            .providers
+            .get(&model.provider)
+            .is_some_and(|provider| provider.protocol == Protocol::Anthropic);
+        if !anthropic {
+            problems.push(format!(
+                "roles.{role}.thinking_budget: only valid on the anthropic protocol"
+            ));
+        }
+        if budget < MIN_THINKING_BUDGET {
+            problems.push(format!(
+                "roles.{role}.thinking_budget: must be at least {MIN_THINKING_BUDGET}"
+            ));
+        }
+        if budget >= model.max_tokens {
+            problems.push(format!(
+                "roles.{role}.thinking_budget: must be less than max_tokens"
+            ));
+        }
+    }
+}
+
+/// The `anthropic` protocol rejects a temperature when thinking is enabled.
+fn check_thinking_temperature(settings: &Settings, problems: &mut Vec<String>) {
+    for (role, model) in settings.roles.all() {
+        let anthropic = settings
+            .providers
+            .get(&model.provider)
+            .is_some_and(|provider| provider.protocol == Protocol::Anthropic);
+        if anthropic && model.reasoning && model.temperature.is_some() {
+            problems.push(format!(
+                "roles.{role}.temperature: the anthropic protocol does not accept a temperature with reasoning = true"
             ));
         }
     }
@@ -81,11 +168,25 @@ fn check_pipeline(settings: &Settings, problems: &mut Vec<String>) {
     if pipeline.concurrency == 0 {
         problems.push("pipeline.concurrency: must be at least 1".to_string());
     }
+    if pipeline.concurrency > MAX_CONCURRENCY {
+        problems.push(format!(
+            "pipeline.concurrency: must be at most {MAX_CONCURRENCY}"
+        ));
+    }
     if !(pipeline.eval_ratio > 0.0 && pipeline.eval_ratio < 1.0) {
         problems.push("pipeline.eval_ratio: must be in (0, 1)".to_string());
     }
     if !(pipeline.dedup_threshold > 0.0 && pipeline.dedup_threshold <= 1.0) {
         problems.push("pipeline.dedup_threshold: must be in (0, 1]".to_string());
+    }
+    if !(pipeline.embedding_threshold > 0.0 && pipeline.embedding_threshold <= 1.0) {
+        problems.push("pipeline.embedding_threshold: must be in (0, 1]".to_string());
+    }
+    if pipeline.question_batch_size == 0 {
+        problems.push("pipeline.question_batch_size: must be at least 1".to_string());
+    }
+    if pipeline.request_timeout_secs == 0 {
+        problems.push("pipeline.request_timeout_secs: must be at least 1".to_string());
     }
 }
 
@@ -267,6 +368,206 @@ mod tests {
         assert!(problems.contains(&"pipeline.concurrency: must be at least 1".to_string()));
         assert!(problems.contains(&"pipeline.eval_ratio: must be in (0, 1)".to_string()));
         assert!(problems.contains(&"pipeline.dedup_threshold: must be in (0, 1]".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn role_parameters_are_checked() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            r#"{ provider = "nanogpt", model = "m1" }"#,
+            r#"{ provider = "nanogpt", model = "m1", max_tokens = 0, temperature = 2.5, reasoning_effort = "high" }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec![
+                "roles.generator.max_tokens: must be at least 1".to_string(),
+                "roles.generator.temperature: must be in [0, 2]".to_string(),
+                "roles.generator.reasoning_effort: requires reasoning = true".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn embedder_must_use_the_openai_protocol() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            "[roles]",
+            "[providers.claude]\nprotocol = \"anthropic\"\n[roles]\nembedder = { provider = \"claude\", model = \"e\" }",
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec![
+                "roles.embedder: the anthropic protocol has no embeddings, use an openai provider"
+                    .to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn role_parameters_have_defaults() -> Result<(), config::ConfigError> {
+        let settings = settings(VALID)?;
+        assert_eq!(settings.roles.parent.max_tokens, 16_384);
+        assert_eq!(settings.roles.parent.temperature, None);
+        assert_eq!(settings.roles.parent.reasoning_effort, None);
+        assert_eq!(settings.pipeline.question_batch_size, 10);
+        assert_eq!(settings.pipeline.request_timeout_secs, 600);
+        Ok(())
+    }
+
+    #[test]
+    fn new_pipeline_fields_are_checked() -> Result<(), config::ConfigError> {
+        let toml = format!(
+            "{VALID}\n[pipeline]\nembedding_threshold = 1.5\nquestion_batch_size = 0\nrequest_timeout_secs = 0\n"
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec![
+                "pipeline.embedding_threshold: must be in (0, 1]".to_string(),
+                "pipeline.question_batch_size: must be at least 1".to_string(),
+                "pipeline.request_timeout_secs: must be at least 1".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrency_is_capped() -> Result<(), config::ConfigError> {
+        let toml = format!("{VALID}\n[pipeline]\nconcurrency = 1025\n");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["pipeline.concurrency: must be at most 1024".to_string()]
+        );
+        let toml = format!("{VALID}\n[pipeline]\nconcurrency = 1024\n");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn temperature_with_reasoning_is_rejected_on_the_anthropic_protocol()
+    -> Result<(), config::ConfigError> {
+        let with_claude = |parent: &str| {
+            VALID.replace(
+                r#"parent = { provider = "nanogpt", model = "m2", reasoning = true }"#,
+                &format!("parent = {parent}\n[providers.claude]\nprotocol = \"anthropic\""),
+            )
+        };
+        let toml = with_claude(
+            r#"{ provider = "claude", model = "m2", reasoning = true, temperature = 0.7 }"#,
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "roles.parent.temperature: the anthropic protocol does not accept a temperature with reasoning = true"
+                    .to_string()
+            ]
+        );
+        for parent in [
+            r#"{ provider = "claude", model = "m2", temperature = 0.7 }"#,
+            r#"{ provider = "claude", model = "m2", reasoning = true }"#,
+            r#"{ provider = "nanogpt", model = "m2", reasoning = true, temperature = 0.7 }"#,
+        ] {
+            assert_eq!(
+                check(&settings(&with_claude(parent))?),
+                Vec::<String>::new(),
+                "{parent}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Applies `generator` in place of the default `nanogpt`-backed generator, and
+    /// declares a `claude` provider on the `anthropic` protocol for it to reference.
+    fn with_anthropic_generator(generator: &str) -> String {
+        format!(
+            "{}\n[providers.claude]\nprotocol = \"anthropic\"",
+            VALID.replace(
+                r#"generator = { provider = "nanogpt", model = "m1" }"#,
+                &format!("generator = {generator}"),
+            )
+        )
+    }
+
+    #[test]
+    fn thinking_budget_requires_reasoning() -> Result<(), config::ConfigError> {
+        let toml = with_anthropic_generator(
+            r#"{ provider = "claude", model = "m1", thinking_budget = 2048 }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec!["roles.generator.thinking_budget: requires reasoning = true".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_budget_has_a_minimum() -> Result<(), config::ConfigError> {
+        let toml = with_anthropic_generator(
+            r#"{ provider = "claude", model = "m1", reasoning = true, thinking_budget = 512, max_tokens = 4096 }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec!["roles.generator.thinking_budget: must be at least 1024".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_budget_must_be_below_max_tokens() -> Result<(), config::ConfigError> {
+        let toml = with_anthropic_generator(
+            r#"{ provider = "claude", model = "m1", reasoning = true, thinking_budget = 4096, max_tokens = 4096 }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec!["roles.generator.thinking_budget: must be less than max_tokens".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_budget_cannot_combine_with_reasoning_effort() -> Result<(), config::ConfigError> {
+        let toml = with_anthropic_generator(
+            r#"{ provider = "claude", model = "m1", reasoning = true, thinking_budget = 2048, reasoning_effort = "high", max_tokens = 4096 }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec![
+                "roles.generator.thinking_budget: cannot be combined with reasoning_effort"
+                    .to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_budget_is_rejected_on_the_openai_protocol() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            r#"generator = { provider = "nanogpt", model = "m1" }"#,
+            r#"generator = { provider = "nanogpt", model = "m1", reasoning = true, thinking_budget = 2048 }"#,
+        );
+        let problems = check(&settings(&toml)?);
+        assert_eq!(
+            problems,
+            vec![
+                "roles.generator.thinking_budget: only valid on the anthropic protocol".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_budget_is_accepted_when_valid() -> Result<(), config::ConfigError> {
+        let toml = with_anthropic_generator(
+            r#"{ provider = "claude", model = "m1", reasoning = true, thinking_budget = 2048, max_tokens = 4096 }"#,
+        );
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
         Ok(())
     }
 

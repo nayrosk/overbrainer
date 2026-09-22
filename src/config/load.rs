@@ -31,9 +31,11 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    /// The file or environment could not be parsed into `Settings`.
+    /// The file or environment could not be parsed into `Settings`. The message names
+    /// the key and the expected type, never the offending value, which may be a secret
+    /// set in the wrong variable.
     #[error("invalid configuration: {0}")]
-    Parse(Box<config::ConfigError>),
+    Parse(String),
     /// The parsed settings failed semantic validation.
     #[error("invalid configuration:\n  {}", .0.join("\n  "))]
     Invalid(Vec<String>),
@@ -41,8 +43,58 @@ pub enum ConfigError {
 
 impl From<config::ConfigError> for ConfigError {
     fn from(source: config::ConfigError) -> Self {
-        Self::Parse(Box::new(source))
+        Self::Parse(describe(&source))
     }
+}
+
+/// Describes a `config` error without the offending value.
+///
+/// Type errors keep their key and expected type. Custom messages from serde quote the
+/// value (`invalid value: string "..."`, `unknown variant ...`), so only the part from
+/// `expected` onward is kept. Unknown field names are keys, not values, and are kept.
+/// TOML syntax errors are reported by location only, never with source snippets.
+fn describe(error: &config::ConfigError) -> String {
+    match error {
+        config::ConfigError::Type { key, expected, .. } => {
+            let key = key.as_deref().unwrap_or("a value");
+            format!("`{key}` has the wrong type, expected {expected}")
+        },
+        config::ConfigError::At { error, key, .. } => match key {
+            Some(key) => format!("`{key}`: {}", describe(error)),
+            None => describe(error),
+        },
+        config::ConfigError::Message(message) => redact(message),
+        config::ConfigError::FileParse { .. } => redact_toml_error(error),
+        _ => "invalid configuration".to_string(),
+    }
+}
+
+/// Keeps only the location of a TOML parse error ("at line N, column M"), never the
+/// source snippet that follows it on the next lines.
+fn redact_toml_error(error: &config::ConfigError) -> String {
+    let message = error.to_string();
+    let first_line = message.lines().next().unwrap_or("");
+    match first_line.find("at line ") {
+        Some(pos) => format!(
+            "TOML syntax error in overbrainer.toml {}",
+            first_line[pos..].trim_end()
+        ),
+        None => "TOML syntax error in overbrainer.toml".to_string(),
+    }
+}
+
+/// Keeps what a serde message says was expected, dropping the value it quotes.
+fn redact(message: &str) -> String {
+    if message.starts_with("unknown field") || message.starts_with("missing field") {
+        return message.to_string();
+    }
+    if let Some(index) = message.find("expected") {
+        return format!("invalid value, {}", &message[index..]);
+    }
+    if let Some((head, _)) = message.split_once(" does not have variant constructor") {
+        return format!("{head}: unknown variant");
+    }
+    "invalid value".to_string()
 }
 
 /// Loads `<project_dir>/overbrainer.toml` layered with `OVERBRAINER_*` variables.
