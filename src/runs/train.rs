@@ -236,9 +236,12 @@ fn not_retrieved(message: Option<String>, error: &ExecError) -> String {
     }
 }
 
-/// Reads new metric lines and the job status until the job ends, then reads the
-/// last lines. Up to [`MAX_FAILURES`] failures in a row are retried, for the last
-/// read as for the others.
+/// Reads new metric lines and the job status until the job ends, then drains the
+/// rest of the metrics file: one read fetches at most [`MAX_TAIL_READ`] bytes, so a
+/// file larger than that needs several. Up to [`MAX_FAILURES`] failures in a row are
+/// retried, for the drain as for the rest.
+///
+/// [`MAX_TAIL_READ`]: crate::exec::MAX_TAIL_READ
 async fn follow<E: Executor>(
     ctx: &RunCtx<'_, E>,
     job: &JobId,
@@ -264,14 +267,22 @@ async fn follow<E: Executor>(
         tokio::time::sleep(ctx.poll).await;
     };
     loop {
+        let offset = stream.offset();
         match stream.read().await {
             Ok(lines) => {
+                // The budget is not given back here: it is the same one the poll
+                // loop was left with, spent over the whole drain.
+                let drained = lines.is_empty() && stream.offset() == offset;
                 publish(ctx.bus, lines, summary);
-                return Ok(status);
+                if drained {
+                    return Ok(status);
+                }
             },
-            Err(error) => retry(&mut failures, error)?,
+            Err(error) => {
+                retry(&mut failures, error)?;
+                tokio::time::sleep(ctx.poll).await;
+            },
         }
-        tokio::time::sleep(ctx.poll).await;
     }
 }
 
@@ -430,7 +441,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::exec::{JobCommand, Pid};
+    use crate::exec::{JobCommand, MAX_TAIL_READ, Pid};
     use crate::runs::RECORD_FILE;
     use crate::train::Artifacts;
 
@@ -479,9 +490,10 @@ mod tests {
     const RUN_ID: &str = "20260922-143005-abcd";
 
     /// A scripted target. Its job reads `status`, its metrics file holds
-    /// [`METRICS`], and the read numbered `failing_read` (from 0) fails.
+    /// `metrics`, and the read numbered `failing_read` (from 0) fails.
     struct Fake {
         status: JobStatus,
+        metrics: String,
         spawn_fails: bool,
         download_fails: bool,
         failing_read: Option<u32>,
@@ -495,6 +507,7 @@ mod tests {
         fn new(status: JobStatus) -> Self {
             Self {
                 status,
+                metrics: METRICS.to_string(),
                 spawn_fails: false,
                 download_fails: false,
                 failing_read: None,
@@ -548,14 +561,21 @@ mod tests {
             &self,
             _path: &str,
             offset: u64,
-            _limit: u64,
+            limit: u64,
         ) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
             let read = self.reads.fetch_add(1, Ordering::SeqCst);
-            let start = usize::try_from(offset).unwrap_or(METRICS.len());
+            let start = usize::try_from(offset).unwrap_or(self.metrics.len());
+            let mut bytes = self
+                .metrics
+                .as_bytes()
+                .get(start..)
+                .unwrap_or_default()
+                .to_vec();
+            bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
             ready(if self.failing_read == Some(read) {
                 Err(broken("read"))
             } else {
-                Ok(METRICS.as_bytes().get(start..).unwrap_or_default().to_vec())
+                Ok(bytes)
             })
         }
 
@@ -680,6 +700,33 @@ mod tests {
         assert_eq!(outcome.record.state, RunState::Succeeded);
         assert_eq!(outcome.summary.lines, 1);
         assert_eq!(fake.reads.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_final_drain_reads_the_whole_metrics_file() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        // Over twice what one read fetches, so the drain after the job ends has to
+        // read again, and again, instead of summarizing a prefix.
+        let line = r#"{"event": "log", "time": 1, "step": 7, "loss": 1.0}"#;
+        let count = 2 * usize::try_from(MAX_TAIL_READ)? / (line.len() + 1) + 1;
+        let mut metrics = String::with_capacity(count * (line.len() + 1));
+        for _ in 0..count {
+            metrics.push_str(line);
+            metrics.push('\n');
+        }
+        let fake = Fake {
+            metrics,
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        let record = running()?;
+        runs.save(&record)?;
+        let outcome = watch(&ctx(&runs, &fake, &bus), &NoFiles, record).await?;
+        assert_eq!(outcome.record.state, RunState::Succeeded);
+        assert_eq!(outcome.summary.lines, count);
         Ok(())
     }
 
