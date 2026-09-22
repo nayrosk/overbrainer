@@ -50,7 +50,7 @@ How the stages work:
 - `subtopics` asks the `generator` role for `subtopics` subtopic names per topic.
 - `questions` asks the `generator` for questions in batches of `question_batch_size`, listing the questions already accepted for the subtopic. Near-duplicates are dropped: first by word overlap (`dedup_threshold`), then, when `roles.embedder` is set, by embedding similarity (`embedding_threshold`). A subtopic stops at `questions_per_subtopic`, or after `max_retries` batches that bring nothing new.
 - `answers` sends each question to the `parent` role, `concurrency` requests at a time, with the answer system prompt. An answer that hit the token limit, was refused, is empty, or (with `reasoning = true`) has no raw reasoning is kept in `answers.jsonl` with `meta.excluded` set, and left out of training.
-- `split` writes the usable answers of every topic to `train.jsonl` and `eval.jsonl`, `eval_ratio` of each subtopic going to eval; `--topic` only limits what is counted in the printed report. The split is deterministic for a given `seed`.
+- `split` writes the usable answers of every topic to `train.jsonl` and `eval.jsonl`; `--topic` only limits what is counted in the printed report. The eval set holds `eval_ratio` of all usable answers, rounded, and at least one as soon as there are two. It is spread over the subtopics in proportion to their size, so even many small subtopics give an eval set. The split is deterministic for a given `seed`.
 
 Answer lines use the Axolotl `chat_template` format, with the parent's reasoning in `reasoning_content`:
 
@@ -126,7 +126,7 @@ The embedder must use the `openai` protocol: Anthropic has no embeddings endpoin
 | `embedding_threshold` | `0.9` | Embedding similarity above which two questions are duplicates. |
 | `question_batch_size` | `10` | Questions requested per call. |
 | `request_timeout_secs` | `600` | Timeout of one request. |
-| `eval_ratio` | `0.1` | Share of each subtopic kept for evaluation. |
+| `eval_ratio` | `0.1` | Share of the usable answers kept for evaluation, spread over the subtopics. |
 | `seed` | `42` | Seed of the train/eval split. |
 | `include_system_prompt` | `false` | Store the system prompt in the dataset. |
 
