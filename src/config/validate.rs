@@ -11,18 +11,31 @@ pub(crate) fn is_valid_name(name: &str) -> bool {
 /// Semantic checks that serde cannot express. Returns one message per problem.
 pub(crate) fn check(settings: &Settings) -> Vec<String> {
     let mut problems = Vec::new();
+    check_names(settings, &mut problems);
+    check_roles(settings, &mut problems);
+    check_topics(settings, &mut problems);
+    check_pipeline(settings, &mut problems);
+    check_training(settings, &mut problems);
+    check_targets(settings, &mut problems);
+    problems
+}
 
-    for name in settings.providers.keys() {
+/// Provider and target names must be usable in env variable names.
+fn check_names(settings: &Settings, problems: &mut Vec<String>) {
+    let names = settings
+        .providers
+        .keys()
+        .map(|name| ("providers", name))
+        .chain(settings.targets.keys().map(|name| ("targets", name)));
+    for (table, name) in names {
         if !is_valid_name(name) {
-            problems.push(format!("providers.{name}: name must match ^[a-z0-9_]+$"));
+            problems.push(format!("{table}.{name}: name must match ^[a-z0-9_]+$"));
         }
     }
-    for name in settings.targets.keys() {
-        if !is_valid_name(name) {
-            problems.push(format!("targets.{name}: name must match ^[a-z0-9_]+$"));
-        }
-    }
+}
 
+/// Every role must reference a declared provider.
+fn check_roles(settings: &Settings, problems: &mut Vec<String>) {
     let roles = [
         ("generator", Some(&settings.roles.generator)),
         ("parent", Some(&settings.roles.parent)),
@@ -38,7 +51,10 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
             ));
         }
     }
+}
 
+/// Topic names are unique and their counts are at least 1.
+fn check_topics(settings: &Settings, problems: &mut Vec<String>) {
     let mut seen = std::collections::BTreeSet::new();
     for topic in &settings.topics {
         if !seen.insert(topic.name.as_str()) {
@@ -57,7 +73,10 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
             ));
         }
     }
+}
 
+/// Pipeline counts and ratios are within range. NaN is always out of range.
+fn check_pipeline(settings: &Settings, problems: &mut Vec<String>) {
     let pipeline = &settings.pipeline;
     if pipeline.concurrency == 0 {
         problems.push("pipeline.concurrency: must be at least 1".to_string());
@@ -68,7 +87,10 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
     if !(pipeline.dedup_threshold > 0.0 && pipeline.dedup_threshold <= 1.0) {
         problems.push("pipeline.dedup_threshold: must be in (0, 1]".to_string());
     }
+}
 
+/// The training section must point at a declared target.
+fn check_training(settings: &Settings, problems: &mut Vec<String>) {
     if let Some(training) = &settings.training
         && !settings.targets.contains_key(&training.target)
     {
@@ -77,30 +99,31 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
             training.target
         ));
     }
+}
 
+/// Per-kind target requirements.
+fn check_targets(settings: &Settings, problems: &mut Vec<String>) {
     for (name, target) in &settings.targets {
         match target {
             Target::Local { runtime, image, .. } | Target::Ssh { runtime, image, .. } => {
                 if *runtime == Runtime::Docker && image.is_none() {
                     problems.push(format!("targets.{name}: runtime `docker` requires `image`"));
                 }
-            }
+            },
             Target::Runpod {
                 max_hours,
                 gpu_count,
                 ..
             } => {
-                if *max_hours <= 0.0 {
+                if max_hours.is_nan() || *max_hours <= 0.0 {
                     problems.push(format!("targets.{name}.max_hours: must be greater than 0"));
                 }
                 if *gpu_count == 0 {
                     problems.push(format!("targets.{name}.gpu_count: must be at least 1"));
                 }
-            }
+            },
         }
     }
-
-    problems
 }
 
 /// Lists env-only keys that appear in the TOML file. Values are never included.
@@ -201,6 +224,22 @@ mod tests {
             problems,
             vec!["training.target: unknown target `cloud`".to_string()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn runpod_max_hours_must_be_a_positive_number() -> Result<(), config::ConfigError> {
+        for value in ["0.0", "-1.0", "nan"] {
+            let toml = format!(
+                "{VALID}\n[targets.cloud]\nkind = \"runpod\"\ngpu_type = \"g\"\nimage = \"i\"\nmax_hours = {value}\n"
+            );
+            let problems = check(&settings(&toml)?);
+            assert_eq!(
+                problems,
+                vec!["targets.cloud.max_hours: must be greater than 0".to_string()],
+                "max_hours = {value}"
+            );
+        }
         Ok(())
     }
 
