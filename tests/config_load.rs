@@ -338,9 +338,10 @@ not valid toml here = SK-LEAK-MARKER-999 !!broken!!
                 !debug.contains("SK-LEAK-MARKER-999"),
                 "marker leaked in Debug: {debug}"
             );
-            assert!(
-                text.contains("line") || text.contains("TOML"),
-                "error should mention location: {text}"
+            assert_eq!(
+                text,
+                "invalid configuration: TOML syntax error in overbrainer.toml at line 5, column 5",
+                "the error names the location only"
             );
             Ok(())
         },

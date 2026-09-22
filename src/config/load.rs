@@ -69,21 +69,18 @@ fn describe(error: &config::ConfigError) -> String {
     }
 }
 
-/// Extracts location info from TOML parse errors, never including source snippets.
+/// Keeps only the location of a TOML parse error ("at line N, column M"), never the
+/// source snippet that follows it on the next lines.
 fn redact_toml_error(error: &config::ConfigError) -> String {
     let message = error.to_string();
     let first_line = message.lines().next().unwrap_or("");
-
-    if let Some(pos) = first_line.find("at line ") {
-        if let Some(end) = first_line[pos..].find('\n') {
-            let location = &first_line[pos + 3..pos + end];
-            return format!("TOML syntax error in overbrainer.toml {location}");
-        }
-        let location = &first_line[pos + 3..];
-        return format!("TOML syntax error in overbrainer.toml {location}");
+    match first_line.find("at line ") {
+        Some(pos) => format!(
+            "TOML syntax error in overbrainer.toml {}",
+            first_line[pos..].trim_end()
+        ),
+        None => "TOML syntax error in overbrainer.toml".to_string(),
     }
-
-    "TOML syntax error in overbrainer.toml".to_string()
 }
 
 /// Keeps what a serde message says was expected, dropping the value it quotes.
