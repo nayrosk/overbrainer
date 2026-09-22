@@ -279,3 +279,103 @@ fn reasoning_template_warning_follows_the_template_in_use() -> TestResult {
     assert!(warning.contains("chat_template `chatml`"), "{warning}");
     Ok(())
 }
+
+#[test]
+fn chat_template_tokenizer_default_falls_back_to_the_base_model_heuristic() -> TestResult {
+    let (_dir, qwen) = settings(
+        "[training]\ntarget = \"box\"\nbase_model = \"Qwen/Qwen3-8B\"\nadapter = \"lora\"\n[training.axolotl_extra]\nchat_template = \"tokenizer_default\"\n",
+    )?;
+    assert_eq!(reasoning_template_warning(training(&qwen)?), None);
+
+    let (_dir, llama) = settings(
+        "[training]\ntarget = \"box\"\nbase_model = \"meta-llama/Llama-3.2-1B\"\nadapter = \"lora\"\n[training.axolotl_extra]\nchat_template = \"tokenizer_default\"\n",
+    )?;
+    let warning = reasoning_template_warning(training(&llama)?).ok_or("no warning")?;
+    assert!(warning.contains("meta-llama/Llama-3.2-1B"), "{warning}");
+    Ok(())
+}
+
+#[test]
+fn chat_template_jinja_overrides_chat_template_and_is_checked_for_reasoning_content() -> TestResult
+{
+    // chatml alone would warn, but the jinja override renders reasoning_content.
+    let (_dir, with_marker) = settings(
+        "[training]\ntarget = \"box\"\nbase_model = \"meta-llama/Llama-3.2-1B\"\nadapter = \"lora\"\n[training.axolotl_extra]\nchat_template = \"chatml\"\nchat_template_jinja = \"{{ reasoning_content }}\"\n",
+    )?;
+    assert_eq!(reasoning_template_warning(training(&with_marker)?), None);
+
+    // Qwen3 alone would not warn, but the jinja override does not render it.
+    let (_dir, without_marker) = settings(
+        "[training]\ntarget = \"box\"\nbase_model = \"Qwen/Qwen3-8B\"\nadapter = \"lora\"\n[training.axolotl_extra]\nchat_template_jinja = \"{{ messages }}\"\n",
+    )?;
+    let warning = reasoning_template_warning(training(&without_marker)?).ok_or("no warning")?;
+    assert!(warning.contains("chat_template_jinja"), "{warning}");
+    Ok(())
+}
+
+#[test]
+fn copy_errors_name_both_the_source_and_the_destination() -> TestResult {
+    let (dir, settings) = settings(QLORA)?;
+    let files = DataFiles::new(dir.path());
+    let trainer = Axolotl::new(training(&settings)?, &files);
+    let run = dir.path().join("runs/r1");
+    fs::create_dir_all(dir.path().join("data"))?;
+    fs::write(&files.train, "{\"a\":1}\n")?;
+    // The destination is already a directory, so `fs::copy` fails writing to it,
+    // not reading the source.
+    fs::create_dir_all(run.join("data/train.jsonl"))?;
+
+    let error = trainer
+        .prepare(&run, "/workspace/run")
+        .err()
+        .ok_or("expected a copy error")?;
+    let message = error.to_string();
+    assert!(
+        message.contains(&files.train.display().to_string()),
+        "{message}"
+    );
+    assert!(
+        message.contains(&run.join("data/train.jsonl").display().to_string()),
+        "{message}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_metadata_error_other_than_missing_is_reported_as_io() -> TestResult {
+    let (dir, settings) = settings(QLORA)?;
+    // `data` is a file, not a directory: metadata on `data/train.jsonl` fails
+    // because a path component is not a directory, which is not the same as a
+    // missing training file.
+    fs::write(dir.path().join("data"), "not a directory")?;
+    let files = DataFiles::new(dir.path());
+    let trainer = Axolotl::new(training(&settings)?, &files);
+    let run = dir.path().join("runs/r1");
+
+    let result = trainer.prepare(&run, "/workspace/run");
+    assert!(matches!(result, Err(TrainError::Io { .. })), "{result:?}");
+    Ok(())
+}
+
+#[test]
+fn eval_steps_and_eval_strategy_are_dropped_without_eval_data() -> TestResult {
+    let (dir, settings) = settings(
+        "[training]\ntarget = \"box\"\nbase_model = \"m\"\nadapter = \"lora\"\n[training.axolotl_extra]\neval_steps = 50\neval_strategy = \"steps\"\n",
+    )?;
+    let trainer = Axolotl::new(training(&settings)?, &DataFiles::new(dir.path()));
+    let config = trainer.config("/r", false);
+    assert!(config.get("eval_steps").is_none());
+    assert!(config.get("eval_strategy").is_none());
+    Ok(())
+}
+
+#[test]
+fn attn_implementation_in_axolotl_extra_overrides_the_default() -> TestResult {
+    let (dir, settings) = settings(
+        "[training]\ntarget = \"box\"\nbase_model = \"m\"\nadapter = \"lora\"\n[training.axolotl_extra]\nattn_implementation = \"flash_attention_2\"\n",
+    )?;
+    let trainer = Axolotl::new(training(&settings)?, &DataFiles::new(dir.path()));
+    let config = trainer.config("/r", false);
+    assert_eq!(config["attn_implementation"], "flash_attention_2");
+    Ok(())
+}

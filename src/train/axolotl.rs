@@ -86,6 +86,13 @@ impl<'a> Axolotl<'a> {
         for (key, value) in &training.axolotl_extra {
             merge(&mut config, key, value);
         }
+        // Without eval data, Axolotl (via the HF `Trainer`) rejects a step-based or
+        // strategy-based eval cadence set through `axolotl_extra`: there is no eval
+        // dataset for it to apply to.
+        if !has_eval && let Value::Object(map) = &mut config {
+            map.remove("eval_steps");
+            map.remove("eval_strategy");
+        }
         config
     }
 
@@ -174,13 +181,13 @@ fn merge(config: &mut Value, key: &str, value: &Value) {
 
 impl Trainer for Axolotl<'_> {
     fn prepare(&self, run_dir: &Path, root: &str) -> Result<(), TrainError> {
-        if fs::metadata(&self.train).map_or(true, |meta| meta.len() == 0) {
+        if file_size(&self.train)?.unwrap_or(0) == 0 {
             return Err(TrainError::NoTrainingData {
                 path: self.train.clone(),
             });
         }
         copy(&self.train, &run_dir.join(TRAIN_FILE))?;
-        let has_eval = fs::metadata(&self.eval).is_ok_and(|meta| meta.len() > 0);
+        let has_eval = file_size(&self.eval)?.is_some_and(|len| len > 0);
         if has_eval {
             copy(&self.eval, &run_dir.join(EVAL_FILE))?;
         }
@@ -223,11 +230,30 @@ fn command(subcommand: &str) -> Vec<String> {
     vec!["axolotl".into(), subcommand.into(), CONFIG_FILE.into()]
 }
 
+/// The size of `path`, or `None` when it does not exist.
+///
+/// A metadata error other than "not found" (for example a permission error, or a
+/// path component that is not a directory) is not a missing file and is reported as
+/// [`TrainError::Io`] rather than treated as one.
+fn file_size(path: &Path) -> Result<Option<u64>, TrainError> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(Some(meta.len())),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(io_error(path)(source)),
+    }
+}
+
 fn copy(from: &Path, to: &Path) -> Result<(), TrainError> {
     if let Some(dir) = to.parent() {
         fs::create_dir_all(dir).map_err(io_error(dir))?;
     }
-    fs::copy(from, to).map(drop).map_err(io_error(to))
+    fs::copy(from, to)
+        .map(drop)
+        .map_err(|source| TrainError::Copy {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+            source,
+        })
 }
 
 fn write(path: &Path, content: &str) -> Result<(), TrainError> {
@@ -247,21 +273,41 @@ fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> TrainError + '_ {
 /// A warning when the chat template in use may drop `reasoning_content`, which
 /// leaves the parent's reasoning out of training without any error.
 ///
-/// With `axolotl_extra.chat_template` set, only Axolotl's reasoning templates pass.
-/// Otherwise the base model's own template is used, and only Qwen3 model names pass
-/// (their official template renders reasoning). This is a name heuristic: a local
-/// path or a renamed model may be warned about wrongly.
+/// With `axolotl_extra.chat_template_jinja` set, that custom template decides the
+/// answer on its own (it is checked for a `reasoning_content` reference), regardless
+/// of `chat_template`. Otherwise, with `axolotl_extra.chat_template` set to anything
+/// but `tokenizer_default` (Axolotl's own name for "use the base model's template"),
+/// only Axolotl's reasoning templates pass. Otherwise, or with `tokenizer_default`,
+/// the base model's own template is used, and only Qwen3 model names pass (their
+/// official template renders reasoning).
+///
+/// This is a name heuristic: a local path or a renamed model may be warned about
+/// wrongly, and it can pass wrongly too. A non-thinking Qwen3 variant, for example
+/// `Qwen3-8B-Instruct-2507` or `Qwen3-Coder-30B-A3B-Instruct`, matches the Qwen3 name
+/// check but its own template does not render reasoning.
 #[must_use]
 pub fn reasoning_template_warning(training: &Training) -> Option<String> {
+    let extra = &training.axolotl_extra;
+    if let Some(jinja) = extra.get("chat_template_jinja").and_then(Value::as_str) {
+        return if jinja.contains("reasoning_content") {
+            None
+        } else {
+            Some(
+                "chat_template_jinja does not reference reasoning_content, leaving \
+                 the parent's reasoning out of training"
+                    .to_string(),
+            )
+        };
+    }
     let known = format!(
         "templates known to render it: {}",
         REASONING_TEMPLATES.join(", ")
     );
-    match training
-        .axolotl_extra
+    let chat_template = extra
         .get("chat_template")
         .and_then(Value::as_str)
-    {
+        .filter(|template| *template != "tokenizer_default");
+    match chat_template {
         Some(template) if REASONING_TEMPLATES.contains(&template) => None,
         Some(template) => Some(format!(
             "chat_template `{template}` may drop reasoning_content, leaving the parent's reasoning out of training ({known})"

@@ -15,11 +15,23 @@ pub use yaml::to_yaml;
 /// Errors while preparing the files of a run.
 #[derive(Debug, thiserror::Error)]
 pub enum TrainError {
-    /// A file of the run could not be written or copied.
-    #[error("cannot write {}", path.display())]
+    /// A file or directory of the run could not be written, or its metadata could
+    /// not be read.
+    #[error("cannot access {}", path.display())]
     Io {
         /// The file or directory.
         path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A file could not be copied from its source to its destination.
+    #[error("cannot copy {} to {}", from.display(), to.display())]
+    Copy {
+        /// The file being copied.
+        from: PathBuf,
+        /// Where it was being copied to.
+        to: PathBuf,
         /// Underlying I/O error.
         #[source]
         source: std::io::Error,
@@ -50,8 +62,9 @@ pub trait Trainer {
     ///
     /// # Errors
     ///
-    /// Returns [`TrainError::NoTrainingData`] when there is nothing to train on, and
-    /// [`TrainError::Io`] when a file cannot be written.
+    /// Returns [`TrainError::NoTrainingData`] when there is nothing to train on,
+    /// [`TrainError::Copy`] when a source file cannot be copied to its destination,
+    /// and [`TrainError::Io`] for any other file or metadata error.
     fn prepare(&self, run_dir: &Path, root: &str) -> Result<(), TrainError>;
 
     /// Commands run one after the other in the run directory, each as a program and

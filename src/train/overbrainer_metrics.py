@@ -26,9 +26,9 @@ def _number(value):
 class OverbrainerMetricsCallback(TrainerCallback):
     def __init__(self, path):
         self.path = path
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     def _write(self, record):
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as file:
             file.write(json.dumps(record) + "\n")
             file.flush()
