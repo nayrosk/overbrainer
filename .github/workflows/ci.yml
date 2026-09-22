@@ -52,6 +52,14 @@ jobs:
         run: |
           python3 -m pip install --break-system-packages pyyaml
           python3 -c 'import yaml'
+      - name: Install the shells the generated scripts are tested under
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dash busybox-static
+          dash -c 'echo dash ready'
+          busybox sh -c 'echo busybox ready'
       - run: cargo test --all-targets --locked
 
   ssh:
