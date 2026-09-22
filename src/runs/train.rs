@@ -14,8 +14,10 @@ use crate::train::{TrainError, Trainer};
 /// by the runs of that target so a base model is downloaded once.
 pub const HF_CACHE_DIR: &str = ".hf-cache";
 
-/// Consecutive failures to reach the target before a watch gives up (the job keeps
-/// running and can be attached again).
+/// Failures in a row to reach the target that a watch retries: the sixth one in a
+/// row gives up (the job keeps running and can be attached again). A success in the
+/// poll loop starts the count again; the drain that follows the job's end spends
+/// what is left of it.
 const MAX_FAILURES: u32 = 5;
 
 /// Errors of the train, attach and cancel flows.
