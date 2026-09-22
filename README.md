@@ -120,7 +120,7 @@ The embedder must use the `openai` protocol: Anthropic has no embeddings endpoin
 
 | Key | Default | Meaning |
 |---|---|---|
-| `concurrency` | `8` | Parallel requests in `answers`. |
+| `concurrency` | `8` | Parallel requests in `answers`, 1 to 1024. |
 | `max_retries` | `5` | Retries per request (rate limits, server errors, timeouts), and batches without progress before a subtopic stops. |
 | `dedup_threshold` | `0.8` | Word-overlap similarity above which two questions are duplicates. |
 | `embedding_threshold` | `0.9` | Embedding similarity above which two questions are duplicates. |

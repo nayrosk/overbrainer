@@ -1,5 +1,9 @@
 use super::types::{Protocol, Runtime, Settings, Target};
 
+/// Highest `pipeline.concurrency`: far above what providers allow, and well within
+/// what a semaphore can hold.
+const MAX_CONCURRENCY: usize = 1024;
+
 /// Returns true when `name` matches `^[a-z0-9_]+$`.
 pub(crate) fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -104,6 +108,11 @@ fn check_pipeline(settings: &Settings, problems: &mut Vec<String>) {
     let pipeline = &settings.pipeline;
     if pipeline.concurrency == 0 {
         problems.push("pipeline.concurrency: must be at least 1".to_string());
+    }
+    if pipeline.concurrency > MAX_CONCURRENCY {
+        problems.push(format!(
+            "pipeline.concurrency: must be at most {MAX_CONCURRENCY}"
+        ));
     }
     if !(pipeline.eval_ratio > 0.0 && pipeline.eval_ratio < 1.0) {
         problems.push("pipeline.eval_ratio: must be in (0, 1)".to_string());
@@ -363,6 +372,18 @@ mod tests {
                 "pipeline.request_timeout_secs: must be at least 1".to_string(),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrency_is_capped() -> Result<(), config::ConfigError> {
+        let toml = format!("{VALID}\n[pipeline]\nconcurrency = 1025\n");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["pipeline.concurrency: must be at most 1024".to_string()]
+        );
+        let toml = format!("{VALID}\n[pipeline]\nconcurrency = 1024\n");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
         Ok(())
     }
 

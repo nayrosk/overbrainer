@@ -159,7 +159,7 @@ impl Effort {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Pipeline {
-    /// Number of requests to run concurrently. Must be at least 1.
+    /// Number of requests to run concurrently. Must be between 1 and 1024.
     pub concurrency: usize,
     /// Maximum number of retries for a failed request.
     pub max_retries: u32,
