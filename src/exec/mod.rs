@@ -9,6 +9,7 @@
 
 mod lines;
 mod local;
+mod runtime;
 mod script;
 mod tar;
 
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 pub use lines::{LineStream, MAX_TAIL_READ, complete_lines};
 pub use local::LocalExecutor;
+pub use runtime::{CONTAINER_ROOT, JobRuntime, JobSpec, shell_path};
 pub use script::{cancel_script, job_script, parse_status, quote, status_script};
 
 use crate::config::Engine;
