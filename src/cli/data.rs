@@ -30,7 +30,7 @@ pub enum Command {
     Answers,
     /// `overbrainer split`
     Split,
-    /// `overbrainer run`: the four stages in order.
+    /// `overbrainer run`: the four stages in order (training follows in `cli::run`).
     Run,
 }
 
@@ -187,7 +187,6 @@ async fn run_all(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<()> {
     report(Stage::Questions, questions(session, ctx).await)?;
     report(Stage::Answers, answers(session, ctx).await)?;
     print_split(&pipeline::split(ctx)?);
-    tracing::info!("training is not available yet: run stops after split");
     Ok(())
 }
 

@@ -4,6 +4,7 @@ mod config_check;
 mod data;
 mod init;
 mod progress;
+mod train;
 
 use std::path::PathBuf;
 
@@ -60,8 +61,55 @@ pub enum Command {
     /// example after the questions were regenerated), are left out and counted as
     /// orphaned; they stay in data/answers.jsonl.
     Split(SplitArgs),
-    /// Run subtopics, questions, answers and split in order.
+    /// Run subtopics, questions, answers and split in order, then train when
+    /// overbrainer.toml has a [training] section.
     Run,
+    /// Fine-tune the child model on data/train.jsonl, evaluating on data/eval.jsonl.
+    ///
+    /// The job runs detached on the target and writes to runs/<run-id>/. Ctrl-C stops
+    /// following it but leaves it running: `overbrainer train attach <run-id>` follows
+    /// it again, `overbrainer train cancel <run-id>` stops it.
+    Train(TrainArgs),
+    /// Inspect training runs.
+    Runs {
+        /// The runs subcommand to run.
+        #[command(subcommand)]
+        command: RunsCommand,
+    },
+}
+
+/// Options and subcommands of `overbrainer train`.
+#[derive(Debug, Default, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct TrainArgs {
+    /// Train on this target instead of training.target.
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Follow or stop an existing run instead of starting one.
+    #[command(subcommand)]
+    pub command: Option<TrainCommand>,
+}
+
+/// Subcommands of `overbrainer train`.
+#[derive(Debug, Subcommand)]
+pub enum TrainCommand {
+    /// Follow a run again after Ctrl-C or a lost connection, then retrieve its results.
+    Attach {
+        /// ID of the run, as shown by `overbrainer runs ls`.
+        run_id: String,
+    },
+    /// Stop the job of a run.
+    Cancel {
+        /// ID of the run, as shown by `overbrainer runs ls`.
+        run_id: String,
+    },
+}
+
+/// Subcommands of `overbrainer runs`.
+#[derive(Debug, Subcommand)]
+pub enum RunsCommand {
+    /// List the runs in runs/, oldest first: ID, state, target, creation time.
+    Ls,
 }
 
 /// Options shared by the pipeline stage commands.
@@ -116,7 +164,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             };
             data::run(dir, data::Command::Split, &args).await
         },
-        Command::Run => data::run(dir, data::Command::Run, &StageArgs::default()).await,
+        Command::Run => {
+            data::run(dir, data::Command::Run, &StageArgs::default()).await?;
+            train::after_run(dir).await
+        },
+        Command::Train(args) => train::run(dir, &args).await,
+        Command::Runs {
+            command: RunsCommand::Ls,
+        } => train::list(dir),
     }
 }
 
