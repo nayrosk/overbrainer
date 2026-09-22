@@ -1,15 +1,24 @@
 use super::{ExecError, Executor};
 
-/// Splits `bytes`, read from byte `offset` of a file, into complete lines. Returns
-/// them with the offset just past the last one: an unterminated last line is left
-/// for the next read.
+/// Maximum bytes [`LineStream::read`] asks for in one poll, so a burst of output (or
+/// a stalled connection) cannot pull an unbounded amount of data into memory at
+/// once. A caller wanting more calls `read` again.
+pub const MAX_TAIL_READ: u64 = 1_048_576;
+
+/// Splits `bytes`, read from byte `offset` of a file, into complete lines, treating
+/// `\n` and `\r` (as printed by a progress bar that redraws its line in place) alike
+/// as terminators. Returns them with the offset just past the last terminator: an
+/// unterminated last line is left for the next read.
 #[must_use]
 pub fn complete_lines(bytes: &[u8], offset: u64) -> (Vec<String>, u64) {
-    let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+    let Some(end) = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n' || *byte == b'\r')
+    else {
         return (Vec::new(), offset);
     };
     let lines = bytes[..end]
-        .split(|byte| *byte == b'\n')
+        .split(|byte| *byte == b'\n' || *byte == b'\r')
         .filter(|line| !line.is_empty())
         .map(|line| String::from_utf8_lossy(line).into_owned())
         .collect();
@@ -49,7 +58,10 @@ impl<'a, E: Executor> LineStream<'a, E> {
     ///
     /// Returns an [`ExecError`] when the file cannot be read.
     pub async fn read(&mut self) -> Result<Vec<String>, ExecError> {
-        let bytes = self.executor.read_from(&self.path, self.offset).await?;
+        let bytes = self
+            .executor
+            .read_from(&self.path, self.offset, MAX_TAIL_READ)
+            .await?;
         let (lines, offset) = complete_lines(&bytes, self.offset);
         self.offset = offset;
         Ok(lines)
@@ -58,6 +70,12 @@ impl<'a, E: Executor> LineStream<'a, E> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::exec::{JobCommand, JobId, JobStatus};
+
     use super::*;
 
     #[test]
@@ -69,5 +87,89 @@ mod tests {
         assert_eq!(complete_lines(b"partial", 3), (Vec::new(), 3));
         assert_eq!(complete_lines(b"\n\nx\n", 0), (vec!["x".to_string()], 4));
         assert_eq!(complete_lines(b"", 7), (Vec::new(), 7));
+    }
+
+    #[test]
+    fn a_carriage_return_also_terminates_a_line() {
+        assert_eq!(
+            complete_lines(b"10%\r50%\r100%\npartial", 0),
+            (
+                vec!["10%".to_string(), "50%".to_string(), "100%".to_string()],
+                13
+            )
+        );
+    }
+
+    /// Records the `limit` it was asked to read with, and serves bytes from a fixed
+    /// buffer. Every other method is unused by these tests.
+    struct RecordingExecutor {
+        content: Vec<u8>,
+        last_limit: AtomicU64,
+    }
+
+    impl Executor for RecordingExecutor {
+        fn workdir(&self) -> &'static str {
+            "/w"
+        }
+
+        fn upload(
+            &self,
+            _local: &Path,
+            _remote: &str,
+        ) -> impl Future<Output = Result<(), ExecError>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn spawn(
+            &self,
+            _job: &JobCommand,
+        ) -> impl Future<Output = Result<JobId, ExecError>> + Send {
+            std::future::ready(Err(ExecError::Protocol("unused".to_string())))
+        }
+
+        fn read_from(
+            &self,
+            _path: &str,
+            offset: u64,
+            limit: u64,
+        ) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
+            self.last_limit.store(limit, Ordering::SeqCst);
+            let start = usize::try_from(offset).unwrap_or(self.content.len());
+            let bytes = self.content.get(start..).unwrap_or_default().to_vec();
+            std::future::ready(Ok(bytes))
+        }
+
+        fn status(
+            &self,
+            _job: &JobId,
+        ) -> impl Future<Output = Result<JobStatus, ExecError>> + Send {
+            std::future::ready(Err(ExecError::Protocol("unused".to_string())))
+        }
+
+        fn cancel(&self, _job: &JobId) -> impl Future<Output = Result<(), ExecError>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn download(
+            &self,
+            _remote: &str,
+            _local: &Path,
+            _entries: &[String],
+            _exclude: &[String],
+        ) -> impl Future<Output = Result<(), ExecError>> + Send {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_caps_its_request_at_max_tail_read() -> Result<(), Box<dyn std::error::Error>> {
+        let executor = RecordingExecutor {
+            content: b"a\n".to_vec(),
+            last_limit: AtomicU64::new(0),
+        };
+        let mut stream = LineStream::new(&executor, "job.log", 0);
+        stream.read().await?;
+        assert_eq!(executor.last_limit.load(Ordering::SeqCst), MAX_TAIL_READ);
+        Ok(())
     }
 }

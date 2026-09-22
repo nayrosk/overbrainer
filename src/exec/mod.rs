@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
-pub use lines::{LineStream, complete_lines};
+pub use lines::{LineStream, MAX_TAIL_READ, complete_lines};
 pub use script::{cancel_script, job_script, parse_status, quote, status_script};
 
 use crate::config::Engine;
@@ -77,6 +77,43 @@ pub struct Container {
     pub name: String,
 }
 
+/// A job's process ID, validated to be neither `0` nor `1`. Process group `0` is a
+/// wildcard for `kill`, and `1` is `init` (or, over SSH, sometimes a container's own
+/// PID 1): signalling either would never correctly target a single job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Pid(u32);
+
+impl Pid {
+    /// Validates `pid`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Protocol`] when `pid` is `0` or `1`.
+    pub fn new(pid: u32) -> Result<Self, ExecError> {
+        if pid <= 1 {
+            return Err(ExecError::Protocol(format!("invalid process id {pid}")));
+        }
+        Ok(Self(pid))
+    }
+
+    /// The validated process ID.
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Pid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = u32::deserialize(deserializer)?;
+        Self::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A job to start in the background.
 #[derive(Debug, Clone)]
 pub struct JobCommand {
@@ -96,8 +133,9 @@ pub struct JobCommand {
 pub struct JobId {
     /// Run directory on the target.
     pub dir: String,
-    /// Process ID of the job's session leader, also its process group ID.
-    pub pid: u32,
+    /// Process ID of the job's session leader, also its process group ID. Never `0`
+    /// or `1`.
+    pub pid: Pid,
     /// The container the job runs in, if any.
     pub container: Option<Container>,
 }
@@ -152,8 +190,8 @@ pub trait Executor: Send + Sync {
     /// Returns an [`ExecError`] when the job cannot be started.
     fn spawn(&self, job: &JobCommand) -> impl Future<Output = Result<JobId, ExecError>> + Send;
 
-    /// Bytes of the file `path` from byte `offset` to its current end. A missing file
-    /// reads as empty.
+    /// Bytes of the file `path` from byte `offset`, up to `limit` bytes: fewer when
+    /// less than `limit` remains past `offset`. A missing file reads as empty.
     ///
     /// # Errors
     ///
@@ -162,6 +200,7 @@ pub trait Executor: Send + Sync {
         &self,
         path: &str,
         offset: u64,
+        limit: u64,
     ) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send;
 
     /// What `job` is doing now.
@@ -200,5 +239,26 @@ pub trait Executor: Send + Sync {
         Self: Sized,
     {
         LineStream::new(self, path, offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_rejects_zero_and_one() {
+        assert!(Pid::new(0).is_err());
+        assert!(Pid::new(1).is_err());
+        assert!(Pid::new(2).is_ok_and(|pid| pid.get() == 2));
+    }
+
+    #[test]
+    fn deserializing_a_job_id_rejects_an_invalid_pid() -> Result<(), Box<dyn std::error::Error>> {
+        let valid: JobId = serde_json::from_str(r#"{"dir":"/w/r1","pid":42,"container":null}"#)?;
+        assert_eq!(valid.pid.get(), 42);
+        let invalid = serde_json::from_str::<JobId>(r#"{"dir":"/w/r1","pid":1,"container":null}"#);
+        assert!(invalid.is_err());
+        Ok(())
     }
 }
