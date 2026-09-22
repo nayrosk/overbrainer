@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use config::{Config, Environment, File, FileFormat};
+use serde_json::Value;
 
 use super::{Settings, validate};
 
@@ -124,7 +126,7 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
         .build()?;
     let mut problems = validate::env_only_in_file(&file_only);
 
-    let settings: Settings = Config::builder()
+    let mut settings: Settings = Config::builder()
         .add_source(File::from_str(&content, FileFormat::Toml))
         .add_source(
             Environment::with_prefix(ENV_PREFIX)
@@ -136,10 +138,171 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
         .build()?
         .try_deserialize()?;
 
+    if let Some(training) = settings.training.as_mut() {
+        let file_extra: BTreeMap<String, Value> =
+            file_only.get("training.axolotl_extra").unwrap_or_default();
+        coerce_env_scalars(&mut training.axolotl_extra, &file_extra);
+    }
+
     problems.extend(validate::check(&settings));
     if problems.is_empty() {
         Ok(settings)
     } else {
         Err(ConfigError::Invalid(problems))
+    }
+}
+
+/// Gives env-provided values of `training.axolotl_extra` a type.
+///
+/// The `Environment` source above is built with `try_parsing(false)`, the config-wide
+/// default that keeps every env value a string (so a secret such as `0123` is never
+/// silently type-parsed). This function is where `axolotl_extra` alone deliberately
+/// relaxes that default: every value set through
+/// `OVERBRAINER_TRAINING__AXOLOTL_EXTRA__*` arrives as a string, and a string that is
+/// not the file's own value for the same key came from env and becomes a boolean
+/// (`true`, `false`), a canonical integer, or a finite float when it parses as one
+/// (see [`scalar`]); any other text stays a string. Values from `overbrainer.toml`
+/// keep their TOML type. A value that must stay a string, such as a revision with
+/// leading zeros (`"0123"`) or a version-like `"3.14"`, belongs in the file; env has
+/// no way to know a key means "always a string", so an override of that key with
+/// different text is still coerced by this function.
+fn coerce_env_scalars(extra: &mut BTreeMap<String, Value>, file: &BTreeMap<String, Value>) {
+    for (key, value) in extra.iter_mut() {
+        coerce(value, file.get(key));
+    }
+}
+
+fn coerce(value: &mut Value, file: Option<&Value>) {
+    if let Value::Object(map) = value {
+        for (key, inner) in map.iter_mut() {
+            coerce(inner, file.and_then(|file| file.get(key)));
+        }
+        return;
+    }
+    let parsed = match &*value {
+        Value::String(text) if file.and_then(Value::as_str) != Some(text.as_str()) => scalar(text),
+        _ => None,
+    };
+    if let Some(parsed) = parsed {
+        *value = parsed;
+    }
+}
+
+/// `text` as a boolean, an integer or a finite float, when it is one.
+///
+/// An integer is only recognized when `text` is its own canonical rendering (no
+/// leading zero, no leading `+`), so a padded value such as a revision (`"0123"`)
+/// is not silently read as `123`. `text` is first tried as an `i64`, then, for a
+/// positive value that overflows it, as a `u64`, so a value up to [`u64::MAX`]
+/// keeps its exact precision. When `text` reads as an integer (an optional sign
+/// followed only by digits) but is not the canonical rendering of an `i64` or
+/// `u64`, either because it overflows both or because of a leading zero or `+`, it
+/// is left as a string: it is never tried as a float, which would silently lose
+/// precision for a value outside the `i64`/`u64` range. Floats have no such check:
+/// any other text that parses as a finite `f64` is accepted.
+fn scalar(text: &str) -> Option<Value> {
+    match text {
+        "true" => return Some(Value::Bool(true)),
+        "false" => return Some(Value::Bool(false)),
+        _ => {},
+    }
+    if let Some(integer) = canonical_integer(text) {
+        return Some(integer);
+    }
+    if looks_like_integer(text) {
+        return None;
+    }
+    text.parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map(Value::Number)
+}
+
+/// `text` as an `i64`, or, for a positive value that overflows `i64`, as a `u64`,
+/// but only when `text` is that integer's own canonical rendering (no leading
+/// zero, no leading `+`).
+fn canonical_integer(text: &str) -> Option<Value> {
+    if let Ok(integer) = text.parse::<i64>() {
+        return (integer.to_string() == text).then_some(Value::from(integer));
+    }
+    if let Ok(integer) = text.parse::<u64>() {
+        return (integer.to_string() == text).then_some(Value::from(integer));
+    }
+    None
+}
+
+/// True when `text` reads as an integer: an optional leading `+` or `-` followed by
+/// one or more ASCII digits. This is broader than [`canonical_integer`], which also
+/// requires `text` to be that integer's canonical rendering and to fit in an `i64`
+/// or `u64`.
+fn looks_like_integer(text: &str) -> bool {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalars_parse_only_plain_values() {
+        assert_eq!(scalar("true"), Some(Value::Bool(true)));
+        assert_eq!(scalar("10"), Some(Value::from(10)));
+        assert_eq!(scalar("0.05"), Some(Value::from(0.05)));
+        assert_eq!(scalar("nan"), None);
+        assert_eq!(scalar("inf"), None);
+        assert_eq!(scalar("qwen3"), None);
+        assert_eq!(scalar("True"), None);
+    }
+
+    #[test]
+    fn non_canonical_integers_stay_strings() {
+        assert_eq!(scalar("0123"), None, "leading zero");
+        assert_eq!(scalar("+5"), None, "leading plus");
+        assert_eq!(scalar("007"), None, "leading zeros");
+    }
+
+    #[test]
+    fn canonical_integers_and_floats_still_parse() {
+        assert_eq!(scalar("0"), Some(Value::from(0)));
+        assert_eq!(scalar("-3"), Some(Value::from(-3)));
+        assert_eq!(scalar("1e-7"), Some(Value::from(1e-7)));
+    }
+
+    #[test]
+    fn i64_max_still_parses_as_an_integer() {
+        assert_eq!(scalar("9223372036854775807"), Some(Value::from(i64::MAX)));
+    }
+
+    #[test]
+    fn i64_max_plus_one_becomes_a_u64_not_a_float() {
+        assert_eq!(
+            scalar("9223372036854775808"),
+            Some(Value::from(9_223_372_036_854_775_808_u64)),
+            "one past i64::MAX must not lose precision as an f64"
+        );
+    }
+
+    #[test]
+    fn u64_max_still_parses_as_an_integer() {
+        assert_eq!(scalar("18446744073709551615"), Some(Value::from(u64::MAX)));
+    }
+
+    #[test]
+    fn u64_max_plus_one_stays_a_string() {
+        assert_eq!(
+            scalar("18446744073709551616"),
+            None,
+            "an integer past u64::MAX must stay a string, not become an imprecise float"
+        );
+    }
+
+    #[test]
+    fn a_negative_integer_below_i64_min_stays_a_string() {
+        assert_eq!(
+            scalar("-9223372036854775809"),
+            None,
+            "a negative integer past i64::MIN must stay a string, not become an imprecise float"
+        );
     }
 }

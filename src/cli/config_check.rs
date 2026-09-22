@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 use secrecy::SecretString;
 
-use crate::config::{EnvSource, Settings, Target};
+use crate::config::{DEFAULT_IMAGE, DEFAULT_WORKDIR, Engine, EnvSource, Runtime, Settings, Target};
 
 /// Prints the resolved configuration with secrets masked. With `resolve`, also
 /// resolves every secret (testing Vault access) and fails on the first error.
@@ -89,22 +89,7 @@ fn describe(settings: &Settings) -> Vec<String> {
         ));
     }
     for (name, target) in &settings.targets {
-        let summary = match target {
-            Target::Local { runtime, .. } => format!("local, {runtime:?}"),
-            Target::Ssh { runtime, host, .. } => {
-                format!(
-                    "ssh {}, {runtime:?}",
-                    host.as_deref().unwrap_or("(host unset)")
-                )
-            },
-            Target::Runpod {
-                gpu_type,
-                gpu_count,
-                max_hours,
-                ..
-            } => format!("runpod {gpu_count}x {gpu_type}, max {max_hours}h"),
-        };
-        lines.push(format!("targets.{name} = {summary}"));
+        lines.push(format!("targets.{name} = {}", target_summary(target)));
     }
     lines.push(format!(
         "runpod.api_key = {}",
@@ -112,4 +97,53 @@ fn describe(settings: &Settings) -> Vec<String> {
     ));
     lines.push(format!("hf_token = {}", masked(settings.hf_token.as_ref())));
     lines
+}
+
+fn target_summary(target: &Target) -> String {
+    match target {
+        Target::Local {
+            runtime,
+            engine,
+            image,
+            venv,
+        } => format!(
+            "local, {}",
+            runtime_summary(*runtime, *engine, image.as_deref(), venv.as_deref())
+        ),
+        Target::Ssh {
+            runtime,
+            host,
+            workdir,
+            engine,
+            image,
+            venv,
+        } => format!(
+            "ssh {} in {}, {}",
+            host.as_deref().unwrap_or("(host unset)"),
+            workdir.as_deref().unwrap_or(DEFAULT_WORKDIR),
+            runtime_summary(*runtime, *engine, image.as_deref(), venv.as_deref())
+        ),
+        Target::Runpod {
+            gpu_type,
+            gpu_count,
+            max_hours,
+            ..
+        } => format!("runpod {gpu_count}x {gpu_type}, max {max_hours}h"),
+    }
+}
+
+fn runtime_summary(
+    runtime: Runtime,
+    engine: Option<Engine>,
+    image: Option<&str>,
+    venv: Option<&str>,
+) -> String {
+    match runtime {
+        Runtime::Docker => format!(
+            "{} {}",
+            engine.unwrap_or(Engine::Docker).command(),
+            image.unwrap_or(DEFAULT_IMAGE)
+        ),
+        Runtime::Native => format!("native, venv {}", venv.unwrap_or("(axolotl on PATH)")),
+    }
 }

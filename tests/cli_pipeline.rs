@@ -122,7 +122,7 @@ async fn run_chains_the_data_stages_and_prints_costs() -> TestResult {
         ))
         .stdout(predicate::str::contains("cost $"))
         .stdout(predicate::str::contains(KEY).not())
-        .stderr(predicate::str::contains("training is not available yet"))
+        .stderr(predicate::str::contains("run stops after split"))
         .stderr(predicate::str::contains(KEY).not());
     for file in ["subtopics", "questions", "answers", "train", "eval"] {
         assert!(
@@ -385,5 +385,46 @@ async fn split_warns_when_every_usable_answer_is_orphaned() -> TestResult {
             "split: 0 train, 0 eval, 0 excluded, 1 orphaned",
         ))
         .stderr(predicate::str::contains("usable answers are orphaned"));
+    Ok(())
+}
+
+const FAKE_AXOLOTL: &str = r#"#!/bin/sh
+if [ "$1" = train ]; then
+  printf '{"event": "begin", "time": 1, "max_steps": 1}\n' >> "$OVERBRAINER_METRICS"
+  printf '{"event": "log", "time": 2, "step": 1, "epoch": 1.0, "max_steps": 1, "loss": 0.75}\n' >> "$OVERBRAINER_METRICS"
+  mkdir -p output && echo adapter > output/adapter_model.safetensors
+fi
+"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_trains_after_split_when_training_is_configured() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = provider().await;
+    let dir = project()?;
+    let venv = dir.path().join("venv");
+    std::fs::create_dir_all(venv.join("bin"))?;
+    std::fs::write(venv.join("bin/axolotl"), FAKE_AXOLOTL)?;
+    std::fs::set_permissions(
+        venv.join("bin/axolotl"),
+        std::fs::Permissions::from_mode(0o755),
+    )?;
+    let config = format!(
+        "{PROJECT}\n[training]\ntarget = \"here\"\nbase_model = \"Qwen/Qwen3-4B\"\nadapter = \"lora\"\n\n[targets.here]\nkind = \"local\"\nruntime = \"native\"\nvenv = \"{}\"\n",
+        venv.display()
+    );
+    std::fs::write(dir.path().join("overbrainer.toml"), config)?;
+    overbrainer(dir.path(), &server)?
+        // The fake axolotl script calls `mkdir`; without PATH its lookup would be
+        // implementation-defined. A fixed PATH keeps the test deterministic and
+        // independent of the developer's own PATH.
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("split: 3 train, 1 eval"))
+        .stdout(predicate::str::contains(
+            "succeeded; step 1/1, epoch 1.00, loss 0.7500; output in runs/",
+        ));
     Ok(())
 }

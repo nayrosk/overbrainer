@@ -48,7 +48,68 @@ jobs:
         with:
           toolchain: "stable"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install PyYAML for the YAML round trip test
+        run: |
+          python3 -m pip install --break-system-packages pyyaml
+          python3 -c 'import yaml'
+      - name: Install the shells the generated scripts are tested under
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dash busybox-static
+          dash -c 'echo dash ready'
+          busybox sh -c 'echo busybox ready'
       - run: cargo test --all-targets --locked
+
+  ssh:
+    runs-on: ubuntu-latest
+    services:
+      sshd:
+        image: linuxserver/openssh-server:10.3_p1-r1-ls237@sha256:946fa26105e0ec212fdf821b9ddc59aab65f2c2d07c02b25ff0f5001fc332ff0
+        ports:
+          - 2222:2222
+        env:
+          USER_NAME: overbrainer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch; toolchain set below
+        with:
+          toolchain: "stable"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Authorize a throwaway key on the test sshd
+        env:
+          SSHD: ${{ job.services.sshd.id }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/overbrainer_test
+          for _ in $(seq 1 60); do
+            docker exec "$SSHD" test -f /config/.ssh/authorized_keys && break
+            sleep 1
+          done
+          docker exec -i "$SSHD" sh -c 'cat >> /config/.ssh/authorized_keys' < ~/.ssh/overbrainer_test.pub
+          for _ in $(seq 1 60); do
+            ssh-keyscan -p 2222 127.0.0.1 > ~/.ssh/overbrainer_known_hosts 2>/dev/null
+            [ -s ~/.ssh/overbrainer_known_hosts ] && break
+            sleep 1
+          done
+          cat > ~/.ssh/overbrainer_config <<EOF
+          Host overbrainer-test
+            HostName 127.0.0.1
+            Port 2222
+            User overbrainer
+            IdentityFile $HOME/.ssh/overbrainer_test
+            IdentitiesOnly yes
+            UserKnownHostsFile $HOME/.ssh/overbrainer_known_hosts
+          EOF
+          echo "OVERBRAINER_TEST_SSH_CONFIG=$HOME/.ssh/overbrainer_config" >> "$GITHUB_ENV"
+      - name: Test the SSH executor against the sshd
+        env:
+          OVERBRAINER_TEST_SSH_HOST: overbrainer-test
+        run: cargo test --locked --test exec_ssh
 
   msrv:
     runs-on: ubuntu-latest

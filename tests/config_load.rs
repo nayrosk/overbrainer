@@ -1,6 +1,6 @@
 use std::fs;
 
-use overbrainer::config::{ConfigError, EnvSource, Target, load};
+use overbrainer::config::{ConfigError, Engine, EnvSource, Target, load};
 use secrecy::ExposeSecret;
 
 const BASE: &str = r#"
@@ -347,4 +347,88 @@ not valid toml here = SK-LEAK-MARKER-999 !!broken!!
         },
         other => Err(format!("expected Parse, got {other:?}").into()),
     }
+}
+
+#[test]
+fn ssh_target_options_come_from_the_file_and_env() -> Result<(), Box<dyn std::error::Error>> {
+    let toml = format!(
+        "{BASE}{}",
+        TARGETS.replace(
+            "runtime = \"native\"",
+            "runtime = \"docker\"\nengine = \"podman\""
+        )
+    );
+    let dir = project(&toml)?;
+    let settings = load(
+        dir.path(),
+        env(&[("OVERBRAINER_TARGETS__BOX__WORKDIR", "/data/overbrainer")]),
+    )?;
+    match settings.targets.get("box") {
+        Some(Target::Ssh {
+            engine,
+            workdir,
+            image,
+            ..
+        }) => {
+            assert_eq!(*engine, Some(Engine::Podman));
+            assert_eq!(workdir.as_deref(), Some("/data/overbrainer"));
+            assert_eq!(*image, None);
+            Ok(())
+        },
+        other => Err(format!("expected ssh target, got {other:?}").into()),
+    }
+}
+
+const TRAINING: &str = r#"
+[training]
+target = "box"
+base_model = "Qwen/Qwen3-4B"
+adapter = "qlora"
+
+[training.axolotl_extra]
+chat_template = "qwen3"
+revision = "0123"
+special_tokens = { pad_token = "<|endoftext|>" }
+
+[targets.box]
+kind = "ssh"
+runtime = "native"
+"#;
+
+#[test]
+fn env_values_in_axolotl_extra_get_their_types() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TRAINING}"))?;
+    let settings = load(
+        dir.path(),
+        env(&[
+            (
+                "OVERBRAINER_TRAINING__AXOLOTL_EXTRA__GRADIENT_CHECKPOINTING",
+                "true",
+            ),
+            ("OVERBRAINER_TRAINING__AXOLOTL_EXTRA__WARMUP_STEPS", "10"),
+            ("OVERBRAINER_TRAINING__AXOLOTL_EXTRA__WEIGHT_DECAY", "0.01"),
+            (
+                "OVERBRAINER_TRAINING__AXOLOTL_EXTRA__ATTN_IMPLEMENTATION",
+                "sdpa",
+            ),
+            (
+                "OVERBRAINER_TRAINING__AXOLOTL_EXTRA__SPECIAL_TOKENS__EOS_TOKEN",
+                "<|im_end|>",
+            ),
+        ]),
+    )?;
+    let extra = &settings.training.ok_or("training missing")?.axolotl_extra;
+    assert_eq!(
+        serde_json::to_value(extra)?,
+        serde_json::json!({
+            "attn_implementation": "sdpa",
+            "chat_template": "qwen3",
+            "gradient_checkpointing": true,
+            "revision": "0123",
+            "special_tokens": {"eos_token": "<|im_end|>", "pad_token": "<|endoftext|>"},
+            "warmup_steps": 10,
+            "weight_decay": 0.01
+        })
+    );
+    Ok(())
 }
