@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -60,8 +61,11 @@ impl LlmClient for FakeLlm {
         (self.reply)(&request, call)
     }
 
-    async fn embed(&self, _inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
-        Err(LlmError::Unsupported("embeddings"))
+    fn embed(
+        &self,
+        _inputs: &[String],
+    ) -> impl Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send {
+        std::future::ready(Err(LlmError::Unsupported("embeddings")))
     }
 }
 
@@ -302,16 +306,24 @@ impl FlakyDedup {
 }
 
 impl Deduplicator for FlakyDedup {
-    async fn admit(&mut self, candidates: Vec<String>) -> Result<Vec<String>, LlmError> {
+    fn admit(
+        &mut self,
+        candidates: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<String>, LlmError>> + Send {
         self.calls += 1;
-        if self.calls == self.fail_at {
-            return Err((self.error)());
-        }
-        Ok(candidates)
+        let result = if self.calls == self.fail_at {
+            Err((self.error)())
+        } else {
+            Ok(candidates)
+        };
+        std::future::ready(result)
     }
 
-    async fn record(&mut self, _accepted: &[String]) -> Result<(), LlmError> {
-        Ok(())
+    fn record(
+        &mut self,
+        _accepted: &[String],
+    ) -> impl Future<Output = Result<(), LlmError>> + Send {
+        std::future::ready(Ok(()))
     }
 }
 
@@ -911,8 +923,11 @@ impl LlmClient for RacingLlm {
         Ok(text("An answer."))
     }
 
-    async fn embed(&self, _inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
-        Err(LlmError::Unsupported("embeddings"))
+    fn embed(
+        &self,
+        _inputs: &[String],
+    ) -> impl Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send {
+        std::future::ready(Err(LlmError::Unsupported("embeddings")))
     }
 }
 
@@ -1030,13 +1045,19 @@ struct CountingEmbedder {
 }
 
 impl LlmClient for &CountingEmbedder {
-    async fn complete(&self, _request: CompletionRequest) -> Result<Completion, LlmError> {
-        Err(LlmError::Unsupported("completions"))
+    fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> impl Future<Output = Result<Completion, LlmError>> + Send {
+        std::future::ready(Err(LlmError::Unsupported("completions")))
     }
 
-    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+    fn embed(
+        &self,
+        inputs: &[String],
+    ) -> impl Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(inputs.iter().map(|_| vec![1.0, 0.0]).collect())
+        std::future::ready(Ok(inputs.iter().map(|_| vec![1.0, 0.0]).collect()))
     }
 }
 

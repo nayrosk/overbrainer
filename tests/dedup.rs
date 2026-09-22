@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -32,15 +33,21 @@ impl FakeEmbedder {
 }
 
 impl LlmClient for &FakeEmbedder {
-    async fn complete(&self, _request: CompletionRequest) -> Result<Completion, LlmError> {
-        Err(LlmError::Unsupported("completions"))
+    fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> impl Future<Output = Result<Completion, LlmError>> + Send {
+        std::future::ready(Err(LlmError::Unsupported("completions")))
     }
 
-    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+    fn embed(
+        &self,
+        inputs: &[String],
+    ) -> impl Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send {
         if let Ok(mut asked) = self.asked.lock() {
             asked.extend(inputs.iter().cloned());
         }
-        inputs
+        let result = inputs
             .iter()
             .map(|input| {
                 self.vectors
@@ -48,7 +55,8 @@ impl LlmClient for &FakeEmbedder {
                     .cloned()
                     .ok_or_else(|| LlmError::InvalidResponse(format!("unknown text {input}")))
             })
-            .collect()
+            .collect();
+        std::future::ready(result)
     }
 }
 
@@ -84,20 +92,28 @@ impl FlakyEmbedder {
 }
 
 impl LlmClient for &FlakyEmbedder {
-    async fn complete(&self, _request: CompletionRequest) -> Result<Completion, LlmError> {
-        Err(LlmError::Unsupported("completions"))
+    fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> impl Future<Output = Result<Completion, LlmError>> + Send {
+        std::future::ready(Err(LlmError::Unsupported("completions")))
     }
 
-    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+    fn embed(
+        &self,
+        inputs: &[String],
+    ) -> impl Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        if call <= self.fails {
-            return Err(LlmError::Status {
+        let result = if call <= self.fails {
+            Err(LlmError::Status {
                 status: 503,
                 message: String::new(),
                 retry_after: None,
-            });
-        }
-        Ok(inputs.iter().map(|_| self.vector.clone()).collect())
+            })
+        } else {
+            Ok(inputs.iter().map(|_| self.vector.clone()).collect())
+        };
+        std::future::ready(result)
     }
 }
 
@@ -186,15 +202,21 @@ struct BatchRecorder {
 }
 
 impl LlmClient for &BatchRecorder {
-    async fn complete(&self, _request: CompletionRequest) -> Result<Completion, LlmError> {
-        Err(LlmError::Unsupported("completions"))
+    fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> impl Future<Output = Result<Completion, LlmError>> + Send {
+        std::future::ready(Err(LlmError::Unsupported("completions")))
     }
 
-    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+    fn embed(
+        &self,
+        inputs: &[String],
+    ) -> impl Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send {
         if let Ok(mut batches) = self.batches.lock() {
             batches.push(inputs.to_vec());
         }
-        Ok(inputs.iter().map(|_| vec![1.0, 0.0]).collect())
+        std::future::ready(Ok(inputs.iter().map(|_| vec![1.0, 0.0]).collect()))
     }
 }
 
