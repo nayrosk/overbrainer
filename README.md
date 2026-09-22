@@ -4,7 +4,7 @@ Distill knowledge from a large "parent" LLM into a smaller open-weights "child" 
 
 overbrainer generates questions on your topics with an LLM, collects answers (and reasoning) from a parent model, then fine-tunes a child model with Axolotl locally, over SSH or on Runpod, while showing live progress in a terminal UI.
 
-Status: early development. Available today: project setup, configuration checks, and the data pipeline (subtopics, questions, answers, train/eval split). Training comes next.
+Status: early development. Available today: project setup, configuration checks, the data pipeline (subtopics, questions, answers, train/eval split), and fine-tuning with Axolotl on this machine or over SSH. Runpod and the terminal UI come next.
 
 ## Install
 
@@ -22,8 +22,10 @@ cd my-project
 cp .env.example .env   # then fill in URLs and keys
 overbrainer config check
 overbrainer config check --resolve   # also tests Vault access
-overbrainer run                      # subtopics, questions, answers, split
+overbrainer run                      # subtopics, questions, answers, split, then train
 ```
+
+`overbrainer run` trains only when `overbrainer.toml` has a `[training]` section; otherwise it stops after `split`.
 
 ## Building a dataset
 
@@ -88,6 +90,84 @@ Some parents never return their raw reasoning, whatever their responses claim: a
 | `prompts/answer_system.txt` | `topic`, `description` |
 
 A missing file falls back to the built-in default.
+
+## Training
+
+`overbrainer train` fine-tunes `training.base_model` with [Axolotl](https://github.com/axolotl-ai-cloud/axolotl) 0.19 on `data/train.jsonl`, evaluating on `data/eval.jsonl`, on the target named by `training.target` (or `--target NAME`).
+
+| Command | What it does |
+|---|---|
+| `overbrainer train [--target NAME]` | Start a run and follow it until the job ends |
+| `overbrainer train attach RUN_ID` | Follow a run again, then retrieve its results |
+| `overbrainer train cancel RUN_ID` | Stop the job of a run and retrieve its artifacts |
+| `overbrainer runs ls` | List the runs: ID, state, target, creation time |
+
+A run gets an ID such as `20260922-143005-a1b2` and a directory `runs/<run-id>/` holding `axolotl.yaml`, copies of the train and eval files, the metrics plugin, `run.json` (target, job, state), and, once the job has ended, `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. Intermediate `checkpoint-*` directories stay on the target.
+
+The job runs detached from overbrainer: once it has started, Ctrl-C, a closed terminal or a lost SSH connection stop overbrainer from following it, not the training. Starting a run is never interrupted: a Ctrl-C pressed while a run is starting is only acted on once the job has actually started, so the command always finishes starting before it detaches. After Ctrl-C, overbrainer prints the `overbrainer train attach` command that follows the run again and exits with an error status; after five failed attempts in a row to reach the target, it does the same. `overbrainer runs ls` shows the state last recorded in `run.json`; `train attach` refreshes it. Progress (step, epoch, loss, learning rate, every evaluation) goes to stderr; the final summary goes to stdout:
+
+```
+train: run 20260922-143005-a1b2 succeeded; step 1200/1200, epoch 3.00, loss 0.4123, eval_loss 0.5012; output in runs/20260922-143005-a1b2/output
+```
+
+A run fails when the job exits with a non-zero code or when it writes no metric line at all, which means Axolotl did not load the metrics plugin; `runs/<run-id>/job.log` holds the job's output.
+
+`overbrainer train cancel` needs a `[training]` section: cancelling a run also retrieves its artifacts, the same way a successful or failed run does. Cancelling a job that has already ended leaves it alone; overbrainer reports the state it found and tells you to run `overbrainer train attach RUN_ID` to collect it.
+
+### Targets
+
+```toml
+[targets.local]
+kind = "local"                 # this machine, in runs/<run-id>/
+runtime = "native"             # native | docker
+venv = "~/.venvs/axolotl"      # native: directory holding bin/axolotl; otherwise axolotl must be on PATH
+
+[targets.homelab]
+kind = "ssh"                   # host from OVERBRAINER_TARGETS__HOMELAB__HOST (user@host or a ~/.ssh/config alias)
+runtime = "docker"
+engine = "podman"              # docker (default) | podman
+# image = "..."                # default: axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1, pinned by digest
+# workdir = "overbrainer"      # on the remote machine, relative to its home directory
+```
+
+- `docker` runtime: one container per run, named `overbrainer-<run-id>`, with all GPUs, the host IPC namespace and the run directory mounted at `/workspace/run`. The Hugging Face cache is `runs/.hf-cache` (local) or `<workdir>/.hf-cache` (SSH), shared by the runs of the target, so a base model is downloaded once. Docker needs the NVIDIA Container Toolkit (`--gpus all`); Podman needs its CDI specification (`--device nvidia.com/gpu=all`, generated with `nvidia-ctk cdi generate`). The default image is built for CUDA 13 and needs an NVIDIA driver from the 580 series or newer. With rootful Docker, the files the container writes are owned by root.
+- `native` runtime: runs `<venv>/bin/axolotl` on the host. Over SSH, if systemd-logind kills user processes at logout (`KillUserProcesses=yes`), enable lingering for the SSH user (`loginctl enable-linger`) so the job survives the disconnection.
+- SSH uses your `ssh` binary with `~/.ssh/config`, the agent and `known_hosts`; a host that is not already in `known_hosts` is refused. Files travel as `tar` streams over the connection, so the remote machine needs `tar`, `setsid` and `nohup` (any Linux distribution has them). overbrainer keeps one master connection open (OpenSSH `ControlMaster`); an `ssh` wrapper that kills background processes, such as a firejail profile, breaks it.
+
+### The Hugging Face token
+
+`OVERBRAINER_HF_TOKEN` (a literal or a `vault:` reference) is resolved only when a run starts and reaches the job only as its `HF_TOKEN` environment variable: it is never written to `axolotl.yaml`, `run.json` or any other file, never put on a command line, and sent over SSH on the command's standard input. It is needed for gated or private base models and for `hub_model_id`, which pushes the adapter (not the merged model) to a private Hub repository.
+
+### Reasoning in the chat template
+
+The parent's reasoning is trained only if the chat template renders `reasoning_content`. Axolotl's `qwen3`, `qwen3_5`, `exaone4`, `gemma4` and `gemma4_unified` templates do, as does the official template of Qwen3 models; other templates may drop it without any error. overbrainer warns at the start of a run when the template in use (the base model's own, or `axolotl_extra.chat_template`) is not one of them. The check goes by name only: a local path or a renamed model may get the warning wrongly.
+
+### Training settings
+
+| Key | Default | Meaning |
+|---|---|---|
+| `target` | required | Target to train on. |
+| `base_model` | required | Hugging Face repo ID, or a path on the target. |
+| `adapter` | required | `lora`, `qlora` (4-bit base model) or `full`. |
+| `epochs` | `3` | Training epochs. |
+| `learning_rate` | `2e-4` | Peak learning rate. |
+| `lora_r` | `16` | LoRA rank. |
+| `lora_alpha` | `32` | LoRA scaling factor. |
+| `lora_dropout` | `0.05` | LoRA dropout, in [0, 1). |
+| `sequence_len` | `4096` | Maximum tokens per example. |
+| `micro_batch_size` | `2` | Examples per GPU per step. |
+| `gradient_accumulation_steps` | `4` | Steps summed before each optimizer update. |
+| `optimizer` | `adamw_torch_fused` | Axolotl optimizer name. |
+| `lr_scheduler` | `cosine` | Axolotl scheduler name. |
+| `sample_packing` | `true` | Pack short examples into one sequence. |
+| `evals_per_epoch` | `4` | Evaluations on `data/eval.jsonl` per epoch. |
+| `saves_per_epoch` | `1` | Checkpoints per epoch. |
+| `merge` | `false` | Also write the merged model (`lora` and `qlora` only). |
+| `hub_model_id` | none | Push the adapter to this private Hub repository. |
+
+overbrainer also sets `attn_implementation: sdpa` (no extra package needed), `gradient_checkpointing: true`, `warmup_ratio: 0.1` and `logging_steps: 1`. `[training.axolotl_extra]` is merged into the generated YAML last: tables merge key by key, any other value replaces the generated one, so it can change these too (for example `attn_implementation = "flash_attention_2"` on an image with flash-attn installed, or `chat_template = "qwen3"`). An `eval_steps` or `save_steps` there replaces `evals_per_epoch` or `saves_per_epoch`. It cannot set a key that has a typed setting above (use the setting) nor the keys overbrainer manages: `datasets`, `test_datasets`, `val_set_size`, `output_dir`, `dataset_prepared_path`, `plugins`.
+
+Values set through the environment (`OVERBRAINER_TRAINING__AXOLOTL_EXTRA__WARMUP_STEPS=10`) arrive as text; overbrainer turns `true`, `false`, integers and decimal numbers into booleans and numbers, and leaves anything else as text. A number-like value that must stay text belongs in `overbrainer.toml`.
 
 ## Configuration
 
