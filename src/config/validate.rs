@@ -316,13 +316,17 @@ fn check_targets(settings: &Settings, problems: &mut Vec<String>) {
                 engine,
                 image,
                 venv,
-            } => check_runtime(
-                name,
-                *runtime,
-                engine.is_some() || image.is_some(),
-                venv.is_some(),
-                problems,
-            ),
+            } => {
+                check_runtime(
+                    name,
+                    *runtime,
+                    engine.is_some() || image.is_some(),
+                    venv.is_some(),
+                    problems,
+                );
+                check_target_image(name, image.as_deref(), problems);
+                check_target_venv(name, venv.as_deref(), problems);
+            },
             Target::Ssh {
                 runtime,
                 engine,
@@ -338,9 +342,9 @@ fn check_targets(settings: &Settings, problems: &mut Vec<String>) {
                     venv.is_some(),
                     problems,
                 );
-                if workdir.as_ref().is_some_and(|dir| dir.trim().is_empty()) {
-                    problems.push(format!("targets.{name}.workdir: must not be empty"));
-                }
+                check_target_image(name, image.as_deref(), problems);
+                check_target_venv(name, venv.as_deref(), problems);
+                check_target_workdir(name, workdir.as_deref(), problems);
             },
             Target::Runpod {
                 max_hours,
@@ -377,6 +381,88 @@ fn check_runtime(
         )),
         Runtime::Docker | Runtime::Native => {},
     }
+}
+
+/// `workdir` must not be empty and, when set, must be a safe path (see
+/// [`check_safe_path`]). It reaches remote shell commands, so unsafe characters are
+/// rejected here in addition to callers quoting it.
+fn check_target_workdir(name: &str, workdir: Option<&str>, problems: &mut Vec<String>) {
+    let Some(workdir) = workdir else {
+        return;
+    };
+    if workdir.trim().is_empty() {
+        problems.push(format!("targets.{name}.workdir: must not be empty"));
+        return;
+    }
+    check_safe_path(name, "workdir", workdir, problems);
+}
+
+/// `venv`, when set, must be a safe path (see [`check_safe_path`]). It reaches remote
+/// shell commands, so unsafe characters are rejected here in addition to callers
+/// quoting it.
+fn check_target_venv(name: &str, venv: Option<&str>, problems: &mut Vec<String>) {
+    if let Some(venv) = venv {
+        check_safe_path(name, "venv", venv, problems);
+    }
+}
+
+/// Characters allowed in a `workdir` or `venv` value.
+fn is_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '~' | '-')
+}
+
+/// `value` uses only `[A-Za-z0-9._/~-]`, has no `..` path segment, does not start
+/// with `-`, and uses `~` only as the first character, alone or followed by `/`.
+fn check_safe_path(name: &str, field: &str, value: &str, problems: &mut Vec<String>) {
+    if !value.chars().all(is_path_char) {
+        problems.push(format!(
+            "targets.{name}.{field}: only letters, digits and . _ / ~ - are allowed"
+        ));
+        return;
+    }
+    if value.starts_with('-') {
+        problems.push(format!("targets.{name}.{field}: must not start with -"));
+    }
+    if value.split('/').any(|segment| segment == "..") {
+        problems.push(format!("targets.{name}.{field}: must not contain .."));
+    }
+    if !valid_tilde_placement(value) {
+        problems.push(format!(
+            "targets.{name}.{field}: ~ is only allowed as the first character, alone or followed by /"
+        ));
+    }
+}
+
+/// `~` appears at most once, and only as the first character, alone or followed by `/`.
+fn valid_tilde_placement(value: &str) -> bool {
+    match value.matches('~').count() {
+        0 => true,
+        1 => value.starts_with('~') && (value.len() == 1 || value.as_bytes()[1] == b'/'),
+        _ => false,
+    }
+}
+
+/// `image`, when set, must use only `[A-Za-z0-9._/:@-]` and not start with `-`. It
+/// reaches remote shell commands, so unsafe characters are rejected here in addition
+/// to callers quoting it.
+fn check_target_image(name: &str, image: Option<&str>, problems: &mut Vec<String>) {
+    let Some(image) = image else {
+        return;
+    };
+    if !image.chars().all(is_image_char) {
+        problems.push(format!(
+            "targets.{name}.image: only letters, digits and . _ / : @ - are allowed"
+        ));
+        return;
+    }
+    if image.starts_with('-') {
+        problems.push(format!("targets.{name}.image: must not start with -"));
+    }
+}
+
+/// Characters allowed in an `image` value.
+fn is_image_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '@' | '-')
 }
 
 /// Lists env-only keys that appear in the TOML file. Values are never included.
@@ -530,6 +616,153 @@ mod tests {
             check(&settings(&toml)?),
             vec!["targets.box.workdir: must not be empty".to_string()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn target_paths_reject_unsafe_characters() -> Result<(), config::ConfigError> {
+        for value in [
+            "/opt/venv;rm",
+            "/opt/venv`id`",
+            "/opt/venv$(id)",
+            "/opt/venv here",
+        ] {
+            let toml = VALID.replace(
+                r#"runtime = "native""#,
+                &format!("runtime = \"native\"\nvenv = \"{value}\""),
+            );
+            assert_eq!(
+                check(&settings(&toml)?),
+                vec![
+                    "targets.local.venv: only letters, digits and . _ / ~ - are allowed"
+                        .to_string()
+                ],
+                "venv = {value}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn target_paths_reject_dot_dot_segments() -> Result<(), config::ConfigError> {
+        for value in ["/opt/../etc", "..", "foo/../bar", "../foo"] {
+            let toml = VALID.replace(
+                r#"runtime = "native""#,
+                &format!("runtime = \"native\"\nvenv = \"{value}\""),
+            );
+            assert_eq!(
+                check(&settings(&toml)?),
+                vec!["targets.local.venv: must not contain ..".to_string()],
+                "venv = {value}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn target_paths_reject_a_leading_dash() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            r#"runtime = "native""#,
+            "runtime = \"native\"\nvenv = \"-rf\"",
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["targets.local.venv: must not start with -".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_paths_reject_a_misplaced_tilde() -> Result<(), config::ConfigError> {
+        for value in ["a~b", "~foo", "~/foo~"] {
+            let toml = VALID.replace(
+                r#"runtime = "native""#,
+                &format!("runtime = \"native\"\nvenv = \"{value}\""),
+            );
+            assert_eq!(
+                check(&settings(&toml)?),
+                vec![
+                    "targets.local.venv: ~ is only allowed as the first character, alone or followed by /"
+                        .to_string()
+                ],
+                "venv = {value}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn target_paths_accept_safe_values() -> Result<(), config::ConfigError> {
+        for value in ["/opt/axolotl-venv", "relative/path_1.2", "~", "~/venv"] {
+            let toml = VALID.replace(
+                r#"runtime = "native""#,
+                &format!("runtime = \"native\"\nvenv = \"{value}\""),
+            );
+            assert_eq!(
+                check(&settings(&toml)?),
+                Vec::<String>::new(),
+                "venv = {value}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_workdir_rejects_dot_dot_segments() -> Result<(), config::ConfigError> {
+        let toml = format!(
+            "{VALID}\n[targets.box]\nkind = \"ssh\"\nruntime = \"native\"\nworkdir = \"/data/../etc\"\n"
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["targets.box.workdir: must not contain ..".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_image_rejects_unsafe_characters() -> Result<(), config::ConfigError> {
+        for value in [
+            "repo/img;rm",
+            "repo/img`id`",
+            "repo/img$(id)",
+            "repo/img here",
+        ] {
+            let toml = VALID.replace(
+                r#"runtime = "native""#,
+                &format!("runtime = \"docker\"\nimage = \"{value}\""),
+            );
+            assert_eq!(
+                check(&settings(&toml)?),
+                vec![
+                    "targets.local.image: only letters, digits and . _ / : @ - are allowed"
+                        .to_string()
+                ],
+                "image = {value}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn target_image_rejects_a_leading_dash() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            r#"runtime = "native""#,
+            "runtime = \"docker\"\nimage = \"-x\"",
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["targets.local.image: must not start with -".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_image_accepts_a_reference_with_a_digest() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            r#"runtime = "native""#,
+            "runtime = \"docker\"\nimage = \"axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1@sha256:9de7c7a5b8830480a7d2eb3b6d49759586615f5f8eb1126d5df29f8bd9fa324b\"",
+        );
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
         Ok(())
     }
 
