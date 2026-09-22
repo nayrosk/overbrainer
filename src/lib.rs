@@ -11,3 +11,4 @@ pub mod pipeline;
 pub mod pricing;
 pub mod prompts;
 pub mod secrets;
+pub mod train;
