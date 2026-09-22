@@ -11,7 +11,9 @@ pub use subtopics::subtopics;
 use crate::config::{RoleModel, Settings, Topic};
 use crate::dataset::{DataFiles, DatasetError};
 use crate::events::{Event, EventBus, Stage, StageStats};
-use crate::llm::{Completion, CompletionRequest, LlmClient, LlmError, RetryPolicy, with_retry};
+use crate::llm::{
+    Completion, CompletionRequest, LlmClient, LlmError, RetryPolicy, Usage, with_retry,
+};
 use crate::pricing::Price;
 use crate::prompts::{PromptError, Prompts};
 
@@ -144,27 +146,32 @@ pub(crate) async fn complete_with_retry<C: LlmClient>(
 }
 
 /// Asks `role` for a JSON array of strings, retrying unparseable answers up to
-/// `pipeline.max_retries` times. Tokens of every attempt are added to `stats`.
+/// `pipeline.max_retries` times. Tokens of every attempt are added to `stats` and also
+/// returned, summed, as the item's own usage. Every parse failure is reported as a
+/// retryable `ItemFailed`; the caller reports the final, non-retryable failure through
+/// [`item_error`], so a failing item is reported exactly once as final.
 pub(crate) async fn ask_list<C: LlmClient>(
     ctx: &Ctx<'_>,
     role: &RoleClient<C>,
     prompt: String,
     item: &Item,
     stats: &mut StageStats,
-) -> Result<Vec<String>, LlmError> {
+) -> Result<(Vec<String>, Usage), LlmError> {
     let policy = ctx.policy();
     let request = role.request(None, prompt);
-    for attempt in 0..=policy.max_retries {
+    let mut usage = Usage::default();
+    for _ in 0..=policy.max_retries {
         let completion =
             complete_with_retry(&role.client, &policy, &request, item, ctx.bus).await?;
         stats.add_usage(completion.usage, role.price.as_ref());
+        usage += completion.usage;
         if let Some(items) = string_array(&completion.content) {
-            return Ok(items);
+            return Ok((items, usage));
         }
         item.failed(
             ctx.bus,
             "the answer is not a JSON array of strings".to_string(),
-            attempt < policy.max_retries,
+            true,
         );
     }
     Err(LlmError::InvalidResponse(
