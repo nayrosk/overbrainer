@@ -50,8 +50,8 @@ impl AnthropicClient {
     }
 
     /// Sends one message request. With reasoning, asks for adaptive thinking and, when
-    /// an effort is configured, sets `output_config.effort` — unless the role set a
-    /// `thinking_budget`, in which case it asks for a fixed thinking budget instead and
+    /// an effort is configured, sets `output_config.effort`. If the role sets a
+    /// `thinking_budget`, it asks for a fixed thinking budget instead and
     /// omits `output_config` entirely. See [`thinking_config`].
     ///
     /// # Errors
