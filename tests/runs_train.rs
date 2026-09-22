@@ -45,12 +45,13 @@ case "$1:$mode" in
   train:silent) exit 0 ;;
   train:slow) sleep 60 ;;
   train:*)
+    sleep 1
     printf '{"event": "begin", "time": 1, "max_steps": 2}\n' >> "$OVERBRAINER_METRICS"
     printf '{"event": "log", "time": 2, "step": 1, "epoch": 0.5, "max_steps": 2, "loss": 1.5, "learning_rate": 0.0002}\n' >> "$OVERBRAINER_METRICS"
     printf '{"event": "log", "time": 3, "step": 2, "epoch": 1.0, "max_steps": 2, "eval_loss": 1.25}\n' >> "$OVERBRAINER_METRICS"
     mkdir -p output/checkpoint-2
     echo adapter > output/adapter_model.safetensors
-    [ -n "$HF_TOKEN" ] && echo "token present"
+    if [ -n "$HF_TOKEN" ]; then echo "token present"; fi
     ;;
   merge-lora:*) mkdir -p output/merged && echo merged > output/merged/model.safetensors ;;
 esac
@@ -171,7 +172,11 @@ async fn a_run_trains_merges_and_records_its_outcome() -> TestResult {
     }
 
     let events = events(&mut receiver);
-    assert!(events.contains(&Event::JobStatus(JobStatus::Running)));
+    let running = events
+        .iter()
+        .filter(|event| **event == Event::JobStatus(JobStatus::Running))
+        .count();
+    assert_eq!(running, 1, "{events:?}");
     assert!(events.contains(&Event::JobStatus(JobStatus::Exited(0))));
     let steps: Vec<u64> = events
         .iter()
@@ -244,7 +249,9 @@ async fn a_job_without_metrics_fails_the_run() -> TestResult {
 async fn a_running_job_can_be_cancelled() -> TestResult {
     let fixture = Fixture::new("slow")?;
     let runs = Runs::new(fixture.project());
-    let executor = LocalExecutor::new(runs.dir())?;
+    // A work directory apart from `runs/`, so the cancel's download is seen.
+    let workdir = tempfile::tempdir()?;
+    let executor = LocalExecutor::new(workdir.path())?;
     let bus = EventBus::new();
     let ctx = RunCtx {
         runs: &runs,
@@ -259,11 +266,14 @@ async fn a_running_job_can_be_cancelled() -> TestResult {
         secrets: Vec::new(),
     };
     let record = start(&ctx, &trainer, launch, create(&runs, &executor, "box")?).await?;
-    let (cancelled, status) = cancel(&runs, &executor, record.clone()).await?;
+    let local_log = runs.run_dir(&record.id)?.join("job.log");
+    assert!(!local_log.exists());
+    let (cancelled, status) = cancel(&runs, &executor, &trainer, record.clone()).await?;
     assert_eq!(status, JobStatus::Cancelled);
     assert_eq!(cancelled.state, RunState::Cancelled);
     assert_eq!(cancelled.message, None);
     assert_eq!(runs.load(&record.id)?.state, RunState::Cancelled);
+    assert!(local_log.is_file(), "the job log was not retrieved");
     // A watch started before the cancel sees the job end as cancelled.
     let outcome = watch(&ctx, &trainer, record).await?;
     assert_eq!(outcome.record.state, RunState::Cancelled);
@@ -294,7 +304,7 @@ async fn cancelling_an_ended_job_leaves_the_run_running() -> TestResult {
         wait_until_ended(&executor, &job).await?,
         JobStatus::Exited(0)
     );
-    let (unchanged, status) = cancel(&runs, &executor, record.clone()).await?;
+    let (unchanged, status) = cancel(&runs, &executor, &trainer, record.clone()).await?;
     assert_eq!(status, JobStatus::Exited(0));
     assert_eq!(unchanged, record);
     assert_eq!(runs.load(&record.id)?.state, RunState::Running);

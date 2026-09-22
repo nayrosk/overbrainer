@@ -95,11 +95,16 @@ pub fn create<E: Executor>(
 
 /// Prepares the files of the run `record` (from [`create`]), copies them to the
 /// target and starts the job. The record is saved with the job, as `Running`.
+/// The `Running` status event is left to [`watch`], which reports it on its first
+/// look at the job.
 ///
 /// # Errors
 ///
 /// Returns a [`RunError`] when a file cannot be prepared, copied, or the job cannot
-/// start; the record is then saved as `Failed` with the reason.
+/// start; the record is then saved as `Failed` with the reason (a failure to save
+/// it is only logged, and the original error returned). When the job started but
+/// its record cannot be saved, nothing could find the job again: it is cancelled,
+/// on a best effort basis, and the save error is returned.
 pub async fn start<E: Executor, T: Trainer>(
     ctx: &RunCtx<'_, E>,
     trainer: &T,
@@ -107,20 +112,37 @@ pub async fn start<E: Executor, T: Trainer>(
     mut record: RunRecord,
 ) -> Result<RunRecord, RunError> {
     match launch_job(ctx, trainer, launch, &record).await {
-        Ok(job) => {
-            record.job = Some(job);
-            record.state = RunState::Running;
-            ctx.runs.save(&record)?;
-            ctx.bus.publish(Event::JobStatus(JobStatus::Running));
-            Ok(record)
-        },
+        Ok(job) => record_started(ctx, record, job).await,
         Err(error) => {
             record.state = RunState::Failed;
             record.message = Some(error.to_string());
-            ctx.runs.save(&record)?;
+            if let Err(save_error) = ctx.runs.save(&record) {
+                tracing::warn!("cannot record run {} as failed: {save_error}", record.id);
+            }
             Err(error)
         },
     }
+}
+
+/// Saves `record` as `Running` with its started `job`. When that fails, the job
+/// is cancelled on a best effort basis, since nothing could find it again.
+async fn record_started<E: Executor>(
+    ctx: &RunCtx<'_, E>,
+    mut record: RunRecord,
+    job: JobId,
+) -> Result<RunRecord, RunError> {
+    record.job = Some(job.clone());
+    record.state = RunState::Running;
+    let Err(error) = ctx.runs.save(&record) else {
+        return Ok(record);
+    };
+    if let Err(cancel_error) = ctx.executor.cancel(&job).await {
+        tracing::warn!(
+            "cannot cancel the job of run {}, which is not recorded: {cancel_error}",
+            record.id
+        );
+    }
+    Err(error.into())
 }
 
 async fn launch_job<E: Executor, T: Trainer>(
@@ -180,13 +202,7 @@ pub async fn watch<E: Executor, T: Trainer>(
     let mut summary = MetricsSummary::default();
     let status = follow(ctx, &job, &mut stream, &mut summary).await?;
     let (state, message) = outcome(status, &summary, &record.id);
-    let artifacts = trainer.artifacts();
-    let mut entries = artifacts.entries;
-    entries.push(JOB_LOG.to_string());
-    let downloaded = ctx
-        .executor
-        .download(&record.remote_dir, &local, &entries, &artifacts.exclude)
-        .await;
+    let downloaded = retrieve(ctx.executor, trainer, &record.remote_dir, &local).await;
     record.message = match downloaded {
         Ok(()) => message,
         Err(error) if state == RunState::Succeeded => return Err(error.into()),
@@ -195,6 +211,21 @@ pub async fn watch<E: Executor, T: Trainer>(
     record.state = state;
     ctx.runs.save(&record)?;
     Ok(Outcome { record, summary })
+}
+
+/// Copies the trainer's artifacts and the job log from `remote` into `local`.
+async fn retrieve<E: Executor, T: Trainer>(
+    executor: &E,
+    trainer: &T,
+    remote: &str,
+    local: &Path,
+) -> Result<(), ExecError> {
+    let artifacts = trainer.artifacts();
+    let mut entries = artifacts.entries;
+    entries.push(JOB_LOG.to_string());
+    executor
+        .download(remote, local, &entries, &artifacts.exclude)
+        .await
 }
 
 /// `message` with the reason the artifacts could not be retrieved added to it.
@@ -206,7 +237,8 @@ fn not_retrieved(message: Option<String>, error: &ExecError) -> String {
 }
 
 /// Reads new metric lines and the job status until the job ends, then reads the
-/// last lines. Up to [`MAX_FAILURES`] failures in a row are retried.
+/// last lines. Up to [`MAX_FAILURES`] failures in a row are retried, for the last
+/// read as for the others.
 async fn follow<E: Executor>(
     ctx: &RunCtx<'_, E>,
     job: &JobId,
@@ -215,7 +247,7 @@ async fn follow<E: Executor>(
 ) -> Result<JobStatus, RunError> {
     let mut failures = 0;
     let mut last = None;
-    loop {
+    let status = loop {
         match poll(ctx, job, stream, summary).await {
             Ok(status) => {
                 failures = 0;
@@ -224,17 +256,34 @@ async fn follow<E: Executor>(
                     last = Some(status);
                 }
                 if status.is_finished() {
-                    publish(ctx.bus, stream.read().await?, summary);
-                    return Ok(status);
+                    break status;
                 }
             },
-            Err(error) if failures < MAX_FAILURES => {
-                failures += 1;
-                unreachable_target(&error, failures);
-            },
-            Err(error) => return Err(error.into()),
+            Err(error) => retry(&mut failures, error)?,
         }
         tokio::time::sleep(ctx.poll).await;
+    };
+    loop {
+        match stream.read().await {
+            Ok(lines) => {
+                publish(ctx.bus, lines, summary);
+                return Ok(status);
+            },
+            Err(error) => retry(&mut failures, error)?,
+        }
+        tokio::time::sleep(ctx.poll).await;
+    }
+}
+
+/// Counts one more failure in a row to reach the job, and returns it as an error
+/// once [`MAX_FAILURES`] have been retried.
+fn retry(failures: &mut u32, error: ExecError) -> Result<(), RunError> {
+    if *failures < MAX_FAILURES {
+        *failures += 1;
+        unreachable_target(&error, *failures);
+        Ok(())
+    } else {
+        Err(error.into())
     }
 }
 
@@ -307,7 +356,11 @@ fn local_summary(path: &Path) -> Result<MetricsSummary, RunError> {
 /// Cancels the job of a started run, then reads its status back.
 ///
 /// Only when the job reads [`JobStatus::Cancelled`] is the record changed: it is
-/// saved as `Cancelled`, without a message. A job that had already ended before
+/// saved as `Cancelled`, without a message, and the trainer's artifacts and the
+/// job log are then copied into the local run directory, since nobody may be
+/// watching the run to do it. That copy is best effort: when it fails, the failure
+/// is logged and the record stays `Cancelled` with
+/// `artifacts not retrieved: <error>` as its message. A job that had already ended before
 /// the cancel is left alone by the target, so its status stays
 /// [`JobStatus::Exited`] or [`JobStatus::Lost`]; the record is then returned
 /// unchanged (still `Running`), so a later watch or attach records the real
@@ -318,9 +371,10 @@ fn local_summary(path: &Path) -> Result<MetricsSummary, RunError> {
 ///
 /// Returns [`RunError::NotStarted`] for a run without a job, and an error when the
 /// target cannot be reached or the record cannot be saved.
-pub async fn cancel<E: Executor>(
+pub async fn cancel<E: Executor, T: Trainer>(
     runs: &Runs,
     executor: &E,
+    trainer: &T,
     mut record: RunRecord,
 ) -> Result<(RunRecord, JobStatus), RunError> {
     let job = record
@@ -333,6 +387,15 @@ pub async fn cancel<E: Executor>(
         record.state = RunState::Cancelled;
         record.message = None;
         runs.save(&record)?;
+        let local = runs.run_dir(&record.id)?;
+        if let Err(error) = retrieve(executor, trainer, &record.remote_dir, &local).await {
+            tracing::warn!(
+                "cannot retrieve the artifacts of cancelled run {}: {error}",
+                record.id
+            );
+            record.message = Some(not_retrieved(None, &error));
+            runs.save(&record)?;
+        }
     }
     Ok((record, status))
 }
@@ -340,9 +403,11 @@ pub async fn cancel<E: Executor>(
 #[cfg(test)]
 mod tests {
     use std::future::{Future, ready};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
     use crate::exec::{JobCommand, Pid};
+    use crate::runs::RECORD_FILE;
     use crate::train::Artifacts;
 
     #[test]
@@ -387,12 +452,48 @@ mod tests {
     }
 
     const METRICS: &str = "{\"event\": \"begin\", \"time\": 1}\n";
+    const RUN_ID: &str = "20260922-143005-abcd";
 
-    /// A target whose job has exited with code 0 after writing [`METRICS`], and
-    /// from which nothing can be downloaded.
-    struct BrokenDownload;
+    /// A scripted target. Its job reads `status`, its metrics file holds
+    /// [`METRICS`], and the read numbered `failing_read` (from 0) fails.
+    struct Fake {
+        status: JobStatus,
+        spawn_fails: bool,
+        download_fails: bool,
+        failing_read: Option<u32>,
+        reads: AtomicU32,
+        cancels: AtomicU32,
+    }
 
-    impl Executor for BrokenDownload {
+    impl Fake {
+        fn new(status: JobStatus) -> Self {
+            Self {
+                status,
+                spawn_fails: false,
+                download_fails: false,
+                failing_read: None,
+                reads: AtomicU32::new(0),
+                cancels: AtomicU32::new(0),
+            }
+        }
+    }
+
+    fn broken(action: &'static str) -> ExecError {
+        ExecError::Command {
+            action,
+            message: "connection reset".to_string(),
+        }
+    }
+
+    fn job() -> Result<JobId, ExecError> {
+        Ok(JobId {
+            dir: format!("/w/{RUN_ID}"),
+            pid: Pid::new(42)?,
+            container: None,
+        })
+    }
+
+    impl Executor for Fake {
         fn workdir(&self) -> &'static str {
             "/w"
         }
@@ -409,7 +510,11 @@ mod tests {
             &self,
             _job: &JobCommand,
         ) -> impl Future<Output = Result<JobId, ExecError>> + Send {
-            ready(Err(ExecError::Protocol("unused".to_string())))
+            ready(if self.spawn_fails {
+                Err(broken("spawn"))
+            } else {
+                job()
+            })
         }
 
         fn read_from(
@@ -418,22 +523,24 @@ mod tests {
             offset: u64,
             _limit: u64,
         ) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
+            let read = self.reads.fetch_add(1, Ordering::SeqCst);
             let start = usize::try_from(offset).unwrap_or(METRICS.len());
-            ready(Ok(METRICS
-                .as_bytes()
-                .get(start..)
-                .unwrap_or_default()
-                .to_vec()))
+            ready(if self.failing_read == Some(read) {
+                Err(broken("read"))
+            } else {
+                Ok(METRICS.as_bytes().get(start..).unwrap_or_default().to_vec())
+            })
         }
 
         fn status(
             &self,
             _job: &JobId,
         ) -> impl Future<Output = Result<JobStatus, ExecError>> + Send {
-            ready(Ok(JobStatus::Exited(0)))
+            ready(Ok(self.status))
         }
 
         fn cancel(&self, _job: &JobId) -> impl Future<Output = Result<(), ExecError>> + Send {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
             ready(Ok(()))
         }
 
@@ -444,10 +551,11 @@ mod tests {
             _entries: &[String],
             _exclude: &[String],
         ) -> impl Future<Output = Result<(), ExecError>> + Send {
-            ready(Err(ExecError::Command {
-                action: "download",
-                message: "connection reset".to_string(),
-            }))
+            ready(if self.download_fails {
+                Err(broken("download"))
+            } else {
+                Ok(())
+            })
         }
     }
 
@@ -478,38 +586,142 @@ mod tests {
         }
     }
 
+    fn running() -> Result<RunRecord, ExecError> {
+        Ok(RunRecord {
+            id: RUN_ID.to_string(),
+            target: "box".to_string(),
+            created: "2026-09-22T14:30:05Z".to_string(),
+            remote_dir: format!("/w/{RUN_ID}"),
+            job: Some(job()?),
+            state: RunState::Running,
+            message: None,
+        })
+    }
+
+    fn ctx<'a>(runs: &'a Runs, executor: &'a Fake, bus: &'a EventBus) -> RunCtx<'a, Fake> {
+        RunCtx {
+            runs,
+            executor,
+            bus,
+            poll: Duration::from_millis(1),
+        }
+    }
+
+    /// Makes every later save of the run `id` fail: its temporary file is taken by
+    /// a directory.
+    fn break_saves(runs: &Runs, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::create_dir(runs.run_dir(id)?.join(format!(".{RECORD_FILE}.tmp")))?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_successful_run_whose_artifacts_cannot_be_retrieved_stays_running()
     -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
         let bus = EventBus::new();
-        let ctx = RunCtx {
-            runs: &runs,
-            executor: &BrokenDownload,
-            bus: &bus,
-            poll: Duration::from_millis(1),
+        let fake = Fake {
+            download_fails: true,
+            ..Fake::new(JobStatus::Exited(0))
         };
-        let record = RunRecord {
-            id: "20260922-143005-abcd".to_string(),
-            target: "box".to_string(),
-            created: "2026-09-22T14:30:05Z".to_string(),
-            remote_dir: "/w/20260922-143005-abcd".to_string(),
-            job: Some(JobId {
-                dir: "/w/20260922-143005-abcd".to_string(),
-                pid: Pid::new(42)?,
-                container: None,
-            }),
-            state: RunState::Running,
-            message: None,
-        };
+        let record = running()?;
         runs.save(&record)?;
-        let error = watch(&ctx, &NoFiles, record.clone())
+        let error = watch(&ctx(&runs, &fake, &bus), &NoFiles, record.clone())
             .await
             .err()
             .ok_or("the watch succeeded")?;
         assert!(error.to_string().contains("connection reset"), "{error}");
         assert_eq!(runs.load(&record.id)?, record);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_last_read_after_the_end_is_retried() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            failing_read: Some(1),
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        let record = running()?;
+        runs.save(&record)?;
+        let outcome = watch(&ctx(&runs, &fake, &bus), &NoFiles, record).await?;
+        assert_eq!(outcome.record.state, RunState::Succeeded);
+        assert_eq!(outcome.summary.lines, 1);
+        assert_eq!(fake.reads.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_whose_run_cannot_be_recorded_is_cancelled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake::new(JobStatus::Running);
+        let created = create(&runs, &fake, "box")?;
+        break_saves(&runs, &created.id)?;
+        let launch = Launch {
+            runtime: &JobRuntime::Native { venv: None },
+            secrets: Vec::new(),
+        };
+        let result = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await;
+        assert!(matches!(result, Err(RunError::Runs(_))), "{result:?}");
+        assert_eq!(fake.cancels.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_returns_its_own_error_when_it_cannot_be_recorded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            spawn_fails: true,
+            ..Fake::new(JobStatus::Running)
+        };
+        let created = create(&runs, &fake, "box")?;
+        break_saves(&runs, &created.id)?;
+        let launch = Launch {
+            runtime: &JobRuntime::Native { venv: None },
+            secrets: Vec::new(),
+        };
+        let result = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await;
+        assert!(
+            matches!(
+                &result,
+                Err(RunError::Exec(ExecError::Command {
+                    action: "spawn",
+                    ..
+                }))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(fake.cancels.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_keeps_cancelled_when_its_artifacts_cannot_be_retrieved()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let fake = Fake {
+            download_fails: true,
+            ..Fake::new(JobStatus::Cancelled)
+        };
+        let record = running()?;
+        runs.save(&record)?;
+        let (cancelled, status) = cancel(&runs, &fake, &NoFiles, record).await?;
+        assert_eq!(status, JobStatus::Cancelled);
+        assert_eq!(cancelled.state, RunState::Cancelled);
+        assert_eq!(
+            cancelled.message.as_deref(),
+            Some("artifacts not retrieved: download failed: connection reset")
+        );
+        assert_eq!(runs.load(&cancelled.id)?, cancelled);
         Ok(())
     }
 }
