@@ -316,3 +316,34 @@ fn type_errors_name_the_key_but_not_the_value() -> Result<(), Box<dyn std::error
     }
     Ok(())
 }
+
+#[test]
+fn toml_syntax_errors_never_echo_source() -> Result<(), Box<dyn std::error::Error>> {
+    let malformed_toml = r#"
+[project]
+name = "demo"
+
+not valid toml here = SK-LEAK-MARKER-999 !!broken!!
+"#;
+    let dir = project(malformed_toml)?;
+    match load(dir.path(), env(&[])) {
+        Err(error @ ConfigError::Parse(_)) => {
+            let text = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(
+                !text.contains("SK-LEAK-MARKER-999"),
+                "marker leaked in Display: {text}"
+            );
+            assert!(
+                !debug.contains("SK-LEAK-MARKER-999"),
+                "marker leaked in Debug: {debug}"
+            );
+            assert!(
+                text.contains("line") || text.contains("TOML"),
+                "error should mention location: {text}"
+            );
+            Ok(())
+        },
+        other => Err(format!("expected Parse, got {other:?}").into()),
+    }
+}

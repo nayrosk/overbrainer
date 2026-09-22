@@ -52,6 +52,7 @@ impl From<config::ConfigError> for ConfigError {
 /// Type errors keep their key and expected type. Custom messages from serde quote the
 /// value (`invalid value: string "..."`, `unknown variant ...`), so only the part from
 /// `expected` onward is kept. Unknown field names are keys, not values, and are kept.
+/// TOML syntax errors are reported by location only, never with source snippets.
 fn describe(error: &config::ConfigError) -> String {
     match error {
         config::ConfigError::Type { key, expected, .. } => {
@@ -63,8 +64,26 @@ fn describe(error: &config::ConfigError) -> String {
             None => describe(error),
         },
         config::ConfigError::Message(message) => redact(message),
-        other => other.to_string(),
+        config::ConfigError::FileParse { .. } => redact_toml_error(error),
+        _ => "invalid configuration".to_string(),
     }
+}
+
+/// Extracts location info from TOML parse errors, never including source snippets.
+fn redact_toml_error(error: &config::ConfigError) -> String {
+    let message = error.to_string();
+    let first_line = message.lines().next().unwrap_or("");
+
+    if let Some(pos) = first_line.find("at line ") {
+        if let Some(end) = first_line[pos..].find('\n') {
+            let location = &first_line[pos + 3..pos + end];
+            return format!("TOML syntax error in overbrainer.toml {location}");
+        }
+        let location = &first_line[pos + 3..];
+        return format!("TOML syntax error in overbrainer.toml {location}");
+    }
+
+    "TOML syntax error in overbrainer.toml".to_string()
 }
 
 /// Keeps what a serde message says was expected, dropping the value it quotes.
