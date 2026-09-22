@@ -110,3 +110,27 @@ fn resolve_without_vault_fails_on_reference() -> Result<(), Box<dyn std::error::
         .stderr(predicate::str::contains("VAULT_ADDR is not set"));
     Ok(())
 }
+
+#[test]
+fn malformed_dotenv_does_not_leak_its_content() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join(".env"),
+        "OVERBRAINER_HF_TOKEN=hf_marker_abc def\"x\n",
+    )?;
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["config", "check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot parse .env"))
+        .stderr(predicate::str::contains("hf_marker").not())
+        .stdout(predicate::str::contains("hf_marker").not());
+    Ok(())
+}
