@@ -1,0 +1,47 @@
+[package]
+name = "overbrainer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Distill a large LLM into a smaller open-weights model: generate questions, collect answers, fine-tune, visualize."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nayrosk/overbrainer"
+readme = "README.md"
+keywords = ["llm", "distillation", "fine-tuning", "cli", "tui"]
+categories = ["command-line-utilities", "science"]
+include = ["src/**/*", "templates/**/*", "LICENSE-*", "README.md"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+cognitive_complexity = "warn"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+config = { version = "0.15.26", default-features = false, features = ["toml"] }
+dotenvy = "0.15.7"
+rustify = { version = "0.7.0", default-features = false }
+secrecy = { version = "0.10.3", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+vaultrs = "0.8.0"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+wiremock = "0.6.5"

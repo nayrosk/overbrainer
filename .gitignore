@@ -1,0 +1,10 @@
+/target
+.env
+/data/
+/runs/
+/docs/design/
+.claude/settings.local.json
+.claude/**/*.jsonl
+.claude/projects/
+.claude/todos/
+.claude/shell-snapshots/
