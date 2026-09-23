@@ -3,13 +3,12 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use super::{Pod, PodId};
-use crate::runs::{Runs, RunsError, rfc3339};
+use crate::runs::{Runs, RunsError, rfc3339, write_atomic};
 
 /// The pod record of a run, in its local run directory.
 pub const POD_FILE: &str = "pod.json";
@@ -250,15 +249,12 @@ impl PodRecord {
             path: dir.clone(),
             source,
         })?;
-        let path = dir.join(POD_FILE);
-        let tmp = dir.join(format!(".{POD_FILE}.tmp"));
         let mut content = serde_json::to_vec_pretty(self).map_err(|source| RunsError::Invalid {
-            path: path.clone(),
+            path: dir.join(POD_FILE),
             source,
         })?;
         content.push(b'\n');
-        write(&tmp, &content)?;
-        fs::rename(&tmp, &path).map_err(|source| RunsError::Io { path, source })
+        write_atomic(&dir, POD_FILE, &content)
     }
 
     /// Appends a create call for `gpu_type`, sent `now`, and returns it. Its pod
@@ -406,13 +402,6 @@ impl PodRecord {
     }
 }
 
-fn write(path: &Path, content: &[u8]) -> Result<(), RunsError> {
-    fs::write(path, content).map_err(|source| RunsError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,11 +491,69 @@ mod tests {
         let text = fs::read_to_string(runs.run_dir(RUN)?.join(POD_FILE))?;
         assert!(text.contains("\"state\": \"creating\""), "{text}");
         assert!(text.contains("\"result\": \"sent\""), "{text}");
-        assert!(!runs.run_dir(RUN)?.join(".pod.json.tmp").exists());
+        assert_eq!(
+            crate::runs::tests::leftover_temp_files(&runs.run_dir(RUN)?)?,
+            Vec::<String>::new()
+        );
         assert!(matches!(
             PodRecord::load(&runs, "../x"),
             Err(RunsError::InvalidId(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_saves_always_leave_a_valid_record() -> TestResult {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8_u32)
+                .map(|writer| {
+                    let runs = &runs;
+                    scope.spawn(move || -> Result<(), RunsError> {
+                        for save in 0..40 {
+                            let mut record =
+                                PodRecord::new(RUN, false, writer + 1, "ssh-ed25519 AAAAhost");
+                            record.begin_attempt(&format!("GPU {save}"), at(1_790_000_000), 1.0);
+                            record.save(runs)?;
+                            PodRecord::load(runs, RUN)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(result) => result.map_err(|error| format!("{error:#?}")),
+                    Err(_) => Err("a writer panicked".to_string()),
+                })
+                .collect()
+        });
+        for result in results {
+            result?;
+        }
+        let saved = PodRecord::load(&runs, RUN)?.ok_or("no pod.json")?;
+        assert_eq!(saved.attempts[0].gpu_type, "GPU 39");
+        assert_eq!(
+            crate::runs::tests::leftover_temp_files(&runs.run_dir(RUN)?)?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_temporary_file() -> TestResult {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let dir = runs.run_dir(RUN)?;
+        fs::create_dir_all(dir.join(POD_FILE))?;
+        let record = PodRecord::new(RUN, false, 1, "ssh-ed25519 AAAAhost");
+        assert!(matches!(record.save(&runs), Err(RunsError::Io { .. })));
+        assert_eq!(
+            crate::runs::tests::leftover_temp_files(&dir)?,
+            Vec::<String>::new()
+        );
         Ok(())
     }
 

@@ -7,7 +7,7 @@ mod train;
 
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -177,15 +177,13 @@ impl Runs {
         let dir = self.run_dir(&record.id)?;
         fs::create_dir_all(&dir).map_err(io_error(&dir))?;
         let path = dir.join(RECORD_FILE);
-        let tmp = dir.join(format!(".{RECORD_FILE}.tmp"));
         let mut content =
             serde_json::to_vec_pretty(record).map_err(|source| RunsError::Invalid {
                 path: path.clone(),
                 source,
             })?;
         content.push(b'\n');
-        fs::write(&tmp, content).map_err(io_error(&tmp))?;
-        fs::rename(&tmp, &path).map_err(io_error(&path))
+        write_atomic(&dir, RECORD_FILE, &content)
     }
 
     /// Reads the record of run `id`.
@@ -244,6 +242,34 @@ impl Runs {
     }
 }
 
+/// Replaces `dir/name` with `content` atomically: writes a temporary file of its
+/// own in `dir` (`.<name>.<random>.tmp`, never shared with a concurrent save),
+/// then renames it over `dir/name`, so a reader sees either the old or the new
+/// content. The temporary file is removed when the write or the rename fails.
+///
+/// # Errors
+///
+/// Returns [`RunsError::Io`] when the temporary file cannot be created or
+/// written, or cannot be renamed over `dir/name`.
+pub(crate) fn write_atomic(dir: &Path, name: &str, content: &[u8]) -> Result<(), RunsError> {
+    let tmp = dir.join(format!(".{name}.{:016x}.tmp", fastrand::u64(..)));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(io_error(&tmp))?;
+    let written = file.write_all(content).map_err(io_error(&tmp));
+    drop(file);
+    let path = dir.join(name);
+    let renamed = written.and_then(|()| fs::rename(&tmp, &path).map_err(io_error(&path)));
+    if renamed.is_err()
+        && let Err(error) = fs::remove_file(&tmp)
+    {
+        tracing::warn!("cannot remove {}: {error}", tmp.display());
+    }
+    renamed
+}
+
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> RunsError + '_ {
     move |source| RunsError::Io {
         path: path.to_path_buf(),
@@ -252,7 +278,7 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> RunsError + '_ {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn record(id: &str) -> RunRecord {
@@ -283,6 +309,77 @@ mod tests {
         assert_eq!(runs.load("20260921-000000-aaaa")?, first);
         let json = fs::read_to_string(runs.run_dir(&first.id)?.join(RECORD_FILE))?;
         assert!(json.contains("\"state\": \"succeeded\""), "{json}");
+        Ok(())
+    }
+
+    /// The temporary files a save left in `dir`: `.run.json.<random>.tmp` or
+    /// `.pod.json.<random>.tmp`.
+    pub(crate) fn leftover_temp_files(dir: &Path) -> io::Result<Vec<String>> {
+        let mut left = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') && Path::new(&name).extension().is_some_and(|e| e == "tmp") {
+                left.push(name);
+            }
+        }
+        Ok(left)
+    }
+
+    #[test]
+    fn concurrent_saves_always_leave_a_valid_record() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let id = "20260922-143005-bbbb";
+        let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|writer| {
+                    let runs = &runs;
+                    scope.spawn(move || -> Result<(), RunsError> {
+                        for save in 0..40 {
+                            let mut run = record(id);
+                            run.message = Some(format!("writer {writer} save {save}"));
+                            runs.save(&run)?;
+                            runs.load(id)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(result) => result.map_err(|error| format!("{error:#?}")),
+                    Err(_) => Err("a writer panicked".to_string()),
+                })
+                .collect()
+        });
+        for result in results {
+            result?;
+        }
+        let saved = runs.load(id)?;
+        assert!(
+            saved
+                .message
+                .as_deref()
+                .is_some_and(|message| message.ends_with("save 39")),
+            "{saved:?}"
+        );
+        assert_eq!(
+            leftover_temp_files(&runs.run_dir(id)?)?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_temporary_file() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let run = record("20260922-143005-bbbb");
+        let dir = runs.run_dir(&run.id)?;
+        fs::create_dir_all(dir.join(RECORD_FILE))?;
+        assert!(matches!(runs.save(&run), Err(RunsError::Io { .. })));
+        assert_eq!(leftover_temp_files(&dir)?, Vec::<String>::new());
         Ok(())
     }
 

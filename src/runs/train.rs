@@ -718,8 +718,9 @@ mod tests {
         spawn_fails: bool,
         download_fails: bool,
         failing_read: Option<u32>,
-        /// A directory created when a download is asked for, before it fails.
-        dir_on_download: Option<PathBuf>,
+        /// A run directory whose later saves [`break_saves_in`] breaks when a
+        /// download is asked for, before it fails.
+        break_on_download: Option<PathBuf>,
         /// What the target's manifest lists.
         manifest: Vec<FileDigest>,
         reads: AtomicU32,
@@ -734,7 +735,7 @@ mod tests {
                 spawn_fails: false,
                 download_fails: false,
                 failing_read: None,
-                dir_on_download: None,
+                break_on_download: None,
                 manifest: Vec::new(),
                 reads: AtomicU32::new(0),
                 cancels: AtomicU32::new(0),
@@ -823,8 +824,8 @@ mod tests {
             _entries: &[String],
             _exclude: &[String],
         ) -> impl Future<Output = Result<(), ExecError>> + Send {
-            if let Some(dir) = &self.dir_on_download {
-                std::fs::create_dir(dir).ok();
+            if let Some(dir) = &self.break_on_download {
+                break_saves_in(dir).ok();
             }
             ready(if self.download_fails {
                 Err(broken("download"))
@@ -921,12 +922,25 @@ mod tests {
         }
     }
 
-    /// Makes every later save of the run `id` fail: its temporary file is taken by
-    /// a directory.
+    /// Makes every later save of the run `id` fail: see [`break_saves_in`].
     fn break_saves(runs: &Runs, id: &str) -> Result<(), Box<dyn std::error::Error>> {
-        std::fs::create_dir(runs.run_dir(id)?.join(format!(".{RECORD_FILE}.tmp")))?;
+        break_saves_in(&runs.run_dir(id)?)?;
         Ok(())
     }
+
+    /// Makes every later save in the run directory `dir` fail, root or not: its
+    /// `run.json` moves to [`SAVED_BEFORE`] and a directory takes its place, which
+    /// no save can be renamed over.
+    fn break_saves_in(dir: &Path) -> std::io::Result<()> {
+        let record = dir.join(RECORD_FILE);
+        if record.is_file() {
+            std::fs::rename(&record, dir.join(SAVED_BEFORE))?;
+        }
+        std::fs::create_dir(record)
+    }
+
+    /// Where [`break_saves_in`] moves the last saved `run.json`.
+    const SAVED_BEFORE: &str = "run.json.before";
 
     #[tokio::test]
     async fn a_successful_run_whose_artifacts_cannot_be_retrieved_stays_running()
@@ -1083,7 +1097,7 @@ mod tests {
         // The download breaks every later save, after `Cancelled` is on disk.
         let fake = Fake {
             download_fails: true,
-            dir_on_download: Some(runs.run_dir(RUN_ID)?.join(format!(".{RECORD_FILE}.tmp"))),
+            break_on_download: Some(runs.run_dir(RUN_ID)?),
             ..Fake::new(JobStatus::Cancelled)
         };
         let (cancelled, status, retrieved) = cancel(&runs, &fake, &NoFiles, record).await?;
@@ -1098,7 +1112,8 @@ mod tests {
             "{:?}",
             cancelled.message
         );
-        let saved = runs.load(RUN_ID)?;
+        let saved: RunRecord =
+            serde_json::from_slice(&std::fs::read(runs.run_dir(RUN_ID)?.join(SAVED_BEFORE))?)?;
         assert_eq!(saved.state, RunState::Cancelled);
         assert_eq!(saved.message, None);
         Ok(())
