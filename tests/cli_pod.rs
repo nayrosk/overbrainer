@@ -288,6 +288,27 @@ async fn pod_ls_prints_the_table_on_stdout() -> TestResult {
 }
 
 #[tokio::test]
+async fn pod_ls_says_when_the_account_has_no_overbrainer_pod() -> TestResult {
+    let server = serve(Account::default()).await;
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("overbrainer.toml"), CONFIG)?;
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "ls"]);
+    let output = output(cmd).await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        "pod: no overbrainer pod on this account\n"
+    );
+    assert!(deletes(&server).await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn pod_rm_keeps_the_training_pod_of_a_running_run_unless_forced() -> TestResult {
     let server = stub().await;
     let dir = project()?;
