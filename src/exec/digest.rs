@@ -19,11 +19,20 @@ pub struct FileDigest {
     pub sha256: String,
 }
 
-/// Prints `sha256sum` lines for every regular file under the `entries` of
-/// `remote` that exist, leaving out names matching an `exclude` pattern at any
-/// depth (the same rule as the `tar --exclude` of a download), or nothing when no
-/// entry exists. Fails, saying so, when `remote` itself is not a directory. Paths
-/// are printed with a leading `./`, so an entry can never read as an option.
+/// Prints one NUL-terminated `<hash> <path>` record for every regular file under
+/// the `entries` of `remote` that exist, leaving out names matching an `exclude`
+/// pattern at any depth (the same rule as the `tar --exclude` of a download), or
+/// nothing when no entry exists. Fails, saying so, when `remote` itself is not a
+/// directory. Paths are printed with a leading `./`, so an entry can never read
+/// as an option.
+///
+/// Each file is hashed through `sha256sum`'s standard input, so a file name never
+/// reaches `sha256sum` and never has to survive its own escaping: GNU coreutils
+/// escapes a name holding a backslash or a line break, busybox does not, and a
+/// script working with one would not work with the other. The record itself is
+/// framed by this script, not by `sha256sum`, and terminated with a NUL byte,
+/// which cannot appear in a POSIX path, so a name can hold anything else,
+/// including a line break, a backslash or a quote, without ambiguity.
 ///
 /// Needs `find` and `sha256sum`, which GNU coreutils and busybox both provide.
 #[must_use]
@@ -43,7 +52,12 @@ pub fn manifest_script(remote: &str, entries: &[String], exclude: &[String]) -> 
          cd -- {dir} || exit 1\n\
          for entry in {candidates}; do\n\
          [ -e \"$entry\" ] || continue\n\
-         find \"./$entry\" {prune}-type f -exec sha256sum {{}} + || exit 1\n\
+         find \"./$entry\" {prune}-type f -exec sh -c '\n\
+         for f; do\n\
+         hash=$(sha256sum < \"$f\") || exit 1\n\
+         printf \"%s %s\\0\" \"${{hash%% *}}\" \"$f\"\n\
+         done\n\
+         ' sh {{}} + || exit 1\n\
          done\n",
         dir = quote(remote),
         candidates = candidates.join(" "),
@@ -54,63 +68,33 @@ pub fn manifest_script(remote: &str, entries: &[String], exclude: &[String]) -> 
 ///
 /// # Errors
 ///
-/// Returns [`ExecError::Protocol`] for a line that is not `<64 hex digits>`, two
-/// spaces (or a space and `*`) and a path.
+/// Returns [`ExecError::Protocol`] for a record that is not `<64 hex digits>`, a
+/// space and a path.
 pub fn parse_manifest(output: &str) -> Result<Vec<FileDigest>, ExecError> {
     let mut digests = Vec::new();
-    for line in output.lines().filter(|line| !line.is_empty()) {
-        digests.push(parse_line(line)?);
+    for record in output.split('\0').filter(|record| !record.is_empty()) {
+        digests.push(parse_record(record)?);
     }
     digests.sort();
     Ok(digests)
 }
 
-/// One `sha256sum` line. GNU `sha256sum` starts a line with `\` when the file
-/// name holds a backslash or a line break, which it then escapes.
-fn parse_line(line: &str) -> Result<FileDigest, ExecError> {
-    let invalid = || ExecError::Protocol(format!("unexpected sha256sum line {line:?}"));
-    let (escaped, rest) = match line.strip_prefix('\\') {
-        Some(rest) => (true, rest),
-        None => (false, line),
-    };
-    let hash = rest.get(..64).ok_or_else(invalid)?;
+/// One `<hash> <path>` record of [`manifest_script`], without its trailing NUL.
+fn parse_record(record: &str) -> Result<FileDigest, ExecError> {
+    let invalid = || ExecError::Protocol(format!("unexpected manifest record {record:?}"));
+    let hash = record.get(..64).ok_or_else(invalid)?;
     if !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid());
     }
-    let name = rest
+    let name = record
         .get(64..)
-        .and_then(|tail| tail.strip_prefix(" ").or_else(|| tail.strip_prefix("*")))
-        .and_then(|tail| tail.strip_prefix(" ").or_else(|| tail.strip_prefix("*")))
+        .and_then(|tail| tail.strip_prefix(' '))
         .ok_or_else(invalid)?;
-    let name = if escaped {
-        unescape(name)
-    } else {
-        name.to_string()
-    };
-    let path = name.strip_prefix("./").unwrap_or(&name).to_string();
+    let path = name.strip_prefix("./").unwrap_or(name).to_string();
     Ok(FileDigest {
         path,
         sha256: hash.to_ascii_lowercase(),
     })
-}
-
-/// Undoes GNU `sha256sum`'s escaping of `\\`, `\n` and `\r` in a file name.
-fn unescape(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut chars = name.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-    out
 }
 
 /// SHA-256 of the file at `path`, as 64 lowercase hexadecimal digits.
@@ -290,33 +274,30 @@ mod tests {
     }
 
     #[test]
-    fn sha256sum_lines_parse_with_their_escapes() -> TestResult {
-        let output =
-            format!("{W}  ./output/b.bin\n{W} *./output/a.bin\n\\{W}  ./odd\\\\name\\nx\n");
+    fn manifest_records_survive_any_name_once_nul_terminated() -> TestResult {
+        let output = format!("{W} output/b.bin\0{W} output/odd\\name\"'*?\n.bin\0");
         assert_eq!(
             parse_manifest(&output)?,
             vec![
                 FileDigest {
-                    path: "odd\\name\nx".into(),
-                    sha256: W.into()
-                },
-                FileDigest {
-                    path: "output/a.bin".into(),
-                    sha256: W.into()
-                },
-                FileDigest {
                     path: "output/b.bin".into(),
+                    sha256: W.into()
+                },
+                FileDigest {
+                    path: "output/odd\\name\"'*?\n.bin".into(),
                     sha256: W.into()
                 },
             ]
         );
-        assert!(parse_manifest("nothex  ./a\n").is_err());
-        assert!(parse_manifest(&format!("{W}./a\n")).is_err());
+        assert!(parse_manifest("nothex a\0").is_err());
+        assert!(parse_manifest(&format!("{W}noSpace\0")).is_err());
         Ok(())
     }
 
     /// A run directory with an adapter, an excluded checkpoint, a nested
-    /// excluded checkpoint, a log and a symbolic link.
+    /// excluded checkpoint, a log, a symbolic link, and names that would trip a
+    /// naive line- or escape-based parser: a line break, a backslash, a quote and
+    /// two consecutive spaces.
     fn fixture() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let dir = root.path();
@@ -327,18 +308,32 @@ mod tests {
         fs::write(dir.join("output/checkpoint-5/state"), "w")?;
         fs::write(dir.join("output/nested/checkpoint-9/state"), "w")?;
         fs::write(dir.join("job.log"), "w")?;
+        fs::write(dir.join("output/weird\nname.bin"), "w")?;
+        fs::write(dir.join("output/back\\slash.bin"), "w")?;
+        fs::write(dir.join("output/quote\"mark.bin"), "w")?;
+        fs::write(dir.join("output/two  spaces.bin"), "w")?;
         std::os::unix::fs::symlink("adapter.bin", dir.join("output/link.bin"))?;
         Ok(root)
     }
 
     fn expected() -> Vec<FileDigest> {
-        ["job.log", "output/adapter.bin", "output/nested/config.json"]
-            .into_iter()
-            .map(|path| FileDigest {
-                path: path.to_string(),
-                sha256: W.to_string(),
-            })
-            .collect()
+        let mut digests: Vec<FileDigest> = [
+            "job.log",
+            "output/adapter.bin",
+            "output/nested/config.json",
+            "output/weird\nname.bin",
+            "output/back\\slash.bin",
+            "output/quote\"mark.bin",
+            "output/two  spaces.bin",
+        ]
+        .into_iter()
+        .map(|path| FileDigest {
+            path: path.to_string(),
+            sha256: W.to_string(),
+        })
+        .collect();
+        digests.sort();
+        digests
     }
 
     fn entries() -> Vec<String> {
