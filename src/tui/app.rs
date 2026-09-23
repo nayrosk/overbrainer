@@ -786,7 +786,7 @@ impl App {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         if ctrl_c {
-            self.overlay = None;
+            self.close_overlay();
             self.dataset.input = None;
             return self.quit();
         }
@@ -840,9 +840,23 @@ impl App {
         Vec::new()
     }
 
+    /// Closes the overlay and returns it. Closing the start dialog forgets its
+    /// list price lookup: nothing shows its prices any more.
+    fn close_overlay(&mut self) -> Option<Overlay> {
+        let overlay = self.overlay.take();
+        if let Some(Overlay::Confirm(Confirm {
+            action: Action::Start(_),
+            ..
+        })) = &overlay
+        {
+            self.prices = None;
+        }
+        overlay
+    }
+
     /// `y` runs the dialog's action; any other key closes it.
     fn on_confirm_key(&mut self, code: KeyCode) -> Vec<Effect> {
-        let Some(Overlay::Confirm(confirm)) = self.overlay.take() else {
+        let Some(Overlay::Confirm(confirm)) = self.close_overlay() else {
             return Vec::new();
         };
         if code != KeyCode::Char('y') {
@@ -1176,7 +1190,7 @@ impl App {
     /// abandoned, an edit being saved and a cancel are waited for (they are never
     /// cut, design 3.6).
     pub(super) fn on_signal(&mut self) -> Vec<Effect> {
-        self.overlay = None;
+        self.close_overlay();
         let effects = self.leave(Exit::Signal);
         if self.exit.is_none() {
             let mut waited = Vec::new();
@@ -3003,6 +3017,126 @@ mod tests {
         assert!(dialog(&app).contains("NVIDIA A40                 list price unknown"));
         assert_eq!(app.prices, None);
         Ok(())
+    }
+
+    #[test]
+    fn a_plan_never_replaces_an_open_dialog_and_y_still_quits() -> Result<(), String> {
+        let mut app = app();
+        // A followed run: `q` asks first.
+        app.training.tasks.insert(
+            TaskId(9),
+            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, FIRST),
+        );
+        let effects = press(&mut app, &[KeyCode::Char('3'), KeyCode::Char('t')]);
+        let Some(Effect::Spawn(prepare, Task::Prepare)) = effects.last() else {
+            return Err(format!("{effects:?}"));
+        };
+        press(&mut app, &[KeyCode::Char('q')]);
+        let effects = app.on_done(
+            *prepare,
+            Ok(Done::Prepared(Ok(crate::tui::snapshots::runpod_plan()))),
+        );
+        assert_eq!(effects, [], "no price lookup either");
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(Confirm {
+                    action: Action::Quit,
+                    ..
+                }))
+            ),
+            "{:?}",
+            app.overlay
+        );
+        assert_eq!(
+            status(&app),
+            Some("a run is prepared: press t again to start it")
+        );
+        let effects = press(&mut app, &[KeyCode::Char('y')]);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Spawn(_, Task::Train(TrainJob::Start)))),
+            "{effects:?}"
+        );
+        assert_eq!(app.leaving, Some(Exit::Quit), "y quits");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_waits_while_the_help_or_the_filter_is_open() {
+        let mut app = app();
+        for open in [true, false] {
+            if open {
+                app.overlay = Some(Overlay::Help);
+            } else {
+                app.overlay = None;
+                app.dataset.input = Some("bor".into());
+            }
+            app.prepare = Some(TaskId(3));
+            let effects = app.on_done(
+                TaskId(3),
+                Ok(Done::Prepared(Ok(crate::tui::snapshots::runpod_plan()))),
+            );
+            assert_eq!(effects, []);
+            assert!(!matches!(app.overlay, Some(Overlay::Confirm(_))));
+        }
+    }
+
+    #[test]
+    fn t_while_a_run_is_prepared_says_so() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('3'), KeyCode::Char('t')]);
+        assert_eq!(press(&mut app, &[KeyCode::Char('t')]), []);
+        assert_eq!(status(&app), Some("already preparing a run"));
+    }
+
+    #[test]
+    fn closing_the_start_dialog_forgets_its_price_lookup() -> Result<(), String> {
+        for code in [KeyCode::Char('n'), KeyCode::Char('y'), KeyCode::Esc] {
+            let mut app = app();
+            let effects = app.prepared(Ok(crate::tui::snapshots::runpod_plan()));
+            let [Effect::Spawn(lookup, Task::Prices(_))] = effects.as_slice() else {
+                return Err(format!("{effects:?}"));
+            };
+            assert!(app.work().contains(&"preparing a run".to_string()));
+            press(&mut app, &[code]);
+            assert_eq!(app.prices, None, "{code:?}");
+            assert!(!app.work().contains(&"preparing a run".to_string()));
+            app.on_done(*lookup, Ok(Done::Prices(Vec::new())));
+        }
+        let mut app = app();
+        app.prepared(Ok(crate::tui::snapshots::runpod_plan()));
+        app.on_input(&ctrl_c());
+        assert_eq!(app.prices, None, "Ctrl-C");
+        Ok(())
+    }
+
+    #[test]
+    fn abandoning_drops_a_cancel_asked_for_during_the_start() {
+        let mut app = app();
+        starting(&mut app, TaskId(6));
+        app.cancel_run(FIRST);
+        press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        assert!(
+            dialog(&app).starts_with("Quitting waits"),
+            "{}",
+            dialog(&app)
+        );
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('y')]),
+            [Effect::Abandon(TaskId(6))]
+        );
+        let failed = "interrupted before its job started: run 20260921-133200-a1b2 failed";
+        let effects = app.on_done(TaskId(6), Ok(Done::Trained(Err(failed.into()))));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Spawn(_, Task::Train(TrainJob::Cancel(_))))),
+            "{effects:?}"
+        );
+        assert_eq!(app.exit, Some(Exit::Quit));
+        assert_eq!(app.exit_notes, [failed]);
     }
 
     #[test]

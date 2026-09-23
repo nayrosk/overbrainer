@@ -118,23 +118,44 @@ fn kind(target: &Target) -> String {
 /// cannot be read has none, and the whole lookup gives up after
 /// [`PRICES_TIMEOUT`]. Only the client's fixed messages reach the logs.
 pub(super) async fn list_prices(dir: &Path, env: EnvSource, gpu_types: Vec<String>) -> Prices {
+    list_prices_within(dir, env, gpu_types, PRICES_TIMEOUT).await
+}
+
+/// [`list_prices`], giving up after `limit`: the prices read by then are
+/// kept, the types still unread have none.
+async fn list_prices_within(
+    dir: &Path,
+    env: EnvSource,
+    gpu_types: Vec<String>,
+    limit: Duration,
+) -> Prices {
+    let mut prices = Vec::new();
     let lookup = async {
         let settings = crate::config::load(dir, env)?;
         let client = crate::cli::pod::client(&settings).await?;
-        Ok::<_, anyhow::Error>(read_prices(&client, &gpu_types).await)
+        read_prices(&client, &gpu_types, &mut prices).await;
+        Ok::<_, anyhow::Error>(())
     };
-    let failure = match tokio::time::timeout(PRICES_TIMEOUT, lookup).await {
-        Ok(Ok(prices)) => return prices,
-        Ok(Err(error)) => format!("cannot look up list prices: {error:#}"),
-        Err(_) => "list prices took too long".to_string(),
+    let failure = match tokio::time::timeout(limit, lookup).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("cannot look up list prices: {error:#}")),
+        Err(_) => Some("list prices took too long".to_string()),
     };
-    tracing::warn!("{failure}");
-    gpu_types.into_iter().map(|gpu| (gpu, None)).collect()
+    if let Some(failure) = failure {
+        tracing::warn!("{failure}");
+    }
+    let unread = gpu_types.into_iter().skip(prices.len());
+    prices.extend(unread.map(|gpu| (gpu, None)));
+    prices
 }
 
-/// The list price of each of `gpu_types`, `None` for one that cannot be read.
-async fn read_prices(client: &crate::runpod::RunpodClient, gpu_types: &[String]) -> Prices {
-    let mut prices = Vec::new();
+/// Reads the list price of each of `gpu_types` into `prices`, in order, `None`
+/// for one that cannot be read.
+async fn read_prices(
+    client: &crate::runpod::RunpodClient,
+    gpu_types: &[String],
+    prices: &mut Prices,
+) {
     for gpu in gpu_types {
         let price = client.gpu_list_price(gpu).await.unwrap_or_else(|error| {
             tracing::warn!("cannot read the list price of {gpu}: {error}");
@@ -142,7 +163,16 @@ async fn read_prices(client: &crate::runpod::RunpodClient, gpu_types: &[String])
         });
         prices.push((gpu.clone(), price));
     }
+}
+
+/// The usable list price of `gpu` in `prices`: none when it is not there, or
+/// not a positive number.
+fn listed(prices: &Prices, gpu: &str) -> Option<f64> {
     prices
+        .iter()
+        .find(|(name, _)| name == gpu)
+        .and_then(|(_, price)| *price)
+        .filter(|price| price.is_finite() && *price > 0.0)
 }
 
 /// The confirmation text of `plan`, with the list `prices` once looked up.
@@ -178,29 +208,28 @@ fn gpu_lines(runpod: &RunpodPlan, prices: Option<&Prices>) -> Vec<String> {
         "GPU types   tried in order, list price x {} GPU:",
         runpod.gpu_count
     )];
-    for gpu in &runpod.gpu_types {
-        let price = match prices {
-            None => "looking up list prices...".to_string(),
-            Some(prices) => prices
-                .iter()
-                .find(|(name, _)| name == gpu)
-                .and_then(|(_, price)| *price)
-                .map_or_else(
-                    || "list price unknown".to_string(),
-                    |price| format!("${:.2}/h", price * count),
-                ),
+    let rates: Vec<Option<f64>> = runpod
+        .gpu_types
+        .iter()
+        .map(|gpu| prices.and_then(|prices| listed(prices, gpu)))
+        .collect();
+    for (gpu, rate) in runpod.gpu_types.iter().zip(&rates) {
+        let price = match (prices, rate) {
+            (None, _) => "looking up list prices...".to_string(),
+            (Some(_), Some(rate)) => format!("${:.2}/h", rate * count),
+            (Some(_), None) => "list price unknown".to_string(),
         };
         lines.push(format!("- {gpu:<26} {price}"));
     }
-    let highest = prices
-        .into_iter()
-        .flatten()
-        .filter(|(name, _)| runpod.gpu_types.contains(name))
-        .filter_map(|(_, price)| *price)
-        .reduce(f64::max);
+    let highest = rates.iter().flatten().copied().reduce(f64::max);
+    let some_unknown = if rates.contains(&None) {
+        " (some prices unknown)"
+    } else {
+        ""
+    };
     let most = highest.map_or_else(String::new, |rate| {
         format!(
-            ", about ${:.2} at most at the highest listed rate",
+            ", about ${:.2} at most at the highest listed rate{some_unknown}",
             rate * count * runpod.max_hours
         )
     });
@@ -246,8 +275,13 @@ mod tests {
         assert_eq!(
             text[6],
             "max_hours   6: the watchdog deletes the pod by then, about $8.88 at most at the \
-             highest listed rate"
+             highest listed rate (some prices unknown)"
         );
+        let all = vec![
+            ("NVIDIA GeForce RTX 4090".to_string(), Some(0.74)),
+            ("NVIDIA A40".to_string(), Some(0.44)),
+        ];
+        assert!(super::text(&plan(true), Some(&all))[6].ends_with("at the highest listed rate"));
         let waiting = super::text(&plan(true), None);
         assert!(waiting[4].ends_with("looking up list prices..."));
     }
@@ -351,6 +385,110 @@ mod tests {
         let shown = text(&plan, Some(&prices)).join("\n");
         assert!(shown.contains("$1.48/h") && shown.contains("list price unknown"));
         assert!(!shown.contains(KEY) && !format!("{plan:?}").contains(KEY));
+        Ok(())
+    }
+
+    #[test]
+    fn a_price_of_zero_or_less_is_unknown_and_never_bounds_the_run() {
+        let prices = vec![
+            ("NVIDIA GeForce RTX 4090".to_string(), Some(0.0)),
+            ("NVIDIA A40".to_string(), Some(-1.0)),
+        ];
+        let text = text(&plan(true), Some(&prices));
+        assert_eq!(text[4], "- NVIDIA GeForce RTX 4090    list price unknown");
+        assert_eq!(text[5], "- NVIDIA A40                 list price unknown");
+        assert_eq!(
+            text[6],
+            "max_hours   6: the watchdog deletes the pod by then"
+        );
+        let prices = vec![
+            ("NVIDIA GeForce RTX 4090".to_string(), Some(f64::NAN)),
+            ("NVIDIA A40".to_string(), Some(0.44)),
+        ];
+        let text = super::text(&plan(true), Some(&prices));
+        assert_eq!(text[4], "- NVIDIA GeForce RTX 4090    list price unknown");
+        assert!(
+            text[6]
+                .contains("about $5.28 at most at the highest listed rate (some prices unknown)"),
+            "{}",
+            text[6]
+        );
+    }
+
+    /// A catalog answering `price` for `gpu`, after `delay`.
+    async fn priced(server: &MockServer, gpu: &str, price: f64, delay: Duration) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v2/catalog/gpus/{}",
+                gpu.replace(' ', "%20")
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": gpu, "price": {"secure": price}}))
+                    .set_delay(delay),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_lookup_past_its_time_keeps_the_prices_read_in_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        priced(&server, "NVIDIA GeForce RTX 4090", 0.74, Duration::ZERO).await;
+        priced(&server, "NVIDIA A40", 0.44, Duration::from_secs(30)).await;
+        let (dir, env) = runpod_project(Some(&server))?;
+        let gpus = vec![
+            "NVIDIA GeForce RTX 4090".to_string(),
+            "NVIDIA A40".to_string(),
+            "NVIDIA RTX A6000".to_string(),
+        ];
+        let started = std::time::Instant::now();
+        let prices = list_prices_within(dir.path(), env, gpus, Duration::from_secs(2)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "gave up in time"
+        );
+        assert_eq!(
+            prices,
+            [
+                ("NVIDIA GeForce RTX 4090".to_string(), Some(0.74)),
+                ("NVIDIA A40".to_string(), None),
+                ("NVIDIA RTX A6000".to_string(), None),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_price_read_never_logs_the_key() -> Result<(), Box<dyn std::error::Error>> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/catalog/gpus/NVIDIA%20A40"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string(format!("{{\"detail\": \"{KEY}\"}}")),
+            )
+            .mount(&server)
+            .await;
+        let (dir, env) = runpod_project(Some(&server))?;
+        let logs = crate::logging::LogBuffer::new(100);
+        let subscriber = tracing_subscriber::registry().with(logs.layer());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let prices = list_prices(dir.path(), env, vec!["NVIDIA A40".into()]).await;
+        drop(guard);
+        assert_eq!(prices, [("NVIDIA A40".to_string(), None)]);
+        let lines = logs.window(tracing::Level::TRACE, 1000, 0).lines;
+        assert!(
+            lines.iter().any(|line| line
+                .message
+                .contains("cannot read the list price of NVIDIA A40")),
+            "{lines:?}"
+        );
+        for line in &lines {
+            assert!(!line.message.contains(KEY), "{line:?}");
+        }
         Ok(())
     }
 

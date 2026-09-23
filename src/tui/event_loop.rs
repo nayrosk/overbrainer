@@ -17,7 +17,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use super::app::{App, Effect, Exit};
-use super::tasks::{Done, Msg, Task, TaskId, Tasks};
+use super::tasks::{Done, Msg, Task, TaskId, Tasks, TrainJob};
 use super::terminal::Screen;
 use super::ui;
 
@@ -220,7 +220,7 @@ where
         // List prices are only read: nothing waits for them.
         self.tasks.abort_lookups();
         for effect in std::mem::take(&mut self.pending) {
-            self.apply_late(effect);
+            self.apply_late(app, effect);
         }
         if !self.tasks.is_empty() {
             // Why the loop ended stays what it was.
@@ -237,7 +237,7 @@ where
     /// before each end.
     async fn wait_tasks(&mut self, app: &mut App) {
         for effect in app.on_signal() {
-            self.apply_late(effect);
+            self.apply_late(app, effect);
         }
         let lines = app.waiting_for();
         if let Some(real) = &mut self.real
@@ -264,16 +264,18 @@ where
                 None => app.on_signal(),
             };
             for effect in effects {
-                self.apply_late(effect);
+                self.apply_late(app, effect);
             }
         }
     }
 
     /// Runs `effect` once the loop ended: a training task or an edit starts
     /// (never lost, never cut), a token is cancelled, a task abandoned; a
-    /// reading, a stage or the editor does not start any more.
-    fn apply_late(&mut self, effect: Effect) {
+    /// reading, a stage or the editor does not start any more, nor a new run
+    /// (the app notes it was not started).
+    fn apply_late(&mut self, app: &mut App, effect: Effect) {
         match effect {
+            Effect::Spawn(id, Task::Train(TrainJob::Start)) => app.start_dropped(id),
             Effect::Spawn(id, task @ (Task::Train(_) | Task::Edit(_))) => {
                 self.tasks.spawn(id, task);
             },
@@ -290,7 +292,7 @@ where
                 continue;
             }
             for effect in app.on_message(message) {
-                self.apply_late(effect);
+                self.apply_late(app, effect);
             }
         }
     }
@@ -806,6 +808,35 @@ mod tests {
         let error = app.training.ended.get(RUN).and_then(|e| e.error.clone());
         assert_eq!(error, Some(format!("run {RUN} has not started")));
         assert_eq!(app.exit, Some(Exit::Quit), "why the loop ended is kept");
+        Ok(())
+    }
+
+    /// A start left pending when the loop ended (a draw error) is never
+    /// spawned: nothing would follow it. The exit notes say it was not started.
+    #[tokio::test]
+    async fn a_start_left_pending_never_runs_once_the_loop_ended()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::tasks::{Task, TrainJob};
+        use crate::tui::training::{Follow, Job};
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = looping(&mut terminal, dir.path());
+        let mut app = app();
+        app.project.dir = dir.path().to_path_buf();
+        app.training
+            .tasks
+            .insert(TaskId(4), Follow::new(Job::Start { runpod: true }, ""));
+        looping.pending = vec![Effect::Spawn(TaskId(4), Task::Train(TrainJob::Start))];
+        tokio::time::timeout(LIMIT, looping.settle(&mut app)).await?;
+        assert!(looping.tasks.is_empty(), "never spawned");
+        assert!(app.training.tasks.is_empty());
+        assert_eq!(
+            app.exit_notes,
+            [
+                "a new training run was not started: the TUI ended first; start it again with \
+              `overbrainer train` or t"
+            ]
+        );
         Ok(())
     }
 

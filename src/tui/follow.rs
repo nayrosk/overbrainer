@@ -185,7 +185,11 @@ impl App {
 
     /// `t`: prepares the confirmation of a new run, in a task.
     fn prepare_start(&mut self) -> Vec<Effect> {
-        if self.start_refused() || self.prepare.is_some() {
+        if self.start_refused() {
+            return Vec::new();
+        }
+        if self.prepare.is_some() {
+            self.say(Severity::Info, "already preparing a run");
             return Vec::new();
         }
         let id = self.task_id();
@@ -195,7 +199,9 @@ impl App {
 
     /// The plan of a new run is ready: asks to start it, and looks up the list
     /// prices of a Runpod run meanwhile (an earlier lookup no longer counts).
-    /// Dropped once the TUI is quitting.
+    /// Dropped once the TUI is quitting, and while a dialog, the help, the menu
+    /// or the filter is open (it never replaces what the user is answering):
+    /// the status line then says to press `t` again.
     pub(super) fn prepared(&mut self, plan: Result<StartPlan, String>) -> Vec<Effect> {
         self.prepare = None;
         if self.leaving.is_some() {
@@ -208,6 +214,13 @@ impl App {
                 return Vec::new();
             },
         };
+        if self.overlay.is_some() || self.dataset.input.is_some() {
+            self.say(
+                Severity::Info,
+                "a run is prepared: press t again to start it",
+            );
+            return Vec::new();
+        }
         let gpu_types = plan.runpod.as_ref().map(|runpod| runpod.gpu_types.clone());
         self.overlay = Some(Overlay::Confirm(Confirm {
             title: " Start a training run? ".to_string(),
@@ -246,6 +259,18 @@ impl App {
         let effects = self.train(Job::Start { runpod }, "");
         self.say(Severity::Info, format!("starting a run on {}", plan.target));
         effects
+    }
+
+    /// Start task `id` was never spawned (the loop ended first): it is
+    /// forgotten, and the exit notes say so.
+    pub(super) fn start_dropped(&mut self, id: TaskId) {
+        self.training.tasks.remove(&id);
+        self.exit_notes.push(
+            "a new training run was not started: the TUI ended first; start it again with \
+             `overbrainer train` or t"
+                .to_string(),
+        );
+        self.leave_when_idle();
     }
 
     /// Starts a training task doing `job` on run `run_id`. The late messages of
@@ -552,8 +577,9 @@ impl App {
         let runs: Vec<&str> = starting.iter().map(|(_, run)| run.as_str()).collect();
         let text = format!(
             "Quitting waits until the job of {} has started, which can take minutes. Abandon \
-             it instead? Its pod is deleted and the run fails, as Ctrl-C does on the command \
-             line before the job starts.",
+             it instead? If its pod is still being prepared, it is deleted and the run fails, \
+             as Ctrl-C does on the command line; once its job is being sent, the run is \
+             detached instead.",
             runs.join(", ")
         );
         self.overlay = Some(Overlay::Confirm(Confirm {
@@ -566,7 +592,9 @@ impl App {
     }
 
     /// Abandons the start tasks `ids` that still provision, once confirmed: as
-    /// a signal would, their pods are deleted and their runs fail.
+    /// a signal would, their pods are deleted and their runs fail. A cancel
+    /// asked for meanwhile is dropped: an abandoned run has no job to cancel,
+    /// and its flow's error says what became of it.
     pub(super) fn abandon(&mut self, ids: &[TaskId]) -> Vec<Effect> {
         let mut effects = Vec::new();
         for id in ids {
@@ -575,6 +603,7 @@ impl App {
                 && follow.detach != Detach::Done
             {
                 follow.detach = Detach::Done;
+                follow.cancel_after = false;
                 effects.push(Effect::Abandon(*id));
             }
         }

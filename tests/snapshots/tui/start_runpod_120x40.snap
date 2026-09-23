@@ -22,7 +22,7 @@ source: src/tui/snapshots.rs
 "│                     │- NVIDIA RTX A6000           $0.79/h                                      │                     │"
 "│                     │- NVIDIA A40                 list price unknown                           │                     │"
 "│                     │max_hours   6: the watchdog deletes the pod by then, about $4.74 at most  │                     │"
-"│                     │at the highest listed rate                                                │                     │"
+"│                     │at the highest listed rate (some prices unknown)                          │                     │"
 "│                     │warning     qwen2 renders no reasoning_content (see the logs)             │                     │"
 "│                     │The run keeps going when you leave this view or quit; attach again here or│                     │"
 "│                     │with `overbrainer train attach <run-id>`.                                 │                     │"
