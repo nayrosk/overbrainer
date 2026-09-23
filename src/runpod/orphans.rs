@@ -17,7 +17,8 @@ use super::{
 const CELL_CHARS: usize = 64;
 
 /// The note of a stray pod: another pod of a run, left by an ambiguous create,
-/// whose delete could not be confirmed (`stray_pods` in `pod.json`).
+/// whose delete could not be confirmed (`stray_pods` in `pod.json`), or any pod
+/// carrying the run's marker that `pod.json` does not record.
 const STRAY: &str = "stray, not deleted";
 
 /// The note of a pod named like overbrainer's without a usable run marker.
@@ -37,10 +38,11 @@ pub enum RowKind {
     Kept,
     /// Its results were not retrieved; its watchdog deletes it later.
     AwaitingRetrieval,
-    /// One of its run's `stray_pods`.
+    /// One of its run's `stray_pods`, or any pod carrying its run's marker other
+    /// than the one in its `pod.json`.
     Stray,
-    /// One of its run's `stray_pods`, beside the run's pod kept or awaiting
-    /// retrieval: `pod rm` of the run deletes that pod too.
+    /// A stray, beside the run's pod kept or awaiting retrieval: `pod rm` of the
+    /// run deletes that pod too.
     StrayBesideKept,
     /// Its run is not in this project's `runs/`: it may belong to another
     /// checkout.
@@ -101,9 +103,11 @@ impl PodRow {
 /// `pod.json` that cannot be read is skipped with a warning.
 ///
 /// The note of a row says `run <state>` for a run in progress, `run <state>, not
-/// deleted` for an ended run, `kept`, `awaiting retrieval`, `stray, not deleted`,
-/// `no run marker`, `run record unreadable`, `gone`, or, for a run not in this
-/// project's `runs/`, how to remove it if no other checkout owns it.
+/// deleted` for an ended run, `kept`, `awaiting retrieval`, `stray, not deleted`
+/// (a pod of `stray_pods`, or any pod carrying the run's marker other than the
+/// one `pod.json` records), `no run marker`, `run record unreadable`, `gone`,
+/// or, for a run not in this project's `runs/`, how to remove it if no other
+/// checkout owns it.
 ///
 /// # Errors
 ///
@@ -238,8 +242,15 @@ impl<'a> Known<'a> {
                 ),
             );
         };
-        let pod_state = self.pod_records.get(run).map(|pod| pod.state);
-        if self.is_stray(id) {
+        let pod_record = self.pod_records.get(run);
+        let pod_state = pod_record.map(|pod| pod.state);
+        // A pod carrying the marker that is not the run's recorded pod (an extra
+        // pod of an unclear create) is a stray too: the run's state says nothing
+        // about it, and beside a kept pod no watchdog would ever delete it.
+        let extra = pod_record
+            .and_then(|pod| pod.pod_id.as_ref())
+            .is_some_and(|recorded| recorded != id);
+        if extra || self.is_stray(id) {
             let kept = matches!(
                 pod_state,
                 Some(PodState::Kept | PodState::AwaitingRetrieval)

@@ -11,7 +11,7 @@ use overbrainer::events::EventBus;
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
     AttemptResult, DeletedBy, Pod, PodCtx, PodError, PodId, PodRecord, PodRow, PodState, RowKind,
-    RunpodClient, Timing, orphan_warnings, pod_rows, remove_run_pods,
+    RunpodClient, Timing, listed_rows, orphan_warnings, pod_rows, remove_run_pods,
 };
 use overbrainer::runs::{RunRecord, RunState, Runs};
 use secrecy::SecretString;
@@ -341,6 +341,51 @@ async fn the_stray_hint_of_a_kept_run_says_pod_rm_deletes_the_kept_pod_too() -> 
                 "pod s1 (stray, not deleted) is still on Runpod at $0.53/h: remove it with `overbrainer pod rm {ENDED}` (this also deletes the run's kept pod)"
             )]
         );
+    }
+    Ok(())
+}
+
+/// A pod carrying a run's marker that is neither the pod in its `pod.json` nor a
+/// known stray (an extra pod of an unclear create) is a stray: nothing else
+/// guards it, least of all beside a kept pod whose watchdog stays its hand.
+#[tokio::test]
+async fn an_extra_marker_pod_is_a_stray_and_an_orphan() -> TestResult {
+    let cases = [
+        (
+            PodState::Kept,
+            RunState::Succeeded,
+            RowKind::StrayBesideKept,
+        ),
+        (PodState::Running, RunState::Running, RowKind::Stray),
+    ];
+    for (pod_state, run_state, kind) in cases {
+        let account =
+            Account::default()
+                .with("p3", Some(ENDED), true)
+                .with("x2", Some(ENDED), true);
+        let harness = Harness::new(account).await?;
+        harness.recorded(ENDED, run_state, "p3", pod_state)?;
+        for rows in [
+            pod_rows(&harness.ctx()).await?,
+            listed_rows(&harness.ctx()).await?,
+        ] {
+            let extra = find(&rows, "x2")?;
+            assert_eq!(
+                (extra.kind, extra.note.as_str()),
+                (kind, "stray, not deleted")
+            );
+            assert!(extra.is_orphan(), "{extra:?}");
+            assert_ne!(find(&rows, "p3")?.kind, kind);
+            let warnings = orphan_warnings(&rows);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].starts_with(&format!(
+                    "pod x2 (stray, not deleted) is still on Runpod at $0.53/h: remove it with `overbrainer pod rm {ENDED}`"
+                )),
+                "{warnings:?}"
+            );
+        }
+        assert!(harness.deletes().await.is_empty());
     }
     Ok(())
 }
