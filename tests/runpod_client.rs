@@ -22,6 +22,12 @@ const HOST_KEY: &str = "b3BlbnNzaC1ob3N0LWtleQ";
 /// The exact and windowed redaction pass replaces 16-character pieces: any
 /// shorter fragment of a secret is not a claim this client makes.
 const REDACT_WINDOW: usize = 16;
+/// The fuzzy leak detector withholds a create error once it still finds this
+/// many contiguous characters of a secret, after undoing common formatting.
+const MIN_LEAKED_PIECE: usize = 12;
+/// Text shown instead of a create call's error once sanitizing it changed
+/// anything: matches `client.rs`'s `WITHHELD_MESSAGE` exactly.
+const WITHHELD_MESSAGE: &str = "the API echoed the pod's settings; message withheld";
 
 /// A realistic-looking base64 host key, `len` characters, deterministic so the
 /// test is reproducible.
@@ -39,6 +45,21 @@ fn assert_key_never_leaks(text: &str, key: &str) {
     assert!(!text.contains(key), "full key leaked: {text}");
     for start in 0..=(key.len() - REDACT_WINDOW) {
         let piece = &key[start..start + REDACT_WINDOW];
+        assert!(
+            !text.contains(piece),
+            "key fragment `{piece}` leaked: {text}"
+        );
+    }
+}
+
+/// Asserts that `text` holds neither the whole of `key` nor any
+/// [`MIN_LEAKED_PIECE`]-character piece of it: the bar an echoed create error
+/// must clear once formatting (escaping, line-wrapping, percent-encoding) could
+/// otherwise defeat the coarser [`REDACT_WINDOW`]-based redaction.
+fn assert_no_short_piece_leaks(text: &str, key: &str) {
+    assert!(!text.contains(key), "full key leaked: {text}");
+    for start in 0..=(key.len() - MIN_LEAKED_PIECE) {
+        let piece = &key[start..start + MIN_LEAKED_PIECE];
         assert!(
             !text.contains(piece),
             "key fragment `{piece}` leaked: {text}"
@@ -289,10 +310,9 @@ async fn a_create_error_never_quotes_a_key() -> TestResult {
         .ok_or("no error")?;
     let text = format!("{error} {error:?}");
     assert!(!text.contains(HOST_KEY) && !text.contains(KEY), "{text}");
-    assert!(
-        text.contains("env.OVERBRAINER_HOST_KEY *** too long; key ***"),
-        "{text}"
-    );
+    // The body echoed both secrets, so the whole message is withheld rather
+    // than shown with them individually redacted.
+    assert!(text.contains(WITHHELD_MESSAGE), "{text}");
     Ok(())
 }
 
@@ -358,6 +378,109 @@ async fn a_long_host_key_echoed_only_at_its_start_never_leaks() -> TestResult {
 async fn a_long_host_key_echoed_only_in_its_middle_never_leaks() -> TestResult {
     let key = generated_host_key(400);
     create_error_with_echoed_key(&key[150..250], &key).await
+}
+
+async fn create_error_with_transformed_key(transform: impl Fn(&str) -> String) -> TestResult {
+    let server = MockServer::start().await;
+    let key = generated_host_key(200);
+    let echoed = transform(&key);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "title": "Unprocessable",
+            "detail": format!("host key rejected: {echoed}")
+        })))
+        .mount(&server)
+        .await;
+    let mut create = request();
+    create.env.host_key = SecretString::from(key.clone());
+    let error = client(&server)?
+        .create_pod(&create)
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert_no_short_piece_leaks(&format!("{error} {error:?}"), &key);
+    Ok(())
+}
+
+/// `text` with every character percent-encoded.
+fn percent_encode(text: &str) -> String {
+    use std::fmt::Write;
+
+    text.chars().fold(String::new(), |mut acc, c| {
+        let _ = write!(acc, "%{:02X}", c as u32);
+        acc
+    })
+}
+
+/// `text` wrapped with a newline every `width` characters.
+fn line_wrap(text: &str, width: usize) -> String {
+    text.chars()
+        .collect::<Vec<_>>()
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn a_json_escaped_echo_never_leaks_a_short_piece() -> TestResult {
+    create_error_with_transformed_key(|key| key.replace('/', "\\/")).await
+}
+
+#[tokio::test]
+async fn a_line_wrapped_echo_never_leaks_a_short_piece() -> TestResult {
+    create_error_with_transformed_key(|key| line_wrap(key, 15)).await
+}
+
+#[tokio::test]
+async fn a_percent_encoded_echo_never_leaks_a_short_piece() -> TestResult {
+    create_error_with_transformed_key(percent_encode).await
+}
+
+#[tokio::test]
+async fn a_capacity_failure_is_shown_as_is() -> TestResult {
+    let server = MockServer::start().await;
+    let detail = "There are no longer any instances available with the requested \
+                   specifications. Please refresh and try again.";
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({ "detail": detail })))
+        .mount(&server)
+        .await;
+    let error = client(&server)?
+        .create_pod(&request())
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert_eq!(error.status(), Some(400));
+    assert!(error.to_string().contains(detail), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_capacity_failure_is_recognized_even_if_the_body_also_echoes_the_key() -> TestResult {
+    let server = MockServer::start().await;
+    let key = generated_host_key(200);
+    let detail = "There are no longer any instances available with the requested \
+                   specifications. Please refresh and try again.";
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "detail": detail,
+            "errors": [format!("debug: {key}")]
+        })))
+        .mount(&server)
+        .await;
+    let mut create = request();
+    create.env.host_key = SecretString::from(key.clone());
+    let error = client(&server)?
+        .create_pod(&create)
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert_eq!(error.status(), Some(400));
+    let text = error.to_string();
+    assert!(text.contains("no longer any instances available"), "{text}");
+    assert_no_short_piece_leaks(&text, &key);
+    Ok(())
 }
 
 #[tokio::test]
