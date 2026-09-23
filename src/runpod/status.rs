@@ -13,6 +13,8 @@ pub enum DeleteReason {
     NotReady,
     /// The pod's watchdog could not prove it can delete its own pod.
     Refused,
+    /// The pod's bootstrap failed: no job can run on it.
+    BootstrapFailed,
     /// Ctrl-C before the job started.
     Interrupted,
     /// `max_hours` has passed.
@@ -31,6 +33,7 @@ impl DeleteReason {
             Self::Retrieved => "results retrieved",
             Self::NotReady => "not ready in time",
             Self::Refused => "its watchdog cannot delete it",
+            Self::BootstrapFailed => "its bootstrap failed",
             Self::Interrupted => "interrupted before the job started",
             Self::Deadline => "max_hours reached",
             Self::Requested => "requested",

@@ -184,9 +184,48 @@ async fn a_run_whose_pod_cannot_be_placed_is_failed() -> TestResult {
     let pod = PodRecord::load(&harness.runs, &run.id)?.ok_or("no pod.json")?;
     assert_eq!(pod.attempts[0].result, AttemptResult::Unavailable);
     assert!(pod.host_key.starts_with("ssh-ed25519 "));
+    // No pod was left: the private client key has nothing left to reach.
+    let ssh = harness.runs.run_dir(&run.id)?.join("ssh");
+    assert!(!ssh.join("id_ed25519").exists());
+    assert!(!ssh.join("host_ed25519").exists());
+    Ok(())
+}
+
+/// A pod whose deletion cannot be confirmed may still run: the client key
+/// that reaches it stays.
+#[tokio::test]
+async fn a_failed_provisioning_keeps_the_client_key_while_a_pod_may_remain() -> TestResult {
+    if !keygen_available() {
+        return Ok(());
+    }
+    let harness = Harness::new().await?;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(json!({"id": "p1", "status": "RUNNING"})),
+        )
+        .mount(&harness.server)
+        .await;
+    // A dead pod that never goes away.
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"id": "p1", "status": "EXITED"})),
+        )
+        .mount(&harness.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&harness.server)
+        .await;
+    let run = create(&harness.runs, "/workspace/overbrainer", "gpu_cloud")?;
+    let result = start_pod(&harness.ctx(), &target(), run.clone(), false).await;
+    assert!(matches!(result, Err(PodError::NotDeleted(_))), "{result:?}");
+    let pod = PodRecord::load(&harness.runs, &run.id)?.ok_or("no pod.json")?;
+    assert_eq!(pod.state, PodState::Deleting);
     let ssh = harness.runs.run_dir(&run.id)?.join("ssh");
     assert!(ssh.join("id_ed25519").is_file());
-    assert!(!ssh.join("host_ed25519").exists());
     Ok(())
 }
 
@@ -206,6 +245,8 @@ async fn ctrl_c_before_the_pod_fails_the_run_as_interrupted() -> TestResult {
         saved.message.as_deref(),
         Some("interrupted before the job started")
     );
+    let key = harness.runs.run_dir(&run.id)?.join("ssh/id_ed25519");
+    assert!(!key.exists());
     Ok(())
 }
 
@@ -522,6 +563,35 @@ async fn a_pod_that_only_looks_gone_once_is_not_gone() -> TestResult {
     assert_eq!(
         PodRecord::load(&harness.runs, &run.id)?.map(|saved| saved.state),
         Some(PodState::Provisioning)
+    );
+    assert_eq!(deletes(&harness.server).await, 0);
+    Ok(())
+}
+
+/// A stopped pod will not run again by itself: waiting for it is pointless.
+#[tokio::test]
+async fn reconnect_to_a_stopped_pod_points_to_pod_rm() -> TestResult {
+    let harness = Harness::new().await?;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"id": "p1", "status": "EXITED"})),
+        )
+        .mount(&harness.server)
+        .await;
+    let run = broken_run(&harness.runs)?;
+    let mut pod = pod_record(&run.id, true, Duration::ZERO)?;
+    let error = reconnect(&harness.ctx(), &mut pod, &run)
+        .await
+        .err()
+        .ok_or("reconnected to a stopped pod")?;
+    assert!(matches!(error, PodError::PodStopped { .. }), "{error}");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "pod p1 is stopped and will not run again by itself; remove it with `overbrainer pod rm {}`",
+            run.id
+        )
     );
     assert_eq!(deletes(&harness.server).await, 0);
     Ok(())

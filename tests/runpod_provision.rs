@@ -372,6 +372,28 @@ async fn a_400_that_is_not_about_capacity_stops_at_once() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_walk_ending_on_capacity_still_names_a_pod_that_never_became_ready() -> TestResult {
+    let harness = Harness::new().await?;
+    create_for(
+        &harness.server,
+        "A",
+        ResponseTemplate::new(201).set_body_json(pod("p1", "n1", "RUNNING")),
+    )
+    .await;
+    create_for(&harness.server, "B", no_capacity()).await;
+    serve_pod(&harness.server, "p1", pod("p1", "n1", "ERROR")).await;
+    let (result, _) = harness.provision(&target(&["A", "B"])).await?;
+    let Err(PodError::NoCapacity(message)) = &result else {
+        return Err(format!("expected NoCapacity, got {result:?}").into());
+    };
+    assert_eq!(
+        message,
+        "no gpu_types entry gave a ready pod: 1 pod was created but never became ready, the last one because the pod is ERROR; the other types could not be placed: Runpod answered 400: no capacity for this GPU type"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_403_moves_to_the_next_gpu_type() -> TestResult {
     let harness = Harness::new().await?;
     let mut receiver = harness.bus.subscribe();
@@ -435,7 +457,13 @@ async fn a_pod_gone_or_dead_before_ssh_ends_its_attempt_at_once() -> TestResult 
         "waited {:?}",
         started.elapsed()
     );
-    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    let Err(PodError::NoCapacity(message)) = &result else {
+        return Err(format!("expected NoCapacity, got {result:?}").into());
+    };
+    assert_eq!(
+        message,
+        "no gpu_types entry gave a ready pod: 2 pods were created but never became ready, the last one because the pod is TERMINATED"
+    );
     assert_eq!(
         results(&record),
         vec![AttemptResult::NotReady, AttemptResult::NotReady]

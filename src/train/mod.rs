@@ -54,7 +54,8 @@ pub struct Artifacts {
     pub exclude: Vec<String>,
     /// The entry that must hold at least one file once the job has succeeded (the
     /// trained model), if any. A successful run whose target has nothing there is
-    /// not considered retrieved.
+    /// recorded `Failed`, yet still retrieved once what the target had was
+    /// downloaded and verified.
     pub required: Option<String>,
 }
 

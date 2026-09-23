@@ -16,8 +16,8 @@ use crate::train::Trainer;
 use super::provision::note_strays;
 use super::{
     CLIENT_KEY, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId, PodKeys, PodPlan, PodRecord,
-    PodState, PodStatus, Provisioned, RunpodTarget, SSH_DIR, SshEndpoint, alias, provision, remove,
-    sweep, write_config,
+    PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget, SSH_DIR, SshEndpoint, alias,
+    provision, remove, sweep, write_config,
 };
 
 /// How long after the watchdog's deadline the client deletes the pod itself, when
@@ -34,7 +34,8 @@ const GONE_LOOKS: u32 = 3;
 /// Creates the pod of the new run `run` (from `runs::create`) and waits until it is
 /// ready: keys in `runs/<id>/ssh/`, then `pod.json`, then provisioning. When that
 /// fails, the run is saved `Failed` with the reason (`interrupted before the job
-/// started` after Ctrl-C), and whatever pod was created is deleted.
+/// started` after Ctrl-C), whatever pod was created is deleted, and once every
+/// pod of the run is confirmed deleted, the run's private client key is removed.
 ///
 /// # Errors
 ///
@@ -52,8 +53,28 @@ pub async fn start_pod(
         if let Err(save_error) = ctx.runs.save(&run) {
             tracing::warn!("cannot record run {} as failed: {save_error}", run.id);
         }
+        if no_pod_left(ctx.runs, &run.id) {
+            forget_client_key(ctx.runs, &run.id);
+        }
     }
     result
+}
+
+/// Whether `pod.json` shows no pod of the run that may still exist: no pod, or
+/// one confirmed deleted, and no stray. A `pod.json` that cannot be read shows
+/// nothing for sure; none at all means no pod was ever asked for.
+fn no_pod_left(runs: &Runs, run_id: &str) -> bool {
+    match PodRecord::load(runs, run_id) {
+        Ok(Some(record)) => {
+            record.stray_pods.is_empty()
+                && (record.pod_id.is_none() || record.state == PodState::Deleted)
+        },
+        Ok(None) => true,
+        Err(error) => {
+            tracing::warn!("cannot read the pod record of run {run_id}: {error}");
+            false
+        },
+    }
 }
 
 /// The reason a failed provisioning gives in `run.json`: the error's message,
@@ -519,9 +540,9 @@ pub fn forget_client_key(runs: &Runs, run_id: &str) {
 ///
 /// # Errors
 ///
-/// Returns [`PodError::NoEndpoint`] when the pod exists but has no SSH endpoint
-/// (stopped or restarting), and another [`PodError`] when the API, the files or
-/// the connection fail.
+/// Returns [`PodError::PodStopped`] when the pod is stopped (`EXITED`),
+/// [`PodError::NoEndpoint`] when it has no SSH endpoint yet (restarting), and
+/// another [`PodError`] when the API, the files or the connection fail.
 pub async fn reconnect(
     ctx: &PodCtx<'_>,
     pod: &mut PodRecord,
@@ -537,6 +558,12 @@ pub async fn reconnect(
         mark_gone(ctx, pod, id, DeletedBy::Unknown)?;
         return Ok(None);
     };
+    if remote.status == RemoteStatus::Exited {
+        return Err(PodError::PodStopped {
+            pod_id: id,
+            run_id: run.id.clone(),
+        });
+    }
     let direct = remote
         .direct()
         .ok_or_else(|| PodError::NoEndpoint(id.clone(), remote.status.name().to_string()))?;

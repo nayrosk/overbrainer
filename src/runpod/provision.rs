@@ -153,7 +153,8 @@ enum Created {
 ///
 /// # Errors
 ///
-/// Returns [`PodError::NoCapacity`] when no GPU type could be placed,
+/// Returns [`PodError::NoCapacity`] when no GPU type could be placed or gave a
+/// ready pod,
 /// [`PodError::Unanswered`] when no create call got a clear answer,
 /// [`PodError::NoCredits`] on a 402, [`PodError::Rejected`] on a 422 or a 400
 /// that is not a capacity failure, [`PodError::WatchdogRefused`] when the
@@ -248,19 +249,44 @@ async fn walk(
         return Err(PodError::Unanswered);
     }
     Err(no_capacity(
+        tried,
         last_detail,
         plan.target.network_volume_id.is_some(),
     ))
 }
 
-/// The error once every GPU type was tried. `detail` is the last capacity or
-/// 403 answer, as the client's fixed message: a request Runpod rejected for any
-/// other reason stopped the walk at once instead.
-fn no_capacity(detail: Option<String>, volume: bool) -> PodError {
-    let mut message = "no gpu_types entry could be placed".to_string();
-    if let Some(detail) = detail {
-        message = format!("{message}: {detail}");
-    }
+/// The error once every GPU type was tried. `tried` are the attempts of this
+/// walk: when a pod was created but never became ready, the message says so,
+/// with the last one's reason. `detail` is the last capacity or 403 answer, as
+/// the client's fixed message: a request Runpod rejected for any other reason
+/// stopped the walk at once instead.
+fn no_capacity(tried: &[Attempt], detail: Option<String>, volume: bool) -> PodError {
+    let not_ready: Vec<&Attempt> = tried
+        .iter()
+        .filter(|attempt| attempt.result == AttemptResult::NotReady)
+        .collect();
+    let mut message = match not_ready.last() {
+        None => match detail {
+            Some(detail) => format!("no gpu_types entry could be placed: {detail}"),
+            None => "no gpu_types entry could be placed".to_string(),
+        },
+        Some(last) => {
+            let pods = match not_ready.len() {
+                1 => "1 pod was".to_string(),
+                count => format!("{count} pods were"),
+            };
+            let because = last.detail.as_deref().map_or_else(String::new, |reason| {
+                format!(", the last one because {reason}")
+            });
+            let mut message = format!(
+                "no gpu_types entry gave a ready pod: {pods} created but never became ready{because}"
+            );
+            if let Some(detail) = detail {
+                message = format!("{message}; the other types could not be placed: {detail}");
+            }
+            message
+        },
+    };
     if volume {
         message = format!("{message} (check network_volume_id and data_center_ids)");
     }
@@ -452,23 +478,37 @@ fn saved_then_removed(
     }
 }
 
-/// Deletes a pod whose watchdog cannot delete it, and returns the refusal.
+/// Deletes a pod whose watchdog refused it (it cannot delete it, or the pod's
+/// bootstrap failed), and returns the refusal.
 async fn refuse(ctx: &PodCtx<'_>, record: &mut PodRecord, id: &PodId, reason: String) -> PodError {
     record.end_attempt(AttemptResult::Refused, Some(reason.clone()));
     let saved = record.save(ctx.runs);
-    let removed = remove(ctx, record, DeleteReason::Refused, DeletedBy::Client).await;
+    let (delete_reason, refusal) = refusal(id, reason);
+    let removed = remove(ctx, record, delete_reason, DeletedBy::Client).await;
     if let Err(error) = saved_then_removed(saved, removed) {
         return error;
     }
+    refusal
+}
+
+/// Why the pod `id`, refused by its watchdog's verdict `failed <reason>`, is
+/// deleted, and the error that refuses the run.
+fn refusal(id: &PodId, reason: String) -> (DeleteReason, PodError) {
     match reason.strip_prefix(BOOTSTRAP_FAILED) {
-        Some(bootstrap) => PodError::BootstrapFailed {
-            pod_id: id.clone(),
-            reason: bootstrap.to_string(),
-        },
-        None => PodError::WatchdogRefused {
-            pod_id: id.clone(),
-            reason,
-        },
+        Some(bootstrap) => (
+            DeleteReason::BootstrapFailed,
+            PodError::BootstrapFailed {
+                pod_id: id.clone(),
+                reason: bootstrap.to_string(),
+            },
+        ),
+        None => (
+            DeleteReason::Refused,
+            PodError::WatchdogRefused {
+                pod_id: id.clone(),
+                reason,
+            },
+        ),
     }
 }
 
@@ -832,5 +872,18 @@ mod tests {
         assert_eq!(one_line("failed caf\u{e9}"), "failed caf");
         let long = format!("failed {}", "x".repeat(5000));
         assert_eq!(one_line(&long).len(), VERDICT_CHARS);
+    }
+
+    #[test]
+    fn a_failed_bootstrap_has_its_own_delete_reason() -> Result<(), String> {
+        let id = PodId::new("p1")?;
+        let (reason, error) = refusal(&id, "bootstrap: cannot start sshd".to_string());
+        assert_eq!(reason, DeleteReason::BootstrapFailed);
+        assert_eq!(reason.describe(), "its bootstrap failed");
+        assert!(matches!(error, PodError::BootstrapFailed { .. }), "{error}");
+        let (reason, error) = refusal(&id, "http_403".to_string());
+        assert_eq!(reason, DeleteReason::Refused);
+        assert!(matches!(error, PodError::WatchdogRefused { .. }), "{error}");
+        Ok(())
     }
 }

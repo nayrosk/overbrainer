@@ -79,7 +79,8 @@ pub enum PodError {
     /// A run record cannot be read or written.
     #[error(transparent)]
     Runs(#[from] crate::runs::RunsError),
-    /// Every GPU type of the target was unavailable.
+    /// No GPU type of the target gave a ready pod: none could be placed, or the
+    /// pods created never became ready.
     #[error("{0}")]
     NoCapacity(String),
     /// Runpod asks for credits (402).
@@ -159,7 +160,17 @@ pub enum PodError {
         "run {0} is not in this project's runs/: its pods may belong to another checkout; if none owns it, pass --force"
     )]
     NotInRuns(String),
-    /// The pod exists but offers no SSH endpoint.
+    /// The pod exists but offers no SSH endpoint yet.
     #[error("pod {0} has no SSH endpoint (status {1}); try again once it runs")]
     NoEndpoint(PodId, String),
+    /// The pod is stopped (`EXITED`), and will not run again by itself.
+    #[error(
+        "pod {pod_id} is stopped and will not run again by itself; remove it with `overbrainer pod rm {run_id}`"
+    )]
+    PodStopped {
+        /// The pod.
+        pod_id: PodId,
+        /// Its run.
+        run_id: String,
+    },
 }
