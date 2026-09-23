@@ -793,3 +793,83 @@ fn the_client_debug_output_hides_the_key() -> TestResult {
     ));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_gpu_list_price_is_read_from_the_catalog() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus/NVIDIA%20GeForce%20RTX%204090"))
+        .and(header("authorization", format!("Bearer {KEY}").as_str()))
+        .and(header("user-agent", USER_AGENT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "NVIDIA GeForce RTX 4090",
+            "memory": 24,
+            "price": {"community": 0.34, "secure": 0.74, "serverless": 1.1}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let price = client(&server)?
+        .gpu_list_price("NVIDIA GeForce RTX 4090")
+        .await?;
+    assert_eq!(price, Some(0.74));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_gpu_without_a_secure_list_price_has_none() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus/A"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": "A", "price": {"community": 0.3}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus/B"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "B"})))
+        .mount(&server)
+        .await;
+    let client = client(&server)?;
+    assert_eq!(client.gpu_list_price("A").await?, None);
+    assert_eq!(client.gpu_list_price("B").await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_catalog_read_shows_neither_the_key_nor_the_body() -> TestResult {
+    let server = MockServer::start().await;
+    let body = format!("{{\"detail\": \"unknown gpu, key {KEY}, BODY-TEXT\"}}");
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus/missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(body.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus/down"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(body))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let client = client(&server)?;
+    for (gpu, status) in [("missing", 404), ("down", 503)] {
+        let Err(error) = client.gpu_list_price(gpu).await else {
+            return Err(format!("{gpu}: a failed read gave a price").into());
+        };
+        assert_eq!(error.status(), Some(status));
+        let text = format!("{error} {error:?}");
+        assert!(!text.contains(KEY) && !text.contains("BODY-TEXT"), "{text}");
+        assert_eq!(
+            error.to_string(),
+            format!("Runpod answered {status}: cannot read the GPU catalog")
+        );
+    }
+    let Err(error) = client.gpu_list_price("../pods").await else {
+        return Err("an unmocked path gave a price".into());
+    };
+    assert_eq!(error.status(), Some(404));
+    Ok(())
+}

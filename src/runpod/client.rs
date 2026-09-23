@@ -7,6 +7,7 @@ use std::time::Duration;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::{Method, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use super::types::{CreatePod, Pagination, Pod, PodId, PodPage};
@@ -64,6 +65,22 @@ const INVALID_CREATE_ANSWER_MESSAGE: &str = "Runpod's answer to the create call 
 /// A non-create call succeeded (2xx) but its body was not the shape overbrainer
 /// expected. Followed only by serde's error category and position.
 const INVALID_ANSWER_MESSAGE: &str = "Runpod's answer does not have the expected shape";
+/// A GPU catalog read failed: its answer's text is never shown.
+const CATALOG_MESSAGE: &str = "cannot read the GPU catalog";
+
+/// The part of `GET /catalog/gpus/{id}` overbrainer reads.
+#[derive(Debug, Deserialize)]
+struct GpuType {
+    #[serde(default)]
+    price: Option<GpuPrice>,
+}
+
+/// List prices of one GPU, in USD per hour.
+#[derive(Debug, Deserialize)]
+struct GpuPrice {
+    #[serde(default)]
+    secure: Option<f64>,
+}
 
 /// Errors of the Runpod API. No variant ever holds the API key or a pod's host
 /// key. A create call's error never holds any text from Runpod's answer either,
@@ -369,6 +386,43 @@ impl RunpodClient {
                     return Ok(false);
                 }
                 Err(self.status_error(status, &body, retry_after, false))
+            },
+            log_retry,
+        )
+        .await
+    }
+
+    /// The Secure Cloud list price of one GPU of type `gpu_id`, in USD per hour,
+    /// from the catalog (`GET /catalog/gpus/{id}`); `None` when the catalog gives
+    /// none. A pod's real rate is only known once it exists: this is the price
+    /// before any pod is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer. A
+    /// failed answer's message is fixed: no text from Runpod is shown.
+    pub async fn gpu_list_price(&self, gpu_id: &str) -> Result<Option<f64>, ApiError> {
+        let mut url = reqwest::Url::parse(&self.url("catalog/gpus"))
+            .map_err(|error| ApiError::InvalidResponse(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|()| ApiError::InvalidResponse("invalid base URL".to_string()))?
+            .push(gpu_id);
+        with_retry(
+            &self.policy,
+            || async {
+                let (status, body, retry_after) = self
+                    .fetch(self.http.request(Method::GET, url.clone()))
+                    .await?;
+                if !status.is_success() {
+                    return Err(ApiError::Status {
+                        status: status.as_u16(),
+                        message: CATALOG_MESSAGE.to_string(),
+                        retry_after,
+                        capacity: false,
+                    });
+                }
+                let gpu: GpuType = decode(&body, false)?;
+                Ok(gpu.price.and_then(|price| price.secure))
             },
             log_retry,
         )
