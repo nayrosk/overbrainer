@@ -18,6 +18,9 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const KEY: &str = "rp_cli_train_key_7731";
+/// The `PATH` of every `overbrainer` these tests run, and where
+/// [`keygen_available`] looks for `ssh-keygen`.
+const CHILD_PATH: &str = "/usr/bin:/bin";
 const RUN: &str = "20260922-143005-a1b2";
 const ENDED: &str = "20260921-090000-ffff";
 
@@ -64,7 +67,7 @@ fn overbrainer(dir: &Path, server: &MockServer) -> Result<Command, Box<dyn std::
     cmd.env_clear()
         .env("NO_COLOR", "1")
         .env("HOME", "/nonexistent")
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", CHILD_PATH)
         .env("OVERBRAINER_RUNPOD__API_KEY", KEY)
         .env(
             "OVERBRAINER_RUNPOD__BASE_URL",
@@ -79,15 +82,11 @@ async fn output(mut cmd: Command) -> Result<Output, Box<dyn std::error::Error>> 
     Ok(tokio::task::spawn_blocking(move || cmd.output()).await??)
 }
 
+/// Whether `ssh-keygen` is on [`CHILD_PATH`], where `overbrainer` looks for it.
 fn keygen_available() -> bool {
-    let available = std::process::Command::new("ssh-keygen")
-        .arg("-?")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok();
+    let available = std::env::split_paths(CHILD_PATH).any(|dir| dir.join("ssh-keygen").is_file());
     if !available {
-        eprintln!("skipped: ssh-keygen is not installed");
+        eprintln!("skipped: ssh-keygen is not in {CHILD_PATH}");
     }
     available
 }
@@ -405,7 +404,7 @@ async fn ctrl_c_while_the_pod_starts_deletes_it_and_fails_the_run() -> TestResul
     cmd.env_clear()
         .env("NO_COLOR", "1")
         .env("HOME", "/nonexistent")
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", CHILD_PATH)
         .env("OVERBRAINER_RUNPOD__API_KEY", KEY)
         .env(
             "OVERBRAINER_RUNPOD__BASE_URL",
