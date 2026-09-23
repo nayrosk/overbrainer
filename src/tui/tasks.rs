@@ -82,3 +82,53 @@ impl Tasks {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::dataset::rewrite;
+    use crate::tui::snapshots::dataset;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const LIMIT: Duration = Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn a_load_reads_the_data_files_and_ends_with_its_id() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let files = DataFiles::new(dir.path());
+        rewrite(&files.subtopics, &dataset().subtopics)?;
+        let mut tasks = Tasks::new(dir.path());
+        assert!(tasks.is_empty());
+        tasks.spawn(TaskId(7), Task::Load);
+        assert!(!tasks.is_empty());
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        let Some((TaskId(7), Ok(Done::Loaded(Ok(data))))) = next else {
+            return Err(format!("unexpected end: {next:?}").into());
+        };
+        assert_eq!(data.subtopics.len(), 3);
+        assert!(tasks.is_empty());
+        assert!(tasks.next().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_load_of_a_broken_file_ends_with_its_error() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let files = DataFiles::new(dir.path());
+        if let Some(parent) = files.answers.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&files.answers, "not json\n")?;
+        let mut tasks = Tasks::new(dir.path());
+        tasks.spawn(TaskId(1), Task::Load);
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        let Some((TaskId(1), Ok(Done::Loaded(Err(error))))) = next else {
+            return Err(format!("unexpected end: {next:?}").into());
+        };
+        assert!(error.contains("answers.jsonl"), "{error}");
+        Ok(())
+    }
+}

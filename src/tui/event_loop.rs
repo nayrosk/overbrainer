@@ -175,14 +175,13 @@ mod tests {
         let mut app = app();
         app.project.dir = dir.path().to_path_buf();
         let (events, input) = mpsc::unbounded_channel();
-        let run = drive(&mut terminal, &mut app, input, None);
-        let quit = async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            events.send(Ok(key(KeyCode::Char('q'))))
-        };
-        let (ran, sent) = tokio::time::timeout(LIMIT, async { tokio::join!(run, quit) }).await?;
-        ran?;
-        sent?;
+        // No key ends the loop, so it cannot quit before the load ends: it runs
+        // for a window far longer than a read of three records, then is dropped.
+        let window = Duration::from_secs(2);
+        let run = tokio::time::timeout(window, drive(&mut terminal, &mut app, input, None)).await;
+        assert!(run.is_err(), "the loop ended on its own: {run:?}");
+        drop(events);
+        assert_eq!(app.load, None, "the load ended");
         let subtopics = app
             .dataset
             .model

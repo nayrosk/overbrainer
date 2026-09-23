@@ -201,6 +201,9 @@ pub(super) struct App {
     pub(super) log_view: LogView,
     /// The load of the data files running, if any.
     pub(super) load: Option<TaskId>,
+    /// Whether a reload was asked for while a load ran: it starts once that load
+    /// ends, so it reads what changed meanwhile.
+    reload_pending: bool,
     next_task: u64,
     /// Whether something changed since the last draw.
     pub(super) dirty: bool,
@@ -224,6 +227,7 @@ impl App {
             now,
             dataset: DatasetView::default(),
             load: None,
+            reload_pending: false,
             next_task: 0,
             log_view: LogView {
                 min: Level::INFO,
@@ -256,9 +260,10 @@ impl App {
         TaskId(self.next_task)
     }
 
-    /// Reloads the data files, unless a load already runs.
+    /// Reloads the data files; while a load runs, one more starts when it ends.
     fn reload(&mut self) -> Vec<Effect> {
         if self.load.is_some() {
+            self.reload_pending = true;
             return Vec::new();
         }
         let id = self.task_id();
@@ -276,24 +281,41 @@ impl App {
     }
 
     /// Handles the end of task `id`: what it gave back, or how it failed.
+    /// A load's result is used only when `id` is the load running; a reload asked
+    /// for meanwhile starts then.
     pub(super) fn on_done(&mut self, id: TaskId, result: Result<Done, String>) -> Vec<Effect> {
-        if self.load == Some(id) {
-            self.load = None;
-        }
         self.dirty = true;
+        let is_load = self.load == Some(id);
         match result {
-            Ok(Done::Loaded(Ok(data))) => self.dataset.loaded(data, &self.project.topics),
-            Ok(Done::Loaded(Err(error))) => {
-                self.dataset.model = None;
-                self.dataset.error = Some(error.clone());
-                self.say(Severity::Error, error);
+            Ok(Done::Loaded(_)) if !is_load => return Vec::new(),
+            Ok(Done::Loaded(loaded)) => {
+                self.load = None;
+                match loaded {
+                    Ok(data) => self.dataset.loaded(data, &self.project.topics),
+                    Err(error) => self.load_failed(error),
+                }
             },
             Err(error) => {
                 tracing::error!("{error}");
-                self.say(Severity::Error, error);
+                if is_load {
+                    self.load = None;
+                    self.load_failed(error);
+                } else {
+                    self.say(Severity::Error, error);
+                }
             },
         }
+        if self.load.is_none() && std::mem::take(&mut self.reload_pending) {
+            return self.reload();
+        }
         Vec::new()
+    }
+
+    /// Shows why the data could not be loaded, in the view and on the status line.
+    fn load_failed(&mut self, error: String) {
+        self.dataset.model = None;
+        self.dataset.error = Some(error.clone());
+        self.say(Severity::Error, error);
     }
 
     /// Handles one terminal event.
@@ -317,7 +339,9 @@ impl App {
             return Vec::new();
         }
         if self.view == View::Dataset && self.dataset.input.is_some() {
-            self.on_filter_key(key.code);
+            if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+                self.on_filter_key(key.code);
+            }
             return Vec::new();
         }
         if key.code == KeyCode::Char('q') {
@@ -368,6 +392,7 @@ impl App {
             KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(PAGE),
             KeyCode::Char('s') => view.stats = !view.stats,
             KeyCode::Char('/') => view.input = Some(view.filter.clone()),
+            KeyCode::Esc if !view.filter.is_empty() => view.apply_filter(String::new()),
             _ => {},
         }
     }
@@ -486,7 +511,9 @@ mod tests {
     use crate::dataset::Id;
     use crate::logging::LogLine;
     use crate::tui::dataset::Node;
-    use crate::tui::snapshots::{NOW, app, at, ctrl_c, dataset_app, draw, key, text};
+    use crate::tui::snapshots::{
+        MOVED, NOW, app, at, ctrl_c, dataset, dataset_app, draw, key, open_to, path_to, text,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -762,21 +789,127 @@ mod tests {
         assert_eq!(app.exit, Some(Exit::Quit));
     }
 
+    /// The one load in `effects`.
+    fn only_load(effects: &[Effect]) -> Result<TaskId, String> {
+        match effects {
+            [Effect::Spawn(id, Task::Load)] => Ok(*id),
+            other => Err(format!("expected one load, got {other:?}")),
+        }
+    }
+
     #[test]
-    fn a_reload_runs_once_at_a_time_and_a_failed_task_is_shown() {
+    fn a_failed_load_task_is_shown_in_the_view_and_frees_the_load() -> TestResult {
         let mut app = app();
-        let effects = app.start();
-        let Some(Effect::Spawn(id, Task::Load)) = effects.first().cloned() else {
-            return assert_eq!(effects, []);
-        };
-        assert_eq!(press(&mut app, &[KeyCode::Char('R')]), []);
+        let id = only_load(&app.start())?;
         assert_eq!(app.work(), ["loading"]);
-        app.on_done(id, Err("a background task failed: task 1 panicked".into()));
+        let error = "a background task failed: task 1 panicked";
+        assert_eq!(app.on_done(id, Err(error.into())), []);
         assert_eq!(app.load, None);
+        assert_eq!(app.dataset.error.as_deref(), Some(error));
         assert_eq!(
             app.status.as_ref().map(|s| s.severity),
             Some(Severity::Error)
         );
-        assert_eq!(press(&mut app, &[KeyCode::Char('R')]).len(), 1);
+        only_load(&press(&mut app, &[KeyCode::Char('R')]))?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_reload_asked_for_during_a_load_starts_once_it_ends() -> TestResult {
+        let mut app = app();
+        let first = only_load(&app.start())?;
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('R'), KeyCode::Char('R')]),
+            []
+        );
+        let second = only_load(&app.on_done(first, Ok(Done::Loaded(Ok(dataset())))))?;
+        assert_ne!(second, first);
+        assert_eq!(app.load, Some(second));
+        assert!(app.dataset.model.is_some(), "the first load is shown");
+        assert_eq!(app.on_done(second, Ok(Done::Loaded(Ok(dataset())))), []);
+        assert_eq!(app.load, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_that_is_not_the_current_one_is_ignored() -> TestResult {
+        let mut app = app();
+        let id = only_load(&app.start())?;
+        let stale = TaskId(id.0 + 100);
+        assert_eq!(app.on_done(stale, Ok(Done::Loaded(Ok(dataset())))), []);
+        assert!(app.dataset.model.is_none());
+        assert_eq!(app.load, Some(id));
+        app.on_done(
+            id,
+            Ok(Done::Loaded(Err("data/answers.jsonl:1: bad".into()))),
+        );
+        assert_eq!(
+            app.dataset.error.as_deref(),
+            Some("data/answers.jsonl:1: bad")
+        );
+        assert_eq!(app.load, None);
+        Ok(())
+    }
+
+    #[test]
+    fn esc_clears_an_applied_filter() {
+        let mut app = dataset_app();
+        press(
+            &mut app,
+            &[
+                KeyCode::Char('/'),
+                KeyCode::Char('n'),
+                KeyCode::Char('l'),
+                KeyCode::Char('l'),
+                KeyCode::Enter,
+            ],
+        );
+        assert_eq!(app.dataset.filter, "nll");
+        assert_eq!(app.dataset.model.as_ref().and_then(|m| m.matches), Some(1));
+        press(&mut app, &[KeyCode::Esc]);
+        assert_eq!(app.dataset.filter, "");
+        assert_eq!(app.dataset.model.as_ref().and_then(|m| m.matches), None);
+    }
+
+    #[test]
+    fn the_filter_ignores_ctrl_and_alt_keys_but_takes_shifted_ones() {
+        let mut app = dataset_app();
+        let with = |code, modifiers| Event::Key(KeyEvent::new(KeyCode::Char(code), modifiers));
+        press(&mut app, &[KeyCode::Char('/')]);
+        app.on_input(&with('x', KeyModifiers::CONTROL));
+        app.on_input(&with('y', KeyModifiers::ALT));
+        app.on_input(&with('N', KeyModifiers::SHIFT));
+        press(&mut app, &[KeyCode::Char('l'), KeyCode::Enter]);
+        assert_eq!(app.dataset.filter, "Nl");
+        assert_eq!(app.exit, None);
+    }
+
+    #[test]
+    fn the_detail_scroll_is_clamped_to_the_text() -> TestResult {
+        let mut app = dataset_app();
+        open_to(&mut app, &path_to(MOVED, true));
+        app.dataset.scroll = 1000;
+        let rows = text(&draw(&mut app, 120, 40)?);
+        assert_eq!(app.dataset.scroll, 0, "14 lines fit in 38 rows");
+        assert!(rows.iter().any(|row| row.contains("model deepseek-r1")));
+        let rows = text(&draw(&mut app, 80, 24)?);
+        assert_eq!(app.dataset.scroll, 0, "18 lines fit in 20 rows");
+        assert!(rows.iter().any(|row| row.contains("model deepseek-r1")));
+        Ok(())
+    }
+
+    #[test]
+    fn the_stats_pane_shows_all_topics_when_no_topic_is_selected() -> TestResult {
+        let mut app = dataset_app();
+        app.dataset.stats = true;
+        app.dataset.tree.select(Vec::new());
+        let rows = text(&draw(&mut app, 80, 24)?);
+        let title = rows.get(1).cloned().unwrap_or_default();
+        assert!(title.contains("stats: all topics"), "{title}");
+        assert!(
+            rows.iter().any(|row| row.contains("answers          5 ")),
+            "{rows:#?}"
+        );
+        Ok(())
     }
 }

@@ -11,9 +11,9 @@ use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
 use tracing::Level;
 
-use super::app::{App, Overlay, Project, View};
+use super::app::{App, Effect, Overlay, Project, View};
 use super::dataset::{Node, TopicInfo};
-use super::tasks::{Done, TaskId};
+use super::tasks::Done;
 use super::theme::Theme;
 use super::ui;
 use crate::dataset::{
@@ -457,7 +457,10 @@ fn dataset_with_missing_subtopic_and_unconfigured_topic() -> TestResult {
 fn dataset_load_error() -> TestResult {
     let mut app = app();
     let error = "data/answers.jsonl:3: invalid record: expected value at line 1 column 2";
-    app.on_done(TaskId(1), Ok(Done::Loaded(Err(error.into()))));
+    let Some(Effect::Spawn(id, _)) = app.start().first().cloned() else {
+        return Err("no load started".into());
+    };
+    app.on_done(id, Ok(Done::Loaded(Err(error.into()))));
     app.status = None;
     snapshot("dataset_error", &mut app)?;
     Ok(())
