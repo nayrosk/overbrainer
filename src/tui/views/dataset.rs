@@ -70,7 +70,6 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             Some(Node::Topic(topic) | Node::MissingSubtopic(topic)) => Some(topic.clone()),
             _ => None,
         };
-        let topic = topic.or_else(|| model.topics.first().cloned());
         render_stats(frame, right, app, topic.as_deref());
     } else {
         render_detail(frame, right, app);
@@ -207,16 +206,14 @@ fn topic_detail(
 }
 
 fn question_detail(model: &Model, id: &Id, theme: &Theme) -> Vec<Line<'static>> {
-    let Some(question) = model.data.questions.iter().find(|q| &q.id == id) else {
+    let Some(question) = model.question(id) else {
         return Vec::new();
     };
-    let status = match model.answer(id) {
+    let status = match model.class(id) {
         None => "unanswered".to_string(),
-        Some(example) => match model.class(example) {
-            SplitClass::Usable => "answered, usable".to_string(),
-            SplitClass::Excluded(reason) => format!("answered, excluded: {}", exclusion(reason)),
-            SplitClass::Orphaned => "answered, orphaned".to_string(),
-        },
+        Some(SplitClass::Usable) => "answered, usable".to_string(),
+        Some(SplitClass::Excluded(reason)) => format!("answered, excluded: {}", exclusion(reason)),
+        Some(SplitClass::Orphaned) => "answered, orphaned".to_string(),
     };
     let mut lines: Vec<Line<'static>> = question
         .text
@@ -233,10 +230,10 @@ fn question_detail(model: &Model, id: &Id, theme: &Theme) -> Vec<Line<'static>> 
 
 fn answer_detail(model: &Model, example: &Example, theme: &Theme) -> Vec<Line<'static>> {
     let meta = &example.meta;
-    let excluded = match model.class(example) {
-        SplitClass::Excluded(reason) => format!("  excluded: {}", exclusion(reason)),
-        SplitClass::Orphaned => "  orphaned".to_string(),
-        SplitClass::Usable => String::new(),
+    let excluded = match model.class(&example.id) {
+        Some(SplitClass::Excluded(reason)) => format!("  excluded: {}", exclusion(reason)),
+        Some(SplitClass::Orphaned) => "  orphaned".to_string(),
+        Some(SplitClass::Usable) | None => String::new(),
     };
     let mut lines = vec![
         Line::from(Span::styled(
