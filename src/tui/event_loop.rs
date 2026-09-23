@@ -1,7 +1,9 @@
-//! The event loop: one task selecting over terminal input, background tasks,
-//! process signals and a clock tick, drawing the app when it changed.
+//! The event loop: one task selecting over terminal input, background tasks and
+//! their messages, process signals and a clock tick, drawing the app when it
+//! changed. It owns the terminal and runs the effects the app asks for.
 
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
@@ -9,12 +11,12 @@ use crossterm::event::Event as TermEvent;
 use ratatui::backend::Backend;
 use ratatui::{DefaultTerminal, Terminal};
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use super::app::{App, Effect, Exit};
-use super::tasks::Tasks;
-use super::terminal::InputTask;
+use super::tasks::{Done, Msg, TaskId, Tasks};
+use super::terminal::Screen;
 use super::ui;
 
 /// Time between two ticks of the app's clock.
@@ -22,35 +24,45 @@ const TICK: Duration = Duration::from_millis(250);
 /// Shortest time between two draws.
 const FRAME: Duration = Duration::from_millis(33);
 
+/// What the real terminal adds to the loop: process signals, and the screen the
+/// editor borrows.
+pub(super) struct Real {
+    signals: Signals,
+    screen: Screen,
+}
+
 /// Runs the TUI on the real terminal until the app is done.
 ///
 /// # Errors
 ///
 /// Returns an error when drawing fails, the terminal cannot be read, the signals
-/// cannot be caught, or a process signal ended the TUI.
+/// cannot be caught, the terminal cannot be handed to the editor and back, or a
+/// process signal ended the TUI.
 pub(super) async fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
     let signals = Signals::new().context("cannot catch the process signals")?;
     let (events, input) = mpsc::unbounded_channel();
-    let reader = InputTask::start(events);
-    let result = drive(terminal, app, input, Some(signals)).await;
-    reader.stop().await;
-    result
+    let real = Real {
+        signals,
+        screen: Screen::start(events),
+    };
+    drive(terminal, app, input, Some(real)).await
 }
 
-/// The loop itself, on any backend, reading terminal events from `input` and the
-/// process signals from `signals` when given. A read error on `input` ends the
-/// loop with that error; `input` closing quits. It starts the app's background
-/// tasks, and hands each one's end back to the app.
+/// The loop itself, on any backend, reading terminal events from `input`; with
+/// `real`, also the process signals, and the editor gets the terminal. A read
+/// error on `input` ends the loop with that error; `input` closing quits. It
+/// starts the app's background tasks, and hands each one's end back to the app.
 ///
 /// # Errors
 ///
-/// Returns an error when drawing fails, the terminal cannot be read, or a
-/// process signal ended the TUI.
+/// Returns an error when drawing fails, the terminal cannot be read, the
+/// terminal cannot be handed to the editor and back, or a process signal ended
+/// the TUI.
 pub(super) async fn drive<B>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    mut input: UnboundedReceiver<io::Result<TermEvent>>,
-    mut signals: Option<Signals>,
+    input: UnboundedReceiver<io::Result<TermEvent>>,
+    real: Option<Real>,
 ) -> anyhow::Result<()>
 where
     B: Backend,
@@ -58,40 +70,173 @@ where
 {
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut tasks = Tasks::new(&app.project.dir);
-    let mut last_draw: Option<Instant> = None;
-    let mut effects = app.start();
-    loop {
-        for effect in effects.drain(..) {
-            match effect {
-                Effect::Spawn(id, task) => tasks.spawn(id, task),
+    let (messages, inbox) = mpsc::unbounded_channel();
+    let mut looping = Loop {
+        terminal,
+        input,
+        tasks: Tasks::new(&app.project.dir),
+        messages,
+        inbox,
+        tick,
+        real,
+        suspended: false,
+        last_draw: None,
+    };
+    let result = looping.run(app).await;
+    if let Some(real) = looping.real {
+        real.screen.stop().await;
+    }
+    result
+}
+
+/// What woke the loop.
+enum Wake {
+    Input(Option<io::Result<TermEvent>>),
+    Message(Msg),
+    Done(TaskId, Result<Done, String>),
+    Signal,
+    Tick,
+    Draw,
+}
+
+struct Loop<'t, B: Backend> {
+    terminal: &'t mut Terminal<B>,
+    input: UnboundedReceiver<io::Result<TermEvent>>,
+    tasks: Tasks,
+    messages: UnboundedSender<Msg>,
+    inbox: UnboundedReceiver<Msg>,
+    tick: Interval,
+    real: Option<Real>,
+    /// Whether the editor has the terminal: no input is read, nothing is drawn.
+    suspended: bool,
+    last_draw: Option<Instant>,
+}
+
+impl<B> Loop<'_, B>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+{
+    async fn run(&mut self, app: &mut App) -> anyhow::Result<()> {
+        let mut effects = app.start();
+        loop {
+            for effect in effects {
+                self.apply(effect).await?;
             }
-        }
-        let next_draw = last_draw.map_or_else(Instant::now, |at| at + FRAME);
-        tokio::select! {
-            event = input.recv() => match event {
-                Some(Ok(event)) => effects = app.on_input(&event),
-                Some(Err(error)) => {
+            effects = match self.wait(app).await {
+                Wake::Input(Some(Ok(event))) => app.on_input(&event),
+                Wake::Input(Some(Err(error))) => {
                     return Err(anyhow::Error::new(error).context("cannot read the terminal"));
                 },
-                None => app.exit = Some(Exit::Quit),
-            },
-            Some((id, result)) = tasks.next(), if !tasks.is_empty() => {
-                effects = app.on_done(id, result);
-            },
-            () = Signals::recv(signals.as_mut()) => app.on_signal(),
-            _ = tick.tick() => app.on_tick(SystemTime::now()),
-            () = tokio::time::sleep_until(next_draw), if app.dirty => {},
+                Wake::Input(None) => {
+                    app.exit = Some(Exit::Quit);
+                    Vec::new()
+                },
+                Wake::Message(message) => self.on_message(app, message)?,
+                Wake::Done(id, result) => app.on_done(id, result),
+                Wake::Signal => {
+                    app.on_signal();
+                    Vec::new()
+                },
+                Wake::Tick => {
+                    app.on_tick(SystemTime::now());
+                    Vec::new()
+                },
+                Wake::Draw => Vec::new(),
+            };
+            self.draw(app)?;
+            match app.exit {
+                Some(Exit::Quit) => return Ok(()),
+                Some(Exit::Signal) => anyhow::bail!("interrupted by signal"),
+                None => {},
+            }
         }
-        if app.dirty && Instant::now() >= next_draw {
-            terminal.draw(|frame| ui::render(frame, app))?;
+    }
+
+    /// The next thing that happens.
+    async fn wait(&mut self, app: &App) -> Wake {
+        let next_draw = self.next_draw();
+        let draw = app.dirty && !self.suspended;
+        let signals = self.real.as_mut().map(|real| &mut real.signals);
+        tokio::select! {
+            event = self.input.recv(), if !self.suspended => Wake::Input(event),
+            Some(message) = self.inbox.recv() => Wake::Message(message),
+            Some((id, result)) = self.tasks.next(), if !self.tasks.is_empty() => {
+                Wake::Done(id, result)
+            },
+            () = Signals::recv(signals) => Wake::Signal,
+            _ = self.tick.tick() => Wake::Tick,
+            () = tokio::time::sleep_until(next_draw), if draw => Wake::Draw,
+        }
+    }
+
+    fn next_draw(&self) -> Instant {
+        self.last_draw.map_or_else(Instant::now, |at| at + FRAME)
+    }
+
+    fn draw(&mut self, app: &mut App) -> anyhow::Result<()> {
+        if app.dirty && !self.suspended && Instant::now() >= self.next_draw() {
+            self.terminal.draw(|frame| ui::render(frame, app))?;
             app.dirty = false;
-            last_draw = Some(Instant::now());
+            self.last_draw = Some(Instant::now());
         }
-        match app.exit {
-            Some(Exit::Quit) => return Ok(()),
-            Some(Exit::Signal) => anyhow::bail!("interrupted by signal"),
-            None => {},
+        Ok(())
+    }
+
+    async fn apply(&mut self, effect: Effect) -> anyhow::Result<()> {
+        match effect {
+            Effect::Spawn(id, task) => self.tasks.spawn(id, task),
+            Effect::OpenEditor { command, path } => self.open_editor(command, path).await?,
+        }
+        Ok(())
+    }
+
+    /// Hands the terminal to the editor: stops reading input and leaves the
+    /// alternate screen, then runs the editor as a task whose end comes back as
+    /// [`Msg::EditorExited`]. Messages and tasks keep being handled meanwhile.
+    ///
+    /// The editor is started without a shell: its first word is the program, the
+    /// others and the file its arguments.
+    async fn open_editor(&mut self, command: Vec<String>, path: PathBuf) -> anyhow::Result<()> {
+        if let Some(real) = &mut self.real {
+            real.screen
+                .suspend()
+                .await
+                .context("cannot hand the terminal to the editor")?;
+        }
+        self.suspended = true;
+        let messages = self.messages.clone();
+        tokio::spawn(async move {
+            let status = match command.split_first() {
+                Some((program, args)) => {
+                    tokio::process::Command::new(program)
+                        .args(args)
+                        .arg(&path)
+                        .status()
+                        .await
+                },
+                None => Err(io::Error::other("no editor command")),
+            };
+            messages.send(Msg::EditorExited(status)).ok();
+        });
+        Ok(())
+    }
+
+    /// The editor ended: takes the terminal back, repaints it all, then lets the
+    /// app check the edited file.
+    fn on_message(&mut self, app: &mut App, message: Msg) -> anyhow::Result<Vec<Effect>> {
+        match message {
+            Msg::EditorExited(status) => {
+                if let Some(real) = &mut self.real {
+                    real.screen
+                        .resume()
+                        .context("cannot take the terminal back from the editor")?;
+                }
+                self.terminal.clear()?;
+                self.suspended = false;
+                app.dirty = true;
+                Ok(app.on_editor_exit(status))
+            },
         }
     }
 }
@@ -206,6 +351,56 @@ mod tests {
             error.as_deref(),
             Some("cannot read the terminal: the terminal is gone")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_editor_round_trip_saves_the_edit() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = crate::tui::snapshots::project()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut app = app();
+        app.project.dir = dir.path().to_path_buf();
+        app.project.topics = crate::tui::snapshots::topics();
+        app.editor = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf 'When does a borrow end?' > \"$1\"".into(),
+            "editor".into(),
+        ];
+        let (events, input) = mpsc::unbounded_channel();
+        let run = drive(&mut terminal, &mut app, input, None);
+        let files = crate::dataset::DataFiles::new(dir.path());
+        let keys = [
+            KeyCode::Enter,
+            KeyCode::Char('j'),
+            KeyCode::Char('l'),
+            KeyCode::Char('j'),
+            KeyCode::Char('j'),
+            KeyCode::Char('j'),
+            KeyCode::Char('e'),
+        ];
+        let quit = async {
+            // The data is loaded by then.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            for code in keys {
+                events.send(Ok(key(code)))?;
+            }
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if files.train.exists() {
+                    break;
+                }
+            }
+            events.send(Ok(key(KeyCode::Char('q'))))
+        };
+        let (ran, sent) = tokio::time::timeout(LIMIT, async { tokio::join!(run, quit) }).await?;
+        ran?;
+        sent?;
+        let questions: Vec<crate::dataset::Question> = crate::dataset::read(&files.questions)?;
+        let texts: Vec<&str> = questions.iter().map(|q| q.text.as_str()).collect();
+        assert!(texts.contains(&"When does a borrow end?"), "{texts:?}");
+        assert!(!texts.contains(&"When does NLL end a borrow?"));
+        assert!(app.exit_notes.is_empty());
         Ok(())
     }
 }

@@ -25,7 +25,7 @@ const fn row(keys: &'static str, action: &'static str) -> KeyHelp {
 /// Keys that work in every view.
 pub(super) const GLOBAL: &[KeyHelp] = &[
     row("1 2 3 4, Tab, Shift-Tab", "switch view"),
-    row("?", "this help (Esc or ? closes it)"),
+    row("?", "this help (Esc, ? or q closes it)"),
     row("q, Ctrl-C", "quit"),
     row("R", "reload the data files"),
 ];
@@ -36,6 +36,9 @@ const DATASET: &[KeyHelp] = &[
     row("PgUp PgDn", "scroll the detail pane"),
     row("/", "filter the tree (Enter keeps, Esc clears)"),
     row("s", "stats pane"),
+    row("e", "edit in $EDITOR (question, answer, subtopic)"),
+    row("d", "delete, with what depends on it (asks first)"),
+    row("y, n Esc", "in a dialog: confirm, cancel (default: no)"),
 ];
 
 const LOGS: &[KeyHelp] = &[

@@ -22,6 +22,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(width + 1)]).areas(area);
     if let Some(status) = &app.status {
         let style = match status.severity {
+            Severity::Info => theme.ok,
             Severity::Warn => theme.warn,
             Severity::Error => theme.error,
         };

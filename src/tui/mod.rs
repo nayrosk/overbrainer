@@ -4,6 +4,7 @@
 
 mod app;
 mod dataset;
+mod editor;
 mod event_loop;
 mod format;
 mod keys;
@@ -16,7 +17,7 @@ mod ui;
 mod views;
 mod widgets;
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -42,9 +43,14 @@ pub async fn run(project_dir: &Path, logs: LogBuffer) -> anyhow::Result<()> {
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
     let project = Project::new(project_dir, &settings);
     let mut app = App::new(project, logs, Theme::detect(), SystemTime::now());
+    app.editor = editor::command(std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
     let guard = TerminalGuard::enter();
     let mut terminal = terminal::init().context("cannot set up the terminal")?;
     let result = event_loop::run(&mut terminal, &mut app).await;
     drop(guard);
+    app.abandon_edit();
+    for note in &app.exit_notes {
+        writeln!(io::stderr(), "{note}").ok();
+    }
     result
 }

@@ -19,7 +19,7 @@ source: src/tui/snapshots.rs
 "│                                                                                                                      │"
 "│                     ┌ keys: Logs ──────────────────────────────────────────────────────────────┐                     │"
 "│                     │1 2 3 4, Tab, Shift-Tab    switch view                                    │                     │"
-"│                     │?                          this help (Esc or ? closes it)                 │                     │"
+"│                     │?                          this help (Esc, ? or q closes it)              │                     │"
 "│                     │q, Ctrl-C                  quit                                           │                     │"
 "│                     │R                          reload the data files                          │                     │"
 "│                     │k j, Up Down, PgUp PgDn    scroll                                         │                     │"

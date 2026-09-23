@@ -185,6 +185,43 @@ pub(super) fn dataset_app() -> App {
     app
 }
 
+/// `overbrainer.toml` of the fixtures' project.
+pub(super) const CONFIG: &str = r#"
+[project]
+name = "rust_expert"
+
+[[topics]]
+name = "ownership"
+description = "Moves, borrows and lifetimes in Rust"
+subtopics = 2
+questions_per_subtopic = 3
+
+[[topics]]
+name = "traits"
+subtopics = 2
+questions_per_subtopic = 2
+
+[providers.fake]
+protocol = "openai"
+
+[roles]
+generator = { provider = "fake", model = "gen" }
+parent = { provider = "fake", model = "parent" }
+"#;
+
+/// A project directory holding [`CONFIG`] and the files of [`dataset`].
+pub(super) fn project() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("overbrainer.toml"), CONFIG)?;
+    let files = crate::dataset::DataFiles::new(dir.path());
+    let data = dataset();
+    crate::dataset::rewrite(&files.subtopics, &data.subtopics)?;
+    crate::dataset::rewrite(&files.questions, &data.questions)?;
+    crate::dataset::rewrite(&files.answers, &data.answers)?;
+    crate::dataset::rewrite(&files.rejected, &data.rejected)?;
+    Ok(dir)
+}
+
 /// The tree path of a question of `ownership`/`Borrowing`, and of its answer.
 pub(super) fn path_to(text: &str, answer: bool) -> Vec<Node> {
     let subtopic = Id::subtopic("ownership", "Borrowing");
@@ -463,5 +500,15 @@ fn dataset_load_error() -> TestResult {
     app.on_done(id, Ok(Done::Loaded(Err(error.into()))));
     app.status = None;
     snapshot("dataset_error", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn the_delete_dialog_says_what_goes_with_a_subtopic() -> TestResult {
+    let mut app = dataset_app();
+    open_to(&mut app, &path_to(MOVED, false)[..2]);
+    app.on_input(&key(KeyCode::Char('d')));
+    assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
+    snapshot("dataset_delete", &mut app)?;
     Ok(())
 }

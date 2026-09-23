@@ -2,16 +2,20 @@
 //! reads the clock or touches the terminal: the loop feeds it input, ticks and
 //! signals, and renders it.
 
+use std::io;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::{Duration, SystemTime};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tracing::Level;
 
-use super::dataset::{DatasetView, TopicInfo};
-use super::tasks::{Done, Task, TaskId};
+use super::dataset::{DatasetView, Model, Node, TopicInfo};
+use super::editor::{self, Session, Target};
+use super::tasks::{Done, Edit, Saved, Task, TaskId};
 use super::theme::Theme;
 use crate::config::Settings;
+use crate::dataset::{AnswerText, Counts, Dataset, Deletion};
 use crate::logging::LogBuffer;
 
 /// How long a status message stays on the status line.
@@ -58,6 +62,13 @@ impl Project {
 pub(super) enum Effect {
     /// Start a background task.
     Spawn(TaskId, Task),
+    /// Hand the terminal to the editor `command`, on the file `path`.
+    OpenEditor {
+        /// The program and its arguments.
+        command: Vec<String>,
+        /// The file to edit.
+        path: PathBuf,
+    },
 }
 
 /// The four views, switched with `1` to `4`.
@@ -105,6 +116,8 @@ impl View {
 /// How a status message is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Severity {
+    /// A result or a note.
+    Info,
     /// A refusal or a warning.
     Warn,
     /// A failure.
@@ -127,6 +140,33 @@ pub(super) struct Status {
 pub(super) enum Overlay {
     /// The key table.
     Help,
+    /// A question answered with `y` or `n`.
+    Confirm(Confirm),
+}
+
+/// A confirmation dialog: `y` runs its action, anything else closes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Confirm {
+    /// The title.
+    pub(super) title: String,
+    /// The question, one paragraph per entry.
+    pub(super) text: Vec<String>,
+    /// What `y` does, in one word.
+    pub(super) yes: &'static str,
+    /// What `y` runs.
+    pub(super) action: Action,
+}
+
+/// What a confirmed dialog runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Action {
+    /// A deletion, which must still remove `counts`.
+    Delete {
+        /// What is deleted.
+        deletion: Deletion,
+        /// What the dialog said it removes.
+        counts: Counts,
+    },
 }
 
 /// Why the loop ends.
@@ -204,6 +244,16 @@ pub(super) struct App {
     /// Whether a reload was asked for while a load ran: it starts once that load
     /// ends, so it reads what changed meanwhile.
     reload_pending: bool,
+    /// The edit being saved, if any.
+    pub(super) edit: Option<TaskId>,
+    /// The edit open in the editor or being saved.
+    pub(super) editing: Option<Session>,
+    /// The editor command.
+    pub(super) editor: Vec<String>,
+    /// Lines printed on stderr once the terminal is restored.
+    pub(super) exit_notes: Vec<String>,
+    /// Whether the user quit and the TUI waits for work to end.
+    pub(super) quitting: bool,
     next_task: u64,
     /// Whether something changed since the last draw.
     pub(super) dirty: bool,
@@ -228,6 +278,11 @@ impl App {
             dataset: DatasetView::default(),
             load: None,
             reload_pending: false,
+            edit: None,
+            editing: None,
+            editor: vec!["vi".to_string()],
+            exit_notes: Vec::new(),
+            quitting: false,
             next_task: 0,
             log_view: LogView {
                 min: Level::INFO,
@@ -277,38 +332,185 @@ impl App {
         if self.load.is_some() {
             work.push("loading".to_string());
         }
+        if self.edit.is_some() {
+            work.push("saving".to_string());
+        }
+        if self.lock().is_some() {
+            work.push("edits locked".to_string());
+        }
         work
+    }
+
+    /// Why the dataset cannot be changed now, if it cannot.
+    pub(super) fn lock(&self) -> Option<&'static str> {
+        if self.edit.is_some() || self.editing.is_some() {
+            return Some("an edit is being saved");
+        }
+        None
+    }
+
+    /// Refuses a change to the dataset while it is locked.
+    fn locked(&mut self) -> bool {
+        let Some(reason) = self.lock() else {
+            return false;
+        };
+        self.say(
+            Severity::Warn,
+            format!("refused: {reason}; edits resume when it ends"),
+        );
+        true
     }
 
     /// Handles the end of task `id`: what it gave back, or how it failed.
     /// A load's result is used only when `id` is the load running; a reload asked
-    /// for meanwhile starts then.
+    /// for meanwhile starts then. An edit's end reloads the data.
     pub(super) fn on_done(&mut self, id: TaskId, result: Result<Done, String>) -> Vec<Effect> {
         self.dirty = true;
-        let is_load = self.load == Some(id);
         match result {
-            Ok(Done::Loaded(_)) if !is_load => return Vec::new(),
-            Ok(Done::Loaded(loaded)) => {
-                self.load = None;
-                match loaded {
-                    Ok(data) => self.dataset.loaded(data, &self.project.topics),
-                    Err(error) => self.load_failed(error),
-                }
-            },
-            Err(error) => {
-                tracing::error!("{error}");
-                if is_load {
-                    self.load = None;
-                    self.load_failed(error);
-                } else {
-                    self.say(Severity::Error, error);
-                }
-            },
+            Ok(Done::Loaded(loaded)) => self.on_loaded(id, loaded),
+            Ok(Done::Saved(saved)) => self.saved(saved),
+            Err(error) => self.failed(id, error),
         }
+    }
+
+    /// Load `id` read `loaded`: shown when it is the load running, else ignored.
+    fn on_loaded(&mut self, id: TaskId, loaded: Result<Dataset, String>) -> Vec<Effect> {
+        if self.load != Some(id) {
+            return Vec::new();
+        }
+        self.load = None;
+        match loaded {
+            Ok(data) => self.dataset.loaded(data, &self.project.topics),
+            Err(error) => self.load_failed(error),
+        }
+        self.pending_reload()
+    }
+
+    /// Task `id` failed (a panic): an edit keeps its typed text, a load shows why.
+    fn failed(&mut self, id: TaskId, error: String) -> Vec<Effect> {
+        tracing::error!("{error}");
+        if self.edit == Some(id) {
+            return self.saved(Err(error));
+        }
+        if self.load == Some(id) {
+            self.load = None;
+            self.load_failed(error);
+            return self.pending_reload();
+        }
+        self.say(Severity::Error, error);
+        Vec::new()
+    }
+
+    /// Starts the reload asked for while a load ran, once no load runs.
+    fn pending_reload(&mut self) -> Vec<Effect> {
         if self.load.is_none() && std::mem::take(&mut self.reload_pending) {
             return self.reload();
         }
         Vec::new()
+    }
+
+    /// An edit task ended: says what it did, or keeps the typed text of a refused
+    /// edit, then reloads the data.
+    fn saved(&mut self, saved: Result<Saved, String>) -> Vec<Effect> {
+        self.edit = None;
+        let session = self.editing.take();
+        match saved {
+            Ok(saved) => {
+                if let Some(session) = session {
+                    std::fs::remove_file(&session.path).ok();
+                }
+                let message = match &saved.split {
+                    Ok(_) => saved.message,
+                    Err(error) => {
+                        format!("{}, but split failed: {error}; run split", saved.message)
+                    },
+                };
+                self.dataset.split = saved.split.ok();
+                self.say(Severity::Info, message);
+            },
+            Err(error) => match session {
+                Some(session) => self.kept(&session, &error),
+                None => self.say(Severity::Error, error),
+            },
+        }
+        if self.quitting {
+            self.quit();
+        }
+        self.reload()
+    }
+
+    /// Keeps the temp file of `session` after `error`, saying where it is, on the
+    /// status line and on exit.
+    fn kept(&mut self, session: &Session, error: &str) {
+        let path = session.path.display();
+        self.exit_notes.push(format!(
+            "an edit was refused ({error}); its text is kept in {path}"
+        ));
+        self.say(
+            Severity::Error,
+            format!("refused: {error}; your text is kept in {path}"),
+        );
+    }
+
+    /// The editor ended with `status`: checks the edited file and saves it.
+    pub(super) fn on_editor_exit(&mut self, status: io::Result<ExitStatus>) -> Vec<Effect> {
+        let Some(session) = self.editing.clone() else {
+            return Vec::new();
+        };
+        let failed = match status {
+            Ok(status) if status.success() => None,
+            Ok(status) => Some(status.code().map_or_else(
+                || "the editor was killed; nothing changed".to_string(),
+                |code| format!("the editor exited with status {code}; nothing changed"),
+            )),
+            Err(error) => Some(format!("cannot run the editor: {error}; nothing changed")),
+        };
+        if let Some(message) = failed {
+            return self.drop_edit(&session, Severity::Warn, message);
+        }
+        let bytes = match std::fs::read(&session.path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.editing = None;
+                self.say(
+                    Severity::Error,
+                    format!("cannot read the edited file: {error}"),
+                );
+                return Vec::new();
+            },
+        };
+        match editor::check(&session, bytes) {
+            Ok(edited) => {
+                let id = self.task_id();
+                self.edit = Some(id);
+                vec![Effect::Spawn(id, Task::Edit(Edit::Change(edited)))]
+            },
+            Err(refusal) if refusal.keep => {
+                self.editing = None;
+                self.kept(&session, &refusal.message);
+                Vec::new()
+            },
+            Err(refusal) => self.drop_edit(&session, Severity::Info, refusal.message),
+        }
+    }
+
+    /// Ends an edit that changed nothing, removing its temp file.
+    fn drop_edit(&mut self, session: &Session, severity: Severity, message: String) -> Vec<Effect> {
+        std::fs::remove_file(&session.path).ok();
+        self.editing = None;
+        self.say(severity, message);
+        Vec::new()
+    }
+
+    /// Notes, for the exit, the temp file of an edit the TUI ended during (a
+    /// signal, a terminal error): it may hold typed text.
+    pub(super) fn abandon_edit(&mut self) {
+        if let Some(session) = self.editing.take() {
+            self.exit_notes.push(format!(
+                "an edit was not saved; its text is kept in {}",
+                session.path.display()
+            ));
+        }
     }
 
     /// Shows why the data could not be loaded, in the view and on the status line.
@@ -344,14 +546,18 @@ impl App {
             }
             return Vec::new();
         }
+        match &self.overlay {
+            Some(Overlay::Help) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
+                    self.overlay = None;
+                }
+                return Vec::new();
+            },
+            Some(Overlay::Confirm(_)) => return self.on_confirm_key(key.code),
+            None => {},
+        }
         if key.code == KeyCode::Char('q') {
             self.quit();
-            return Vec::new();
-        }
-        if self.overlay == Some(Overlay::Help) {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
-                self.overlay = None;
-            }
             return Vec::new();
         }
         match key.code {
@@ -363,20 +569,52 @@ impl App {
             KeyCode::Char('4') => self.view = View::Logs,
             KeyCode::Tab => self.view = self.view.shifted(1),
             KeyCode::BackTab => self.view = self.view.shifted(View::ALL.len() - 1),
-            code => self.on_view_key(code),
+            code => return self.on_view_key(code),
         }
         Vec::new()
     }
 
-    fn on_view_key(&mut self, code: KeyCode) {
-        match self.view {
-            View::Dataset => self.on_dataset_key(code),
-            View::Logs => self.on_logs_key(code),
-            View::Pipeline | View::Training => {},
+    /// `y` runs the dialog's action; any other key closes it.
+    fn on_confirm_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        let Some(Overlay::Confirm(confirm)) = self.overlay.take() else {
+            return Vec::new();
+        };
+        if code != KeyCode::Char('y') {
+            return Vec::new();
+        }
+        match confirm.action {
+            Action::Delete { deletion, counts } => {
+                if self.locked() {
+                    return Vec::new();
+                }
+                let id = self.task_id();
+                self.edit = Some(id);
+                vec![Effect::Spawn(
+                    id,
+                    Task::Edit(Edit::Delete { deletion, counts }),
+                )]
+            },
         }
     }
 
-    fn on_dataset_key(&mut self, code: KeyCode) {
+    fn on_view_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        match self.view {
+            View::Dataset => return self.on_dataset_key(code),
+            View::Logs => self.on_logs_key(code),
+            View::Pipeline | View::Training => {},
+        }
+        Vec::new()
+    }
+
+    fn on_dataset_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        match code {
+            KeyCode::Char('e') => return self.edit_selected(),
+            KeyCode::Char('d') => {
+                self.delete_selected();
+                return Vec::new();
+            },
+            _ => {},
+        }
         let view = &mut self.dataset;
         match code {
             KeyCode::Up | KeyCode::Char('k') => view.step(false),
@@ -394,6 +632,93 @@ impl App {
             KeyCode::Char('/') => view.input = Some(view.filter.clone()),
             KeyCode::Esc if !view.filter.is_empty() => view.apply_filter(String::new()),
             _ => {},
+        }
+        Vec::new()
+    }
+
+    /// `e`: opens the selected question, answer or subtopic name in the editor.
+    fn edit_selected(&mut self) -> Vec<Effect> {
+        if self.locked() {
+            return Vec::new();
+        }
+        let target = match self.selected_target() {
+            Ok(target) => target,
+            Err(refusal) => {
+                self.say(Severity::Warn, refusal);
+                return Vec::new();
+            },
+        };
+        let text = match editor::text_of(&target) {
+            Ok(text) => text,
+            Err(refusal) => {
+                self.say(Severity::Warn, refusal);
+                return Vec::new();
+            },
+        };
+        match editor::open(&self.project.dir.join("data"), target, &text) {
+            Ok(session) => {
+                let path = session.path.clone();
+                self.editing = Some(session);
+                vec![Effect::OpenEditor {
+                    command: self.editor.clone(),
+                    path,
+                }]
+            },
+            Err(error) => {
+                self.say(
+                    Severity::Error,
+                    format!("cannot write the edit file: {error}"),
+                );
+                Vec::new()
+            },
+        }
+    }
+
+    /// What `e` edits for the selected node.
+    fn selected_target(&self) -> Result<Target, &'static str> {
+        let model = self.dataset.model.as_ref().ok_or("nothing to edit")?;
+        match self.dataset.tree.selected().last() {
+            Some(Node::Question(id)) => model
+                .question(id)
+                .map(|q| Target::Question {
+                    id: id.clone(),
+                    text: q.text.clone(),
+                })
+                .ok_or("changed on disk; press R"),
+            Some(Node::Answer(id)) => model
+                .answer(id)
+                .and_then(AnswerText::of)
+                .map(|before| Target::Answer {
+                    id: id.clone(),
+                    before,
+                })
+                .ok_or("changed on disk; press R"),
+            Some(Node::Subtopic(id)) => model
+                .data
+                .subtopics
+                .iter()
+                .find(|s| &s.id == id)
+                .map(|s| Target::Subtopic {
+                    id: id.clone(),
+                    name: s.name.clone(),
+                })
+                .ok_or("changed on disk; press R"),
+            Some(Node::Topic(_)) => Err("refused: topics live in overbrainer.toml"),
+            Some(Node::MissingSubtopic(_)) | None => Err("nothing to edit here"),
+        }
+    }
+
+    /// `d`: asks to delete the selected node, with what goes with it.
+    fn delete_selected(&mut self) {
+        if self.locked() {
+            return;
+        }
+        let Some(model) = &self.dataset.model else {
+            return;
+        };
+        match deletion(model, self.dataset.tree.selected(), &self.project.topics) {
+            Ok(confirm) => self.overlay = Some(Overlay::Confirm(confirm)),
+            Err(refusal) => self.say(Severity::Warn, refusal),
         }
     }
 
@@ -461,8 +786,13 @@ impl App {
             .map(|line| line.seq);
     }
 
-    /// `q` or Ctrl-C: quits.
+    /// `q` or Ctrl-C: quits, once an edit being saved is saved.
     fn quit(&mut self) {
+        if self.edit.is_some() {
+            self.quitting = true;
+            self.say(Severity::Info, "quitting once the edit is saved");
+            return;
+        }
         self.exit = Some(Exit::Quit);
     }
 
@@ -503,6 +833,97 @@ impl App {
     }
 }
 
+/// The confirmation of `d` on the node at `path`, with what it removes.
+fn deletion(model: &Model, path: &[Node], topics: &[TopicInfo]) -> Result<Confirm, String> {
+    let data = &model.data;
+    let deletion = match path.last() {
+        Some(Node::Subtopic(id)) => Deletion::Subtopic(id.clone()),
+        Some(Node::Question(id)) => Deletion::Question(id.clone()),
+        Some(Node::Answer(id)) => Deletion::Answer(id.clone()),
+        Some(Node::MissingSubtopic(topic)) => Deletion::MissingSubtopic(topic.clone()),
+        Some(Node::Topic(_)) => {
+            return Err("refused: topics live in overbrainer.toml".to_string());
+        },
+        None => return Err("nothing to delete".to_string()),
+    };
+    let counts = data
+        .counts(&deletion)
+        .ok_or_else(|| "changed on disk; press R".to_string())?;
+    let rebuilt = "train and eval are rebuilt.";
+    let (title, question) = match &deletion {
+        Deletion::Subtopic(id) => {
+            let subtopic = data.subtopics.iter().find(|s| &s.id == id);
+            let name = subtopic.map_or("", |s| s.name.as_str());
+            let target = subtopic
+                .and_then(|s| topics.iter().find(|t| t.name == s.topic))
+                .map_or_else(String::new, |topic| {
+                    format!(" to reach {}", topic.subtopics)
+                });
+            (
+                " Delete a subtopic? ",
+                format!(
+                    "Delete subtopic \"{name}\" with its {} and {}? It is recorded in \
+                     data/rejected.jsonl so the subtopics stage does not generate it again; the \
+                     next subtopics run generates a replacement{target}. {rebuilt}",
+                    count(counts.questions, "question"),
+                    count(counts.answers, "answer"),
+                ),
+            )
+        },
+        Deletion::Question(id) => {
+            let question = data.questions.iter().find(|q| &q.id == id);
+            let subtopic = question.map_or("", |q| q.subtopic.as_str());
+            let target = question
+                .and_then(|q| topics.iter().find(|t| t.name == q.topic))
+                .map_or_else(String::new, |topic| {
+                    format!(" up to {}", topic.questions_per_subtopic)
+                });
+            let answer = if counts.answers > 0 {
+                " and its answer"
+            } else {
+                ""
+            };
+            (
+                " Delete a question? ",
+                format!(
+                    "Delete this question{answer}? It is recorded in data/rejected.jsonl; the \
+                     next questions run tops \"{subtopic}\"{target} without it. {rebuilt}"
+                ),
+            )
+        },
+        Deletion::Answer(_) => (
+            " Delete an answer? ",
+            format!(
+                "Delete this answer? The question stays; the next answers run asks the parent \
+                 again (a paid request). {rebuilt}"
+            ),
+        ),
+        Deletion::MissingSubtopic(_) => (
+            " Delete questions? ",
+            format!(
+                "Delete {} whose subtopic no longer exists, and their {}? {rebuilt}",
+                count(counts.questions, "question"),
+                count(counts.answers, "answer"),
+            ),
+        ),
+    };
+    Ok(Confirm {
+        title: title.to_string(),
+        text: vec![question],
+        yes: "delete",
+        action: Action::Delete { deletion, counts },
+    })
+}
+
+/// `count` `noun`s, plural unless 1.
+fn count(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
@@ -511,8 +932,10 @@ mod tests {
     use crate::dataset::Id;
     use crate::logging::LogLine;
     use crate::tui::dataset::Node;
+    use crate::tui::editor::Edited;
     use crate::tui::snapshots::{
-        MOVED, NOW, app, at, ctrl_c, dataset, dataset_app, draw, key, open_to, path_to, text,
+        MOVED, NOW, app, at, ctrl_c, dataset, dataset_app, draw, key, open_to, path_to, project,
+        text,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -549,6 +972,9 @@ mod tests {
         assert_eq!(app.overlay, None);
         press(&mut app, &[KeyCode::Char('?'), KeyCode::Char('?')]);
         assert_eq!(app.overlay, None);
+        press(&mut app, &[KeyCode::Char('?'), KeyCode::Char('q')]);
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.exit, None, "q closes the help, it does not quit");
     }
 
     #[test]
@@ -910,6 +1336,184 @@ mod tests {
             rows.iter().any(|row| row.contains("answers          5 ")),
             "{rows:#?}"
         );
+        Ok(())
+    }
+
+    /// [`dataset_app`] on a copy of the fixture's files in a temp directory.
+    fn project_app() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
+        let dir = project()?;
+        let mut app = dataset_app();
+        app.project.dir = dir.path().to_path_buf();
+        Ok((dir, app))
+    }
+
+    fn exited(code: i32) -> ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+
+    fn status(app: &App) -> Option<&str> {
+        app.status.as_ref().map(|status| status.text.as_str())
+    }
+
+    #[test]
+    fn e_opens_the_selected_question_then_saves_what_was_typed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = project_app()?;
+        app.editor = vec!["my-editor".into(), "--wait".into()];
+        open_to(&mut app, &path_to(MOVED, false));
+        let effects = press(&mut app, &[KeyCode::Char('e')]);
+        let [Effect::OpenEditor { command, path }] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        assert_eq!(command, &["my-editor", "--wait"]);
+        assert_eq!(std::fs::read_to_string(path)?, format!("{MOVED}\n"));
+        assert_eq!(app.lock(), Some("an edit is being saved"));
+        std::fs::write(path, "What happens to a borrow after a move?\n")?;
+        let effects = app.on_editor_exit(Ok(exited(0)));
+        let [Effect::Spawn(id, Task::Edit(Edit::Change(Edited::Question { text, .. })))] =
+            effects.as_slice()
+        else {
+            return Err(format!("{effects:?}").into());
+        };
+        assert_eq!(text, "What happens to a borrow after a move?");
+        let saved = Saved {
+            message: "question saved".into(),
+            split: Ok(crate::pipeline::SplitReport::default()),
+        };
+        let reload = app.on_done(*id, Ok(Done::Saved(Ok(saved))));
+        assert!(matches!(reload.as_slice(), [Effect::Spawn(_, Task::Load)]));
+        assert_eq!(status(&app), Some("question saved"));
+        assert!(!path.exists(), "the temp file is removed once saved");
+        assert_eq!(app.lock(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_editor_that_fails_or_changes_nothing_saves_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = project_app()?;
+        open_to(&mut app, &path_to(MOVED, false)[..2]);
+        for (exit, message) in [
+            (
+                Ok(exited(1)),
+                "the editor exited with status 1; nothing changed",
+            ),
+            (Ok(exited(0)), "unchanged"),
+            (
+                Err(io::Error::from(io::ErrorKind::NotFound)),
+                "cannot run the editor: entity not found; nothing changed",
+            ),
+        ] {
+            let effects = press(&mut app, &[KeyCode::Char('e')]);
+            let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
+                return Err(format!("{effects:?}").into());
+            };
+            assert_eq!(app.on_editor_exit(exit), []);
+            assert_eq!(status(&app), Some(message));
+            assert!(!path.exists());
+            assert_eq!(app.lock(), None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_save_keeps_the_typed_text_and_says_where() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_dir, mut app) = project_app()?;
+        open_to(&mut app, &path_to(MOVED, false));
+        let effects = press(&mut app, &[KeyCode::Char('e')]);
+        let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        std::fs::write(path, "When does NLL end a borrow?")?;
+        let effects = app.on_editor_exit(Ok(exited(0)));
+        let [Effect::Spawn(id, _)] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        let refused = "another question of this subtopic already has this text";
+        app.on_done(*id, Ok(Done::Saved(Err(refused.into()))));
+        assert!(path.exists());
+        let kept = format!(
+            "refused: {refused}; your text is kept in {}",
+            path.display()
+        );
+        assert_eq!(status(&app), Some(kept.as_str()));
+        assert_eq!(app.exit_notes.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn e_and_d_are_refused_on_a_topic_and_while_an_edit_is_saved() {
+        let mut app = dataset_app();
+        press(&mut app, &[KeyCode::Char('e')]);
+        assert_eq!(
+            status(&app),
+            Some("refused: topics live in overbrainer.toml")
+        );
+        press(&mut app, &[KeyCode::Char('d')]);
+        assert_eq!(app.overlay, None);
+        open_to(&mut app, &path_to(MOVED, true));
+        app.edit = Some(TaskId(9));
+        for code in ['e', 'd'] {
+            assert_eq!(press(&mut app, &[KeyCode::Char(code)]), []);
+            assert_eq!(
+                status(&app),
+                Some("refused: an edit is being saved; edits resume when it ends")
+            );
+        }
+        press(&mut app, &[KeyCode::Char('q')]);
+        assert_eq!(app.exit, None, "quitting waits for the edit");
+        app.on_done(TaskId(9), Err("a background task failed: panicked".into()));
+        assert_eq!(app.exit, Some(Exit::Quit));
+    }
+
+    #[test]
+    fn d_asks_then_deletes_the_selected_answer_only_on_y() {
+        let mut app = dataset_app();
+        open_to(&mut app, &path_to(MOVED, true));
+        press(&mut app, &[KeyCode::Char('d')]);
+        let Some(Overlay::Confirm(confirm)) = app.overlay.clone() else {
+            return assert_eq!(app.overlay, None);
+        };
+        assert_eq!(
+            confirm.text,
+            [
+                "Delete this answer? The question stays; the next answers run asks the parent \
+              again (a paid request). train and eval are rebuilt."
+            ]
+        );
+        assert_eq!(press(&mut app, &[KeyCode::Char('n')]), []);
+        assert_eq!(app.overlay, None);
+        press(&mut app, &[KeyCode::Char('d')]);
+        let effects = press(&mut app, &[KeyCode::Char('y')]);
+        let id = Id::question(&Id::subtopic("ownership", "Borrowing"), MOVED);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Spawn(_, Task::Edit(Edit::Delete { deletion: Deletion::Answer(answer), counts }))]
+                if *answer == id && *counts == Counts { questions: 0, answers: 1 }
+        ));
+    }
+
+    #[test]
+    fn an_edit_open_when_the_tui_ends_is_noted_for_the_exit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = project_app()?;
+        open_to(&mut app, &path_to(MOVED, false));
+        let effects = press(&mut app, &[KeyCode::Char('e')]);
+        let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        app.abandon_edit();
+        assert!(path.exists(), "it may hold typed text");
+        assert_eq!(
+            app.exit_notes,
+            [format!(
+                "an edit was not saved; its text is kept in {}",
+                path.display()
+            )]
+        );
+        app.abandon_edit();
+        assert_eq!(app.exit_notes.len(), 1);
         Ok(())
     }
 }

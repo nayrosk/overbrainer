@@ -1,5 +1,6 @@
 //! Pieces drawn over or around the views.
 
+pub(super) mod dialog;
 pub(super) mod help;
 pub(super) mod status;
 pub(super) mod too_small;

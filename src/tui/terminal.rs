@@ -1,5 +1,5 @@
-//! The real terminal: setting it up, restoring it on every exit path, and reading
-//! its input.
+//! The real terminal: setting it up, restoring it on every exit path, reading its
+//! input, and handing it to the editor and back.
 
 use std::io::{self, Write};
 use std::mem::ManuallyDrop;
@@ -7,10 +7,12 @@ use std::panic::{self, PanicHookInfo};
 use std::sync::Arc;
 use std::thread;
 
-use crossterm::cursor::Show;
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{Event, EventStream};
 use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::{DefaultTerminal, Terminal};
@@ -93,9 +95,66 @@ fn restore() {
     execute!(io::stdout(), Show).ok();
 }
 
+/// The screen of the real terminal, with the task reading its input.
+///
+/// While the editor has the terminal, no task reads it and the terminal is in
+/// its normal mode; the guard's panic hook still restores it then, which leaving
+/// the alternate screen and raw mode a second time does no harm to.
+pub(super) struct Screen {
+    reader: Option<InputTask>,
+    events: UnboundedSender<io::Result<Event>>,
+}
+
+impl Screen {
+    /// Starts reading the terminal, sending each event on `events`.
+    pub(super) fn start(events: UnboundedSender<io::Result<Event>>) -> Self {
+        Self {
+            reader: Some(InputTask::start(events.clone())),
+            events,
+        }
+    }
+
+    /// Hands the terminal over: stops reading it first and waits until the
+    /// `EventStream` is dropped (so its reader thread takes no keystroke from the
+    /// editor), then leaves the alternate screen and raw mode, and shows the
+    /// cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the terminal cannot be switched back.
+    pub(super) async fn suspend(&mut self) -> io::Result<()> {
+        if let Some(reader) = self.reader.take() {
+            reader.stop().await;
+        }
+        execute!(io::stdout(), LeaveAlternateScreen, Show)?;
+        disable_raw_mode()
+    }
+
+    /// Takes the terminal back: raw mode, the alternate screen and a hidden
+    /// cursor, then reads it again with a new `EventStream`. The caller clears
+    /// the terminal so the next draw repaints it all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the terminal cannot be set up again.
+    pub(super) fn resume(&mut self) -> io::Result<()> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        self.reader = Some(InputTask::start(self.events.clone()));
+        Ok(())
+    }
+
+    /// Stops reading the terminal.
+    pub(super) async fn stop(self) {
+        if let Some(reader) = self.reader {
+            reader.stop().await;
+        }
+    }
+}
+
 /// The task owning crossterm's `EventStream`, forwarding its events, then its
 /// error if reading fails.
-pub(super) struct InputTask {
+struct InputTask {
     token: CancellationToken,
     handle: JoinHandle<()>,
 }
@@ -103,7 +162,7 @@ pub(super) struct InputTask {
 impl InputTask {
     /// Starts reading the terminal, sending each event on `events`. A read error
     /// is sent too, and ends the task.
-    pub(super) fn start(events: UnboundedSender<io::Result<Event>>) -> Self {
+    fn start(events: UnboundedSender<io::Result<Event>>) -> Self {
         let token = CancellationToken::new();
         let stop = token.clone();
         let handle = tokio::spawn(async move {
@@ -131,7 +190,7 @@ impl InputTask {
 
     /// Stops reading and waits until the `EventStream` is dropped, so its reader
     /// thread no longer takes keystrokes.
-    pub(super) async fn stop(self) {
+    async fn stop(self) {
         self.token.cancel();
         self.handle.await.ok();
     }
