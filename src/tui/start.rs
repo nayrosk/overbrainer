@@ -216,6 +216,15 @@ pub(super) fn text(plan: &StartPlan, prices: Option<&Prices>) -> Vec<String> {
     text
 }
 
+/// The position in [`text`] of the line saying what a Runpod run costs at
+/// most (`max_hours`): a dialog too tall for the terminal keeps it.
+pub(super) fn cost_line(plan: &StartPlan) -> Option<usize> {
+    // After the target, model and data lines, the GPU header and its types.
+    plan.runpod
+        .as_ref()
+        .map(|runpod| 3 + 1 + runpod.gpu_types.len())
+}
+
 /// The GPU types of `runpod`, each with its list price times the GPU count
 /// once `prices` are known, then `max_hours` with the most it can cost at the
 /// highest listed rate.
@@ -278,6 +287,18 @@ mod tests {
             }),
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_cost_line_is_the_max_hours_line() {
+        let runpod = plan(true);
+        let line = cost_line(&runpod).and_then(|at| text(&runpod, None).get(at).cloned());
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.starts_with("max_hours ")),
+            "{line:?}"
+        );
+        assert_eq!(cost_line(&plan(false)), None);
     }
 
     #[test]

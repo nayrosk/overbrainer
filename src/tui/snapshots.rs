@@ -934,6 +934,47 @@ fn quitting_while_a_runpod_run_provisions_offers_to_abandon_it() -> TestResult {
     Ok(())
 }
 
+/// A start dialog taller than the terminal keeps its key line and its
+/// most-it-can-cost line, and marks the text it cut; so does a quit dialog.
+#[test]
+fn a_tall_dialog_keeps_its_keys_and_its_cost_at_80x24() -> TestResult {
+    let mut app = app();
+    app.view = View::Training;
+    let mut plan = runpod_plan();
+    let gpus: Vec<String> = (1..=14).map(|n| format!("NVIDIA GPU model {n}")).collect();
+    if let Some(runpod) = &mut plan.runpod {
+        runpod.gpu_types.clone_from(&gpus);
+    }
+    plan.warnings = (1..=4)
+        .map(|n| format!("warning number {n} about this run"))
+        .collect();
+    app.prepared(Ok(plan));
+    app.priced(&gpus.iter().map(|gpu| (gpu.clone(), Some(0.5))).collect());
+    let rows = text(&draw(&mut app, 80, 24)?).join("\n");
+    for shown in [
+        "[y] start",
+        "[n] cancel",
+        "max_hours   6",
+        "…",
+        "target      gpu_cloud",
+    ] {
+        assert!(rows.contains(shown), "{shown}\n{rows}");
+    }
+    let mut app = self::app();
+    for n in 0..20 {
+        app.training.tasks.insert(
+            TaskId(n),
+            Follow::new(Job::Attach, &format!("20260921-1332{n:02}-a1b2")),
+        );
+    }
+    app.on_input(&key(KeyCode::Char('q')));
+    let rows = text(&draw(&mut app, 80, 24)?).join("\n");
+    for shown in ["[y] quit", "[n] stay", "…"] {
+        assert!(rows.contains(shown), "{shown}\n{rows}");
+    }
+    Ok(())
+}
+
 /// The help overlay of every view keeps its note whole at the minimum size.
 #[test]
 fn the_help_note_fits_every_view_at_80x24() -> TestResult {
