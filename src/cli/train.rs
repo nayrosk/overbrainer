@@ -15,6 +15,7 @@ use crate::config::{DEFAULT_WORKDIR, EnvSource, Settings, Target, Training};
 use crate::dataset::DataFiles;
 use crate::events::EventBus;
 use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
+use crate::runpod::PodRecord;
 use crate::runs::{
     Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, cancel, create, start, watch,
 };
@@ -183,15 +184,28 @@ async fn cancel_run(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints the runs in `runs/`, oldest first: ID, state, target, creation time.
+/// Prints the runs in `runs/`, oldest first: ID, state, target, creation time,
+/// and, for a Runpod run, what `pod.json` says of its pod (no API call).
 ///
 /// # Errors
 ///
 /// Returns an error when a run record cannot be read.
 pub fn list(project_dir: &Path) -> anyhow::Result<()> {
-    for record in Runs::new(project_dir).list()? {
+    let runs = Runs::new(project_dir);
+    for record in runs.list()? {
+        let pod = match PodRecord::load(&runs, &record.id) {
+            Ok(Some(pod)) => format!("  {}", pod.summary()),
+            Ok(None) => String::new(),
+            Err(error) => {
+                warn(&format!(
+                    "cannot read the pod record of run {}: {error}",
+                    record.id
+                ));
+                String::new()
+            },
+        };
         println!(
-            "{}  {:<9}  {}  {}",
+            "{}  {:<9}  {}  {}{pod}",
             record.id,
             record.state.name(),
             record.target,

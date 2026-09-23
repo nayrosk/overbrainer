@@ -3,6 +3,7 @@
 mod config_check;
 mod data;
 mod init;
+mod pod;
 mod progress;
 mod train;
 
@@ -76,6 +77,27 @@ pub enum Command {
         #[command(subcommand)]
         command: RunsCommand,
     },
+    /// Find and remove the Runpod pods overbrainer created.
+    Pod {
+        /// The pod subcommand to run.
+        #[command(subcommand)]
+        command: PodCommand,
+    },
+}
+
+/// Subcommands of `overbrainer pod`.
+#[derive(Debug, Subcommand)]
+pub enum PodCommand {
+    /// List the pods overbrainer created, with their run and what is known of it.
+    Ls,
+    /// Delete every pod of a run, and wait until Runpod no longer shows them.
+    Rm {
+        /// ID of the run, as shown by `overbrainer runs ls` or `overbrainer pod ls`.
+        run_id: String,
+        /// Delete even when the run's job is still running (the run is then failed).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Options and subcommands of `overbrainer train`.
@@ -108,7 +130,8 @@ pub enum TrainCommand {
 /// Subcommands of `overbrainer runs`.
 #[derive(Debug, Subcommand)]
 pub enum RunsCommand {
-    /// List the runs in runs/, oldest first: ID, state, target, creation time.
+    /// List the runs in runs/, oldest first: ID, state, target, creation time, and
+    /// the pod of a Runpod run.
     Ls,
 }
 
@@ -172,6 +195,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
+        Command::Pod { command } => pod::run(dir, &command).await,
     }
 }
 

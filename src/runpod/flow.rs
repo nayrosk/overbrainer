@@ -201,6 +201,19 @@ async fn gone(ctx: &PodCtx<'_>, pod: &mut PodRecord) -> Result<bool, PodError> {
     Ok(true)
 }
 
+/// The pod `id` as the API shows it, or `None` when it is really gone: a 404
+/// that [`look_again`] confirms. Nothing is ever deleted here.
+///
+/// # Errors
+///
+/// Returns [`PodError::Api`] when a look fails: the pod is then undetermined.
+pub(super) async fn look_up(ctx: &PodCtx<'_>, id: &PodId) -> Result<Option<Pod>, PodError> {
+    match ctx.client.get_pod(id).await? {
+        Some(pod) => Ok(Some(pod)),
+        None => look_again(ctx, id).await,
+    }
+}
+
 /// Looks again at the pod `id`, whose first look just answered Runpod's 404:
 /// `None` when it is really gone, that is [`GONE_LOOKS`] looks in a row answer
 /// that 404, [`Timing::gone_interval`] apart, and the pod list no longer shows
@@ -226,7 +239,7 @@ async fn look_again(ctx: &PodCtx<'_>, id: &PodId) -> Result<Option<Pod>, PodErro
 }
 
 /// Records the pod `id` as deleted by `by`.
-fn mark_gone(
+pub(super) fn mark_gone(
     ctx: &PodCtx<'_>,
     pod: &mut PodRecord,
     id: PodId,
@@ -391,12 +404,7 @@ pub async fn reconnect(
     if pod.state == PodState::Deleted {
         return Ok(None);
     }
-    let first = ctx.client.get_pod(&id).await?;
-    let seen = match first {
-        Some(remote) => Some(remote),
-        None => look_again(ctx, &id).await?,
-    };
-    let Some(remote) = seen else {
+    let Some(remote) = look_up(ctx, &id).await? else {
         mark_gone(ctx, pod, id, DeletedBy::Unknown)?;
         return Ok(None);
     };

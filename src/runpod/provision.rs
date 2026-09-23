@@ -686,7 +686,7 @@ pub async fn remove(
 
 /// Sends the delete of `id` and waits until the API no longer knows it. `true`
 /// when the delete found the pod, `false` when Runpod already did not know it.
-async fn delete_confirmed(ctx: &PodCtx<'_>, id: &PodId) -> Result<bool, PodError> {
+pub(super) async fn delete_confirmed(ctx: &PodCtx<'_>, id: &PodId) -> Result<bool, PodError> {
     let found = ctx.client.delete_pod(id).await?;
     wait_gone(ctx, id).await?;
     Ok(found)

@@ -12,6 +12,7 @@ mod bootstrap;
 mod client;
 mod flow;
 mod keys;
+mod orphans;
 mod provision;
 mod record;
 mod status;
@@ -30,6 +31,7 @@ pub use keys::{
     CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,
     write_known_hosts,
 };
+pub use orphans::{PodRow, Removed, orphan_warnings, pod_rows, remove_run_pods, table};
 pub use provision::{
     PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, sweep, wait_gone,
 };
@@ -125,6 +127,11 @@ pub enum PodError {
     /// The run's pod no longer exists.
     #[error("pod {0} no longer exists")]
     PodGone(PodId),
+    /// `pod rm` of a run whose job still runs, without `--force`.
+    #[error(
+        "run {0} is still running; stop it with `overbrainer train cancel {0}` first, or pass --force"
+    )]
+    RunStillRunning(String),
     /// The pod exists but offers no SSH endpoint.
     #[error("pod {0} has no SSH endpoint (status {1}); try again once it runs")]
     NoEndpoint(PodId, String),
