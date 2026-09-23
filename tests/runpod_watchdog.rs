@@ -710,14 +710,16 @@ async fn a_pod_with_no_curl_on_path_is_a_failed_verdict() -> TestResult {
 /// `write_watchdog` that copies the real watchdog content (from
 /// `OVERBRAINER_TEST_WATCHDOG_SRC`) to its target instead of embedding a
 /// here-document, so a test can drive the real bootstrap failure path without
-/// touching the pod's actual `/etc` or `/root`.
+/// touching the pod's actual `/etc` or `/root`. Like the real one built by
+/// `pod_command()`, it copies to a sibling `.tmp` file and only `mv -f`s it into
+/// place once the copy itself succeeded.
 fn start_bootstrap(shell: Shell, env: &[(&str, String)]) -> std::io::Result<Child> {
     let mut command = Command::new(shell.0[0]);
     command
         .args(&shell.0[1..])
         .arg("-c")
         .arg(format!(
-            "{}\nwrite_watchdog() {{\n  mkdir -p \"$(dirname \"$1\")\" || return 1\n  cp \"$OVERBRAINER_TEST_WATCHDOG_SRC\" \"$1\" || return 1\n}}\nbootstrap_main\n",
+            "{}\nwrite_watchdog() {{\n  mkdir -p \"$(dirname \"$1\")\" || return 1\n  cp \"$OVERBRAINER_TEST_WATCHDOG_SRC\" \"$1.tmp\" || return 1\n  mv -f \"$1.tmp\" \"$1\"\n}}\nbootstrap_main\n",
             bootstrap_functions()
         ))
         .env_clear()
@@ -807,9 +809,24 @@ impl FailingBootstrap {
     }
 }
 
+/// Whether this process's effective user is root, which can write through the
+/// read-only directory `FailingBootstrap` relies on to make `install_authorized_key`
+/// fail: the two bootstrap-failure tests below need to skip in that case, the same
+/// way other tests skip for a missing tool.
+fn running_as_root() -> bool {
+    let root = StdCommand::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout.trim_ascii() == b"0");
+    if root {
+        eprintln!("skipped: running as root, permissions cannot force a write to fail");
+    }
+    root
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bootstrap_failure_still_deletes_a_guarded_pod() -> TestResult {
-    if !curl_available() || !keygen_available() {
+    if !curl_available() || !keygen_available() || running_as_root() {
         return Ok(());
     }
     for &shell in shells() {
@@ -840,7 +857,7 @@ async fn a_bootstrap_failure_still_deletes_a_guarded_pod() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bootstrap_failure_in_keep_mode_only_logs() -> TestResult {
-    if !curl_available() || !keygen_available() {
+    if !curl_available() || !keygen_available() || running_as_root() {
         return Ok(());
     }
     for &shell in shells() {

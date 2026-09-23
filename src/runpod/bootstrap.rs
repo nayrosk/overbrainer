@@ -34,11 +34,13 @@ pub fn bootstrap_functions() -> &'static str {
 
 /// The pod's `cmd`: `bash -c` with the bootstrap, a `write_watchdog` function
 /// holding the watchdog in a quoted here-document, and the call to
-/// `bootstrap_main`.
+/// `bootstrap_main`. `write_watchdog` writes to a sibling `.tmp` file and only
+/// `mv -f`s it into place once the write itself succeeded, so a write that fails
+/// partway (a full disk) can never leave `fail` a truncated watchdog to exec into.
 #[must_use]
 pub fn pod_command() -> Vec<String> {
     let script = format!(
-        "{BOOTSTRAP}\nwrite_watchdog() {{\n  mkdir -p \"$(dirname \"$1\")\" || return 1\n  cat > \"$1\" <<'{HEREDOC_END}'\n{}{HEREDOC_END}\n}}\n\nbootstrap_main\n",
+        "{BOOTSTRAP}\nwrite_watchdog() {{\n  mkdir -p \"$(dirname \"$1\")\" || return 1\n  cat > \"$1.tmp\" <<'{HEREDOC_END}' || return 1\n{}{HEREDOC_END}\n  mv -f \"$1.tmp\" \"$1\"\n}}\n\nbootstrap_main\n",
         watchdog_script()
     );
     vec!["bash".to_string(), "-c".to_string(), script]
