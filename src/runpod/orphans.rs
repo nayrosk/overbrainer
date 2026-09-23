@@ -428,7 +428,9 @@ pub struct Removal {
 /// failure is returned at the end.
 ///
 /// A run absent from this project's `runs/` is refused unless `force`: its pods
-/// may belong to another checkout. For a run in progress (preparing or running)
+/// may belong to another checkout. So is a run still starting its pod (preparing,
+/// or running with a last create call that has no pod yet), with
+/// [`PodError::StillStarting`], and nothing is deleted. For a running run
 /// without `force`, its training pod (the one in `pod.json`) is kept, every other
 /// pod is deleted, and [`PodError::RunStillRunning`] says so. Forced, the run is
 /// saved `Failed` once a pod was deleted. The run's private client key is removed
@@ -447,14 +449,18 @@ async fn remove_checked(
     removed: &mut Vec<Removed>,
 ) -> Result<(), PodError> {
     ctx.runs.run_dir(run_id)?;
-    let in_progress = match ctx.runs.load(run_id) {
-        Ok(run) => matches!(run.state, RunState::Preparing | RunState::Running),
-        Err(RunsError::NotFound(_)) if force => false,
+    let state = match ctx.runs.load(run_id) {
+        Ok(run) => Some(run.state),
+        Err(RunsError::NotFound(_)) if force => None,
         Err(RunsError::NotFound(_)) => return Err(PodError::NotInRuns(run_id.to_string())),
         Err(error) => return Err(error.into()),
     };
-    let keep_training = in_progress && !force;
+    let in_progress = matches!(state, Some(RunState::Preparing | RunState::Running));
     let record = PodRecord::load(ctx.runs, run_id)?;
+    if !force && starting(state, record.as_ref()) {
+        return Err(PodError::StillStarting(run_id.to_string()));
+    }
+    let keep_training = in_progress && !force;
     let training = record
         .as_ref()
         .filter(|record| record.state != PodState::Deleted)
@@ -487,6 +493,20 @@ async fn remove_checked(
     }
     forget_client_key(ctx.runs, run_id);
     Ok(())
+}
+
+/// Whether the run is still starting its pod: preparing, or in progress with a
+/// last create call that has no pod yet. Such a run's pods are all left alone
+/// without `--force`: provisioning sweeps its own duplicates.
+fn starting(state: Option<RunState>, record: Option<&PodRecord>) -> bool {
+    let unanswered = record
+        .and_then(|record| record.attempts.last())
+        .is_some_and(|attempt| attempt.pod_id.is_none());
+    match state {
+        Some(RunState::Preparing) => true,
+        Some(RunState::Running) => unanswered,
+        _ => false,
+    }
 }
 
 /// Deletes the pod of `record`, unless it is already deleted.

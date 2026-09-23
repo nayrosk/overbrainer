@@ -381,8 +381,42 @@ async fn a_corrupt_pod_json_is_skipped_with_a_warning() -> TestResult {
 }
 
 #[tokio::test]
-async fn pod_rm_of_a_run_in_progress_keeps_its_training_pod_and_deletes_the_others() -> TestResult {
-    for state in [RunState::Running, RunState::Preparing] {
+async fn pod_rm_of_a_running_run_keeps_its_training_pod_and_deletes_the_others() -> TestResult {
+    let state = RunState::Running;
+    let account = Account::default()
+        .with("p1", Some(RUN), true)
+        .with("s1", Some(RUN), true)
+        .with("x2", Some(RUN), true);
+    let harness = Harness::new(account).await?;
+    harness.recorded(RUN, state, "p1", PodState::Running)?;
+    harness.strays(RUN, &["s1"])?;
+    let removal = remove_run_pods(&harness.ctx(), RUN, false).await;
+    let error = removal.result.err().ok_or("expected a refusal")?;
+    assert!(matches!(error, PodError::RunStillRunning { .. }), "{error}");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "run {RUN} is still running: its training pod p1 was kept, and its other pods s1, x2 were deleted; stop it with `overbrainer train cancel {RUN}` first, or pass --force"
+        )
+    );
+    let ids: Vec<String> = removal
+        .removed
+        .iter()
+        .map(|pod| pod.pod_id.to_string())
+        .collect();
+    assert_eq!(ids, vec!["s1", "x2"]);
+    assert_eq!(harness.deletes().await, vec!["s1", "x2"]);
+    let record = harness.pod_json(RUN)?;
+    assert_eq!(record.state, PodState::Running);
+    assert!(record.stray_pods.is_empty());
+    assert_eq!(harness.runs.load(RUN)?.state, state);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pod_rm_leaves_a_run_still_starting_its_pod_alone_unless_forced() -> TestResult {
+    // A preparing run, and a running run whose last create call has no pod yet.
+    for (state, answered) in [(RunState::Preparing, true), (RunState::Running, false)] {
         let account = Account::default()
             .with("p1", Some(RUN), true)
             .with("s1", Some(RUN), true)
@@ -390,26 +424,29 @@ async fn pod_rm_of_a_run_in_progress_keeps_its_training_pod_and_deletes_the_othe
         let harness = Harness::new(account).await?;
         harness.recorded(RUN, state, "p1", PodState::Running)?;
         harness.strays(RUN, &["s1"])?;
-        let removal = remove_run_pods(&harness.ctx(), RUN, false).await;
-        let error = removal.result.err().ok_or("expected a refusal")?;
-        assert!(matches!(error, PodError::RunStillRunning { .. }), "{error}");
+        if !answered {
+            let mut record = harness.pod_json(RUN)?;
+            record.begin_attempt("NVIDIA A40", SystemTime::now(), 6.0);
+            record.save(&harness.runs)?;
+        }
+        let refused = remove_run_pods(&harness.ctx(), RUN, false).await;
+        let error = refused.result.err().ok_or("expected a refusal")?;
+        assert!(matches!(error, PodError::StillStarting(_)), "{error}");
         assert_eq!(
             error.to_string(),
             format!(
-                "run {RUN} is still running: its training pod p1 was kept, and its other pods s1, x2 were deleted; stop it with `overbrainer train cancel {RUN}` first, or pass --force"
+                "run {RUN} is still starting its pod; wait for it, or use `overbrainer train cancel {RUN}` once it runs, or `pod rm {RUN} --force`"
             )
         );
-        let ids: Vec<String> = removal
-            .removed
-            .iter()
-            .map(|pod| pod.pod_id.to_string())
-            .collect();
-        assert_eq!(ids, vec!["s1", "x2"]);
-        assert_eq!(harness.deletes().await, vec!["s1", "x2"]);
-        let record = harness.pod_json(RUN)?;
-        assert_eq!(record.state, PodState::Running);
-        assert!(record.stray_pods.is_empty());
+        assert!(refused.removed.is_empty());
+        assert!(harness.deletes().await.is_empty());
+        assert_eq!(harness.pod_json(RUN)?.stray_pods.len(), 1);
         assert_eq!(harness.runs.load(RUN)?.state, state);
+
+        let forced = remove_run_pods(&harness.ctx(), RUN, true).await;
+        forced.result?;
+        assert_eq!(harness.deletes().await, vec!["p1", "s1", "x2"]);
+        assert_eq!(harness.runs.load(RUN)?.state, RunState::Failed);
     }
     Ok(())
 }

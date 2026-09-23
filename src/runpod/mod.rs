@@ -140,6 +140,12 @@ pub enum PodError {
         /// What was kept and deleted, starting with `: `, or empty.
         kept: String,
     },
+    /// `pod rm` of a run still starting its pod, without `--force`: nothing was
+    /// deleted, since a pod being provisioned must never be at risk.
+    #[error(
+        "run {0} is still starting its pod; wait for it, or use `overbrainer train cancel {0}` once it runs, or `pod rm {0} --force`"
+    )]
+    StillStarting(String),
     /// `pod rm` of a run absent from this project's `runs/`, without `--force`:
     /// its pods may belong to another checkout.
     #[error(
