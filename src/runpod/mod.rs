@@ -8,12 +8,16 @@
 
 use std::path::PathBuf;
 
+mod bootstrap;
 mod client;
 mod keys;
 mod record;
 mod status;
 mod types;
 
+pub use bootstrap::{
+    HOST_KEY_ENV, JOB_ENV, PodSettings, bootstrap_functions, pod_command, pod_env, watchdog_script,
+};
 pub use client::{ApiError, RunpodClient, USER_AGENT};
 pub use keys::{
     CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,

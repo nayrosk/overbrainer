@@ -27,7 +27,7 @@ pub use digest::{
 pub use lines::{LineStream, MAX_TAIL_READ, complete_lines};
 pub use local::LocalExecutor;
 pub use runtime::{JobRuntime, JobSpec, shell_path};
-pub use script::{cancel_script, job_script, parse_status, quote, status_script};
+pub use script::{GROUP_SIGNAL, cancel_script, job_script, parse_status, quote, status_script};
 pub use ssh::SshExecutor;
 
 use crate::config::Engine;
