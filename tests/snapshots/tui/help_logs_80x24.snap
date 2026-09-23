@@ -15,7 +15,7 @@ source: src/tui/snapshots.rs
 "│ │q, Ctrl-C                  quit                                           │ │"
 "│ │k j, Up Down, PgUp PgDn    scroll                                         │ │"
 "│ │G, End                     follow the newest lines                        │ │"
-"│ │f                          cycle the level shown: error, warn, info, debug│ │"
+"│ │f                          cycle level: error, warn, info, debug, trace   │ │"
 "│ └──────────────────────────────────────────────────────────────────────────┘ │"
 "│                                                                              │"
 "│                                                                              │"
