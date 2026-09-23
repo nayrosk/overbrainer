@@ -5,6 +5,7 @@ mod id;
 mod summary;
 mod train;
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ pub const RUNS_DIR: &str = "runs";
 pub const RECORD_FILE: &str = "run.json";
 
 /// Errors reading or writing run records.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum RunsError {
     /// A run file or directory could not be read or written.
     #[error("cannot access {}", path.display())]
@@ -37,7 +38,7 @@ pub enum RunsError {
         #[source]
         source: io::Error,
     },
-    /// A `run.json` is not a valid record.
+    /// A `run.json` or `pod.json` is not a valid record.
     #[error("{} is not a valid run record", path.display())]
     Invalid {
         /// The file.
@@ -52,6 +53,31 @@ pub enum RunsError {
     /// No run has this ID.
     #[error("no run `{0}` in runs/")]
     NotFound(String),
+}
+
+impl fmt::Debug for RunsError {
+    /// Same fields as the derived `Debug`, except `Invalid`'s JSON error, whose
+    /// message can quote the offending value straight from the file it failed to
+    /// parse; only its position is shown, never that text.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { path, source } => f
+                .debug_struct("Io")
+                .field("path", path)
+                .field("source", source)
+                .finish(),
+            Self::Invalid { path, source } => f
+                .debug_struct("Invalid")
+                .field("path", path)
+                .field(
+                    "source",
+                    &format_args!("line {} column {}", source.line(), source.column()),
+                )
+                .finish(),
+            Self::InvalidId(id) => f.debug_tuple("InvalidId").field(id).finish(),
+            Self::NotFound(id) => f.debug_tuple("NotFound").field(id).finish(),
+        }
+    }
 }
 
 /// Where a run stands, as last seen by overbrainer.

@@ -498,4 +498,31 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn a_corrupt_pod_json_fails_without_echoing_its_content() -> TestResult {
+        const MARKER: &str = "MARKER-6b1f2d9c-never-printed";
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let dir = runs.run_dir(RUN)?;
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(POD_FILE);
+        for content in [
+            // Truncated JSON.
+            format!("{{\"version\": 1, \"{MARKER}\": "),
+            // Valid JSON, but not the shape of a `PodRecord`.
+            format!("[\"{MARKER}\", 1, 2]"),
+        ] {
+            fs::write(&path, &content)?;
+            let error = PodRecord::load(&runs, RUN)
+                .err()
+                .ok_or("expected an error")?;
+            assert!(matches!(error, RunsError::Invalid { .. }), "{content}");
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(!display.contains(MARKER), "{display}");
+            assert!(!debug.contains(MARKER), "{debug}");
+        }
+        Ok(())
+    }
 }
