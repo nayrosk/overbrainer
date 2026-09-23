@@ -62,6 +62,9 @@ jobs:
           busybox sh -c 'echo busybox ready'
           curl --version
       - run: cargo test --all-targets --locked
+        env:
+          # A missing or changed TUI snapshot fails the test; nothing is written.
+          INSTA_UPDATE: "no"
 
   ssh:
     runs-on: ubuntu-latest
