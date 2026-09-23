@@ -4,7 +4,7 @@ Distill knowledge from a large "parent" LLM into a smaller open-weights "child" 
 
 overbrainer generates questions on your topics with an LLM, collects answers (and reasoning) from a parent model, then fine-tunes a child model with Axolotl locally, over SSH or on Runpod, while showing live progress in a terminal UI.
 
-Status: early development. Available today: project setup, configuration checks, the data pipeline (subtopics, questions, answers, train/eval split), and fine-tuning with Axolotl on this machine, over SSH or on a Runpod pod. The terminal UI comes next.
+Status: early development. Available today: project setup, configuration checks, the data pipeline (subtopics, questions, answers, train/eval split), fine-tuning with Axolotl on this machine, over SSH or on a Runpod pod, and a terminal UI over all of it.
 
 ## Install
 
@@ -210,6 +210,25 @@ overbrainer also sets `attn_implementation: sdpa` (no extra package needed), `gr
 
 Values set through the environment (`OVERBRAINER_TRAINING__AXOLOTL_EXTRA__WARMUP_STEPS=10`) arrive as text; overbrainer turns `true`, `false`, integers and decimal numbers into booleans and numbers, and leaves anything else as text. A number-like value that must stay text belongs in `overbrainer.toml`.
 
+## Terminal UI
+
+`overbrainer tui` shows the project in four views, switched with `1` to `4` (or Tab, Shift-Tab): the dataset, the pipeline stages, the training runs, and the logs. `?` lists the keys of the current view (Esc, `?` or `q` closes it); `R` reloads the data files and the runs list from disk. It runs the same stages and training flows as the commands above, needs a terminal (it refuses to start when stdout is not one), and is laid out for at least 80x24 characters. `NO_COLOR` switches to a monochrome theme. While the TUI runs, logs go to its Logs view instead of stderr; `OVERBRAINER_LOG` still sets what is captured.
+
+- **Dataset** (`1`): the topics, their subtopics, questions and answers as a tree, with a detail pane (an answer's reasoning and content, PgUp and PgDn scroll it) or, with `s`, the stats of the selected topic and the train and eval sizes. `/` filters the tree by a case-insensitive substring of question texts and subtopic names: Enter keeps the typed filter applied, Esc clears the filter, whether it is being typed or already applied. Questions show `[a]` when answered and used for training, `[x]` when the answer is excluded, `[o]` when orphaned (its topic is no longer configured), `[ ]` when unanswered. Topics no longer in `overbrainer.toml` and questions whose subtopic is gone are shown too, so they can be deleted.
+- **Pipeline** (`2`): `r` opens a menu of the stages and `run`, always on every topic and without `--force` (both stay command-line options). The view shows each stage's progress, requests in flight, retries, failures, tokens and cost, and the summary lines the command would print. `run` stops after `split` here: training starts only with `t`.
+- **Training** (`3`): the runs of `runs/`, and for the selected one its progress, ETA, pod and estimated spend, a loss chart and sparklines of the learning rate and gradient norm. `t` starts a run on `training.target` after a confirmation that shows the target, the model, the data and, for Runpod, each GPU type with its catalog list price times `gpu_count`, and the most `max_hours` can cost at the highest listed rate, marked "(some prices unknown)" when a price could not be read; `--target` and `--keep-pod` stay command-line options. A start holds the data lock until its job begins and is never interrupted before then; quitting while a Runpod run is still provisioning offers to abandon it instead of waiting. `a` follows a run again, `c` cancels its job after a confirmation. Leaving the view does not stop following a run: its results are still retrieved and its pod deleted on time while the TUI is open.
+- **Logs** (`4`): the captured log lines, newest at the bottom. Scrolling back with `k`/`j`, the arrows or PgUp/PgDn pins the view on the line it reached; `G` or End follows the newest lines again. `f` cycles the level shown (error, warn, info, debug, trace) and resumes following.
+
+`e` edits the selected question, answer or subtopic name in `$VISUAL` or `$EDITOR` (`vi` by default; `code --wait` works). The text goes through a file in `data/` readable only by you; an answer shows its reasoning and content between two marker lines, which must stay as they are. Editing a question's text gives it a new ID and deletes its old answer (it answers another question): run `answers` to answer it again. Renaming a subtopic gives its questions new IDs and keeps their answers. An edit that collides with another question or subtopic is refused, and an edit refused after you typed it keeps its file, whose path is shown. `d` deletes the selected item after a confirmation that says what goes with it: a subtopic takes its questions and their answers, a question its answer, an answer only itself. After every edit or deletion, `split` runs again.
+
+A deleted subtopic or question is recorded in `data/rejected.jsonl`, so the stages do not generate it again: `subtopics` drops that name, and `questions` treats that text as already asked (its exact text, a case or spacing variant, or a near-duplicate). `--force` keeps these rejections. To allow one again, remove its line from `data/rejected.jsonl`.
+
+While a stage, an edit or a training start runs in the TUI, and once it is quitting, `e`, `d`, `r` and `t` are refused. An `overbrainer` command run in another terminal at the same time is not locked out: avoid editing in the TUI while a stage runs elsewhere, since a stage appending to a file the TUI rewrites loses those lines. An edit checks that what it changes is still on disk as shown, and refuses otherwise.
+
+`q` quits at once when nothing runs, and otherwise asks, saying what becomes of each piece of work: a stage stops and resumes on its next run (its requests in flight are lost, already paid); a followed run keeps running and can be attached again; a run still starting is left running once its job has started, never cut during its start, and for a Runpod run still provisioning a second question offers to delete its pod instead; an edit or a cancel in progress is waited for, including a cancel confirmed while quitting. While the help overlay is open, `q` (like Esc or `?`) closes it instead of quitting; a filter being typed also takes `q` as a character. Ctrl-C quits the same way `q` does, but from any of those contexts too, closing or leaving them first. After the TUI exits, it prints what it left running, with the commands to follow it again. A SIGTERM or SIGHUP from outside ends the TUI without asking, as Ctrl-C does on the command line; so does SIGINT, except while `$EDITOR` holds the terminal, where it is ignored (it would come from a Ctrl-C typed in the editor) until the TUI takes the terminal back. An editor still running when the TUI ends is sent SIGTERM, then SIGKILL two seconds later if it has not exited.
+
+If the terminal fails (it cannot be drawn on or read, or a view panics), the TUI quits as a confirmed `q` does, without asking, and gives the terminal back: stderr says what it waits for, and prints the warnings and errors logged meanwhile. A run still starting is waited for until its job has started, never abandoned; Ctrl-C at that point abandons it, as on the command line.
+
 ## Configuration
 
 `overbrainer.toml` describes the project: topics, providers (by protocol), model roles, pipeline and training settings, training targets. It never contains URLs, hosts or secrets, so it is safe to commit.
@@ -268,7 +287,7 @@ overbrainer reads `VAULT_ADDR` and `VAULT_TOKEN` (or `~/.vault-token`, as writte
 
 ### Logs
 
-Logs go to stderr. Set the filter with `OVERBRAINER_LOG` (for example `debug`); by default overbrainer logs at `info` and its dependencies at `warn`. `NO_COLOR` disables colors.
+Logs go to stderr, or to the Logs view of `overbrainer tui`. Set the filter with `OVERBRAINER_LOG` (for example `debug`); by default overbrainer logs at `info` and its dependencies at `warn`. `NO_COLOR` disables colors.
 
 ## Releasing
 

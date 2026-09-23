@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use overbrainer::config::{EnvSource, Settings, load};
 use overbrainer::dataset::{
-    DataFiles, Example, Exclusion, FinishReason, Id, Question, ReasoningKind, Role, Subtopic, read,
+    Appender, DataFiles, Example, Exclusion, FinishReason, Id, Question, ReasoningKind, Rejected,
+    Role, Subtopic, read,
 };
 use overbrainer::dedup::{Deduplicator, Embedding, Layered, Lexical};
 use overbrainer::events::{Event, EventBus, Stage};
@@ -1237,5 +1238,67 @@ async fn split_leaves_out_and_counts_answers_of_replaced_questions() -> TestResu
             .all(|e| e.messages[0].content != "Question 0?"),
         "the answer of the replaced question is not trained"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn subtopics_drop_a_rejected_name_and_top_up_with_another() -> TestResult {
+    let project = Project::new()?;
+    Appender::open(&project.files.rejected)?.append(&Rejected::Subtopic {
+        id: Id::subtopic("ownership", "Borrowing"),
+        topic: "ownership".into(),
+        name: "Borrowing".into(),
+    })?;
+    let fake = FakeLlm::new(Box::new(|_, _| {
+        Ok(text(r#"["  borrowing", "Lifetimes", "Moves"]"#))
+    }));
+    let generator = project.role(fake, false);
+    let stats = pipeline::subtopics(&project.ctx(false), &generator).await?;
+    assert_eq!((stats.done, stats.failed), (1, 0));
+    let subtopics: Vec<Subtopic> = read(&project.files.subtopics)?;
+    let names: Vec<&str> = subtopics.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["Lifetimes", "Moves"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn questions_drop_rejected_texts_their_case_variants_and_near_duplicates() -> TestResult {
+    let project = Project::new()?;
+    let subtopic_id = Id::subtopic("ownership", "Borrowing");
+    Appender::open(&project.files.subtopics)?.append(&Subtopic {
+        id: subtopic_id.clone(),
+        topic: "ownership".into(),
+        name: "Borrowing".into(),
+    })?;
+    let rejected = "What happens to a borrow when the owner is moved?";
+    Appender::open(&project.files.rejected)?.append(&Rejected::Question {
+        id: Id::question(&subtopic_id, rejected),
+        topic: "ownership".into(),
+        subtopic_id: subtopic_id.clone(),
+        text: rejected.into(),
+    })?;
+    let fake = FakeLlm::new(Box::new(|_, call| {
+        Ok(text(match call {
+            1 => {
+                r#"["WHAT HAPPENS TO A BORROW WHEN THE OWNER IS MOVED?", "What happens to a borrow when the owner is moved away?"]"#
+            },
+            2 => r#"["What is a lifetime?", "Why does a borrow end early?"]"#,
+            _ => r#"["When does a move happen?"]"#,
+        }))
+    }));
+    let generator = project.role(fake, false);
+    let stats = pipeline::questions(&project.ctx(false), &generator, || Lexical::new(0.8)).await?;
+    assert_eq!((stats.done, stats.failed), (1, 0));
+    let questions: Vec<Question> = read(&project.files.questions)?;
+    let texts: Vec<&str> = questions.iter().map(|q| q.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        [
+            "What is a lifetime?",
+            "Why does a borrow end early?",
+            "When does a move happen?"
+        ]
+    );
+    assert_eq!(generator.client.requests().len(), 3);
     Ok(())
 }

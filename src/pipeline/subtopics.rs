@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use super::{Ctx, Item, PipelineError, RoleClient, ask_list, item_error, without_topics};
 use crate::config::Topic;
-use crate::dataset::{Appender, Id, Subtopic, read, rewrite};
+use crate::dataset::{Appender, Id, Rejected, Subtopic, read, rewrite};
 use crate::events::{Event, Stage, StageStats};
 use crate::llm::{LlmClient, Usage};
 use crate::prompts;
@@ -17,7 +17,7 @@ struct Context<'a> {
 }
 
 /// One topic's remaining subtopics to generate: how many are still missing and which
-/// IDs (stored or already generated in this run) must not be repeated.
+/// IDs (stored, rejected, or already generated in this run) must not be repeated.
 struct Plan<'a> {
     topic: &'a Topic,
     existing_ids: BTreeSet<Id>,
@@ -30,8 +30,9 @@ struct Plan<'a> {
 /// A topic is skipped once it has `topic.subtopics` stored subtopics; `--force` first
 /// removes the topic's subtopics. A topic with fewer stored subtopics than configured,
 /// for example after a crash mid-topic, is resumed: only the missing count is
-/// requested, and generated names that normalize to an ID already stored or already
-/// generated in this batch are dropped. An unparseable answer is asked again.
+/// requested, and generated names that normalize to an ID already stored, recorded in
+/// `data/rejected.jsonl` (a deleted subtopic), or already generated in this batch are
+/// dropped. An unparseable answer is asked again.
 ///
 /// # Errors
 ///
@@ -43,6 +44,7 @@ pub async fn subtopics<C: LlmClient>(
 ) -> Result<StageStats, PipelineError> {
     let topics = ctx.topics()?;
     let mut existing: Vec<Subtopic> = read(&ctx.files.subtopics)?;
+    let rejected: Vec<Rejected> = read(&ctx.files.rejected)?;
     if ctx.force {
         existing = without_topics(existing, &topics, |subtopic| &subtopic.topic);
         rewrite(&ctx.files.subtopics, &existing)?;
@@ -69,6 +71,7 @@ pub async fn subtopics<C: LlmClient>(
                 .iter()
                 .filter(|subtopic| subtopic.topic == topic.name)
                 .map(|subtopic| subtopic.id.clone())
+                .chain(rejected_ids(&rejected, &topic.name))
                 .collect(),
             missing: target - have,
             item: Item {
@@ -102,6 +105,17 @@ pub async fn subtopics<C: LlmClient>(
     Ok(stats)
 }
 
+/// IDs of the subtopics of `topic_name` recorded in `data/rejected.jsonl`.
+fn rejected_ids<'a>(
+    rejected: &'a [Rejected],
+    topic_name: &'a str,
+) -> impl Iterator<Item = Id> + 'a {
+    rejected.iter().filter_map(move |record| match record {
+        Rejected::Subtopic { id, topic, .. } if topic == topic_name => Some(id.clone()),
+        _ => None,
+    })
+}
+
 /// Subtopics of `topic_name` already stored.
 fn stored_count(existing: &[Subtopic], topic_name: &str) -> usize {
     existing
@@ -116,7 +130,8 @@ fn target_count(topic: &Topic) -> usize {
 }
 
 /// Asks for `plan.missing` names and turns them into records, dropping names that
-/// normalize to an ID already stored or already generated earlier in this batch.
+/// normalize to an ID of `plan.existing_ids` or already generated earlier in this
+/// batch.
 async fn generate<C: LlmClient>(
     ctx: &Ctx<'_>,
     generator: &RoleClient<C>,

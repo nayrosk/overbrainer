@@ -47,7 +47,7 @@ pub async fn run(project_dir: &Path, command: &PodCommand) -> anyhow::Result<()>
 /// # Errors
 ///
 /// Returns an error when the key is not set or cannot be resolved.
-pub(super) async fn client(settings: &Settings) -> anyhow::Result<RunpodClient> {
+pub(crate) async fn client(settings: &Settings) -> anyhow::Result<RunpodClient> {
     let key = settings
         .runpod
         .api_key

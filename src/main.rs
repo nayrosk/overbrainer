@@ -16,7 +16,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    overbrainer::logging::init();
+    let logs = cli.command.log_mode();
+    overbrainer::logging::init(&logs);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -29,7 +30,7 @@ fn main() -> ExitCode {
         },
     };
 
-    match runtime.block_on(cli::run(cli)) {
+    match runtime.block_on(cli::run(cli, logs)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");

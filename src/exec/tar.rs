@@ -53,13 +53,24 @@ pub(crate) fn upload_entries(dir: &Path, skip: &[String]) -> Result<Vec<String>,
     Ok(entries)
 }
 
-/// Starts a local `tar` writing `entries` of `dir` to its stdout.
+/// A local `tar` command in its own process group, as the local executor's
+/// scripts are: a Ctrl-C typed in the terminal (SIGINT to the foreground
+/// group, from the command line or from `$EDITOR` over the TUI) cannot kill a
+/// copy in flight; only the flow copying decides when it stops.
+fn tar() -> Command {
+    let mut command = Command::new("tar");
+    command.process_group(0);
+    command
+}
+
+/// Starts a local `tar` writing `entries` of `dir` to its stdout, in its own
+/// process group.
 pub(crate) fn spawn_create(
     dir: &Path,
     entries: &[String],
     exclude: &[String],
 ) -> Result<Child, ExecError> {
-    Command::new("tar")
+    tar()
         .args(create_args(&dir.to_string_lossy(), entries, exclude))
         .env("COPYFILE_DISABLE", "1")
         .stdin(Stdio::null())
@@ -70,7 +81,8 @@ pub(crate) fn spawn_create(
 }
 
 /// Extracts the `tar` stream `reader` into the local directory `dir`, created if
-/// needed. An empty stream (nothing to copy) extracts nothing.
+/// needed, with a `tar` in its own process group. An empty stream (nothing to
+/// copy) extracts nothing.
 pub(crate) async fn extract<R: AsyncRead + Unpin>(
     reader: &mut R,
     dir: &Path,
@@ -82,7 +94,7 @@ pub(crate) async fn extract<R: AsyncRead + Unpin>(
     }
     first.truncate(read);
     std::fs::create_dir_all(dir).map_err(io_error(dir))?;
-    let mut child = Command::new("tar")
+    let mut child = tar()
         .arg("-C")
         .arg(dir)
         .args(["-xf", "-"])
@@ -192,6 +204,27 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// The process group of process `pid`, from `/proc`.
+    fn process_group(pid: u32) -> Result<u32, Box<dyn std::error::Error>> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        // `pid (comm) state ppid pgrp ...`: the fields after the command name.
+        let after = stat.rsplit_once(')').ok_or("no command name")?.1;
+        let pgrp = after.split_whitespace().nth(2).ok_or("no process group")?;
+        Ok(pgrp.parse()?)
+    }
+
+    /// A copy's `tar` leads its own process group, so a SIGINT sent to the
+    /// terminal's foreground group does not reach it.
+    #[tokio::test]
+    async fn tar_runs_in_its_own_process_group() -> TestResult {
+        let dir = tempdir()?;
+        let child = spawn_create(dir.path(), &[".".to_string()], &[])?;
+        let pid = child.id().ok_or("tar exited")?;
+        assert_eq!(process_group(pid)?, pid);
+        finish(child, "upload").await?;
+        Ok(())
+    }
 
     fn exit(code: i32) -> std::process::ExitStatus {
         std::os::unix::process::ExitStatusExt::from_raw(code << 8)

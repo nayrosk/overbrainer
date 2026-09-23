@@ -18,6 +18,8 @@ pub struct DataFiles {
     pub train: PathBuf,
     /// `data/eval.jsonl`
     pub eval: PathBuf,
+    /// `data/rejected.jsonl`
+    pub rejected: PathBuf,
 }
 
 impl DataFiles {
@@ -31,6 +33,7 @@ impl DataFiles {
             answers: data.join("answers.jsonl"),
             train: data.join("train.jsonl"),
             eval: data.join("eval.jsonl"),
+            rejected: data.join("rejected.jsonl"),
         }
     }
 }
@@ -202,12 +205,23 @@ fn is_json(line: &[u8]) -> bool {
 ///
 /// Returns [`DatasetError::Io`] if the temp file cannot be written or renamed.
 pub fn rewrite<T: Serialize>(path: &Path, items: &[T]) -> Result<(), DatasetError> {
+    let tmp = write_temp(path, "tmp", items)?;
+    fs::rename(&tmp, path).map_err(io_error(path))
+}
+
+/// Writes `items` to `.<name>.<suffix>` next to `path` and syncs it. Returns the temp
+/// file's path.
+fn write_temp<T: Serialize>(
+    path: &Path,
+    suffix: &str,
+    items: &[T],
+) -> Result<PathBuf, DatasetError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir).map_err(io_error(dir))?;
     let name = path
         .file_name()
         .map_or_else(|| "data".into(), |name| name.to_string_lossy());
-    let tmp = dir.join(format!(".{name}.tmp"));
+    let tmp = dir.join(format!(".{name}.{suffix}"));
     let mut buffer = Vec::new();
     for item in items {
         serde_json::to_writer(&mut buffer, item).map_err(|e| io_error(&tmp)(e.into()))?;
@@ -217,5 +231,61 @@ pub fn rewrite<T: Serialize>(path: &Path, items: &[T]) -> Result<(), DatasetErro
     file.write_all(&buffer)
         .and_then(|()| file.sync_all())
         .map_err(io_error(&tmp))?;
-    fs::rename(&tmp, path).map_err(io_error(path))
+    Ok(tmp)
+}
+
+/// A change to several JSONL files: every new content is written and synced to a
+/// temp file first ([`Rewrite::stage`]), then all of them are renamed over their
+/// files back to back ([`Rewrite::commit`]). A failure while staging changes no
+/// file; only a crash between two renames can leave the files half changed.
+/// Temp files not committed are removed when the `Rewrite` is dropped.
+#[derive(Debug, Default)]
+pub struct Rewrite {
+    staged: Vec<(PathBuf, PathBuf)>,
+}
+
+impl Rewrite {
+    /// A change with nothing staged.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Writes `items` as the next content of `path`, into a synced temp file next
+    /// to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatasetError::Io`] if the temp file cannot be written.
+    pub fn stage<T: Serialize>(&mut self, path: &Path, items: &[T]) -> Result<(), DatasetError> {
+        let tmp = write_temp(path, "staged.tmp", items)?;
+        self.staged.push((tmp, path.to_path_buf()));
+        Ok(())
+    }
+
+    /// Renames every temp file over its file, in the order they were staged,
+    /// stopping at the first failure (the temp files left are removed).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatasetError::Io`] for the first file that cannot be replaced.
+    pub fn commit(mut self) -> Result<(), DatasetError> {
+        let mut pending = std::mem::take(&mut self.staged).into_iter();
+        while let Some((tmp, path)) = pending.next() {
+            if let Err(source) = fs::rename(&tmp, &path) {
+                fs::remove_file(&tmp).ok();
+                self.staged = pending.collect();
+                return Err(io_error(&path)(source));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Rewrite {
+    fn drop(&mut self) {
+        for (tmp, _) in &self.staged {
+            fs::remove_file(tmp).ok();
+        }
+    }
 }

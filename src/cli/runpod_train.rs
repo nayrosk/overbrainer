@@ -6,17 +6,14 @@
 //! the pod's watchdog bounds the cost.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, bail};
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::task::JoinHandle;
 
-use super::train::{Interrupt, POLL, finish, reattach, secrets, started, training, warn};
+use super::front::{BusGuard, Flag, Frontend, Interrupt};
+use super::train::{POLL, finish, reattach, secrets, started, training, warn};
 use crate::config::Settings;
 use crate::dataset::DataFiles;
-use crate::events::EventBus;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{
     DeleteReason, DeletedBy, Ending, PodCtx, PodError, PodRecord, PodState, RunpodClient,
@@ -29,47 +26,41 @@ use crate::runs::{
 };
 use crate::train::{Axolotl, reasoning_template_warning};
 
-/// What every Runpod command sets up: the API client, the event rendering and
-/// the Ctrl-C flag provisioning checks between its steps.
-struct Session {
+/// What every Runpod command sets up: the API client, the front end's bus and
+/// the interrupted flag provisioning checks between its steps.
+struct Session<'f> {
     client: RunpodClient,
     runs: Runs,
-    bus: EventBus,
+    guard: BusGuard,
     timing: Timing,
-    interrupted: Arc<AtomicBool>,
-    watcher: JoinHandle<()>,
-    renderer: JoinHandle<()>,
+    flag: Flag,
+    front: &'f Frontend,
 }
 
-impl Session {
-    /// Opens the API client and run store, then starts the session's Ctrl-C
-    /// watcher and event renderer.
+impl<'f> Session<'f> {
+    /// Opens the API client and run store, then the front end's interrupted flag
+    /// and bus.
     ///
     /// # Errors
     ///
     /// Returns an error when the Runpod API key cannot be resolved, the client
-    /// cannot be built, or the Ctrl-C handler cannot be installed.
-    async fn open(project_dir: &Path, settings: &Settings) -> anyhow::Result<Self> {
+    /// cannot be built, or the interrupted flag cannot be set up.
+    async fn open(
+        project_dir: &Path,
+        settings: &Settings,
+        front: &'f Frontend,
+    ) -> anyhow::Result<Self> {
         let client = super::pod::client(settings).await?;
-        // Registered now, so a Ctrl-C from here on is seen by provisioning.
-        let mut sigint = signal(SignalKind::interrupt()).context("cannot catch Ctrl-C")?;
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let seen = Arc::clone(&interrupted);
-        let watcher = tokio::spawn(async move {
-            if sigint.recv().await.is_some() {
-                seen.store(true, Ordering::SeqCst);
-            }
-        });
-        let bus = EventBus::new();
-        let renderer = tokio::spawn(super::progress::render(bus.subscribe()));
+        // Set up now, so an interruption from here on is seen by provisioning.
+        let flag = front.provisioning_flag()?;
+        let guard = front.open_bus();
         Ok(Self {
             client,
             runs: Runs::new(project_dir),
-            bus,
+            guard,
             timing: Timing::standard(),
-            interrupted,
-            watcher,
-            renderer,
+            flag,
+            front,
         })
     }
 
@@ -77,21 +68,30 @@ impl Session {
         PodCtx {
             client: &self.client,
             runs: &self.runs,
-            bus: &self.bus,
+            bus: &self.guard.bus,
             timing: &self.timing,
-            interrupted: &self.interrupted,
+            interrupted: &self.flag.interrupted,
         }
     }
 
-    /// Stops watching Ctrl-C and lets the renderer print what is left.
+    /// Stops watching for the interruption and lets the bus show what is left.
     async fn close(self) {
-        self.watcher.abort();
-        drop(self.bus);
-        self.renderer.await.ok();
+        self.flag.close();
+        self.guard.close().await;
     }
 }
 
-/// `overbrainer train` on the Runpod target `name`.
+/// Which Runpod target `overbrainer train` starts a run on, and how.
+pub(super) struct RunpodStart<'a> {
+    /// Name of the target in `overbrainer.toml`.
+    pub(super) name: &'a str,
+    /// The target, defaults applied.
+    pub(super) spec: &'a RunpodTarget,
+    /// `--keep-pod`.
+    pub(super) keep: bool,
+}
+
+/// `overbrainer train` on the Runpod target `start.name`.
 ///
 /// # Errors
 ///
@@ -100,17 +100,17 @@ impl Session {
 pub(super) async fn train(
     project_dir: &Path,
     settings: &Settings,
-    name: &str,
-    spec: &RunpodTarget,
-    keep: bool,
+    start: RunpodStart<'_>,
+    front: &Frontend,
 ) -> anyhow::Result<()> {
+    let RunpodStart { name, spec, keep } = start;
     let training = training(settings)?;
     if let Some(warning) = reasoning_template_warning(training) {
         warn(&warning);
     }
     let secrets = secrets(settings).await?;
-    let session = Session::open(project_dir, settings).await?;
-    let mut interrupt = Interrupt::catch();
+    let session = Session::open(project_dir, settings, front).await?;
+    let mut interrupt = front.interrupt();
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let job = Job {
         session: &session,
@@ -121,6 +121,7 @@ pub(super) async fn train(
         warn_orphans(&session.ctx()).await;
         let record = create(&session.runs, spec.workdir(), name)?;
         started(&record);
+        front.run_created(&record.id);
         job.run(&mut interrupt, record, keep, secrets).await
     }
     .await;
@@ -130,7 +131,7 @@ pub(super) async fn train(
 
 /// A run's job on its pod.
 struct Job<'a> {
-    session: &'a Session,
+    session: &'a Session<'a>,
     spec: &'a RunpodTarget,
     trainer: &'a Axolotl<'a>,
 }
@@ -140,7 +141,7 @@ impl Job<'_> {
         RunCtx {
             runs: &self.session.runs,
             executor,
-            bus: &self.session.bus,
+            bus: &self.session.guard.bus,
             poll: POLL,
         }
     }
@@ -166,7 +167,7 @@ impl Job<'_> {
             Err(PodError::Interrupted) => bail!(interrupted_before_job(&self.session.runs, &id)),
             Err(error) => return Err(error.into()),
         };
-        if interrupt.caught() || self.session.interrupted.load(Ordering::SeqCst) {
+        if interrupt.caught() || self.session.flag.interrupted.load(Ordering::SeqCst) {
             return abandon(&ctx, interrupt, &mut pod, &id).await;
         }
         let executor = provisioned.executor;
@@ -272,7 +273,12 @@ impl Job<'_> {
                 outcome.retrieved,
             ))
             .await;
-        let finished = finish(&self.session.runs, &id, Ok(Some(outcome)));
+        let finished = finish(
+            &self.session.runs,
+            &id,
+            Ok(Some(outcome)),
+            self.session.front,
+        );
         ended(pod, ending, &id, finished)
     }
 
@@ -325,19 +331,20 @@ impl Job<'_> {
                 record,
             ))
             .await?;
+        let front = self.session.front;
         if status != JobStatus::Cancelled {
-            println!(
+            front.line(&format!(
                 "train: the job of run {id} had already ended ({}): collect it with `overbrainer train attach {id}`",
                 super::progress::status_name(status)
-            );
+            ));
             return Ok(());
         }
         let ending = interrupt
             .shield(end_pod(&ctx, pod, &executor, &record, retrieved))
             .await;
         match &record.message {
-            Some(message) => println!("train: run {id} cancelled ({message})"),
-            None => println!("train: run {id} cancelled"),
+            Some(message) => front.line(&format!("train: run {id} cancelled ({message})")),
+            None => front.line(&format!("train: run {id} cancelled")),
         }
         ended(pod, ending, &id, Ok(()))
     }
@@ -514,6 +521,7 @@ pub(super) async fn attach(
     settings: &Settings,
     record: RunRecord,
     mut pod: PodRecord,
+    front: &Frontend,
 ) -> anyhow::Result<()> {
     let training = training(settings)?;
     let spec = target_of(settings, &record)?;
@@ -523,8 +531,8 @@ pub(super) async fn attach(
             record.id
         );
     }
-    let session = Session::open(project_dir, settings).await?;
-    let mut interrupt = Interrupt::catch();
+    let session = Session::open(project_dir, settings, front).await?;
+    let mut interrupt = front.interrupt();
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let job = Job {
         session: &session,
@@ -539,7 +547,7 @@ pub(super) async fn attach(
 /// Reports a run whose pod is gone from its local files; a run still `Running`
 /// is failed first, since its job went with the pod.
 async fn from_local_files(
-    session: &Session,
+    session: &Session<'_>,
     trainer: &Axolotl<'_>,
     mut record: RunRecord,
     pod: &PodRecord,
@@ -556,11 +564,11 @@ async fn from_local_files(
     let run_ctx = RunCtx {
         runs: &session.runs,
         executor: &nowhere,
-        bus: &session.bus,
+        bus: &session.guard.bus,
         poll: POLL,
     };
     let outcome = watch(&run_ctx, trainer, record).await?;
-    finish(&session.runs, &id, Ok(Some(outcome)))
+    finish(&session.runs, &id, Ok(Some(outcome)), session.front)
 }
 
 /// `overbrainer train cancel` on a Runpod run.
@@ -574,11 +582,12 @@ pub(super) async fn cancel(
     settings: &Settings,
     record: RunRecord,
     mut pod: PodRecord,
+    front: &Frontend,
 ) -> anyhow::Result<()> {
     let training = training(settings)?;
     let spec = target_of(settings, &record)?;
-    let session = Session::open(project_dir, settings).await?;
-    let mut interrupt = Interrupt::catch();
+    let session = Session::open(project_dir, settings, front).await?;
+    let mut interrupt = front.interrupt();
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let job = Job {
         session: &session,

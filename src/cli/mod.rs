@@ -1,19 +1,22 @@
 //! Command line interface.
 
 mod config_check;
-mod data;
+pub(crate) mod data;
+pub(crate) mod front;
 mod init;
-mod pod;
+pub(crate) mod pod;
 mod progress;
 mod runpod_train;
-mod train;
+pub(crate) mod train;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use secrecy::SecretString;
 use tokio::sync::OnceCell;
 
+use self::front::Frontend;
+use crate::logging::{LOG_LINES, LogBuffer, LogMode};
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
 
 /// The `overbrainer` command line interface.
@@ -84,6 +87,20 @@ pub enum Command {
         #[command(subcommand)]
         command: PodCommand,
     },
+    /// Browse the dataset, run stages and follow training runs in a terminal UI.
+    Tui,
+}
+
+impl Command {
+    /// Where this command's logs go: an in-memory buffer for `tui`, which owns the
+    /// terminal, stderr for every other command.
+    #[must_use]
+    pub fn log_mode(&self) -> LogMode {
+        match self {
+            Self::Tui => LogMode::Tui(LogBuffer::new(LOG_LINES)),
+            _ => LogMode::Stderr,
+        }
+    }
 }
 
 /// Subcommands of `overbrainer pod`.
@@ -170,38 +187,49 @@ pub enum ConfigCommand {
     },
 }
 
-/// Runs the parsed command line.
+/// Runs the parsed command line, whose logs were set up with `logs` (see
+/// [`Command::log_mode`]).
 ///
 /// # Errors
 ///
-/// Returns an error if the selected subcommand fails.
-pub async fn run(cli: Cli) -> anyhow::Result<()> {
+/// Returns an error if the selected subcommand fails, or if `tui` is not given the
+/// [`LogMode::Tui`] its logs need.
+pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
     let dir = &cli.project_dir;
     match cli.command {
         Command::Init { dir: target } => init::run(target.as_deref().unwrap_or(dir)),
         Command::Config {
             command: ConfigCommand::Check { resolve },
         } => config_check::run(dir, resolve).await,
-        Command::Subtopics(args) => data::run(dir, data::Command::Subtopics, &args).await,
-        Command::Questions(args) => data::run(dir, data::Command::Questions, &args).await,
-        Command::Answers(args) => data::run(dir, data::Command::Answers, &args).await,
+        Command::Subtopics(args) => stage(dir, data::Command::Subtopics, &args).await,
+        Command::Questions(args) => stage(dir, data::Command::Questions, &args).await,
+        Command::Answers(args) => stage(dir, data::Command::Answers, &args).await,
         Command::Split(SplitArgs { topic }) => {
             let args = StageArgs {
                 topic,
                 force: false,
             };
-            data::run(dir, data::Command::Split, &args).await
+            stage(dir, data::Command::Split, &args).await
         },
         Command::Run => {
-            data::run(dir, data::Command::Run, &StageArgs::default()).await?;
-            train::after_run(dir).await
+            stage(dir, data::Command::Run, &StageArgs::default()).await?;
+            train::after_run(dir, &Frontend::Cli).await
         },
-        Command::Train(args) => train::run(dir, &args).await,
+        Command::Train(args) => train::run(dir, &args, &Frontend::Cli).await,
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
         Command::Pod { command } => pod::run(dir, &command).await,
+        Command::Tui => match logs {
+            LogMode::Tui(buffer) => crate::tui::run(dir, buffer).await,
+            LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),
+        },
     }
+}
+
+/// Runs a pipeline command on the command line.
+async fn stage(dir: &Path, command: data::Command, args: &StageArgs) -> anyhow::Result<()> {
+    data::run(dir, command, args, &Frontend::Cli).await
 }
 
 /// Secret resolver from `VAULT_ADDR`, `VAULT_TOKEN` and `~/.vault-token`. Vault is

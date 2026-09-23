@@ -9,7 +9,7 @@ mod subtopics;
 pub use answers::{answers, classify, raw_reasoning_warning};
 pub use parse::string_array;
 pub use questions::questions;
-pub use split::{SplitReport, split, stratify};
+pub use split::{SplitClass, SplitReport, eval_size, split, split_class, stratify};
 pub use subtopics::subtopics;
 
 use crate::config::{RoleModel, Settings, Topic};
