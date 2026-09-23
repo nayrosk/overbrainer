@@ -460,30 +460,47 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn a_failed_price_read_never_logs_the_key() -> Result<(), Box<dyn std::error::Error>> {
+    /// The capture is installed with `with_default` around a runtime built for
+    /// the test, and the callsite interest cache rebuilt under it. The warning
+    /// is hit once before: while a single subscriber is registered, `tracing`
+    /// registers a callsite first hit on another thread (by a test with no
+    /// subscriber) with that thread's default, caching it as never. The fixed
+    /// catalog warning must be captured, so an empty capture fails.
+    #[test]
+    fn a_failed_price_read_never_logs_the_key() -> Result<(), Box<dyn std::error::Error>> {
         use tracing_subscriber::layer::SubscriberExt;
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/catalog/gpus/NVIDIA%20A40"))
-            .respond_with(
-                ResponseTemplate::new(404).set_body_string(format!("{{\"detail\": \"{KEY}\"}}")),
-            )
-            .mount(&server)
-            .await;
-        let (dir, env) = runpod_project(Some(&server))?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (server, dir, env) = runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/catalog/gpus/NVIDIA%20A40"))
+                .respond_with(
+                    ResponseTemplate::new(404)
+                        .set_body_string(format!("{{\"detail\": \"{KEY}\"}}")),
+                )
+                .mount(&server)
+                .await;
+            let (dir, env) = runpod_project(Some(&server))?;
+            // Registers the warning's callsite before the capture.
+            list_prices(dir.path(), env.clone(), vec!["NVIDIA A40".into()]).await;
+            Ok::<_, Box<dyn std::error::Error>>((server, dir, env))
+        })?;
         let logs = crate::logging::LogBuffer::new(100);
         let subscriber = tracing_subscriber::registry().with(logs.layer());
-        let guard = tracing::subscriber::set_default(subscriber);
-        let prices = list_prices(dir.path(), env, vec!["NVIDIA A40".into()]).await;
-        drop(guard);
+        let prices = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            runtime.block_on(list_prices(dir.path(), env, vec!["NVIDIA A40".into()]))
+        });
+        drop(server);
         assert_eq!(prices, [("NVIDIA A40".to_string(), None)]);
         let lines = logs.window(tracing::Level::TRACE, 1000, 0).lines;
         assert!(
-            lines.iter().any(|line| line
-                .message
-                .contains("cannot read the list price of NVIDIA A40")),
+            lines.iter().any(|line| line.message
+                == "cannot read the list price of NVIDIA A40: Runpod answered 404: cannot \
+                    read the GPU catalog"),
             "{lines:?}"
         );
         for line in &lines {
