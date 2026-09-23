@@ -22,6 +22,8 @@ pub(super) struct Theme {
     pub(super) error: Style,
     /// Keys in the help overlay and dialogs.
     pub(super) key: Style,
+    /// The filled part of a progress gauge.
+    pub(super) gauge: Style,
 }
 
 impl Theme {
@@ -38,6 +40,7 @@ impl Theme {
             warn: Style::new().fg(Color::Yellow),
             error: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             key: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            gauge: Style::new().fg(Color::Green),
         }
     }
 
@@ -51,6 +54,7 @@ impl Theme {
             warn: Style::new().add_modifier(Modifier::BOLD),
             error: Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             key: Style::new().add_modifier(Modifier::BOLD),
+            gauge: Style::new().add_modifier(Modifier::BOLD),
         }
     }
 

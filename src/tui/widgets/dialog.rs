@@ -22,7 +22,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, confirm: &Confirm, t
             Span::styled("[y]", theme.key),
             Span::raw(format!(" {}   ", confirm.yes)),
             Span::styled("[n]", theme.key),
-            Span::raw(" cancel"),
+            Span::raw(format!(" {}", confirm.no)),
         ])
         .right_aligned(),
     );

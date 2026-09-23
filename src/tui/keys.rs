@@ -28,6 +28,7 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
     row("?", "this help (Esc, ? or q closes it)"),
     row("q, Ctrl-C", "quit"),
     row("R", "reload the data files"),
+    row("r", "run a pipeline stage, or run (asks which)"),
 ];
 
 const DATASET: &[KeyHelp] = &[

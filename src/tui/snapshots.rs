@@ -5,7 +5,9 @@
 use std::convert::Infallible;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use crossterm::event::{
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
@@ -13,13 +15,16 @@ use tracing::Level;
 
 use super::app::{App, Effect, Overlay, Project, View};
 use super::dataset::{Node, TopicInfo};
-use super::tasks::Done;
+use super::tasks::{Done, TaskId};
 use super::theme::Theme;
 use super::ui;
+use crate::cli::data::Command;
 use crate::dataset::{
     Dataset, Example, Exclusion, FinishReason, Id, Message, Meta, Question, ReasoningKind,
     Rejected, Role, Subtopic,
 };
+use crate::events::{Event, Stage, StageStats};
+use crate::llm::Usage;
 use crate::logging::{LogBuffer, LogLine};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -43,6 +48,7 @@ pub(super) fn app() -> App {
         dir: "/nonexistent/rust_expert".into(),
         topics: Vec::new(),
         eval_ratio: 0.1,
+        concurrency: 8,
     };
     App::new(project, LogBuffer::new(100), Theme::color(), at(NOW))
 }
@@ -245,9 +251,88 @@ pub(super) fn open_to(app: &mut App, path: &[Node]) {
     app.dataset.tree.select(path.to_vec());
 }
 
+fn usage(input_tokens: u64, output_tokens: u64) -> Usage {
+    Usage {
+        input_tokens,
+        output_tokens,
+    }
+}
+
+/// `stage` run to its end: `total` items, `retries` retried attempts.
+fn stage_events(stage: Stage, total: usize, retries: usize) -> Vec<Event> {
+    let mut events = vec![Event::StageStarted { stage, total }];
+    for n in 0..retries {
+        events.push(Event::ItemFailed {
+            stage,
+            id: format!("item{n}"),
+            error: "429 Too Many Requests; retrying in 4.0s".into(),
+            retryable: true,
+        });
+    }
+    for n in 0..total {
+        events.push(Event::ItemDone {
+            stage,
+            id: format!("item{n}"),
+            usage: Some(usage(1000, 250)),
+        });
+    }
+    events
+}
+
+/// A `run` task past its subtopics and questions, answering: 120 of 400 done,
+/// 14 retries, 1 failure.
+pub(super) fn pipeline_running(app: &mut App) {
+    app.pipeline_task = Some(TaskId(7));
+    app.pipeline.started(Command::Run, 8);
+    let mut events = stage_events(Stage::Subtopics, 3, 0);
+    events.push(Event::StageFinished {
+        stage: Stage::Subtopics,
+        stats: StageStats {
+            done: 3,
+            usage: usage(3000, 750),
+            cost: Some(0.0012),
+            ..StageStats::default()
+        },
+    });
+    events.extend(stage_events(Stage::Questions, 36, 2));
+    events.push(Event::StageFinished {
+        stage: Stage::Questions,
+        stats: StageStats {
+            done: 36,
+            usage: usage(40_210, 9120),
+            cost: Some(0.0123),
+            ..StageStats::default()
+        },
+    });
+    events.extend(stage_events(Stage::Answers, 400, 0).into_iter().take(120));
+    for n in 0..14 {
+        events.push(Event::ItemFailed {
+            stage: Stage::Answers,
+            id: format!("3f1c000000000000000000000000{n:04x}"),
+            error: "429 Too Many Requests; retrying in 4.0s".into(),
+            retryable: true,
+        });
+    }
+    events.push(Event::ItemFailed {
+        stage: Stage::Answers,
+        id: "77aa00000000000000000000000010bc".into(),
+        error: "gave up: the answer is not a JSON array of strings".into(),
+        retryable: false,
+    });
+    for event in &events {
+        app.pipeline.event(event);
+    }
+    for line in [
+        "subtopics: 3 done, 0 skipped, 0 failed, 0 excluded; tokens 3000 in, 750 out; cost $0.0012",
+        "questions: 36 done, 0 skipped, 0 failed, 0 excluded; tokens 40210 in, 9120 out; cost $0.0123",
+    ] {
+        app.pipeline.results.push(line.into());
+    }
+}
+
 /// A key press.
-pub(super) fn key(code: KeyCode) -> Event {
-    Event::Key(KeyEvent {
+pub(super) fn key(code: KeyCode) -> TermEvent {
+    TermEvent::Key(KeyEvent {
         code,
         modifiers: KeyModifiers::NONE,
         kind: KeyEventKind::Press,
@@ -256,8 +341,8 @@ pub(super) fn key(code: KeyCode) -> Event {
 }
 
 /// Ctrl-C, a key in raw mode.
-pub(super) fn ctrl_c() -> Event {
-    Event::Key(KeyEvent {
+pub(super) fn ctrl_c() -> TermEvent {
+    TermEvent::Key(KeyEvent {
         code: KeyCode::Char('c'),
         modifiers: KeyModifiers::CONTROL,
         kind: KeyEventKind::Press,
@@ -510,5 +595,105 @@ fn the_delete_dialog_says_what_goes_with_a_subtopic() -> TestResult {
     app.on_input(&key(KeyCode::Char('d')));
     assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
     snapshot("dataset_delete", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn pipeline_before_any_run() -> TestResult {
+    let mut app = app();
+    app.view = View::Pipeline;
+    snapshot("pipeline_idle", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn pipeline_running_with_retries_and_errors() -> TestResult {
+    let mut app = app();
+    app.view = View::Pipeline;
+    pipeline_running(&mut app);
+    snapshot("pipeline_running", &mut app)?;
+    app.pipeline.skipped = 312;
+    snapshot("pipeline_lagged", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn pipeline_finished_with_results() -> TestResult {
+    let mut app = app();
+    app.view = View::Pipeline;
+    app.pipeline.started(Command::Answers, 8);
+    for event in stage_events(Stage::Answers, 4, 1) {
+        app.pipeline.event(&event);
+    }
+    app.pipeline.event(&Event::StageFinished {
+        stage: Stage::Answers,
+        stats: StageStats {
+            done: 4,
+            usage: usage(4000, 7360),
+            cost: Some(0.0431),
+            ..StageStats::default()
+        },
+    });
+    app.pipeline.results.push(
+        "answers: 4 done, 0 skipped, 0 failed, 0 excluded; tokens 4000 in, 7360 out; cost $0.0431"
+            .into(),
+    );
+    app.pipeline.running = false;
+    app.pipeline.outcome = Some(Ok(()));
+    snapshot("pipeline_finished", &mut app)?;
+    Ok(())
+}
+
+/// A failed `run` at the minimum size still shows its final error and its
+/// newest item failures: older failures give way first.
+#[test]
+fn a_failed_run_keeps_its_error_in_view_at_80x24() -> TestResult {
+    let mut app = app();
+    app.view = View::Pipeline;
+    pipeline_running(&mut app);
+    app.pipeline.skipped = 312;
+    for line in [
+        "answers: 400 done, 0 skipped, 1 failed, 0 excluded; tokens 400000 in, 100000 out; cost $0.4000",
+        "split: 399 train, 1 eval, 0 excluded, 0 orphaned",
+    ] {
+        app.pipeline.results.push(line.into());
+    }
+    app.pipeline_task = None;
+    app.pipeline.running = false;
+    app.pipeline.outcome = Some(Err("1 item failed; it is retried on the next run".into()));
+    let rows = text(&draw(&mut app, 80, 24)?);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("1 item failed; it is retried on the next run")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("77aa…10bc")),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("3f1c…000a")),
+        "{rows:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_run_menu() -> TestResult {
+    let mut app = app();
+    app.on_input(&key(KeyCode::Char('r')));
+    app.on_input(&key(KeyCode::Down));
+    app.on_input(&key(KeyCode::Down));
+    snapshot("run_menu", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn the_quit_dialog_says_what_becomes_of_the_work() -> TestResult {
+    let mut app = app();
+    pipeline_running(&mut app);
+    app.edit = Some(TaskId(8));
+    app.on_input(&key(KeyCode::Char('q')));
+    snapshot("quit_dialog", &mut app)?;
     Ok(())
 }

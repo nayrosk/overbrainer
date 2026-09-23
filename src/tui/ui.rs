@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Paragraph, Tabs};
 
 use super::app::{App, Overlay, View};
 use super::views;
-use super::widgets::{dialog, help, status, too_small};
+use super::widgets::{dialog, help, menu, status, too_small};
 
 /// Draws `app` on `frame`.
 pub(super) fn render(frame: &mut Frame, app: &mut App) {
@@ -27,7 +27,8 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
     match app.view {
         View::Dataset => views::dataset::render(frame, body, app),
         View::Logs => views::logs::render(frame, body, app),
-        View::Pipeline | View::Training => {
+        View::Pipeline => views::pipeline::render(frame, body, app),
+        View::Training => {
             let block = Block::bordered()
                 .title(Span::styled(
                     format!(" {} ", app.view.title()),
@@ -41,6 +42,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
     match &app.overlay {
         Some(Overlay::Help) => help::render(frame, area, app),
         Some(Overlay::Confirm(confirm)) => dialog::render(frame, area, confirm, &app.theme),
+        Some(Overlay::Menu(selected)) => menu::render(frame, area, *selected, &app.theme),
         None => {},
     }
 }

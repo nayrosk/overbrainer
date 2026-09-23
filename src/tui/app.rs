@@ -12,8 +12,11 @@ use tracing::Level;
 
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
 use super::editor::{self, Session, Target};
-use super::tasks::{Done, Edit, Saved, Task, TaskId};
+use super::pipeline::{PipelineView, STAGES, command_name};
+use super::tasks::{Done, Edit, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
+use crate::cli::data::Command;
+use crate::cli::front::Report;
 use crate::config::Settings;
 use crate::dataset::{AnswerText, Counts, Dataset, Deletion, Id};
 use crate::logging::LogBuffer;
@@ -34,6 +37,8 @@ pub(super) struct Project {
     pub(super) topics: Vec<TopicInfo>,
     /// `pipeline.eval_ratio`.
     pub(super) eval_ratio: f64,
+    /// `pipeline.concurrency`.
+    pub(super) concurrency: usize,
 }
 
 impl Project {
@@ -53,6 +58,7 @@ impl Project {
                 })
                 .collect(),
             eval_ratio: settings.pipeline.eval_ratio,
+            concurrency: settings.pipeline.concurrency,
         }
     }
 }
@@ -62,6 +68,8 @@ impl Project {
 pub(super) enum Effect {
     /// Start a background task.
     Spawn(TaskId, Task),
+    /// Cancel the token of a task: a pipeline stops.
+    Cancel(TaskId),
     /// Hand the terminal to the editor `command`, on the file `path`.
     OpenEditor {
         /// The program and its arguments.
@@ -142,7 +150,18 @@ pub(super) enum Overlay {
     Help,
     /// A question answered with `y` or `n`.
     Confirm(Confirm),
+    /// The `r` menu, with its selected entry.
+    Menu(usize),
 }
+
+/// The entries of the `r` menu: every pipeline command, all topics, no `--force`.
+pub(super) const MENU: [(Command, &str); 5] = [
+    (Command::Subtopics, "generate the missing subtopics"),
+    (Command::Questions, "fill the subtopics with questions"),
+    (Command::Answers, "ask the parent to answer (paid requests)"),
+    (Command::Split, "rebuild train and eval"),
+    (Command::Run, "all four stages; training starts only with t"),
+];
 
 /// A confirmation dialog: `y` runs its action, anything else closes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +172,8 @@ pub(super) struct Confirm {
     pub(super) text: Vec<String>,
     /// What `y` does, in one word.
     pub(super) yes: &'static str,
+    /// What `n` does, in one word.
+    pub(super) no: &'static str,
     /// What `y` runs.
     pub(super) action: Action,
 }
@@ -167,6 +188,8 @@ pub(super) enum Action {
         /// What the dialog said it removes.
         counts: Counts,
     },
+    /// Quitting while work runs.
+    Quit,
 }
 
 /// Why the loop ends.
@@ -250,11 +273,15 @@ pub(super) struct App {
     pub(super) editing: Option<Session>,
     /// The editor command.
     pub(super) editor: Vec<String>,
+    /// The Pipeline view's state.
+    pub(super) pipeline: PipelineView,
+    /// The pipeline task running, if any.
+    pub(super) pipeline_task: Option<TaskId>,
     /// Lines printed on stderr once the terminal is restored.
     pub(super) exit_notes: Vec<String>,
-    /// How the TUI ends once the edit being saved is saved: `q` or a signal
-    /// came while it was saved.
-    pub(super) quitting: Option<Exit>,
+    /// How the TUI ends, set once it is to end while it waits for work to end:
+    /// the pipeline task it stopped, and an edit being saved (never cut).
+    pub(super) leaving: Option<Exit>,
     next_task: u64,
     /// Whether something changed since the last draw.
     pub(super) dirty: bool,
@@ -282,8 +309,10 @@ impl App {
             edit: None,
             editing: None,
             editor: vec!["vi".to_string()],
+            pipeline: PipelineView::default(),
+            pipeline_task: None,
             exit_notes: Vec::new(),
-            quitting: None,
+            leaving: None,
             next_task: 0,
             log_view: LogView {
                 min: Level::INFO,
@@ -330,8 +359,14 @@ impl App {
     /// The work running, as the status line shows it.
     pub(super) fn work(&self) -> Vec<String> {
         let mut work = Vec::new();
+        if self.leaving.is_some() {
+            work.push("quitting: waiting".to_string());
+        }
         if self.load.is_some() {
             work.push("loading".to_string());
+        }
+        if let Some(progress) = self.pipeline.progress() {
+            work.push(progress);
         }
         if self.edit.is_some() {
             work.push("saving".to_string());
@@ -342,10 +377,16 @@ impl App {
         work
     }
 
-    /// Why the dataset cannot be changed now, if it cannot.
-    pub(super) fn lock(&self) -> Option<&'static str> {
+    /// Why the dataset cannot be changed now, if it cannot: a stage or an edit
+    /// runs in this TUI.
+    pub(super) fn lock(&self) -> Option<String> {
+        if self.pipeline_task.is_some() {
+            let running = self.pipeline.progress().unwrap_or_default();
+            let stage = running.split(' ').next().unwrap_or("a stage");
+            return Some(format!("{stage} is running"));
+        }
         if self.edit.is_some() || self.editing.is_some() {
-            return Some("an edit is being saved");
+            return Some("an edit is being saved".to_string());
         }
         None
     }
@@ -370,6 +411,7 @@ impl App {
         match result {
             Ok(Done::Loaded(loaded)) => self.on_loaded(id, loaded),
             Ok(Done::Saved(saved)) => self.saved(saved),
+            Ok(Done::Pipeline(outcome)) => self.pipeline_ended(id, outcome),
             Err(error) => self.failed(id, error),
         }
     }
@@ -387,11 +429,15 @@ impl App {
         self.pending_reload()
     }
 
-    /// Task `id` failed (a panic): an edit keeps its typed text, a load shows why.
+    /// Task `id` failed (a panic): an edit keeps its typed text, a load and a
+    /// stage show why.
     fn failed(&mut self, id: TaskId, error: String) -> Vec<Effect> {
         tracing::error!("{error}");
         if self.edit == Some(id) {
             return self.saved(Err(error));
+        }
+        if self.pipeline_task == Some(id) {
+            return self.pipeline_ended(id, Err(error));
         }
         if self.load == Some(id) {
             self.load = None;
@@ -419,11 +465,109 @@ impl App {
             Ok(saved) => self.applied(session.as_ref(), saved),
             Err(error) => self.refused(session.as_ref(), error),
         }
-        if let Some(exit) = self.quitting.take() {
-            self.exit = Some(exit);
+        self.leave_when_idle();
+        if self.exit.is_some() {
             return Vec::new();
         }
         self.reload()
+    }
+
+    /// Pipeline task `id` ended with `outcome`: says so, then reloads the data.
+    fn pipeline_ended(&mut self, id: TaskId, outcome: Result<(), String>) -> Vec<Effect> {
+        if self.pipeline_task != Some(id) {
+            return Vec::new();
+        }
+        self.pipeline_task = None;
+        self.pipeline.running = false;
+        let name = self.pipeline.command.map_or("stage", command_name);
+        let (severity, said) = match &outcome {
+            Ok(()) if self.pipeline.command == Some(Command::Run) => (
+                Severity::Info,
+                "run finished after split; training starts only with t".to_string(),
+            ),
+            Ok(()) => (Severity::Info, format!("{name} finished")),
+            Err(error) => (Severity::Error, format!("{name}: {error}")),
+        };
+        if self.leaving.is_some() {
+            self.exit_notes.push(said.clone());
+        }
+        self.say(severity, said);
+        self.pipeline.outcome = Some(outcome);
+        self.leave_when_idle();
+        if self.exit.is_some() {
+            return Vec::new();
+        }
+        self.reload()
+    }
+
+    /// A message of a running task: the events, lag and lines of the pipeline
+    /// task running; those of any other task are dropped.
+    pub(super) fn on_message(&mut self, message: Msg) {
+        self.dirty = true;
+        match message {
+            Msg::Event(id, event) if self.pipeline_task == Some(id) => self.pipeline.event(&event),
+            Msg::Lagged(id, skipped) if self.pipeline_task == Some(id) => {
+                self.pipeline.skipped += skipped;
+            },
+            Msg::Report(id, Report::Line(line)) if self.pipeline_task == Some(id) => {
+                self.pipeline.results.push(line);
+            },
+            _ => {},
+        }
+    }
+
+    /// `r`: the menu of pipeline commands, unless the data is locked.
+    fn run_menu(&mut self) {
+        if let Some(reason) = self.lock() {
+            self.say(
+                Severity::Warn,
+                format!("refused: {reason}; one task at a time"),
+            );
+            return;
+        }
+        self.overlay = Some(Overlay::Menu(0));
+    }
+
+    /// A key in the `r` menu: moves, runs the selected command, or closes it.
+    fn on_menu_key(&mut self, selected: usize, code: KeyCode) -> Vec<Effect> {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.overlay = Some(Overlay::Menu(selected.saturating_sub(1)));
+            },
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.overlay = Some(Overlay::Menu((selected + 1).min(MENU.len() - 1)));
+            },
+            KeyCode::Enter => {
+                self.overlay = None;
+                let (command, _) = MENU[selected.min(MENU.len() - 1)];
+                return self.run_pipeline(command);
+            },
+            _ => self.overlay = None,
+        }
+        Vec::new()
+    }
+
+    /// Starts the pipeline `command` and shows the Pipeline view.
+    fn run_pipeline(&mut self, command: Command) -> Vec<Effect> {
+        if let Some(reason) = self.lock() {
+            self.say(
+                Severity::Warn,
+                format!("refused: {reason}; one task at a time"),
+            );
+            return Vec::new();
+        }
+        let id = self.task_id();
+        self.pipeline_task = Some(id);
+        self.pipeline.started(command, self.project.concurrency);
+        self.view = View::Pipeline;
+        vec![Effect::Spawn(id, Task::Pipeline(command))]
+    }
+
+    /// Ends the TUI once nothing it waits for runs.
+    fn leave_when_idle(&mut self) {
+        if self.leaving.is_some() && self.edit.is_none() && self.pipeline_task.is_none() {
+            self.exit = self.leaving;
+        }
     }
 
     /// A change was saved: drops the temp file of `session`, and says what the
@@ -440,7 +584,7 @@ impl App {
             ),
         };
         self.dataset.split = saved.split.ok();
-        if self.quitting.is_some() {
+        if self.leaving.is_some() {
             self.exit_notes
                 .push(format!("a change was saved: {message}"));
         }
@@ -453,7 +597,7 @@ impl App {
             self.kept(session, &error);
             return;
         }
-        if self.quitting.is_some() {
+        if self.leaving.is_some() {
             self.exit_notes
                 .push(format!("a change was refused ({error}); nothing changed"));
         }
@@ -531,6 +675,16 @@ impl App {
         }
     }
 
+    /// Notes, for the exit, the pipeline task still running when the TUI ended
+    /// without waiting for it (a terminal error): it was stopped with the loop.
+    pub(super) fn abandon_stage(&mut self) {
+        if self.pipeline_task.take().is_some() {
+            let name = self.pipeline.command.map_or("stage", command_name);
+            self.exit_notes
+                .push(format!("{name} was stopped; the next `{name}` resumes it"));
+        }
+    }
+
     /// Shows why the data could not be loaded, in the view and on the status line.
     fn load_failed(&mut self, error: String) {
         self.dataset.model = None;
@@ -555,8 +709,9 @@ impl App {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         if ctrl_c {
-            self.quit();
-            return Vec::new();
+            self.overlay = None;
+            self.dataset.input = None;
+            return self.quit();
         }
         if self.view == View::Dataset && self.dataset.input.is_some() {
             if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
@@ -565,6 +720,7 @@ impl App {
             return Vec::new();
         }
         match &self.overlay {
+            Some(Overlay::Menu(selected)) => return self.on_menu_key(*selected, key.code),
             Some(Overlay::Help) => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
                     self.overlay = None;
@@ -575,11 +731,17 @@ impl App {
             None => {},
         }
         if key.code == KeyCode::Char('q') {
-            self.quit();
+            return self.quit();
+        }
+        if self.leaving == Some(Exit::Quit) && matches!(key.code, KeyCode::Esc | KeyCode::Char('n'))
+        {
+            self.leaving = None;
+            self.say(Severity::Info, "not quitting");
             return Vec::new();
         }
         match key.code {
             KeyCode::Char('R') => return self.reload(),
+            KeyCode::Char('r') => self.run_menu(),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Char('1') => self.view = View::Dataset,
             KeyCode::Char('2') => self.view = View::Pipeline,
@@ -601,6 +763,7 @@ impl App {
             return Vec::new();
         }
         match confirm.action {
+            Action::Quit => self.leave(Exit::Quit),
             Action::Delete { deletion, counts } => {
                 if self.locked() {
                     return Vec::new();
@@ -804,30 +967,74 @@ impl App {
             .map(|line| line.seq);
     }
 
-    /// `q` or Ctrl-C: quits, once an edit being saved is saved.
-    fn quit(&mut self) {
-        if self.edit.is_some() {
-            if self.quitting.is_none() {
-                self.quitting = Some(Exit::Quit);
-            }
-            self.say(Severity::Info, "quitting once the edit is saved");
-            return;
+    /// `q` or Ctrl-C: quits at once when nothing runs, else asks, saying what
+    /// becomes of each piece of work.
+    fn quit(&mut self) -> Vec<Effect> {
+        if self.leaving.is_some() {
+            self.say(Severity::Info, "quitting once the work running ends");
+            return Vec::new();
         }
-        self.exit = Some(Exit::Quit);
+        let mut text = Vec::new();
+        if self.pipeline_task.is_some() {
+            let command = self.pipeline.command.map_or("stage", command_name);
+            let progress = self.pipeline.progress().unwrap_or_default();
+            let flight: usize = STAGES
+                .iter()
+                .map(|stage| self.pipeline.in_flight(*stage))
+                .sum();
+            text.push(format!(
+                "{progress}, {} in flight. It stops now; the next `{command}` resumes it. \
+                 The requests in flight are lost (already paid).",
+                count(flight, "request"),
+            ));
+        }
+        if self.edit.is_some() {
+            text.push("An edit is being saved: quitting waits for it.".to_string());
+        }
+        if text.is_empty() {
+            self.exit = Some(Exit::Quit);
+            return Vec::new();
+        }
+        self.overlay = Some(Overlay::Confirm(Confirm {
+            title: " Quit overbrainer? ".to_string(),
+            text,
+            yes: "quit",
+            no: "stay",
+            action: Action::Quit,
+        }));
+        Vec::new()
     }
 
-    /// SIGINT, SIGTERM or SIGHUP from outside: quits without asking, once an
-    /// edit being saved is saved (it is never cut, design 3.6).
-    pub(super) fn on_signal(&mut self) {
-        if self.edit.is_some() {
-            self.quitting = Some(Exit::Signal);
+    /// Ends the TUI for `why`: stops the pipeline task, and waits for it and for
+    /// an edit being saved. A signal is never turned back into a plain quit.
+    fn leave(&mut self, why: Exit) -> Vec<Effect> {
+        if self.leaving != Some(Exit::Signal) {
+            self.leaving = Some(why);
+        }
+        let effects = self.pipeline_task.map(Effect::Cancel).into_iter().collect();
+        self.leave_when_idle();
+        effects
+    }
+
+    /// SIGINT, SIGTERM or SIGHUP from outside: quits without asking, as Ctrl-C
+    /// does on the command line: the stage stops, an edit being saved is waited
+    /// for (it is never cut, design 3.6).
+    pub(super) fn on_signal(&mut self) -> Vec<Effect> {
+        self.overlay = None;
+        let effects = self.leave(Exit::Signal);
+        if self.exit.is_none() {
+            let waited = if self.edit.is_some() {
+                "the edit is saved".to_string()
+            } else {
+                let name = self.pipeline.command.map_or("stage", command_name);
+                format!("{name} stops")
+            };
             self.say(
                 Severity::Warn,
-                "interrupted: exiting once the edit is saved",
+                format!("interrupted: exiting once {waited}"),
             );
-            return;
         }
-        self.exit = Some(Exit::Signal);
+        effects
     }
 
     /// Moves the clock to `now`: expires the status message and shows new log
@@ -901,6 +1108,7 @@ fn deletion(model: &Model, path: &[Node], topics: &[TopicInfo]) -> Result<Confir
         title: title.to_string(),
         text: vec![question],
         yes: "delete",
+        no: "cancel",
         action: Action::Delete { deletion, counts },
     })
 }
@@ -1150,6 +1358,7 @@ mod tests {
                 dir: "/nonexistent/rust_expert".into(),
                 topics: Vec::new(),
                 eval_ratio: 0.1,
+                concurrency: 8,
             },
             LogBuffer::new(25),
             Theme::color(),
@@ -1428,7 +1637,7 @@ mod tests {
         };
         assert_eq!(command, &["my-editor", "--wait"]);
         assert_eq!(std::fs::read_to_string(path)?, format!("{MOVED}\n"));
-        assert_eq!(app.lock(), Some("an edit is being saved"));
+        assert_eq!(app.lock().as_deref(), Some("an edit is being saved"));
         std::fs::write(path, "What happens to a borrow after a move?\n")?;
         let effects = app.on_editor_exit(Ok(exited(0)));
         let [Effect::Spawn(id, Task::Edit(Edit::Change(Edited::Question { text, .. })))] =
@@ -1523,6 +1732,8 @@ mod tests {
             );
         }
         press(&mut app, &[KeyCode::Char('q')]);
+        assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
+        press(&mut app, &[KeyCode::Char('y')]);
         assert_eq!(app.exit, None, "quitting waits for the edit");
         app.on_done(TaskId(9), Err("a background task failed: panicked".into()));
         assert_eq!(app.exit, Some(Exit::Quit));
@@ -1715,5 +1926,128 @@ mod tests {
             assert!(!text.contains("next"), "{text}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn r_runs_the_chosen_command_one_task_at_a_time() {
+        let mut app = dataset_app();
+        press(
+            &mut app,
+            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Down],
+        );
+        assert_eq!(app.overlay, Some(Overlay::Menu(2)));
+        let effects = press(&mut app, &[KeyCode::Enter]);
+        let [Effect::Spawn(id, Task::Pipeline(Command::Answers))] = effects.as_slice() else {
+            return assert_eq!(effects, []);
+        };
+        assert_eq!(app.view, View::Pipeline);
+        assert_eq!(app.pipeline.concurrency, 8);
+        app.on_message(Msg::Event(
+            *id,
+            crate::events::Event::StageStarted {
+                stage: crate::events::Stage::Answers,
+                total: 3,
+            },
+        ));
+        app.on_message(Msg::Event(
+            TaskId(99),
+            crate::events::Event::StageStarted {
+                stage: crate::events::Stage::Split,
+                total: 3,
+            },
+        ));
+        assert_eq!(
+            app.pipeline.row(crate::events::Stage::Split).state,
+            super::super::pipeline::StageState::Idle,
+            "another task's events are ignored"
+        );
+        app.on_message(Msg::Lagged(*id, 5));
+        app.on_message(Msg::Report(*id, Report::Line("answers: 3 done".into())));
+        assert_eq!((app.pipeline.skipped, app.pipeline.results.len()), (5, 1));
+        assert_eq!(press(&mut app, &[KeyCode::Char('r')]), []);
+        assert_eq!(
+            status(&app),
+            Some("refused: answers is running; one task at a time")
+        );
+        app.view = View::Dataset;
+        press(&mut app, &[KeyCode::Char('e')]);
+        assert_eq!(
+            status(&app),
+            Some("refused: answers is running; edits resume when it ends")
+        );
+        let reload = app.on_done(*id, Ok(Done::Pipeline(Ok(()))));
+        assert!(matches!(reload.as_slice(), [Effect::Spawn(_, Task::Load)]));
+        assert_eq!(status(&app), Some("answers finished"));
+        assert_eq!(app.lock(), None);
+    }
+
+    #[test]
+    fn quitting_asks_then_stops_the_stage_and_waits_for_it() {
+        let mut app = app();
+        crate::tui::snapshots::pipeline_running(&mut app);
+        app.on_input(&ctrl_c());
+        let Some(Overlay::Confirm(confirm)) = app.overlay.clone() else {
+            return assert_eq!(app.overlay, None);
+        };
+        assert_eq!(
+            confirm.text,
+            [
+                "answers 120/400, 8 requests in flight. It stops now; the next `run` resumes \
+                 it. The requests in flight are lost (already paid)."
+            ]
+        );
+        assert_eq!(press(&mut app, &[KeyCode::Char('n')]), []);
+        assert_eq!(app.leaving, None);
+        press(&mut app, &[KeyCode::Char('q')]);
+        let effects = press(&mut app, &[KeyCode::Char('y')]);
+        assert_eq!(effects, [Effect::Cancel(TaskId(7))]);
+        assert_eq!(app.exit, None);
+        assert_eq!(
+            app.work().first().map(String::as_str),
+            Some("quitting: waiting")
+        );
+        app.on_done(TaskId(7), Ok(Done::Pipeline(Err("interrupted".into()))));
+        assert_eq!(app.exit, Some(Exit::Quit));
+        assert_eq!(app.exit_notes, ["run: interrupted"]);
+    }
+
+    #[test]
+    fn a_signal_stops_the_stage_without_asking_and_exits_once_it_ended() {
+        let mut app = app();
+        crate::tui::snapshots::pipeline_running(&mut app);
+        assert_eq!(app.on_signal(), [Effect::Cancel(TaskId(7))]);
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.exit, None);
+        app.on_done(TaskId(7), Err("a background task failed".into()));
+        assert_eq!(app.exit, Some(Exit::Signal));
+    }
+
+    #[test]
+    fn a_signal_while_quitting_stays_a_signal_and_n_cannot_undo_it() {
+        let mut app = app();
+        crate::tui::snapshots::pipeline_running(&mut app);
+        press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        assert_eq!(app.leaving, Some(Exit::Quit));
+        press(&mut app, &[KeyCode::Char('q')]);
+        assert_eq!(app.overlay, None, "no second dialog while quitting");
+        assert_eq!(app.on_signal(), [Effect::Cancel(TaskId(7))]);
+        assert_eq!(app.leaving, Some(Exit::Signal));
+        press(&mut app, &[KeyCode::Char('n'), KeyCode::Esc]);
+        assert_eq!(app.leaving, Some(Exit::Signal));
+        app.on_done(TaskId(7), Ok(Done::Pipeline(Err("interrupted".into()))));
+        assert_eq!(app.exit, Some(Exit::Signal));
+    }
+
+    #[test]
+    fn a_stage_the_loop_ended_without_waiting_is_noted_for_the_exit() {
+        let mut app = app();
+        crate::tui::snapshots::pipeline_running(&mut app);
+        app.abandon_stage();
+        assert_eq!(
+            app.exit_notes,
+            ["run was stopped; the next `run` resumes it"]
+        );
+        app.abandon_stage();
+        assert_eq!(app.exit_notes.len(), 1);
     }
 }

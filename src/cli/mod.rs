@@ -1,8 +1,8 @@
 //! Command line interface.
 
 mod config_check;
-mod data;
-mod front;
+pub(crate) mod data;
+pub(crate) mod front;
 mod init;
 mod pod;
 mod progress;

@@ -78,7 +78,7 @@ where
     let mut looping = Loop {
         terminal,
         input,
-        tasks: Tasks::new(&app.project.dir),
+        tasks: Tasks::new(&app.project.dir, messages.clone()),
         messages,
         inbox,
         tick,
@@ -145,10 +145,7 @@ where
                 },
                 Wake::Message(message) => self.on_message(app, message)?,
                 Wake::Done(id, result) => app.on_done(id, result),
-                Wake::Signal => {
-                    app.on_signal();
-                    Vec::new()
-                },
+                Wake::Signal => app.on_signal(),
                 Wake::Tick => {
                     app.on_tick(SystemTime::now());
                     Vec::new()
@@ -201,6 +198,7 @@ where
     async fn apply(&mut self, effect: Effect) -> anyhow::Result<()> {
         match effect {
             Effect::Spawn(id, task) => self.tasks.spawn(id, task),
+            Effect::Cancel(id) => self.tasks.cancel(id),
             Effect::OpenEditor { command, path } => self.open_editor(&command, path).await?,
         }
         Ok(())
@@ -257,6 +255,10 @@ where
                 self.suspended = false;
                 app.dirty = true;
                 Ok(app.on_editor_exit(status))
+            },
+            message => {
+                app.on_message(message);
+                Ok(Vec::new())
             },
         }
     }
@@ -547,6 +549,65 @@ mod tests {
         tokio::time::timeout(LIMIT, stop_editor(&mut editor)).await?;
         let status = editor.try_wait()?;
         assert_eq!(status.and_then(|status| status.signal()), Some(9));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_burst_through_a_task_bus_loses_nothing_while_the_loop_draws()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::events::{Event, EventBus, Stage};
+        use crate::tui::tasks::{BUS_CAPACITY, Msg, TaskId, forward};
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
+        let mut app = app();
+        app.view = crate::tui::app::View::Pipeline;
+        app.pipeline_task = Some(TaskId(1));
+        app.pipeline.started(crate::cli::data::Command::Answers, 8);
+        let bus = EventBus::with_capacity(BUS_CAPACITY);
+        let (messages, mut inbox) = mpsc::unbounded_channel();
+        forward(TaskId(1), bus.subscribe(), messages);
+        let received = std::cell::Cell::new(0_usize);
+        // Two bursts of 20 000 events, the size of a large tail read, each
+        // followed by an await, as `watch` does between two reads.
+        let publish = async {
+            bus.publish(Event::StageStarted {
+                stage: Stage::Answers,
+                total: 40_000,
+            });
+            for burst in 0..2 {
+                for n in 0..20_000 {
+                    bus.publish(Event::ItemDone {
+                        stage: Stage::Answers,
+                        id: format!("{burst}-{n}"),
+                        usage: None,
+                    });
+                }
+                while received.get() < 1 + (burst + 1) * 20_000 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+            drop(bus);
+        };
+        let consume = async {
+            while let Some(message) = inbox.recv().await {
+                if let Msg::Lagged(_, skipped) = message {
+                    return Err(format!("{skipped} events skipped"));
+                }
+                app.on_message(message);
+                received.set(received.get() + 1);
+                if received.get().is_multiple_of(5_000) {
+                    terminal
+                        .draw(|frame| ui::render(frame, &mut app))
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            Ok(received.get())
+        };
+        let ((), received) =
+            tokio::time::timeout(LIMIT, async { tokio::join!(publish, consume) }).await?;
+        assert_eq!(received?, 40_001);
+        let row = app.pipeline.row(Stage::Answers);
+        assert_eq!((row.finished, row.total), (40_000, 40_000));
         Ok(())
     }
 }

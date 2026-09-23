@@ -11,6 +11,7 @@ use std::task::{Context as TaskContext, Poll, Waker};
 use anyhow::Context;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::events::EventBus;
 
@@ -18,6 +19,25 @@ use crate::events::EventBus;
 pub(crate) enum Frontend {
     /// The command line: a new bus rendered to stderr, Ctrl-C (SIGINT), stdout.
     Cli,
+    /// The terminal UI: the task's own bus, the token that detaches it, the flag
+    /// that abandons a Runpod provisioning, and a sink into the app.
+    Tui {
+        /// The task's bus, which the app forwards.
+        bus: EventBus,
+        /// Cancelled to interrupt the task's flow (a raced watch detaches).
+        detach: CancellationToken,
+        /// Set to make Runpod provisioning stop and delete its pod.
+        abandon: Arc<AtomicBool>,
+        /// Receives what the command line would print.
+        report: Arc<dyn Fn(Report) + Send + Sync>,
+    },
+}
+
+/// What a flow tells its front end besides events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Report {
+    /// A line the command line prints on stdout.
+    Line(String),
 }
 
 impl Frontend {
@@ -32,6 +52,10 @@ impl Frontend {
                     renderer: Some(renderer),
                 }
             },
+            Self::Tui { bus, .. } => BusGuard {
+                bus: bus.clone(),
+                renderer: None,
+            },
         }
     }
 
@@ -39,6 +63,13 @@ impl Frontend {
     pub(crate) fn interrupt(&self) -> Interrupt {
         match self {
             Self::Cli => Interrupt::catch(),
+            Self::Tui { detach, .. } => {
+                let detach = detach.clone();
+                Interrupt::on(Box::pin(async move {
+                    detach.cancelled_owned().await;
+                    Ok(())
+                }))
+            },
         }
     }
 
@@ -63,13 +94,19 @@ impl Frontend {
                     watcher: Some(watcher),
                 })
             },
+            Self::Tui { abandon, .. } => Ok(Flag {
+                interrupted: Arc::clone(abandon),
+                watcher: None,
+            }),
         }
     }
 
-    /// Emits a summary line: the command line prints it on stdout.
+    /// Emits a summary line: the command line prints it on stdout, the TUI gets
+    /// it as a [`Report::Line`].
     pub(crate) fn line(&self, line: &str) {
         match self {
             Self::Cli => println!("{line}"),
+            Self::Tui { report, .. } => report(Report::Line(line.to_string())),
         }
     }
 }
@@ -122,6 +159,11 @@ pub(crate) enum Interrupt {
 }
 
 impl Interrupt {
+    /// Interrupted when `signal` resolves.
+    fn on(signal: Signal) -> Self {
+        Self::Listening(signal)
+    }
+
     /// Starts catching Ctrl-C now.
     fn catch() -> Self {
         let mut signal: Signal = Box::pin(tokio::signal::ctrl_c());
@@ -235,6 +277,90 @@ mod tests {
         let raced = tokio::time::timeout(limit, interrupt.race(raced)).await?;
         assert!(raced.is_none());
         assert!(interrupt.caught());
+        Ok(())
+    }
+
+    fn tui(detach: &CancellationToken) -> Frontend {
+        Frontend::Tui {
+            bus: EventBus::with_capacity(8),
+            detach: detach.clone(),
+            abandon: Arc::new(AtomicBool::new(false)),
+            report: Arc::new(|_| {}),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_detach_token_never_stops_a_shielded_flow_and_stops_a_raced_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limit = Duration::from_secs(10);
+        let token = CancellationToken::new();
+        let mut interrupt = tui(&token).interrupt();
+        assert!(matches!(interrupt, Interrupt::Listening(_)));
+        let shielded = async {
+            token.cancel();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            "ended"
+        };
+        assert_eq!(
+            tokio::time::timeout(limit, interrupt.shield(shielded)).await?,
+            "ended"
+        );
+        assert!(interrupt.caught());
+        assert_eq!(interrupt.race(std::future::ready(())).await, None);
+
+        let token = CancellationToken::new();
+        let mut interrupt = tui(&token).interrupt();
+        let raced = async {
+            token.cancel();
+            std::future::pending::<()>().await;
+        };
+        assert!(
+            tokio::time::timeout(limit, interrupt.race(raced))
+                .await?
+                .is_none()
+        );
+        assert!(interrupt.caught());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_tui_front_end_shares_its_bus_flag_and_reports() -> anyhow::Result<()> {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&lines);
+        let abandon = Arc::new(AtomicBool::new(false));
+        let front = Frontend::Tui {
+            bus: EventBus::with_capacity(8),
+            detach: CancellationToken::new(),
+            abandon: Arc::clone(&abandon),
+            report: Arc::new(move |report| {
+                if let Ok(mut lines) = seen.lock() {
+                    lines.push(report);
+                }
+            }),
+        };
+        let Frontend::Tui { bus, .. } = &front else {
+            anyhow::bail!("not a TUI front end");
+        };
+        let mut events = bus.subscribe();
+        let guard = front.open_bus();
+        guard.bus.publish(Event::StageStarted {
+            stage: Stage::Split,
+            total: 2,
+        });
+        assert!(events.try_recv().is_ok(), "the task's own bus");
+        guard.close().await;
+        let flag = front.provisioning_flag()?;
+        abandon.store(true, Ordering::SeqCst);
+        assert!(flag.interrupted.load(Ordering::SeqCst));
+        flag.close();
+        front.line("split: 1 train, 1 eval, 0 excluded, 0 orphaned");
+        let reported = lines.lock().map(|lines| lines.clone()).unwrap_or_default();
+        assert_eq!(
+            reported,
+            [Report::Line(
+                "split: 1 train, 1 eval, 0 excluded, 0 orphaned".into()
+            )]
+        );
         Ok(())
     }
 

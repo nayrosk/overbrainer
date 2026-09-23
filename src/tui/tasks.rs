@@ -5,15 +5,30 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
+use tokio::sync::broadcast::Receiver;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use super::editor::Edited;
+use crate::cli::StageArgs;
+use crate::cli::data::Command;
+use crate::cli::front::{Frontend, Report};
 use crate::config::EnvSource;
 use crate::dataset::{Counts, DataFiles, Dataset, Deletion};
-use crate::events::EventBus;
+use crate::events::{Event, EventBus};
 use crate::pipeline::{Ctx, SplitReport};
 use crate::prompts::Prompts;
+
+/// Events kept for a TUI task's forwarder when it falls behind. `watch` publishes
+/// every line of one tail read at once, at most 1 MiB, and a metrics line is at
+/// least about 40 bytes: about 26 000 events, then an await lets the forwarder
+/// drain.
+pub(super) const BUS_CAPACITY: usize = 32_768;
 
 /// Identifies a task for the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,6 +41,8 @@ pub(super) enum Task {
     Load,
     /// Changes the dataset files, then runs `split`.
     Edit(Edit),
+    /// A pipeline command, on every topic, without `--force`.
+    Pipeline(Command),
 }
 
 /// A change to the dataset files.
@@ -49,6 +66,8 @@ pub(super) enum Done {
     Loaded(Result<Dataset, String>),
     /// What an edit did, or why nothing changed.
     Saved(Result<Saved, String>),
+    /// How a pipeline command ended.
+    Pipeline(Result<(), String>),
 }
 
 /// A saved edit.
@@ -65,6 +84,50 @@ pub(super) struct Saved {
 pub(super) enum Msg {
     /// The editor ended, or could not be started.
     EditorExited(io::Result<ExitStatus>),
+    /// An event of a task's bus.
+    Event(TaskId, Event),
+    /// A task's forwarder fell behind and skipped this many events.
+    Lagged(TaskId, u64),
+    /// A line a task's flow reported.
+    Report(TaskId, Report),
+}
+
+/// Forwards the events of task `id` from `events` as messages, until every
+/// sender of its bus is dropped (the task ended). Lag is reported, never fatal.
+pub(super) fn forward(id: TaskId, mut events: Receiver<Event>, messages: UnboundedSender<Msg>) {
+    tokio::spawn(async move {
+        loop {
+            let message = match events.recv().await {
+                Ok(event) => Msg::Event(id, event),
+                Err(RecvError::Lagged(skipped)) => Msg::Lagged(id, skipped),
+                Err(RecvError::Closed) => break,
+            };
+            if messages.send(message).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// A TUI front end for task `id`: its own bus, forwarded to `messages`, its
+/// detach token and abandon flag, and its reports sent as messages.
+fn front_end(
+    id: TaskId,
+    messages: &UnboundedSender<Msg>,
+    detach: &CancellationToken,
+    abandon: &Arc<AtomicBool>,
+) -> Frontend {
+    let bus = EventBus::with_capacity(BUS_CAPACITY);
+    forward(id, bus.subscribe(), messages.clone());
+    let sink = messages.clone();
+    Frontend::Tui {
+        bus,
+        detach: detach.clone(),
+        abandon: Arc::clone(abandon),
+        report: Arc::new(move |report| {
+            sink.send(Msg::Report(id, report)).ok();
+        }),
+    }
 }
 
 /// Applies `edit` to the files of the project in `project_dir`, freshly read,
@@ -110,17 +173,29 @@ pub(super) fn save(project_dir: &Path, edit: &Edit, env: EnvSource) -> Result<Sa
 /// The running tasks.
 pub(super) struct Tasks {
     project_dir: PathBuf,
+    messages: UnboundedSender<Msg>,
     set: JoinSet<Done>,
     ids: HashMap<tokio::task::Id, TaskId>,
+    tokens: HashMap<TaskId, CancellationToken>,
 }
 
 impl Tasks {
-    /// No task yet, for the project in `project_dir`.
-    pub(super) fn new(project_dir: &Path) -> Self {
+    /// No task yet, for the project in `project_dir`; running tasks send their
+    /// messages to `messages`.
+    pub(super) fn new(project_dir: &Path, messages: UnboundedSender<Msg>) -> Self {
         Self {
             project_dir: project_dir.to_path_buf(),
+            messages,
             set: JoinSet::new(),
             ids: HashMap::new(),
+            tokens: HashMap::new(),
+        }
+    }
+
+    /// Cancels the token of task `id`: a pipeline stops, a training detaches.
+    pub(super) fn cancel(&self, id: TaskId) {
+        if let Some(token) = self.tokens.get(&id) {
+            token.cancel();
         }
     }
 
@@ -153,6 +228,23 @@ impl Tasks {
                     })
                 })
             },
+            Task::Pipeline(command) => {
+                let dir = self.project_dir.clone();
+                let token = CancellationToken::new();
+                let abandon = Arc::new(AtomicBool::new(false));
+                let front = front_end(id, &self.messages, &token, &abandon);
+                self.tokens.insert(id, token.clone());
+                self.set.spawn(async move {
+                    let args = StageArgs::default();
+                    let run = crate::cli::data::run(&dir, command, &args, &front);
+                    Done::Pipeline(tokio::select! {
+                        result = run => result.map_err(|error| format!("{error:#}")),
+                        () = token.cancelled() => {
+                            Err("interrupted: the stage resumes on its next run".to_string())
+                        },
+                    })
+                })
+            },
         };
         self.ids.insert(handle.id(), id);
     }
@@ -170,6 +262,7 @@ impl Tasks {
                 ),
             };
             if let Some(id) = self.ids.remove(&task) {
+                self.tokens.remove(&id);
                 return Some((id, result));
             }
         }
@@ -193,7 +286,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let files = DataFiles::new(dir.path());
         rewrite(&files.subtopics, &dataset().subtopics)?;
-        let mut tasks = Tasks::new(dir.path());
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
         assert!(tasks.is_empty());
         tasks.spawn(TaskId(7), Task::Load);
         assert!(!tasks.is_empty());
@@ -215,7 +308,7 @@ mod tests {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&files.answers, "not json\n")?;
-        let mut tasks = Tasks::new(dir.path());
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
         tasks.spawn(TaskId(1), Task::Load);
         let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
         let Some((TaskId(1), Ok(Done::Loaded(Err(error))))) = next else {
