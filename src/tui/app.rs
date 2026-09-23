@@ -301,6 +301,9 @@ pub(super) struct App {
     pub(super) prices: Option<TaskId>,
     /// Lines printed on stderr once the terminal is restored.
     pub(super) exit_notes: Vec<String>,
+    /// Which of `exit_notes` were added only because the TUI was leaving (a
+    /// stage stopped, a run detached): dropped when the user stays.
+    leaving_notes: Vec<usize>,
     /// How the TUI ends, set once it is to end while it waits for work to end:
     /// the pipeline task it stopped, and an edit being saved (never cut).
     pub(super) leaving: Option<Exit>,
@@ -339,6 +342,7 @@ impl App {
             prepare: None,
             prices: None,
             exit_notes: Vec::new(),
+            leaving_notes: Vec::new(),
             leaving: None,
             next_task: 0,
             log_view: LogView {
@@ -557,7 +561,7 @@ impl App {
             Err(error) => (Severity::Error, format!("{name}: {error}")),
         };
         if self.leaving.is_some() {
-            self.exit_notes.push(said.clone());
+            self.note_leaving(said.clone());
         }
         self.say(severity, said);
         self.pipeline.outcome = Some(outcome);
@@ -637,6 +641,13 @@ impl App {
         self.pipeline.started(command, self.project.concurrency);
         self.view = View::Pipeline;
         vec![Effect::Spawn(id, Task::Pipeline(command))]
+    }
+
+    /// Adds `note` to the exit notes because the TUI is leaving: it is dropped
+    /// if the user stays.
+    pub(super) fn note_leaving(&mut self, note: String) {
+        self.leaving_notes.push(self.exit_notes.len());
+        self.exit_notes.push(note);
     }
 
     /// Ends the TUI once nothing it waits for runs.
@@ -1161,8 +1172,17 @@ impl App {
 
     /// `n` or Esc while quitting: stays. A stage stopped and a run detached
     /// still end; a run waiting for its job to detach keeps being followed.
+    /// The exit notes added only because the TUI was leaving are dropped; those
+    /// of kept edit files and saved changes stay.
     fn stay(&mut self) {
         self.leaving = None;
+        let dropped = std::mem::take(&mut self.leaving_notes);
+        let mut index = 0;
+        self.exit_notes.retain(|_| {
+            let keep = !dropped.contains(&index);
+            index += 1;
+            keep
+        });
         let mut still = Vec::new();
         if self.pipeline_task.is_some() {
             let name = self.pipeline.command.map_or("stage", command_name);
@@ -3253,6 +3273,37 @@ mod tests {
         );
         assert_eq!(app.exit, Some(Exit::Signal));
         assert_eq!(app.exit_notes, [failed]);
+    }
+
+    /// Staying after `y` drops the exit notes of a run detached and of a stage
+    /// stopped by the quit, and keeps that of a change saved meanwhile.
+    #[test]
+    fn staying_drops_the_notes_of_leaving_and_keeps_saved_changes() {
+        let mut app = app();
+        crate::tui::snapshots::pipeline_running(&mut app);
+        app.training.tasks.insert(
+            TaskId(9),
+            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, FIRST),
+        );
+        watching(&mut app, TaskId(9));
+        app.edit = Some(TaskId(40));
+        press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        app.on_done(TaskId(9), Ok(Done::Trained(Err(DETACHED.into()))));
+        let saved = Saved {
+            message: "question edited".into(),
+            split: Err("no eval".into()),
+        };
+        app.on_done(TaskId(40), Ok(Done::Saved(Ok(saved))));
+        let kept = "a change was saved: question edited, but split failed: no eval; run split";
+        assert_eq!(app.exit_notes, [DETACHED, kept]);
+        press(&mut app, &[KeyCode::Esc]);
+        assert_eq!(app.leaving, None);
+        assert_eq!(app.exit_notes, [kept]);
+        app.on_done(TaskId(7), Ok(Done::Pipeline(Err("interrupted".into()))));
+        assert_eq!(app.exit_notes, [kept], "the stage ends after the stay");
+        press(&mut app, &[KeyCode::Char('q')]);
+        assert_eq!(app.exit, Some(Exit::Quit));
+        assert_eq!(app.exit_notes, [kept]);
     }
 
     #[test]

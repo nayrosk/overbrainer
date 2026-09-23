@@ -411,7 +411,7 @@ impl App {
             },
             Msg::Report(_, Report::Line(line)) => {
                 if self.leaving.is_some() {
-                    self.exit_notes.push(line.clone());
+                    self.note_leaving(line.clone());
                 }
                 if let Some(ended) = self.training.ended.get_mut(&run) {
                     ended.lines.push(line);
@@ -434,12 +434,14 @@ impl App {
         let error = result.err();
         let cancel = follow.cancel_after && self.leaving != Some(Exit::Signal);
         if self.leaving.is_some() {
-            self.exit_notes.extend(follow.lines.iter().cloned());
-            if !cancel {
-                self.exit_notes.extend(error.iter().cloned());
+            for line in &follow.lines {
+                self.note_leaving(line.clone());
+            }
+            if !cancel && let Some(error) = &error {
+                self.note_leaving(error.clone());
             }
             if follow.cancel_after && !cancel {
-                self.exit_notes.push(format!(
+                self.note_leaving(format!(
                     "run {run} was not cancelled: interrupted before its cancel started; \
                      cancel it with `overbrainer train cancel {run}`"
                 ));
