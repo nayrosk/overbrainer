@@ -2,15 +2,18 @@
 # init (docker-init) runs, so it lives exactly as long as the container. At startup
 # it proves that the pod's own API key reaches the pod, and writes the verdict
 # where the client reads it; then, every interval, it deletes the pod when a rule
-# says so. Keep mode (--keep-pod) never deletes. The API key only ever reaches
-# curl on its standard input: it is never in a command line, a file or a log.
+# says so. Keep mode (--keep-pod) holds only once the job exists (job.pid): from
+# then on nothing deletes the pod, but before that a kept pod is as unguarded as
+# any other, so every rule applies to it, the boot grace included. The API key
+# only ever reaches curl on its standard input: it is never in a command line, a
+# file or a log.
 #
 # When the bootstrap itself failed (OVERBRAINER_BOOT_FAILED=1, set by bootstrap.sh's
 # `fail` once the watchdog file exists), this still runs: the pod's own key is
 # already installed by then, so the proof can still be attempted, but the verdict
-# always reports the bootstrap failure and the pod is deleted at once (unless kept).
-# This is what stops a pod that failed early, before sshd even started, from
-# sitting unguarded and unbilled-for-nothing until its deadline.
+# always reports the bootstrap failure and the pod is deleted at once, kept or
+# not: no job will ever start on it. This is what stops a pod that failed early,
+# before sshd even started, from sitting unguarded and billing for nothing.
 #
 # POSIX sh: it runs under bash on the pod and is tested under sh, dash and busybox.
 # group_signal comes from overbrainer's job scripts and is prepended to this file.
@@ -133,9 +136,6 @@ result=$(probe)
 if [ "$BOOT_FAILED" = 1 ]; then
   boot_reason=$(cat "$POD_DIR/bootstrap_failed" 2>/dev/null)
   result="failed bootstrap: ${boot_reason:-unknown}"
-  if [ "$KEEP" = 1 ]; then
-    log "bootstrap failed, kept (keep mode): ${boot_reason:-unknown}"
-  fi
 fi
 verdict "$result"
 log "probe $result"
@@ -157,19 +157,21 @@ while :; do
     retrieved=1
     log "retrieved marker seen"
   fi
+  # Keep mode stays the deadline, retrieved and abandoned rules only once the
+  # job started; a failed bootstrap deletes the pod whatever the mode.
   reason=
-  if [ "$KEEP" != 1 ]; then
-    if [ "$BOOT_FAILED" = 1 ]; then
-      reason=bootstrap_failed
-    elif [ -n "$DEADLINE" ] && [ "$n" -ge "$DEADLINE" ]; then
-      reason=deadline
-    elif [ "$retrieved" = 1 ]; then
-      reason=retrieved
-    elif [ -n "$ended_at" ]; then
-      if [ $((n - ended_at)) -ge "$RETRIEVE_GRACE" ]; then reason=abandoned; fi
-    elif [ "$started" = 0 ] && [ $((n - start)) -ge "$BOOT_GRACE" ]; then
-      reason=never_started
-    fi
+  if [ "$BOOT_FAILED" = 1 ]; then
+    reason=bootstrap_failed
+  elif [ "$KEEP" = 1 ] && [ "$started" = 1 ]; then
+    :
+  elif [ -n "$DEADLINE" ] && [ "$n" -ge "$DEADLINE" ]; then
+    reason=deadline
+  elif [ "$retrieved" = 1 ]; then
+    reason=retrieved
+  elif [ -n "$ended_at" ]; then
+    if [ $((n - ended_at)) -ge "$RETRIEVE_GRACE" ]; then reason=abandoned; fi
+  elif [ "$started" = 0 ] && [ $((n - start)) -ge "$BOOT_GRACE" ]; then
+    reason=never_started
   fi
   if [ -n "$reason" ] && delete_pod "$reason"; then
     if [ "$DELETE_METHOD" = stop ]; then

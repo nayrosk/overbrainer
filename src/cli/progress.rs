@@ -193,7 +193,7 @@ pub fn pod_line(status: &PodStatus) -> String {
                 duration_words(*after)
             ),
             None => format!(
-                "{pod_id} ready after {}; watchdog armed, kept with no time limit (--keep-pod)",
+                "{pod_id} ready after {}; watchdog armed, kept with no time limit once the job starts (--keep-pod)",
                 duration_words(*after)
             ),
         },

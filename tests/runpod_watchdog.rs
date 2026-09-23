@@ -215,14 +215,16 @@ async fn assert_clean(server: &MockServer, pod: &Pod, output: &str, shell: Shell
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_readable_pod_is_ready_and_a_kept_pod_is_never_deleted() -> TestResult {
+async fn a_readable_pod_is_ready_and_a_kept_pod_with_a_job_is_never_deleted() -> TestResult {
     if !curl_available() {
         return Ok(());
     }
     for &shell in shells() {
         let server = stub(200, 204).await;
         let pod = Pod::new()?;
-        // Everything that would delete an ordinary pod at once.
+        // Keep mode holds once the job exists; then everything that would
+        // delete an ordinary pod at once.
+        fs::write(pod.file("job.pid"), "999999\n")?;
         fs::write(pod.file("exit_code"), "0\n")?;
         fs::write(pod.file(".pod/retrieved"), "")?;
         let child = pod.start(
@@ -366,6 +368,36 @@ async fn a_job_that_never_starts_is_deleted_after_the_boot_grace() -> TestResult
             "{shell}: {output}"
         );
         assert!(output.contains("DELETE 404"), "{shell}: {output}");
+    }
+    Ok(())
+}
+
+/// Keep mode starts once the job exists: a kept pod whose job never started is
+/// as unguarded as any other, so the boot grace still deletes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_pod_whose_job_never_starts_is_deleted_after_the_boot_grace() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        let child = pod.start(
+            shell,
+            &server,
+            &[
+                ("OVERBRAINER_KEEP_POD", "1".into()),
+                ("OVERBRAINER_BOOT_GRACE", "2".into()),
+            ],
+        )?;
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert!(
+            output.contains("delete reason=never_started"),
+            "{shell}: {output}"
+        );
+        assert_eq!(deletes(&server).await, 1, "{shell}");
+        assert_clean(&server, &pod, &output, shell).await;
     }
     Ok(())
 }
@@ -886,7 +918,7 @@ async fn a_stale_verdict_is_removed_before_sshd_starts() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_bootstrap_failure_in_keep_mode_only_logs() -> TestResult {
+async fn a_bootstrap_failure_in_keep_mode_still_deletes_the_pod() -> TestResult {
     if !curl_available() || !keygen_available() || running_as_root() {
         return Ok(());
     }
@@ -896,24 +928,19 @@ async fn a_bootstrap_failure_in_keep_mode_only_logs() -> TestResult {
         let mut env = setup.env.clone();
         env.push(("OVERBRAINER_KEEP_POD", "1".to_string()));
         let child = start_bootstrap(shell, &env, ":")?;
-        assert!(
-            until(Duration::from_secs(10), || {
-                setup.read(".pod/watchdog")
-                    == "failed bootstrap: cannot install the authorized key\n"
-            })
-            .await,
-            "{shell}: {:?}",
-            setup.read(".pod/watchdog")
-        );
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
         assert_eq!(
-            deletes(&server).await,
-            0,
-            "{shell}: a kept, failed pod was deleted"
+            setup.read(".pod/watchdog"),
+            "failed bootstrap: cannot install the authorized key\n",
+            "{shell}: {output}"
         );
-        drop(child);
-        let log = setup.read(".pod/watchdog.log");
-        assert!(log.contains("bootstrap failed, kept"), "{shell}: {log}");
+        assert!(
+            output.contains("delete reason=bootstrap_failed"),
+            "{shell}: {output}"
+        );
+        assert_eq!(deletes(&server).await, 1, "{shell}: {output}");
+        assert!(!output.contains(KEY), "{shell}: {output}");
     }
     Ok(())
 }

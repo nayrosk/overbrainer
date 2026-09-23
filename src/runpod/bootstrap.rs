@@ -59,7 +59,8 @@ pub struct PodSettings<'a> {
     pub boot_grace: Duration,
     /// How long the watchdog keeps a pod whose ended job was not retrieved.
     pub retrieve_grace: Duration,
-    /// `--keep-pod`: the watchdog never deletes the pod.
+    /// `--keep-pod`: once the job exists, the watchdog never deletes the pod
+    /// (before that, the boot grace and a failed bootstrap still do).
     pub keep: bool,
     /// Base URL of the Runpod API, for the watchdog.
     pub api_url: &'a str,

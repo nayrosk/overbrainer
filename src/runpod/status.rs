@@ -75,7 +75,8 @@ pub enum PodStatus {
         /// Time from creation to ready.
         after: Duration,
         /// When the watchdog deletes the pod at the latest, RFC 3339 UTC; `None`
-        /// for a pod kept with `--keep-pod`, which is never deleted automatically.
+        /// for a pod kept with `--keep-pod`, which is never deleted automatically
+        /// once its job starts.
         deadline: Option<String>,
     },
     /// The pod is being deleted.

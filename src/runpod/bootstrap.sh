@@ -24,7 +24,7 @@ watchdog_path() {
 # fail REASON: logs REASON, records it in .pod/bootstrap_failed (plain text, never
 # a secret: every caller passes a fixed literal), then, if the watchdog file has
 # already been written, execs into it with OVERBRAINER_BOOT_FAILED=1 so the pod
-# still gets a proof attempt, a verdict and, unless kept, gets deleted. Only when
+# still gets a proof attempt, a verdict and gets deleted, kept or not. Only when
 # the watchdog itself could not be written does this exit without a guard, as
 # before: nothing is left that could run it.
 fail() {
