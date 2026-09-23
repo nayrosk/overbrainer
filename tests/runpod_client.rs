@@ -1,5 +1,6 @@
 //! `RunpodClient` against a local HTTP stub: authentication, user agent, retries,
-//! error messages without secrets, pagination.
+//! error messages without secrets, pagination, and the fixed, status-only
+//! messages a create call's error ever shows.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,15 +20,16 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const KEY: &str = "rp_test_key_5f1d";
 const HOST_KEY: &str = "b3BlbnNzaC1ob3N0LWtleQ";
-/// The exact and windowed redaction pass replaces 16-character pieces: any
-/// shorter fragment of a secret is not a claim this client makes.
-const REDACT_WINDOW: usize = 16;
-/// The fuzzy leak detector withholds a create error once it still finds this
-/// many contiguous characters of a secret, after undoing common formatting.
-const MIN_LEAKED_PIECE: usize = 12;
-/// Text shown instead of a create call's error once sanitizing it changed
-/// anything: matches `client.rs`'s `WITHHELD_MESSAGE` exactly.
-const WITHHELD_MESSAGE: &str = "the API echoed the pod's settings; message withheld";
+
+/// The fixed messages `client.rs` shows for a create call's failed answer.
+/// These must match its private constants of the same name exactly.
+const CAPACITY_MESSAGE: &str = "no capacity for this GPU type";
+const AUTH_REJECTED_MESSAGE: &str = "Runpod refused the API key";
+const INSUFFICIENT_BALANCE_MESSAGE: &str = "the Runpod account balance is insufficient";
+const INVALID_REQUEST_MESSAGE: &str =
+    "Runpod rejected the create request (please report it: overbrainer built an invalid request)";
+const SERVER_ERROR_MESSAGE: &str = "Runpod failed to process the create request";
+const INVALID_CREATE_ANSWER_MESSAGE: &str = "Runpod's answer to the create call could not be read (please report it: overbrainer built an invalid request)";
 
 /// A realistic-looking base64 host key, `len` characters, deterministic so the
 /// test is reproducible.
@@ -39,32 +41,24 @@ fn generated_host_key(len: usize) -> String {
         .collect()
 }
 
-/// Asserts that `text` holds neither the whole of `key` nor any
-/// [`REDACT_WINDOW`]-character piece of it.
-fn assert_key_never_leaks(text: &str, key: &str) {
-    assert!(!text.contains(key), "full key leaked: {text}");
-    for start in 0..=(key.len() - REDACT_WINDOW) {
-        let piece = &key[start..start + REDACT_WINDOW];
-        assert!(
-            !text.contains(piece),
-            "key fragment `{piece}` leaked: {text}"
-        );
-    }
+/// `text` with every character percent-encoded.
+fn percent_encode(text: &str) -> String {
+    use std::fmt::Write;
+
+    text.chars().fold(String::new(), |mut acc, c| {
+        let _ = write!(acc, "%{:02X}", c as u32);
+        acc
+    })
 }
 
-/// Asserts that `text` holds neither the whole of `key` nor any
-/// [`MIN_LEAKED_PIECE`]-character piece of it: the bar an echoed create error
-/// must clear once formatting (escaping, line-wrapping, percent-encoding) could
-/// otherwise defeat the coarser [`REDACT_WINDOW`]-based redaction.
-fn assert_no_short_piece_leaks(text: &str, key: &str) {
-    assert!(!text.contains(key), "full key leaked: {text}");
-    for start in 0..=(key.len() - MIN_LEAKED_PIECE) {
-        let piece = &key[start..start + MIN_LEAKED_PIECE];
-        assert!(
-            !text.contains(piece),
-            "key fragment `{piece}` leaked: {text}"
-        );
-    }
+/// `text` split into `width`-character chunks and rejoined with `sep`.
+fn chunk_join(text: &str, width: usize, sep: &str) -> String {
+    text.chars()
+        .collect::<Vec<_>>()
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(sep)
 }
 
 fn client(server: &MockServer) -> Result<RunpodClient, ApiError> {
@@ -112,6 +106,39 @@ fn request() -> CreatePod {
         },
         cmd: vec!["bash".into(), "-c".into(), "true".into()],
     }
+}
+
+/// Runs `create_pod` with its host key set to `key`, against a mocked answer of
+/// `status` with `body`, and returns the resulting error.
+async fn create_status_error(
+    status: u16,
+    key: &str,
+    body: serde_json::Value,
+) -> Result<ApiError, Box<dyn std::error::Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(&server)
+        .await;
+    let mut create = request();
+    create.env.host_key = SecretString::from(key.to_string());
+    client(&server)?
+        .create_pod(&create)
+        .await
+        .err()
+        .ok_or_else(|| "no error".into())
+}
+
+/// Asserts that `error`'s `Display` and `Debug` are built only from `status`
+/// and `expected`: the exact fixed text for its class, with no server byte.
+fn assert_exact_create_message(error: &ApiError, status: u16, expected: &str) {
+    assert_eq!(error.status(), Some(status));
+    assert_eq!(
+        error.to_string(),
+        format!("Runpod answered {status}: {expected}")
+    );
+    let debug = format!("{error:?}");
+    assert!(debug.contains(&format!("message: {expected:?}")), "{debug}");
 }
 
 #[tokio::test]
@@ -294,7 +321,7 @@ async fn a_create_sends_the_v2_body_and_reads_the_pod() -> TestResult {
 }
 
 #[tokio::test]
-async fn a_create_error_never_quotes_a_key() -> TestResult {
+async fn a_create_error_shows_no_server_text() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(422).set_body_json(json!({
@@ -308,11 +335,7 @@ async fn a_create_error_never_quotes_a_key() -> TestResult {
         .await
         .err()
         .ok_or("no error")?;
-    let text = format!("{error} {error:?}");
-    assert!(!text.contains(HOST_KEY) && !text.contains(KEY), "{text}");
-    // The body echoed both secrets, so the whole message is withheld rather
-    // than shown with them individually redacted.
-    assert!(text.contains(WITHHELD_MESSAGE), "{text}");
+    assert_exact_create_message(&error, 422, INVALID_REQUEST_MESSAGE);
     Ok(())
 }
 
@@ -342,149 +365,152 @@ async fn a_create_is_retried_on_a_rate_limit_only() -> TestResult {
     Ok(())
 }
 
-async fn create_error_with_echoed_key(echoed: &str, key: &str) -> TestResult {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
-            "title": "Unprocessable",
-            "detail": format!("host key rejected: {echoed}")
-        })))
-        .mount(&server)
-        .await;
-    let mut create = request();
-    create.env.host_key = SecretString::from(key.to_string());
-    let error = client(&server)?
-        .create_pod(&create)
-        .await
-        .err()
-        .ok_or("no error")?;
-    assert_key_never_leaks(&format!("{error} {error:?}"), key);
-    Ok(())
-}
+// The attack shapes: however Runpod's answer echoes the request (plain,
+// nested inside another object, JSON-escaped, percent-encoded, chunked at any
+// width, joined with any separator), a create error's `Display` and `Debug`
+// are built only from the fixed message for its class and the status: never
+// from anything the server said.
 
 #[tokio::test]
-async fn a_long_host_key_fully_echoed_never_leaks() -> TestResult {
-    let key = generated_host_key(400);
-    create_error_with_echoed_key(&key, &key).await
-}
-
-#[tokio::test]
-async fn a_long_host_key_echoed_only_at_its_start_never_leaks() -> TestResult {
-    let key = generated_host_key(400);
-    create_error_with_echoed_key(&key[..200], &key).await
-}
-
-#[tokio::test]
-async fn a_long_host_key_echoed_only_in_its_middle_never_leaks() -> TestResult {
-    let key = generated_host_key(400);
-    create_error_with_echoed_key(&key[150..250], &key).await
-}
-
-async fn create_error_with_transformed_key(transform: impl Fn(&str) -> String) -> TestResult {
-    let server = MockServer::start().await;
+async fn a_plain_echo_never_appears_in_a_create_error() -> TestResult {
     let key = generated_host_key(200);
-    let echoed = transform(&key);
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
-            "title": "Unprocessable",
-            "detail": format!("host key rejected: {echoed}")
-        })))
-        .mount(&server)
-        .await;
-    let mut create = request();
-    create.env.host_key = SecretString::from(key.clone());
-    let error = client(&server)?
-        .create_pod(&create)
-        .await
-        .err()
-        .ok_or("no error")?;
-    assert_no_short_piece_leaks(&format!("{error} {error:?}"), &key);
+    let error =
+        create_status_error(422, &key, json!({"errors": [format!("bad key {key}")]})).await?;
+    assert_exact_create_message(&error, 422, INVALID_REQUEST_MESSAGE);
     Ok(())
 }
 
-/// `text` with every character percent-encoded.
-fn percent_encode(text: &str) -> String {
-    use std::fmt::Write;
-
-    text.chars().fold(String::new(), |mut acc, c| {
-        let _ = write!(acc, "%{:02X}", c as u32);
-        acc
-    })
-}
-
-/// `text` wrapped with a newline every `width` characters.
-fn line_wrap(text: &str, width: usize) -> String {
-    text.chars()
-        .collect::<Vec<_>>()
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n")
+#[tokio::test]
+async fn a_nested_echo_never_appears_in_a_create_error() -> TestResult {
+    let key = generated_host_key(200);
+    let error = create_status_error(
+        422,
+        &key,
+        json!({
+            "errors": [{
+                "message": "rejected",
+                "context": {"env": {"OVERBRAINER_HOST_KEY": key}}
+            }]
+        }),
+    )
+    .await?;
+    assert_exact_create_message(&error, 422, INVALID_REQUEST_MESSAGE);
+    Ok(())
 }
 
 #[tokio::test]
-async fn a_json_escaped_echo_never_leaks_a_short_piece() -> TestResult {
-    create_error_with_transformed_key(|key| key.replace('/', "\\/")).await
+async fn a_json_escaped_echo_never_appears_in_a_create_error() -> TestResult {
+    let key = generated_host_key(200);
+    let escaped = key.replace('/', "\\/");
+    let error =
+        create_status_error(422, &key, json!({"detail": format!("bad key {escaped}")})).await?;
+    assert_exact_create_message(&error, 422, INVALID_REQUEST_MESSAGE);
+    Ok(())
 }
 
 #[tokio::test]
-async fn a_line_wrapped_echo_never_leaks_a_short_piece() -> TestResult {
-    create_error_with_transformed_key(|key| line_wrap(key, 15)).await
+async fn a_plus_escaped_echo_never_appears_in_a_create_error() -> TestResult {
+    let key = generated_host_key(200);
+    let escaped = key.replace('+', "\\u002B");
+    let error =
+        create_status_error(422, &key, json!({"detail": format!("bad key {escaped}")})).await?;
+    assert_exact_create_message(&error, 422, INVALID_REQUEST_MESSAGE);
+    Ok(())
 }
 
 #[tokio::test]
-async fn a_percent_encoded_echo_never_leaks_a_short_piece() -> TestResult {
-    create_error_with_transformed_key(percent_encode).await
+async fn a_percent_encoded_echo_never_appears_in_a_create_error() -> TestResult {
+    let key = generated_host_key(200);
+    let encoded = percent_encode(&key);
+    let error =
+        create_status_error(422, &key, json!({"detail": format!("bad key {encoded}")})).await?;
+    assert_exact_create_message(&error, 422, INVALID_REQUEST_MESSAGE);
+    Ok(())
 }
 
 #[tokio::test]
-async fn a_capacity_failure_is_shown_as_is() -> TestResult {
-    let server = MockServer::start().await;
+async fn a_key_wrapped_every_8_characters_never_appears_in_a_create_error() -> TestResult {
+    let key = generated_host_key(200);
+    let wrapped = chunk_join(&key, 8, "\n");
+    let error =
+        create_status_error(422, &key, json!({"detail": format!("bad key {wrapped}")})).await?;
+    assert_exact_create_message(&error, 422, INVALID_REQUEST_MESSAGE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_key_joined_with_dashes_every_11_characters_never_appears_in_a_create_error() -> TestResult
+{
+    let key = generated_host_key(200);
+    let joined = chunk_join(&key, 11, "-");
+    let error =
+        create_status_error(422, &key, json!({"detail": format!("bad key {joined}")})).await?;
+    assert_exact_create_message(&error, 422, INVALID_REQUEST_MESSAGE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_capacity_400_whose_detail_echoes_the_key_shows_only_the_capacity_message() -> TestResult
+{
+    let key = generated_host_key(200);
+    let detail = format!(
+        "There are no longer any instances available with the requested specifications. \
+         Please refresh and try again. (offending value: {key})"
+    );
+    let error = create_status_error(400, &key, json!({"detail": detail})).await?;
+    assert_exact_create_message(&error, 400, CAPACITY_MESSAGE);
+    Ok(())
+}
+
+// Classification: every class is reachable and shows only its own fixed text.
+
+#[tokio::test]
+async fn a_capacity_failure_shows_only_the_fixed_message() -> TestResult {
     let detail = "There are no longer any instances available with the requested \
                    specifications. Please refresh and try again.";
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({ "detail": detail })))
-        .mount(&server)
-        .await;
-    let error = client(&server)?
-        .create_pod(&request())
-        .await
-        .err()
-        .ok_or("no error")?;
-    assert_eq!(error.status(), Some(400));
-    assert!(error.to_string().contains(detail), "{error}");
+    let error = create_status_error(400, "irrelevant", json!({ "detail": detail })).await?;
+    assert_exact_create_message(&error, 400, CAPACITY_MESSAGE);
     Ok(())
 }
 
 #[tokio::test]
-async fn a_capacity_failure_is_recognized_even_if_the_body_also_echoes_the_key() -> TestResult {
-    let server = MockServer::start().await;
-    let key = generated_host_key(200);
-    let detail = "There are no longer any instances available with the requested \
-                   specifications. Please refresh and try again.";
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "detail": detail,
-            "errors": [format!("debug: {key}")]
-        })))
-        .mount(&server)
-        .await;
-    let mut create = request();
-    create.env.host_key = SecretString::from(key.clone());
-    let error = client(&server)?
-        .create_pod(&create)
-        .await
-        .err()
-        .ok_or("no error")?;
-    assert_eq!(error.status(), Some(400));
-    let text = error.to_string();
-    assert!(text.contains("no longer any instances available"), "{text}");
-    assert_no_short_piece_leaks(&text, &key);
+async fn a_non_capacity_400_is_classified_as_invalid_request() -> TestResult {
+    let error =
+        create_status_error(400, "irrelevant", json!({"detail": "unrelated bad body"})).await?;
+    assert_exact_create_message(&error, 400, INVALID_REQUEST_MESSAGE);
     Ok(())
 }
 
 #[tokio::test]
-async fn a_decode_error_never_quotes_the_host_key_it_rejects() -> TestResult {
+async fn a_401_create_failure_is_classified_as_auth_rejected() -> TestResult {
+    let error = create_status_error(401, "irrelevant", json!({"detail": "irrelevant"})).await?;
+    assert_exact_create_message(&error, 401, AUTH_REJECTED_MESSAGE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_403_create_failure_is_classified_as_auth_rejected() -> TestResult {
+    let error = create_status_error(403, "irrelevant", json!({"detail": "irrelevant"})).await?;
+    assert_exact_create_message(&error, 403, AUTH_REJECTED_MESSAGE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_402_create_failure_is_classified_as_insufficient_balance() -> TestResult {
+    let error = create_status_error(402, "irrelevant", json!({"detail": "irrelevant"})).await?;
+    assert_exact_create_message(&error, 402, INSUFFICIENT_BALANCE_MESSAGE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_500_create_failure_is_classified_as_a_server_error() -> TestResult {
+    let error = create_status_error(500, "irrelevant", json!({"detail": "irrelevant"})).await?;
+    assert_exact_create_message(&error, 500, SERVER_ERROR_MESSAGE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_create_decode_failure_shows_no_server_text() -> TestResult {
     let server = MockServer::start().await;
     let key = generated_host_key(400);
     Mock::given(method("POST"))
@@ -501,8 +527,13 @@ async fn a_decode_error_never_quotes_the_host_key_it_rejects() -> TestResult {
         .await
         .err()
         .ok_or("no error")?;
-    assert!(matches!(error, ApiError::InvalidResponse(_)), "{error:?}");
-    assert_key_never_leaks(&format!("{error} {error:?}"), &key);
+    assert!(
+        matches!(
+            &error,
+            ApiError::InvalidResponse(message) if message == INVALID_CREATE_ANSWER_MESSAGE
+        ),
+        "{error:?}"
+    );
     Ok(())
 }
 

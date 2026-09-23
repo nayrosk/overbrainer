@@ -16,7 +16,7 @@ use crate::retry::{RetryPolicy, Retryable, with_retry};
 /// generic client's user agent with a 403 ("error code: 1010").
 pub const USER_AGENT: &str = concat!("overbrainer/", env!("CARGO_PKG_VERSION"));
 
-/// Longest error text kept from a Runpod answer.
+/// Longest error text kept from a non-create answer.
 const MAX_MESSAGE_CHARS: usize = 300;
 /// Connection timeout of every request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -26,30 +26,39 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Pods asked for per page of `GET /pods`.
 const PAGE_SIZE: &str = "1000";
-/// Length of the substring windows checked against each secret, so a value
+/// Length of the substring windows checked against the account key, so a value
 /// Runpod echoes only in part still disappears.
 const REDACT_WINDOW: usize = 16;
-/// Shortest run of base64-alphabet characters treated as a secret in a create
-/// call's error body, regardless of whether it matches a known secret exactly.
-const MIN_BASE64_RUN: usize = 40;
 /// Pages of `GET /pods` followed before giving up: protects against a server
 /// whose pagination never reports `hasNextPage: false`.
 const MAX_PAGES: usize = 100;
-/// Shortest contiguous piece of a create call's secret that, once common echo
-/// transports (whitespace, percent-encoding, a JSON `\/` escape) are undone,
-/// is still enough to withhold the whole message rather than show it.
-const MIN_LEAKED_PIECE: usize = 12;
 /// Substring of Runpod's capacity failure (`POST /pods`, 400) that identifies
-/// it: no secret this client hides could ever produce this text, so it is
-/// recognized and shown even when the rest of a create error is withheld.
+/// it. Only used to classify a create failure; the `detail` it comes from is
+/// never shown.
 const CAPACITY_SIGNATURE: &str = "no longer any instances available";
-/// Shown instead of a create call's error text once sanitizing it changed
-/// anything, directly or after undoing an echo's formatting: a value split
-/// into pieces this small could otherwise still slip through unredacted.
-const WITHHELD_MESSAGE: &str = "the API echoed the pod's settings; message withheld";
+
+/// A create call's answer had no GPU capacity for the requested type.
+const CAPACITY_MESSAGE: &str = "no capacity for this GPU type";
+/// A create call's answer was a 401 or a 403.
+const AUTH_REJECTED_MESSAGE: &str = "Runpod refused the API key";
+/// A create call's answer was a 402.
+const INSUFFICIENT_BALANCE_MESSAGE: &str = "the Runpod account balance is insufficient";
+/// A create call's answer was a 4xx that is none of the above.
+const INVALID_REQUEST_MESSAGE: &str =
+    "Runpod rejected the create request (please report it: overbrainer built an invalid request)";
+/// A create call's answer was a 5xx or another status none of the above covers.
+const SERVER_ERROR_MESSAGE: &str = "Runpod failed to process the create request";
+/// A create call succeeded (2xx) but its body was not the shape overbrainer
+/// expected.
+const INVALID_CREATE_ANSWER_MESSAGE: &str = "Runpod's answer to the create call could not be read (please report it: overbrainer built an invalid request)";
 
 /// Errors of the Runpod API. No variant ever holds the API key or a pod's host
-/// key: messages built from an answer are cleaned of both.
+/// key. A create call's error never holds any text from Runpod's answer either,
+/// however that text was shaped: its message is chosen only from the HTTP
+/// status (see [`RunpodClient::status_error`]), because no amount of pattern
+/// matching against ways a server might chunk, escape or encode an echoed value
+/// can be shown complete; not showing any of it is the only claim this client
+/// can make and keep.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     /// The HTTP client could not be built.
@@ -67,7 +76,9 @@ pub enum ApiError {
     Status {
         /// HTTP status code.
         status: u16,
-        /// What Runpod said, cleaned of secrets and capped.
+        /// For a non-create call, Runpod's own text, cleaned of the account
+        /// key and capped. For a create call, one of a fixed set of messages
+        /// chosen only by status: never anything Runpod said.
         message: String,
         /// Parsed `Retry-After`, when present.
         retry_after: Option<Duration>,
@@ -210,12 +221,10 @@ impl RunpodClient {
     ///
     /// # Errors
     ///
-    /// Returns an [`ApiError`] when the pod was not created or the answer cannot be
-    /// read. Its message never holds the request's host key nor the API key, even
-    /// truncated or echoed back through a formatting Runpod applied to it: any
-    /// error whose text turned out to echo the request is withheld entirely.
+    /// Returns an [`ApiError`] when the pod was not created or the answer cannot
+    /// be read. Its message is never built from anything Runpod said: see
+    /// [`ApiError`].
     pub async fn create_pod(&self, request: &CreatePod) -> Result<Pod, ApiError> {
-        let secrets = [request.env.host_key.expose_secret()];
         let mut attempt = 0;
         loop {
             let builder = self
@@ -225,7 +234,7 @@ impl RunpodClient {
                 .timeout(CREATE_TIMEOUT);
             let (status, body, retry_after) = self.fetch(builder).await?;
             if status.is_success() {
-                return decode(&body, &self.hidden(&secrets), &secrets, true);
+                return decode(&body, self.api_key.expose_secret(), true);
             }
             if status == StatusCode::TOO_MANY_REQUESTS && attempt < self.policy.max_retries {
                 let wait = self.policy.delay(attempt, retry_after, fastrand::f64());
@@ -237,7 +246,7 @@ impl RunpodClient {
                 attempt += 1;
                 continue;
             }
-            return Err(self.status_error(status, &body, retry_after, &secrets));
+            return Err(self.status_error(status, &body, retry_after, true));
         }
     }
 
@@ -256,12 +265,12 @@ impl RunpodClient {
                 let (status, body, retry_after) =
                     self.fetch(self.http.request(Method::GET, &url)).await?;
                 if status.is_success() {
-                    return decode(&body, &self.hidden(&[]), &[], false).map(Some);
+                    return decode(&body, self.api_key.expose_secret(), false).map(Some);
                 }
                 if status == StatusCode::NOT_FOUND && is_runpod_error_shape(status, &body) {
                     return Ok(None);
                 }
-                Err(self.status_error(status, &body, retry_after, &[]))
+                Err(self.status_error(status, &body, retry_after, false))
             },
             log_retry,
         )
@@ -303,9 +312,9 @@ impl RunpodClient {
             &self.policy,
             || async {
                 let body = self
-                    .send(self.http.request(Method::GET, url.clone()), &[])
+                    .send(self.http.request(Method::GET, url.clone()))
                     .await?;
-                decode(&body, &self.hidden(&[]), &[], false)
+                decode(&body, self.api_key.expose_secret(), false)
             },
             log_retry,
         )
@@ -331,7 +340,7 @@ impl RunpodClient {
                 if status == StatusCode::NOT_FOUND && is_runpod_error_shape(status, &body) {
                     return Ok(());
                 }
-                Err(self.status_error(status, &body, retry_after, &[]))
+                Err(self.status_error(status, &body, retry_after, false))
             },
             log_retry,
         )
@@ -342,19 +351,12 @@ impl RunpodClient {
         format!("{}/{path}", self.base_url)
     }
 
-    /// `secrets` (the request's own, when it has any) together with the API key,
-    /// all of which must never appear in a message this client raises.
-    fn hidden<'a>(&'a self, secrets: &[&'a str]) -> Vec<&'a str> {
-        let mut hidden = vec![self.api_key.expose_secret()];
-        hidden.extend_from_slice(secrets);
-        hidden
-    }
-
     /// Sends `builder` and returns its raw status, body and `Retry-After`. Only a
     /// transport failure (connection, TLS, timeout) becomes an [`ApiError`] here:
-    /// a non-success HTTP status is returned as data, unredacted, so `get_pod` and
-    /// `delete_pod` can recognize Runpod's own "not found" shape before anyone
-    /// builds the client-facing, redacted error from it.
+    /// a non-success HTTP status is returned as data, unredacted, so `get_pod`
+    /// and `delete_pod` can recognize Runpod's own "not found" shape, and
+    /// `status_error` can classify a create failure, before anyone builds the
+    /// client-facing error from it.
     async fn fetch(
         &self,
         builder: reqwest::RequestBuilder,
@@ -367,55 +369,38 @@ impl RunpodClient {
     }
 
     /// Sends `builder` and returns the body of a success answer, or the client's
-    /// redacted [`ApiError::Status`] for a failure.
-    async fn send(
-        &self,
-        builder: reqwest::RequestBuilder,
-        secrets: &[&str],
-    ) -> Result<String, ApiError> {
+    /// redacted [`ApiError::Status`] for a failure. Only used for non-create
+    /// calls.
+    async fn send(&self, builder: reqwest::RequestBuilder) -> Result<String, ApiError> {
         let (status, body, retry_after) = self.fetch(builder).await?;
         if status.is_success() {
             return Ok(body);
         }
-        Err(self.status_error(status, &body, retry_after, secrets))
+        Err(self.status_error(status, &body, retry_after, false))
     }
 
     /// Builds the [`ApiError::Status`] a caller sees from a failed answer.
     ///
-    /// For a create call (`secrets` not empty), Runpod's capacity failure is
-    /// recognized and shown from `body` directly before anything else is looked
-    /// at (classify before withholding), and any other message that sanitizing
-    /// changed at all, directly or once common echo transports are undone, is
-    /// replaced by [`WITHHELD_MESSAGE`] rather than shown redacted: a value split
-    /// into pieces shorter than [`REDACT_WINDOW`] could otherwise still slip
-    /// through. A non-create call's message is shown as sanitized.
+    /// A create call (`is_create`) never shows any text from Runpod: its
+    /// message is a fixed string chosen only from `status` (and, for a 400,
+    /// whether `body` is Runpod's capacity failure), by
+    /// [`create_failure_message`]. A non-create call's message is Runpod's own
+    /// text, with the account API key redacted and the result capped.
     fn status_error(
         &self,
         status: StatusCode,
         body: &str,
         retry_after: Option<Duration>,
-        secrets: &[&str],
+        is_create: bool,
     ) -> ApiError {
-        let is_create = !secrets.is_empty();
-        let hidden = self.hidden(secrets);
-        if is_create
-            && status == StatusCode::BAD_REQUEST
-            && let Some(detail) = capacity_detail(body)
-        {
-            return ApiError::Status {
-                status: status.as_u16(),
-                message: cap(&sanitize(&detail, &hidden, true)),
-                retry_after,
-            };
-        }
-        let (message, changed) = build_message(status, body, &hidden, secrets, is_create);
+        let message = if is_create {
+            create_failure_message(status, body).to_string()
+        } else {
+            build_message(status, body, self.api_key.expose_secret())
+        };
         ApiError::Status {
             status: status.as_u16(),
-            message: if is_create && changed {
-                WITHHELD_MESSAGE.to_string()
-            } else {
-                message
-            },
+            message,
             retry_after,
         }
     }
@@ -425,29 +410,23 @@ fn log_retry(error: &ApiError, wait: Duration) {
     tracing::warn!("{error}; retrying in {}s", wait.as_secs());
 }
 
-/// Parses a success body. A parse failure's message can quote the offending
-/// value (a custom `Deserialize` does, for [`PodId`]), which may be a secret this
-/// call's body echoed back, so it is cleaned exactly like a failed answer's, and,
-/// for a create call, withheld entirely rather than shown redacted when
-/// sanitizing it changed anything or it still echoes a piece of `secrets`.
+/// Parses a success body into `T`.
+///
+/// For a create call (`is_create`), a parse failure never shows any text from
+/// Runpod: its message is the fixed [`INVALID_CREATE_ANSWER_MESSAGE`], for the
+/// same reason [`RunpodClient::status_error`] never shows one either. For a
+/// non-create call, the parse failure's message (which can quote the offending
+/// value: `PodId`'s custom `Deserialize` does) is redacted of the account key.
 fn decode<T: DeserializeOwned>(
     body: &str,
-    hidden: &[&str],
-    secrets: &[&str],
+    account_key: &str,
     is_create: bool,
 ) -> Result<T, ApiError> {
     serde_json::from_str(body).map_err(|error| {
-        let text = error.to_string();
-        let cleaned = sanitize(&text, hidden, is_create);
-        let leaked = is_create
-            && (cleaned != text
-                || secrets
-                    .iter()
-                    .any(|secret| echoes_a_piece_of(&text, secret)));
-        ApiError::InvalidResponse(if leaked {
-            WITHHELD_MESSAGE.to_string()
+        ApiError::InvalidResponse(if is_create {
+            INVALID_CREATE_ANSWER_MESSAGE.to_string()
         } else {
-            cleaned
+            redact(&error.to_string(), account_key)
         })
     })
 }
@@ -475,101 +454,52 @@ fn is_runpod_error_shape(status: StatusCode, body: &str) -> bool {
     status_matches || object.contains_key("title") || object.contains_key("detail")
 }
 
-/// `body`'s `detail`, when it is Runpod's capacity failure (identified by
-/// [`CAPACITY_SIGNATURE`]): recognized from the raw body, before any secret in
-/// the rest of it (for example in `errors[]`) could cause the message to be
-/// withheld, since only `detail` is ever shown for it.
-fn capacity_detail(body: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    let detail = value.get("detail")?.as_str()?;
-    detail
-        .contains(CAPACITY_SIGNATURE)
-        .then(|| detail.to_string())
+/// The fixed message for a create call's failed answer, chosen only from
+/// `status` and, for a 400, whether `body` is Runpod's capacity failure. Never
+/// reads anything else from `body`, and never shows any of it: this is the only
+/// place a create error's message is decided, so no echo of the request, in any
+/// shape a server could produce, can ever reach a caller.
+fn create_failure_message(status: StatusCode, body: &str) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST if is_capacity_failure(body) => CAPACITY_MESSAGE,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AUTH_REJECTED_MESSAGE,
+        StatusCode::PAYMENT_REQUIRED => INSUFFICIENT_BALANCE_MESSAGE,
+        status if status.is_client_error() => INVALID_REQUEST_MESSAGE,
+        _ => SERVER_ERROR_MESSAGE,
+    }
 }
 
-/// The extracted, doubly-sanitized, capped message for a failed answer, and
-/// whether sanitizing changed anything: directly (an exact or windowed match in
-/// either pass) or because `body` still echoes a piece of one of `secrets` once
-/// common formatting is undone. `status` and `body` are Runpod's raw answer;
-/// `hidden` and `secrets` name what must never appear in the result.
-fn build_message(
-    status: StatusCode,
-    body: &str,
-    hidden: &[&str],
-    secrets: &[&str],
-    is_create: bool,
-) -> (String, bool) {
-    let first_pass = sanitize(body, hidden, is_create);
-    let first_changed = first_pass != body;
+/// Whether `body`'s `detail` is Runpod's capacity failure (identified by
+/// [`CAPACITY_SIGNATURE`]). Only a boolean ever leaves this function: `detail`
+/// itself is never shown, even for a capacity failure, since it is still text
+/// Runpod chose and could, in principle, be made to include anything.
+fn is_capacity_failure(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("detail")?.as_str().map(str::to_string))
+        .is_some_and(|detail| detail.contains(CAPACITY_SIGNATURE))
+}
+
+/// The extracted, doubly-redacted, capped message for a non-create call's
+/// failed answer. `account_key` is redacted in two passes: JSON-decoding while
+/// extracting the message (`error_text`) can rejoin a value an escape sequence
+/// split (for example `\/` becomes `/`), so redacting only the raw body is not
+/// enough; capping happens only after both passes, so a truncation can never
+/// leave a partial key behind.
+fn build_message(status: StatusCode, body: &str, account_key: &str) -> String {
+    let first_pass = redact(body, account_key);
     let extracted = error_text(status, &first_pass);
-    // JSON-decoding in `error_text` can rejoin a secret an escape sequence
-    // split (for example `\/` becomes `/`), so it must be sanitized again
-    // before it is capped: capping first would let a truncated fragment
-    // through, and skipping this pass would let the whole rejoined value
-    // through.
-    let second_pass = sanitize(&extracted, hidden, is_create);
-    let second_changed = second_pass != extracted;
-    let echoed = is_create && secrets.iter().any(|secret| echoes_a_piece_of(body, secret));
-    (cap(&second_pass), first_changed || second_changed || echoed)
-}
-
-/// Whether `text`, once common echo transports are undone (whitespace removed,
-/// `%XX` percent-decoded, a JSON `\/` escape unescaped), still holds at least
-/// [`MIN_LEAKED_PIECE`] contiguous characters of `secret`. Unlike `redact`, this
-/// never has to reproduce the exact span to blank out: it only has to notice
-/// that one exists, so [`RunpodClient::status_error`] can withhold the message.
-fn echoes_a_piece_of(text: &str, secret: &str) -> bool {
-    let secret_chars: Vec<char> = secret.chars().collect();
-    if secret_chars.len() < MIN_LEAKED_PIECE {
-        return false;
-    }
-    let canonical = canonicalize(text);
-    (0..=secret_chars.len() - MIN_LEAKED_PIECE).any(|start| {
-        let piece: String = secret_chars[start..start + MIN_LEAKED_PIECE]
-            .iter()
-            .collect();
-        canonical.contains(&piece)
-    })
-}
-
-/// `text` with whitespace removed, `%XX` percent-decoded and a JSON `\/` escape
-/// unescaped, so a secret broken only by formatting still reads as contiguous.
-fn canonicalize(text: &str) -> String {
-    percent_decode(&text.replace("\\/", "/"))
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect()
-}
-
-/// Decodes every `%XX` escape in `text`; anything else passes through unchanged.
-fn percent_decode(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(chars.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let hex = (chars[i] == '%' && i + 2 < chars.len())
-            .then(|| chars[i + 1..=i + 2].iter().collect::<String>());
-        let byte = hex
-            .as_deref()
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        if let Some(byte) = byte {
-            out.push(char::from(byte));
-            i += 3;
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
-    }
-    out
+    let second_pass = redact(&extracted, account_key);
+    cap(&second_pass)
 }
 
 /// What to say about a failed answer, extracted but not yet capped. A 401 never
 /// quotes Runpod; a 403 keeps a non-JSON body (Cloudflare's `error code: 1010`
 /// says what is wrong); anything else keeps the RFC 9457 `title`, `detail` and
-/// `errors[]`, or the body start. `body` must already be cleaned of secrets by a
-/// first sanitize pass; the result still needs a second pass before it is safe
-/// to cap, because JSON-decoding here can rejoin a secret an escape sequence
-/// split (a `\/` becomes `/`).
+/// `errors[]`, or the body start. `body` must already be cleaned of the account
+/// key by a first redaction pass; the result still needs a second pass before
+/// it is safe to cap, because JSON-decoding here can rejoin a value an escape
+/// sequence split.
 fn error_text(status: StatusCode, body: &str) -> String {
     if status == StatusCode::UNAUTHORIZED {
         return "Runpod rejected the API key, check OVERBRAINER_RUNPOD__API_KEY".to_string();
@@ -614,74 +544,24 @@ fn cap(text: &str) -> String {
     text.chars().take(MAX_MESSAGE_CHARS).collect()
 }
 
-/// Cleans `text` of every secret in `hidden`; when `strip_base64` is set (the
-/// create call, whose failing body may echo the pod's host key, about 550 base64
-/// characters, in a form the exact and windowed passes of [`redact`] miss), also
-/// of any run of [`MIN_BASE64_RUN`] or more base64 characters. Order matters:
-/// this must run on the raw body before any text is extracted from it or capped,
-/// so a truncation can never leave a partial secret behind.
-fn sanitize(text: &str, hidden: &[&str], strip_base64: bool) -> String {
-    let cleaned = redact(text, hidden);
-    if strip_base64 {
-        redact_base64_runs(&cleaned)
-    } else {
-        cleaned
+/// `text` with every occurrence of `secret` replaced by `***`: first every
+/// exact occurrence, then every [`REDACT_WINDOW`]-character piece of it at any
+/// offset, so a value Runpod echoes only in part still disappears. Used only
+/// for the account API key, the only secret a non-create call's answer could
+/// ever echo (a create call never shows any of its answer at all).
+fn redact(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return text.to_string();
     }
-}
-
-/// `text` with every non-empty one of `secrets` replaced by `***`: first every
-/// exact occurrence, then every [`REDACT_WINDOW`]-character piece of the secret
-/// at any offset, so a value Runpod echoes only in part still disappears.
-fn redact(text: &str, secrets: &[&str]) -> String {
-    secrets
-        .iter()
-        .filter(|secret| !secret.is_empty())
-        .fold(text.to_string(), |text, secret| redact_one(&text, secret))
-}
-
-/// `redact`'s two passes for one `secret`.
-fn redact_one(text: &str, secret: &str) -> String {
-    let text = text.replace(secret, "***");
+    let replaced = text.replace(secret, "***");
     let chars: Vec<char> = secret.chars().collect();
     if chars.len() < REDACT_WINDOW {
-        return text;
+        return replaced;
     }
-    (0..=chars.len() - REDACT_WINDOW).fold(text, |text, start| {
+    (0..=chars.len() - REDACT_WINDOW).fold(replaced, |text, start| {
         let window: String = chars[start..start + REDACT_WINDOW].iter().collect();
         text.replace(&window, "***")
     })
-}
-
-/// Replaces every run of [`MIN_BASE64_RUN`] or more base64-alphabet characters in
-/// `text` with `<redacted>`, regardless of whether it matches a known secret.
-fn redact_base64_runs(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut run = String::new();
-    for c in text.chars() {
-        if is_base64_char(c) {
-            run.push(c);
-        } else {
-            flush_base64_run(&mut result, &mut run);
-            result.push(c);
-        }
-    }
-    flush_base64_run(&mut result, &mut run);
-    result
-}
-
-/// Appends `run` to `result`, replaced by `<redacted>` when it reached
-/// [`MIN_BASE64_RUN`], then clears it.
-fn flush_base64_run(result: &mut String, run: &mut String) {
-    if run.chars().count() >= MIN_BASE64_RUN {
-        result.push_str("<redacted>");
-    } else {
-        result.push_str(run);
-    }
-    run.clear();
-}
-
-fn is_base64_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='
 }
 
 #[cfg(test)]
@@ -725,10 +605,8 @@ mod tests {
 
     #[test]
     fn secrets_are_redacted() {
-        assert_eq!(
-            redact("key k1 and host h1, k1 again", &["k1", "", "h1"]),
-            "key *** and host ***, *** again"
-        );
+        assert_eq!(redact("key k1, k1 again", "k1"), "key ***, *** again");
+        assert_eq!(redact("nothing hidden", ""), "nothing hidden");
     }
 
     #[test]
@@ -737,36 +615,26 @@ mod tests {
         let piece = &secret[3..19];
         assert_eq!(piece.len(), REDACT_WINDOW);
         let text = format!("prefix {piece} suffix");
-        let cleaned = redact(&text, &[secret]);
+        let cleaned = redact(&text, secret);
         assert!(!cleaned.contains(piece), "{cleaned}");
         assert_eq!(cleaned, "prefix *** suffix");
     }
 
     #[test]
     fn secrets_shorter_than_a_window_only_match_exactly() {
-        assert_eq!(redact("short s1 stays", &["s1"]), "short *** stays");
+        assert_eq!(redact("short s1 stays", "s1"), "short *** stays");
     }
 
-    #[test]
-    fn long_base64_runs_are_redacted_regardless_of_a_known_secret() {
-        let run = "A".repeat(MIN_BASE64_RUN + 5);
-        let text = format!("prefix {run} suffix");
-        assert_eq!(redact_base64_runs(&text), "prefix <redacted> suffix");
-        let short = "B".repeat(MIN_BASE64_RUN - 1);
-        let text = format!("prefix {short} suffix");
-        assert_eq!(redact_base64_runs(&text), text);
-    }
-
-    /// Pins the order `build_message` must follow: sanitize, decode (extract),
-    /// sanitize again, only then cap. Every 16-character window of this secret
-    /// contains a `/`, so a sanitize pass over the still-escaped raw body (which
-    /// spells it `\/`) can never match any window of it directly: only after
+    /// Pins the order `build_message` must follow: redact, extract, redact
+    /// again, only then cap. Every 16-character window of this key contains a
+    /// `/`, so a redaction pass over the still-escaped raw body (which spells
+    /// it `\/`) can never match any window of it directly: only after
     /// `error_text` JSON-decodes the body and restores the real slashes can a
     /// second pass catch it. Reverting to a single pre-decode pass, or capping
-    /// before that second pass, lets the decoded secret straight through.
+    /// before that second pass, lets the decoded key straight through.
     #[test]
-    fn json_unescaping_is_sanitized_again_before_capping() {
-        let secret: String = (0..64)
+    fn json_unescaping_is_redacted_again_before_capping() {
+        let key: String = (0..64)
             .map(|i| {
                 if i % 4 == 3 {
                     '/'
@@ -775,104 +643,88 @@ mod tests {
                 }
             })
             .collect();
-        let escaped = secret.replace('/', "\\/");
+        let escaped = key.replace('/', "\\/");
         let body = format!(r#"{{"detail": "bad key {escaped}"}}"#);
-        let hidden = [secret.as_str()];
-        let (message, changed) =
-            build_message(StatusCode::BAD_REQUEST, &body, &hidden, &hidden, true);
-        assert!(changed);
-        assert!(!message.contains(&secret), "{message}");
+        let message = build_message(StatusCode::BAD_REQUEST, &body, &key);
+        assert!(!message.contains(&key), "{message}");
     }
 
     #[test]
-    fn echoes_a_piece_of_is_false_without_a_relation() {
-        let secret = "abcdefghijklmnopqrstuvwxyz0123456789";
-        assert!(!echoes_a_piece_of("no relation here", secret));
+    fn is_capacity_failure_recognizes_only_the_signature() {
+        assert!(is_capacity_failure(
+            r#"{"detail": "There are no longer any instances available with the requested specifications. Please refresh and try again."}"#
+        ));
+        assert!(!is_capacity_failure(r#"{"detail": "bad body"}"#));
+        assert!(!is_capacity_failure("not json"));
+        assert!(!is_capacity_failure(r#"{"title": "no detail field"}"#));
     }
 
     #[test]
-    fn echoes_a_piece_of_undoes_line_wrapping() {
-        let secret = "abcdefghijklmnopqrstuvwxyz0123456789";
-        let wrapped: String = secret
-            .chars()
-            .collect::<Vec<_>>()
-            .chunks(5)
-            .map(|chunk| chunk.iter().collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(echoes_a_piece_of(&wrapped, secret));
-    }
-
-    #[test]
-    fn echoes_a_piece_of_undoes_percent_encoding() {
-        use std::fmt::Write;
-
-        let secret = "abcdefghijklmnopqrstuvwxyz0123456789";
-        let percent = secret.chars().fold(String::new(), |mut acc, c| {
-            let _ = write!(acc, "%{:02X}", c as u32);
-            acc
-        });
-        assert!(echoes_a_piece_of(&percent, secret));
-    }
-
-    #[test]
-    fn echoes_a_piece_of_undoes_a_json_escaped_slash() {
-        let secret = "abc/def/ghi/jkl/mno/pqr/stu/vwx/yz0/123/456/789";
-        let escaped = secret.replace('/', "\\/");
-        assert!(echoes_a_piece_of(&escaped, secret));
-    }
-
-    #[test]
-    fn a_capacity_detail_is_recognized_and_others_are_not() {
+    fn create_failures_are_classified_by_status_alone() {
+        let capacity_body = r#"{"detail": "There are no longer any instances available with the requested specifications. Please refresh and try again."}"#;
         assert_eq!(
-            capacity_detail(
-                r#"{"detail": "There are no longer any instances available with the requested specifications. Please refresh and try again."}"#
-            ),
-            Some(
-                "There are no longer any instances available with the requested specifications. Please refresh and try again."
-                    .to_string()
-            )
+            create_failure_message(StatusCode::BAD_REQUEST, capacity_body),
+            CAPACITY_MESSAGE
         );
-        assert_eq!(capacity_detail(r#"{"detail": "bad body"}"#), None);
-        assert_eq!(capacity_detail("not json"), None);
-        assert_eq!(capacity_detail(r#"{"title": "no detail field"}"#), None);
+        assert_eq!(
+            create_failure_message(StatusCode::BAD_REQUEST, r#"{"detail": "bad body"}"#),
+            INVALID_REQUEST_MESSAGE
+        );
+        assert_eq!(
+            create_failure_message(StatusCode::UNAUTHORIZED, ""),
+            AUTH_REJECTED_MESSAGE
+        );
+        assert_eq!(
+            create_failure_message(StatusCode::FORBIDDEN, ""),
+            AUTH_REJECTED_MESSAGE
+        );
+        assert_eq!(
+            create_failure_message(StatusCode::PAYMENT_REQUIRED, ""),
+            INSUFFICIENT_BALANCE_MESSAGE
+        );
+        assert_eq!(
+            create_failure_message(StatusCode::UNPROCESSABLE_ENTITY, ""),
+            INVALID_REQUEST_MESSAGE
+        );
+        assert_eq!(
+            create_failure_message(StatusCode::TOO_MANY_REQUESTS, ""),
+            INVALID_REQUEST_MESSAGE
+        );
+        assert_eq!(
+            create_failure_message(StatusCode::INTERNAL_SERVER_ERROR, ""),
+            SERVER_ERROR_MESSAGE
+        );
+        assert_eq!(
+            create_failure_message(StatusCode::BAD_GATEWAY, ""),
+            SERVER_ERROR_MESSAGE
+        );
     }
 
-    /// A non-alphanumeric secret, so `PodId::new` genuinely rejects it (its
+    /// A non-alphanumeric key, so `PodId::new` genuinely rejects it (its
     /// custom `Deserialize` embeds the raw value in its error, which `decode`
     /// must clean) rather than failing on an unrelated type mismatch.
-    const INVALID_POD_ID_SECRET: &str = "topsecret+host/key=value1234567890";
+    const INVALID_POD_ID_KEY: &str = "topsecret+host/key=value1234567890";
 
     #[test]
     fn decode_errors_are_redacted() {
-        let body = format!(r#""{INVALID_POD_ID_SECRET}""#);
-        let result: Result<PodId, ApiError> = decode(
-            &body,
-            &[INVALID_POD_ID_SECRET],
-            &[INVALID_POD_ID_SECRET],
-            false,
-        );
+        let body = format!(r#""{INVALID_POD_ID_KEY}""#);
+        let result: Result<PodId, ApiError> = decode(&body, INVALID_POD_ID_KEY, false);
         let message = match result {
             Err(ApiError::InvalidResponse(message)) => message,
             Err(other) => other.to_string(),
             Ok(_) => String::new(),
         };
         assert!(!message.is_empty(), "expected a decode error");
-        assert!(!message.contains(INVALID_POD_ID_SECRET), "{message}");
+        assert!(!message.contains(INVALID_POD_ID_KEY), "{message}");
     }
 
     #[test]
-    fn a_create_decode_error_is_withheld_when_it_echoes_the_secret() {
-        let body = format!(r#""{INVALID_POD_ID_SECRET}""#);
-        let result: Result<PodId, ApiError> = decode(
-            &body,
-            &[INVALID_POD_ID_SECRET],
-            &[INVALID_POD_ID_SECRET],
-            true,
-        );
+    fn a_create_decode_error_never_shows_the_answer() {
+        let body = format!(r#""{INVALID_POD_ID_KEY}""#);
+        let result: Result<PodId, ApiError> = decode(&body, INVALID_POD_ID_KEY, true);
         assert!(matches!(
             result,
-            Err(ApiError::InvalidResponse(ref message)) if message == WITHHELD_MESSAGE
+            Err(ApiError::InvalidResponse(ref message)) if message == INVALID_CREATE_ANSWER_MESSAGE
         ));
     }
 
