@@ -25,6 +25,11 @@ const HOST_KEY: &str = "b3BlbnNzaC1ob3N0LWtleQ";
 /// These must match its private constants of the same name exactly.
 const CAPACITY_MESSAGE: &str = "no capacity for this GPU type";
 const AUTH_REJECTED_MESSAGE: &str = "Runpod refused the API key";
+const FORBIDDEN_MESSAGE: &str =
+    "Runpod refused the request (403): check the API key and that the GPU type is allowed";
+const RATE_LIMITED_MESSAGE: &str = "Runpod is rate limiting requests; try again later";
+const TIMEOUT_MESSAGE: &str =
+    "Runpod timed out on the create request (the pod may have been created anyway)";
 const INSUFFICIENT_BALANCE_MESSAGE: &str = "the Runpod account balance is insufficient";
 const INVALID_REQUEST_MESSAGE: &str =
     "Runpod rejected the create request (please report it: overbrainer built an invalid request)";
@@ -489,9 +494,42 @@ async fn a_401_create_failure_is_classified_as_auth_rejected() -> TestResult {
 }
 
 #[tokio::test]
-async fn a_403_create_failure_is_classified_as_auth_rejected() -> TestResult {
+async fn a_403_create_failure_names_the_key_and_the_gpu_type() -> TestResult {
     let error = create_status_error(403, "irrelevant", json!({"detail": "irrelevant"})).await?;
-    assert_exact_create_message(&error, 403, AUTH_REJECTED_MESSAGE);
+    assert_exact_create_message(&error, 403, FORBIDDEN_MESSAGE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_408_create_failure_is_a_timeout_and_ambiguous() -> TestResult {
+    let error = create_status_error(408, "irrelevant", json!({"detail": "irrelevant"})).await?;
+    assert_exact_create_message(&error, 408, TIMEOUT_MESSAGE);
+    assert!(error.is_ambiguous());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_429_left_after_retries_is_named_a_rate_limit() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .set_body_json(json!({"detail": "irrelevant"})),
+        )
+        .mount(&server)
+        .await;
+    let error = client(&server)?
+        .create_pod(&request())
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert_exact_create_message(&error, 429, RATE_LIMITED_MESSAGE);
+    assert!(!error.is_ambiguous());
+    assert_eq!(
+        server.received_requests().await.unwrap_or_default().len(),
+        3
+    );
     Ok(())
 }
 
@@ -534,6 +572,67 @@ async fn a_create_decode_failure_shows_no_server_text() -> TestResult {
         ),
         "{error:?}"
     );
+    Ok(())
+}
+
+/// Asserts that no 8-character piece of `secret` appears in `error`'s `Display`
+/// or `Debug`.
+fn assert_no_piece_of(error: &ApiError, secret: &str) {
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    let chars: Vec<char> = secret.chars().collect();
+    for window in chars.windows(8) {
+        let piece: String = window.iter().collect();
+        assert!(!display.contains(&piece), "{piece} in {display}");
+        assert!(!debug.contains(&piece), "{piece} in {debug}");
+    }
+}
+
+/// A pod whose `env` is a string holding the host key, which `PodEnv` cannot
+/// read: serde's own message would quote the whole string.
+fn pod_with_a_string_env(host_key: &str) -> serde_json::Value {
+    json!({
+        "id": "p1",
+        "status": "RUNNING",
+        "env": format!("OVERBRAINER_HOST_KEY={host_key}")
+    })
+}
+
+#[tokio::test]
+async fn a_get_decode_error_never_quotes_the_body() -> TestResult {
+    let server = MockServer::start().await;
+    let host_key = generated_host_key(500);
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pod_with_a_string_env(&host_key)))
+        .mount(&server)
+        .await;
+    let error = client(&server)?
+        .get_pod(&PodId::new("p1")?)
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert!(matches!(error, ApiError::InvalidResponse(_)), "{error:?}");
+    assert!(error.to_string().contains("line 1, column"), "{error}");
+    assert_no_piece_of(&error, &host_key);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_list_decode_error_never_quotes_the_body() -> TestResult {
+    let server = MockServer::start().await;
+    let host_key = generated_host_key(500);
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"pods": [pod_with_a_string_env(&host_key)]})),
+        )
+        .mount(&server)
+        .await;
+    let error = client(&server)?.list_pods().await.err().ok_or("no error")?;
+    assert!(matches!(error, ApiError::InvalidResponse(_)), "{error:?}");
+    assert_no_piece_of(&error, &host_key);
     Ok(())
 }
 

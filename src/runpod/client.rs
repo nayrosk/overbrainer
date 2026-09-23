@@ -39,8 +39,18 @@ const CAPACITY_SIGNATURE: &str = "no longer any instances available";
 
 /// A create call's answer had no GPU capacity for the requested type.
 const CAPACITY_MESSAGE: &str = "no capacity for this GPU type";
-/// A create call's answer was a 401 or a 403.
+/// A create call's answer was a 401.
 const AUTH_REJECTED_MESSAGE: &str = "Runpod refused the API key";
+/// A create call's answer was a 403. The provisioning walk reads a 403 as "skip
+/// this GPU type", so the message names both possible causes.
+const FORBIDDEN_MESSAGE: &str =
+    "Runpod refused the request (403): check the API key and that the GPU type is allowed";
+/// A create call's answer was still a 429 once its retries ran out.
+const RATE_LIMITED_MESSAGE: &str = "Runpod is rate limiting requests; try again later";
+/// A create call's answer was a 408: ambiguous, like [`ApiError::is_ambiguous`]
+/// says, since Runpod may have processed the request before timing out.
+const TIMEOUT_MESSAGE: &str =
+    "Runpod timed out on the create request (the pod may have been created anyway)";
 /// A create call's answer was a 402.
 const INSUFFICIENT_BALANCE_MESSAGE: &str = "the Runpod account balance is insufficient";
 /// A create call's answer was a 4xx that is none of the above.
@@ -51,6 +61,9 @@ const SERVER_ERROR_MESSAGE: &str = "Runpod failed to process the create request"
 /// A create call succeeded (2xx) but its body was not the shape overbrainer
 /// expected.
 const INVALID_CREATE_ANSWER_MESSAGE: &str = "Runpod's answer to the create call could not be read (please report it: overbrainer built an invalid request)";
+/// A non-create call succeeded (2xx) but its body was not the shape overbrainer
+/// expected. Followed only by serde's error category and position.
+const INVALID_ANSWER_MESSAGE: &str = "Runpod's answer does not have the expected shape";
 
 /// Errors of the Runpod API. No variant ever holds the API key or a pod's host
 /// key. A create call's error never holds any text from Runpod's answer either,
@@ -83,7 +96,9 @@ pub enum ApiError {
         /// Parsed `Retry-After`, when present.
         retry_after: Option<Duration>,
     },
-    /// A success answer whose body is not what the API documents.
+    /// A success answer whose body is not what the API documents. A decode
+    /// failure's text is a fixed description plus serde's category and
+    /// position: never serde's own message, which quotes the offending value.
     #[error("invalid answer from Runpod: {0}")]
     InvalidResponse(String),
 }
@@ -234,7 +249,7 @@ impl RunpodClient {
                 .timeout(CREATE_TIMEOUT);
             let (status, body, retry_after) = self.fetch(builder).await?;
             if status.is_success() {
-                return decode(&body, self.api_key.expose_secret(), true);
+                return decode(&body, true);
             }
             if status == StatusCode::TOO_MANY_REQUESTS && attempt < self.policy.max_retries {
                 let wait = self.policy.delay(attempt, retry_after, fastrand::f64());
@@ -265,7 +280,7 @@ impl RunpodClient {
                 let (status, body, retry_after) =
                     self.fetch(self.http.request(Method::GET, &url)).await?;
                 if status.is_success() {
-                    return decode(&body, self.api_key.expose_secret(), false).map(Some);
+                    return decode(&body, false).map(Some);
                 }
                 if status == StatusCode::NOT_FOUND && is_runpod_error_shape(status, &body) {
                     return Ok(None);
@@ -314,7 +329,7 @@ impl RunpodClient {
                 let body = self
                     .send(self.http.request(Method::GET, url.clone()))
                     .await?;
-                decode(&body, self.api_key.expose_secret(), false)
+                decode(&body, false)
             },
             log_retry,
         )
@@ -412,23 +427,38 @@ fn log_retry(error: &ApiError, wait: Duration) {
 
 /// Parses a success body into `T`.
 ///
-/// For a create call (`is_create`), a parse failure never shows any text from
-/// Runpod: its message is the fixed [`INVALID_CREATE_ANSWER_MESSAGE`], for the
-/// same reason [`RunpodClient::status_error`] never shows one either. For a
-/// non-create call, the parse failure's message (which can quote the offending
-/// value: `PodId`'s custom `Deserialize` does) is redacted of the account key.
-fn decode<T: DeserializeOwned>(
-    body: &str,
-    account_key: &str,
-    is_create: bool,
-) -> Result<T, ApiError> {
+/// A parse failure never shows any text from Runpod, on any call: serde's own
+/// message quotes the offending value (an `env` that came back as a string
+/// would carry the whole host key, and `PodId`'s custom `Deserialize` embeds
+/// the raw ID), and no redaction can know every secret a body might hold. For
+/// a create call (`is_create`) the message is the fixed
+/// [`INVALID_CREATE_ANSWER_MESSAGE`], for the same reason
+/// [`RunpodClient::status_error`] never shows any answer text either; for any
+/// other call it is [`decode_failure_message`].
+fn decode<T: DeserializeOwned>(body: &str, is_create: bool) -> Result<T, ApiError> {
     serde_json::from_str(body).map_err(|error| {
         ApiError::InvalidResponse(if is_create {
             INVALID_CREATE_ANSWER_MESSAGE.to_string()
         } else {
-            redact(&error.to_string(), account_key)
+            decode_failure_message(&error)
         })
     })
+}
+
+/// [`INVALID_ANSWER_MESSAGE`] with `error`'s category, line and column: the
+/// only parts of a serde error that can never hold a byte of the body.
+fn decode_failure_message(error: &serde_json::Error) -> String {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => "I/O",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "end of input",
+    };
+    format!(
+        "{INVALID_ANSWER_MESSAGE} ({category} error at line {}, column {})",
+        error.line(),
+        error.column()
+    )
 }
 
 /// `Retry-After` in seconds. The HTTP-date form is ignored; backoff applies instead.
@@ -455,15 +485,20 @@ fn is_runpod_error_shape(status: StatusCode, body: &str) -> bool {
 }
 
 /// The fixed message for a create call's failed answer, chosen only from
-/// `status` and, for a 400, whether `body` is Runpod's capacity failure. Never
+/// `status` and, for a 400, whether `body` is Runpod's capacity failure. A 408
+/// names a timeout whose outcome is unknown, matching
+/// [`ApiError::is_ambiguous`]; a 429 is one still there once retries ran out. Never
 /// reads anything else from `body`, and never shows any of it: this is the only
 /// place a create error's message is decided, so no echo of the request, in any
 /// shape a server could produce, can ever reach a caller.
 fn create_failure_message(status: StatusCode, body: &str) -> &'static str {
     match status {
         StatusCode::BAD_REQUEST if is_capacity_failure(body) => CAPACITY_MESSAGE,
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AUTH_REJECTED_MESSAGE,
+        StatusCode::UNAUTHORIZED => AUTH_REJECTED_MESSAGE,
+        StatusCode::FORBIDDEN => FORBIDDEN_MESSAGE,
         StatusCode::PAYMENT_REQUIRED => INSUFFICIENT_BALANCE_MESSAGE,
+        StatusCode::REQUEST_TIMEOUT => TIMEOUT_MESSAGE,
+        StatusCode::TOO_MANY_REQUESTS => RATE_LIMITED_MESSAGE,
         status if status.is_client_error() => INVALID_REQUEST_MESSAGE,
         _ => SERVER_ERROR_MESSAGE,
     }
@@ -676,7 +711,11 @@ mod tests {
         );
         assert_eq!(
             create_failure_message(StatusCode::FORBIDDEN, ""),
-            AUTH_REJECTED_MESSAGE
+            FORBIDDEN_MESSAGE
+        );
+        assert_eq!(
+            create_failure_message(StatusCode::REQUEST_TIMEOUT, ""),
+            TIMEOUT_MESSAGE
         );
         assert_eq!(
             create_failure_message(StatusCode::PAYMENT_REQUIRED, ""),
@@ -688,7 +727,7 @@ mod tests {
         );
         assert_eq!(
             create_failure_message(StatusCode::TOO_MANY_REQUESTS, ""),
-            INVALID_REQUEST_MESSAGE
+            RATE_LIMITED_MESSAGE
         );
         assert_eq!(
             create_failure_message(StatusCode::INTERNAL_SERVER_ERROR, ""),
@@ -708,7 +747,7 @@ mod tests {
     #[test]
     fn decode_errors_are_redacted() {
         let body = format!(r#""{INVALID_POD_ID_KEY}""#);
-        let result: Result<PodId, ApiError> = decode(&body, INVALID_POD_ID_KEY, false);
+        let result: Result<PodId, ApiError> = decode(&body, false);
         let message = match result {
             Err(ApiError::InvalidResponse(message)) => message,
             Err(other) => other.to_string(),
@@ -719,9 +758,20 @@ mod tests {
     }
 
     #[test]
+    fn a_decode_error_is_only_a_fixed_text_a_category_and_a_position() {
+        let body = r#"{"id": "p1", "env": "OVERBRAINER_HOST_KEY=c2VjcmV0"}"#;
+        let result: Result<Pod, ApiError> = decode(body, false);
+        assert!(matches!(
+            result,
+            Err(ApiError::InvalidResponse(ref message))
+                if message == &format!("{INVALID_ANSWER_MESSAGE} (data error at line 1, column 51)")
+        ));
+    }
+
+    #[test]
     fn a_create_decode_error_never_shows_the_answer() {
         let body = format!(r#""{INVALID_POD_ID_KEY}""#);
-        let result: Result<PodId, ApiError> = decode(&body, INVALID_POD_ID_KEY, true);
+        let result: Result<PodId, ApiError> = decode(&body, true);
         assert!(matches!(
             result,
             Err(ApiError::InvalidResponse(ref message)) if message == INVALID_CREATE_ANSWER_MESSAGE
