@@ -24,8 +24,8 @@ const FRAME: Duration = Duration::from_millis(33);
 ///
 /// # Errors
 ///
-/// Returns an error when drawing fails, the signals cannot be caught, or a
-/// process signal ended the TUI.
+/// Returns an error when drawing fails, the terminal cannot be read, the signals
+/// cannot be caught, or a process signal ended the TUI.
 pub(super) async fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
     let (events, input) = mpsc::unbounded_channel();
     let reader = InputTask::start(events);
@@ -34,7 +34,8 @@ pub(super) async fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow
     result
 }
 
-/// The loop itself, on any backend, reading terminal events from `input`.
+/// The loop itself, on any backend, reading terminal events from `input`. A read
+/// error on `input` ends the loop with that error; `input` closing quits.
 ///
 /// # Errors
 ///
@@ -42,7 +43,7 @@ pub(super) async fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow
 pub(super) async fn drive<B>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    mut input: UnboundedReceiver<TermEvent>,
+    mut input: UnboundedReceiver<io::Result<TermEvent>>,
 ) -> anyhow::Result<()>
 where
     B: Backend,
@@ -56,7 +57,10 @@ where
         let next_draw = last_draw.map_or_else(Instant::now, |at| at + FRAME);
         tokio::select! {
             event = input.recv() => match event {
-                Some(event) => app.on_input(&event),
+                Some(Ok(event)) => app.on_input(&event),
+                Some(Err(error)) => {
+                    return Err(anyhow::Error::new(error).context("cannot read the terminal"));
+                },
                 None => app.exit = Some(Exit::Quit),
             },
             () = signals.recv() => app.on_signal(),
@@ -119,9 +123,9 @@ mod tests {
         let mut app = app();
         let (events, input) = mpsc::unbounded_channel();
         terminal.backend_mut().resize(100, 30);
-        events.send(TermEvent::Resize(100, 30))?;
-        events.send(key(KeyCode::Char('4')))?;
-        events.send(key(KeyCode::Char('q')))?;
+        events.send(Ok(TermEvent::Resize(100, 30)))?;
+        events.send(Ok(key(KeyCode::Char('4'))))?;
+        events.send(Ok(key(KeyCode::Char('q'))))?;
         tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input)).await??;
         let area = terminal.backend().buffer().area;
         assert_eq!((area.width, area.height), (100, 30));
@@ -137,6 +141,23 @@ mod tests {
         drop(events);
         tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input)).await??;
         assert_eq!(app.exit, Some(Exit::Quit));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_read_error_ends_the_loop_with_that_error() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut app = app();
+        let (events, input) = mpsc::unbounded_channel();
+        events.send(Err(io::Error::other("the terminal is gone")))?;
+        drop(events);
+        let result = tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input)).await?;
+        let error = result.err().map(|error| format!("{error:#}"));
+        assert_eq!(
+            error.as_deref(),
+            Some("cannot read the terminal: the terminal is gone")
+        );
         Ok(())
     }
 }
