@@ -653,7 +653,19 @@ mod tests {
             content: "Because, really.".into(),
         };
         data.edit_answer(&answered_id(), &emptied, edited.clone())?;
-        assert_eq!(AnswerText::of(&data.answers[0]), Some(edited));
+        assert_eq!(AnswerText::of(&data.answers[0]), Some(edited.clone()));
+        let blank = AnswerText {
+            reasoning: Some("  ".into()),
+            content: "Because, truly.".into(),
+        };
+        data.edit_answer(&answered_id(), &edited, blank)?;
+        assert_eq!(
+            AnswerText::of(&data.answers[0]),
+            Some(AnswerText {
+                reasoning: None,
+                content: "Because, truly.".into(),
+            })
+        );
         Ok(())
     }
 
@@ -770,11 +782,13 @@ mod tests {
     }
 
     #[test]
-    fn a_rename_with_a_carriage_return_is_refused_as_multiline() {
+    fn a_rename_with_any_line_separator_is_refused_as_multiline() {
         let mut data = dataset();
         let before = data.clone();
-        let result = data.rename_subtopic(&borrowing_id(), "Borrowing", "A\rB");
-        assert!(matches!(result, Err(EditError::MultiLine)));
+        for name in ["A\rB", "A\u{85}B", "A\u{2028}B", "A\u{2029}B"] {
+            let result = data.rename_subtopic(&borrowing_id(), "Borrowing", name);
+            assert!(matches!(result, Err(EditError::MultiLine)), "{name:?}");
+        }
         assert_eq!(data, before);
     }
 
