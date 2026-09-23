@@ -281,7 +281,7 @@ impl Dataset {
     ///
     /// Returns [`EditError::Changed`] when the answer is gone or reads otherwise,
     /// and [`EditError::ReasoningRemoved`] when `after` has no reasoning (blank
-    /// included) but the answer has one.
+    /// included) but the answer has one (a blank one counts as none).
     pub fn edit_answer(
         &mut self,
         id: &Id,
@@ -296,7 +296,11 @@ impl Dataset {
         let reasoning = after
             .reasoning
             .filter(|reasoning| !reasoning.trim().is_empty());
-        if before.reasoning.is_some() && reasoning.is_none() {
+        let had = before
+            .reasoning
+            .as_deref()
+            .is_some_and(|reasoning| !reasoning.trim().is_empty());
+        if had && reasoning.is_none() {
             return Err(EditError::ReasoningRemoved);
         }
         if let Some(message) = example
@@ -865,6 +869,25 @@ mod tests {
                 content: "Because, truly.".into(),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_blank_reasoning_counts_as_none() -> Result<(), EditError> {
+        let mut data = dataset();
+        if let Some(message) = data.answers[0].messages.get_mut(1) {
+            message.reasoning_content = Some(" \n".into());
+        }
+        let before = AnswerText {
+            reasoning: Some(" \n".into()),
+            content: "Because.".into(),
+        };
+        let edited = AnswerText {
+            reasoning: None,
+            content: "Because, really.".into(),
+        };
+        data.edit_answer(&answered_id(), &before, edited.clone())?;
+        assert_eq!(AnswerText::of(&data.answers[0]), Some(edited));
         Ok(())
     }
 
