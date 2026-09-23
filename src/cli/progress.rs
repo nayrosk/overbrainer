@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn pod_events_read_as_sentences() -> Result<(), String> {
+    fn pod_events_read_as_sentences() -> Result<(), crate::runpod::InvalidPodId> {
         let pod_id = crate::runpod::PodId::new("k3x9abc")?;
         assert_eq!(
             pod_line(&PodStatus::Created {

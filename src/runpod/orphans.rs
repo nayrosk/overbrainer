@@ -749,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_pod_rm_says_what_it_kept_and_deleted() -> Result<(), String> {
+    fn a_refused_pod_rm_says_what_it_kept_and_deleted() -> Result<(), crate::runpod::InvalidPodId> {
         let training = PodId::new("p1")?;
         let others = [
             Removed::unrecorded(PodId::new("s1")?),

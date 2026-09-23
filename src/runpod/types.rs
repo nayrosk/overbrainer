@@ -13,18 +13,24 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[serde(transparent)]
 pub struct PodId(String);
 
+/// A string rejected by [`PodId::new`]: empty, or holding anything but ASCII
+/// letters and digits.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("`{0}` is not a Runpod pod ID")]
+pub struct InvalidPodId(String);
+
 impl PodId {
     /// Validates `id`.
     ///
     /// # Errors
     ///
-    /// Returns the rejected ID when it is empty or holds anything but ASCII
+    /// Returns [`InvalidPodId`] when `id` is empty or holds anything but ASCII
     /// letters and digits.
-    pub fn new(id: &str) -> Result<Self, String> {
+    pub fn new(id: &str) -> Result<Self, InvalidPodId> {
         if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()) {
             Ok(Self(id.to_string()))
         } else {
-            Err(format!("`{id}` is not a Runpod pod ID"))
+            Err(InvalidPodId(id.to_string()))
         }
     }
 
@@ -424,5 +430,16 @@ mod tests {
             assert!(PodId::new(bad).is_err(), "{bad}");
         }
         assert!(serde_json::from_str::<Pod>(r#"{"id": "../etc"}"#).is_err());
+    }
+
+    #[test]
+    fn a_rejected_pod_id_is_an_error_of_its_own() {
+        let error: Option<InvalidPodId> = PodId::new("a-b").err();
+        let source: Option<&dyn std::error::Error> =
+            error.as_ref().map(|e| e as &dyn std::error::Error);
+        assert_eq!(
+            source.map(ToString::to_string).as_deref(),
+            Some("`a-b` is not a Runpod pod ID")
+        );
     }
 }

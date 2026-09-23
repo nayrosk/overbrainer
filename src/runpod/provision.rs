@@ -881,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_bootstrap_has_its_own_delete_reason() -> Result<(), String> {
+    fn a_failed_bootstrap_has_its_own_delete_reason() -> Result<(), crate::runpod::InvalidPodId> {
         let id = PodId::new("p1")?;
         let (reason, error) = refusal(&id, "bootstrap: cannot start sshd".to_string());
         assert_eq!(reason, DeleteReason::BootstrapFailed);

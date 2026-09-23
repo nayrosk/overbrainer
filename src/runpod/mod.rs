@@ -43,8 +43,8 @@ pub use record::{
 pub use status::{DeleteReason, PodStatus};
 pub use target::{MIN_CUDA_VERSION, RunpodTarget, VOLUME_MOUNT, VOLUME_WORKDIR, WORKDIR};
 pub use types::{
-    CreateEnv, CreatePod, GpuRequest, Mounts, NetworkMount, Pagination, Pod, PodEnv, PodGpu, PodId,
-    PodPage, PodSsh, RemoteStatus, SshDirect,
+    CreateEnv, CreatePod, GpuRequest, InvalidPodId, Mounts, NetworkMount, Pagination, Pod, PodEnv,
+    PodGpu, PodId, PodPage, PodSsh, RemoteStatus, SshDirect,
 };
 
 /// Errors of a Runpod run's pod: provisioning, keys, readiness, deletion.
