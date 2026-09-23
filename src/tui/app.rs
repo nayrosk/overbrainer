@@ -3267,24 +3267,36 @@ mod tests {
         assert_eq!(app.exit_notes, [failed]);
     }
 
-    /// A signal abandons a start whose cancel was asked for: no note says the
-    /// run was not cancelled, its flow's error says what became of it.
+    /// A signal abandons a start whose cancel was asked for: the cancel never
+    /// runs, and a note says how to run it, true whether the start failed with
+    /// no job or detached with one.
     #[test]
-    fn a_signal_drops_a_cancel_asked_for_during_the_start() {
-        let mut app = app();
-        starting(&mut app, TaskId(6));
-        app.cancel_run(FIRST);
-        assert_eq!(app.on_signal(), [Effect::Abandon(TaskId(6))]);
+    fn a_signal_during_a_start_notes_its_cancel_never_runs() {
         let failed = "interrupted before its job started: run 20260921-133200-a1b2 failed";
-        let effects = app.on_done(TaskId(6), Ok(Done::Trained(Err(failed.into()))));
-        assert!(
-            !effects
-                .iter()
-                .any(|e| matches!(e, Effect::Spawn(_, Task::Train(TrainJob::Cancel(_))))),
-            "{effects:?}"
-        );
-        assert_eq!(app.exit, Some(Exit::Signal));
-        assert_eq!(app.exit_notes, [failed]);
+        for error in [failed, DETACHED] {
+            let mut app = app();
+            starting(&mut app, TaskId(6));
+            app.cancel_run(FIRST);
+            assert_eq!(app.on_signal(), [Effect::Abandon(TaskId(6))]);
+            let effects = app.on_done(TaskId(6), Ok(Done::Trained(Err(error.into()))));
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Spawn(_, Task::Train(TrainJob::Cancel(_))))),
+                "{effects:?}"
+            );
+            assert_eq!(app.exit, Some(Exit::Signal));
+            assert_eq!(
+                app.exit_notes,
+                [
+                    error.to_string(),
+                    "run 20260921-133200-a1b2 was not cancelled (a signal came during its \
+                     start); if it is running, cancel it with `overbrainer train cancel \
+                     20260921-133200-a1b2`"
+                        .to_string(),
+                ]
+            );
+        }
     }
 
     /// Staying after `y` drops the exit notes of a run detached and of a stage

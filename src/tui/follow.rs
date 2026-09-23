@@ -441,10 +441,21 @@ impl App {
                 self.note_leaving(error.clone());
             }
             if follow.cancel_after && !cancel {
-                self.note_leaving(format!(
-                    "run {run} was not cancelled: interrupted before its cancel started; \
-                     cancel it with `overbrainer train cancel {run}`"
-                ));
+                // A start abandoned may have failed with no job, or detached
+                // once its job started (a local or SSH start, a Runpod job
+                // already being sent), whose pod then bills until `max_hours`.
+                let note = if follow.starting() {
+                    format!(
+                        "run {run} was not cancelled (a signal came during its start); if it \
+                         is running, cancel it with `overbrainer train cancel {run}`"
+                    )
+                } else {
+                    format!(
+                        "run {run} was not cancelled: interrupted before its cancel started; \
+                         cancel it with `overbrainer train cancel {run}`"
+                    )
+                };
+                self.note_leaving(note);
             }
         }
         match &error {
@@ -608,9 +619,9 @@ impl App {
 
     /// On a process signal: every task that follows a run is abandoned at once,
     /// as Ctrl-C does on the command line (a Runpod run still provisioning
-    /// deletes its pod and fails); cancels are waited for. A cancel asked for
-    /// during a start is dropped, as [`App::abandon`] drops it: its flow's
-    /// error says what became of the run.
+    /// deletes its pod and fails); cancels are waited for. A cancel waiting
+    /// for a task never starts after a signal; the exit notes say how to run
+    /// it (see [`App::trained`]).
     pub(super) fn abandon_all(&mut self) -> Vec<Effect> {
         self.training
             .tasks
@@ -618,9 +629,6 @@ impl App {
             .filter(|(_, follow)| follow.job != Job::Cancel)
             .map(|(id, follow)| {
                 follow.detach = Detach::Done;
-                if follow.starting() {
-                    follow.cancel_after = false;
-                }
                 Effect::Abandon(*id)
             })
             .collect()
