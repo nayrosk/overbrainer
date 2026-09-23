@@ -2,10 +2,12 @@
 
 mod id;
 mod jsonl;
+mod rejected;
 mod types;
 
 pub use id::{Id, normalize};
-pub use jsonl::{Appender, DataFiles, DatasetError, read, rewrite};
+pub use jsonl::{Appender, DataFiles, DatasetError, Rewrite, read, rewrite};
+pub use rejected::Rejected;
 pub use types::{
     Example, Exclusion, FinishReason, Message, Meta, Question, ReasoningKind, Role, Subtopic,
 };
