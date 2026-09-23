@@ -7,15 +7,12 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::dataset::{AnswerText, Id};
+use crate::dataset::{AnswerText, Id, LINE_BREAKS};
 
 /// The line before an answer's reasoning in the temp file.
 pub(super) const REASONING_MARKER: &str = "=== overbrainer: reasoning (leave empty for none) ===";
 /// The line before an answer's content in the temp file.
 pub(super) const ANSWER_MARKER: &str = "=== overbrainer: answer ===";
-
-/// What ends a line, as `Dataset::rename_subtopic` refuses it in a subtopic name.
-const LINE_BREAKS: [char; 5] = ['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'];
 
 /// What is being edited, as it was when the editor opened.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -6,7 +6,7 @@ mod jsonl;
 mod rejected;
 mod types;
 
-pub use edit::{AnswerText, Change, Counts, Dataset, Deletion, EditError, Touched};
+pub use edit::{AnswerText, Change, Counts, Dataset, Deletion, EditError, LINE_BREAKS, Touched};
 pub use id::{Id, normalize};
 pub use jsonl::{Appender, DataFiles, DatasetError, Rewrite, read, rewrite};
 pub use rejected::Rejected;

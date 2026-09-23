@@ -10,6 +10,10 @@ use super::{
     DataFiles, DatasetError, Example, Id, Question, Rejected, Rewrite, Role, Subtopic, read,
 };
 
+/// What ends a line: a subtopic name holding any of them is refused as several
+/// lines ([`EditError::MultiLine`]).
+pub const LINE_BREAKS: [char; 5] = ['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'];
+
 /// Why an edit was refused. Messages hold dataset text only.
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
@@ -326,7 +330,7 @@ impl Dataset {
         before: &str,
         name: &str,
     ) -> Result<Change, EditError> {
-        if name.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']) {
+        if name.contains(LINE_BREAKS) {
             return Err(EditError::MultiLine);
         }
         let index = self
