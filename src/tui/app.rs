@@ -15,7 +15,7 @@ use super::editor::{self, Session, Target};
 use super::tasks::{Done, Edit, Saved, Task, TaskId};
 use super::theme::Theme;
 use crate::config::Settings;
-use crate::dataset::{AnswerText, Counts, Dataset, Deletion};
+use crate::dataset::{AnswerText, Counts, Dataset, Deletion, Id};
 use crate::logging::LogBuffer;
 
 /// How long a status message stays on the status line.
@@ -252,8 +252,9 @@ pub(super) struct App {
     pub(super) editor: Vec<String>,
     /// Lines printed on stderr once the terminal is restored.
     pub(super) exit_notes: Vec<String>,
-    /// Whether the user quit and the TUI waits for work to end.
-    pub(super) quitting: bool,
+    /// How the TUI ends once the edit being saved is saved: `q` or a signal
+    /// came while it was saved.
+    pub(super) quitting: Option<Exit>,
     next_task: u64,
     /// Whether something changed since the last draw.
     pub(super) dirty: bool,
@@ -282,7 +283,7 @@ impl App {
             editing: None,
             editor: vec!["vi".to_string()],
             exit_notes: Vec::new(),
-            quitting: false,
+            quitting: None,
             next_task: 0,
             log_view: LogView {
                 min: Level::INFO,
@@ -415,28 +416,48 @@ impl App {
         self.edit = None;
         let session = self.editing.take();
         match saved {
-            Ok(saved) => {
-                if let Some(session) = session {
-                    std::fs::remove_file(&session.path).ok();
-                }
-                let message = match &saved.split {
-                    Ok(_) => saved.message,
-                    Err(error) => {
-                        format!("{}, but split failed: {error}; run split", saved.message)
-                    },
-                };
-                self.dataset.split = saved.split.ok();
-                self.say(Severity::Info, message);
-            },
-            Err(error) => match session {
-                Some(session) => self.kept(&session, &error),
-                None => self.say(Severity::Error, error),
-            },
+            Ok(saved) => self.applied(session.as_ref(), saved),
+            Err(error) => self.refused(session.as_ref(), error),
         }
-        if self.quitting {
-            self.quit();
+        if let Some(exit) = self.quitting.take() {
+            self.exit = Some(exit);
+            return Vec::new();
         }
         self.reload()
+    }
+
+    /// A change was saved: drops the temp file of `session`, and says what the
+    /// change did, and whether `split` failed after it.
+    fn applied(&mut self, session: Option<&Session>, saved: Saved) {
+        if let Some(session) = session {
+            std::fs::remove_file(&session.path).ok();
+        }
+        let (message, severity) = match &saved.split {
+            Ok(_) => (saved.message, Severity::Info),
+            Err(error) => (
+                format!("{}, but split failed: {error}; run split", saved.message),
+                Severity::Warn,
+            ),
+        };
+        self.dataset.split = saved.split.ok();
+        if self.quitting.is_some() {
+            self.exit_notes
+                .push(format!("a change was saved: {message}"));
+        }
+        self.say(severity, message);
+    }
+
+    /// A change was refused: keeps the typed text of `session`, if any.
+    fn refused(&mut self, session: Option<&Session>, error: String) {
+        if let Some(session) = session {
+            self.kept(session, &error);
+            return;
+        }
+        if self.quitting.is_some() {
+            self.exit_notes
+                .push(format!("a change was refused ({error}); nothing changed"));
+        }
+        self.say(Severity::Error, error);
     }
 
     /// Keeps the temp file of `session` after `error`, saying where it is, on the
@@ -472,10 +493,7 @@ impl App {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.editing = None;
-                self.say(
-                    Severity::Error,
-                    format!("cannot read the edited file: {error}"),
-                );
+                self.kept(&session, &format!("cannot read the edited file: {error}"));
                 return Vec::new();
             },
         };
@@ -789,15 +807,26 @@ impl App {
     /// `q` or Ctrl-C: quits, once an edit being saved is saved.
     fn quit(&mut self) {
         if self.edit.is_some() {
-            self.quitting = true;
+            if self.quitting.is_none() {
+                self.quitting = Some(Exit::Quit);
+            }
             self.say(Severity::Info, "quitting once the edit is saved");
             return;
         }
         self.exit = Some(Exit::Quit);
     }
 
-    /// SIGINT, SIGTERM or SIGHUP from outside: quits without asking.
+    /// SIGINT, SIGTERM or SIGHUP from outside: quits without asking, once an
+    /// edit being saved is saved (it is never cut, design 3.6).
     pub(super) fn on_signal(&mut self) {
+        if self.edit.is_some() {
+            self.quitting = Some(Exit::Signal);
+            self.say(
+                Severity::Warn,
+                "interrupted: exiting once the edit is saved",
+            );
+            return;
+        }
         self.exit = Some(Exit::Signal);
     }
 
@@ -849,59 +878,20 @@ fn deletion(model: &Model, path: &[Node], topics: &[TopicInfo]) -> Result<Confir
     let counts = data
         .counts(&deletion)
         .ok_or_else(|| "changed on disk; press R".to_string())?;
-    let rebuilt = "train and eval are rebuilt.";
     let (title, question) = match &deletion {
-        Deletion::Subtopic(id) => {
-            let subtopic = data.subtopics.iter().find(|s| &s.id == id);
-            let name = subtopic.map_or("", |s| s.name.as_str());
-            let target = subtopic
-                .and_then(|s| topics.iter().find(|t| t.name == s.topic))
-                .map_or_else(String::new, |topic| {
-                    format!(" to reach {}", topic.subtopics)
-                });
-            (
-                " Delete a subtopic? ",
-                format!(
-                    "Delete subtopic \"{name}\" with its {} and {}? It is recorded in \
-                     data/rejected.jsonl so the subtopics stage does not generate it again; the \
-                     next subtopics run generates a replacement{target}. {rebuilt}",
-                    count(counts.questions, "question"),
-                    count(counts.answers, "answer"),
-                ),
-            )
-        },
-        Deletion::Question(id) => {
-            let question = data.questions.iter().find(|q| &q.id == id);
-            let subtopic = question.map_or("", |q| q.subtopic.as_str());
-            let target = question
-                .and_then(|q| topics.iter().find(|t| t.name == q.topic))
-                .map_or_else(String::new, |topic| {
-                    format!(" up to {}", topic.questions_per_subtopic)
-                });
-            let answer = if counts.answers > 0 {
-                " and its answer"
-            } else {
-                ""
-            };
-            (
-                " Delete a question? ",
-                format!(
-                    "Delete this question{answer}? It is recorded in data/rejected.jsonl; the \
-                     next questions run tops \"{subtopic}\"{target} without it. {rebuilt}"
-                ),
-            )
-        },
-        Deletion::Answer(_) => (
-            " Delete an answer? ",
-            format!(
-                "Delete this answer? The question stays; the next answers run asks the parent \
-                 again (a paid request). {rebuilt}"
-            ),
+        Deletion::Subtopic(id) => (
+            " Delete a subtopic? ",
+            subtopic_text(data, id, counts, topics),
         ),
+        Deletion::Question(id) => (
+            " Delete a question? ",
+            question_text(data, id, counts, topics),
+        ),
+        Deletion::Answer(id) => (" Delete an answer? ", answer_text(data, id, topics)),
         Deletion::MissingSubtopic(_) => (
             " Delete questions? ",
             format!(
-                "Delete {} whose subtopic no longer exists, and their {}? {rebuilt}",
+                "Delete {} whose subtopic no longer exists, and their {}? {REBUILT}",
                 count(counts.questions, "question"),
                 count(counts.answers, "answer"),
             ),
@@ -913,6 +903,77 @@ fn deletion(model: &Model, path: &[Node], topics: &[TopicInfo]) -> Result<Confir
         yes: "delete",
         action: Action::Delete { deletion, counts },
     })
+}
+
+/// The end of every deletion's text.
+const REBUILT: &str = "train and eval are rebuilt.";
+
+/// What the dialog says of a topic that is not in `overbrainer.toml`: no stage
+/// runs on it, so nothing comes back.
+fn not_configured(topic: &str) -> String {
+    format!("its topic \"{topic}\" is not in overbrainer.toml, so no run replaces it")
+}
+
+/// The dialog text for deleting subtopic `id`, which removes `counts`.
+fn subtopic_text(data: &Dataset, id: &Id, counts: Counts, topics: &[TopicInfo]) -> String {
+    let subtopic = data.subtopics.iter().find(|s| &s.id == id);
+    let name = subtopic.map_or("", |s| s.name.as_str());
+    let topic = subtopic.map_or("", |s| s.topic.as_str());
+    let then = topics.iter().find(|t| t.name == topic).map_or_else(
+        || format!("; {}", not_configured(topic)),
+        |topic| {
+            format!(
+                " so the subtopics stage does not generate it again; the next subtopics run \
+                 generates a replacement to reach {}",
+                topic.subtopics
+            )
+        },
+    );
+    format!(
+        "Delete subtopic \"{name}\" with its {} and {}? It is recorded in \
+         data/rejected.jsonl{then}. {REBUILT}",
+        count(counts.questions, "question"),
+        count(counts.answers, "answer"),
+    )
+}
+
+/// The dialog text for deleting question `id`, which removes `counts`.
+fn question_text(data: &Dataset, id: &Id, counts: Counts, topics: &[TopicInfo]) -> String {
+    let question = data.questions.iter().find(|q| &q.id == id);
+    let subtopic = question.map_or("", |q| q.subtopic.as_str());
+    let topic = question.map_or("", |q| q.topic.as_str());
+    let then = topics.iter().find(|t| t.name == topic).map_or_else(
+        || not_configured(topic),
+        |topic| {
+            format!(
+                "the next questions run tops \"{subtopic}\" up to {} without it",
+                topic.questions_per_subtopic
+            )
+        },
+    );
+    let answer = if counts.answers > 0 {
+        " and its answer"
+    } else {
+        ""
+    };
+    format!(
+        "Delete this question{answer}? It is recorded in data/rejected.jsonl; {then}. {REBUILT}"
+    )
+}
+
+/// The dialog text for deleting the answer of question `id`.
+fn answer_text(data: &Dataset, id: &Id, topics: &[TopicInfo]) -> String {
+    let topic = data
+        .answers
+        .iter()
+        .find(|a| &a.id == id)
+        .map_or("", |a| a.topic.as_str());
+    let then = if topics.iter().any(|t| t.name == topic) {
+        "the next answers run asks the parent again (a paid request)".to_string()
+    } else {
+        not_configured(topic)
+    };
+    format!("Delete this answer? The question stays; {then}. {REBUILT}")
 }
 
 /// `count` `noun`s, plural unless 1.
@@ -1514,6 +1575,145 @@ mod tests {
         );
         app.abandon_edit();
         assert_eq!(app.exit_notes.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_signal_during_a_save_waits_for_it_then_says_it_was_saved()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = project_app()?;
+        open_to(&mut app, &path_to(MOVED, false));
+        let effects = press(&mut app, &[KeyCode::Char('e')]);
+        let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        std::fs::write(path, "What happens to a borrow after a move?\n")?;
+        let effects = app.on_editor_exit(Ok(exited(0)));
+        let [Effect::Spawn(id, _)] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        app.on_signal();
+        assert_eq!(app.exit, None, "the save is never cut");
+        let saved = Saved {
+            message: "question saved".into(),
+            split: Err("cannot write data/train.jsonl".into()),
+        };
+        assert_eq!(app.on_done(*id, Ok(Done::Saved(Ok(saved)))), []);
+        assert_eq!(app.exit, Some(Exit::Signal));
+        assert!(!path.exists());
+        let said = "question saved, but split failed: cannot write data/train.jsonl; run split";
+        assert_eq!(app.exit_notes, [format!("a change was saved: {said}")]);
+        assert_eq!(status(&app), Some(said));
+        assert_eq!(
+            app.status.as_ref().map(|s| s.severity),
+            Some(Severity::Warn)
+        );
+        app.abandon_edit();
+        assert_eq!(app.exit_notes.len(), 1, "no stale note");
+        Ok(())
+    }
+
+    #[test]
+    fn a_signal_during_a_refused_save_notes_the_kept_file() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_dir, mut app) = project_app()?;
+        open_to(&mut app, &path_to(MOVED, false));
+        let effects = press(&mut app, &[KeyCode::Char('e')]);
+        let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        std::fs::write(path, "When does NLL end a borrow?")?;
+        let effects = app.on_editor_exit(Ok(exited(0)));
+        let [Effect::Spawn(id, _)] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        app.on_signal();
+        let refused = "another question of this subtopic already has this text";
+        app.on_done(*id, Ok(Done::Saved(Err(refused.into()))));
+        assert_eq!(app.exit, Some(Exit::Signal));
+        assert!(path.exists());
+        assert_eq!(
+            app.exit_notes,
+            [format!(
+                "an edit was refused ({refused}); its text is kept in {}",
+                path.display()
+            )]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_edited_file_that_cannot_be_read_is_noted_for_the_exit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = project_app()?;
+        open_to(&mut app, &path_to(MOVED, false));
+        let effects = press(&mut app, &[KeyCode::Char('e')]);
+        let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        std::fs::remove_file(path)?;
+        std::fs::create_dir(path)?;
+        assert_eq!(app.on_editor_exit(Ok(exited(0))), []);
+        assert_eq!(app.lock(), None);
+        assert_eq!(app.exit_notes.len(), 1);
+        assert!(
+            app.exit_notes[0].contains("cannot read the edited file")
+                && app.exit_notes[0].contains(&path.display().to_string()),
+            "{:?}",
+            app.exit_notes
+        );
+        Ok(())
+    }
+
+    /// The text of the dialog `d` opens on the node at `path`.
+    fn dialog_text(app: &mut App, path: &[Node]) -> Result<String, String> {
+        open_to(app, path);
+        press(app, &[KeyCode::Char('d')]);
+        match app.overlay.take() {
+            Some(Overlay::Confirm(confirm)) => Ok(confirm.text.concat()),
+            other => Err(format!("{other:?}")),
+        }
+    }
+
+    #[test]
+    fn a_deletion_in_a_topic_not_configured_promises_no_replacement() -> Result<(), String> {
+        let mut app = dataset_app();
+        let legacy = Id::subtopic("old_topic", "Legacy");
+        let question = Id::question(&legacy, "Is this question still used?");
+        let topic = Node::Topic("old_topic".into());
+        let not_configured = "its topic \"old_topic\" is not in overbrainer.toml, so no run \
+                              replaces it. train and eval are rebuilt.";
+        let subtopic = dialog_text(&mut app, &[topic.clone(), Node::Subtopic(legacy.clone())])?;
+        assert_eq!(
+            subtopic,
+            format!(
+                "Delete subtopic \"Legacy\" with its 1 question and 1 answer? It is recorded in \
+                 data/rejected.jsonl; {not_configured}"
+            )
+        );
+        let path = [
+            topic,
+            Node::Subtopic(legacy),
+            Node::Question(question.clone()),
+        ];
+        let text = dialog_text(&mut app, &path)?;
+        assert_eq!(
+            text,
+            format!(
+                "Delete this question and its answer? It is recorded in data/rejected.jsonl; \
+                 {not_configured}"
+            )
+        );
+        let mut answer = path.to_vec();
+        answer.push(Node::Answer(question));
+        let text = dialog_text(&mut app, &answer)?;
+        assert_eq!(
+            text,
+            format!("Delete this answer? The question stays; {not_configured}")
+        );
+        for text in [subtopic, text] {
+            assert!(!text.contains("next"), "{text}");
+        }
         Ok(())
     }
 }
