@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use super::{Ctx, Item, PipelineError, RoleClient, ask_list, item_error, without_topics};
 use crate::config::Topic;
-use crate::dataset::{Appender, Id, Question, Subtopic, read, rewrite};
+use crate::dataset::{Appender, Id, Question, Rejected, Subtopic, read, rewrite};
 use crate::dedup::Deduplicator;
 use crate::events::{Event, Stage, StageStats};
 use crate::llm::{LlmClient, Usage};
@@ -23,8 +23,9 @@ struct Context<'a> {
 /// Subtopics are filled one batch at a time (`pipeline.question_batch_size`), each
 /// prompt listing the questions already accepted for the subtopic. Every batch goes
 /// through a deduplicator shared by the whole topic, created by `new_dedup` and seeded
-/// with the questions already on disk; a topic with nothing left to fill is not
-/// seeded, so its stored questions are not embedded again. A subtopic stops at
+/// with the questions already on disk and the topic's questions recorded in
+/// `data/rejected.jsonl` (deleted questions), so neither comes back; a topic with
+/// nothing left to fill is not seeded, so its stored questions are not embedded again. A subtopic stops at
 /// `questions_per_subtopic` or after `pipeline.max_retries` batches without a new
 /// question (at least one).
 /// Batches run one after the other because each depends on the previous ones. A
@@ -49,6 +50,7 @@ where
     let topics = ctx.topics()?;
     let subtopics: Vec<Subtopic> = read(&ctx.files.subtopics)?;
     let mut existing: Vec<Question> = read(&ctx.files.questions)?;
+    let rejected: Vec<Rejected> = read(&ctx.files.rejected)?;
     if ctx.force {
         existing = without_topics(existing, &topics, |question| &question.topic);
         rewrite(&ctx.files.questions, &existing)?;
@@ -68,7 +70,8 @@ where
         let pending = subtopics.iter().any(|subtopic| {
             subtopic.topic == topic.name && needs_filling(subtopic, &existing, &[topic])
         });
-        if pending && !seed(ctx, topic, &existing, &mut dedup, &mut filler.stats).await? {
+        let known = seed_texts(&topic.name, &existing, &rejected);
+        if pending && !seed(ctx, topic, &known, &mut dedup, &mut filler.stats).await? {
             continue;
         }
         for subtopic in subtopics.iter().filter(|s| s.topic == topic.name) {
@@ -89,21 +92,30 @@ where
     Ok(filler.stats)
 }
 
-/// Records the questions of `topic` already on disk in `dedup`. Returns `false` when
-/// that failed without stopping the stage (the topic is then reported as failed).
+/// The texts of `topic_name`'s questions already on disk, then of its rejected ones.
+fn seed_texts(topic_name: &str, existing: &[Question], rejected: &[Rejected]) -> Vec<String> {
+    let stored = existing
+        .iter()
+        .filter(|question| question.topic == topic_name)
+        .map(|question| question.text.clone());
+    let deleted = rejected.iter().filter_map(|record| match record {
+        Rejected::Question { topic, text, .. } if topic == topic_name => Some(text.clone()),
+        _ => None,
+    });
+    stored.chain(deleted).collect()
+}
+
+/// Records `known`, the texts `topic` must not generate again, in `dedup`. Returns
+/// `false` when that failed without stopping the stage (the topic is then reported
+/// as failed).
 async fn seed<D: Deduplicator>(
     ctx: &Ctx<'_>,
     topic: &Topic,
-    existing: &[Question],
+    known: &[String],
     dedup: &mut D,
     stats: &mut StageStats,
 ) -> Result<bool, PipelineError> {
-    let known: Vec<String> = existing
-        .iter()
-        .filter(|question| question.topic == topic.name)
-        .map(|question| question.text.clone())
-        .collect();
-    let Err(error) = dedup.record(&known).await else {
+    let Err(error) = dedup.record(known).await else {
         return Ok(true);
     };
     let item = Item {
