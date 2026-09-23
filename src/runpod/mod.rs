@@ -7,9 +7,11 @@
 //! runtime, like an SSH target.
 
 mod client;
+mod status;
 mod types;
 
 pub use client::{ApiError, RunpodClient, USER_AGENT};
+pub use status::{DeleteReason, PodStatus};
 pub use types::{
     CreateEnv, CreatePod, GpuRequest, Mounts, NetworkMount, Pagination, Pod, PodEnv, PodGpu, PodId,
     PodPage, PodSsh, RemoteStatus, SshDirect,

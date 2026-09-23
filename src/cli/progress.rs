@@ -7,6 +7,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::events::{Event, Stage, StageStats};
 use crate::exec::JobStatus;
+use crate::runpod::PodStatus;
 use crate::train::TrainMetric;
 
 /// Training logs come at every step: at most one is shown per interval, plus every
@@ -63,6 +64,7 @@ impl Progress {
                 }
             },
             Event::JobStatus(status) => job(*status),
+            Event::PodStatus(status) => tracing::info!("pod: {}", pod_line(status)),
         }
     }
 
@@ -158,6 +160,71 @@ pub fn status_name(status: JobStatus) -> String {
         JobStatus::Exited(code) => format!("exited with code {code}"),
         JobStatus::Cancelled => "cancelled".to_string(),
         JobStatus::Lost => "lost (stopped without an exit code)".to_string(),
+    }
+}
+
+/// A pod event in words, for example
+/// `created k3x9abc (NVIDIA RTX A6000, EU-RO-1, $0.53/h); waiting for SSH`.
+#[must_use]
+pub fn pod_line(status: &PodStatus) -> String {
+    match status {
+        PodStatus::Creating { name, gpu_type } => format!("creating {name} ({gpu_type})"),
+        PodStatus::Unavailable { gpu_type, reason } => {
+            format!("{gpu_type} unavailable ({reason})")
+        },
+        PodStatus::Created {
+            pod_id,
+            gpu_type,
+            data_center,
+            cost_per_hour,
+        } => {
+            let mut parts = vec![gpu_type.clone()];
+            parts.extend(data_center.clone());
+            parts.extend(cost_per_hour.map(|cost| format!("${cost:.2}/h")));
+            format!("created {pod_id} ({}); waiting for SSH", parts.join(", "))
+        },
+        PodStatus::Ready {
+            pod_id,
+            after,
+            deadline,
+        } => match deadline {
+            Some(deadline) => format!(
+                "{pod_id} ready after {}; watchdog armed, deletes it by {deadline} at the latest",
+                duration_words(*after)
+            ),
+            None => format!(
+                "{pod_id} ready after {}; watchdog armed, kept with no time limit (--keep-pod)",
+                duration_words(*after)
+            ),
+        },
+        PodStatus::Deleting { pod_id, reason } => {
+            format!("deleting {pod_id} ({})", reason.describe())
+        },
+        PodStatus::Deleted {
+            pod_id,
+            uptime,
+            estimated_spend,
+        } => {
+            let after = uptime.map_or_else(String::new, |uptime| {
+                format!(" after {}", duration_words(uptime))
+            });
+            let spend =
+                estimated_spend.map_or_else(String::new, |spend| format!(", about ${spend:.2}"));
+            format!("{pod_id} deleted{after}{spend}")
+        },
+        PodStatus::Kept { pod_id } => format!("{pod_id} kept (--keep-pod)"),
+    }
+}
+
+/// `duration` to the second below a minute, to the second below an hour, to the
+/// minute above: `45s`, `3m41s`, `1h12m`.
+#[must_use]
+pub fn duration_words(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m{:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h{:02}m", seconds / 3600, seconds % 3600 / 60),
     }
 }
 
@@ -284,5 +351,58 @@ mod tests {
         assert_eq!(progress.finished, 1);
         let mut empty = started(0);
         assert_eq!(empty.advance(), None);
+    }
+
+    #[test]
+    fn pod_events_read_as_sentences() -> Result<(), String> {
+        let pod_id = crate::runpod::PodId::new("k3x9abc")?;
+        assert_eq!(
+            pod_line(&PodStatus::Created {
+                pod_id: pod_id.clone(),
+                gpu_type: "NVIDIA RTX A6000".into(),
+                data_center: Some("EU-RO-1".into()),
+                cost_per_hour: Some(0.53),
+            }),
+            "created k3x9abc (NVIDIA RTX A6000, EU-RO-1, $0.53/h); waiting for SSH"
+        );
+        assert_eq!(
+            pod_line(&PodStatus::Ready {
+                pod_id: pod_id.clone(),
+                after: Duration::from_secs(221),
+                deadline: Some("2026-09-22T20:30:05Z".into()),
+            }),
+            "k3x9abc ready after 3m41s; watchdog armed, deletes it by 2026-09-22T20:30:05Z at the latest"
+        );
+        assert_eq!(
+            pod_line(&PodStatus::Deleted {
+                pod_id: pod_id.clone(),
+                uptime: Some(Duration::from_secs(4_320)),
+                estimated_spend: Some(0.636),
+            }),
+            "k3x9abc deleted after 1h12m, about $0.64"
+        );
+        assert_eq!(
+            pod_line(&PodStatus::Deleting {
+                pod_id,
+                reason: crate::runpod::DeleteReason::NotReady,
+            }),
+            "deleting k3x9abc (not ready in time)"
+        );
+        assert_eq!(
+            pod_line(&PodStatus::Unavailable {
+                gpu_type: "NVIDIA A40".into(),
+                reason: "400: no capacity".into(),
+            }),
+            "NVIDIA A40 unavailable (400: no capacity)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durations_read_in_the_right_unit() {
+        assert_eq!(duration_words(Duration::from_secs(45)), "45s");
+        assert_eq!(duration_words(Duration::from_secs(60)), "1m00s");
+        assert_eq!(duration_words(Duration::from_secs(3_599)), "59m59s");
+        assert_eq!(duration_words(Duration::from_secs(10_920)), "3h02m");
     }
 }
