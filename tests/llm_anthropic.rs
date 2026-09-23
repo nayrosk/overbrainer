@@ -3,7 +3,7 @@ use std::time::Duration;
 use overbrainer::config::{Effort, EnvSource, Protocol, load};
 use overbrainer::dataset::{FinishReason, ReasoningKind};
 use overbrainer::llm::{
-    CompletionRequest, LlmClient, LlmError, ProtocolClient, SetupError, connect,
+    CompletionRequest, LlmClient, LlmError, ProtocolClient, Retryable, SetupError, connect,
 };
 use overbrainer::secrets::{Resolver, VaultSource};
 use secrecy::SecretString;

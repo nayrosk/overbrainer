@@ -11,6 +11,7 @@ pub mod logging;
 pub mod pipeline;
 pub mod pricing;
 pub mod prompts;
+pub mod retry;
 pub mod runs;
 pub mod secrets;
 pub mod train;
