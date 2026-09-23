@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::editor::Edited;
@@ -29,6 +30,11 @@ use crate::prompts::Prompts;
 /// least about 40 bytes: about 26 000 events, then an await lets the forwarder
 /// drain.
 pub(super) const BUS_CAPACITY: usize = 32_768;
+
+/// How long a pipeline task waits for its forwarder once its flow is dropped:
+/// only a sender kept by a task the flow spawned and has not yet dropped can
+/// hold it that long.
+const FORWARD_GRACE: Duration = Duration::from_secs(5);
 
 /// Identifies a task for the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -94,7 +100,12 @@ pub(super) enum Msg {
 
 /// Forwards the events of task `id` from `events` as messages, until every
 /// sender of its bus is dropped (the task ended). Lag is reported, never fatal.
-pub(super) fn forward(id: TaskId, mut events: Receiver<Event>, messages: UnboundedSender<Msg>) {
+/// The handle ends once the last event is sent.
+pub(super) fn forward(
+    id: TaskId,
+    mut events: Receiver<Event>,
+    messages: UnboundedSender<Msg>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let message = match events.recv().await {
@@ -106,28 +117,30 @@ pub(super) fn forward(id: TaskId, mut events: Receiver<Event>, messages: Unbound
                 break;
             }
         }
-    });
+    })
 }
 
-/// A TUI front end for task `id`: its own bus, forwarded to `messages`, its
-/// detach token and abandon flag, and its reports sent as messages.
+/// A TUI front end for task `id`: its own bus, forwarded to `messages` by the
+/// task returned with it, its detach token and abandon flag, and its reports
+/// sent as messages.
 fn front_end(
     id: TaskId,
     messages: &UnboundedSender<Msg>,
     detach: &CancellationToken,
     abandon: &Arc<AtomicBool>,
-) -> Frontend {
+) -> (Frontend, JoinHandle<()>) {
     let bus = EventBus::with_capacity(BUS_CAPACITY);
-    forward(id, bus.subscribe(), messages.clone());
+    let forwarder = forward(id, bus.subscribe(), messages.clone());
     let sink = messages.clone();
-    Frontend::Tui {
+    let front = Frontend::Tui {
         bus,
         detach: detach.clone(),
         abandon: Arc::clone(abandon),
         report: Arc::new(move |report| {
             sink.send(Msg::Report(id, report)).ok();
         }),
-    }
+    };
+    (front, forwarder)
 }
 
 /// Applies `edit` to the files of the project in `project_dir`, freshly read,
@@ -207,45 +220,57 @@ impl Tasks {
     /// Starts `task` as `id`.
     pub(super) fn spawn(&mut self, id: TaskId, task: Task) {
         let files = DataFiles::new(&self.project_dir);
-        let handle = match task {
-            Task::Load => self.set.spawn(async move {
-                let read = tokio::task::spawn_blocking(move || Dataset::read(&files)).await;
-                Done::Loaded(match read {
-                    Ok(Ok(data)) => Ok(data),
-                    Ok(Err(error)) => Err(format!("{:#}", anyhow::Error::from(error))),
-                    Err(error) => Err(format!("cannot read the data files: {error}")),
-                })
-            }),
-            Task::Edit(edit) => {
-                let dir = self.project_dir.clone();
-                self.set.spawn(async move {
-                    let saved =
-                        tokio::task::spawn_blocking(move || save(&dir, &edit, EnvSource::Process))
-                            .await;
-                    Done::Saved(match saved {
-                        Ok(saved) => saved,
-                        Err(error) => Err(format!("the edit failed: {error}")),
+        let handle =
+            match task {
+                Task::Load => self.set.spawn(async move {
+                    let read = tokio::task::spawn_blocking(move || Dataset::read(&files)).await;
+                    Done::Loaded(match read {
+                        Ok(Ok(data)) => Ok(data),
+                        Ok(Err(error)) => Err(format!("{:#}", anyhow::Error::from(error))),
+                        Err(error) => Err(format!("cannot read the data files: {error}")),
                     })
-                })
-            },
-            Task::Pipeline(command) => {
-                let dir = self.project_dir.clone();
-                let token = CancellationToken::new();
-                let abandon = Arc::new(AtomicBool::new(false));
-                let front = front_end(id, &self.messages, &token, &abandon);
-                self.tokens.insert(id, token.clone());
-                self.set.spawn(async move {
+                }),
+                Task::Edit(edit) => {
+                    let dir = self.project_dir.clone();
+                    self.set.spawn(async move {
+                        let saved = tokio::task::spawn_blocking(move || {
+                            save(&dir, &edit, EnvSource::Process)
+                        })
+                        .await;
+                        Done::Saved(match saved {
+                            Ok(saved) => saved,
+                            Err(error) => Err(format!("the edit failed: {error}")),
+                        })
+                    })
+                },
+                Task::Pipeline(command) => {
+                    let dir = self.project_dir.clone();
+                    let token = CancellationToken::new();
+                    let abandon = Arc::new(AtomicBool::new(false));
+                    let (front, forwarder) = front_end(id, &self.messages, &token, &abandon);
+                    self.tokens.insert(id, token.clone());
+                    self.set.spawn(async move {
                     let args = StageArgs::default();
-                    let run = crate::cli::data::run(&dir, command, &args, &front);
-                    Done::Pipeline(tokio::select! {
-                        result = run => result.map_err(|error| format!("{error:#}")),
-                        () = token.cancelled() => {
-                            Err("interrupted: the stage resumes on its next run".to_string())
-                        },
-                    })
+                    let outcome = {
+                        let run = crate::cli::data::run(&dir, command, &args, &front);
+                        tokio::select! {
+                            result = run => result.map_err(|error| format!("{error:#}")),
+                            () = token.cancelled() => {
+                                Err("interrupted: the stage resumes on its next run".to_string())
+                            },
+                        }
+                    };
+                    // The bus closes with the front end: the forwarder then sends
+                    // what is left and ends, so every message of the task is in
+                    // the app's inbox before its end is.
+                    drop(front);
+                    if tokio::time::timeout(FORWARD_GRACE, forwarder).await.is_err() {
+                        tracing::warn!("the events of the stage were not all forwarded");
+                    }
+                    Done::Pipeline(outcome)
                 })
-            },
-        };
+                },
+            };
         self.ids.insert(handle.id(), id);
     }
 
@@ -271,7 +296,6 @@ impl Tasks {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
 
     use super::*;
     use crate::dataset::{Example, Id, Question, rewrite};
@@ -365,6 +389,110 @@ mod tests {
         assert!(save(dir.path(), &edit, EnvSource::Vars(Vec::new())).is_err());
         assert_eq!(std::fs::read(&files.answers)?, before);
         assert!(!files.train.exists());
+        Ok(())
+    }
+
+    /// A copy of a message of the pipeline task, which [`Msg`] cannot clone.
+    fn copy(message: &Msg) -> Option<Msg> {
+        match message {
+            Msg::Event(id, event) => Some(Msg::Event(*id, event.clone())),
+            Msg::Lagged(id, skipped) => Some(Msg::Lagged(*id, *skipped)),
+            Msg::Report(id, report) => Some(Msg::Report(*id, report.clone())),
+            Msg::EditorExited(_) => None,
+        }
+    }
+
+    /// A real `split` task: every message is sent before it ends, and the app
+    /// keeps them whether they are handled before or after its end.
+    #[tokio::test]
+    async fn a_split_task_sends_every_message_before_it_ends() -> TestResult {
+        use crossterm::event::KeyCode;
+
+        use crate::events::Stage;
+        use crate::tui::app::Effect;
+        use crate::tui::pipeline::StageState;
+        use crate::tui::snapshots::{app, key};
+
+        let dir = project()?;
+        let (messages, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = Tasks::new(dir.path(), messages);
+        tasks.spawn(TaskId(1), Task::Pipeline(Command::Split));
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        let Some((TaskId(1), Ok(Done::Pipeline(Ok(()))))) = next else {
+            return Err(format!("unexpected end: {next:?}").into());
+        };
+        let mut received = Vec::new();
+        while let Ok(message) = inbox.try_recv() {
+            received.push(message);
+        }
+        let started = received.iter().any(|message| {
+            matches!(
+                message,
+                Msg::Event(
+                    TaskId(1),
+                    Event::StageStarted {
+                        stage: Stage::Split,
+                        ..
+                    }
+                )
+            )
+        });
+        let finished = received.iter().any(|message| {
+            matches!(
+                message,
+                Msg::Event(
+                    TaskId(1),
+                    Event::StageFinished {
+                        stage: Stage::Split,
+                        ..
+                    }
+                )
+            )
+        });
+        assert!(started && finished, "{received:?}");
+        let line = received.iter().find_map(|message| match message {
+            Msg::Report(TaskId(1), Report::Line(line)) => Some(line.clone()),
+            _ => None,
+        });
+        let Some(line) = line else {
+            return Err(format!("no split line: {received:?}").into());
+        };
+        assert!(line.starts_with("split: "), "{line}");
+        for done_first in [false, true] {
+            let mut app = app();
+            let mut effects = Vec::new();
+            for code in [
+                KeyCode::Char('r'),
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+            ] {
+                effects.extend(app.on_input(&key(code)));
+            }
+            assert_eq!(
+                effects,
+                [Effect::Spawn(TaskId(1), Task::Pipeline(Command::Split))]
+            );
+            if done_first {
+                app.on_done(TaskId(1), Ok(Done::Pipeline(Ok(()))));
+            }
+            for message in received.iter().filter_map(copy) {
+                app.on_message(message);
+            }
+            if !done_first {
+                app.on_done(TaskId(1), Ok(Done::Pipeline(Ok(()))));
+            }
+            assert_eq!(
+                app.pipeline.results,
+                std::slice::from_ref(&line),
+                "done first: {done_first}"
+            );
+            let row = app.pipeline.row(Stage::Split);
+            assert_eq!(row.state, StageState::Done, "done first: {done_first}");
+            assert_eq!(row.finished, row.total, "done first: {done_first}");
+            assert!(row.total > 0);
+        }
         Ok(())
     }
 }

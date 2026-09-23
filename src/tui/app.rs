@@ -277,6 +277,9 @@ pub(super) struct App {
     pub(super) pipeline: PipelineView,
     /// The pipeline task running, if any.
     pub(super) pipeline_task: Option<TaskId>,
+    /// The pipeline task that ended last, until the next one starts: its late
+    /// messages still update the view.
+    pipeline_last: Option<TaskId>,
     /// Lines printed on stderr once the terminal is restored.
     pub(super) exit_notes: Vec<String>,
     /// How the TUI ends, set once it is to end while it waits for work to end:
@@ -311,6 +314,7 @@ impl App {
             editor: vec!["vi".to_string()],
             pipeline: PipelineView::default(),
             pipeline_task: None,
+            pipeline_last: None,
             exit_notes: Vec::new(),
             leaving: None,
             next_task: 0,
@@ -478,7 +482,8 @@ impl App {
             return Vec::new();
         }
         self.pipeline_task = None;
-        self.pipeline.running = false;
+        self.pipeline_last = Some(id);
+        self.pipeline.stopped();
         let name = self.pipeline.command.map_or("stage", command_name);
         let (severity, said) = match &outcome {
             Ok(()) if self.pipeline.command == Some(Command::Run) => (
@@ -500,20 +505,26 @@ impl App {
         self.reload()
     }
 
-    /// A message of a running task: the events, lag and lines of the pipeline
-    /// task running; those of any other task are dropped.
+    /// A message of a task: the events, lag and lines of the pipeline task
+    /// running, or of the last one (a message handled after its end); those of
+    /// any other task are dropped.
     pub(super) fn on_message(&mut self, message: Msg) {
         self.dirty = true;
         match message {
-            Msg::Event(id, event) if self.pipeline_task == Some(id) => self.pipeline.event(&event),
-            Msg::Lagged(id, skipped) if self.pipeline_task == Some(id) => {
+            Msg::Event(id, event) if self.is_pipeline(id) => self.pipeline.event(&event),
+            Msg::Lagged(id, skipped) if self.is_pipeline(id) => {
                 self.pipeline.skipped += skipped;
             },
-            Msg::Report(id, Report::Line(line)) if self.pipeline_task == Some(id) => {
+            Msg::Report(id, Report::Line(line)) if self.is_pipeline(id) => {
                 self.pipeline.results.push(line);
             },
             _ => {},
         }
+    }
+
+    /// Whether task `id` is the pipeline task running or the last one.
+    fn is_pipeline(&self, id: TaskId) -> bool {
+        self.pipeline_task == Some(id) || self.pipeline_last == Some(id)
     }
 
     /// `r`: the menu of pipeline commands, unless the data is locked.
@@ -558,6 +569,7 @@ impl App {
         }
         let id = self.task_id();
         self.pipeline_task = Some(id);
+        self.pipeline_last = None;
         self.pipeline.started(command, self.project.concurrency);
         self.view = View::Pipeline;
         vec![Effect::Spawn(id, Task::Pipeline(command))]
@@ -736,7 +748,14 @@ impl App {
         if self.leaving == Some(Exit::Quit) && matches!(key.code, KeyCode::Esc | KeyCode::Char('n'))
         {
             self.leaving = None;
-            self.say(Severity::Info, "not quitting");
+            let stopping = self.pipeline_task.is_some().then(|| {
+                let name = self.pipeline.command.map_or("stage", command_name);
+                format!("not quitting; {name} still stops")
+            });
+            self.say(
+                Severity::Info,
+                stopping.unwrap_or_else(|| "not quitting".to_string()),
+            );
             return Vec::new();
         }
         match key.code {
@@ -2049,5 +2068,29 @@ mod tests {
         );
         app.abandon_stage();
         assert_eq!(app.exit_notes.len(), 1);
+    }
+
+    #[test]
+    fn staying_after_y_says_the_stage_still_stops() {
+        let mut app = app();
+        crate::tui::snapshots::pipeline_running(&mut app);
+        let effects = press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        assert_eq!(effects, [Effect::Cancel(TaskId(7))]);
+        press(&mut app, &[KeyCode::Esc]);
+        assert_eq!(app.leaving, None);
+        assert_eq!(status(&app), Some("not quitting; run still stops"));
+        app.on_done(
+            TaskId(7),
+            Ok(Done::Pipeline(Err(
+                "interrupted: the stage resumes on its next run".into(),
+            ))),
+        );
+        assert_eq!(app.exit, None);
+        assert!(
+            app.pipeline
+                .rows
+                .iter()
+                .all(|row| row.state != super::super::pipeline::StageState::Running)
+        );
     }
 }

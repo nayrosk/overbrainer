@@ -77,9 +77,13 @@ fn render_row(frame: &mut Frame, area: Rect, view: &PipelineView, stage: Stage, 
         StageState::Pending => ("pending", theme.dim),
         StageState::Running => ("running", theme.warn),
         StageState::Done => ("done", theme.ok),
+        StageState::Stopped => ("stopped", theme.error),
     };
     frame.render_widget(Paragraph::new(Span::styled(label, style)), state_area);
-    if matches!(row.state, StageState::Running | StageState::Done) {
+    if matches!(
+        row.state,
+        StageState::Running | StageState::Done | StageState::Stopped
+    ) {
         let ratio = if row.total == 0 {
             1.0
         } else {

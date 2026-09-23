@@ -29,6 +29,8 @@ pub(super) enum StageState {
     Running,
     /// Finished.
     Done,
+    /// Started, then its task ended first: interrupted, failed or panicked.
+    Stopped,
 }
 
 /// One stage's counters.
@@ -153,8 +155,13 @@ impl PipelineView {
     pub(super) fn event(&mut self, event: &Event) {
         match event {
             Event::StageStarted { stage, total } => {
+                let state = if self.running {
+                    StageState::Running
+                } else {
+                    StageState::Stopped
+                };
                 let row = &mut self.rows[index(*stage)];
-                *row = Row::new(StageState::Running);
+                *row = Row::new(state);
                 row.total = *total;
             },
             Event::ItemDone { stage, usage, .. } => {
@@ -173,6 +180,8 @@ impl PipelineView {
             Event::StageFinished { stage, stats } => {
                 let row = &mut self.rows[index(*stage)];
                 row.state = StageState::Done;
+                row.finished = row.total;
+                row.failed = stats.failed;
                 row.usage = stats.usage;
                 row.stats = Some(stats.clone());
             },
@@ -201,6 +210,9 @@ impl PipelineView {
     /// Requests in flight in `stage`: the answers stage holds up to
     /// `pipeline.concurrency` requests, retries included; the others one.
     pub(super) fn in_flight(&self, stage: Stage) -> usize {
+        if !self.running {
+            return 0;
+        }
         let row = &self.rows[index(stage)];
         match (row.state, stage) {
             (StageState::Running, Stage::Answers) => self.concurrency.min(row.total - row.finished),
@@ -208,6 +220,19 @@ impl PipelineView {
                 usize::from(row.finished < row.total)
             },
             _ => 0,
+        }
+    }
+
+    /// The task ended: a stage it was running is stopped, and a stage it had
+    /// not reached is no longer pending.
+    pub(super) fn stopped(&mut self) {
+        self.running = false;
+        for row in &mut self.rows {
+            row.state = match row.state {
+                StageState::Running => StageState::Stopped,
+                StageState::Pending => StageState::Idle,
+                state => state,
+            };
         }
     }
 
@@ -327,5 +352,55 @@ mod tests {
         assert_eq!(view.row(Stage::Answers).finished, 1);
         assert_eq!(view.errors.len(), 5);
         assert_eq!(view.row(Stage::Subtopics).state, StageState::Idle);
+    }
+
+    #[test]
+    fn a_finished_stage_counts_every_item_even_without_item_events() {
+        let mut view = PipelineView::default();
+        view.started(Command::Split, 1);
+        view.event(&Event::StageStarted {
+            stage: Stage::Split,
+            total: 12,
+        });
+        view.event(&Event::StageFinished {
+            stage: Stage::Split,
+            stats: StageStats {
+                done: 11,
+                failed: 1,
+                ..StageStats::default()
+            },
+        });
+        let row = view.row(Stage::Split);
+        assert_eq!(
+            (row.state, row.finished, row.total, row.failed),
+            (StageState::Done, 12, 12, 1)
+        );
+    }
+
+    #[test]
+    fn a_stopped_task_shows_no_running_row_and_nothing_in_flight() {
+        let mut view = PipelineView::default();
+        view.started(Command::Run, 8);
+        view.event(&Event::StageStarted {
+            stage: Stage::Answers,
+            total: 10,
+        });
+        view.event(&done(Stage::Answers, 5));
+        assert_eq!(view.in_flight(Stage::Answers), 8);
+        view.stopped();
+        assert_eq!(view.row(Stage::Answers).state, StageState::Stopped);
+        assert_eq!(view.row(Stage::Split).state, StageState::Idle, "never ran");
+        assert_eq!(view.in_flight(Stage::Answers), 0);
+        assert_eq!(view.progress(), None);
+        view.event(&Event::StageStarted {
+            stage: Stage::Questions,
+            total: 3,
+        });
+        assert_eq!(
+            view.row(Stage::Questions).state,
+            StageState::Stopped,
+            "a late start is not running"
+        );
+        assert_eq!(view.in_flight(Stage::Questions), 0);
     }
 }

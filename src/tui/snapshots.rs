@@ -644,6 +644,23 @@ fn pipeline_finished_with_results() -> TestResult {
     Ok(())
 }
 
+/// A stopped task: the answers row says so, nothing is in flight.
+#[test]
+fn pipeline_stopped_by_quitting() -> TestResult {
+    let mut app = app();
+    app.view = View::Pipeline;
+    pipeline_running(&mut app);
+    app.on_done(
+        TaskId(7),
+        Ok(Done::Pipeline(Err(
+            "interrupted: the stage resumes on its next run".into(),
+        ))),
+    );
+    app.status = None;
+    snapshot("pipeline_stopped", &mut app)?;
+    Ok(())
+}
+
 /// A failed `run` at the minimum size still shows its final error and its
 /// newest item failures: older failures give way first.
 #[test]
