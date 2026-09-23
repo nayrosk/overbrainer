@@ -95,6 +95,9 @@ pub enum ApiError {
         message: String,
         /// Parsed `Retry-After`, when present.
         retry_after: Option<Duration>,
+        /// Whether this is a create call's 400 recognized as Runpod's capacity
+        /// failure: see [`ApiError::is_capacity`].
+        capacity: bool,
     },
     /// A success answer whose body is not what the API documents. A decode
     /// failure's text is a fixed description plus serde's category and
@@ -111,6 +114,15 @@ impl ApiError {
             Self::Status { status, .. } => Some(*status),
             _ => None,
         }
+    }
+
+    /// Whether a create call failed because Runpod has no capacity left for the
+    /// GPU type (a 400 whose body is Runpod's capacity failure), so another GPU
+    /// type may still be placed. False for any other error, including any other
+    /// 400, which would fail the same way for every GPU type.
+    #[must_use]
+    pub fn is_capacity(&self) -> bool {
+        matches!(self, Self::Status { capacity: true, .. })
     }
 
     /// Whether a failed `POST` may still have created its pod: the request may
@@ -417,6 +429,7 @@ impl RunpodClient {
             status: status.as_u16(),
             message,
             retry_after,
+            capacity: is_create && status == StatusCode::BAD_REQUEST && is_capacity_failure(body),
         }
     }
 }
@@ -845,6 +858,7 @@ mod tests {
             status,
             message: String::new(),
             retry_after: None,
+            capacity: false,
         };
         for code in [408, 429, 500, 503] {
             assert!(status(code).is_retryable(), "{code}");
@@ -859,5 +873,25 @@ mod tests {
             assert!(!status(code).is_ambiguous(), "{code}");
         }
         assert!(ApiError::InvalidResponse(String::new()).is_ambiguous());
+        for code in [400, 403, 500] {
+            assert!(!status(code).is_capacity(), "{code}");
+        }
+    }
+
+    #[test]
+    fn only_a_create_400_about_capacity_is_a_capacity_error() -> Result<(), ApiError> {
+        let client = RunpodClient::new("http://127.0.0.1:1/v2", &SecretString::from("k"))?;
+        let capacity_body = r#"{"detail": "There are no longer any instances available with the requested specifications. Please refresh and try again.", "status": 400, "title": "Bad Request"}"#;
+        let error = |status, body, is_create| client.status_error(status, body, None, is_create);
+        let capacity = error(StatusCode::BAD_REQUEST, capacity_body, true);
+        assert!(capacity.is_capacity());
+        assert_eq!(
+            capacity.to_string(),
+            format!("Runpod answered 400: {CAPACITY_MESSAGE}")
+        );
+        assert!(!error(StatusCode::BAD_REQUEST, r#"{"detail": "bad body"}"#, true).is_capacity());
+        assert!(!error(StatusCode::BAD_REQUEST, capacity_body, false).is_capacity());
+        assert!(!error(StatusCode::FORBIDDEN, capacity_body, true).is_capacity());
+        Ok(())
     }
 }

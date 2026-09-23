@@ -11,8 +11,10 @@ use std::path::PathBuf;
 mod bootstrap;
 mod client;
 mod keys;
+mod provision;
 mod record;
 mod status;
+mod target;
 mod types;
 
 pub use bootstrap::{
@@ -23,11 +25,15 @@ pub use keys::{
     CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,
     write_known_hosts,
 };
+pub use provision::{
+    PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, sweep, wait_gone,
+};
 pub use record::{
     Attempt, AttemptResult, DeletedBy, POD_FILE, POD_RECORD_VERSION, PodRecord, PodState,
     SshEndpoint, hours,
 };
 pub use status::{DeleteReason, PodStatus};
+pub use target::{MIN_CUDA_VERSION, RunpodTarget, VOLUME_MOUNT, VOLUME_WORKDIR, WORKDIR};
 pub use types::{
     CreateEnv, CreatePod, GpuRequest, Mounts, NetworkMount, Pagination, Pod, PodEnv, PodGpu, PodId,
     PodPage, PodSsh, RemoteStatus, SshDirect,
@@ -57,4 +63,48 @@ pub enum PodError {
     /// Runpod reported an SSH endpoint that is not a plain host, port and user.
     #[error("Runpod gave an unusable SSH endpoint: {0}")]
     InvalidEndpoint(String),
+    /// The pod cannot be reached or used.
+    #[error(transparent)]
+    Exec(#[from] crate::exec::ExecError),
+    /// A run record cannot be read or written.
+    #[error(transparent)]
+    Runs(#[from] crate::runs::RunsError),
+    /// Every GPU type of the target was unavailable.
+    #[error("{0}")]
+    NoCapacity(String),
+    /// Runpod asks for credits (402).
+    #[error(
+        "Runpod refused for lack of credits (402): deploying needs at least one hour of credits"
+    )]
+    NoCredits,
+    /// Runpod rejected the create request itself (a 422, or a 400 that is not a
+    /// capacity failure), which is a bug.
+    #[error("Runpod rejected overbrainer's request, which is a bug in overbrainer: {0}")]
+    Rejected(String),
+    /// The pod's watchdog could not prove it can delete its pod; the pod was
+    /// deleted.
+    #[error(
+        "the pod's watchdog cannot remove its own pod ({reason}): pod {pod_id} was deleted and training refused"
+    )]
+    WatchdogRefused {
+        /// The pod.
+        pod_id: PodId,
+        /// The watchdog's verdict.
+        reason: String,
+    },
+    /// The pod's bootstrap failed (its watchdog's verdict was `failed bootstrap:
+    /// <reason>`); the pod was deleted.
+    #[error("the pod's bootstrap failed ({reason}): pod {pod_id} was deleted and training refused")]
+    BootstrapFailed {
+        /// The pod.
+        pod_id: PodId,
+        /// What the bootstrap reported.
+        reason: String,
+    },
+    /// Ctrl-C before the job started.
+    #[error("interrupted before the job started")]
+    Interrupted,
+    /// A deleted pod still shows in the API.
+    #[error("pod {0} could not be confirmed deleted: check `overbrainer pod ls`")]
+    NotDeleted(PodId),
 }

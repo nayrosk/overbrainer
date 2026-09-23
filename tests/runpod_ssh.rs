@@ -7,10 +7,22 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use overbrainer::exec::{Executor, SshExecutor};
-use overbrainer::runpod::{PodKeys, SshEndpoint, alias, write_config};
+use overbrainer::events::EventBus;
+use overbrainer::exec::{Executor, JobCommand, JobStatus, SshExecutor};
+use overbrainer::retry::RetryPolicy;
+use overbrainer::runpod::{
+    PodCtx, PodError, PodKeys, PodPlan, PodRecord, PodState, RunpodClient, RunpodTarget,
+    SshEndpoint, Timing, alias, provision, write_config,
+};
+use overbrainer::runs::Runs;
 use secrecy::SecretString;
+use serde_json::{Value, json};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -137,4 +149,245 @@ async fn another_host_key_is_refused_through_the_per_run_config() -> TestResult 
         "expected a host key verification failure, got: {error}"
     );
     Ok(())
+}
+
+/// `GET /pods/p1`: the pod with the test sshd as its endpoint, until deleted.
+struct Get {
+    deleted: Arc<AtomicBool>,
+    body: Value,
+}
+
+impl Respond for Get {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        if self.deleted.load(Ordering::SeqCst) {
+            ResponseTemplate::new(404).set_body_json(json!({
+                "detail": "pod not found",
+                "status": 404,
+                "title": "Not Found"
+            }))
+        } else {
+            ResponseTemplate::new(200).set_body_json(&self.body)
+        }
+    }
+}
+
+struct Delete(Arc<AtomicBool>);
+
+impl Respond for Delete {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        self.0.store(true, Ordering::SeqCst);
+        ResponseTemplate::new(204)
+    }
+}
+
+/// A stub whose pod `p1` is the test sshd.
+async fn stub(sshd: &Sshd, run_id: &str) -> MockServer {
+    let server = MockServer::start().await;
+    let body = json!({
+        "id": "p1",
+        "name": format!("overbrainer-{run_id}-1"),
+        "status": "RUNNING",
+        "cost": 0.25,
+        "env": {"OVERBRAINER_RUN_ID": run_id},
+        "ssh": {"direct": {
+            "host": sshd.endpoint.host,
+            "port": sshd.endpoint.port,
+            "username": sshd.endpoint.user
+        }}
+    });
+    let deleted = Arc::new(AtomicBool::new(false));
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&body))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Get {
+            deleted: Arc::clone(&deleted),
+            body,
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Delete(deleted))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": []})))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Writes the watchdog's verdict for `run_id` under `workdir` on the test sshd.
+async fn write_verdict(
+    sshd: &Sshd,
+    workdir: &str,
+    run_id: &str,
+    verdict: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let keys = keys(sshd, &sshd.host_public);
+    let alias = alias(run_id);
+    let config = write_config(dir.path(), &alias, &sshd.endpoint, &keys)?;
+    let executor = SshExecutor::connect(&alias, workdir, Some(&config)).await?;
+    let job = executor
+        .spawn(&JobCommand {
+            dir: format!("{}/{run_id}", executor.workdir()),
+            script: format!(
+                "mkdir -p .pod && echo '{verdict}' > .pod/watchdog && echo 'probe {verdict}' > .pod/watchdog.log"
+            ),
+            secrets: Vec::new(),
+            container: None,
+        })
+        .await?;
+    for _ in 0..100 {
+        if executor.status(&job).await? == JobStatus::Exited(0) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("the verdict was not written".into())
+}
+
+async fn provision_against(
+    sshd: &Sshd,
+    verdict: &str,
+) -> Result<(Result<(), PodError>, PodRecord, usize), Box<dyn std::error::Error>> {
+    let run_id = new_run_id();
+    let workdir = format!("overbrainer-tests/runpod-{run_id}");
+    write_verdict(sshd, &workdir, &run_id, verdict).await?;
+    let server = stub(sshd, &run_id).await;
+    let project = tempfile::tempdir()?;
+    let runs = Runs::new(project.path());
+    let client = client(&server)?;
+    let timing = Timing {
+        ready_timeout: Duration::from_secs(30),
+        ..fast()
+    };
+    let interrupted = AtomicBool::new(false);
+    let bus = EventBus::new();
+    let ctx = PodCtx {
+        client: &client,
+        runs: &runs,
+        bus: &bus,
+        timing: &timing,
+        interrupted: &interrupted,
+    };
+    let target = RunpodTarget {
+        gpu_types: vec!["NVIDIA A40".into()],
+        gpu_count: 1,
+        image: "img".into(),
+        venv: "/venv".into(),
+        container_disk_gb: 50,
+        max_hours: 1.0,
+        boot_grace: Duration::from_secs(1800),
+        retrieve_grace: Duration::from_secs(3600),
+        data_center_ids: Vec::new(),
+        network_volume_id: None,
+    };
+    let keys = keys(sshd, &sshd.host_public);
+    let ssh_dir = runs.run_dir(&run_id)?.join("ssh");
+    let plan = PodPlan {
+        run_id: &run_id,
+        target: &target,
+        keys: &keys,
+        ssh_dir: &ssh_dir,
+        workdir: &workdir,
+        api_url: client.base_url(),
+    };
+    let mut record = PodRecord::new(&run_id, false, 1, &keys.host_public);
+    let result = provision(&ctx, &plan, &mut record).await;
+    let deletes = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.method.as_str() == "DELETE")
+        .count();
+    if let Ok(provisioned) = &result {
+        assert_eq!(provisioned.pod_id.as_str(), "p1");
+        assert!(provisioned.executor.workdir().ends_with(&workdir));
+    }
+    Ok((result.map(drop), record, deletes))
+}
+
+#[tokio::test]
+async fn a_pod_is_ready_once_ssh_and_its_watchdog_answer() -> TestResult {
+    let Some(sshd) = sshd()? else {
+        skip();
+        return Ok(());
+    };
+    let (result, record, deletes) = provision_against(&sshd, "ready").await?;
+    result?;
+    assert_eq!(record.state, PodState::Ready);
+    assert_eq!(
+        record.ssh.as_ref().map(|ssh| ssh.port),
+        Some(sshd.endpoint.port)
+    );
+    assert!(record.ready_at.is_some());
+    assert_eq!(deletes, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_watchdog_that_cannot_delete_its_pod_refuses_the_run() -> TestResult {
+    let Some(sshd) = sshd()? else {
+        skip();
+        return Ok(());
+    };
+    let (result, record, deletes) = provision_against(&sshd, "failed http_403").await?;
+    let error = result.err().ok_or("the run was not refused")?;
+    assert!(
+        error
+            .to_string()
+            .starts_with("the pod's watchdog cannot remove its own pod (http_403)"),
+        "{error}"
+    );
+    assert_eq!(record.state, PodState::Deleted);
+    assert_eq!(deletes, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_bootstrap_deletes_the_pod_and_refuses_the_run() -> TestResult {
+    let Some(sshd) = sshd()? else {
+        skip();
+        return Ok(());
+    };
+    let (result, record, deletes) =
+        provision_against(&sshd, "failed bootstrap: cannot write the job environment").await?;
+    let Err(PodError::BootstrapFailed { pod_id, reason }) = result else {
+        return Err(format!("the run was not refused: {result:?}").into());
+    };
+    assert_eq!(pod_id.as_str(), "p1");
+    assert_eq!(reason, "cannot write the job environment");
+    assert_eq!(record.state, PodState::Deleted);
+    assert_eq!(deletes, 1);
+    Ok(())
+}
+
+/// A client of the stub `server`, with millisecond retries.
+fn client(server: &MockServer) -> Result<RunpodClient, Box<dyn std::error::Error>> {
+    Ok(
+        RunpodClient::new(&format!("{}/v2", server.uri()), &SecretString::from("k"))?.with_policy(
+            RetryPolicy {
+                max_retries: 1,
+                base: Duration::from_millis(1),
+                cap: Duration::from_millis(2),
+            },
+        ),
+    )
+}
+
+fn fast() -> Timing {
+    Timing {
+        poll: Duration::from_millis(50),
+        ready_timeout: Duration::from_secs(10),
+        preflight_timeout: Duration::from_secs(5),
+        reconcile_waits: [Duration::from_millis(5), Duration::from_millis(5)],
+        delete_timeout: Duration::from_secs(5),
+    }
 }

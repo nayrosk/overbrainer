@@ -1,0 +1,641 @@
+//! A run's pod from create to ready, and its deletion: the ordered GPU list, the
+//! reconciliation of an ambiguous create, SSH readiness, the watchdog's verdict,
+//! and deletes confirmed by the API.
+
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
+
+use crate::events::{Event, EventBus};
+use crate::exec::{Executor, SshExecutor};
+use crate::runs::Runs;
+
+use super::{
+    ApiError, Attempt, AttemptResult, CreateEnv, CreatePod, DeleteReason, DeletedBy, GpuRequest,
+    HOST_KEY_ENV, MIN_CUDA_VERSION, Mounts, NetworkMount, Pod, PodError, PodId, PodKeys, PodRecord,
+    PodSettings, PodStatus, RunpodClient, RunpodTarget, SshEndpoint, VOLUME_MOUNT, alias,
+    pod_command, pod_env, write_config,
+};
+
+/// Ambiguous creates tried per GPU type before moving to the next one.
+const MAX_AMBIGUOUS: u32 = 2;
+
+/// Bytes read of the watchdog's verdict file.
+const VERDICT_BYTES: u64 = 4096;
+
+/// Prefix of the watchdog's verdict reason when the bootstrap itself failed
+/// (`failed bootstrap: <reason>`).
+const BOOTSTRAP_FAILED: &str = "bootstrap: ";
+
+/// How long the provisioning steps wait. [`Timing::standard`] in production;
+/// tests use milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    /// Time between two looks at the pod.
+    pub poll: Duration,
+    /// Longest wait for an SSH endpoint and a working handshake, together.
+    pub ready_timeout: Duration,
+    /// Longest wait for the watchdog's verdict once SSH works.
+    pub preflight_timeout: Duration,
+    /// Waits before each look for the pod of an ambiguous create.
+    pub reconcile_waits: [Duration; 2],
+    /// Longest wait for a deleted pod to disappear from the API.
+    pub delete_timeout: Duration,
+}
+
+impl Timing {
+    /// Production timing: a look every 5 s, 15 min to become reachable (an 8.5 GB
+    /// image took about 3.5 min to pull), 3 min for the verdict, reconciliation
+    /// after 5 s and 15 s, 60 s for a delete to show.
+    #[must_use]
+    pub fn standard() -> Self {
+        Self {
+            poll: Duration::from_secs(5),
+            ready_timeout: Duration::from_secs(15 * 60),
+            preflight_timeout: Duration::from_secs(3 * 60),
+            reconcile_waits: [Duration::from_secs(5), Duration::from_secs(15)],
+            delete_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// What the pod flows share.
+#[derive(Debug, Clone, Copy)]
+pub struct PodCtx<'a> {
+    /// The Runpod API, with the account key.
+    pub client: &'a RunpodClient,
+    /// The project's `runs/`.
+    pub runs: &'a Runs,
+    /// Where pod events go.
+    pub bus: &'a EventBus,
+    /// How long the steps wait.
+    pub timing: &'a Timing,
+    /// Set by Ctrl-C: provisioning stops at its next step and deletes its pod.
+    pub interrupted: &'a AtomicBool,
+}
+
+impl PodCtx<'_> {
+    fn publish(&self, status: PodStatus) {
+        self.bus.publish(Event::PodStatus(status));
+    }
+
+    fn check(&self) -> Result<(), PodError> {
+        if self.interrupted.load(Ordering::SeqCst) {
+            Err(PodError::Interrupted)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// What to create for a run.
+#[derive(Debug, Clone, Copy)]
+pub struct PodPlan<'a> {
+    /// The run.
+    pub run_id: &'a str,
+    /// The target.
+    pub target: &'a RunpodTarget,
+    /// The run's keys.
+    pub keys: &'a PodKeys,
+    /// The run's local `ssh/` directory, where the ssh config is written.
+    pub ssh_dir: &'a Path,
+    /// Directory of the run directories on the pod: the target's
+    /// [`RunpodTarget::workdir`] (tests use a directory of the test sshd).
+    pub workdir: &'a str,
+    /// Base URL of the Runpod API, which the pod's watchdog calls too.
+    pub api_url: &'a str,
+}
+
+/// A pod ready for the run: reachable over SSH with its pinned host key, with a
+/// watchdog that proved it can delete it.
+#[derive(Debug)]
+pub struct Provisioned {
+    /// The pod.
+    pub pod_id: PodId,
+    /// The connection to it.
+    pub executor: SshExecutor,
+}
+
+/// Why a pod did not become ready.
+enum Wait {
+    /// Not reachable in time, or dead: try the next GPU type.
+    NotReady(String),
+    /// Its watchdog cannot delete it: refuse the run.
+    Refused(String),
+    /// Interrupted, or a failure that no other pod would fix.
+    Failed(PodError),
+}
+
+/// What one create call gave.
+enum Created {
+    Pod(Box<Pod>, AttemptResult),
+    Unavailable(String),
+    Ambiguous,
+}
+
+/// Creates the run's pod, trying `plan.target.gpu_types` in order, and waits
+/// until it is ready. `record` (`pod.json`) is saved before every create call and
+/// after every answer. A pod that dies or stays unreachable is deleted and the
+/// next GPU type tried.
+///
+/// # Errors
+///
+/// Returns [`PodError::NoCapacity`] when no GPU type could be placed,
+/// [`PodError::NoCredits`] on a 402, [`PodError::Rejected`] on a 422,
+/// [`PodError::WatchdogRefused`] when the watchdog cannot delete its pod (which is
+/// deleted), [`PodError::Interrupted`] after Ctrl-C (the pod, if any, is deleted),
+/// and another [`PodError`] when the API or a local file fails.
+pub async fn provision(
+    ctx: &PodCtx<'_>,
+    plan: &PodPlan<'_>,
+    record: &mut PodRecord,
+) -> Result<Provisioned, PodError> {
+    let mut last_detail = None;
+    for gpu in &plan.target.gpu_types {
+        let mut ambiguous = 0;
+        loop {
+            ctx.check()?;
+            match create(ctx, plan, record, gpu).await? {
+                Created::Pod(pod, result) => match settle(ctx, plan, record, &pod, result).await? {
+                    Some(provisioned) => return Ok(provisioned),
+                    None => break,
+                },
+                Created::Unavailable(detail) => {
+                    last_detail = Some(detail);
+                    break;
+                },
+                Created::Ambiguous => {
+                    ambiguous += 1;
+                    if ambiguous >= MAX_AMBIGUOUS {
+                        break;
+                    }
+                },
+            }
+        }
+    }
+    Err(no_capacity(
+        last_detail,
+        plan.target.network_volume_id.is_some(),
+    ))
+}
+
+/// The error once every GPU type was tried. `detail` is the last capacity or
+/// 403 answer, as the client's fixed message: a request Runpod rejected for any
+/// other reason stopped the walk at once instead.
+fn no_capacity(detail: Option<String>, volume: bool) -> PodError {
+    let mut message = "no gpu_types entry could be placed".to_string();
+    if let Some(detail) = detail {
+        message = format!("{message}: {detail}");
+    }
+    if volume {
+        message = format!("{message} (check network_volume_id and data_center_ids)");
+    }
+    PodError::NoCapacity(message)
+}
+
+/// Sends one create call for `gpu`, recording it first.
+async fn create(
+    ctx: &PodCtx<'_>,
+    plan: &PodPlan<'_>,
+    record: &mut PodRecord,
+    gpu: &str,
+) -> Result<Created, PodError> {
+    let attempt = record
+        .begin_attempt(gpu, SystemTime::now(), plan.target.max_hours)
+        .clone();
+    record.save(ctx.runs)?;
+    ctx.publish(PodStatus::Creating {
+        name: attempt.name.clone(),
+        gpu_type: gpu.to_string(),
+    });
+    let request = request(plan, record.keep, &attempt);
+    let error = match ctx.client.create_pod(&request).await {
+        Ok(pod) => return Ok(Created::Pod(Box::new(pod), AttemptResult::Created)),
+        Err(error) => error,
+    };
+    // The client's fixed message for the failure: never text from Runpod.
+    let detail = error.to_string();
+    match skipped(&error) {
+        Some(result) => {
+            record.end_attempt(result, Some(detail.clone()));
+            record.save(ctx.runs)?;
+            ctx.publish(PodStatus::Unavailable {
+                gpu_type: gpu.to_string(),
+                reason: detail.clone(),
+            });
+            Ok(Created::Unavailable(detail))
+        },
+        None if error.is_ambiguous() => {
+            record.end_attempt(AttemptResult::Ambiguous, Some(detail));
+            record.save(ctx.runs)?;
+            tracing::warn!("no clear answer to the create call ({error}): looking for the pod");
+            Ok(match reconcile(ctx, record, &attempt.name).await? {
+                Some(pod) => Created::Pod(Box::new(pod), AttemptResult::Adopted),
+                None => Created::Ambiguous,
+            })
+        },
+        None => {
+            record.end_attempt(AttemptResult::Rejected, Some(detail));
+            record.save(ctx.runs)?;
+            Err(stop(error))
+        },
+    }
+}
+
+/// How a failed create ends its attempt when the next GPU type may still be
+/// placed: no capacity left for this type (a 400 the client recognized as such),
+/// or a 403. `None` for any other failure.
+fn skipped(error: &ApiError) -> Option<AttemptResult> {
+    if error.is_capacity() {
+        Some(AttemptResult::Unavailable)
+    } else if error.status() == Some(403) {
+        Some(AttemptResult::Forbidden)
+    } else {
+        None
+    }
+}
+
+/// The error of a create failure that no other GPU type would fix: a 402, a
+/// 422 or a 400 that is not about capacity (overbrainer's request is wrong), or
+/// anything else the client reported.
+fn stop(error: ApiError) -> PodError {
+    match error.status() {
+        Some(402) => PodError::NoCredits,
+        Some(400 | 422) => PodError::Rejected(error.to_string()),
+        _ => error.into(),
+    }
+}
+
+/// The create call of `attempt`.
+fn request(plan: &PodPlan<'_>, keep: bool, attempt: &Attempt) -> CreatePod {
+    let target = plan.target;
+    let env = pod_env(&PodSettings {
+        run_id: plan.run_id,
+        workdir: plan.workdir,
+        deadline_unix: attempt.deadline_unix,
+        boot_grace: target.boot_grace,
+        retrieve_grace: target.retrieve_grace,
+        keep,
+        api_url: plan.api_url,
+        authorized_key: &plan.keys.client_public,
+    });
+    CreatePod {
+        name: attempt.name.clone(),
+        image: target.image.clone(),
+        cloud: "SECURE",
+        gpu: GpuRequest {
+            id: attempt.gpu_type.clone(),
+            count: target.gpu_count,
+            min_cuda_version: MIN_CUDA_VERSION,
+        },
+        disk: target.container_disk_gb,
+        ports: vec!["22/tcp".to_string()],
+        start_ssh: false,
+        data_center_ids: (!target.data_center_ids.is_empty())
+            .then(|| target.data_center_ids.clone()),
+        mounts: target.network_volume_id.as_ref().map(|volume| Mounts {
+            network: vec![NetworkMount {
+                volume_id: volume.clone(),
+                path: VOLUME_MOUNT.to_string(),
+            }],
+        }),
+        env: CreateEnv {
+            plain: env,
+            host_key_name: HOST_KEY_ENV,
+            host_key: plan.keys.host_private().clone(),
+        },
+        cmd: pod_command(),
+    }
+}
+
+/// Records `pod` as the run's pod and waits for it. `Some` once ready; `None`
+/// when it was deleted as not ready, so the next GPU type is tried.
+async fn settle(
+    ctx: &PodCtx<'_>,
+    plan: &PodPlan<'_>,
+    record: &mut PodRecord,
+    pod: &Pod,
+    result: AttemptResult,
+) -> Result<Option<Provisioned>, PodError> {
+    record.created(pod, result, SystemTime::now());
+    record.save(ctx.runs)?;
+    ctx.publish(PodStatus::Created {
+        pod_id: pod.id.clone(),
+        gpu_type: record.gpu_type.clone().unwrap_or_default(),
+        data_center: record.data_center_id.clone(),
+        cost_per_hour: record.cost_per_hour,
+    });
+    match ready(ctx, plan, record, &pod.id).await {
+        Ok(provisioned) => Ok(Some(provisioned)),
+        Err(Wait::NotReady(reason)) => {
+            not_ready(ctx, record, &pod.id, reason).await?;
+            Ok(None)
+        },
+        Err(Wait::Refused(reason)) => Err(refuse(ctx, record, &pod.id, reason).await),
+        Err(Wait::Failed(error)) => Err(abandon(ctx, record, error).await),
+    }
+}
+
+/// Deletes a pod that did not become ready, best effort, and forgets it.
+async fn not_ready(
+    ctx: &PodCtx<'_>,
+    record: &mut PodRecord,
+    id: &PodId,
+    reason: String,
+) -> Result<(), PodError> {
+    warn(&format!("pod {id} is not ready: {reason}"));
+    record.end_attempt(AttemptResult::NotReady, Some(reason));
+    record.save(ctx.runs)?;
+    if let Err(error) = remove(ctx, record, DeleteReason::NotReady, DeletedBy::Client).await {
+        warn(&error.to_string());
+    }
+    record.forget_pod();
+    record.save(ctx.runs)?;
+    Ok(())
+}
+
+/// Deletes a pod whose watchdog cannot delete it, and returns the refusal.
+async fn refuse(ctx: &PodCtx<'_>, record: &mut PodRecord, id: &PodId, reason: String) -> PodError {
+    record.end_attempt(AttemptResult::Refused, Some(reason.clone()));
+    if let Err(error) = record.save(ctx.runs) {
+        return error.into();
+    }
+    if let Err(error) = remove(ctx, record, DeleteReason::Refused, DeletedBy::Client).await {
+        return error;
+    }
+    match reason.strip_prefix(BOOTSTRAP_FAILED) {
+        Some(bootstrap) => PodError::BootstrapFailed {
+            pod_id: id.clone(),
+            reason: bootstrap.to_string(),
+        },
+        None => PodError::WatchdogRefused {
+            pod_id: id.clone(),
+            reason,
+        },
+    }
+}
+
+/// Deletes the pod after an interruption or a failure, best effort, and returns
+/// `error`.
+async fn abandon(ctx: &PodCtx<'_>, record: &mut PodRecord, error: PodError) -> PodError {
+    let reason = if matches!(error, PodError::Interrupted) {
+        DeleteReason::Interrupted
+    } else {
+        DeleteReason::Requested
+    };
+    if let Err(delete_error) = remove(ctx, record, reason, DeletedBy::Client).await {
+        warn(&delete_error.to_string());
+    }
+    error
+}
+
+fn warn(message: &str) {
+    tracing::warn!("{message}");
+}
+
+/// Waits until the pod `id` answers SSH with the pinned host key and its watchdog
+/// wrote `ready`, then records it as ready.
+async fn ready(
+    ctx: &PodCtx<'_>,
+    plan: &PodPlan<'_>,
+    record: &mut PodRecord,
+    id: &PodId,
+) -> Result<Provisioned, Wait> {
+    let (executor, endpoint) = reach(ctx, plan, record, id).await?;
+    let verdict = format!("{}/{}/.pod/watchdog", executor.workdir(), plan.run_id);
+    preflight(ctx, &executor, &verdict, id).await?;
+    let now = SystemTime::now();
+    record.ready(endpoint, now);
+    record
+        .save(ctx.runs)
+        .map_err(|error| Wait::Failed(error.into()))?;
+    ctx.publish(PodStatus::Ready {
+        pod_id: id.clone(),
+        after: record.uptime(now).unwrap_or_default(),
+        deadline: record.deadline.clone(),
+    });
+    sweep(ctx, plan.run_id, Some(id)).await;
+    Ok(Provisioned {
+        pod_id: id.clone(),
+        executor,
+    })
+}
+
+/// Polls the pod until it has an SSH endpoint and a strict handshake with it
+/// succeeds, within [`Timing::ready_timeout`].
+async fn reach(
+    ctx: &PodCtx<'_>,
+    plan: &PodPlan<'_>,
+    record: &mut PodRecord,
+    id: &PodId,
+) -> Result<(SshExecutor, SshEndpoint), Wait> {
+    let started = Instant::now();
+    let alias = alias(plan.run_id);
+    let mut last = "no SSH endpoint yet".to_string();
+    loop {
+        ctx.check().map_err(Wait::Failed)?;
+        if started.elapsed() >= ctx.timing.ready_timeout {
+            return Err(Wait::NotReady(format!(
+                "not reachable over SSH after {}s: {last}",
+                ctx.timing.ready_timeout.as_secs()
+            )));
+        }
+        let pod = alive(ctx, id).await?;
+        record.note_rate(&pod);
+        if let Some(direct) = pod.direct() {
+            let endpoint = SshEndpoint {
+                host: direct.host.clone(),
+                port: direct.port,
+                user: direct.username.clone(),
+            };
+            let config =
+                write_config(plan.ssh_dir, &alias, &endpoint, plan.keys).map_err(Wait::Failed)?;
+            match SshExecutor::connect(&alias, plan.workdir, Some(&config)).await {
+                Ok(executor) => return Ok((executor, endpoint)),
+                Err(error) => last = chain(&error),
+            }
+        }
+        tokio::time::sleep(ctx.timing.poll).await;
+    }
+}
+
+/// The pod `id` as the API shows it, or [`Wait::NotReady`] at once when it is
+/// gone or dead: its watchdog deletes it right away after a failed bootstrap, so
+/// no later look would find it reachable.
+async fn alive(ctx: &PodCtx<'_>, id: &PodId) -> Result<Pod, Wait> {
+    let pod = ctx
+        .client
+        .get_pod(id)
+        .await
+        .map_err(|error| Wait::Failed(error.into()))?
+        .ok_or_else(|| Wait::NotReady("the pod disappeared".to_string()))?;
+    if pod.status.is_dead() {
+        return Err(Wait::NotReady(format!("the pod is {}", pod.status.name())));
+    }
+    Ok(pod)
+}
+
+/// Reads the watchdog's verdict at `path` until it says `ready` or
+/// `failed <reason>` (`failed bootstrap: <reason>` when the bootstrap failed),
+/// within [`Timing::preflight_timeout`]. While the verdict cannot be read, the
+/// pod `id` is checked too, so a pod that died meanwhile ends the wait at once.
+async fn preflight(
+    ctx: &PodCtx<'_>,
+    executor: &SshExecutor,
+    path: &str,
+    id: &PodId,
+) -> Result<(), Wait> {
+    let started = Instant::now();
+    loop {
+        ctx.check().map_err(Wait::Failed)?;
+        match executor.read_from(path, 0, VERDICT_BYTES).await {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let text = text.trim();
+                if text == "ready" {
+                    return Ok(());
+                }
+                if let Some(reason) = text.strip_prefix("failed ") {
+                    return Err(Wait::Refused(reason.to_string()));
+                }
+            },
+            Err(error) => {
+                tracing::warn!("cannot read the watchdog's verdict: {}", chain(&error));
+                alive(ctx, id).await?;
+            },
+        }
+        if started.elapsed() >= ctx.timing.preflight_timeout {
+            return Err(Wait::Refused(format!(
+                "no verdict within {}s",
+                ctx.timing.preflight_timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(ctx.timing.poll).await;
+    }
+}
+
+/// Deletes the run's current pod and waits until the API no longer knows it,
+/// then records it deleted by `by`. Does nothing when there is no pod.
+///
+/// # Errors
+///
+/// Returns [`PodError::NotDeleted`] when the pod still shows after
+/// [`Timing::delete_timeout`], and another [`PodError`] when the API or
+/// `pod.json` fails.
+pub async fn remove(
+    ctx: &PodCtx<'_>,
+    record: &mut PodRecord,
+    reason: DeleteReason,
+    by: DeletedBy,
+) -> Result<(), PodError> {
+    let Some(id) = record.pod_id.clone() else {
+        return Ok(());
+    };
+    ctx.publish(PodStatus::Deleting {
+        pod_id: id.clone(),
+        reason,
+    });
+    record.state = super::PodState::Deleting;
+    record.save(ctx.runs)?;
+    ctx.client.delete_pod(&id).await?;
+    wait_gone(ctx, &id).await?;
+    let now = SystemTime::now();
+    let uptime = record.uptime(now);
+    record.deleted(by, now);
+    record.save(ctx.runs)?;
+    ctx.publish(PodStatus::Deleted {
+        pod_id: id,
+        uptime,
+        estimated_spend: record.estimated_spend,
+    });
+    Ok(())
+}
+
+/// Polls until the API no longer knows the pod `id`, for at most
+/// [`Timing::delete_timeout`].
+///
+/// # Errors
+///
+/// Returns [`PodError::NotDeleted`] when the pod still shows after that, and
+/// [`PodError::Api`] when the API fails.
+pub async fn wait_gone(ctx: &PodCtx<'_>, id: &PodId) -> Result<(), PodError> {
+    let started = Instant::now();
+    loop {
+        if ctx.client.get_pod(id).await?.is_none() {
+            return Ok(());
+        }
+        if started.elapsed() >= ctx.timing.delete_timeout {
+            return Err(PodError::NotDeleted(id.clone()));
+        }
+        tokio::time::sleep(ctx.timing.poll).await;
+    }
+}
+
+/// Looks for the pod of an ambiguous create by the run marker, twice. The pod
+/// named `name` is adopted; any other pod of the run is a duplicate of an earlier
+/// ambiguous create and is deleted.
+async fn reconcile(
+    ctx: &PodCtx<'_>,
+    record: &PodRecord,
+    name: &str,
+) -> Result<Option<Pod>, PodError> {
+    for wait in ctx.timing.reconcile_waits {
+        tokio::time::sleep(wait).await;
+        ctx.check()?;
+        let mine: Vec<Pod> = ctx
+            .client
+            .list_pods()
+            .await?
+            .into_iter()
+            .filter(|pod| pod.run_id() == Some(record.run_id.as_str()))
+            .collect();
+        if let Some(found) = mine.iter().find(|pod| pod.name == name) {
+            for duplicate in mine.iter().filter(|pod| pod.id != found.id) {
+                delete_duplicate(ctx, &duplicate.id).await;
+            }
+            return Ok(Some(found.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// Deletes every pod carrying the marker of `run_id` but `keep`, best effort: a
+/// pod left over by an ambiguous create that showed up late.
+pub async fn sweep(ctx: &PodCtx<'_>, run_id: &str, keep: Option<&PodId>) {
+    let pods = match ctx.client.list_pods().await {
+        Ok(pods) => pods,
+        Err(error) => {
+            tracing::warn!("cannot look for duplicate pods of run {run_id}: {error}");
+            return;
+        },
+    };
+    for pod in pods {
+        if pod.run_id() == Some(run_id) && Some(&pod.id) != keep {
+            delete_duplicate(ctx, &pod.id).await;
+        }
+    }
+}
+
+async fn delete_duplicate(ctx: &PodCtx<'_>, id: &PodId) {
+    ctx.publish(PodStatus::Deleting {
+        pod_id: id.clone(),
+        reason: DeleteReason::Duplicate,
+    });
+    if let Err(error) = ctx.client.delete_pod(id).await {
+        tracing::warn!(
+            "cannot delete duplicate pod {id}: {error}; its watchdog deletes it after its boot grace"
+        );
+    }
+}
+
+/// `error` and its sources, joined with `: `.
+#[must_use]
+pub fn chain(error: &dyn std::error::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    parts.join(": ")
+}
