@@ -68,9 +68,17 @@ pub fn manifest_script(remote: &str, entries: &[String], exclude: &[String]) -> 
 ///
 /// # Errors
 ///
-/// Returns [`ExecError::Protocol`] for a record that is not `<64 hex digits>`, a
-/// space and a path.
+/// Returns [`ExecError::Protocol`] when non-empty `output` does not end with the
+/// NUL that terminates every record: without it, an output cut short mid-record
+/// would otherwise read as a shorter, wrong path. Also returns
+/// [`ExecError::Protocol`] for a record that is not `<64 hex digits>`, a space
+/// and a path.
 pub fn parse_manifest(output: &str) -> Result<Vec<FileDigest>, ExecError> {
+    if !output.is_empty() && !output.ends_with('\0') {
+        return Err(ExecError::Protocol(
+            "the manifest was cut short: it does not end with its final NUL".to_string(),
+        ));
+    }
     let mut digests = Vec::new();
     for record in output.split('\0').filter(|record| !record.is_empty()) {
         digests.push(parse_record(record)?);
@@ -291,6 +299,14 @@ mod tests {
         );
         assert!(parse_manifest("nothex a\0").is_err());
         assert!(parse_manifest(&format!("{W}noSpace\0")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_manifest_cut_short_of_its_final_nul_is_rejected() -> TestResult {
+        assert_eq!(parse_manifest("")?, Vec::new());
+        let cut_short = format!("{W} output/a.bin\0{W} output/b");
+        assert!(parse_manifest(&cut_short).is_err());
         Ok(())
     }
 
