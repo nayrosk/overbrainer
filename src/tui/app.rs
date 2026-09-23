@@ -753,16 +753,6 @@ impl App {
         }
     }
 
-    /// Notes, for the exit, the pipeline task still running when the TUI ended
-    /// without waiting for it (a terminal error): it was stopped with the loop.
-    pub(super) fn abandon_stage(&mut self) {
-        if self.pipeline_task.take().is_some() {
-            let name = self.pipeline.command.map_or("stage", command_name);
-            self.exit_notes
-                .push(format!("{name} was stopped; the next `{name}` resumes it"));
-        }
-    }
-
     /// Shows why the data could not be loaded, in the view and on the status line.
     fn load_failed(&mut self, error: String) {
         self.dataset.model = None;
@@ -1152,7 +1142,14 @@ impl App {
             match follow.job {
                 super::training::Job::Cancel => format!("waiting for the cancel of run {run}..."),
                 super::training::Job::Start { .. } if follow.starting() => {
-                    format!("waiting for {} to start or be abandoned...", follow.run())
+                    if follow.detach == super::training::Detach::Done {
+                        format!("waiting for {} to be abandoned...", follow.run())
+                    } else {
+                        format!(
+                            "waiting for {} to start; Ctrl-C abandons it...",
+                            follow.run()
+                        )
+                    }
                 },
                 super::training::Job::Start { .. } | super::training::Job::Attach => {
                     format!("waiting for run {run} to detach...")
@@ -1184,6 +1181,17 @@ impl App {
             format!("not quitting; {}", still.join(", "))
         };
         self.say(Severity::Info, said);
+    }
+
+    /// The loop ended with work left (a terminal error, a panic while drawing,
+    /// its input gone): quits as a confirmed quit does, without asking. The
+    /// stage stops, followed runs detach, a run still starting detaches once
+    /// its job started and is never abandoned, and cancels and an edit being
+    /// saved are waited for. Only a signal abandons (design 3.6, 6.7).
+    pub(super) fn on_loop_end(&mut self) -> Vec<Effect> {
+        self.close_overlay();
+        self.dataset.input = None;
+        self.leave(Exit::Quit)
     }
 
     /// SIGINT, SIGTERM or SIGHUP from outside: quits without asking, as Ctrl-C
@@ -2280,17 +2288,42 @@ mod tests {
         assert_eq!(app.exit, Some(Exit::Signal));
     }
 
+    /// The loop ended with a stage running: it stops as on a confirmed quit,
+    /// and its end is noted for the exit.
     #[test]
-    fn a_stage_the_loop_ended_without_waiting_is_noted_for_the_exit() {
+    fn a_stage_running_when_the_loop_ends_stops_and_is_noted() {
         let mut app = app();
         crate::tui::snapshots::pipeline_running(&mut app);
-        app.abandon_stage();
+        assert_eq!(app.on_loop_end(), [Effect::Cancel(TaskId(7))]);
+        assert_eq!(app.leaving, Some(Exit::Quit));
+        assert_eq!(app.waiting_for(), ["waiting for run to stop..."]);
+        app.on_done(TaskId(7), Ok(Done::Pipeline(Err("interrupted".into()))));
+        assert_eq!(app.exit, Some(Exit::Quit));
+        assert_eq!(app.exit_notes, ["run: interrupted"]);
+    }
+
+    /// The loop ended with a Runpod run still provisioning: it is never
+    /// abandoned, only detached once its job started, unless a signal comes.
+    #[test]
+    fn a_start_is_never_abandoned_when_the_loop_ends() {
+        let mut app = app();
+        starting(&mut app, TaskId(6));
+        assert_eq!(app.on_loop_end(), [], "never during the start");
+        assert_eq!(app.overlay, None, "nothing asks");
         assert_eq!(
-            app.exit_notes,
-            ["run was stopped; the next `run` resumes it"]
+            app.waiting_for(),
+            ["waiting for run 20260921-133200-a1b2 to start; Ctrl-C abandons it..."]
         );
-        app.abandon_stage();
-        assert_eq!(app.exit_notes.len(), 1);
+        assert_eq!(watching(&mut app, TaskId(6)), [Effect::Cancel(TaskId(6))]);
+
+        let mut app = super::super::snapshots::app();
+        starting(&mut app, TaskId(6));
+        app.on_loop_end();
+        assert_eq!(app.on_signal(), [Effect::Abandon(TaskId(6))]);
+        assert_eq!(
+            app.waiting_for(),
+            ["waiting for run 20260921-133200-a1b2 to be abandoned..."]
+        );
     }
 
     #[test]
@@ -3004,7 +3037,7 @@ mod tests {
         assert_eq!(app.overlay, None, "nothing left to abandon");
         assert_eq!(
             app.waiting_for(),
-            ["waiting for run 20260921-133200-a1b2 to start or be abandoned..."]
+            ["waiting for run 20260921-133200-a1b2 to be abandoned..."]
         );
     }
 

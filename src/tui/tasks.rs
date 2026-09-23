@@ -447,6 +447,28 @@ impl Tasks {
 }
 
 #[cfg(test)]
+impl Tasks {
+    /// A task `id` standing for a training start: it holds a detach token and
+    /// an abandon flag, as a start does, and ends once `release` or its token
+    /// is cancelled. Returns its abandon flag.
+    pub(super) fn park(&mut self, id: TaskId, release: CancellationToken) -> Arc<AtomicBool> {
+        let token = CancellationToken::new();
+        let abandon = Arc::new(AtomicBool::new(false));
+        self.tokens.insert(id, token.clone());
+        self.abandons.insert(id, Arc::clone(&abandon));
+        let handle = self.set.spawn(async move {
+            tokio::select! {
+                () = release.cancelled() => {},
+                () = token.cancelled() => {},
+            }
+            Done::Trained(Err("parked".to_string()))
+        });
+        self.ids.insert(handle.id(), id);
+        abandon
+    }
+}
+
+#[cfg(test)]
 mod tests {
 
     use super::*;

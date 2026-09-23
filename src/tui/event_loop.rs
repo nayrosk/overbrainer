@@ -72,29 +72,18 @@ where
     B: Backend,
     B::Error: Send + Sync + 'static,
 {
-    let mut tick = tokio::time::interval(TICK);
-    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let (messages, inbox) = mpsc::unbounded_channel();
-    let mut looping = Loop {
-        terminal,
-        input,
-        tasks: Tasks::new(&app.project.dir, messages.clone()),
-        messages,
-        inbox,
-        tick,
-        real,
-        suspended: false,
-        editor: None,
-        last_draw: None,
-        pending: Vec::new(),
-    };
+    let mut looping = Loop::new(terminal, input, &app.project.dir);
+    if let Some(real) = real {
+        looping.signals = Some(real.signals);
+        looping.screen = Some(real.screen);
+    }
     let result = looping.run(app).await;
     if let Some(mut editor) = looping.editor.take() {
         stop_editor(&mut editor).await;
     }
     looping.settle(app).await;
-    if let Some(real) = looping.real {
-        real.screen.stop().await;
+    if let Some(screen) = looping.screen.take() {
+        screen.stop().await;
     }
     result
 }
@@ -116,7 +105,13 @@ struct Loop<'t, B: Backend> {
     messages: UnboundedSender<Msg>,
     inbox: UnboundedReceiver<Msg>,
     tick: Interval,
-    real: Option<Real>,
+    /// The process signals, with the real terminal.
+    signals: Option<Signals>,
+    /// The real terminal's screen, which the editor borrows.
+    screen: Option<Screen>,
+    /// Where lines are written once the loop ended and the screen was given
+    /// back: stderr, with the real terminal.
+    console: Option<Box<dyn Write + Send>>,
     /// Whether the editor has the terminal: no input is read, nothing is drawn,
     /// and SIGINT is ignored (it comes from a Ctrl-C typed in the editor).
     suspended: bool,
@@ -127,11 +122,38 @@ struct Loop<'t, B: Backend> {
     pending: Vec<Effect>,
 }
 
-impl<B> Loop<'_, B>
+impl<'t, B> Loop<'t, B>
 where
     B: Backend,
     B::Error: Send + Sync + 'static,
 {
+    /// A loop drawing on `terminal`, reading terminal events from `input`, for
+    /// the project in `dir`; no signals, no screen to hand over.
+    fn new(
+        terminal: &'t mut Terminal<B>,
+        input: UnboundedReceiver<io::Result<TermEvent>>,
+        dir: &std::path::Path,
+    ) -> Self {
+        let mut tick = tokio::time::interval(TICK);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let (messages, inbox) = mpsc::unbounded_channel();
+        Self {
+            terminal,
+            input,
+            tasks: Tasks::new(dir, messages.clone()),
+            messages,
+            inbox,
+            tick,
+            signals: None,
+            screen: None,
+            console: None,
+            suspended: false,
+            editor: None,
+            last_draw: None,
+            pending: Vec::new(),
+        }
+    }
+
     async fn run(&mut self, app: &mut App) -> anyhow::Result<()> {
         let mut effects = app.start();
         loop {
@@ -211,11 +233,12 @@ where
     /// Once the loop ended with work left (a terminal error, its input gone, or
     /// effects it could not run): the effects that must not be lost run (a
     /// training task or an edit starts, a token is cancelled), then the tasks
-    /// end as on a signal and are waited for, however long: a training task is
-    /// never aborted, since dropped mid-start it would leave a job or a pod that
-    /// nothing finds again. With the real terminal, the screen is given back
-    /// first and stderr says what is waited for; a signal meanwhile acts as a
-    /// first one would. The ends still reach the app, for its exit notes.
+    /// end as on a confirmed quit and are waited for, however long: a training
+    /// task is never aborted, since dropped mid-start it would leave a job or a
+    /// pod that nothing finds again, and a start is never abandoned without a
+    /// signal. With the real terminal, the screen is given back first and
+    /// stderr says what is waited for; a signal meanwhile acts as a first one
+    /// would. The ends still reach the app, for its exit notes.
     async fn settle(&mut self, app: &mut App) {
         // List prices are only read: nothing waits for them.
         self.tasks.abort_lookups();
@@ -231,29 +254,28 @@ where
         self.drain_late(app);
     }
 
-    /// Ends the tasks as on a signal and waits for them, a later signal acting
-    /// as a first one would; with the real terminal, gives the screen back and
-    /// says on stderr what is waited for. The messages in the inbox are handled
+    /// Ends the tasks as a confirmed quit does and waits for them: a run still
+    /// starting is detached once its job started, never abandoned; only a
+    /// signal received meanwhile abandons it, as a first one would. With the
+    /// real terminal, gives the screen back (so Ctrl-C raises SIGINT) and says
+    /// on stderr what is waited for. The messages in the inbox are handled
     /// before each end.
     async fn wait_tasks(&mut self, app: &mut App) {
-        for effect in app.on_signal() {
+        for effect in app.on_loop_end() {
             self.apply_late(app, effect);
         }
         let lines = app.waiting_for();
-        if let Some(real) = &mut self.real
-            && !lines.is_empty()
+        if !lines.is_empty()
+            && let Some(screen) = &mut self.screen
         {
-            real.screen.suspend().await.ok();
-            let mut stderr = io::stderr();
-            for line in &lines {
-                writeln!(stderr, "{line}").ok();
-            }
+            screen.suspend().await.ok();
+            self.console.get_or_insert_with(|| Box::new(io::stderr()));
         }
+        self.write(&lines);
         loop {
-            let signals = self.real.as_mut().map(|real| &mut real.signals);
             let woke = tokio::select! {
                 next = self.tasks.next() => Some(next),
-                () = Signals::recv(signals, true) => None,
+                () = Signals::recv(self.signals.as_mut(), true) => None,
             };
             let effects = match woke {
                 Some(Some((id, result))) => {
@@ -261,10 +283,30 @@ where
                     app.on_done(id, result)
                 },
                 Some(None) => break,
-                None => app.on_signal(),
+                None => self.interrupted(app),
             };
             for effect in effects {
                 self.apply_late(app, effect);
+            }
+        }
+    }
+
+    /// A signal while the tasks are waited for: they end as on a signal, and
+    /// stderr says so.
+    fn interrupted(&mut self, app: &mut App) -> Vec<Effect> {
+        let effects = app.on_signal();
+        if let Some(status) = &app.status {
+            let said = status.text.clone();
+            self.write(&[said]);
+        }
+        effects
+    }
+
+    /// Writes `lines` once the screen was given back; nothing before.
+    fn write(&mut self, lines: &[String]) {
+        if let Some(console) = &mut self.console {
+            for line in lines {
+                writeln!(console, "{line}").ok();
             }
         }
     }
@@ -301,7 +343,7 @@ where
     async fn wait(&mut self, app: &App) -> Wake {
         let next_draw = self.next_draw();
         let draw = app.dirty && !self.suspended;
-        let signals = self.real.as_mut().map(|real| &mut real.signals);
+        let signals = self.signals.as_mut();
         let interrupt = !self.suspended;
         tokio::select! {
             event = self.input.recv(), if !self.suspended => Wake::Input(event),
@@ -349,8 +391,8 @@ where
     /// The editor is started without a shell: its first word is the program, the
     /// others and the file its arguments.
     async fn open_editor(&mut self, command: &[String], path: PathBuf) -> anyhow::Result<()> {
-        if let Some(real) = &mut self.real {
-            real.screen
+        if let Some(screen) = &mut self.screen {
+            screen
                 .suspend()
                 .await
                 .context("cannot hand the terminal to the editor")?;
@@ -380,11 +422,13 @@ where
         match message {
             Msg::EditorExited(status) => {
                 self.editor = None;
-                if let Some(real) = &mut self.real {
-                    real.screen
+                if let Some(screen) = &mut self.screen {
+                    screen
                         .resume()
                         .context("cannot take the terminal back from the editor")?;
-                    real.signals
+                }
+                if let Some(signals) = &mut self.signals {
+                    signals
                         .forget_interrupts()
                         .context("cannot catch the process signals")?;
                 }
@@ -737,20 +781,7 @@ mod tests {
         terminal: &'t mut Terminal<TestBackend>,
         dir: &std::path::Path,
     ) -> Loop<'t, TestBackend> {
-        let (messages, inbox) = mpsc::unbounded_channel();
-        Loop {
-            terminal,
-            input: mpsc::unbounded_channel().1,
-            tasks: Tasks::new(dir, messages.clone()),
-            messages,
-            inbox,
-            tick: tokio::time::interval(TICK),
-            real: None,
-            suspended: false,
-            editor: None,
-            last_draw: None,
-            pending: Vec::new(),
-        }
+        Loop::new(terminal, mpsc::unbounded_channel().1, dir)
     }
 
     const RUN: &str = "20260921-133200-a1b2";
@@ -867,6 +898,91 @@ mod tests {
             app.exit_notes,
             ["a line".to_string(), format!("run {RUN} has not started")]
         );
+        Ok(())
+    }
+
+    /// The app of the project in `dir`, with a Runpod run still provisioning
+    /// as task 4.
+    fn provisioning_app(dir: &std::path::Path) -> App {
+        use crate::tui::training::{Follow, Job};
+        let mut app = app();
+        app.project.dir = dir.to_path_buf();
+        app.training
+            .tasks
+            .insert(TaskId(4), Follow::new(Job::Start { runpod: true }, RUN));
+        app
+    }
+
+    /// A loop whose input fails at once, for the project in `dir`.
+    fn failing_input<'t>(
+        terminal: &'t mut Terminal<TestBackend>,
+        dir: &std::path::Path,
+    ) -> Result<Loop<'t, TestBackend>, Box<dyn std::error::Error>> {
+        let (events, input) = mpsc::unbounded_channel();
+        events.send(Err(io::Error::other("the terminal is gone")))?;
+        Ok(Loop::new(terminal, input, dir))
+    }
+
+    /// A loop ended by a terminal error waits for a Runpod run still
+    /// provisioning, and never abandons it: no signal came.
+    #[tokio::test]
+    async fn a_terminal_error_never_abandons_a_provisioning_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = failing_input(&mut terminal, dir.path())?;
+        let mut app = provisioning_app(dir.path());
+        let release = tokio_util::sync::CancellationToken::new();
+        let abandon = looping.tasks.park(TaskId(4), release.clone());
+        let result = tokio::time::timeout(LIMIT, looping.run(&mut app)).await?;
+        assert!(result.is_err());
+        let check = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let abandoned = abandon.load(Ordering::SeqCst);
+            release.cancel();
+            abandoned
+        };
+        let ((), abandoned) = tokio::time::timeout(LIMIT, async {
+            tokio::join!(looping.settle(&mut app), check)
+        })
+        .await?;
+        assert!(!abandoned, "abandoned while it was waited for");
+        assert!(!abandon.load(Ordering::SeqCst));
+        assert!(app.training.tasks.is_empty(), "it was waited for");
+        assert_eq!(app.leaving, Some(Exit::Quit));
+        Ok(())
+    }
+
+    /// A signal while a loop ended by a terminal error waits abandons a Runpod
+    /// run still provisioning, as a first signal would.
+    #[tokio::test]
+    async fn a_signal_while_the_loop_ends_abandons_a_provisioning_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _signals = crate::test_support::SIGNALS.lock().await;
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = failing_input(&mut terminal, dir.path())?;
+        looping.signals = Some(Signals::new()?);
+        let mut app = provisioning_app(dir.path());
+        let abandon = looping
+            .tasks
+            .park(TaskId(4), tokio_util::sync::CancellationToken::new());
+        let result = tokio::time::timeout(LIMIT, looping.run(&mut app)).await?;
+        assert!(result.is_err());
+        let check = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let abandoned = abandon.load(Ordering::SeqCst);
+            raise("INT")?;
+            Ok::<_, Box<dyn std::error::Error>>(abandoned)
+        };
+        let ((), abandoned) = tokio::time::timeout(LIMIT, async {
+            tokio::join!(looping.settle(&mut app), check)
+        })
+        .await?;
+        assert!(!abandoned?, "abandoned before the signal");
+        assert!(abandon.load(Ordering::SeqCst), "abandoned on the signal");
+        assert!(app.training.tasks.is_empty());
+        assert_eq!(app.exit, Some(Exit::Signal));
         Ok(())
     }
 

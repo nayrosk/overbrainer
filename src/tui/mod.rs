@@ -53,7 +53,6 @@ pub async fn run(project_dir: &Path, logs: LogBuffer) -> anyhow::Result<()> {
     let result = event_loop::run(&mut terminal, &mut app).await;
     drop(guard);
     app.abandon_edit();
-    app.abandon_stage();
     for note in &app.exit_notes {
         writeln!(io::stderr(), "{note}").ok();
     }
