@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use overbrainer::events::EventBus;
@@ -152,13 +152,24 @@ async fn another_host_key_is_refused_through_the_per_run_config() -> TestResult 
 }
 
 /// `GET /pods/p1`: the pod with the test sshd as its endpoint, until deleted.
+/// After `dies_after` looks, the pod shows as EXITED.
 struct Get {
     deleted: Arc<AtomicBool>,
     body: Value,
+    looks: AtomicUsize,
+    dies_after: Option<usize>,
 }
 
 impl Respond for Get {
     fn respond(&self, _: &Request) -> ResponseTemplate {
+        let looks = self.looks.fetch_add(1, Ordering::SeqCst);
+        if self.dies_after.is_some_and(|after| looks >= after)
+            && !self.deleted.load(Ordering::SeqCst)
+        {
+            let mut dead = self.body.clone();
+            dead["status"] = json!("EXITED");
+            return ResponseTemplate::new(200).set_body_json(dead);
+        }
         if self.deleted.load(Ordering::SeqCst) {
             ResponseTemplate::new(404).set_body_json(json!({
                 "detail": "pod not found",
@@ -180,8 +191,8 @@ impl Respond for Delete {
     }
 }
 
-/// A stub whose pod `p1` is the test sshd.
-async fn stub(sshd: &Sshd, run_id: &str) -> MockServer {
+/// A stub whose pod `p1` is the test sshd, dying after `dies_after` looks.
+async fn stub(sshd: &Sshd, run_id: &str, dies_after: Option<usize>) -> MockServer {
     let server = MockServer::start().await;
     let body = json!({
         "id": "p1",
@@ -205,6 +216,8 @@ async fn stub(sshd: &Sshd, run_id: &str) -> MockServer {
         .respond_with(Get {
             deleted: Arc::clone(&deleted),
             body,
+            looks: AtomicUsize::new(0),
+            dies_after,
         })
         .mount(&server)
         .await;
@@ -252,19 +265,25 @@ async fn write_verdict(
     Err("the verdict was not written".into())
 }
 
+/// Provisions against the test sshd with `verdict` written (none when `None`),
+/// the pod dying after `dies_after` looks at it.
 async fn provision_against(
     sshd: &Sshd,
-    verdict: &str,
+    verdict: Option<&str>,
+    dies_after: Option<usize>,
 ) -> Result<(Result<(), PodError>, PodRecord, usize), Box<dyn std::error::Error>> {
     let run_id = new_run_id();
     let workdir = format!("overbrainer-tests/runpod-{run_id}");
-    write_verdict(sshd, &workdir, &run_id, verdict).await?;
-    let server = stub(sshd, &run_id).await;
+    if let Some(verdict) = verdict {
+        write_verdict(sshd, &workdir, &run_id, verdict).await?;
+    }
+    let server = stub(sshd, &run_id, dies_after).await;
     let project = tempfile::tempdir()?;
     let runs = Runs::new(project.path());
     let client = client(&server)?;
     let timing = Timing {
         ready_timeout: Duration::from_secs(30),
+        preflight_timeout: Duration::from_secs(30),
         ..fast()
     };
     let interrupted = AtomicBool::new(false);
@@ -320,7 +339,7 @@ async fn a_pod_is_ready_once_ssh_and_its_watchdog_answer() -> TestResult {
         skip();
         return Ok(());
     };
-    let (result, record, deletes) = provision_against(&sshd, "ready").await?;
+    let (result, record, deletes) = provision_against(&sshd, Some("ready"), None).await?;
     result?;
     assert_eq!(record.state, PodState::Ready);
     assert_eq!(
@@ -338,7 +357,7 @@ async fn a_watchdog_that_cannot_delete_its_pod_refuses_the_run() -> TestResult {
         skip();
         return Ok(());
     };
-    let (result, record, deletes) = provision_against(&sshd, "failed http_403").await?;
+    let (result, record, deletes) = provision_against(&sshd, Some("failed http_403"), None).await?;
     let error = result.err().ok_or("the run was not refused")?;
     assert!(
         error
@@ -357,14 +376,43 @@ async fn a_failed_bootstrap_deletes_the_pod_and_refuses_the_run() -> TestResult 
         skip();
         return Ok(());
     };
-    let (result, record, deletes) =
-        provision_against(&sshd, "failed bootstrap: cannot write the job environment").await?;
+    let (result, record, deletes) = provision_against(
+        &sshd,
+        Some("failed bootstrap: cannot write the job environment"),
+        None,
+    )
+    .await?;
     let Err(PodError::BootstrapFailed { pod_id, reason }) = result else {
         return Err(format!("the run was not refused: {result:?}").into());
     };
     assert_eq!(pod_id.as_str(), "p1");
     assert_eq!(reason, "cannot write the job environment");
     assert_eq!(record.state, PodState::Deleted);
+    assert_eq!(deletes, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pod_that_dies_while_its_verdict_is_awaited_is_deleted_at_once() -> TestResult {
+    let Some(sshd) = sshd()? else {
+        skip();
+        return Ok(());
+    };
+    let started = std::time::Instant::now();
+    // No verdict: SSH works on the first look, the pod is EXITED on the next.
+    let (result, record, deletes) = provision_against(&sshd, None, Some(1)).await?;
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "waited {:?} for a dead pod",
+        started.elapsed()
+    );
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    assert_eq!(record.attempts.len(), 1);
+    assert_eq!(
+        record.attempts[0].detail.as_deref(),
+        Some("the pod is EXITED")
+    );
+    assert_eq!(record.pod_id, None);
     assert_eq!(deletes, 1);
     Ok(())
 }

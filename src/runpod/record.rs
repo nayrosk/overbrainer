@@ -172,6 +172,10 @@ pub struct PodRecord {
     pub deleted_by: Option<DeletedBy>,
     /// Rate times uptime, in USD.
     pub estimated_spend: Option<f64>,
+    /// Other pods of the run (left by an ambiguous create) whose delete could
+    /// not be confirmed: they may still run and bill.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stray_pods: Vec<PodId>,
 }
 
 /// Seconds since the Unix epoch at `time`.
@@ -212,6 +216,7 @@ impl PodRecord {
             deleted_at: None,
             deleted_by: None,
             estimated_spend: None,
+            stray_pods: Vec::new(),
         }
     }
 
@@ -308,6 +313,13 @@ impl PodRecord {
         self.deadline = deadline_unix.map(|at| rfc3339(UNIX_EPOCH + Duration::from_secs(at)));
         self.ready_at = None;
         self.ssh = None;
+    }
+
+    /// Records `id`, another pod of the run whose delete could not be confirmed.
+    pub fn note_stray(&mut self, id: PodId) {
+        if !self.stray_pods.contains(&id) {
+            self.stray_pods.push(id);
+        }
     }
 
     /// Keeps the first non-zero rate Runpod reports.
@@ -496,6 +508,22 @@ mod tests {
             record.attempts[0].pod_id.as_ref().map(PodId::as_str),
             Some("k3x9abc")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stray_pods_are_kept_once_and_only_written_when_present() -> TestResult {
+        let mut record = PodRecord::new(RUN, false, 1, "ssh-ed25519 AAAAhost");
+        let empty = serde_json::to_value(&record)?;
+        assert!(empty.get("stray_pods").is_none());
+        record.note_stray(PodId::new("dup1")?);
+        record.note_stray(PodId::new("dup1")?);
+        let json = serde_json::to_value(&record)?;
+        assert_eq!(json["stray_pods"], serde_json::json!(["dup1"]));
+        let back: PodRecord = serde_json::from_value(json)?;
+        assert_eq!(back, record);
+        let old: PodRecord = serde_json::from_value(empty)?;
+        assert!(old.stray_pods.is_empty());
         Ok(())
     }
 

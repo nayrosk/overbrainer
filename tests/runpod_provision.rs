@@ -3,6 +3,7 @@
 //! creates, pods that never become ready, interruption, confirmed deletes. SSH
 //! readiness itself is covered against a real sshd in `tests/runpod_ssh.rs`.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -329,7 +330,10 @@ async fn pod_json_holds_the_attempt_before_the_create_arrives() -> TestResult {
 async fn lack_of_credits_and_a_rejected_request_stop_at_once() -> TestResult {
     for (status, expected) in [
         (402, "Runpod refused for lack of credits (402)"),
-        (422, "Runpod rejected overbrainer's request"),
+        (
+            422,
+            "Runpod answered 422: Runpod rejected the create request (please report it: overbrainer built an invalid request)",
+        ),
     ] {
         let harness = Harness::new().await?;
         Mock::given(method("POST"))
@@ -356,15 +360,9 @@ async fn a_400_that_is_not_about_capacity_stops_at_once() -> TestResult {
         .await;
     let (result, record) = harness.provision(&target(&["A", "B"])).await?;
     let error = result.err().ok_or("provisioning succeeded")?.to_string();
-    assert!(
-        error.starts_with("Runpod rejected overbrainer's request"),
-        "{error}"
-    );
-    assert!(
-        error.ends_with(
-            "Runpod answered 400: Runpod rejected the create request (please report it: overbrainer built an invalid request)"
-        ),
-        "{error}"
+    assert_eq!(
+        error,
+        "Runpod answered 400: Runpod rejected the create request (please report it: overbrainer built an invalid request)"
     );
     assert!(!error.contains("gpu.count"), "{error}");
     assert_eq!(harness.calls("POST").await.len(), 1);
@@ -455,7 +453,8 @@ async fn a_pod_gone_or_dead_before_ssh_ends_its_attempt_at_once() -> TestResult 
         .iter()
         .map(|request| request.url.path().to_string())
         .collect();
-    assert_eq!(deleted, vec!["/v2/pods/p1", "/v2/pods/p2"]);
+    // p1 was already gone: nothing to delete, only confirmed by its 404.
+    assert_eq!(deleted, vec!["/v2/pods/p2"]);
     assert_eq!(record.pod_id, None);
     Ok(())
 }
@@ -529,7 +528,11 @@ async fn an_ambiguous_create_without_a_pod_is_sent_again() -> TestResult {
         results(&record),
         vec![AttemptResult::Ambiguous, AttemptResult::Unavailable]
     );
-    assert_eq!(harness.calls("GET").await.len(), 2, "two looks for the pod");
+    assert_eq!(
+        harness.calls("GET").await.len(),
+        3,
+        "two looks for the pod, then one sweep after the walk failed"
+    );
     Ok(())
 }
 
@@ -722,5 +725,292 @@ async fn a_delete_is_confirmed_by_the_api_and_priced() -> TestResult {
     .await;
     assert!(matches!(result, Err(PodError::NotDeleted(_))), "{result:?}");
     assert_eq!(record.state, PodState::Deleting);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pod_that_cannot_be_confirmed_deleted_stops_the_walk_and_stays_recorded() -> TestResult {
+    let harness = Harness::new().await?;
+    create_for(
+        &harness.server,
+        "A",
+        ResponseTemplate::new(201).set_body_json(pod("p1", "n1", "RUNNING")),
+    )
+    .await;
+    // Dead, and still shown after its DELETE.
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pod("p1", "n1", "ERROR")))
+        .mount(&harness.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&harness.server)
+        .await;
+    let (result, record) = harness.provision(&target(&["A", "B"])).await?;
+    assert!(
+        matches!(&result, Err(PodError::NotDeleted(id)) if id.as_str() == "p1"),
+        "{result:?}"
+    );
+    assert_eq!(harness.calls("POST").await.len(), 1, "the walk went on");
+    assert_eq!(results(&record), vec![AttemptResult::NotReady]);
+    assert_eq!(
+        record
+            .pod_id
+            .as_ref()
+            .map(overbrainer::runpod::PodId::as_str),
+        Some("p1")
+    );
+    assert_eq!(record.state, PodState::Deleting);
+    Ok(())
+}
+
+/// Presses Ctrl-C, then gives no clear answer to the create call.
+struct UnclearThenInterrupt(Arc<AtomicBool>);
+
+impl Respond for UnclearThenInterrupt {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        self.0.store(true, Ordering::SeqCst);
+        ResponseTemplate::new(503)
+    }
+}
+
+#[tokio::test]
+async fn ctrl_c_during_reconciliation_still_finds_and_deletes_the_pod() -> TestResult {
+    let mut harness = Harness::new().await?;
+    harness.timing.reconcile_waits = [Duration::from_secs(30), Duration::from_secs(30)];
+    let mut receiver = harness.bus.subscribe();
+    Mock::given(method("POST"))
+        .respond_with(UnclearThenInterrupt(Arc::clone(&harness.interrupted)))
+        .mount(&harness.server)
+        .await;
+    let name = "overbrainer-20260922-143005-a1b2-1";
+    list(&harness.server, json!([pod("p1", name, "RUNNING")])).await;
+    serve_pod(&harness.server, "p1", pod("p1", name, "RUNNING")).await;
+    let started = std::time::Instant::now();
+    let (result, record) = harness.provision(&target(&["A", "B"])).await?;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "slept {:?}",
+        started.elapsed()
+    );
+    assert!(matches!(result, Err(PodError::Interrupted)), "{result:?}");
+    let lists = harness
+        .calls("GET")
+        .await
+        .iter()
+        .filter(|request| request.url.path() == "/v2/pods")
+        .count();
+    assert_eq!(lists, 1);
+    assert_eq!(harness.calls("POST").await.len(), 1);
+    assert_eq!(record.state, PodState::Deleted);
+    assert_eq!(
+        harness
+            .calls("DELETE")
+            .await
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect::<Vec<_>>(),
+        vec!["/v2/pods/p1"]
+    );
+    assert!(statuses(&mut receiver).contains(&PodStatus::Deleting {
+        pod_id: overbrainer::runpod::PodId::new("p1")?,
+        reason: DeleteReason::Interrupted,
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pod_that_shows_up_after_a_failed_walk_is_swept_or_recorded() -> TestResult {
+    let harness = Harness::new().await?;
+    let mut receiver = harness.bus.subscribe();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&harness.server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(no_capacity())
+        .mount(&harness.server)
+        .await;
+    // Nothing while reconciling; both late pods once the walk has failed.
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": []})))
+        .up_to_n_times(2)
+        .mount(&harness.server)
+        .await;
+    list(
+        &harness.server,
+        json!([
+            pod("late", "overbrainer-20260922-143005-a1b2-1", "RUNNING"),
+            pod("stuck", "overbrainer-20260922-143005-a1b2-1", "RUNNING")
+        ]),
+    )
+    .await;
+    serve_pod(
+        &harness.server,
+        "late",
+        pod("late", "overbrainer-20260922-143005-a1b2-1", "RUNNING"),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/stuck"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pod(
+            "stuck",
+            "overbrainer-20260922-143005-a1b2-1",
+            "RUNNING",
+        )))
+        .mount(&harness.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/pods/stuck"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&harness.server)
+        .await;
+    let (result, record) = harness.provision(&target(&["A"])).await?;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    assert_eq!(
+        results(&record),
+        vec![AttemptResult::Ambiguous, AttemptResult::Unavailable]
+    );
+    let mut deleted: Vec<String> = harness
+        .calls("DELETE")
+        .await
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
+    deleted.sort();
+    assert_eq!(deleted, vec!["/v2/pods/late", "/v2/pods/stuck"]);
+    assert_eq!(
+        record
+            .stray_pods
+            .iter()
+            .map(overbrainer::runpod::PodId::as_str)
+            .collect::<Vec<_>>(),
+        vec!["stuck"]
+    );
+    let duplicates = statuses(&mut receiver)
+        .into_iter()
+        .filter(|status| {
+            matches!(
+                status,
+                PodStatus::Deleting {
+                    reason: DeleteReason::Duplicate,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(duplicates, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_unclear_answers_per_type_then_the_next_type() -> TestResult {
+    let harness = Harness::new().await?;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&harness.server)
+        .await;
+    list(&harness.server, json!([])).await;
+    let (result, record) = harness.provision(&target(&["A", "B"])).await?;
+    let error = result.err().ok_or("provisioning succeeded")?;
+    assert_eq!(
+        error.to_string(),
+        "Runpod did not answer the create calls clearly; check `overbrainer pod ls`"
+    );
+    let sent: Vec<Value> = harness
+        .calls("POST")
+        .await
+        .iter()
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap_or_default())
+        .collect();
+    let gpus: Vec<&str> = sent
+        .iter()
+        .map(|body| body["gpu"]["id"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(gpus, vec!["A", "A", "B", "B"]);
+    assert_eq!(results(&record), vec![AttemptResult::Ambiguous; 4]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pod_already_gone_is_recorded_deleted_by_its_watchdog() -> TestResult {
+    let harness = Harness::new().await?;
+    Mock::given(path("/v2/pods/p1"))
+        .respond_with(gone())
+        .mount(&harness.server)
+        .await;
+    let pod: overbrainer::runpod::Pod = serde_json::from_value(pod("p1", "n1", "RUNNING"))?;
+    let mut record = PodRecord::new(RUN, false, 1, "ssh-ed25519 AAAAhost");
+    record.begin_attempt("NVIDIA A40", SystemTime::now(), 6.0);
+    record.created(&pod, AttemptResult::Created, SystemTime::now());
+    remove(
+        &harness.ctx(),
+        &mut record,
+        DeleteReason::NotReady,
+        DeletedBy::Client,
+    )
+    .await?;
+    assert_eq!(record.state, PodState::Deleted);
+    assert_eq!(record.deleted_by, Some(DeletedBy::Watchdog));
+    assert!(harness.calls("DELETE").await.is_empty());
+    Ok(())
+}
+
+/// Makes the run directory read-only, so the next `pod.json` save fails, then
+/// answers the create with pod `p1`.
+struct CreateThenLock(PathBuf);
+
+impl Respond for CreateThenLock {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o500));
+        ResponseTemplate::new(201).set_body_json(pod("p1", "n1", "RUNNING"))
+    }
+}
+
+#[tokio::test]
+async fn a_pod_is_still_deleted_when_pod_json_cannot_be_saved() -> TestResult {
+    let harness = Harness::new().await?;
+    let dir = harness.runs.run_dir(RUN)?;
+    // Root writes through a read-only directory: nothing to test then.
+    let probe = tempfile::tempdir()?;
+    std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o500))?;
+    let root = std::fs::write(probe.path().join("x"), b"x").is_ok();
+    std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o700))?;
+    if root {
+        eprintln!("skipped: running as root, permissions cannot force a save to fail");
+        return Ok(());
+    }
+    Mock::given(method("POST"))
+        .respond_with(CreateThenLock(dir.clone()))
+        .mount(&harness.server)
+        .await;
+    serve_pod(&harness.server, "p1", pod("p1", "n1", "RUNNING")).await;
+    let mut record = PodRecord::new(RUN, false, 1, "ssh-ed25519 AAAAhost");
+    record.save(&harness.runs)?;
+    let target = target(&["A"]);
+    let plan = PodPlan {
+        run_id: RUN,
+        target: &target,
+        keys: &harness.keys,
+        ssh_dir: &harness.ssh_dir,
+        workdir: "/workspace/overbrainer",
+        api_url: harness.client.base_url(),
+    };
+    let result = provision(&harness.ctx(), &plan, &mut record).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    assert!(matches!(result, Err(PodError::Runs(_))), "{result:?}");
+    assert_eq!(
+        harness
+            .calls("DELETE")
+            .await
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect::<Vec<_>>(),
+        vec!["/v2/pods/p1"]
+    );
+    assert_eq!(record.state, PodState::Deleted);
     Ok(())
 }

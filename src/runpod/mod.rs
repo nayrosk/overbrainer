@@ -78,9 +78,13 @@ pub enum PodError {
     )]
     NoCredits,
     /// Runpod rejected the create request itself (a 422, or a 400 that is not a
-    /// capacity failure), which is a bug.
-    #[error("Runpod rejected overbrainer's request, which is a bug in overbrainer: {0}")]
+    /// capacity failure), which is a bug. Holds the client's fixed message,
+    /// which already says so.
+    #[error("{0}")]
     Rejected(String),
+    /// No create call got a clear answer (transport errors, timeouts, 5xx).
+    #[error("Runpod did not answer the create calls clearly; check `overbrainer pod ls`")]
+    Unanswered,
     /// The pod's watchdog could not prove it can delete its pod; the pod was
     /// deleted.
     #[error(

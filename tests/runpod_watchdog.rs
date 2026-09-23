@@ -712,14 +712,15 @@ async fn a_pod_with_no_curl_on_path_is_a_failed_verdict() -> TestResult {
 /// here-document, so a test can drive the real bootstrap failure path without
 /// touching the pod's actual `/etc` or `/root`. Like the real one built by
 /// `pod_command()`, it copies to a sibling `.tmp` file and only `mv -f`s it into
-/// place once the copy itself succeeded.
-fn start_bootstrap(shell: Shell, env: &[(&str, String)]) -> std::io::Result<Child> {
+/// place once the copy itself succeeded. `probe` runs first in
+/// `write_watchdog`, so a test can observe what `bootstrap_main` did before it.
+fn start_bootstrap(shell: Shell, env: &[(&str, String)], probe: &str) -> std::io::Result<Child> {
     let mut command = Command::new(shell.0[0]);
     command
         .args(&shell.0[1..])
         .arg("-c")
         .arg(format!(
-            "{}\nwrite_watchdog() {{\n  mkdir -p \"$(dirname \"$1\")\" || return 1\n  cp \"$OVERBRAINER_TEST_WATCHDOG_SRC\" \"$1.tmp\" || return 1\n  mv -f \"$1.tmp\" \"$1\"\n}}\nbootstrap_main\n",
+            "{}\nwrite_watchdog() {{\n  {probe}\n  mkdir -p \"$(dirname \"$1\")\" || return 1\n  cp \"$OVERBRAINER_TEST_WATCHDOG_SRC\" \"$1.tmp\" || return 1\n  mv -f \"$1.tmp\" \"$1\"\n}}\nbootstrap_main\n",
             bootstrap_functions()
         ))
         .env_clear()
@@ -832,7 +833,7 @@ async fn a_bootstrap_failure_still_deletes_a_guarded_pod() -> TestResult {
     for &shell in shells() {
         let server = stub(200, 204).await;
         let setup = FailingBootstrap::new(&server)?;
-        let child = start_bootstrap(shell, &setup.env)?;
+        let child = start_bootstrap(shell, &setup.env, ":")?;
         let (code, output) = finished(child, Duration::from_secs(15)).await?;
         assert_eq!(code, 0, "{shell}: {output}");
         assert_eq!(
@@ -855,6 +856,35 @@ async fn a_bootstrap_failure_still_deletes_a_guarded_pod() -> TestResult {
     Ok(())
 }
 
+/// A verdict left by an earlier pod on a network volume must be gone before
+/// sshd starts, or overbrainer could read it as this pod's `ready`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_verdict_is_removed_before_sshd_starts() -> TestResult {
+    if !curl_available() || !keygen_available() || running_as_root() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let setup = FailingBootstrap::new(&server)?;
+        fs::create_dir_all(setup.run_dir.join(".pod"))?;
+        fs::write(setup.run_dir.join(".pod/watchdog"), "ready\n")?;
+        let probe = "if [ -e \"$OVERBRAINER_RUN_DIR/.pod/watchdog\" ]; then : > \"$OVERBRAINER_RUN_DIR/stale_seen\"; fi";
+        let child = start_bootstrap(shell, &setup.env, probe)?;
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert!(
+            !setup.run_dir.join("stale_seen").exists(),
+            "{shell}: the stale verdict was still there: {output}"
+        );
+        assert_eq!(
+            setup.read(".pod/watchdog"),
+            "failed bootstrap: cannot install the authorized key\n",
+            "{shell}: {output}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bootstrap_failure_in_keep_mode_only_logs() -> TestResult {
     if !curl_available() || !keygen_available() || running_as_root() {
@@ -865,7 +895,7 @@ async fn a_bootstrap_failure_in_keep_mode_only_logs() -> TestResult {
         let setup = FailingBootstrap::new(&server)?;
         let mut env = setup.env.clone();
         env.push(("OVERBRAINER_KEEP_POD", "1".to_string()));
-        let child = start_bootstrap(shell, &env)?;
+        let child = start_bootstrap(shell, &env, ":")?;
         assert!(
             until(Duration::from_secs(10), || {
                 setup.read(".pod/watchdog")

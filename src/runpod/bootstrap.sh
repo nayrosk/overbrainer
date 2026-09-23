@@ -94,6 +94,9 @@ bootstrap_main() {
   job_env_file=${OVERBRAINER_JOB_ENV_FILE:-/etc/overbrainer/job.env}
   cuda_env_script=${OVERBRAINER_CUDA_ENV_SCRIPT:-/workspace/axolotl/scripts/cuda13_env.sh}
   mkdir -p "$OVERBRAINER_RUN_DIR/.pod" || fail "cannot create the run directory"
+  # A verdict left by an earlier pod (a network volume outlives it) must never be
+  # read as this pod's: it goes before sshd can serve it.
+  rm -f "$OVERBRAINER_RUN_DIR/.pod/watchdog" || fail "cannot remove a stale verdict"
   write_watchdog "$watchdog_file" || fail "cannot write the watchdog"
   install_host_key "$etc_ssh_dir" || fail "cannot install the host key"
   install_authorized_key "$authorized_keys_dir" || fail "cannot install the authorized key"

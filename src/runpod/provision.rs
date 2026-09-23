@@ -23,9 +23,16 @@ const MAX_AMBIGUOUS: u32 = 2;
 /// Bytes read of the watchdog's verdict file.
 const VERDICT_BYTES: u64 = 4096;
 
+/// Characters kept of the watchdog's verdict, once reduced to one line of
+/// printable ASCII: it reaches `pod.json`, errors and messages.
+const VERDICT_CHARS: usize = 200;
+
 /// Prefix of the watchdog's verdict reason when the bootstrap itself failed
 /// (`failed bootstrap: <reason>`).
 const BOOTSTRAP_FAILED: &str = "bootstrap: ";
+
+/// Least time between two warnings that the verdict cannot be read.
+const VERDICT_WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// How long the provisioning steps wait. [`Timing::standard`] in production;
 /// tests use milliseconds.
@@ -136,20 +143,74 @@ enum Created {
 /// Creates the run's pod, trying `plan.target.gpu_types` in order, and waits
 /// until it is ready. `record` (`pod.json`) is saved before every create call and
 /// after every answer. A pod that dies or stays unreachable is deleted and the
-/// next GPU type tried.
+/// next GPU type tried. When provisioning fails after a create call got no clear
+/// answer, every pod of the run still listed is deleted (see [`sweep`]).
 ///
 /// # Errors
 ///
 /// Returns [`PodError::NoCapacity`] when no GPU type could be placed,
-/// [`PodError::NoCredits`] on a 402, [`PodError::Rejected`] on a 422,
-/// [`PodError::WatchdogRefused`] when the watchdog cannot delete its pod (which is
-/// deleted), [`PodError::Interrupted`] after Ctrl-C (the pod, if any, is deleted),
-/// and another [`PodError`] when the API or a local file fails.
+/// [`PodError::Unanswered`] when no create call got a clear answer,
+/// [`PodError::NoCredits`] on a 402, [`PodError::Rejected`] on a 422 or a 400
+/// that is not a capacity failure, [`PodError::WatchdogRefused`] when the
+/// watchdog cannot delete its pod and [`PodError::BootstrapFailed`] when the
+/// pod's bootstrap failed (the pod is deleted in both cases),
+/// [`PodError::Interrupted`] after Ctrl-C (the pod, if any, is deleted),
+/// [`PodError::NotDeleted`] when a pod that did not become ready cannot be
+/// confirmed deleted (it stays in `record`), and another [`PodError`] when the
+/// API or a local file fails.
 pub async fn provision(
     ctx: &PodCtx<'_>,
     plan: &PodPlan<'_>,
     record: &mut PodRecord,
 ) -> Result<Provisioned, PodError> {
+    let result = walk(ctx, plan, record).await;
+    if result.is_err() {
+        after_failure(ctx, record).await;
+    }
+    result
+}
+
+/// After a failed walk: a create call with no clear answer may still produce a
+/// pod, so every pod of the run is deleted, and any that cannot be confirmed
+/// deleted is recorded in `record`.
+async fn after_failure(ctx: &PodCtx<'_>, record: &mut PodRecord) {
+    let unclear: Vec<String> = record
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.result == AttemptResult::Ambiguous)
+        .map(|attempt| attempt.name.clone())
+        .collect();
+    if unclear.is_empty() {
+        return;
+    }
+    let stray = sweep(ctx, &record.run_id.clone(), None).await;
+    note_strays(ctx, record, stray);
+    warn(&format!(
+        "the create calls {} got no clear answer from Runpod: a pod may still appear; check `overbrainer pod ls`",
+        unclear.join(", ")
+    ));
+}
+
+/// Records `stray` pods in `pod.json`, best effort.
+fn note_strays(ctx: &PodCtx<'_>, record: &mut PodRecord, stray: Vec<PodId>) {
+    if stray.is_empty() {
+        return;
+    }
+    for id in stray {
+        record.note_stray(id);
+    }
+    if let Err(error) = record.save(ctx.runs) {
+        warn(&format!("cannot record the stray pods: {}", chain(&error)));
+    }
+}
+
+/// Tries the GPU types in order: see [`provision`].
+async fn walk(
+    ctx: &PodCtx<'_>,
+    plan: &PodPlan<'_>,
+    record: &mut PodRecord,
+) -> Result<Provisioned, PodError> {
+    let first = record.attempts.len();
     let mut last_detail = None;
     for gpu in &plan.target.gpu_types {
         let mut ambiguous = 0;
@@ -172,6 +233,14 @@ pub async fn provision(
                 },
             }
         }
+    }
+    let tried = &record.attempts[first..];
+    if !tried.is_empty()
+        && tried
+            .iter()
+            .all(|attempt| attempt.result == AttemptResult::Ambiguous)
+    {
+        return Err(PodError::Unanswered);
     }
     Err(no_capacity(
         last_detail,
@@ -318,7 +387,12 @@ async fn settle(
     result: AttemptResult,
 ) -> Result<Option<Provisioned>, PodError> {
     record.created(pod, result, SystemTime::now());
-    record.save(ctx.runs)?;
+    let saved = record.save(ctx.runs);
+    if saved.is_err() {
+        // Nothing else knows this pod: delete it before giving up.
+        let removed = remove(ctx, record, DeleteReason::Requested, DeletedBy::Client).await;
+        saved_then_removed(saved, removed)?;
+    }
     ctx.publish(PodStatus::Created {
         pod_id: pod.id.clone(),
         gpu_type: record.gpu_type.clone().unwrap_or_default(),
@@ -336,7 +410,10 @@ async fn settle(
     }
 }
 
-/// Deletes a pod that did not become ready, best effort, and forgets it.
+/// Deletes a pod that did not become ready and forgets it, so the next GPU type
+/// can be tried. A pod whose delete cannot be confirmed stays in `record`
+/// (state `Deleting`) and its error stops the walk: another pod must not be
+/// created while this one may still bill.
 async fn not_ready(
     ctx: &PodCtx<'_>,
     record: &mut PodRecord,
@@ -345,22 +422,37 @@ async fn not_ready(
 ) -> Result<(), PodError> {
     warn(&format!("pod {id} is not ready: {reason}"));
     record.end_attempt(AttemptResult::NotReady, Some(reason));
-    record.save(ctx.runs)?;
-    if let Err(error) = remove(ctx, record, DeleteReason::NotReady, DeletedBy::Client).await {
-        warn(&error.to_string());
-    }
+    let saved = record.save(ctx.runs);
+    let removed = remove(ctx, record, DeleteReason::NotReady, DeletedBy::Client).await;
+    saved_then_removed(saved, removed)?;
     record.forget_pod();
     record.save(ctx.runs)?;
     Ok(())
 }
 
+/// The outcome of a `pod.json` save made before a delete that was sent anyway:
+/// the delete's error first, since the pod may then still run, else the save's.
+fn saved_then_removed(
+    saved: Result<(), crate::runs::RunsError>,
+    removed: Result<(), PodError>,
+) -> Result<(), PodError> {
+    match (saved, removed) {
+        (Err(save), Err(delete)) => {
+            warn(&format!("cannot save pod.json: {}", chain(&save)));
+            Err(delete)
+        },
+        (_, Err(delete)) => Err(delete),
+        (Err(save), Ok(())) => Err(save.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 /// Deletes a pod whose watchdog cannot delete it, and returns the refusal.
 async fn refuse(ctx: &PodCtx<'_>, record: &mut PodRecord, id: &PodId, reason: String) -> PodError {
     record.end_attempt(AttemptResult::Refused, Some(reason.clone()));
-    if let Err(error) = record.save(ctx.runs) {
-        return error.into();
-    }
-    if let Err(error) = remove(ctx, record, DeleteReason::Refused, DeletedBy::Client).await {
+    let saved = record.save(ctx.runs);
+    let removed = remove(ctx, record, DeleteReason::Refused, DeletedBy::Client).await;
+    if let Err(error) = saved_then_removed(saved, removed) {
         return error;
     }
     match reason.strip_prefix(BOOTSTRAP_FAILED) {
@@ -414,7 +506,8 @@ async fn ready(
         after: record.uptime(now).unwrap_or_default(),
         deadline: record.deadline.clone(),
     });
-    sweep(ctx, plan.run_id, Some(id)).await;
+    let stray = sweep(ctx, plan.run_id, Some(id)).await;
+    note_strays(ctx, record, stray);
     Ok(Provisioned {
         pod_id: id.clone(),
         executor,
@@ -477,8 +570,9 @@ async fn alive(ctx: &PodCtx<'_>, id: &PodId) -> Result<Pod, Wait> {
 
 /// Reads the watchdog's verdict at `path` until it says `ready` or
 /// `failed <reason>` (`failed bootstrap: <reason>` when the bootstrap failed),
-/// within [`Timing::preflight_timeout`]. While the verdict cannot be read, the
-/// pod `id` is checked too, so a pod that died meanwhile ends the wait at once.
+/// within [`Timing::preflight_timeout`]. While there is no verdict, the pod `id`
+/// is checked on every poll, so a pod that died meanwhile ends the wait at once.
+/// A read failure is logged when it first happens, then at most once a minute.
 async fn preflight(
     ctx: &PodCtx<'_>,
     executor: &SshExecutor,
@@ -486,12 +580,12 @@ async fn preflight(
     id: &PodId,
 ) -> Result<(), Wait> {
     let started = Instant::now();
+    let mut warned: Option<Instant> = None;
     loop {
         ctx.check().map_err(Wait::Failed)?;
         match executor.read_from(path, 0, VERDICT_BYTES).await {
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                let text = text.trim();
+                let text = one_line(&String::from_utf8_lossy(&bytes));
                 if text == "ready" {
                     return Ok(());
                 }
@@ -500,10 +594,15 @@ async fn preflight(
                 }
             },
             Err(error) => {
-                tracing::warn!("cannot read the watchdog's verdict: {}", chain(&error));
-                alive(ctx, id).await?;
+                if warned.is_none_or(|at| at.elapsed() >= VERDICT_WARN_EVERY) {
+                    tracing::warn!("cannot read the watchdog's verdict: {}", chain(&error));
+                    warned = Some(Instant::now());
+                }
             },
         }
+        // No verdict yet (a missing file reads as empty): a pod that died
+        // meanwhile will never write one.
+        alive(ctx, id).await?;
         if started.elapsed() >= ctx.timing.preflight_timeout {
             return Err(Wait::Refused(format!(
                 "no verdict within {}s",
@@ -514,14 +613,27 @@ async fn preflight(
     }
 }
 
+/// `text` as one short line of printable ASCII: control and non-ASCII
+/// characters dropped, at most [`VERDICT_CHARS`] kept.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(VERDICT_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Deletes the run's current pod and waits until the API no longer knows it,
-/// then records it deleted by `by`. Does nothing when there is no pod.
+/// then records it deleted by `by`, or by [`DeletedBy::Watchdog`] when it was
+/// already gone. Does nothing when there is no pod. The delete is sent even
+/// when `pod.json` cannot be saved first.
 ///
 /// # Errors
 ///
 /// Returns [`PodError::NotDeleted`] when the pod still shows after
-/// [`Timing::delete_timeout`], and another [`PodError`] when the API or
-/// `pod.json` fails.
+/// [`Timing::delete_timeout`] (the record stays `Deleting`, with the pod), and
+/// another [`PodError`] when the API or `pod.json` fails.
 pub async fn remove(
     ctx: &PodCtx<'_>,
     record: &mut PodRecord,
@@ -536,19 +648,34 @@ pub async fn remove(
         reason,
     });
     record.state = super::PodState::Deleting;
-    record.save(ctx.runs)?;
-    ctx.client.delete_pod(&id).await?;
-    wait_gone(ctx, &id).await?;
+    let saved = record.save(ctx.runs);
+    // A pod already gone was deleted by its watchdog (after a failed bootstrap,
+    // for example); an error here only means the delete is sent.
+    let gone = matches!(ctx.client.get_pod(&id).await, Ok(None));
+    if !gone {
+        let deleted = delete_confirmed(ctx, &id).await;
+        if deleted.is_err() {
+            return saved_then_removed(saved, deleted);
+        }
+    }
     let now = SystemTime::now();
     let uptime = record.uptime(now);
-    record.deleted(by, now);
-    record.save(ctx.runs)?;
+    record.deleted(if gone { DeletedBy::Watchdog } else { by }, now);
+    let recorded = record.save(ctx.runs);
     ctx.publish(PodStatus::Deleted {
         pod_id: id,
         uptime,
         estimated_spend: record.estimated_spend,
     });
+    recorded?;
+    saved?;
     Ok(())
+}
+
+/// Sends the delete of `id` and waits until the API no longer knows it.
+async fn delete_confirmed(ctx: &PodCtx<'_>, id: &PodId) -> Result<(), PodError> {
+    ctx.client.delete_pod(id).await?;
+    wait_gone(ctx, id).await
 }
 
 /// Polls until the API no longer knows the pod `id`, for at most
@@ -573,15 +700,21 @@ pub async fn wait_gone(ctx: &PodCtx<'_>, id: &PodId) -> Result<(), PodError> {
 
 /// Looks for the pod of an ambiguous create by the run marker, twice. The pod
 /// named `name` is adopted; any other pod of the run is a duplicate of an earlier
-/// ambiguous create and is deleted.
+/// ambiguous create and is deleted (recorded in `record` when that cannot be
+/// confirmed). After Ctrl-C the remaining wait is skipped but the pods are still
+/// listed once, so a pod the call created is adopted and then deleted.
+///
+/// # Errors
+///
+/// Returns [`PodError::Interrupted`] after Ctrl-C when no pod was found.
 async fn reconcile(
     ctx: &PodCtx<'_>,
-    record: &PodRecord,
+    record: &mut PodRecord,
     name: &str,
 ) -> Result<Option<Pod>, PodError> {
     for wait in ctx.timing.reconcile_waits {
-        tokio::time::sleep(wait).await;
-        ctx.check()?;
+        nap(ctx, wait).await;
+        let interrupted = ctx.check().is_err();
         let mine: Vec<Pod> = ctx
             .client
             .list_pods()
@@ -590,41 +723,72 @@ async fn reconcile(
             .filter(|pod| pod.run_id() == Some(record.run_id.as_str()))
             .collect();
         if let Some(found) = mine.iter().find(|pod| pod.name == name) {
+            let mut stray = Vec::new();
             for duplicate in mine.iter().filter(|pod| pod.id != found.id) {
-                delete_duplicate(ctx, &duplicate.id).await;
+                if !delete_duplicate(ctx, &duplicate.id).await {
+                    stray.push(duplicate.id.clone());
+                }
             }
+            note_strays(ctx, record, stray);
             return Ok(Some(found.clone()));
+        }
+        if interrupted {
+            return Err(PodError::Interrupted);
         }
     }
     Ok(None)
 }
 
-/// Deletes every pod carrying the marker of `run_id` but `keep`, best effort: a
-/// pod left over by an ambiguous create that showed up late.
-pub async fn sweep(ctx: &PodCtx<'_>, run_id: &str, keep: Option<&PodId>) {
+/// Sleeps `wait`, or less once Ctrl-C was pressed.
+async fn nap(ctx: &PodCtx<'_>, wait: Duration) {
+    let started = Instant::now();
+    while ctx.check().is_ok() {
+        let left = wait.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return;
+        }
+        tokio::time::sleep(left.min(ctx.timing.poll)).await;
+    }
+}
+
+/// Deletes every pod carrying the marker of `run_id` but `keep`: a pod left over
+/// by an ambiguous create that showed up late. Returns the pods whose deletion
+/// could not be confirmed, for `pod.json`.
+pub async fn sweep(ctx: &PodCtx<'_>, run_id: &str, keep: Option<&PodId>) -> Vec<PodId> {
     let pods = match ctx.client.list_pods().await {
         Ok(pods) => pods,
         Err(error) => {
             tracing::warn!("cannot look for duplicate pods of run {run_id}: {error}");
-            return;
+            return Vec::new();
         },
     };
+    let mut stray = Vec::new();
     for pod in pods {
-        if pod.run_id() == Some(run_id) && Some(&pod.id) != keep {
-            delete_duplicate(ctx, &pod.id).await;
+        if pod.run_id() == Some(run_id)
+            && Some(&pod.id) != keep
+            && !delete_duplicate(ctx, &pod.id).await
+        {
+            stray.push(pod.id);
         }
     }
+    stray
 }
 
-async fn delete_duplicate(ctx: &PodCtx<'_>, id: &PodId) {
+/// Deletes the duplicate pod `id` and confirms it is gone; false when that
+/// failed, so the caller records it.
+async fn delete_duplicate(ctx: &PodCtx<'_>, id: &PodId) -> bool {
     ctx.publish(PodStatus::Deleting {
         pod_id: id.clone(),
         reason: DeleteReason::Duplicate,
     });
-    if let Err(error) = ctx.client.delete_pod(id).await {
-        tracing::warn!(
-            "cannot delete duplicate pod {id}: {error}; its watchdog deletes it after its boot grace"
-        );
+    match delete_confirmed(ctx, id).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                "cannot confirm the deletion of duplicate pod {id}: {error}; its watchdog deletes it after its boot grace"
+            );
+            false
+        },
     }
 }
 
@@ -638,4 +802,21 @@ pub fn chain(error: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     parts.join(": ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_verdict_is_one_short_line_of_printable_ascii() {
+        assert_eq!(one_line("ready\n"), "ready");
+        assert_eq!(
+            one_line("failed http_403\u{1b}[31m\r\nsecond line\u{7}"),
+            "failed http_403[31msecond line"
+        );
+        assert_eq!(one_line("failed caf\u{e9}"), "failed caf");
+        let long = format!("failed {}", "x".repeat(5000));
+        assert_eq!(one_line(&long).len(), VERDICT_CHARS);
+    }
 }
