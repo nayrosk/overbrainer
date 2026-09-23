@@ -110,17 +110,35 @@ pub(super) enum Exit {
     Signal,
 }
 
-/// The Logs view's state: the level shown and how far back it is scrolled.
+/// The Logs view's state: the level shown and where it is scrolled.
+///
+/// Scrolling back pins the view on a line, so the lines on screen stay put while
+/// new ones arrive; `G` or End follows the tail again. `f` changes which lines
+/// match, so it follows the tail again too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LogView {
     /// The least severe level shown.
     pub(super) min: Level,
-    /// Matching lines between the newest one and the bottom of the view; 0
-    /// follows the tail.
-    pub(super) offset: usize,
+    /// While scrolled back, the `seq` of the line at the bottom of the view;
+    /// `None` follows the tail.
+    pub(super) anchor: Option<u64>,
+    /// Rows of lines the view showed at the last draw.
+    pub(super) height: usize,
 }
 
 impl LogView {
+    /// Matching lines newer than the bottom of the view. Exact: it never goes
+    /// past what a full view can show, and an anchor dropped from the buffer
+    /// counts as its oldest line.
+    pub(super) fn offset(&self, logs: &LogBuffer) -> usize {
+        let Some(anchor) = self.anchor else {
+            return 0;
+        };
+        let matching = logs.window(self.min, 0, 0).matching;
+        logs.newer(self.min, anchor)
+            .min(matching.saturating_sub(self.height.max(1)))
+    }
+
     /// The next level `f` selects: error, warn, info, debug, trace, then error.
     fn next_level(level: Level) -> Level {
         match level {
@@ -173,7 +191,8 @@ impl App {
             now,
             log_view: LogView {
                 min: Level::INFO,
-                offset: 0,
+                anchor: None,
+                height: 0,
             },
             dirty: true,
             exit: None,
@@ -232,21 +251,41 @@ impl App {
     }
 
     fn on_logs_key(&mut self, code: KeyCode) {
-        let matching = self.logs.window(self.log_view.min, 0, 0).matching;
-        let last = matching.saturating_sub(1);
-        let view = &mut self.log_view;
         match code {
-            KeyCode::Up | KeyCode::Char('k') => view.offset = (view.offset + 1).min(last),
-            KeyCode::Down | KeyCode::Char('j') => view.offset = view.offset.saturating_sub(1),
-            KeyCode::PageUp => view.offset = (view.offset + PAGE).min(last),
-            KeyCode::PageDown => view.offset = view.offset.saturating_sub(PAGE),
-            KeyCode::End | KeyCode::Char('G') => view.offset = 0,
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_logs(true, 1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_logs(false, 1),
+            KeyCode::PageUp => self.scroll_logs(true, PAGE),
+            KeyCode::PageDown => self.scroll_logs(false, PAGE),
+            KeyCode::End | KeyCode::Char('G') => self.log_view.anchor = None,
             KeyCode::Char('f') => {
-                view.min = LogView::next_level(view.min);
-                view.offset = 0;
+                self.log_view.min = LogView::next_level(self.log_view.min);
+                self.log_view.anchor = None;
             },
             _ => {},
         }
+    }
+
+    /// Moves the Logs view `by` lines back (older) or forward, pinning it on the
+    /// line then at its bottom. Scrolling forward while following does nothing.
+    fn scroll_logs(&mut self, back: bool, by: usize) {
+        let view = self.log_view;
+        let offset = view.offset(&self.logs);
+        let matching = self.logs.window(view.min, 0, 0).matching;
+        let target = if back {
+            offset.saturating_add(by)
+        } else {
+            offset.saturating_sub(by)
+        }
+        .min(matching.saturating_sub(view.height.max(1)));
+        if view.anchor.is_none() && target == 0 {
+            return;
+        }
+        self.log_view.anchor = self
+            .logs
+            .window(view.min, 1, target)
+            .lines
+            .first()
+            .map(|line| line.seq);
     }
 
     /// `q` or Ctrl-C: quits.
@@ -293,9 +332,13 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
     use super::*;
     use crate::logging::LogLine;
-    use crate::tui::snapshots::{NOW, app, at, ctrl_c, key};
+    use crate::tui::snapshots::{NOW, app, at, ctrl_c, draw, key, text};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn press(app: &mut App, codes: &[KeyCode]) {
         for code in codes {
@@ -357,26 +400,120 @@ mod tests {
         });
     }
 
+    /// The Logs view at 80x24 shows 20 lines.
+    const ROWS: usize = 20;
+
+    /// The title row and the rows of lines of the Logs view drawn at 80x24.
+    fn logs_view(app: &mut App) -> Result<(String, Vec<String>), Infallible> {
+        let rows = text(&draw(app, 80, 24)?);
+        let title = rows.get(1).cloned().unwrap_or_default();
+        Ok((title, rows.into_iter().skip(2).take(ROWS).collect()))
+    }
+
     #[test]
-    fn the_logs_view_scrolls_follows_and_cycles_its_level() {
+    fn scrolling_back_stops_at_the_oldest_line_with_an_exact_count() -> TestResult {
         let mut app = app();
         for n in 0..30 {
             log(&app, Level::INFO, &format!("line {n}"));
         }
-        press(
-            &mut app,
-            &[KeyCode::Char('4'), KeyCode::Char('k'), KeyCode::Up],
-        );
-        assert_eq!(app.log_view.offset, 2);
+        press(&mut app, &[KeyCode::Char('4')]);
+        logs_view(&mut app)?;
+        press(&mut app, &[KeyCode::Char('k'), KeyCode::Up]);
+        assert_eq!(app.log_view.offset(&app.logs), 2);
         press(
             &mut app,
             &[KeyCode::PageUp, KeyCode::PageUp, KeyCode::PageUp],
         );
-        assert_eq!(app.log_view.offset, 29, "clamped to the oldest line");
+        let bound = 30 - ROWS;
+        assert_eq!(
+            app.log_view.offset(&app.logs),
+            bound,
+            "the oldest line on top"
+        );
+        let (title, lines) = logs_view(&mut app)?;
+        assert!(
+            title.contains("(10 newer lines below: G follows)"),
+            "{title}"
+        );
+        assert!(lines.first().is_some_and(|row| row.contains("line 0 ")));
+        assert!(lines.last().is_some_and(|row| row.contains("line 19 ")));
         press(&mut app, &[KeyCode::Char('j'), KeyCode::PageDown]);
-        assert_eq!(app.log_view.offset, 18);
+        assert_eq!(app.log_view.offset(&app.logs), 0);
+        assert!(app.log_view.anchor.is_some(), "still pinned at the bottom");
         press(&mut app, &[KeyCode::Char('G')]);
-        assert_eq!(app.log_view.offset, 0);
+        assert_eq!(app.log_view.anchor, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_scrolled_back_view_stays_put_while_lines_arrive() -> TestResult {
+        let mut app = app();
+        for n in 0..30 {
+            log(&app, Level::INFO, &format!("line {n}"));
+        }
+        press(&mut app, &[KeyCode::Char('4')]);
+        logs_view(&mut app)?;
+        press(&mut app, &[KeyCode::Char('k'), KeyCode::Char('k')]);
+        let (title, before) = logs_view(&mut app)?;
+        assert!(
+            title.contains("(2 newer lines below: G follows)"),
+            "{title}"
+        );
+        for n in 30..35 {
+            log(&app, Level::INFO, &format!("line {n}"));
+        }
+        log(&app, Level::DEBUG, "not shown at info");
+        app.on_tick(at(NOW + 1));
+        let (title, after) = logs_view(&mut app)?;
+        assert_eq!(after, before);
+        assert!(
+            title.contains("(7 newer lines below: G follows)"),
+            "{title}"
+        );
+        press(&mut app, &[KeyCode::End]);
+        let (title, lines) = logs_view(&mut app)?;
+        assert!(!title.contains("newer"), "{title}");
+        assert!(lines.last().is_some_and(|row| row.contains("line 34 ")));
+        Ok(())
+    }
+
+    #[test]
+    fn a_pinned_line_dropped_from_the_buffer_clamps_to_the_oldest() -> TestResult {
+        let mut app = App::new(
+            Project {
+                name: "rust_expert".into(),
+            },
+            LogBuffer::new(25),
+            Theme::color(),
+            at(NOW),
+        );
+        for n in 0..25 {
+            log(&app, Level::INFO, &format!("line {n}"));
+        }
+        press(&mut app, &[KeyCode::Char('4')]);
+        logs_view(&mut app)?;
+        press(&mut app, &[KeyCode::PageUp]);
+        assert_eq!(app.log_view.anchor, Some(20), "line 19 at the bottom");
+        for n in 25..50 {
+            log(&app, Level::INFO, &format!("line {n}"));
+        }
+        let (title, lines) = logs_view(&mut app)?;
+        assert!(
+            title.contains("(5 newer lines below: G follows)"),
+            "{title}"
+        );
+        assert!(lines.first().is_some_and(|row| row.contains("line 25 ")));
+        Ok(())
+    }
+
+    #[test]
+    fn f_cycles_the_level_and_follows_again() {
+        let mut app = app();
+        for n in 0..30 {
+            log(&app, Level::INFO, &format!("line {n}"));
+        }
+        press(&mut app, &[KeyCode::Char('4'), KeyCode::Char('k')]);
+        assert!(app.log_view.anchor.is_some());
         let levels: Vec<Level> = (0..5)
             .map(|_| {
                 press(&mut app, &[KeyCode::Char('f')]);
@@ -393,6 +530,7 @@ mod tests {
                 Level::INFO
             ]
         );
+        assert_eq!(app.log_view.anchor, None);
     }
 
     #[test]

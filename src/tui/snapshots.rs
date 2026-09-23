@@ -69,6 +69,17 @@ pub(super) fn draw(
     Ok(terminal)
 }
 
+/// The rows of `terminal`'s buffer as text.
+pub(super) fn text(terminal: &Terminal<TestBackend>) -> Vec<String> {
+    let buffer = terminal.backend().buffer();
+    let width = usize::from(buffer.area.width).max(1);
+    buffer
+        .content()
+        .chunks(width)
+        .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
+        .collect()
+}
+
 /// Checks `app` drawn at `width` by `height` against the snapshot `name`.
 fn snapshot_at(name: &str, app: &mut App, width: u16, height: u16) -> Result<(), Infallible> {
     let terminal = draw(app, width, height)?;

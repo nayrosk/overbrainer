@@ -11,13 +11,15 @@ use crate::tui::app::App;
 use crate::tui::format::clock;
 
 /// Draws the Logs view in `area`.
-pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
+/// Records the rows it has, which bound how far back the view scrolls.
+pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.log_view.height = usize::from(area.height.saturating_sub(2));
     let theme = &app.theme;
     let view = app.log_view;
-    let height = usize::from(area.height.saturating_sub(2));
-    let window = app.logs.window(view.min, height, view.offset);
-    let note = if view.offset > 0 {
-        format!("({} newer lines below: G follows) ", view.offset)
+    let offset = view.offset(&app.logs);
+    let window = app.logs.window(view.min, view.height, offset);
+    let note = if view.anchor.is_some() {
+        format!("({offset} newer lines below: G follows) ")
     } else {
         String::new()
     };

@@ -154,6 +154,17 @@ impl LogBuffer {
         }
     }
 
+    /// How many kept lines at `min` or more severe were pushed after the line
+    /// numbered `seq`. A `seq` older than every kept line counts them all.
+    #[must_use]
+    pub fn newer(&self, min: Level, seq: u64) -> usize {
+        self.lock()
+            .lines
+            .iter()
+            .filter(|line| line.level <= min && line.seq > seq)
+            .count()
+    }
+
     /// The newest line at `min` or more severe.
     #[must_use]
     pub fn latest(&self, min: Level) -> Option<LogLine> {
@@ -279,6 +290,23 @@ mod tests {
         assert_eq!(
             buffer.latest(Level::WARN).map(|line| line.message),
             Some("e2".to_string())
+        );
+    }
+
+    #[test]
+    fn newer_counts_matching_lines_after_a_sequence_number() {
+        let buffer = LogBuffer::new(3);
+        buffer.push(line(Level::INFO, "i1"));
+        buffer.push(line(Level::DEBUG, "d1"));
+        buffer.push(line(Level::INFO, "i2"));
+        buffer.push(line(Level::INFO, "i3"));
+        assert_eq!(buffer.newer(Level::INFO, 2), 2);
+        assert_eq!(buffer.newer(Level::TRACE, 2), 2);
+        assert_eq!(buffer.newer(Level::INFO, 4), 0);
+        assert_eq!(
+            buffer.newer(Level::TRACE, 1),
+            3,
+            "the dropped line counts all"
         );
     }
 
