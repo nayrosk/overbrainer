@@ -169,6 +169,9 @@ async fn record_started<E: Executor>(
     Err(error.into())
 }
 
+/// Prepares and uploads the run, excluding its local SSH keys and `pod.json`,
+/// then starts the trainer through the selected runtime. Secrets are passed to
+/// the job separately from the uploaded run directory.
 async fn launch_job<E: Executor, T: Trainer>(
     ctx: &RunCtx<'_, E>,
     trainer: &T,

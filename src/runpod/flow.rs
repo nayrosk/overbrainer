@@ -91,6 +91,9 @@ fn run_message(error: &PodError) -> String {
     }
 }
 
+/// Generates the run's SSH keys, saves its initial `pod.json`, then provisions
+/// a reachable pod. The record exists before the first create request, so every
+/// attempt can be tracked even when Runpod's answer is ambiguous.
 async fn provision_run(
     ctx: &PodCtx<'_>,
     target: &RunpodTarget,

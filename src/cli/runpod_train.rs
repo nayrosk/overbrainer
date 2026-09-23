@@ -42,6 +42,13 @@ struct Session {
 }
 
 impl Session {
+    /// Opens the API client and run store, then starts the session's Ctrl-C
+    /// watcher and event renderer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Runpod API key cannot be resolved, the client
+    /// cannot be built, or the Ctrl-C handler cannot be installed.
     async fn open(project_dir: &Path, settings: &Settings) -> anyhow::Result<Self> {
         let client = super::pod::client(settings).await?;
         // Registered now, so a Ctrl-C from here on is seen by provisioning.

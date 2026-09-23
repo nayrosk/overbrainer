@@ -164,6 +164,9 @@ struct Known<'a> {
 }
 
 impl<'a> Known<'a> {
+    /// Loads the project's run records and their readable pod records once.
+    /// An unreadable `pod.json` is warned about and omitted so account pods can
+    /// still be listed and classified from the remaining evidence.
     fn load(runs: &'a Runs) -> Result<Self, PodError> {
         let run_records: HashMap<String, RunRecord> = runs
             .list()?
