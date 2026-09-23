@@ -438,6 +438,7 @@ fn fast() -> Timing {
         preflight_timeout: Duration::from_secs(5),
         reconcile_waits: [Duration::from_millis(5), Duration::from_millis(5)],
         delete_timeout: Duration::from_secs(5),
+        gone_interval: Duration::from_millis(5),
     }
 }
 
@@ -540,6 +541,96 @@ async fn a_retrieved_run_marks_its_pod_then_deletes_it_unless_kept() -> TestResu
         }
         assert_eq!(PodRecord::load(&runs, &run.id)?, Some(pod));
     }
+    Ok(())
+}
+
+/// `DELETE /pods/p1` that first looks, over its own ssh connection, whether the
+/// retrieved marker is already on the test sshd.
+struct DeleteAfterMarker {
+    deleted: Arc<AtomicBool>,
+    marked: Arc<AtomicBool>,
+    config: PathBuf,
+    alias: String,
+    marker: String,
+}
+
+impl Respond for DeleteAfterMarker {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let seen = std::process::Command::new("ssh")
+            .arg("-F")
+            .arg(&self.config)
+            .arg(&self.alias)
+            .arg(format!("test -f '{}'", self.marker))
+            .status()
+            .is_ok_and(|status| status.success());
+        self.marked.store(seen, Ordering::SeqCst);
+        self.deleted.store(true, Ordering::SeqCst);
+        ResponseTemplate::new(204)
+    }
+}
+
+#[tokio::test]
+async fn the_retrieved_marker_is_on_the_pod_before_its_delete() -> TestResult {
+    let Some(sshd) = sshd()? else {
+        skip();
+        return Ok(());
+    };
+    let project = tempfile::tempdir()?;
+    let runs = Runs::new(project.path());
+    let (run, mut pod, executor) = started_run(&sshd, &runs, false).await?;
+    let dir = tempfile::tempdir()?;
+    let probe = format!("{}-probe", alias(&run.id));
+    let config = write_config(
+        dir.path(),
+        &probe,
+        &sshd.endpoint,
+        &keys(&sshd, &sshd.host_public),
+    )?;
+    let server = MockServer::start().await;
+    let deleted = Arc::new(AtomicBool::new(false));
+    let marked = Arc::new(AtomicBool::new(false));
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Get {
+            deleted: Arc::clone(&deleted),
+            body: json!({"id": "p1", "status": "RUNNING", "cost": 0.25}),
+            looks: AtomicUsize::new(0),
+            dies_after: None,
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(DeleteAfterMarker {
+            deleted,
+            marked: Arc::clone(&marked),
+            config,
+            alias: probe,
+            marker: format!("{}/.pod/retrieved", run.remote_dir),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": []})))
+        .mount(&server)
+        .await;
+    let client = client(&server)?;
+    let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
+    let ctx = PodCtx {
+        client: &client,
+        runs: &runs,
+        bus: &bus,
+        timing: &timing,
+        interrupted: &interrupted,
+    };
+    let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
+    assert_eq!(ending, Ending::Deleted);
+    assert!(
+        marked.load(Ordering::SeqCst),
+        "the pod was deleted before its retrieved marker was written"
+    );
     Ok(())
 }
 
@@ -646,6 +737,19 @@ async fn attach_reconnects_through_a_fresh_endpoint() -> TestResult {
     let ssh_dir = runs.run_dir(&run.id)?.join("ssh");
     fs::create_dir_all(&ssh_dir)?;
     fs::copy(&sshd.identity, ssh_dir.join("id_ed25519"))?;
+    // The endpoint seen last is stale: the pod was reset and its port changed.
+    let stale = SshEndpoint {
+        port: sshd.endpoint.port.wrapping_add(1),
+        ..sshd.endpoint.clone()
+    };
+    write_config(
+        &ssh_dir,
+        &alias(&run.id),
+        &stale,
+        &keys(&sshd, &sshd.host_public),
+    )?;
+    pod.ssh = Some(stale);
+    pod.save(&runs)?;
     let server = stub(&sshd, &run.id, None).await;
     let client = client(&server)?;
     let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
@@ -658,9 +762,12 @@ async fn attach_reconnects_through_a_fresh_endpoint() -> TestResult {
     };
     let executor = reconnect(&ctx, &mut pod, &run).await?.ok_or("no pod")?;
     assert_eq!(format!("{}/{}", executor.workdir(), run.id), run.remote_dir);
-    assert_eq!(
-        pod.ssh.as_ref().map(|ssh| ssh.port),
-        Some(sshd.endpoint.port)
+    assert_eq!(pod.ssh.as_ref(), Some(&sshd.endpoint));
+    assert_eq!(PodRecord::load(&runs, &run.id)?, Some(pod));
+    let config = fs::read_to_string(ssh_dir.join("config"))?;
+    assert!(
+        config.contains(&format!("Port {}", sshd.endpoint.port)),
+        "{config}"
     );
     Ok(())
 }

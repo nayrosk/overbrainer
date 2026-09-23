@@ -7,15 +7,15 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use overbrainer::events::EventBus;
 use overbrainer::exec::{Executor, JobCommand, LocalExecutor};
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
-    AttemptResult, PodCtx, PodError, PodRecord, PodState, RunpodClient, RunpodTarget, Timing,
-    follow, start_pod,
+    AttemptResult, DeletedBy, PodCtx, PodError, PodRecord, PodState, RunpodClient, RunpodTarget,
+    Timing, follow, reconnect, start_pod,
 };
 use overbrainer::runs::{RunCtx, RunRecord, RunState, Runs, create};
 use overbrainer::train::{Artifacts, TrainError, Trainer};
@@ -112,6 +112,7 @@ impl Harness {
                 preflight_timeout: Duration::from_millis(200),
                 reconcile_waits: [Duration::from_millis(5), Duration::from_millis(5)],
                 delete_timeout: Duration::from_millis(300),
+                gone_interval: Duration::from_millis(5),
             },
             interrupted: AtomicBool::new(false),
             client,
@@ -248,6 +249,74 @@ async fn deletes(server: &MockServer) -> usize {
         .count()
 }
 
+/// How many looks at pod `p1` the stub received.
+async fn gets(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.method.as_str() == "GET" && request.url.path() == "/v2/pods/p1")
+        .count()
+}
+
+/// `GET /pods/p1` answering in turn from `present` (the last answer repeats):
+/// the pod when true, Runpod's 404 when false.
+struct Sequence {
+    present: Vec<bool>,
+    looks: AtomicUsize,
+}
+
+impl Respond for Sequence {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let look = self.looks.fetch_add(1, Ordering::SeqCst);
+        let present = self
+            .present
+            .get(look)
+            .or(self.present.last())
+            .copied()
+            .unwrap_or(false);
+        if present {
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": "p1", "status": "RUNNING", "cost": 0.5}))
+        } else {
+            ResponseTemplate::new(404).set_body_json(json!({
+                "detail": "pod not found",
+                "status": 404,
+                "title": "Not Found"
+            }))
+        }
+    }
+}
+
+/// Serves pod `p1` answering from `present` (see [`Sequence`]), listed by
+/// `GET /pods` when `listed`, and accepting deletes (which the tests count).
+async fn serve_sequence(server: &MockServer, present: Vec<bool>, listed: bool) {
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Sequence {
+            present,
+            looks: AtomicUsize::new(0),
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(server)
+        .await;
+    let pods = if listed {
+        json!({"pods": [{"id": "p1", "status": "RUNNING"}]})
+    } else {
+        json!({"pods": []})
+    };
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pods))
+        .mount(server)
+        .await;
+}
+
 /// A pod record for pod `p1`, created now, whose deadline passed `ago` ago.
 fn pod_record(
     run_id: &str,
@@ -333,8 +402,10 @@ async fn a_watch_that_loses_a_deleted_pod_fails_the_run() -> TestResult {
     let saved = harness.runs.load(&run.id)?;
     assert_eq!(saved.state, RunState::Failed);
     assert_eq!(saved.message.as_deref(), Some("pod p1 no longer exists"));
-    // A pod the API no longer shows is still sent its delete, to confirm it.
-    assert_eq!(deletes(&harness.server).await, 1);
+    assert_eq!(pod.deleted_by, Some(DeletedBy::Unknown));
+    // A pod that only looks gone is never sent a delete, kept or not.
+    assert_eq!(deletes(&harness.server).await, 0);
+    assert_eq!(gets(&harness.server).await, 3);
 
     let alive = Harness::new().await?;
     serve_p1(&alive.server, false).await;
@@ -350,5 +421,140 @@ async fn a_watch_that_loses_a_deleted_pod_fails_the_run() -> TestResult {
     assert!(matches!(result, Err(PodError::Run(_))), "{result:?}");
     assert_eq!(alive.runs.load(&run.id)?.state, RunState::Running);
     assert_eq!(deletes(&alive.server).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pod_that_only_looks_gone_once_is_not_gone() -> TestResult {
+    let executor = LocalExecutor::new(&tempfile::tempdir()?.path().join("pod"))?;
+    // A 404 then the pod; 404s only, but the pod is still listed.
+    for (present, listed) in [(vec![false, true], false), (vec![false], true)] {
+        let harness = Harness::new().await?;
+        serve_sequence(&harness.server, present, listed).await;
+        let run = broken_run(&harness.runs)?;
+        let mut pod = pod_record(&run.id, false, Duration::ZERO)?;
+        pod.save(&harness.runs)?;
+        let run_ctx = RunCtx {
+            runs: &harness.runs,
+            executor: &executor,
+            bus: &harness.bus,
+            poll: Duration::from_millis(5),
+        };
+        let result = follow(&harness.ctx(), &run_ctx, &Nothing, run.clone(), &mut pod).await;
+        assert!(matches!(result, Err(PodError::Run(_))), "{result:?}");
+        assert_eq!(pod.state, PodState::Provisioning);
+        assert_eq!(
+            PodRecord::load(&harness.runs, &run.id)?.map(|saved| saved.state),
+            Some(PodState::Provisioning)
+        );
+        assert_eq!(harness.runs.load(&run.id)?.state, RunState::Running);
+        assert_eq!(deletes(&harness.server).await, 0);
+    }
+
+    let harness = Harness::new().await?;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Sequence {
+            present: vec![false],
+            looks: AtomicUsize::new(0),
+        })
+        .mount(&harness.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&harness.server)
+        .await;
+    let run = broken_run(&harness.runs)?;
+    let mut pod = pod_record(&run.id, false, Duration::ZERO)?;
+    pod.save(&harness.runs)?;
+    let run_ctx = RunCtx {
+        runs: &harness.runs,
+        executor: &executor,
+        bus: &harness.bus,
+        poll: Duration::from_millis(5),
+    };
+    let result = follow(&harness.ctx(), &run_ctx, &Nothing, run.clone(), &mut pod).await;
+    assert!(matches!(result, Err(PodError::Run(_))), "{result:?}");
+    assert_eq!(
+        PodRecord::load(&harness.runs, &run.id)?.map(|saved| saved.state),
+        Some(PodState::Provisioning)
+    );
+    assert_eq!(deletes(&harness.server).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconnect_records_a_pod_confirmed_gone_without_deleting_it() -> TestResult {
+    let harness = Harness::new().await?;
+    serve_sequence(&harness.server, vec![false], false).await;
+    let run = broken_run(&harness.runs)?;
+    let mut pod = pod_record(&run.id, true, Duration::ZERO)?;
+    let key = harness.runs.run_dir(&run.id)?.join("ssh/id_ed25519");
+    std::fs::create_dir_all(key.parent().ok_or("no ssh dir")?)?;
+    std::fs::write(&key, "private")?;
+    let executor = reconnect(&harness.ctx(), &mut pod, &run).await?;
+    assert!(executor.is_none());
+    assert_eq!(pod.state, PodState::Deleted);
+    assert_eq!(pod.deleted_by, Some(DeletedBy::Unknown));
+    assert_eq!(PodRecord::load(&harness.runs, &run.id)?, Some(pod));
+    assert!(!key.exists());
+    assert_eq!(deletes(&harness.server).await, 0);
+    assert_eq!(gets(&harness.server).await, 3);
+
+    // A single 404, then the pod (without an SSH endpoint): not gone.
+    let flaky = Harness::new().await?;
+    serve_sequence(&flaky.server, vec![false, true], false).await;
+    let run = broken_run(&flaky.runs)?;
+    let mut pod = pod_record(&run.id, true, Duration::ZERO)?;
+    let result = reconnect(&flaky.ctx(), &mut pod, &run).await;
+    assert!(
+        matches!(result, Err(PodError::NoEndpoint(..))),
+        "{result:?}"
+    );
+    assert_eq!(pod.state, PodState::Provisioning);
+    assert_eq!(deletes(&flaky.server).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_kept_pod_past_a_deadline_is_never_deleted() -> TestResult {
+    let harness = Harness::new().await?;
+    serve_p1(&harness.server, false).await;
+    let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
+    let mut run = create(&harness.runs, executor.workdir(), "gpu_cloud")?;
+    let job = executor
+        .spawn(&JobCommand {
+            dir: run.remote_dir.clone(),
+            script: r#"sleep 1; printf '{"event": "log", "time": 1, "step": 1, "epoch": 1, "max_steps": 1, "loss": 1.5, "learning_rate": 0.0002}\n' >> metrics.jsonl"#.into(),
+            secrets: Vec::new(),
+            container: None,
+        })
+        .await?;
+    run.job = Some(job);
+    run.state = RunState::Running;
+    harness.runs.save(&run)?;
+    let mut pod = pod_record(&run.id, true, Duration::ZERO)?;
+    // Whatever the record says, a kept pod has no deadline.
+    let past = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs()
+        .saturating_sub(3600);
+    pod.deadline_unix = Some(past);
+    let run_ctx = RunCtx {
+        runs: &harness.runs,
+        executor: &executor,
+        bus: &harness.bus,
+        poll: Duration::from_millis(50),
+    };
+    let outcome = follow(&harness.ctx(), &run_ctx, &Nothing, run.clone(), &mut pod).await?;
+    assert_eq!(
+        outcome.record.state,
+        RunState::Succeeded,
+        "{:?}",
+        outcome.record.message
+    );
+    assert_ne!(pod.state, PodState::Deleted);
+    assert_eq!(deletes(&harness.server).await, 0);
     Ok(())
 }

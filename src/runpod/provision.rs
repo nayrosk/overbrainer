@@ -48,12 +48,16 @@ pub struct Timing {
     pub reconcile_waits: [Duration; 2],
     /// Longest wait for a deleted pod to disappear from the API.
     pub delete_timeout: Duration,
+    /// Time between two looks at a pod that looks gone, before it is declared
+    /// gone (see `runpod::follow` and `runpod::reconnect`).
+    pub gone_interval: Duration,
 }
 
 impl Timing {
     /// Production timing: a look every 5 s, 15 min to become reachable (an 8.5 GB
     /// image took about 3.5 min to pull), 3 min for the verdict, reconciliation
-    /// after 5 s and 15 s, 60 s for a delete to show.
+    /// after 5 s and 15 s, 60 s for a delete to show, 10 s between two looks at a
+    /// pod that looks gone.
     #[must_use]
     pub fn standard() -> Self {
         Self {
@@ -62,6 +66,7 @@ impl Timing {
             preflight_timeout: Duration::from_secs(3 * 60),
             reconcile_waits: [Duration::from_secs(5), Duration::from_secs(15)],
             delete_timeout: Duration::from_secs(60),
+            gone_interval: Duration::from_secs(10),
         }
     }
 }

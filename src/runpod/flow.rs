@@ -15,9 +15,9 @@ use crate::train::Trainer;
 
 use super::provision::note_strays;
 use super::{
-    CLIENT_KEY, DeleteReason, DeletedBy, PodCtx, PodError, PodId, PodKeys, PodPlan, PodRecord,
+    CLIENT_KEY, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId, PodKeys, PodPlan, PodRecord,
     PodState, PodStatus, Provisioned, RunpodTarget, SSH_DIR, SshEndpoint, alias, provision, remove,
-    sweep, wait_gone, write_config,
+    sweep, write_config,
 };
 
 /// How long after the watchdog's deadline the client deletes the pod itself, when
@@ -27,6 +27,9 @@ pub const DEADLINE_MARGIN: Duration = Duration::from_secs(5 * 60);
 /// Where the watchdog looks for the client's "retrieved" marker, in a run
 /// directory on the pod.
 pub const RETRIEVED_MARKER: &str = ".pod/retrieved";
+
+/// Looks in a row that must answer Runpod's 404 before a pod is declared gone.
+const GONE_LOOKS: u32 = 3;
 
 /// Creates the pod of the new run `run` (from `runs::create`) and waits until it is
 /// ready: keys in `runs/<id>/ssh/`, then `pod.json`, then provisioning. When that
@@ -182,8 +185,8 @@ async fn unreachable(
     }
 }
 
-/// Whether the run's pod no longer exists; if so, its deletion is confirmed (see
-/// [`confirm_gone`]) and `pod.json` records it.
+/// Whether the run's pod no longer exists; if so, `pod.json` records it deleted
+/// by [`DeletedBy::Unknown`]. Nothing is ever deleted here: see [`look_again`].
 async fn gone(ctx: &PodCtx<'_>, pod: &mut PodRecord) -> Result<bool, PodError> {
     let Some(id) = pod.pod_id.clone() else {
         return Ok(true);
@@ -191,30 +194,35 @@ async fn gone(ctx: &PodCtx<'_>, pod: &mut PodRecord) -> Result<bool, PodError> {
     if pod.state == PodState::Deleted {
         return Ok(true);
     }
-    if ctx.client.get_pod(&id).await?.is_some() {
+    if ctx.client.get_pod(&id).await?.is_some() || look_again(ctx, &id).await?.is_some() {
         return Ok(false);
     }
-    confirm_gone(ctx, pod, id).await?;
+    mark_gone(ctx, pod, id, DeletedBy::Unknown)?;
     Ok(true)
 }
 
-/// The API no longer shows the pod `id`: its delete is still sent, since a
-/// one-off 404 must never pass a live pod for deleted, and its absence awaited
-/// before `pod.json` records it deleted. Until then `pod.json` keeps the pod, as
-/// `Deleting`.
-async fn confirm_gone(ctx: &PodCtx<'_>, pod: &mut PodRecord, id: PodId) -> Result<(), PodError> {
-    pod.state = PodState::Deleting;
-    let saved = pod.save(ctx.runs);
-    let found = ctx.client.delete_pod(&id).await?;
-    wait_gone(ctx, &id).await?;
-    saved?;
-    let by = if found {
-        tracing::warn!("pod {id} was reported gone but still existed: it was deleted");
-        DeletedBy::Client
-    } else {
-        DeletedBy::Unknown
-    };
-    mark_gone(ctx, pod, id, by)
+/// Looks again at the pod `id`, whose first look just answered Runpod's 404:
+/// `None` when it is really gone, that is [`GONE_LOOKS`] looks in a row answer
+/// that 404, [`Timing::gone_interval`] apart, and the pod list no longer shows
+/// it; otherwise the pod as last seen. A pod that only looks gone may be kept,
+/// or hold results not yet retrieved, so it is never deleted: any answer showing
+/// the pod means it is not gone, and any error leaves it undetermined (the error
+/// is returned and nothing is recorded).
+///
+/// [`Timing::gone_interval`]: super::Timing::gone_interval
+async fn look_again(ctx: &PodCtx<'_>, id: &PodId) -> Result<Option<Pod>, PodError> {
+    for _ in 1..GONE_LOOKS {
+        tokio::time::sleep(ctx.timing.gone_interval).await;
+        if let Some(pod) = ctx.client.get_pod(id).await? {
+            return Ok(Some(pod));
+        }
+    }
+    Ok(ctx
+        .client
+        .list_pods()
+        .await?
+        .into_iter()
+        .find(|listed| listed.id == *id))
 }
 
 /// Records the pod `id` as deleted by `by`.
@@ -364,8 +372,8 @@ pub fn forget_client_key(runs: &Runs, run_id: &str) {
 
 /// Connects again to the pod of the run `run`, for `train attach` and `train
 /// cancel`: looks it up (its public port may have changed), rewrites the run's ssh
-/// config and connects. `None` when the pod no longer exists, which `pod.json`
-/// then records once its deletion is confirmed.
+/// config and connects. `None` when the pod no longer exists (confirmed by
+/// repeated looks, never by a delete), which `pod.json` then records.
 ///
 /// # Errors
 ///
@@ -383,8 +391,13 @@ pub async fn reconnect(
     if pod.state == PodState::Deleted {
         return Ok(None);
     }
-    let Some(remote) = ctx.client.get_pod(&id).await? else {
-        confirm_gone(ctx, pod, id).await?;
+    let first = ctx.client.get_pod(&id).await?;
+    let seen = match first {
+        Some(remote) => Some(remote),
+        None => look_again(ctx, &id).await?,
+    };
+    let Some(remote) = seen else {
+        mark_gone(ctx, pod, id, DeletedBy::Unknown)?;
         return Ok(None);
     };
     let direct = remote

@@ -175,6 +175,7 @@ impl Harness {
                 preflight_timeout: Duration::from_millis(300),
                 reconcile_waits: [Duration::from_millis(5), Duration::from_millis(5)],
                 delete_timeout: Duration::from_millis(300),
+                gone_interval: Duration::from_millis(5),
             },
             interrupted: Arc::new(AtomicBool::new(false)),
             keys: PodKeys::new(
