@@ -31,7 +31,9 @@ pub use keys::{
     CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,
     write_known_hosts,
 };
-pub use orphans::{PodRow, Removed, orphan_warnings, pod_rows, remove_run_pods, table};
+pub use orphans::{
+    PodRow, Removal, Removed, RowKind, orphan_warnings, pod_rows, remove_run_pods, table,
+};
 pub use provision::{
     PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, sweep, wait_gone,
 };
@@ -127,11 +129,23 @@ pub enum PodError {
     /// The run's pod no longer exists.
     #[error("pod {0} no longer exists")]
     PodGone(PodId),
-    /// `pod rm` of a run whose job still runs, without `--force`.
+    /// `pod rm` of a run in progress (preparing or running), without `--force`:
+    /// its training pod was kept, and only its other pods were deleted.
     #[error(
-        "run {0} is still running; stop it with `overbrainer train cancel {0}` first, or pass --force"
+        "run {run_id} is still running{kept}; stop it with `overbrainer train cancel {run_id}` first, or pass --force"
     )]
-    RunStillRunning(String),
+    RunStillRunning {
+        /// The run.
+        run_id: String,
+        /// What was kept and deleted, starting with `: `, or empty.
+        kept: String,
+    },
+    /// `pod rm` of a run absent from this project's `runs/`, without `--force`:
+    /// its pods may belong to another checkout.
+    #[error(
+        "run {0} is not in this project's runs/: its pods may belong to another checkout; if none owns it, pass --force"
+    )]
+    NotInRuns(String),
     /// The pod exists but offers no SSH endpoint.
     #[error("pod {0} has no SSH endpoint (status {1}); try again once it runs")]
     NoEndpoint(PodId, String),

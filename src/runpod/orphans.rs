@@ -1,11 +1,12 @@
 //! `overbrainer pod ls` and `pod rm`, and the orphan warning of `train`: the pods
 //! of the account that overbrainer created, matched with `runs/`.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use crate::runs::{RunState, Runs, RunsError};
+use crate::runs::{RECORD_FILE, RunRecord, RunState, Runs, RunsError};
 
-use super::flow::{look_up, mark_gone};
+use super::flow::{Look, look_up_all, mark_gone};
 use super::provision::delete_confirmed;
 use super::{
     DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId, PodRecord, PodState, forget_client_key,
@@ -18,6 +19,36 @@ const CELL_CHARS: usize = 64;
 /// The note of a stray pod: another pod of a run, left by an ambiguous create,
 /// whose delete could not be confirmed (`stray_pods` in `pod.json`).
 const STRAY: &str = "stray, not deleted";
+
+/// The note of a pod named like overbrainer's without a usable run marker.
+const NO_MARKER: &str = "no run marker";
+
+/// The message of a forced `pod rm` that deleted the pod of a run in progress.
+const FAILED_BY_POD_RM: &str = "pod deleted by `pod rm` before its results were retrieved";
+
+/// What overbrainer knows of a pod of `pod ls`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// Its run is preparing or running.
+    InProgress,
+    /// Its run has ended, and the pod is still there.
+    Ended,
+    /// Kept with `--keep-pod`: only `pod rm` deletes it.
+    Kept,
+    /// Its results were not retrieved; its watchdog deletes it later.
+    AwaitingRetrieval,
+    /// One of its run's `stray_pods`.
+    Stray,
+    /// Its run is not in this project's `runs/`: it may belong to another
+    /// checkout.
+    NotInRuns,
+    /// Its run directory is here, but its run record cannot be read.
+    Unreadable,
+    /// Named like overbrainer's pods, but without a usable run marker.
+    NoMarker,
+    /// Recorded in `runs/`, and confirmed gone.
+    Gone,
+}
 
 /// A row of `overbrainer pod ls`.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,192 +66,279 @@ pub struct PodRow {
     pub rate: Option<f64>,
     /// When it was created.
     pub created: String,
-    /// What overbrainer knows of it (see [`pod_rows`]).
+    /// What overbrainer knows of it, in words (see [`pod_rows`]).
     pub note: String,
+    /// The same, for code.
+    pub kind: RowKind,
 }
 
 impl PodRow {
-    /// Whether nothing will delete this pod on its own: its run is unknown or has
-    /// ended, or it is a stray, and it is neither kept nor waiting for its results
-    /// to be retrieved.
+    /// Whether nothing will delete this pod on its own: its run has ended, it is
+    /// a stray, its run is not in this project, or it has no run marker. A kept
+    /// pod, or one waiting for its results to be retrieved, is not.
     #[must_use]
     pub fn is_orphan(&self) -> bool {
-        self.note == "not in runs/" || self.note.ends_with(", not deleted")
+        matches!(
+            self.kind,
+            RowKind::Ended | RowKind::Stray | RowKind::NotInRuns | RowKind::NoMarker
+        )
     }
 }
 
 /// Every pod of the account whose run marker is set or whose name starts with
 /// `overbrainer-`, plus every pod recorded in `runs/` (the run's pod and its
-/// `stray_pods`) that the list does not show. Such a pod is looked up again and
-/// declared gone only after three 404s in a row and a list without it (never by
-/// a delete): the run's pod is then recorded `deleted` in `pod.json`, and a stray
-/// is dropped from `stray_pods`. The note of a row says `run <state>` for a run
-/// in progress, `run <state>, not deleted` for an ended run, `kept`, `awaiting
-/// retrieval`, `stray, not deleted`, `not in runs/` for a marker without a local
-/// run, or `gone`.
+/// `stray_pods`) that the list does not show. Those are looked up together
+/// (see `look_up_all`) and declared gone only after three 404s in a row and a
+/// list without them (never by a delete): the run's pod is then recorded
+/// `deleted` in `pod.json`, and a stray is dropped from `stray_pods`. A
+/// `pod.json` that cannot be read is skipped with a warning.
+///
+/// The note of a row says `run <state>` for a run in progress, `run <state>, not
+/// deleted` for an ended run, `kept`, `awaiting retrieval`, `stray, not deleted`,
+/// `no run marker`, `run record unreadable`, `gone`, or, for a run not in this
+/// project's `runs/`, how to remove it if no other checkout owns it.
 ///
 /// # Errors
 ///
 /// Returns a [`PodError`] when the API or `runs/` cannot be read.
 pub async fn pod_rows(ctx: &PodCtx<'_>) -> Result<Vec<PodRow>, PodError> {
     let pods = ctx.client.list_pods().await?;
-    let mut records = Vec::new();
-    for run in ctx.runs.list()? {
-        if let Some(record) = PodRecord::load(ctx.runs, &run.id)? {
-            records.push(record);
+    let known = Known::load(ctx.runs)?;
+    let mut rows: Vec<PodRow> = pods
+        .iter()
+        .filter(|pod| pod.run_id().is_some() || pod.name.starts_with("overbrainer-"))
+        .map(|pod| known.row(pod.run_id(), pod))
+        .collect();
+    let unlisted = known.unlisted(&pods);
+    let ids: Vec<PodId> = unlisted.iter().map(|entry| entry.id.clone()).collect();
+    let looks = look_up_all(ctx, &ids).await;
+    for (entry, look) in unlisted.iter().zip(looks) {
+        if let Some(row) = settle(ctx, &known, entry, look)? {
+            rows.push(row);
         }
-    }
-    let mut rows = Vec::new();
-    for pod in &pods {
-        if pod.run_id().is_some() || pod.name.starts_with("overbrainer-") {
-            let stray = records
-                .iter()
-                .any(|record| record.stray_pods.contains(&pod.id));
-            let run = pod.run_id().unwrap_or("-");
-            rows.push(row(ctx.runs, run, pod, stray)?);
-        }
-    }
-    for record in &mut records {
-        unlisted_pod(ctx, record, &pods, &mut rows).await?;
-        unlisted_strays(ctx, record, &pods, &mut rows).await?;
     }
     rows.sort_by(|a, b| (&a.run, &a.pod_id).cmp(&(&b.run, &b.pod_id)));
     Ok(rows)
 }
 
-/// The row of the run's recorded pod when the list does not show it: the pod as
-/// a look finds it, or `GONE` once confirmed gone (then recorded so).
-async fn unlisted_pod(
-    ctx: &PodCtx<'_>,
-    record: &mut PodRecord,
-    pods: &[Pod],
-    rows: &mut Vec<PodRow>,
-) -> Result<(), PodError> {
-    let Some(id) = record.pod_id.clone() else {
-        return Ok(());
-    };
-    if record.state == PodState::Deleted || pods.iter().any(|pod| pod.id == id) {
-        return Ok(());
-    }
-    let run_id = record.run_id.clone();
-    match look_up(ctx, &id).await {
-        Ok(Some(pod)) => rows.push(row(ctx.runs, &run_id, &pod, false)?),
-        Ok(None) => {
-            mark_gone(ctx, record, id.clone(), DeletedBy::Unknown)?;
-            rows.push(recorded_row(record, &id, "GONE", "gone".to_string()));
-        },
-        Err(error) => {
-            tracing::warn!("cannot look up pod {id} of run {run_id}: {error}");
-            let note = note(ctx.runs, &run_id, false)?;
-            rows.push(recorded_row(record, &id, "UNCHECKED", note));
-        },
-    }
-    Ok(())
-}
-
-/// The rows of the run's stray pods the list does not show. A stray confirmed
-/// gone is dropped from `stray_pods` instead.
-async fn unlisted_strays(
-    ctx: &PodCtx<'_>,
-    record: &mut PodRecord,
-    pods: &[Pod],
-    rows: &mut Vec<PodRow>,
-) -> Result<(), PodError> {
-    let unlisted: Vec<PodId> = record
-        .stray_pods
-        .iter()
-        .filter(|id| pods.iter().all(|pod| pod.id != **id))
-        .cloned()
-        .collect();
-    for id in unlisted {
-        unlisted_stray(ctx, record, id, rows).await?;
-    }
-    Ok(())
-}
-
-/// The row of the stray pod `id` of `record`, or nothing once it is confirmed
-/// gone and dropped from `stray_pods`.
-async fn unlisted_stray(
-    ctx: &PodCtx<'_>,
-    record: &mut PodRecord,
+/// A recorded pod the list does not show.
+struct Unlisted {
+    run_id: String,
     id: PodId,
-    rows: &mut Vec<PodRow>,
-) -> Result<(), PodError> {
-    let run_id = record.run_id.clone();
-    match look_up(ctx, &id).await {
-        Ok(Some(pod)) => rows.push(row(ctx.runs, &run_id, &pod, true)?),
-        Ok(None) => forget_stray(ctx.runs, record, &id)?,
-        Err(error) => {
-            tracing::warn!("cannot look up stray pod {id} of run {run_id}: {error}");
-            let mut unchecked = recorded_row(record, &id, "UNCHECKED", STRAY.to_string());
-            unchecked.gpu = "-".to_string();
-            unchecked.created = String::new();
-            rows.push(unchecked);
+    stray: bool,
+}
+
+/// What `runs/` holds, read once.
+struct Known<'a> {
+    runs: &'a Runs,
+    run_records: HashMap<String, RunRecord>,
+    pod_records: HashMap<String, PodRecord>,
+}
+
+impl<'a> Known<'a> {
+    fn load(runs: &'a Runs) -> Result<Self, PodError> {
+        let run_records: HashMap<String, RunRecord> = runs
+            .list()?
+            .into_iter()
+            .map(|run| (run.id.clone(), run))
+            .collect();
+        let mut pod_records = HashMap::new();
+        for id in run_records.keys() {
+            match PodRecord::load(runs, id) {
+                Ok(Some(record)) => {
+                    pod_records.insert(id.clone(), record);
+                },
+                Ok(None) => {},
+                Err(error) => {
+                    tracing::warn!("skipping the unreadable pod record of run {id}: {error}");
+                },
+            }
+        }
+        Ok(Self {
+            runs,
+            run_records,
+            pod_records,
+        })
+    }
+
+    /// The recorded pods, and strays, that `pods` does not show.
+    fn unlisted(&self, pods: &[Pod]) -> Vec<Unlisted> {
+        let listed = |id: &PodId| pods.iter().any(|pod| pod.id == *id);
+        let mut unlisted = Vec::new();
+        for (run_id, record) in &self.pod_records {
+            if let Some(id) = &record.pod_id
+                && record.state != PodState::Deleted
+                && !listed(id)
+            {
+                unlisted.push(Unlisted {
+                    run_id: run_id.clone(),
+                    id: id.clone(),
+                    stray: false,
+                });
+            }
+            for id in &record.stray_pods {
+                if !listed(id) && record.pod_id.as_ref() != Some(id) {
+                    unlisted.push(Unlisted {
+                        run_id: run_id.clone(),
+                        id: id.clone(),
+                        stray: true,
+                    });
+                }
+            }
+        }
+        unlisted
+    }
+
+    fn is_stray(&self, id: &PodId) -> bool {
+        self.pod_records
+            .values()
+            .any(|record| record.stray_pods.contains(id))
+    }
+
+    /// What `runs/` says about the pod `id` of the run `run`.
+    fn classify(&self, run: Option<&str>, id: &PodId) -> (RowKind, String) {
+        let Some((run, dir)) = run.and_then(|run| Some((run, self.runs.run_dir(run).ok()?))) else {
+            return (RowKind::NoMarker, NO_MARKER.to_string());
+        };
+        let Some(record) = self.run_records.get(run) else {
+            if dir.join(RECORD_FILE).exists() {
+                return (RowKind::Unreadable, "run record unreadable".to_string());
+            }
+            return (
+                RowKind::NotInRuns,
+                format!(
+                    "not in this project's runs/; if no other checkout owns it, `overbrainer pod rm {run} --force`"
+                ),
+            );
+        };
+        if self.is_stray(id) {
+            return (RowKind::Stray, STRAY.to_string());
+        }
+        match (self.pod_records.get(run).map(|pod| pod.state), record.state) {
+            (Some(PodState::Kept), _) => (RowKind::Kept, "kept".to_string()),
+            (Some(PodState::AwaitingRetrieval), _) => {
+                (RowKind::AwaitingRetrieval, "awaiting retrieval".to_string())
+            },
+            (_, state @ (RunState::Preparing | RunState::Running)) => {
+                (RowKind::InProgress, format!("run {}", state.name()))
+            },
+            (_, ended) => (RowKind::Ended, format!("run {}, not deleted", ended.name())),
+        }
+    }
+
+    /// The row of `pod`, a pod of the run `run`.
+    fn row(&self, run: Option<&str>, pod: &Pod) -> PodRow {
+        let (kind, note) = self.classify(run, &pod.id);
+        PodRow {
+            run: cell(run.unwrap_or("-")),
+            pod_id: pod.id.to_string(),
+            status: pod.status.name().to_string(),
+            gpu: cell(pod.gpu_type().unwrap_or("-")),
+            rate: pod.cost,
+            created: cell(pod.created_at.as_deref().unwrap_or_default()),
+            note,
+            kind,
+        }
+    }
+
+    /// The row of the recorded pod `entry`, from what `pod.json` says.
+    fn recorded_row(&self, entry: &Unlisted, status: &str, kind: RowKind, note: String) -> PodRow {
+        let record = self.pod_records.get(&entry.run_id).filter(|_| !entry.stray);
+        PodRow {
+            run: cell(&entry.run_id),
+            pod_id: entry.id.to_string(),
+            status: status.to_string(),
+            gpu: cell(
+                record
+                    .and_then(|record| record.gpu_type.as_deref())
+                    .unwrap_or("-"),
+            ),
+            rate: None,
+            created: cell(
+                record
+                    .and_then(|record| record.created_at.as_deref())
+                    .unwrap_or_default(),
+            ),
+            note,
+            kind,
+        }
+    }
+}
+
+/// The row of an unlisted recorded pod once looked up, recording it gone (or
+/// dropping it from `stray_pods`) when it is.
+fn settle(
+    ctx: &PodCtx<'_>,
+    known: &Known<'_>,
+    entry: &Unlisted,
+    look: Look,
+) -> Result<Option<PodRow>, PodError> {
+    match look {
+        Look::Found(pod) => Ok(Some(known.row(Some(&entry.run_id), &pod))),
+        Look::Gone if entry.stray => {
+            forget_stray(ctx.runs, &entry.run_id, &entry.id)?;
+            Ok(None)
+        },
+        Look::Gone => {
+            record_gone(ctx, &entry.run_id, &entry.id)?;
+            let row = known.recorded_row(entry, "GONE", RowKind::Gone, "gone".to_string());
+            Ok(Some(row))
+        },
+        Look::Failed(error) => {
+            tracing::warn!(
+                "cannot look up pod {} of run {}: {error}",
+                entry.id,
+                entry.run_id
+            );
+            let (kind, note) = known.classify(Some(&entry.run_id), &entry.id);
+            Ok(Some(known.recorded_row(entry, "UNCHECKED", kind, note)))
         },
     }
-    Ok(())
 }
 
-/// Drops the stray pod `id`, confirmed gone, from `record`.
-fn forget_stray(runs: &Runs, record: &mut PodRecord, id: &PodId) -> Result<(), PodError> {
-    record.stray_pods.retain(|stray| stray != id);
-    record.save(runs)?;
-    tracing::info!("stray pod {id} of run {} is gone", record.run_id);
-    Ok(())
-}
-
-/// The row of `pod`, a pod of the run `run`.
-fn row(runs: &Runs, run: &str, pod: &Pod, stray: bool) -> Result<PodRow, PodError> {
-    Ok(PodRow {
-        run: cell(run),
-        pod_id: pod.id.to_string(),
-        status: pod.status.name().to_string(),
-        gpu: cell(pod.gpu_type().unwrap_or("-")),
-        rate: pod.cost,
-        created: cell(pod.created_at.as_deref().unwrap_or_default()),
-        note: note(runs, run, stray)?,
-    })
-}
-
-/// The row of the pod `id` of `record`, from what `pod.json` says.
-fn recorded_row(record: &PodRecord, id: &PodId, status: &str, note: String) -> PodRow {
-    PodRow {
-        run: record.run_id.clone(),
-        pod_id: id.to_string(),
-        status: status.to_string(),
-        gpu: cell(record.gpu_type.as_deref().unwrap_or("-")),
-        rate: None,
-        created: record.created_at.clone().unwrap_or_default(),
-        note,
+/// Records the pod `id` of the run `run_id` gone, on a fresh `pod.json`, when it
+/// is still the run's pod.
+fn record_gone(ctx: &PodCtx<'_>, run_id: &str, id: &PodId) -> Result<(), PodError> {
+    if let Some(mut record) = PodRecord::load(ctx.runs, run_id)?
+        && record.pod_id.as_ref() == Some(id)
+        && record.state != PodState::Deleted
+    {
+        mark_gone(ctx, &mut record, id.clone(), DeletedBy::Unknown)?;
     }
+    Ok(())
 }
 
-/// `text`, from the Runpod account, as one short line of printable ASCII.
+/// Drops the stray pod `id`, confirmed gone, from the run's `pod.json`.
+fn forget_stray(runs: &Runs, run_id: &str, id: &PodId) -> Result<(), PodError> {
+    edit_record(runs, run_id, |record| {
+        record.stray_pods.retain(|stray| stray != id);
+    })?;
+    tracing::info!("stray pod {id} of run {run_id} is gone");
+    Ok(())
+}
+
+/// Applies `edit` to the run's `pod.json`, read again just before, and saves
+/// it, so that a concurrent writer is not overwritten with a stale copy.
+/// Nothing when the run has no `pod.json`.
+fn edit_record(
+    runs: &Runs,
+    run_id: &str,
+    edit: impl FnOnce(&mut PodRecord),
+) -> Result<(), PodError> {
+    if let Some(mut record) = PodRecord::load(runs, run_id)? {
+        edit(&mut record);
+        record.save(runs)?;
+    }
+    Ok(())
+}
+
+/// `text`, from the Runpod account or a local record, as one short line of
+/// printable ASCII.
 fn cell(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .take(CELL_CHARS)
         .collect()
-}
-
-/// What `runs/` says about a pod of `run_id`; `stray` for one of its
-/// `stray_pods`.
-fn note(runs: &Runs, run_id: &str, stray: bool) -> Result<String, PodError> {
-    let run = match runs.load(run_id) {
-        Ok(run) => run,
-        Err(RunsError::NotFound(_) | RunsError::InvalidId(_)) => return Ok("not in runs/".into()),
-        Err(error) => return Err(error.into()),
-    };
-    if stray {
-        return Ok(STRAY.to_string());
-    }
-    let state = PodRecord::load(runs, run_id)?.map(|record| record.state);
-    Ok(match (state, run.state) {
-        (Some(PodState::Kept), _) => "kept".to_string(),
-        (Some(PodState::AwaitingRetrieval), _) => "awaiting retrieval".to_string(),
-        (_, RunState::Preparing | RunState::Running) => format!("run {}", run.state.name()),
-        (_, ended) => format!("run {}, not deleted", ended.name()),
-    })
 }
 
 /// The rows as the aligned table `pod ls` prints, header first; nothing when
@@ -246,8 +364,8 @@ pub fn table(rows: &[PodRow]) -> Vec<String> {
     lines
 }
 
-/// One warning per orphan pod among `rows`, naming the command that removes it.
-/// Never deletes anything: only `overbrainer pod rm` does.
+/// One warning per orphan pod among `rows`, saying how to remove it. Never
+/// deletes anything.
 #[must_use]
 pub fn orphan_warnings(rows: &[PodRow]) -> Vec<String> {
     rows.iter()
@@ -256,10 +374,19 @@ pub fn orphan_warnings(rows: &[PodRow]) -> Vec<String> {
             let rate = row
                 .rate
                 .map_or_else(String::new, |rate| format!(" at ${rate:.2}/h"));
-            format!(
-                "pod {} ({}) is still on Runpod{rate}: remove it with `overbrainer pod rm {}`",
-                row.pod_id, row.note, row.run
-            )
+            match row.kind {
+                RowKind::NoMarker => format!(
+                    "pod {} is named like an overbrainer pod but has no run marker; if it is yours, delete it from the Runpod console",
+                    row.pod_id
+                ),
+                RowKind::NotInRuns => {
+                    format!("pod {} is still on Runpod{rate}: {}", row.pod_id, row.note)
+                },
+                _ => format!(
+                    "pod {} ({}) is still on Runpod{rate}: remove it with `overbrainer pod rm {}`",
+                    row.pod_id, row.note, row.run
+                ),
+            }
         })
         .collect()
 }
@@ -285,90 +412,129 @@ impl Removed {
     }
 }
 
-/// Deletes every pod of the run `run_id`: the one in its `pod.json` (even kept),
-/// its `stray_pods`, and any other carrying its marker (so a pod whose run
-/// directory is gone, or a duplicate, goes too). The delete is always sent and
-/// each pod confirmed gone; a stray is dropped from `stray_pods` once it is. A
-/// run still `Running` is refused unless `force`; forced, it is saved `Failed`
-/// once a pod was deleted. The run's private client key is removed once every
-/// pod is.
+/// What `pod rm` did: the pods it deleted, even when it failed.
+#[derive(Debug)]
+pub struct Removal {
+    /// Every pod deleted and confirmed gone.
+    pub removed: Vec<Removed>,
+    /// How it ended.
+    pub result: Result<(), PodError>,
+}
+
+/// Deletes the pods of the run `run_id`: the one in its `pod.json` (even kept),
+/// its `stray_pods`, and any other carrying its marker. Every delete is sent and
+/// confirmed; a stray is dropped from `stray_pods` once gone, and a pod found by
+/// its marker whose delete fails is added to it. Every pod is tried; the first
+/// failure is returned at the end.
 ///
-/// # Errors
-///
-/// Returns [`PodError::RunStillRunning`] for a running run without `force`,
-/// and another [`PodError`] when the API or the files fail, or a delete cannot
-/// be confirmed (every stray is still tried first).
-pub async fn remove_run_pods(
+/// A run absent from this project's `runs/` is refused unless `force`: its pods
+/// may belong to another checkout. For a run in progress (preparing or running)
+/// without `force`, its training pod (the one in `pod.json`) is kept, every other
+/// pod is deleted, and [`PodError::RunStillRunning`] says so. Forced, the run is
+/// saved `Failed` once a pod was deleted. The run's private client key is removed
+/// once every pod is.
+#[must_use]
+pub async fn remove_run_pods(ctx: &PodCtx<'_>, run_id: &str, force: bool) -> Removal {
+    let mut removed = Vec::new();
+    let result = remove_checked(ctx, run_id, force, &mut removed).await;
+    Removal { removed, result }
+}
+
+async fn remove_checked(
     ctx: &PodCtx<'_>,
     run_id: &str,
     force: bool,
-) -> Result<Vec<Removed>, PodError> {
-    ctx.runs.run_dir(run_id)?;
-    let run = match ctx.runs.load(run_id) {
-        Ok(run) => Some(run),
-        Err(RunsError::NotFound(_)) => None,
-        Err(error) => return Err(error.into()),
-    };
-    let running = run
-        .as_ref()
-        .is_some_and(|run| run.state == RunState::Running);
-    if running && !force {
-        return Err(PodError::RunStillRunning(run_id.to_string()));
-    }
-    let mut removed = Vec::new();
-    let result = remove_all(ctx, run_id, &mut removed).await;
-    if let Some(mut run) = run.filter(|_| running && !removed.is_empty()) {
-        run.state = RunState::Failed;
-        run.message = Some("pod deleted by `pod rm` before its results were retrieved".to_string());
-        ctx.runs.save(&run)?;
-    }
-    result?;
-    forget_client_key(ctx.runs, run_id);
-    Ok(removed)
-}
-
-/// See [`remove_run_pods`]: every deleted pod is pushed to `removed`.
-async fn remove_all(
-    ctx: &PodCtx<'_>,
-    run_id: &str,
     removed: &mut Vec<Removed>,
 ) -> Result<(), PodError> {
-    if let Some(mut record) = PodRecord::load(ctx.runs, run_id)? {
-        if record.state != PodState::Deleted
-            && let Some(id) = record.pod_id.clone()
-        {
-            let uptime = record.uptime(SystemTime::now());
-            remove(ctx, &mut record, DeleteReason::Requested, DeletedBy::PodRm).await?;
-            removed.push(Removed {
-                pod_id: id,
-                uptime,
-                estimated_spend: record.estimated_spend,
-            });
-        }
-        remove_strays(ctx, &mut record, removed).await?;
+    ctx.runs.run_dir(run_id)?;
+    let in_progress = match ctx.runs.load(run_id) {
+        Ok(run) => matches!(run.state, RunState::Preparing | RunState::Running),
+        Err(RunsError::NotFound(_)) if force => false,
+        Err(RunsError::NotFound(_)) => return Err(PodError::NotInRuns(run_id.to_string())),
+        Err(error) => return Err(error.into()),
+    };
+    let keep_training = in_progress && !force;
+    let record = PodRecord::load(ctx.runs, run_id)?;
+    let training = record
+        .as_ref()
+        .filter(|record| record.state != PodState::Deleted)
+        .and_then(|record| record.pod_id.clone());
+    let mut failed = None;
+    if !keep_training
+        && let Some(mut record) = record
+        && let Err(error) = remove_recorded(ctx, &mut record, removed).await
+    {
+        failed.get_or_insert(error);
     }
-    for pod in ctx.client.list_pods().await? {
-        if pod.run_id() == Some(run_id) && removed.iter().all(|done| done.pod_id != pod.id) {
-            delete_confirmed(ctx, &pod.id).await?;
-            removed.push(Removed::unrecorded(pod.id));
-        }
+    let mut tried: Vec<PodId> = training.iter().cloned().collect();
+    remove_strays(ctx, run_id, removed, &mut tried, &mut failed).await;
+    remove_marked(ctx, run_id, removed, &tried, &mut failed).await;
+    if in_progress
+        && !keep_training
+        && !removed.is_empty()
+        && let Err(error) = fail_run(ctx.runs, run_id)
+    {
+        failed.get_or_insert(error);
     }
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    if keep_training {
+        return Err(PodError::RunStillRunning {
+            run_id: run_id.to_string(),
+            kept: kept_words(training.as_ref(), removed),
+        });
+    }
+    forget_client_key(ctx.runs, run_id);
     Ok(())
 }
 
-/// Deletes every stray pod of `record`, dropping each from `stray_pods` once it
-/// is confirmed gone. Every stray is tried; the first failure is returned.
-async fn remove_strays(
+/// Deletes the pod of `record`, unless it is already deleted.
+async fn remove_recorded(
     ctx: &PodCtx<'_>,
     record: &mut PodRecord,
     removed: &mut Vec<Removed>,
 ) -> Result<(), PodError> {
-    let mut failed = None;
-    for id in record.stray_pods.clone() {
+    let Some(id) = record
+        .pod_id
+        .clone()
+        .filter(|_| record.state != PodState::Deleted)
+    else {
+        return Ok(());
+    };
+    let uptime = record.uptime(SystemTime::now());
+    remove(ctx, record, DeleteReason::Requested, DeletedBy::PodRm).await?;
+    removed.push(Removed {
+        pod_id: id,
+        uptime,
+        estimated_spend: record.estimated_spend,
+    });
+    Ok(())
+}
+
+/// Deletes every stray pod of the run, dropping each from `stray_pods` once it
+/// is confirmed gone. Each one tried is added to `tried`.
+async fn remove_strays(
+    ctx: &PodCtx<'_>,
+    run_id: &str,
+    removed: &mut Vec<Removed>,
+    tried: &mut Vec<PodId>,
+    failed: &mut Option<PodError>,
+) {
+    let strays = match PodRecord::load(ctx.runs, run_id) {
+        Ok(record) => record.map(|record| record.stray_pods).unwrap_or_default(),
+        Err(error) => {
+            failed.get_or_insert(error.into());
+            return;
+        },
+    };
+    for id in strays {
+        tried.push(id.clone());
         match delete_confirmed(ctx, &id).await {
             Ok(_) => {
-                record.stray_pods.retain(|stray| *stray != id);
-                record.save(ctx.runs)?;
+                if let Err(error) = forget_stray(ctx.runs, run_id, &id) {
+                    failed.get_or_insert(error);
+                }
                 removed.push(Removed::unrecorded(id));
             },
             Err(error) => {
@@ -377,14 +543,80 @@ async fn remove_strays(
             },
         }
     }
-    failed.map_or(Ok(()), Err)
+}
+
+/// Deletes every other listed pod carrying the run's marker, but those in
+/// `tried`. One whose delete fails is added to `stray_pods`.
+async fn remove_marked(
+    ctx: &PodCtx<'_>,
+    run_id: &str,
+    removed: &mut Vec<Removed>,
+    tried: &[PodId],
+    failed: &mut Option<PodError>,
+) {
+    let pods = match ctx.client.list_pods().await {
+        Ok(pods) => pods,
+        Err(error) => {
+            failed.get_or_insert(error.into());
+            return;
+        },
+    };
+    for pod in pods {
+        let done = tried.contains(&pod.id) || removed.iter().any(|done| done.pod_id == pod.id);
+        if pod.run_id() != Some(run_id) || done {
+            continue;
+        }
+        match delete_confirmed(ctx, &pod.id).await {
+            Ok(_) => removed.push(Removed::unrecorded(pod.id)),
+            Err(error) => {
+                record_stray(ctx.runs, run_id, &pod.id, &error);
+                failed.get_or_insert(error);
+            },
+        }
+    }
+}
+
+/// Adds the pod `id`, whose delete failed with `error`, to the run's
+/// `stray_pods`, best effort.
+fn record_stray(runs: &Runs, run_id: &str, id: &PodId, error: &PodError) {
+    let stray = id.clone();
+    let recorded = match edit_record(runs, run_id, |record| record.note_stray(stray)) {
+        Ok(()) => String::new(),
+        Err(record_error) => format!(" (and cannot record it as stray: {record_error})"),
+    };
+    tracing::warn!("cannot confirm the deletion of pod {id}: {error}{recorded}");
+}
+
+/// Saves the run `run_id`, read again just before, `Failed` by `pod rm`.
+fn fail_run(runs: &Runs, run_id: &str) -> Result<(), PodError> {
+    let mut run = runs.load(run_id)?;
+    run.state = RunState::Failed;
+    run.message = Some(FAILED_BY_POD_RM.to_string());
+    runs.save(&run)?;
+    Ok(())
+}
+
+/// What a `pod rm` of a run in progress kept and deleted, for its error.
+fn kept_words(training: Option<&PodId>, removed: &[Removed]) -> String {
+    let others: Vec<String> = removed.iter().map(|pod| pod.pod_id.to_string()).collect();
+    let deleted = if others.is_empty() {
+        String::new()
+    } else {
+        format!("its other pods {} were deleted", others.join(", "))
+    };
+    match (training, deleted.is_empty()) {
+        (Some(id), true) => format!(": its training pod {id} was kept"),
+        (Some(id), false) => format!(": its training pod {id} was kept, and {deleted}"),
+        (None, false) => format!(": {deleted}"),
+        (None, true) => String::new(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn row(run: &str, note: &str) -> PodRow {
+    fn row(run: &str, kind: RowKind, note: &str) -> PodRow {
         PodRow {
             run: run.to_string(),
             pod_id: "k3x9abc".to_string(),
@@ -393,25 +625,34 @@ mod tests {
             rate: Some(0.49),
             created: "2026-09-21T09:00:03Z".to_string(),
             note: note.to_string(),
+            kind,
         }
     }
 
     #[test]
-    fn only_pods_nothing_will_delete_are_orphans() {
+    fn only_pods_nothing_will_delete_are_orphans_and_each_gets_a_safe_hint() {
         let rows = [
-            row("r1", "run running"),
-            row("r2", "run succeeded, not deleted"),
-            row("r3", "not in runs/"),
-            row("r4", "kept"),
-            row("r5", "awaiting retrieval"),
-            row("r6", "stray, not deleted"),
+            row("r1", RowKind::InProgress, "run running"),
+            row("r2", RowKind::Ended, "run succeeded, not deleted"),
+            row(
+                "r3",
+                RowKind::NotInRuns,
+                "not in this project's runs/; if no other checkout owns it, `overbrainer pod rm r3 --force`",
+            ),
+            row("r4", RowKind::Kept, "kept"),
+            row("r5", RowKind::AwaitingRetrieval, "awaiting retrieval"),
+            row("r6", RowKind::Stray, STRAY),
+            row("-", RowKind::NoMarker, NO_MARKER),
+            row("r8", RowKind::Unreadable, "run record unreadable"),
+            row("r9", RowKind::Gone, "gone"),
         ];
         assert_eq!(
             orphan_warnings(&rows),
             vec![
                 "pod k3x9abc (run succeeded, not deleted) is still on Runpod at $0.49/h: remove it with `overbrainer pod rm r2`".to_string(),
-                "pod k3x9abc (not in runs/) is still on Runpod at $0.49/h: remove it with `overbrainer pod rm r3`".to_string(),
+                "pod k3x9abc is still on Runpod at $0.49/h: not in this project's runs/; if no other checkout owns it, `overbrainer pod rm r3 --force`".to_string(),
                 "pod k3x9abc (stray, not deleted) is still on Runpod at $0.49/h: remove it with `overbrainer pod rm r6`".to_string(),
+                "pod k3x9abc is named like an overbrainer pod but has no run marker; if it is yours, delete it from the Runpod console".to_string(),
             ]
         );
     }
@@ -419,7 +660,11 @@ mod tests {
     #[test]
     fn the_table_aligns_its_columns() {
         assert!(table(&[]).is_empty());
-        let lines = table(&[row("20260921-090000-ffff", "run succeeded, not deleted")]);
+        let lines = table(&[row(
+            "20260921-090000-ffff",
+            RowKind::Ended,
+            "run succeeded, not deleted",
+        )]);
         assert_eq!(
             lines,
             vec![
@@ -433,5 +678,24 @@ mod tests {
     fn text_from_the_account_is_one_short_printable_line() {
         assert_eq!(cell("run\u{1b}[31m\nx\u{e9}"), "run[31mx");
         assert_eq!(cell(&"y".repeat(500)).len(), CELL_CHARS);
+    }
+
+    #[test]
+    fn a_refused_pod_rm_says_what_it_kept_and_deleted() -> Result<(), String> {
+        let training = PodId::new("p1")?;
+        let others = [
+            Removed::unrecorded(PodId::new("s1")?),
+            Removed::unrecorded(PodId::new("x2")?),
+        ];
+        assert_eq!(
+            kept_words(Some(&training), &others),
+            ": its training pod p1 was kept, and its other pods s1, x2 were deleted"
+        );
+        assert_eq!(
+            kept_words(Some(&training), &[]),
+            ": its training pod p1 was kept"
+        );
+        assert_eq!(kept_words(None, &[]), "");
+        Ok(())
     }
 }

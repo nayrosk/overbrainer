@@ -238,6 +238,90 @@ async fn look_again(ctx: &PodCtx<'_>, id: &PodId) -> Result<Option<Pod>, PodErro
         .find(|listed| listed.id == *id))
 }
 
+/// What a batched look found of one pod (see [`look_up_all`]).
+#[derive(Debug)]
+pub(super) enum Look {
+    /// The API shows the pod.
+    Found(Box<Pod>),
+    /// Confirmed gone: [`GONE_LOOKS`] 404s in a row and absent from the list.
+    Gone,
+    /// A look failed: the pod is undetermined. Holds the error's message.
+    Failed(String),
+}
+
+/// [`look_up`] for several pods at once, with the same strength per pod but
+/// one wait for all: every pod is looked at once; those answering Runpod's 404
+/// are looked at again [`GONE_LOOKS`] - 1 times, [`Timing::gone_interval`]
+/// apart, then checked against one pod list. No wait at all when every pod
+/// answers. Nothing is ever deleted here. The looks are in the order of `ids`.
+///
+/// [`Timing::gone_interval`]: super::Timing::gone_interval
+pub(super) async fn look_up_all(ctx: &PodCtx<'_>, ids: &[PodId]) -> Vec<Look> {
+    let mut looks: Vec<Option<Look>> = ids.iter().map(|_| None).collect();
+    let mut pending: Vec<usize> = (0..ids.len()).collect();
+    for round in 0..GONE_LOOKS {
+        if pending.is_empty() {
+            break;
+        }
+        if round > 0 {
+            tokio::time::sleep(ctx.timing.gone_interval).await;
+        }
+        pending = look_round(ctx, ids, &pending, &mut looks).await;
+    }
+    look_again_all(ctx, ids, &pending, &mut looks).await;
+    looks
+        .into_iter()
+        .map(|look| look.unwrap_or(Look::Gone))
+        .collect()
+}
+
+/// Looks at the pods at `pending` once; returns those answering Runpod's 404.
+async fn look_round(
+    ctx: &PodCtx<'_>,
+    ids: &[PodId],
+    pending: &[usize],
+    looks: &mut [Option<Look>],
+) -> Vec<usize> {
+    let mut missing = Vec::new();
+    for &index in pending {
+        match ctx.client.get_pod(&ids[index]).await {
+            Ok(Some(pod)) => looks[index] = Some(Look::Found(Box::new(pod))),
+            Ok(None) => missing.push(index),
+            Err(error) => looks[index] = Some(Look::Failed(error.to_string())),
+        }
+    }
+    missing
+}
+
+/// The last step of [`look_up_all`]: one pod list, which must not show the pods
+/// at `pending` (each answered [`GONE_LOOKS`] 404s in a row) for them to be
+/// gone.
+async fn look_again_all(
+    ctx: &PodCtx<'_>,
+    ids: &[PodId],
+    pending: &[usize],
+    looks: &mut [Option<Look>],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    match ctx.client.list_pods().await {
+        Ok(listed) => {
+            for &index in pending {
+                looks[index] = Some(match listed.iter().find(|pod| pod.id == ids[index]) {
+                    Some(pod) => Look::Found(Box::new(pod.clone())),
+                    None => Look::Gone,
+                });
+            }
+        },
+        Err(error) => {
+            for &index in pending {
+                looks[index] = Some(Look::Failed(error.to_string()));
+            }
+        },
+    }
+}
+
 /// Records the pod `id` as deleted by `by`.
 pub(super) fn mark_gone(
     ctx: &PodCtx<'_>,

@@ -379,9 +379,20 @@ impl PodRecord {
     }
 
     /// One line for `runs ls`: `pod running k3x9abc $0.53/h`, `pod deleted about
-    /// $0.64`, `pod kept k3x9abc`, and so on.
+    /// $0.64`, `pod kept k3x9abc`, and so on, followed by `+N stray` when
+    /// [`PodRecord::stray_pods`] is not empty.
     #[must_use]
     pub fn summary(&self) -> String {
+        let summary = self.pod_summary();
+        if self.stray_pods.is_empty() {
+            summary
+        } else {
+            format!("{summary} +{} stray", self.stray_pods.len())
+        }
+    }
+
+    /// [`PodRecord::summary`] without the stray pods.
+    fn pod_summary(&self) -> String {
         let id = self
             .pod_id
             .as_ref()
@@ -518,6 +529,7 @@ mod tests {
         assert!(empty.get("stray_pods").is_none());
         record.note_stray(PodId::new("dup1")?);
         record.note_stray(PodId::new("dup1")?);
+        assert_eq!(record.summary(), "pod creating (no pod) +1 stray");
         let json = serde_json::to_value(&record)?;
         assert_eq!(json["stray_pods"], serde_json::json!(["dup1"]));
         let back: PodRecord = serde_json::from_value(json)?;

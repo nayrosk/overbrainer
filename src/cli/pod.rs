@@ -73,11 +73,12 @@ async fn ls(ctx: &PodCtx<'_>) -> anyhow::Result<()> {
 }
 
 async fn rm(ctx: &PodCtx<'_>, run_id: &str, force: bool) -> anyhow::Result<()> {
-    let removed = remove_run_pods(ctx, run_id, force).await?;
-    if removed.is_empty() {
+    let removal = remove_run_pods(ctx, run_id, force).await;
+    if removal.removed.is_empty() && removal.result.is_ok() {
         println!("pod: no pod for run {run_id}");
     }
-    for pod in removed {
+    // Every deleted pod is printed, even when the command fails overall.
+    for pod in &removal.removed {
         let after = pod.uptime.map_or_else(String::new, |uptime| {
             format!(" after {}", duration_words(uptime))
         });
@@ -86,5 +87,5 @@ async fn rm(ctx: &PodCtx<'_>, run_id: &str, force: bool) -> anyhow::Result<()> {
             .map_or_else(String::new, |spend| format!(", about ${spend:.2}"));
         println!("pod: {} deleted{after}{spend}", pod.pod_id);
     }
-    Ok(())
+    Ok(removal.result?)
 }

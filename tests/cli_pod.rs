@@ -244,8 +244,14 @@ async fn deletes(server: &MockServer) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn pod_ls_joins_the_account_with_runs() -> TestResult {
-    let server = stub().await;
+async fn pod_ls_prints_the_table_on_stdout() -> TestResult {
+    let server = serve(
+        Account::default()
+            .with("p1", RUNNING, true)
+            .with("p3", ENDED, true)
+            .with("p9", "20260101-000000-dead", true),
+    )
+    .await;
     let dir = project()?;
     let mut cmd = overbrainer(dir.path(), &server)?;
     cmd.args(["pod", "ls"]);
@@ -257,76 +263,32 @@ async fn pod_ls_joins_the_account_with_runs() -> TestResult {
     );
     let stdout = String::from_utf8(output.stdout)?;
     let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "{stdout}");
     assert!(lines[0].starts_with("RUN "), "{stdout}");
     assert!(lines[0].ends_with("NOTE"), "{stdout}");
     let row = |run: &str| lines.iter().find(|line| line.starts_with(run)).copied();
-    let dead = row("20260101-000000-dead").ok_or("no orphan row")?;
+    let elsewhere = row("20260101-000000-dead").ok_or("no orphan row")?;
     assert!(
-        dead.contains("p9") && dead.ends_with("not in runs/"),
-        "{dead}"
+        elsewhere.contains("p9")
+            && elsewhere.ends_with(
+                "not in this project's runs/; if no other checkout owns it, `overbrainer pod rm 20260101-000000-dead --force`"
+            ),
+        "{elsewhere}"
     );
     let running = row(RUNNING).ok_or("no running row")?;
     assert!(
         running.contains("RUNNING") && running.contains("0.53") && running.ends_with("run running"),
         "{running}"
     );
-    let gone = row(ENDED).ok_or("no gone row")?;
-    assert!(gone.contains("GONE") && gone.ends_with("gone"), "{gone}");
-    let runs = Runs::new(dir.path());
-    let ended = PodRecord::load(&runs, ENDED)?.ok_or("no pod.json")?;
-    assert_eq!(ended.state, PodState::Deleted);
-    assert_eq!(ended.deleted_by, Some(DeletedBy::Unknown));
+    let ended = row(ENDED).ok_or("no ended row")?;
+    assert!(ended.ends_with("run succeeded, not deleted"), "{ended}");
     assert!(!stdout.contains("rp_cli_key_4411"));
-    // A pod that only looks gone is never deleted.
     assert!(deletes(&server).await.is_empty());
     Ok(())
 }
 
 #[tokio::test]
-async fn pod_ls_shows_stray_pods_and_drops_those_confirmed_gone() -> TestResult {
-    let server = serve(
-        Account::default()
-            .with("p1", RUNNING, true)
-            .with("p3", ENDED, true)
-            .with("s1", ENDED, true)
-            .with("s2", ENDED, false),
-    )
-    .await;
-    let dir = project()?;
-    let runs = Runs::new(dir.path());
-    add_strays(&runs, ENDED, &["s1", "s2", "s3"])?;
-    let mut cmd = overbrainer(dir.path(), &server)?;
-    cmd.args(["pod", "ls"]);
-    let output = output(cmd).await?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout)?;
-    let row = |id: &str| {
-        stdout
-            .lines()
-            .find(|line| line.split_whitespace().nth(1) == Some(id))
-    };
-    for stray in ["s1", "s2"] {
-        let line = row(stray).ok_or(format!("no row for {stray}: {stdout}"))?;
-        assert!(
-            line.starts_with(ENDED) && line.ends_with("stray, not deleted"),
-            "{line}"
-        );
-    }
-    let main = row("p3").ok_or("no row for p3")?;
-    assert!(main.ends_with("run succeeded, not deleted"), "{main}");
-    assert!(row("s3").is_none(), "{stdout}");
-    // s3 answered 404 three times and is not listed: no longer a stray.
-    assert_eq!(strays(&runs, ENDED)?, vec!["s1", "s2"]);
-    assert!(deletes(&server).await.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn pod_rm_refuses_a_running_run_unless_forced() -> TestResult {
+async fn pod_rm_keeps_the_training_pod_of_a_running_run_unless_forced() -> TestResult {
     let server = stub().await;
     let dir = project()?;
     let mut cmd = overbrainer(dir.path(), &server)?;
@@ -335,7 +297,7 @@ async fn pod_rm_refuses_a_running_run_unless_forced() -> TestResult {
     assert!(!refused.status.success());
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains(&format!(
-            "run {RUNNING} is still running; stop it with `overbrainer train cancel {RUNNING}` first, or pass --force"
+            "run {RUNNING} is still running: its training pod p1 was kept; stop it with `overbrainer train cancel {RUNNING}` first, or pass --force"
         )),
         "{}",
         String::from_utf8_lossy(&refused.stderr)
@@ -378,7 +340,7 @@ async fn pod_rm_refuses_a_running_run_unless_forced() -> TestResult {
 }
 
 #[tokio::test]
-async fn pod_rm_deletes_the_stray_pods_and_forgets_those_confirmed_gone() -> TestResult {
+async fn pod_rm_prints_the_pods_it_deleted_even_when_it_fails() -> TestResult {
     let mut account = Account::default()
         .with("p3", ENDED, true)
         .with("s1", ENDED, true)
@@ -387,20 +349,18 @@ async fn pod_rm_deletes_the_stray_pods_and_forgets_those_confirmed_gone() -> Tes
     let server = serve(account).await;
     let dir = project()?;
     let runs = Runs::new(dir.path());
-    add_strays(&runs, ENDED, &["s1", "s2", "s3"])?;
+    add_strays(&runs, ENDED, &["s1", "s3"])?;
     let mut cmd = overbrainer(dir.path(), &server)?;
     cmd.args(["pod", "rm", ENDED]);
     let failed = output(cmd).await?;
-    // s3's DELETE is refused: the command fails and s3 stays a stray.
     assert!(!failed.status.success());
-    let mut sent = deletes(&server).await;
-    sent.sort();
-    // The DELETE is sent even for s2, which Runpod no longer knows.
-    assert_eq!(sent, vec!["p3", "s1", "s2", "s3"]);
+    let stdout = String::from_utf8(failed.stdout)?;
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    assert!(lines[0].starts_with("pod: p3 deleted after "), "{stdout}");
+    assert_eq!(lines[1], "pod: s1 deleted");
     assert_eq!(strays(&runs, ENDED)?, vec!["s3"]);
-    let pod = PodRecord::load(&runs, ENDED)?.ok_or("no pod.json")?;
-    assert_eq!(pod.state, PodState::Deleted);
-    assert!(!String::from_utf8(failed.stdout)?.contains("rp_cli_key_4411"));
+    assert!(!stdout.contains("rp_cli_key_4411"));
     Ok(())
 }
 
@@ -430,6 +390,7 @@ async fn pod_rm_removes_a_kept_pod() -> TestResult {
 #[test]
 fn runs_ls_shows_the_pod_of_a_runpod_run() -> TestResult {
     let dir = project()?;
+    add_strays(&Runs::new(dir.path()), ENDED, &["s1", "s2"])?;
     Command::cargo_bin("overbrainer")?
         .env_clear()
         .env("HOME", "/nonexistent")
@@ -440,6 +401,9 @@ fn runs_ls_shows_the_pod_of_a_runpod_run() -> TestResult {
         .success()
         .stdout(predicate::str::contains(format!(
             "{RUNNING}  running    gpu_cloud  2026-09-22T14:30:05Z  pod running p1 $0.53/h"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "{ENDED}  succeeded  gpu_cloud  2026-09-22T14:30:05Z  pod running p3 $0.53/h +2 stray\n"
         )))
         .stdout(predicate::str::contains(format!(
             "{FORGOTTEN}  failed     gpu_cloud  2026-09-20T12:00:00Z\n"
