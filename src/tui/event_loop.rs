@@ -405,7 +405,11 @@ where
     /// are settled rather than dropped with the loop (a start never cut). The
     /// owner thread's panic hook has restored the terminal by then.
     fn draw(&mut self, app: &mut App) -> anyhow::Result<()> {
-        if app.dirty && !self.suspended && Instant::now() >= self.next_draw() {
+        // Never `Instant::now() >= self.next_draw()`: with no draw yet, the
+        // second reading of the clock can come after the first, and the first
+        // frame would then never be drawn.
+        let due = self.last_draw.is_none_or(|at| Instant::now() >= at + FRAME);
+        if app.dirty && !self.suspended && due {
             let terminal = &mut *self.terminal;
             let drawn = panic::catch_unwind(AssertUnwindSafe(|| {
                 terminal.draw(|frame| ui::render(frame, app)).map(drop)
