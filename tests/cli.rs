@@ -278,3 +278,30 @@ fn init_refusal_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+#[test]
+fn tui_refuses_a_stdout_that_is_not_a_terminal() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .arg("tui")
+        .assert()
+        .failure()
+        .code(1)
+        .stdout("")
+        .stderr("error: overbrainer tui needs a terminal: stdout is not a TTY\n");
+    Ok(())
+}
+
+#[test]
+fn help_lists_the_tui_command() -> Result<(), Box<dyn std::error::Error>> {
+    overbrainer()?
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "tui        Browse the dataset, run stages and follow training runs in a terminal UI",
+        ));
+    Ok(())
+}

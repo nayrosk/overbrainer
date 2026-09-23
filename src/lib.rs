@@ -16,3 +16,4 @@ pub mod runpod;
 pub mod runs;
 pub mod secrets;
 pub mod train;
+pub mod tui;

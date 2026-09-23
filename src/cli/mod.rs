@@ -16,6 +16,7 @@ use secrecy::SecretString;
 use tokio::sync::OnceCell;
 
 use self::front::Frontend;
+use crate::logging::{LOG_LINES, LogBuffer, LogMode};
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
 
 /// The `overbrainer` command line interface.
@@ -86,6 +87,20 @@ pub enum Command {
         #[command(subcommand)]
         command: PodCommand,
     },
+    /// Browse the dataset, run stages and follow training runs in a terminal UI.
+    Tui,
+}
+
+impl Command {
+    /// Where this command's logs go: an in-memory buffer for `tui`, which owns the
+    /// terminal, stderr for every other command.
+    #[must_use]
+    pub fn log_mode(&self) -> LogMode {
+        match self {
+            Self::Tui => LogMode::Tui(LogBuffer::new(LOG_LINES)),
+            _ => LogMode::Stderr,
+        }
+    }
 }
 
 /// Subcommands of `overbrainer pod`.
@@ -172,12 +187,14 @@ pub enum ConfigCommand {
     },
 }
 
-/// Runs the parsed command line.
+/// Runs the parsed command line, whose logs were set up with `logs` (see
+/// [`Command::log_mode`]).
 ///
 /// # Errors
 ///
-/// Returns an error if the selected subcommand fails.
-pub async fn run(cli: Cli) -> anyhow::Result<()> {
+/// Returns an error if the selected subcommand fails, or if `tui` is not given the
+/// [`LogMode::Tui`] its logs need.
+pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
     let dir = &cli.project_dir;
     match cli.command {
         Command::Init { dir: target } => init::run(target.as_deref().unwrap_or(dir)),
@@ -203,6 +220,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             command: RunsCommand::Ls,
         } => train::list(dir),
         Command::Pod { command } => pod::run(dir, &command).await,
+        Command::Tui => match logs {
+            LogMode::Tui(buffer) => crate::tui::run(dir, buffer).await,
+            LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),
+        },
     }
 }
 
