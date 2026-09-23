@@ -1,19 +1,16 @@
 //! The training commands: `train`, `train attach`, `train cancel` and `runs ls`.
 
-use std::future::Future;
-use std::io;
 use std::path::Path;
-use std::pin::{Pin, pin};
-use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 
+use super::front::Frontend;
 use super::progress::status_name;
+use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
 use crate::config::{DEFAULT_WORKDIR, EnvSource, Settings, Target, Training};
 use crate::dataset::DataFiles;
-use crate::events::EventBus;
 use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{PodRecord, RunpodTarget};
 use crate::runs::{
@@ -24,13 +21,13 @@ use crate::train::{Axolotl, OUTPUT_DIR, reasoning_template_warning};
 /// Time between two looks at a running job.
 pub(super) const POLL: Duration = Duration::from_secs(2);
 
-/// Runs `overbrainer train` or one of its subcommands.
+/// Runs `overbrainer train` or one of its subcommands, for `front`.
 ///
 /// # Errors
 ///
 /// Returns an error when the configuration or the target cannot be used, when the
 /// run fails, or when it is interrupted (the job keeps running).
-pub async fn run(project_dir: &Path, args: &TrainArgs) -> anyhow::Result<()> {
+pub async fn run(project_dir: &Path, args: &TrainArgs, front: &Frontend) -> anyhow::Result<()> {
     match &args.command {
         None => {
             let settings = crate::config::load(project_dir, EnvSource::Process)?;
@@ -39,11 +36,12 @@ pub async fn run(project_dir: &Path, args: &TrainArgs) -> anyhow::Result<()> {
                 &settings,
                 args.target.as_deref(),
                 args.keep_pod,
+                front,
             )
             .await
         },
-        Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id).await,
-        Some(TrainCommand::Cancel { run_id }) => cancel_run(project_dir, run_id).await,
+        Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id, front).await,
+        Some(TrainCommand::Cancel { run_id }) => cancel_run(project_dir, run_id, front).await,
     }
 }
 
@@ -52,13 +50,13 @@ pub async fn run(project_dir: &Path, args: &TrainArgs) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error when training fails.
-pub async fn after_run(project_dir: &Path) -> anyhow::Result<()> {
+pub async fn after_run(project_dir: &Path, front: &Frontend) -> anyhow::Result<()> {
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
     if settings.training.is_none() {
         no_training();
         return Ok(());
     }
-    train(project_dir, &settings, None, false).await
+    train(project_dir, &settings, None, false, front).await
 }
 
 fn no_training() {
@@ -70,6 +68,7 @@ async fn train(
     settings: &Settings,
     target: Option<&str>,
     keep_pod: bool,
+    front: &Frontend,
 ) -> anyhow::Result<()> {
     let training = training(settings)?;
     let name = target.unwrap_or(&training.target);
@@ -78,7 +77,12 @@ async fn train(
         .get(name)
         .with_context(|| format!("unknown target `{name}`"))?;
     if let Some(spec) = RunpodTarget::from_target(target) {
-        return super::runpod_train::train(project_dir, settings, name, &spec, keep_pod).await;
+        let start = RunpodStart {
+            name,
+            spec: &spec,
+            keep: keep_pod,
+        };
+        return super::runpod_train::train(project_dir, settings, start, front).await;
     }
     if keep_pod {
         bail!("--keep-pod only applies to a runpod target");
@@ -92,17 +96,16 @@ async fn train(
     let runs = Runs::new(project_dir);
     // Caught from before the run exists, so Ctrl-C never kills the process while
     // its job is being started and not yet recorded.
-    let mut interrupt = Interrupt::catch();
+    let mut interrupt = front.interrupt();
     let record = create(&runs, executor.workdir(), name)?;
     started(&record);
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let id = record.id.clone();
-    let bus = EventBus::new();
-    let renderer = tokio::spawn(super::progress::render(bus.subscribe()));
+    let guard = front.open_bus();
     let ctx = RunCtx {
         runs: &runs,
         executor: &executor,
-        bus: &bus,
+        bus: &guard.bus,
         poll: POLL,
     };
     let launch = Launch {
@@ -126,27 +129,25 @@ async fn train(
             interrupt.race(flow).await.transpose()
         },
     };
-    drop(bus);
-    renderer.await.ok();
-    finish(&runs, &id, result)
+    guard.close().await;
+    finish(&runs, &id, result, front)
 }
 
-async fn attach(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
+async fn attach(project_dir: &Path, run_id: &str, front: &Frontend) -> anyhow::Result<()> {
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
     let training = training(&settings)?;
     let runs = Runs::new(project_dir);
     let record = runs.load(run_id)?;
     if let Some(pod) = PodRecord::load(&runs, run_id)? {
-        return super::runpod_train::attach(project_dir, &settings, record, pod).await;
+        return super::runpod_train::attach(project_dir, &settings, record, pod, front).await;
     }
     let executor = run_executor(project_dir, &settings, &record).await?;
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
-    let bus = EventBus::new();
-    let renderer = tokio::spawn(super::progress::render(bus.subscribe()));
+    let guard = front.open_bus();
     let ctx = RunCtx {
         runs: &runs,
         executor: &executor,
-        bus: &bus,
+        bus: &guard.bus,
         poll: POLL,
     };
     let flow = async {
@@ -154,13 +155,12 @@ async fn attach(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
             .await
             .with_context(|| reattach(run_id))
     };
-    let result = Interrupt::catch().race(flow).await.transpose();
-    drop(bus);
-    renderer.await.ok();
-    finish(&runs, run_id, result)
+    let result = front.interrupt().race(flow).await.transpose();
+    guard.close().await;
+    finish(&runs, run_id, result, front)
 }
 
-async fn cancel_run(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
+async fn cancel_run(project_dir: &Path, run_id: &str, front: &Frontend) -> anyhow::Result<()> {
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
     let runs = Runs::new(project_dir);
     let record = runs.load(run_id)?;
@@ -180,25 +180,26 @@ async fn cancel_run(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
          no [training] section in overbrainer.toml",
     )?;
     if let Some(pod) = PodRecord::load(&runs, run_id)? {
-        return super::runpod_train::cancel(project_dir, &settings, record, pod).await;
+        return super::runpod_train::cancel(project_dir, &settings, record, pod, front).await;
     }
     let executor = run_executor(project_dir, &settings, &record).await?;
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     // Cancelling is never interrupted: dropping it between the `cancelling` marker
     // and the signal would leave that marker on the target for ever.
-    let (record, status, _) = Interrupt::catch()
+    let (record, status, _) = front
+        .interrupt()
         .shield(cancel(&runs, &executor, &trainer, record))
         .await?;
     if status != JobStatus::Cancelled {
-        println!(
+        front.line(&format!(
             "train: the job of run {run_id} had already ended ({}): collect it with `overbrainer train attach {run_id}`",
             status_name(status)
-        );
+        ));
         return Ok(());
     }
     match &record.message {
-        Some(message) => println!("train: run {run_id} cancelled ({message})"),
-        None => println!("train: run {run_id} cancelled"),
+        Some(message) => front.line(&format!("train: run {run_id} cancelled ({message})")),
+        None => front.line(&format!("train: run {run_id} cancelled")),
     }
     Ok(())
 }
@@ -307,87 +308,13 @@ async fn run_executor(
     executor(project_dir, &record.target, target).await
 }
 
-type CtrlC = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
-
-/// Ctrl-C, caught from [`Interrupt::catch`] on so that it no longer stops the
-/// process: a flow either runs to its end regardless ([`Interrupt::shield`]) or
-/// stops at the first Ctrl-C ([`Interrupt::race`]).
-pub(super) enum Interrupt {
-    /// Waiting for Ctrl-C.
-    Listening(CtrlC),
-    /// Ctrl-C was pressed.
-    Caught,
-    /// Ctrl-C cannot be caught: it stops the process as usual.
-    Off,
-}
-
-impl Interrupt {
-    /// Starts catching Ctrl-C now.
-    pub(super) fn catch() -> Self {
-        let mut signal: CtrlC = Box::pin(tokio::signal::ctrl_c());
-        // The handler is installed on the first poll; a later poll registers the
-        // real waker.
-        let mut cx = TaskContext::from_waker(Waker::noop());
-        match signal.as_mut().poll(&mut cx) {
-            Poll::Pending => Self::Listening(signal),
-            Poll::Ready(result) => Self::after(result),
-        }
-    }
-
-    fn after(result: io::Result<()>) -> Self {
-        match result {
-            Ok(()) => Self::Caught,
-            Err(error) => {
-                warn(&format!("cannot catch Ctrl-C: {error}"));
-                Self::Off
-            },
-        }
-    }
-
-    /// Whether Ctrl-C was pressed.
-    pub(super) fn caught(&self) -> bool {
-        matches!(self, Self::Caught)
-    }
-
-    /// Runs `flow` to its end, noting a Ctrl-C pressed meanwhile.
-    pub(super) async fn shield<T>(&mut self, flow: impl Future<Output = T>) -> T {
-        let mut flow = pin!(flow);
-        let result = match self {
-            Self::Listening(signal) => tokio::select! {
-                output = &mut flow => return output,
-                result = signal.as_mut() => result,
-            },
-            Self::Caught | Self::Off => return flow.await,
-        };
-        *self = Self::after(result);
-        flow.await
-    }
-
-    /// Runs `flow`, or `None` when Ctrl-C is pressed first (or was already).
-    pub(super) async fn race<T>(&mut self, flow: impl Future<Output = T>) -> Option<T> {
-        let mut flow = pin!(flow);
-        let result = match self {
-            Self::Listening(signal) => tokio::select! {
-                output = &mut flow => return Some(output),
-                result = signal.as_mut() => result,
-            },
-            Self::Caught => return None,
-            Self::Off => return Some(flow.await),
-        };
-        *self = Self::after(result);
-        if self.caught() {
-            None
-        } else {
-            Some(flow.await)
-        }
-    }
-}
-
-/// Prints the outcome on stdout, or explains how to follow an interrupted run.
+/// Emits the outcome through `front` (stdout on the command line), or explains how
+/// to follow an interrupted run.
 pub(super) fn finish(
     runs: &Runs,
     id: &str,
     result: anyhow::Result<Option<Outcome>>,
+    front: &Frontend,
 ) -> anyhow::Result<()> {
     let Some(outcome) = result? else {
         return interrupted(runs, id);
@@ -398,12 +325,12 @@ pub(super) fn finish(
     } else {
         String::new()
     };
-    println!(
+    front.line(&format!(
         "train: run {} {}; {}{output}",
         record.id,
         record.state.name(),
         outcome.summary.describe()
-    );
+    ));
     match record.state {
         RunState::Succeeded => Ok(()),
         RunState::Cancelled => bail!("run {} was cancelled", record.id),
@@ -447,56 +374,4 @@ pub(super) fn started(record: &RunRecord) {
 
 pub(super) fn warn(message: &str) {
     tracing::warn!("{message}");
-}
-
-#[cfg(test)]
-mod tests {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    use super::*;
-
-    /// Sends SIGINT to this process, as Ctrl-C does.
-    async fn ctrl_c() -> io::Result<()> {
-        let status = tokio::process::Command::new("kill")
-            .args(["-INT", &std::process::id().to_string()])
-            .status()
-            .await?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other("kill failed"))
-        }
-    }
-
-    #[tokio::test]
-    async fn ctrl_c_never_stops_a_shielded_flow_and_stops_a_raced_one()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let limit = Duration::from_secs(10);
-        let mut interrupt = Interrupt::catch();
-        assert!(matches!(interrupt, Interrupt::Listening(_)));
-        // Ctrl-C arrives while the flow waits: it still ends, and Ctrl-C is noted.
-        let mut received = signal(SignalKind::interrupt())?;
-        let shielded = async {
-            ctrl_c().await?;
-            received.recv().await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok::<_, io::Error>("ended")
-        };
-        let ended = tokio::time::timeout(limit, interrupt.shield(shielded)).await??;
-        assert_eq!(ended, "ended");
-        assert!(interrupt.caught());
-        // Once Ctrl-C was pressed, a race does not even start its flow.
-        assert_eq!(interrupt.race(std::future::ready(())).await, None);
-
-        let mut interrupt = Interrupt::catch();
-        let raced = async {
-            ctrl_c().await?;
-            std::future::pending::<()>().await;
-            Ok::<_, io::Error>(())
-        };
-        let raced = tokio::time::timeout(limit, interrupt.race(raced)).await?;
-        assert!(raced.is_none());
-        assert!(interrupt.caught());
-        Ok(())
-    }
 }

@@ -127,10 +127,17 @@ impl EventBus {
     /// Events kept for a subscriber that falls behind.
     pub const CAPACITY: usize = 1024;
 
-    /// A bus with no subscriber yet.
+    /// A bus with no subscriber yet, keeping [`Self::CAPACITY`] events.
     #[must_use]
     pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(Self::CAPACITY);
+        Self::with_capacity(Self::CAPACITY)
+    }
+
+    /// A bus with no subscriber yet, keeping `capacity` events (at least 1) for a
+    /// subscriber that falls behind.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity.max(1));
         Self { sender }
     }
 
@@ -194,5 +201,33 @@ mod tests {
         stats.add_usage(usage, Some(&price));
         assert_eq!(stats.usage.input_tokens, 2_000_000);
         assert!(stats.cost.is_some_and(|cost| (cost - 3.0).abs() < 1e-9));
+    }
+
+    #[tokio::test]
+    async fn a_larger_bus_keeps_more_events_for_a_slow_subscriber()
+    -> Result<(), broadcast::error::RecvError> {
+        let small = EventBus::new();
+        let large = EventBus::with_capacity(EventBus::CAPACITY * 2);
+        let (mut behind, mut kept) = (small.subscribe(), large.subscribe());
+        for total in 0..EventBus::CAPACITY * 2 {
+            let event = Event::StageStarted {
+                stage: Stage::Answers,
+                total,
+            };
+            small.publish(event.clone());
+            large.publish(event);
+        }
+        assert!(matches!(
+            behind.recv().await,
+            Err(broadcast::error::RecvError::Lagged(1024))
+        ));
+        assert_eq!(
+            kept.recv().await?,
+            Event::StageStarted {
+                stage: Stage::Answers,
+                total: 0
+            }
+        );
+        Ok(())
     }
 }

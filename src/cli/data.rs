@@ -8,6 +8,7 @@ use anyhow::{Context, bail};
 use serde_json::Value;
 use tokio::sync::{Mutex, OnceCell};
 
+use super::front::Frontend;
 use super::{LazyVault, StageArgs};
 use crate::config::{EnvSource, RoleModel, Settings};
 use crate::dataset::{DataFiles, Subtopic, read};
@@ -129,21 +130,24 @@ impl Session {
     }
 }
 
-/// Runs `command` in `project_dir`, logging progress to stderr and printing a usage
-/// summary per stage to stdout.
+/// Runs `command` in `project_dir`, publishing progress on `front`'s bus and
+/// emitting a usage summary per stage through `front` (stdout on the command line).
 ///
 /// # Errors
 ///
 /// Returns an error if the configuration, a template or a data file cannot be loaded,
 /// if `--topic` names no configured topic, if a provider cannot be reached, or if
 /// items failed (they are retried on the next run).
-pub async fn run(project_dir: &Path, command: Command, args: &StageArgs) -> anyhow::Result<()> {
+pub async fn run(
+    project_dir: &Path,
+    command: Command,
+    args: &StageArgs,
+    front: &Frontend,
+) -> anyhow::Result<()> {
     let session = Session::open(project_dir)?;
-    let bus = EventBus::new();
-    let renderer = tokio::spawn(super::progress::render(bus.subscribe()));
-    let result = execute(&session, &bus, command, args).await;
-    drop(bus);
-    renderer.await.ok();
+    let guard = front.open_bus();
+    let result = execute(&session, &guard.bus, command, args, front).await;
+    guard.close().await;
     result
 }
 
@@ -152,6 +156,7 @@ async fn execute(
     bus: &EventBus,
     command: Command,
     args: &StageArgs,
+    front: &Frontend,
 ) -> anyhow::Result<()> {
     let empty = Prompts::empty();
     session.ctx(bus, args, &empty).topics()?;
@@ -162,31 +167,31 @@ async fn execute(
     };
     let ctx = session.ctx(bus, args, &prompts);
     match command {
-        Command::Subtopics => report(Stage::Subtopics, subtopics(session, &ctx).await),
+        Command::Subtopics => report(Stage::Subtopics, subtopics(session, &ctx).await, front),
         Command::Questions => {
             if missing_subtopics(&ctx)? {
                 let first = Ctx {
                     force: false,
                     ..ctx
                 };
-                report(Stage::Subtopics, subtopics(session, &first).await)?;
+                report(Stage::Subtopics, subtopics(session, &first).await, front)?;
             }
-            report(Stage::Questions, questions(session, &ctx).await)
+            report(Stage::Questions, questions(session, &ctx).await, front)
         },
-        Command::Answers => report(Stage::Answers, answers(session, &ctx).await),
+        Command::Answers => report(Stage::Answers, answers(session, &ctx).await, front),
         Command::Split => {
-            print_split(&pipeline::split(&ctx)?);
+            print_split(&pipeline::split(&ctx)?, front);
             Ok(())
         },
-        Command::Run => run_all(session, &ctx).await,
+        Command::Run => run_all(session, &ctx, front).await,
     }
 }
 
-async fn run_all(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<()> {
-    report(Stage::Subtopics, subtopics(session, ctx).await)?;
-    report(Stage::Questions, questions(session, ctx).await)?;
-    report(Stage::Answers, answers(session, ctx).await)?;
-    print_split(&pipeline::split(ctx)?);
+async fn run_all(session: &Session, ctx: &Ctx<'_>, front: &Frontend) -> anyhow::Result<()> {
+    report(Stage::Subtopics, subtopics(session, ctx).await, front)?;
+    report(Stage::Questions, questions(session, ctx).await, front)?;
+    report(Stage::Answers, answers(session, ctx).await, front)?;
+    print_split(&pipeline::split(ctx)?, front);
     Ok(())
 }
 
@@ -224,19 +229,24 @@ async fn answers(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<StageStats>
     Ok(pipeline::answers(ctx, session.parent().await?).await?)
 }
 
-/// Prints the stage summary on stdout and fails when items failed. A stage stopped by
-/// a fatal provider error still prints what it produced and spent before stopping.
-fn report(stage: Stage, result: anyhow::Result<StageStats>) -> anyhow::Result<()> {
+/// Emits the stage summary through `front` and fails when items failed. A stage
+/// stopped by a fatal provider error still emits what it produced and spent before
+/// stopping.
+fn report(
+    stage: Stage,
+    result: anyhow::Result<StageStats>,
+    front: &Frontend,
+) -> anyhow::Result<()> {
     let stats = match result {
         Ok(stats) => stats,
         Err(error) => {
             if let Some(PipelineError::Llm { stage, spent, .. }) = error.downcast_ref() {
-                println!("{}", summary(*stage, spent));
+                front.line(&summary(*stage, spent));
             }
             return Err(error);
         },
     };
-    println!("{}", summary(stage, &stats));
+    front.line(&summary(stage, &stats));
     if stats.failed > 0 {
         bail!(
             "{} {stage} item(s) failed; run the command again to retry them",
@@ -246,8 +256,8 @@ fn report(stage: Stage, result: anyhow::Result<StageStats>) -> anyhow::Result<()
     Ok(())
 }
 
-fn print_split(report: &SplitReport) {
-    println!("{}", split_summary(report));
+fn print_split(report: &SplitReport, front: &Frontend) {
+    front.line(&split_summary(report));
 }
 
 /// One line: counts, tokens, and cost when the price is known.

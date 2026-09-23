@@ -2,18 +2,20 @@
 
 mod config_check;
 mod data;
+mod front;
 mod init;
 mod pod;
 mod progress;
 mod runpod_train;
 mod train;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use secrecy::SecretString;
 use tokio::sync::OnceCell;
 
+use self::front::Frontend;
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
 
 /// The `overbrainer` command line interface.
@@ -182,26 +184,31 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Config {
             command: ConfigCommand::Check { resolve },
         } => config_check::run(dir, resolve).await,
-        Command::Subtopics(args) => data::run(dir, data::Command::Subtopics, &args).await,
-        Command::Questions(args) => data::run(dir, data::Command::Questions, &args).await,
-        Command::Answers(args) => data::run(dir, data::Command::Answers, &args).await,
+        Command::Subtopics(args) => stage(dir, data::Command::Subtopics, &args).await,
+        Command::Questions(args) => stage(dir, data::Command::Questions, &args).await,
+        Command::Answers(args) => stage(dir, data::Command::Answers, &args).await,
         Command::Split(SplitArgs { topic }) => {
             let args = StageArgs {
                 topic,
                 force: false,
             };
-            data::run(dir, data::Command::Split, &args).await
+            stage(dir, data::Command::Split, &args).await
         },
         Command::Run => {
-            data::run(dir, data::Command::Run, &StageArgs::default()).await?;
-            train::after_run(dir).await
+            stage(dir, data::Command::Run, &StageArgs::default()).await?;
+            train::after_run(dir, &Frontend::Cli).await
         },
-        Command::Train(args) => train::run(dir, &args).await,
+        Command::Train(args) => train::run(dir, &args, &Frontend::Cli).await,
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
         Command::Pod { command } => pod::run(dir, &command).await,
     }
+}
+
+/// Runs a pipeline command on the command line.
+async fn stage(dir: &Path, command: data::Command, args: &StageArgs) -> anyhow::Result<()> {
+    data::run(dir, command, args, &Frontend::Cli).await
 }
 
 /// Secret resolver from `VAULT_ADDR`, `VAULT_TOKEN` and `~/.vault-token`. Vault is
