@@ -208,6 +208,7 @@ mod tests {
     #[tokio::test]
     async fn ctrl_c_never_stops_a_shielded_flow_and_stops_a_raced_one()
     -> Result<(), Box<dyn std::error::Error>> {
+        let _signals = crate::test_support::SIGNALS.lock().await;
         let limit = Duration::from_secs(10);
         let mut interrupt = Frontend::Cli.interrupt();
         assert!(matches!(interrupt, Interrupt::Listening(_)));
