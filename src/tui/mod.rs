@@ -43,10 +43,6 @@ pub async fn run(project_dir: &Path, logs: LogBuffer) -> anyhow::Result<()> {
     let guard = TerminalGuard::enter();
     let mut terminal = terminal::init().context("cannot set up the terminal")?;
     let result = event_loop::run(&mut terminal, &mut app).await;
-    // Shown here, errors ignored, so dropping the terminal writes nothing to a
-    // terminal that may be gone.
-    terminal.show_cursor().ok();
-    drop(terminal);
     drop(guard);
     result
 }

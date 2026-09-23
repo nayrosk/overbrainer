@@ -47,7 +47,8 @@ pub(super) fn of(view: View) -> &'static [KeyHelp] {
 mod tests {
     use super::*;
 
-    /// Every row fits the overlay, so no text is cut at any terminal size.
+    /// Every row fits the overlay, so no text is cut at the minimum terminal size
+    /// (80 columns, wider than the overlay) and up.
     #[test]
     fn every_row_fits_the_help_overlay() {
         let views = View::ALL.into_iter().flat_map(of);

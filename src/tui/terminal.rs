@@ -2,10 +2,12 @@
 //! its input.
 
 use std::io::{self, Write};
+use std::mem::ManuallyDrop;
 use std::panic::{self, PanicHookInfo};
 use std::sync::Arc;
 use std::thread;
 
+use crossterm::cursor::Show;
 use crossterm::event::{Event, EventStream};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
@@ -67,21 +69,28 @@ impl Drop for TerminalGuard {
 /// Enables raw mode and enters the alternate screen, like `ratatui::try_init`
 /// without the panic hook it installs (the guard's hook replaces it).
 ///
+/// The terminal is never dropped. ratatui's `Drop for Terminal` shows a hidden
+/// cursor again and, when that fails on a closed terminal, reports it with
+/// `eprintln!`, which panics on a dead stderr and aborts the process during an
+/// unwind. [`restore`] shows the cursor instead, from the guard and the panic
+/// hook, and the terminal's memory is left to the end of the process.
+///
 /// # Errors
 ///
 /// Returns an error when the terminal cannot be set up.
-pub(super) fn init() -> io::Result<DefaultTerminal> {
+pub(super) fn init() -> io::Result<ManuallyDrop<DefaultTerminal>> {
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(io::stdout()))
+    Terminal::new(CrosstermBackend::new(io::stdout())).map(ManuallyDrop::new)
 }
 
-/// Leaves the alternate screen and raw mode. A failure is written to stderr,
-/// ignoring a failed write: the terminal may be gone.
+/// Leaves the alternate screen and raw mode, and shows the cursor. A failure is
+/// written to stderr, ignoring a failed write: the terminal may be gone.
 fn restore() {
     if let Err(error) = ratatui::try_restore() {
         writeln!(io::stderr(), "cannot restore the terminal: {error}").ok();
     }
+    execute!(io::stdout(), Show).ok();
 }
 
 /// The task owning crossterm's `EventStream`, forwarding its events, then its
