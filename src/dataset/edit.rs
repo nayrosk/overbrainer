@@ -161,7 +161,13 @@ impl Dataset {
         let mut rewrite = Rewrite::new();
         let touched = change.touched;
         if touched.contains(Touched::REJECTED) {
-            rewrite.stage(&files.rejected, &self.rejected)?;
+            let rejected: Vec<Rejected> = self
+                .rejected
+                .iter()
+                .chain(&change.append)
+                .cloned()
+                .collect();
+            rewrite.stage(&files.rejected, &rejected)?;
         }
         if touched.contains(Touched::SUBTOPICS) {
             rewrite.stage(&files.subtopics, &self.subtopics)?;
@@ -172,7 +178,7 @@ impl Dataset {
         if touched.contains(Touched::ANSWERS) {
             rewrite.stage(&files.answers, &self.answers)?;
         }
-        if !change.append.is_empty() {
+        if !touched.contains(Touched::REJECTED) && !change.append.is_empty() {
             let mut appender = super::Appender::open(&files.rejected)?;
             for record in &change.append {
                 appender.append(record)?;
@@ -239,11 +245,13 @@ impl Dataset {
     /// Replaces the assistant message of answer `id`, which must still read
     /// `before`. The ID, the question and `meta` are left as they are.
     ///
+    /// A reasoning that is `Some` but blank once trimmed is treated as absent.
+    ///
     /// # Errors
     ///
     /// Returns [`EditError::Changed`] when the answer is gone or reads otherwise,
-    /// and [`EditError::ReasoningRemoved`] when `after` has no reasoning but the
-    /// answer has one.
+    /// and [`EditError::ReasoningRemoved`] when `after` has no reasoning (blank
+    /// included) but the answer has one.
     pub fn edit_answer(
         &mut self,
         id: &Id,
@@ -255,7 +263,10 @@ impl Dataset {
             .iter_mut()
             .find(|example| &example.id == id && AnswerText::of(example).as_ref() == Some(before))
             .ok_or(EditError::Changed)?;
-        if before.reasoning.is_some() && after.reasoning.is_none() {
+        let reasoning = after
+            .reasoning
+            .filter(|reasoning| !reasoning.trim().is_empty());
+        if before.reasoning.is_some() && reasoning.is_none() {
             return Err(EditError::ReasoningRemoved);
         }
         if let Some(message) = example
@@ -264,7 +275,7 @@ impl Dataset {
             .find(|message| message.role == Role::Assistant)
         {
             message.content = after.content;
-            message.reasoning_content = after.reasoning;
+            message.reasoning_content = reasoning;
         }
         Ok(Change::new(Touched::ANSWERS, "answer saved"))
     }
@@ -289,7 +300,7 @@ impl Dataset {
         before: &str,
         name: &str,
     ) -> Result<Change, EditError> {
-        if name.contains('\n') {
+        if name.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']) {
             return Err(EditError::MultiLine);
         }
         let index = self
@@ -343,8 +354,9 @@ impl Dataset {
         }
     }
 
-    /// How many new IDs of `keys` are used by a question or an answer that `keys`
-    /// does not re-key.
+    /// How many new IDs of `keys` are already used: by a question or an answer that
+    /// `keys` does not re-key, or by another recomputed ID (two questions whose
+    /// texts normalize the same).
     fn taken(&self, keys: &BTreeMap<Id, Id>) -> usize {
         let used: BTreeSet<&Id> = self
             .questions
@@ -353,7 +365,10 @@ impl Dataset {
             .chain(self.answers.iter().map(|example| &example.id))
             .filter(|id| !keys.contains_key(*id))
             .collect();
-        keys.values().filter(|new_id| used.contains(new_id)).count()
+        let mut recomputed: BTreeSet<&Id> = BTreeSet::new();
+        keys.values()
+            .filter(|new_id| used.contains(new_id) || !recomputed.insert(new_id))
+            .count()
     }
 
     /// Gives subtopic `index` its new ID and name, and its questions, answers and
@@ -413,7 +428,7 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::{FinishReason, Message, Meta, ReasoningKind, Role};
+    use crate::dataset::{Exclusion, FinishReason, Message, Meta, ReasoningKind, Role};
 
     const TOPIC: &str = "ownership";
     const ANSWERED: &str = "What is a borrow?";
@@ -582,6 +597,41 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_edit_keeps_its_exclusion() -> Result<(), EditError> {
+        let mut data = dataset();
+        data.answers[0].meta.excluded = Some(Exclusion::Truncated);
+        let meta = data.answers[0].meta.clone();
+        let before = AnswerText {
+            reasoning: Some("Let me think.".into()),
+            content: "Because.".into(),
+        };
+        let after = AnswerText {
+            reasoning: Some("Think again.".into()),
+            content: "Because of moves.".into(),
+        };
+        data.edit_answer(&answered_id(), &before, after)?;
+        assert_eq!(data.answers[0].meta, meta);
+        Ok(())
+    }
+
+    #[test]
+    fn emptying_an_existing_reasoning_with_only_whitespace_is_refused() {
+        let mut data = dataset();
+        let before_data = data.clone();
+        let before = AnswerText {
+            reasoning: Some("Let me think.".into()),
+            content: "Because.".into(),
+        };
+        let blank = AnswerText {
+            reasoning: Some("   ".into()),
+            content: "Because.".into(),
+        };
+        let result = data.edit_answer(&answered_id(), &before, blank);
+        assert!(matches!(result, Err(EditError::ReasoningRemoved)));
+        assert_eq!(data, before_data);
+    }
+
+    #[test]
     fn emptying_an_existing_reasoning_is_refused_but_an_absent_one_stays_absent()
     -> Result<(), EditError> {
         let mut data = dataset();
@@ -694,6 +744,41 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_refused_when_two_recomputed_question_ids_collide() {
+        let mut data = dataset();
+        data.questions.push(Question {
+            id: Id::of(&["clash-one"]),
+            topic: TOPIC.into(),
+            subtopic_id: borrowing_id(),
+            subtopic: "Borrowing".into(),
+            text: "Why fear the borrow checker?".into(),
+        });
+        data.questions.push(Question {
+            id: Id::of(&["clash-two"]),
+            topic: TOPIC.into(),
+            subtopic_id: borrowing_id(),
+            subtopic: "Borrowing".into(),
+            text: "why FEAR the borrow checker?".into(),
+        });
+        let before = data.clone();
+        let rekey = data.rename_subtopic(&borrowing_id(), "Borrowing", "References");
+        assert!(
+            matches!(rekey, Err(EditError::Rekey { count: 1 })),
+            "{rekey:?}"
+        );
+        assert_eq!(data, before);
+    }
+
+    #[test]
+    fn a_rename_with_a_carriage_return_is_refused_as_multiline() {
+        let mut data = dataset();
+        let before = data.clone();
+        let result = data.rename_subtopic(&borrowing_id(), "Borrowing", "A\rB");
+        assert!(matches!(result, Err(EditError::MultiLine)));
+        assert_eq!(data, before);
+    }
+
+    #[test]
     fn save_rewrites_the_touched_files_only() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let files = DataFiles::new(dir.path());
@@ -708,6 +793,36 @@ mod tests {
         assert_eq!(Dataset::read(&files)?, data);
         assert_eq!(std::fs::read(&files.subtopics)?, subtopics_before);
         assert!(!files.rejected.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn save_stages_existing_and_appended_rejected_records_together()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let files = DataFiles::new(dir.path());
+        let mut data = dataset();
+        data.rejected.push(Rejected::Subtopic {
+            id: Id::subtopic(TOPIC, "Deleted"),
+            topic: TOPIC.into(),
+            name: "Deleted".into(),
+        });
+        crate::dataset::rewrite(&files.rejected, &data.rejected)?;
+        let appended = Rejected::Question {
+            id: Id::question(&borrowing_id(), "Is a borrow free?"),
+            topic: TOPIC.into(),
+            subtopic_id: borrowing_id(),
+            text: "Is a borrow free?".into(),
+        };
+        let change = Change {
+            touched: Touched::REJECTED,
+            append: vec![appended.clone()],
+            message: "test".into(),
+        };
+        data.save(&files, &change)?;
+        let mut expected = data.rejected.clone();
+        expected.push(appended);
+        assert_eq!(read::<Rejected>(&files.rejected)?, expected);
         Ok(())
     }
 }
