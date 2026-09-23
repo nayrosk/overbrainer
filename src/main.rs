@@ -16,7 +16,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    overbrainer::logging::init();
+    overbrainer::logging::init(&overbrainer::logging::LogMode::Stderr);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
