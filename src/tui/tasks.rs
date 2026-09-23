@@ -16,6 +16,7 @@ use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::editor::Edited;
+use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::Command;
 use crate::cli::front::{Frontend, Report};
 use crate::cli::{StageArgs, TrainArgs, TrainCommand};
@@ -24,6 +25,7 @@ use crate::dataset::{Counts, DataFiles, Dataset, Deletion};
 use crate::events::{Event, EventBus};
 use crate::pipeline::{Ctx, SplitReport};
 use crate::prompts::Prompts;
+use crate::train::TrainMetric;
 
 /// Events kept for a TUI task's forwarder when it falls behind. `watch` publishes
 /// every line of one tail read at once, at most 1 MiB, and a metrics line is at
@@ -51,6 +53,10 @@ pub(super) enum Task {
     Pipeline(Command),
     /// A training flow of the command line.
     Train(TrainJob),
+    /// Reads `runs/`, with the pod records.
+    Runs,
+    /// Reads the local metrics file of a run.
+    Series(String),
 }
 
 /// A training flow, run exactly as `overbrainer train` runs it.
@@ -105,6 +111,15 @@ pub(super) enum Done {
     Pipeline(Result<(), String>),
     /// How a training flow ended.
     Trained(Result<(), String>),
+    /// What `runs/` holds.
+    Runs(Listing),
+    /// The local metrics of run `run`, `None` when its file cannot be read.
+    Series {
+        /// The run.
+        run: String,
+        /// Its metrics.
+        series: Option<Vec<TrainMetric>>,
+    },
 }
 
 /// A saved edit.
@@ -300,6 +315,27 @@ impl Tasks {
             },
             Task::Pipeline(command) => self.spawn_pipeline(id, command),
             Task::Train(job) => self.spawn_train(id, job),
+            Task::Runs => {
+                let dir = self.project_dir.clone();
+                self.set.spawn(async move {
+                    let listing = tokio::task::spawn_blocking(move || list_runs(&dir)).await;
+                    Done::Runs(listing.unwrap_or_else(|error| Listing {
+                        runs: Err(format!("cannot list the runs: {error}")),
+                        skipped: Vec::new(),
+                    }))
+                })
+            },
+            Task::Series(run) => {
+                let dir = self.project_dir.clone();
+                self.set.spawn(async move {
+                    let id = run.clone();
+                    let series = tokio::task::spawn_blocking(move || read_series(&dir, &id)).await;
+                    Done::Series {
+                        run,
+                        series: series.ok().flatten(),
+                    }
+                })
+            },
         };
         self.ids.insert(handle.id(), id);
     }
@@ -481,6 +517,37 @@ mod tests {
         };
         assert_eq!(error, format!("run {run} has not started"));
         assert!(tasks.is_empty());
+        Ok(())
+    }
+
+    /// The runs and a run's metrics are read in tasks, off the loop's thread.
+    #[tokio::test]
+    async fn runs_and_metrics_are_read_in_tasks() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let run = "20260921-133200-a1b2";
+        let runs = crate::runs::Runs::new(dir.path());
+        runs.save(&crate::tui::snapshots::run(
+            run,
+            "homelab",
+            crate::runs::RunState::Running,
+        ))?;
+        std::fs::write(
+            runs.run_dir(run)?.join(crate::train::METRICS_FILE),
+            "{\"event\": \"log\", \"time\": 2, \"step\": 1, \"loss\": 1.5}\n",
+        )?;
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
+        tasks.spawn(TaskId(1), Task::Runs);
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        let Some((TaskId(1), Ok(Done::Runs(Listing { runs: Ok(rows), .. })))) = next else {
+            return Err(format!("unexpected end: {next:?}").into());
+        };
+        assert_eq!(rows.len(), 1);
+        tasks.spawn(TaskId(2), Task::Series(run.into()));
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        let Some((TaskId(2), Ok(Done::Series { series, .. }))) = next else {
+            return Err(format!("unexpected end: {next:?}").into());
+        };
+        assert_eq!(series.map(|s| s.len()), Some(1));
         Ok(())
     }
 

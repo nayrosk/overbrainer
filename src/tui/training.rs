@@ -1,7 +1,7 @@
 //! The Training view's model: the runs of `runs/`, their metrics, and the
 //! training tasks the TUI follows.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -79,23 +79,59 @@ impl Follow {
     }
 }
 
-/// A training task that ended: its messages handled after its end still count.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Last {
-    /// Its run.
-    pub(super) run_id: String,
-    /// Whether the run's metrics were read again from its local file when the
-    /// task ended: they then hold every late metric.
-    pub(super) healed: bool,
-}
-
 /// How the last task of a run ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Ended {
     /// The lines it reported.
     pub(super) lines: Vec<String>,
     /// Its error, if it failed or was detached.
     pub(super) error: Option<String>,
+    /// Metrics its forwarder skipped.
+    pub(super) skipped: u64,
+    /// Whether the run's metrics were read again from its local file since: they
+    /// then hold every metric, late or skipped.
+    pub(super) healed: bool,
+}
+
+/// What a read of `runs/` found: the runs newest first, or why they cannot be
+/// listed, and the warnings of the records it skipped.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Listing {
+    /// The runs, newest first.
+    pub(super) runs: Result<Vec<RunRow>, String>,
+    /// Why a run record or a pod record was skipped, one line each.
+    pub(super) skipped: Vec<String>,
+}
+
+/// Reads the runs of the project in `dir`, with their pod records: local files
+/// only. Blocking.
+pub(super) fn list_runs(dir: &Path) -> Listing {
+    let runs = Runs::new(dir);
+    let mut skipped = Vec::new();
+    let listed = runs.list_with(|id, error| {
+        skipped.push(format!("skipping unreadable run record for {id}: {error}"));
+    });
+    let runs = match listed {
+        Ok(records) => Ok(records
+            .into_iter()
+            .rev()
+            .map(|record| {
+                let pod = match PodRecord::load(&runs, &record.id) {
+                    Ok(pod) => pod,
+                    Err(error) => {
+                        skipped.push(format!(
+                            "cannot read the pod record of run {}: {error}",
+                            record.id
+                        ));
+                        None
+                    },
+                };
+                RunRow { record, pod }
+            })
+            .collect()),
+        Err(error) => Err(format!("cannot list the runs: {error}")),
+    };
+    Listing { runs, skipped }
 }
 
 /// The Training view's state.
@@ -105,7 +141,8 @@ pub(super) struct TrainingView {
     pub(super) runs: Vec<RunRow>,
     /// The selected run, by position in `runs`.
     pub(super) selected: usize,
-    /// Why the runs could not be listed.
+    /// Why the runs could not be listed at the last read; the runs shown are
+    /// then those of an earlier read.
     pub(super) error: Option<String>,
     /// Metrics of each run shown, by run ID.
     pub(super) series: BTreeMap<String, Vec<TrainMetric>>,
@@ -113,8 +150,20 @@ pub(super) struct TrainingView {
     pub(super) tasks: BTreeMap<TaskId, Follow>,
     /// How the last task of each run ended.
     pub(super) ended: BTreeMap<String, Ended>,
-    /// The training tasks that ended, until another task starts on their run.
-    pub(super) last: BTreeMap<TaskId, Last>,
+    /// The training tasks that ended, with their run, until another task
+    /// starts on it: their messages handled after their end still count.
+    pub(super) last: BTreeMap<TaskId, String>,
+    /// The read of `runs/` running, if any.
+    pub(super) listing: Option<TaskId>,
+    /// Whether another read of `runs/` was asked for while one ran.
+    pub(super) list_again: bool,
+    /// The run to select once it is listed (a run just created).
+    pub(super) wanted: Option<String>,
+    /// The latest read of each run's local metrics, by run ID; an earlier one's
+    /// result is ignored.
+    pub(super) reading: BTreeMap<String, TaskId>,
+    /// The listing warnings already logged: each is logged once.
+    pub(super) warned: BTreeSet<String>,
 }
 
 /// The progress a series of metrics shows.
@@ -176,28 +225,34 @@ pub(super) fn read_series(dir: &Path, id: &str) -> Option<Vec<TrainMetric>> {
 }
 
 impl TrainingView {
-    /// Reads the runs of the project in `dir` again, keeping the selected run.
-    pub(super) fn refresh(&mut self, dir: &Path) {
-        let runs = Runs::new(dir);
+    /// Shows the runs of `listing`, keeping the selected run, or selecting the
+    /// run wanted once it is listed. When it failed, the earlier runs stay, with
+    /// its error. Returns the warnings not logged yet.
+    pub(super) fn listed(&mut self, listing: Listing) -> Vec<String> {
         let selected = self.selected_run().map(|row| row.record.id.clone());
-        match runs.list() {
-            Ok(records) => {
-                self.runs = records
-                    .into_iter()
-                    .rev()
-                    .map(|record| RunRow {
-                        pod: PodRecord::load(&runs, &record.id).ok().flatten(),
-                        record,
-                    })
-                    .collect();
+        match listing.runs {
+            Ok(runs) => {
+                self.runs = runs;
                 self.error = None;
             },
-            Err(error) => self.error = Some(format!("cannot list the runs: {error}")),
+            Err(error) => self.error = Some(error),
         }
         if let Some(id) = selected {
             self.select(&id);
         }
+        if let Some(id) = self.wanted.take() {
+            if self.runs.iter().any(|row| row.record.id == id) {
+                self.select(&id);
+            } else {
+                self.wanted = Some(id);
+            }
+        }
         self.selected = self.selected.min(self.runs.len().saturating_sub(1));
+        listing
+            .skipped
+            .into_iter()
+            .filter(|warning| self.warned.insert(warning.clone()))
+            .collect()
     }
 
     /// Selects run `id`, when listed.
@@ -225,18 +280,21 @@ impl TrainingView {
         self.tasks.contains_key(&id) || self.last.contains_key(&id)
     }
 
-    /// Loads the metrics of the selected run from its local file, once, unless a
-    /// task follows it.
-    pub(super) fn load_selected(&mut self, dir: &Path) {
-        let Some(id) = self.selected_run().map(|row| row.record.id.clone()) else {
-            return;
-        };
-        if self.series.contains_key(&id) || self.task_of(&id).is_some() {
-            return;
-        }
-        if let Some(series) = read_series(dir, &id) {
-            self.series.insert(id, series);
-        }
+    /// The selected run, when its local metrics are to be read: not read yet,
+    /// not being read, and followed by no task.
+    pub(super) fn to_read(&self) -> Option<String> {
+        let id = &self.selected_run()?.record.id;
+        let skip = self.series.contains_key(id)
+            || self.reading.contains_key(id)
+            || self.task_of(id).is_some();
+        (!skip).then(|| id.clone())
+    }
+
+    /// Whether run `id` is being cancelled: by a cancel task, or by one that
+    /// detaches its task first.
+    pub(super) fn cancelling(&self, id: &str) -> bool {
+        self.task_of(id)
+            .is_some_and(|(_, follow)| follow.job == Job::Cancel || follow.cancel_after)
     }
 
     /// Records `event` of task `id`. Returns whether it is the first job status

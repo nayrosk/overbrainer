@@ -3,40 +3,121 @@
 //!
 //! A training task's token is cancelled only once its job's first status arrived
 //! (its watch began), so a start is never cut: asked to detach before, it is
-//! marked and detached then. Only a process signal abandons a task at once.
+//! marked and detached then. Only a process signal abandons a task at once. A
+//! confirmed cancel always runs, quitting included; only a signal drops one not
+//! started yet, and says how to run it.
+//!
+//! Files are read by tasks, never on the loop's thread nor while drawing.
 
 use std::time::{Duration, SystemTime};
 
 use crossterm::event::KeyCode;
 
-use super::app::{Action, App, Confirm, Effect, Overlay, Severity, View};
+use super::app::{Action, App, Confirm, Effect, Exit, Overlay, Severity, View};
 use super::tasks::{Msg, Task, TaskId, TrainJob};
-use super::training::{Detach, Ended, Follow, Job, Last, read_series};
+use super::training::{Detach, Ended, Follow, Job, Listing};
 use crate::cli::front::Report;
 use crate::events::Event;
+use crate::train::TrainMetric;
 
 /// Time between two reads of `runs/` while the Training view is shown.
 const REFRESH: Duration = Duration::from_secs(2);
 
 impl App {
-    /// Reads `runs/` again, and the local metrics of the selected run.
-    pub(super) fn refresh_runs(&mut self) {
-        self.training.refresh(&self.project.dir);
-        self.training.load_selected(&self.project.dir);
+    /// Reads `runs/` again, in a task; while one reads, once more after it.
+    pub(super) fn refresh_runs(&mut self) -> Vec<Effect> {
         self.refreshed = self.now;
-        self.dirty = true;
+        if self.training.listing.is_some() {
+            self.training.list_again = true;
+            return Vec::new();
+        }
+        let id = self.task_id();
+        self.training.listing = Some(id);
+        vec![Effect::Spawn(id, Task::Runs)]
     }
 
     /// Reads `runs/` again when the Training view is shown and it is time (or
     /// the clock went back).
-    pub(super) fn refresh_when_due(&mut self) {
+    pub(super) fn refresh_when_due(&mut self) -> Vec<Effect> {
         let recent = matches!(
             self.now.duration_since(self.refreshed),
             Ok(since) if since < REFRESH
         );
         if self.view == View::Training && !recent {
-            self.refresh_runs();
+            return self.refresh_runs();
         }
+        Vec::new()
+    }
+
+    /// Read `id` of `runs/` found `listing`: shown when it is the latest read,
+    /// then the selected run's metrics are read, and a read asked for meanwhile
+    /// starts. Each new warning is logged once.
+    pub(super) fn listed(&mut self, id: TaskId, listing: Listing) -> Vec<Effect> {
+        if self.training.listing != Some(id) {
+            return Vec::new();
+        }
+        self.training.listing = None;
+        self.dirty = true;
+        for warning in self.training.listed(listing) {
+            tracing::warn!("{warning}");
+        }
+        let mut effects = self.read_selected();
+        if std::mem::take(&mut self.training.list_again) {
+            effects.extend(self.refresh_runs());
+        }
+        effects
+    }
+
+    /// Reads the local metrics of the selected run, in a task, once, unless a
+    /// task follows it.
+    fn read_selected(&mut self) -> Vec<Effect> {
+        match self.training.to_read() {
+            Some(run) => self.read_series(&run),
+            None => Vec::new(),
+        }
+    }
+
+    /// Reads the local metrics of run `run` in a task; an earlier read of it no
+    /// longer counts.
+    fn read_series(&mut self, run: &str) -> Vec<Effect> {
+        let id = self.task_id();
+        self.training.reading.insert(run.to_string(), id);
+        vec![Effect::Spawn(id, Task::Series(run.to_string()))]
+    }
+
+    /// Read `id` of run `run`'s local metrics found `series`: kept when it is
+    /// that run's latest read. Read after a task of the run ended, they hold
+    /// every metric, late or skipped.
+    pub(super) fn series_read(
+        &mut self,
+        id: TaskId,
+        run: String,
+        series: Option<Vec<TrainMetric>>,
+    ) -> Vec<Effect> {
+        if self.training.reading.get(&run) != Some(&id) {
+            return Vec::new();
+        }
+        self.training.reading.remove(&run);
+        if let Some(series) = series {
+            if let Some(ended) = self.training.ended.get_mut(&run) {
+                ended.healed = true;
+            }
+            self.training.series.insert(run, series);
+            self.dirty = true;
+        }
+        Vec::new()
+    }
+
+    /// Read task `id` failed (a panic): it no longer counts.
+    pub(super) fn read_failed(&mut self, id: TaskId, error: &str) -> bool {
+        if self.training.listing == Some(id) {
+            self.training.listing = None;
+            self.training.error = Some(format!("cannot list the runs: {error}"));
+            return true;
+        }
+        let before = self.training.reading.len();
+        self.training.reading.retain(|_, read| *read != id);
+        before != self.training.reading.len()
     }
 
     /// A key in the Training view.
@@ -48,14 +129,17 @@ impl App {
                 view.selected = (view.selected + 1).min(view.runs.len().saturating_sub(1));
             },
             KeyCode::Char('a') => return self.attach_selected(),
-            KeyCode::Char('c') => self.ask_cancel(),
+            KeyCode::Char('c') => {
+                self.ask_cancel();
+                return Vec::new();
+            },
             _ => return Vec::new(),
         }
-        self.training.load_selected(&self.project.dir);
-        Vec::new()
+        self.read_selected()
     }
 
-    /// `a`: follows the selected run again, from its first metric.
+    /// `a`: follows the selected run again, from its first metric; refused
+    /// while the TUI is quitting.
     fn attach_selected(&mut self) -> Vec<Effect> {
         let Some(id) = self
             .training
@@ -64,12 +148,16 @@ impl App {
         else {
             return Vec::new();
         };
-        if let Some((_, follow)) = self.training.task_of(&id) {
-            let said = match follow.job {
-                Job::Attach => format!("run {id} is already followed"),
-                Job::Cancel => format!("run {id} is being cancelled"),
-            };
-            self.say(Severity::Info, said);
+        if self.leaving.is_some() {
+            self.say(Severity::Warn, "refused: quitting; nothing new is followed");
+            return Vec::new();
+        }
+        if self.training.cancelling(&id) {
+            self.say(Severity::Info, format!("run {id} is being cancelled"));
+            return Vec::new();
+        }
+        if self.training.task_of(&id).is_some() {
+            self.say(Severity::Info, format!("run {id} is already followed"));
             return Vec::new();
         }
         self.training.series.remove(&id);
@@ -78,29 +166,31 @@ impl App {
     }
 
     /// Starts a training task doing `job` on run `run_id`. The late messages of
-    /// the run's earlier tasks no longer count.
+    /// the run's earlier tasks, and a read of its metrics, no longer count.
     fn train(&mut self, job: Job, run_id: &str) -> Vec<Effect> {
         let id = self.task_id();
         let task = match job {
             Job::Attach => TrainJob::Attach(run_id.to_string()),
             Job::Cancel => TrainJob::Cancel(run_id.to_string()),
         };
-        self.training.last.retain(|_, last| last.run_id != run_id);
+        self.training.last.retain(|_, run| run != run_id);
+        self.training.reading.remove(run_id);
         self.training.tasks.insert(id, Follow::new(job, run_id));
         vec![Effect::Spawn(id, Task::Train(task))]
     }
 
-    /// `c`: asks to cancel the selected run's job.
+    /// `c`: asks to cancel the selected run's job; refused after a signal.
     fn ask_cancel(&mut self) {
         let Some(row) = self.training.selected_run() else {
             return;
         };
         let (id, target) = (row.record.id.clone(), row.record.target.clone());
-        if matches!(self.training.task_of(&id), Some((_, follow)) if follow.job == Job::Cancel) {
-            self.say(
-                Severity::Info,
-                format!("run {id} is already being cancelled"),
-            );
+        if self.training.cancelling(&id) {
+            self.say(Severity::Info, format!("run {id} is being cancelled"));
+            return;
+        }
+        if self.leaving == Some(Exit::Signal) {
+            self.say(Severity::Warn, "refused: interrupted, exiting");
             return;
         }
         self.overlay = Some(Overlay::Confirm(Confirm {
@@ -119,16 +209,13 @@ impl App {
     /// Cancels run `run_id`: a task following it is detached first, and the
     /// cancel starts once it ended, so two flows never end the same pod at once.
     pub(super) fn cancel_run(&mut self, run_id: &str) -> Vec<Effect> {
-        let Some((task, follow)) = self.training.task_of(run_id) else {
-            return self.train(Job::Cancel, run_id);
-        };
-        if follow.job == Job::Cancel {
-            self.say(
-                Severity::Info,
-                format!("run {run_id} is already being cancelled"),
-            );
+        if self.training.cancelling(run_id) {
+            self.say(Severity::Info, format!("run {run_id} is being cancelled"));
             return Vec::new();
         }
+        let Some((task, _)) = self.training.task_of(run_id) else {
+            return self.train(Job::Cancel, run_id);
+        };
         if let Some(follow) = self.training.tasks.get_mut(&task) {
             follow.cancel_after = true;
         }
@@ -190,8 +277,8 @@ impl App {
                 if let Some(follow) = self.training.tasks.get_mut(&id) {
                     follow.run_id.clone_from(&run_id);
                 }
-                self.refresh_runs();
-                self.training.select(&run_id);
+                self.training.wanted = Some(run_id);
+                return self.refresh_runs();
             },
             Msg::EditorExited(_) => {},
         }
@@ -202,13 +289,18 @@ impl App {
     /// its run ended, and a metric its series, unless the series was read again
     /// from the local file (which holds it).
     fn late_training_message(&mut self, id: TaskId, message: Msg) {
-        let Some(last) = self.training.last.get(&id) else {
+        let Some(run) = self.training.last.get(&id).cloned() else {
             return;
         };
-        let run = last.run_id.clone();
+        let healed = self.training.ended.get(&run).is_some_and(|e| e.healed);
         match message {
-            Msg::Event(_, Event::Metric(metric)) if !last.healed => {
+            Msg::Event(_, Event::Metric(metric)) if !healed => {
                 self.training.series.entry(run).or_default().push(metric);
+            },
+            Msg::Lagged(_, skipped) => {
+                if let Some(ended) = self.training.ended.get_mut(&run) {
+                    ended.skipped += skipped;
+                }
             },
             Msg::Report(_, Report::Line(line)) => {
                 if self.leaving.is_some() {
@@ -222,18 +314,28 @@ impl App {
         }
     }
 
-    /// Training task `id` ended with `result`. While the TUI is leaving, what it
-    /// reported and its error (a detached run's "keeps running ... attach") are
-    /// kept for the exit.
+    /// Training task `id` ended with `result`. A cancel waiting for it starts,
+    /// unless a signal came (an exit note then says how to cancel). While the
+    /// TUI is leaving, what it reported and its error (a detached run's "keeps
+    /// running ... attach") are kept for the exit.
     pub(super) fn trained(&mut self, id: TaskId, result: Result<(), String>) -> Vec<Effect> {
         let Some(follow) = self.training.tasks.remove(&id) else {
             return Vec::new();
         };
         let run = follow.run_id.clone();
         let error = result.err();
+        let cancel = follow.cancel_after && self.leaving != Some(Exit::Signal);
         if self.leaving.is_some() {
             self.exit_notes.extend(follow.lines.iter().cloned());
-            self.exit_notes.extend(error.iter().cloned());
+            if !cancel {
+                self.exit_notes.extend(error.iter().cloned());
+            }
+            if follow.cancel_after && !cancel {
+                self.exit_notes.push(format!(
+                    "run {run} was not cancelled: interrupted before its cancel started; \
+                     cancel it with `overbrainer train cancel {run}`"
+                ));
+            }
         }
         match &error {
             Some(error) if !follow.cancel_after => {
@@ -247,29 +349,21 @@ impl App {
             Ended {
                 lines: follow.lines,
                 error,
+                skipped: follow.skipped,
+                healed: false,
             },
         );
-        // The local metrics, retrieved with the results, heal any missing point.
-        let healed = match read_series(&self.project.dir, &run) {
-            Some(series) => {
-                self.training.series.insert(run.clone(), series);
-                true
-            },
-            None => false,
-        };
-        self.training.last.insert(
-            id,
-            Last {
-                run_id: run.clone(),
-                healed,
-            },
-        );
-        self.refresh_runs();
-        let effects = if follow.cancel_after && self.leaving.is_none() {
-            self.train(Job::Cancel, &run)
-        } else {
-            Vec::new()
-        };
+        self.training.last.insert(id, run.clone());
+        let mut effects = Vec::new();
+        if self.leaving.is_none() {
+            // The local metrics, retrieved with the results, heal any missing
+            // point.
+            effects.extend(self.read_series(&run));
+            effects.extend(self.refresh_runs());
+        }
+        if cancel {
+            effects.extend(self.train(Job::Cancel, &run));
+        }
         self.leave_when_idle();
         effects
     }
@@ -283,6 +377,10 @@ impl App {
                 let run = &follow.run_id;
                 match follow.job {
                     Job::Cancel => format!("Run {run}: cancel in progress, quitting waits for it."),
+                    Job::Attach if follow.cancel_after => format!(
+                        "Run {run}: cancel pending, it starts once the run is detached; \
+                         quitting waits for it."
+                    ),
                     Job::Attach => format!(
                         "Run {run} keeps running{}; attach again from here or with \
                          `overbrainer train attach {run}`.",

@@ -198,6 +198,21 @@ impl Runs {
     ///
     /// Returns an error when `runs/` itself cannot be read.
     pub fn list(&self) -> Result<Vec<RunRecord>, RunsError> {
+        self.list_with(|id, error| {
+            tracing::warn!("skipping unreadable run record for {id}: {error}");
+        })
+    }
+
+    /// [`Runs::list`], calling `skipped` with the ID and error of each record
+    /// that fails to load instead of logging it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `runs/` itself cannot be read.
+    pub fn list_with(
+        &self,
+        mut skipped: impl FnMut(&str, &RunsError),
+    ) -> Result<Vec<RunRecord>, RunsError> {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -217,7 +232,7 @@ impl Runs {
             match self.load(id) {
                 Ok(record) => records.push(record),
                 Err(error @ (RunsError::Invalid { .. } | RunsError::Io { .. })) => {
-                    tracing::warn!("skipping unreadable run record for {id}: {error}");
+                    skipped(id, &error);
                 },
                 Err(error) => return Err(error),
             }

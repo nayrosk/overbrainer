@@ -428,6 +428,8 @@ impl App {
             Ok(Done::Saved(saved)) => self.saved(saved),
             Ok(Done::Pipeline(outcome)) => self.pipeline_ended(id, outcome),
             Ok(Done::Trained(result)) => self.trained(id, result),
+            Ok(Done::Runs(listing)) => self.listed(id, listing),
+            Ok(Done::Series { run, series }) => self.series_read(id, run, series),
             Err(error) => self.failed(id, error),
         }
     }
@@ -457,6 +459,9 @@ impl App {
         }
         if self.training.tasks.contains_key(&id) {
             return self.trained(id, Err(error));
+        }
+        if self.read_failed(id, &error) {
+            return Vec::new();
         }
         if self.load == Some(id) {
             self.load = None;
@@ -778,12 +783,12 @@ impl App {
             KeyCode::Char('R') => return self.reload(),
             KeyCode::Char('r') => self.run_menu(),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
-            KeyCode::Char('1') => self.show(View::Dataset),
-            KeyCode::Char('2') => self.show(View::Pipeline),
-            KeyCode::Char('3') => self.show(View::Training),
-            KeyCode::Char('4') => self.show(View::Logs),
-            KeyCode::Tab => self.show(self.view.shifted(1)),
-            KeyCode::BackTab => self.show(self.view.shifted(View::ALL.len() - 1)),
+            KeyCode::Char('1') => return self.show(View::Dataset),
+            KeyCode::Char('2') => return self.show(View::Pipeline),
+            KeyCode::Char('3') => return self.show(View::Training),
+            KeyCode::Char('4') => return self.show(View::Logs),
+            KeyCode::Tab => return self.show(self.view.shifted(1)),
+            KeyCode::BackTab => return self.show(self.view.shifted(View::ALL.len() - 1)),
             code => return self.on_view_key(code),
         }
         Vec::new()
@@ -791,11 +796,12 @@ impl App {
 
     /// Shows `view`; the Training view reads `runs/` again. Leaving a view never
     /// touches a task.
-    fn show(&mut self, view: View) {
+    fn show(&mut self, view: View) -> Vec<Effect> {
         self.view = view;
         if view == View::Training {
-            self.refresh_runs();
+            return self.refresh_runs();
         }
+        Vec::new()
     }
 
     /// `y` runs the dialog's action; any other key closes it.
@@ -1068,6 +1074,27 @@ impl App {
         effects
     }
 
+    /// What the TUI waits for once its loop ended, one line each: an edit being
+    /// saved, the stage stopping, and each training task.
+    pub(super) fn waiting_for(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.edit.is_some() {
+            lines.push("waiting for an edit to be saved...".to_string());
+        }
+        if self.pipeline_task.is_some() {
+            let name = self.pipeline.command.map_or("stage", command_name);
+            lines.push(format!("waiting for {name} to stop..."));
+        }
+        lines.extend(self.training.tasks.values().map(|follow| {
+            let run = &follow.run_id;
+            match follow.job {
+                super::training::Job::Cancel => format!("waiting for the cancel of run {run}..."),
+                super::training::Job::Attach => format!("waiting for run {run} to detach..."),
+            }
+        }));
+        lines
+    }
+
     /// `n` or Esc while quitting: stays. A stage stopped and a run detached
     /// still end; a run waiting for its job to detach keeps being followed.
     fn stay(&mut self) {
@@ -1117,10 +1144,11 @@ impl App {
     }
 
     /// Moves the clock to `now`: expires the status message and shows new log
-    /// lines, and the newest warning or error on the status line.
-    pub(super) fn on_tick(&mut self, now: SystemTime) {
+    /// lines, and the newest warning or error on the status line; reads `runs/`
+    /// again when the Training view is shown and it is time.
+    pub(super) fn on_tick(&mut self, now: SystemTime) -> Vec<Effect> {
         self.now = now;
-        self.refresh_when_due();
+        let effects = self.refresh_when_due();
         if self.status.as_ref().is_some_and(|status| {
             now.duration_since(status.at)
                 .is_ok_and(|shown| shown >= STATUS_FOR)
@@ -1130,7 +1158,7 @@ impl App {
         }
         let seq = self.logs.seq();
         if seq == self.seen_log {
-            return;
+            return effects;
         }
         if self.view == View::Logs {
             self.dirty = true;
@@ -1146,6 +1174,7 @@ impl App {
             self.say(severity, line.message);
         }
         self.seen_log = seq;
+        effects
     }
 }
 
@@ -2156,29 +2185,77 @@ mod tests {
         );
     }
 
+    /// Runs the reads among `effects` at once, as their tasks would, and hands
+    /// their results to `app`; returns the other effects.
+    fn read(app: &mut App, effects: Vec<Effect>) -> Vec<Effect> {
+        use crate::tui::training::{list_runs, read_series};
+        let mut left = Vec::new();
+        let mut queue: std::collections::VecDeque<Effect> = effects.into();
+        while let Some(effect) = queue.pop_front() {
+            let more = match effect {
+                Effect::Spawn(id, Task::Runs) => {
+                    let listing = list_runs(&app.project.dir);
+                    app.on_done(id, Ok(Done::Runs(listing)))
+                },
+                Effect::Spawn(id, Task::Series(run)) => {
+                    let series = read_series(&app.project.dir, &run);
+                    app.on_done(id, Ok(Done::Series { run, series }))
+                },
+                other => {
+                    left.push(other);
+                    continue;
+                },
+            };
+            queue.extend(more);
+        }
+        left
+    }
+
+    /// [`press`], with the reads it starts run at once.
+    fn keys(app: &mut App, codes: &[KeyCode]) -> Vec<Effect> {
+        let effects = press(app, codes);
+        read(app, effects)
+    }
+
+    /// [`App::on_done`], with the reads it starts run at once.
+    fn ended(app: &mut App, id: TaskId, result: Result<Done, String>) -> Vec<Effect> {
+        let effects = app.on_done(id, result);
+        read(app, effects)
+    }
+
+    const FIRST: &str = "20260921-133200-a1b2";
+    const SECOND: &str = "20260920-101500-9f00";
+
     fn runs_app() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
         let (dir, mut app) = project_app()?;
         let runs = crate::runs::Runs::new(dir.path());
         for (id, state) in [
-            ("20260921-133200-a1b2", crate::runs::RunState::Running),
-            ("20260920-101500-9f00", crate::runs::RunState::Succeeded),
+            (FIRST, crate::runs::RunState::Running),
+            (SECOND, crate::runs::RunState::Succeeded),
         ] {
             runs.save(&crate::tui::snapshots::run(id, "homelab", state))?;
         }
         std::fs::write(
-            runs.run_dir("20260920-101500-9f00")?
-                .join(crate::train::METRICS_FILE),
+            runs.run_dir(SECOND)?.join(crate::train::METRICS_FILE),
             "{\"event\": \"log\", \"time\": 2, \"step\": 1, \"loss\": 1.5}\n",
         )?;
-        press(&mut app, &[KeyCode::Char('3')]);
+        keys(&mut app, &[KeyCode::Char('3')]);
         Ok((dir, app))
     }
 
     /// `a` on the selected run: the task it spawns.
     fn attach(app: &mut App) -> Result<TaskId, String> {
-        let effects = press(app, &[KeyCode::Char('a')]);
+        let effects = keys(app, &[KeyCode::Char('a')]);
         match effects.as_slice() {
             [Effect::Spawn(id, Task::Train(TrainJob::Attach(_)))] => Ok(*id),
+            _ => Err(format!("{effects:?}")),
+        }
+    }
+
+    /// The only effect of `effects`, a cancel task started.
+    fn cancel_started(effects: &[Effect]) -> Result<TaskId, String> {
+        match effects {
+            [Effect::Spawn(id, Task::Train(TrainJob::Cancel(run)))] if run == FIRST => Ok(*id),
             _ => Err(format!("{effects:?}")),
         }
     }
@@ -2189,6 +2266,19 @@ mod tests {
             id,
             crate::events::Event::JobStatus(crate::exec::JobStatus::Running),
         ))
+    }
+
+    fn metric(step: u64) -> crate::train::TrainMetric {
+        crate::train::TrainMetric {
+            time: 1.0,
+            step,
+            epoch: None,
+            max_steps: Some(4),
+            loss: Some(2.0),
+            eval_loss: None,
+            learning_rate: None,
+            grad_norm: None,
+        }
     }
 
     const DETACHED: &str = "interrupted: run 20260921-133200-a1b2 keeps running on target \
@@ -2205,16 +2295,19 @@ mod tests {
             .iter()
             .map(|r| r.record.id.as_str())
             .collect();
-        assert_eq!(ids, ["20260921-133200-a1b2", "20260920-101500-9f00"]);
-        assert!(!app.training.series.contains_key("20260921-133200-a1b2"));
-        press(&mut app, &[KeyCode::Char('j')]);
-        assert_eq!(
-            app.training
-                .series
-                .get("20260920-101500-9f00")
-                .map(Vec::len),
-            Some(1)
+        assert_eq!(ids, [FIRST, SECOND]);
+        assert!(!app.training.series.contains_key(FIRST));
+        let effects = press(&mut app, &[KeyCode::Char('j')]);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Spawn(_, Task::Series(run))] if run == SECOND),
+            "read in a task: {effects:?}"
         );
+        read(&mut app, effects);
+        assert_eq!(app.training.series.get(SECOND).map(Vec::len), Some(1));
+        let again = keys(&mut app, &[KeyCode::Char('k')]);
+        assert_eq!(again, [], "its read ran");
+        let again = press(&mut app, &[KeyCode::Char('j')]);
+        assert_eq!(again, [], "SECOND is read once");
         Ok(())
     }
 
@@ -2223,24 +2316,97 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (dir, mut app) = runs_app()?;
         let runs = crate::runs::Runs::new(dir.path());
-        runs.save(&crate::tui::snapshots::run(
-            "20260922-080000-beef",
-            "homelab",
-            crate::runs::RunState::Preparing,
-        ))?;
-        app.on_tick(at(NOW + 1));
-        assert_eq!(app.training.runs.len(), 2, "read at most every 2 s");
-        app.on_tick(at(NOW + 2));
+        let record =
+            |id| crate::tui::snapshots::run(id, "homelab", crate::runs::RunState::Preparing);
+        runs.save(&record("20260922-080000-beef"))?;
+        let effects = app.on_tick(at(NOW + 1));
+        assert_eq!(effects, [], "read at most every 2 s");
+        let effects = app.on_tick(at(NOW + 2));
+        read(&mut app, effects);
         assert_eq!(app.training.runs.len(), 3);
         assert_eq!(app.training.runs[0].record.id, "20260922-080000-beef");
-        runs.save(&crate::tui::snapshots::run(
-            "20260923-080000-cafe",
-            "homelab",
-            crate::runs::RunState::Preparing,
-        ))?;
-        press(&mut app, &[KeyCode::Char('1')]);
-        app.on_tick(at(NOW + 10));
-        assert_eq!(app.training.runs.len(), 3, "not read while hidden");
+        runs.save(&record("20260923-080000-cafe"))?;
+        keys(&mut app, &[KeyCode::Char('1')]);
+        assert_eq!(app.on_tick(at(NOW + 10)), [], "not read while hidden");
+        Ok(())
+    }
+
+    #[test]
+    fn a_listing_asked_for_while_one_runs_starts_after_it_and_stale_reads_are_ignored()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::training::{Listing, list_runs};
+        let (_dir, mut app) = runs_app()?;
+        let first = app.refresh_runs();
+        let [Effect::Spawn(listing, Task::Runs)] = first.as_slice() else {
+            return Err(format!("{first:?}").into());
+        };
+        assert_eq!(app.refresh_runs(), [], "one read at a time");
+        let again = app.on_done(*listing, Ok(Done::Runs(list_runs(&app.project.dir))));
+        assert!(
+            again
+                .iter()
+                .any(|e| matches!(e, Effect::Spawn(_, Task::Runs))),
+            "{again:?}"
+        );
+        let stale = Listing {
+            runs: Ok(Vec::new()),
+            skipped: Vec::new(),
+        };
+        assert_eq!(app.on_done(*listing, Ok(Done::Runs(stale))), []);
+        assert_eq!(app.training.runs.len(), 2, "a stale listing is ignored");
+        // A read of the metrics started before an attach no longer counts.
+        let reading = press(&mut app, &[KeyCode::Char('j')]);
+        let [Effect::Spawn(read_id, Task::Series(_))] = reading.as_slice() else {
+            return Err(format!("{reading:?}").into());
+        };
+        attach(&mut app)?;
+        let old = Some(vec![metric(1)]);
+        app.on_done(
+            *read_id,
+            Ok(Done::Series {
+                run: SECOND.into(),
+                series: old,
+            }),
+        );
+        assert_eq!(app.training.series.get(SECOND), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_listing_keeps_the_runs_shown_and_marks_them_stale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::training::Listing;
+        let (_dir, mut app) = runs_app()?;
+        let effects = app.refresh_runs();
+        let [Effect::Spawn(listing, Task::Runs)] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        let failed = Listing {
+            runs: Err("cannot list the runs: permission denied".into()),
+            skipped: Vec::new(),
+        };
+        app.on_done(*listing, Ok(Done::Runs(failed)));
+        assert_eq!(app.training.runs.len(), 2);
+        let rows = text(&draw(&mut app, 80, 24)?);
+        assert!(
+            rows[1].contains(" runs (stale: cannot list the runs) "),
+            "{}",
+            rows[1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_skipped_record_is_warned_about_once() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::training::list_runs;
+        let (dir, mut app) = runs_app()?;
+        let broken = dir.path().join("runs/20260922-080000-beef");
+        std::fs::create_dir_all(&broken)?;
+        std::fs::write(broken.join("run.json"), "not json")?;
+        let listing = list_runs(dir.path());
+        assert_eq!(listing.skipped.len(), 1, "{listing:?}");
+        assert_eq!(app.training.listed(listing.clone()).len(), 1);
+        assert_eq!(app.training.listed(listing), Vec::<String>::new());
         Ok(())
     }
 
@@ -2248,23 +2414,12 @@ mod tests {
     fn a_attaches_once_and_its_events_feed_the_run() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = runs_app()?;
         let id = attach(&mut app)?;
-        let run = "20260921-133200-a1b2";
-        assert_eq!(press(&mut app, &[KeyCode::Char('a')]), []);
+        assert_eq!(keys(&mut app, &[KeyCode::Char('a')]), []);
         assert_eq!(
             status(&app),
             Some("run 20260921-133200-a1b2 is already followed")
         );
-        let metric = crate::train::TrainMetric {
-            time: 1.0,
-            step: 1,
-            epoch: None,
-            max_steps: Some(4),
-            loss: Some(2.0),
-            eval_loss: None,
-            learning_rate: None,
-            grad_norm: None,
-        };
-        app.on_message(Msg::Event(id, crate::events::Event::Metric(metric.clone())));
+        app.on_message(Msg::Event(id, crate::events::Event::Metric(metric(1))));
         assert_eq!(watching(&mut app, id), []);
         app.on_message(Msg::Lagged(id, 3));
         app.on_message(Msg::Report(
@@ -2278,15 +2433,24 @@ mod tests {
                 .map(|f| (f.watching, f.skipped, f.lines.len())),
             Some((true, 3, 1))
         );
-        assert_eq!(app.training.series.get(run).map(Vec::len), Some(1));
-        app.on_done(id, Ok(Done::Trained(Ok(()))));
+        assert_eq!(app.training.series.get(FIRST).map(Vec::len), Some(1));
+        ended(&mut app, id, Ok(Done::Trained(Ok(()))));
         assert!(app.training.tasks.is_empty());
-        assert_eq!(app.training.ended.get(run).map(|e| e.lines.len()), Some(1));
+        let end = app.training.ended.get(FIRST).cloned().unwrap_or_default();
+        assert_eq!((end.lines.len(), end.skipped, end.healed), (1, 3, false));
+        let rows = text(&draw(&mut app, 120, 40)?).join("\n");
+        assert!(
+            rows.contains("3 points missing (no local metrics file to read them from)"),
+            "{rows}"
+        );
         // Messages handled after the end still count: no local file holds them.
         app.on_message(Msg::Report(id, Report::Line("late".into())));
-        app.on_message(Msg::Event(id, crate::events::Event::Metric(metric)));
-        assert_eq!(app.training.ended.get(run).map(|e| e.lines.len()), Some(2));
-        assert_eq!(app.training.series.get(run).map(Vec::len), Some(2));
+        app.on_message(Msg::Event(id, crate::events::Event::Metric(metric(2))));
+        assert_eq!(
+            app.training.ended.get(FIRST).map(|e| e.lines.len()),
+            Some(2)
+        );
+        assert_eq!(app.training.series.get(FIRST).map(Vec::len), Some(2));
         Ok(())
     }
 
@@ -2294,24 +2458,21 @@ mod tests {
     fn late_metrics_of_a_run_read_again_from_its_file_are_dropped()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = runs_app()?;
-        press(&mut app, &[KeyCode::Char('j')]);
+        keys(&mut app, &[KeyCode::Char('j')]);
         let id = attach(&mut app)?;
-        let run = "20260920-101500-9f00";
-        assert_eq!(app.training.series.get(run), None, "attach replays it all");
-        app.on_done(id, Ok(Done::Trained(Ok(()))));
-        assert_eq!(app.training.series.get(run).map(Vec::len), Some(1));
-        let metric = crate::train::TrainMetric {
-            time: 2.0,
-            step: 1,
-            epoch: None,
-            max_steps: None,
-            loss: Some(1.5),
-            eval_loss: None,
-            learning_rate: None,
-            grad_norm: None,
-        };
-        app.on_message(Msg::Event(id, crate::events::Event::Metric(metric)));
-        assert_eq!(app.training.series.get(run).map(Vec::len), Some(1));
+        assert_eq!(
+            app.training.series.get(SECOND),
+            None,
+            "attach replays it all"
+        );
+        app.on_message(Msg::Lagged(id, 2));
+        ended(&mut app, id, Ok(Done::Trained(Ok(()))));
+        assert_eq!(app.training.series.get(SECOND).map(Vec::len), Some(1));
+        assert_eq!(app.training.ended.get(SECOND).map(|e| e.healed), Some(true));
+        app.on_message(Msg::Event(id, crate::events::Event::Metric(metric(1))));
+        assert_eq!(app.training.series.get(SECOND).map(Vec::len), Some(1));
+        let rows = text(&draw(&mut app, 120, 40)?).join("\n");
+        assert!(!rows.contains("points missing"), "healed: {rows}");
         Ok(())
     }
 
@@ -2320,23 +2481,24 @@ mod tests {
         let (_dir, mut app) = runs_app()?;
         let follow = attach(&mut app)?;
         watching(&mut app, follow);
-        press(&mut app, &[KeyCode::Char('c')]);
+        keys(&mut app, &[KeyCode::Char('c')]);
         assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
         assert_eq!(
-            press(&mut app, &[KeyCode::Char('y')]),
+            keys(&mut app, &[KeyCode::Char('y')]),
             [Effect::Cancel(follow)]
         );
-        assert_eq!(
-            press(&mut app, &[KeyCode::Char('c'), KeyCode::Char('y')]),
-            []
-        );
+        for key in ['c', 'a'] {
+            assert_eq!(keys(&mut app, &[KeyCode::Char(key)]), []);
+            assert_eq!(app.overlay, None);
+            assert_eq!(
+                status(&app),
+                Some("run 20260921-133200-a1b2 is being cancelled")
+            );
+        }
         let detached = "interrupted: run 20260921-133200-a1b2 keeps running on target `homelab`";
-        let effects = app.on_done(follow, Ok(Done::Trained(Err(detached.into()))));
-        let [Effect::Spawn(_, Task::Train(TrainJob::Cancel(run)))] = effects.as_slice() else {
-            return Err(format!("{effects:?}").into());
-        };
-        assert_eq!(run, "20260921-133200-a1b2");
-        press(&mut app, &[KeyCode::Char('c')]);
+        let effects = ended(&mut app, follow, Ok(Done::Trained(Err(detached.into()))));
+        cancel_started(&effects)?;
+        keys(&mut app, &[KeyCode::Char('c')]);
         assert_eq!(app.overlay, None, "a cancel already runs");
         Ok(())
     }
@@ -2346,8 +2508,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = runs_app()?;
         let follow = attach(&mut app)?;
-        press(&mut app, &[KeyCode::Char('c')]);
-        assert_eq!(press(&mut app, &[KeyCode::Char('y')]), [], "no token cut");
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(keys(&mut app, &[KeyCode::Char('y')]), [], "no token cut");
         let creating = crate::events::Event::PodStatus(crate::runpod::PodStatus::Creating {
             name: "overbrainer-20260921-133200-a1b2-1".into(),
             gpu_type: "NVIDIA GeForce RTX 4090".into(),
@@ -2364,20 +2526,113 @@ mod tests {
         let (_dir, mut app) = runs_app()?;
         let follow = attach(&mut app)?;
         watching(&mut app, follow);
-        press(&mut app, &[KeyCode::Char('j')]);
-        press(&mut app, &[KeyCode::Char('c')]);
-        let cancel = press(&mut app, &[KeyCode::Char('y')]);
+        keys(&mut app, &[KeyCode::Char('j'), KeyCode::Char('c')]);
+        let cancel = keys(&mut app, &[KeyCode::Char('y')]);
         let [Effect::Spawn(cancelling, _)] = cancel.as_slice() else {
             return Err(format!("{cancel:?}").into());
         };
-        press(&mut app, &[KeyCode::Char('q')]);
-        let effects = press(&mut app, &[KeyCode::Char('y')]);
-        assert_eq!(effects, [Effect::Cancel(follow)]);
-        app.on_done(follow, Ok(Done::Trained(Err(DETACHED.into()))));
+        keys(&mut app, &[KeyCode::Char('q')]);
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('y')]),
+            [Effect::Cancel(follow)]
+        );
+        ended(&mut app, follow, Ok(Done::Trained(Err(DETACHED.into()))));
         assert_eq!(app.exit, None, "the cancel is waited for");
-        app.on_done(*cancelling, Ok(Done::Trained(Ok(()))));
+        ended(&mut app, *cancelling, Ok(Done::Trained(Ok(()))));
         assert_eq!(app.exit, Some(Exit::Quit));
         assert_eq!(app.exit_notes, [DETACHED]);
+        Ok(())
+    }
+
+    /// The text of the dialog shown.
+    fn dialog(app: &App) -> String {
+        match &app.overlay {
+            Some(Overlay::Confirm(confirm)) => confirm.text.join("\n"),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn a_cancel_confirmed_before_quitting_still_runs_and_is_waited_for()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let follow = attach(&mut app)?;
+        watching(&mut app, follow);
+        keys(&mut app, &[KeyCode::Char('c'), KeyCode::Char('y')]);
+        keys(&mut app, &[KeyCode::Char('q')]);
+        assert_eq!(
+            dialog(&app),
+            "Run 20260921-133200-a1b2: cancel pending, it starts once the run is detached; \
+             quitting waits for it."
+        );
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('y')]),
+            [],
+            "already detaching"
+        );
+        let effects = ended(&mut app, follow, Ok(Done::Trained(Err(DETACHED.into()))));
+        let cancel = cancel_started(&effects)?;
+        assert_eq!(app.exit, None, "the cancel is waited for");
+        app.on_message(Msg::Report(
+            cancel,
+            Report::Line("train: run 20260921-133200-a1b2 cancelled".into()),
+        ));
+        ended(&mut app, cancel, Ok(Done::Trained(Ok(()))));
+        assert_eq!(app.exit, Some(Exit::Quit));
+        assert_eq!(
+            app.exit_notes,
+            ["train: run 20260921-133200-a1b2 cancelled"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancel_confirmed_while_quitting_still_runs_and_is_waited_for()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let follow = attach(&mut app)?;
+        watching(&mut app, follow);
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]),
+            [Effect::Cancel(follow)]
+        );
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('y')]),
+            [],
+            "already detached"
+        );
+        let effects = ended(&mut app, follow, Ok(Done::Trained(Err(DETACHED.into()))));
+        let cancel = cancel_started(&effects)?;
+        assert_eq!(app.exit, None);
+        ended(&mut app, cancel, Ok(Done::Trained(Ok(()))));
+        assert_eq!(app.exit, Some(Exit::Quit));
+        Ok(())
+    }
+
+    #[test]
+    fn a_signal_before_a_pending_cancel_says_how_to_run_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let follow = attach(&mut app)?;
+        watching(&mut app, follow);
+        keys(&mut app, &[KeyCode::Char('c'), KeyCode::Char('y')]);
+        assert_eq!(app.on_signal(), [Effect::Abandon(follow)]);
+        assert_eq!(
+            ended(&mut app, follow, Ok(Done::Trained(Err(DETACHED.into())))),
+            []
+        );
+        assert_eq!(app.exit, Some(Exit::Signal));
+        assert_eq!(
+            app.exit_notes,
+            [
+                DETACHED.to_string(),
+                "run 20260921-133200-a1b2 was not cancelled: interrupted before its cancel \
+                 started; cancel it with `overbrainer train cancel 20260921-133200-a1b2`"
+                    .to_string(),
+            ]
+        );
         Ok(())
     }
 
@@ -2387,11 +2642,16 @@ mod tests {
         let (_dir, mut app) = runs_app()?;
         let follow = attach(&mut app)?;
         assert_eq!(
-            press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]),
+            keys(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]),
             []
         );
         assert_eq!(app.leaving, Some(Exit::Quit));
-        press(&mut app, &[KeyCode::Char('n')]);
+        assert_eq!(keys(&mut app, &[KeyCode::Char('a')]), []);
+        assert_eq!(
+            status(&app),
+            Some("refused: quitting; nothing new is followed")
+        );
+        keys(&mut app, &[KeyCode::Char('n')]);
         assert_eq!(status(&app), Some("not quitting"));
         assert_eq!(watching(&mut app, follow), [], "still followed");
         Ok(())
@@ -2402,11 +2662,11 @@ mod tests {
         let (_dir, mut app) = runs_app()?;
         let follow = attach(&mut app)?;
         assert_eq!(
-            press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]),
+            keys(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]),
             []
         );
         assert_eq!(watching(&mut app, follow), [Effect::Cancel(follow)]);
-        app.on_done(follow, Ok(Done::Trained(Err(DETACHED.into()))));
+        ended(&mut app, follow, Ok(Done::Trained(Err(DETACHED.into()))));
         assert_eq!(app.exit, Some(Exit::Quit));
         assert_eq!(app.exit_notes, [DETACHED]);
         Ok(())
@@ -2421,7 +2681,7 @@ mod tests {
             status(&app),
             Some("interrupted: exiting once the training tasks end")
         );
-        app.on_done(follow, Err("a background task failed".into()));
+        ended(&mut app, follow, Err("a background task failed".into()));
         assert_eq!(app.exit, Some(Exit::Signal));
         assert_eq!(app.exit_notes, ["a background task failed"]);
         Ok(())
@@ -2434,11 +2694,15 @@ mod tests {
         let follow = attach(&mut app)?;
         watching(&mut app, follow);
         assert_eq!(
-            press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]),
+            keys(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]),
             [Effect::Cancel(follow)]
         );
         assert_eq!(app.on_signal(), [Effect::Abandon(follow)]);
         assert_eq!(app.leaving, Some(Exit::Signal));
+        assert_eq!(
+            app.waiting_for(),
+            ["waiting for run 20260921-133200-a1b2 to detach..."]
+        );
         Ok(())
     }
 }

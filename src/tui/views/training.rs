@@ -11,7 +11,7 @@ use ratatui::widgets::{
     Axis, Block, Chart, Dataset, GraphType, Paragraph, Row, Sparkline, Table, TableState, Wrap,
 };
 
-use crate::runpod::{PodRecord, PodStatus};
+use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, RunState};
 use crate::train::TrainMetric;
 use crate::tui::app::App;
@@ -56,8 +56,8 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
         .series
         .get(&row.record.id)
         .map_or(&[][..], Vec::as_slice);
-    let messages = Paragraph::new(messages(follow, view.ended.get(&row.record.id), theme))
-        .wrap(Wrap { trim: true });
+    let ended = view.ended.get(&row.record.id);
+    let messages = Paragraph::new(messages(follow, ended, theme)).wrap(Wrap { trim: true });
     let pod = row.pod.as_ref().map(|record| {
         Paragraph::new(pod_line(record, follow.and_then(|f| f.pod.as_ref()), app))
             .wrap(Wrap { trim: true })
@@ -77,7 +77,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .areas(inner);
     frame.render_widget(
-        Paragraph::new(status_line(&row.record, series, follow, theme)),
+        Paragraph::new(status_line(&row.record, series, (follow, ended), theme)),
         status,
     );
     if let Some(pod) = pod {
@@ -109,7 +109,9 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|row: &RunRow| {
             let followed = match view.task_of(&row.record.id) {
-                Some((_, follow)) if follow.job == Job::Cancel => "cancelling",
+                Some((_, follow)) if follow.job == Job::Cancel || follow.cancel_after => {
+                    "cancelling"
+                },
                 Some(_) => "followed",
                 None => "",
             };
@@ -137,7 +139,14 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
     .row_highlight_style(theme.selected)
     .block(
         Block::bordered()
-            .title(Span::styled(" runs ", theme.title))
+            .title(Span::styled(
+                if view.error.is_some() && !view.runs.is_empty() {
+                    " runs (stale: cannot list the runs) "
+                } else {
+                    " runs "
+                },
+                theme.title,
+            ))
             .border_style(theme.dim),
     );
     let mut state =
@@ -159,7 +168,7 @@ fn pod_summary(record: &PodRecord) -> String {
 fn status_line(
     record: &RunRecord,
     series: &[TrainMetric],
-    follow: Option<&Follow>,
+    (follow, ended): (Option<&Follow>, Option<&Ended>),
     theme: &Theme,
 ) -> Line<'static> {
     let running = matches!(record.state, RunState::Preparing | RunState::Running);
@@ -185,14 +194,24 @@ fn status_line(
         }
     }
     let state = match follow {
-        Some(follow) if follow.job == Job::Cancel => "   cancelling",
+        Some(follow) if follow.job == Job::Cancel || follow.cancel_after => "   cancelling",
         Some(_) => "   followed",
         None => "",
     };
     spans.push(Span::styled(state, theme.ok));
-    if let Some(follow) = follow.filter(|follow| follow.skipped > 0) {
+    let missing = match (follow, ended) {
+        (Some(follow), _) => follow.skipped,
+        (None, Some(ended)) if !ended.healed => ended.skipped,
+        (None, _) => 0,
+    };
+    if missing > 0 {
+        let until = if follow.is_some() {
+            "until the run ends"
+        } else {
+            "(no local metrics file to read them from)"
+        };
         spans.push(Span::styled(
-            format!("   {} points missing until the run ends", follow.skipped),
+            format!("   {missing} points missing {until}"),
             theme.warn,
         ));
     }
@@ -200,12 +219,56 @@ fn status_line(
 }
 
 /// The pod line: its ID and state, rate, uptime and spend estimate, and what
-/// bounds it.
+/// bounds it. A deleted pod shows what it cost and when it went, as recorded; a
+/// kept one has no time limit (decision 39).
 fn pod_line(record: &PodRecord, latest: Option<&PodStatus>, app: &App) -> Line<'static> {
     let id = record
         .pod_id
         .as_ref()
         .map_or_else(|| "(no pod yet)".to_string(), ToString::to_string);
+    let text = match latest {
+        Some(PodStatus::Deleted {
+            estimated_spend,
+            uptime,
+            ..
+        }) => deleted_line(
+            &id,
+            estimated_spend.or(record.estimated_spend),
+            *uptime,
+            record,
+        ),
+        _ if record.state == PodState::Deleted => {
+            deleted_line(&id, record.estimated_spend, None, record)
+        },
+        _ => live_line(&id, record, latest, app),
+    };
+    Line::from(Span::styled(text, app.theme.dim))
+}
+
+/// The pod line of a deleted pod: its recorded spend, uptime and deletion time.
+fn deleted_line(
+    id: &str,
+    spend: Option<f64>,
+    uptime: Option<std::time::Duration>,
+    record: &PodRecord,
+) -> String {
+    let mut text = format!("pod {id} deleted");
+    if let Some(at) = &record.deleted_at {
+        write!(text, " at {at}").ok();
+    }
+    if let Some(up) = uptime {
+        write!(text, "  up {}", duration(up)).ok();
+    }
+    match spend {
+        Some(spend) => write!(text, "  spent about ${spend:.2}").ok(),
+        None => write!(text, "  spend unknown").ok(),
+    };
+    text
+}
+
+/// The pod line of a pod that exists: its state, rate, uptime and spend so far,
+/// and the watchdog's deadline, or no time limit for a kept pod.
+fn live_line(id: &str, record: &PodRecord, latest: Option<&PodStatus>, app: &App) -> String {
     let state = latest.map_or_else(|| record.state.name(), status_name);
     let rate = record.cost_per_hour.or(match latest {
         Some(PodStatus::Created { cost_per_hour, .. }) => *cost_per_hour,
@@ -221,15 +284,15 @@ fn pod_line(record: &PodRecord, latest: Option<&PodStatus>, app: &App) -> Line<'
         });
         write!(text, "  up {}{spend}", duration(up)).ok();
     }
-    let bound = if record.keep {
-        "  kept, no time limit".to_string()
-    } else {
-        record.deadline.as_ref().map_or_else(String::new, |at| {
-            format!("  deleted by the watchdog by {at}")
-        })
-    };
-    text.push_str(&bound);
-    Line::from(Span::styled(text, app.theme.dim))
+    let kept = record.keep
+        || record.state == PodState::Kept
+        || matches!(latest, Some(PodStatus::Kept { .. }));
+    if kept {
+        text.push_str("  kept, no time limit");
+    } else if let Some(at) = &record.deadline {
+        write!(text, "  deleted by the watchdog by {at}").ok();
+    }
+    text
 }
 
 /// A pod status in one word.

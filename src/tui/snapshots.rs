@@ -833,6 +833,7 @@ fn training_of_a_finished_local_run() -> TestResult {
                     .into(),
             ],
             error: None,
+            ..Ended::default()
         },
     );
     snapshot("training_finished", &mut app)?;
@@ -855,5 +856,41 @@ fn the_cancel_dialog_and_the_quit_dialog_of_a_followed_run() -> TestResult {
     app.overlay = None;
     app.on_input(&key(KeyCode::Char('q')));
     snapshot("training_quit", &mut app)?;
+    Ok(())
+}
+
+/// [`training_app`] with its Runpod run ended and followed by no task, its pod
+/// changed by `change`.
+fn ended_runpod_app(
+    change: impl FnOnce(&mut crate::runpod::PodRecord),
+) -> Result<App, serde_json::Error> {
+    let mut app = training_app()?;
+    app.training.tasks.clear();
+    app.training.series.clear();
+    if let Some(row) = app.training.runs.first_mut() {
+        row.record.state = RunState::Succeeded;
+        if let Some(pod) = row.pod.as_mut() {
+            change(pod);
+        }
+    }
+    Ok(app)
+}
+
+#[test]
+fn training_of_a_run_whose_pod_was_deleted() -> TestResult {
+    let mut app = ended_runpod_app(|pod| {
+        pod.deleted(crate::runpod::DeletedBy::Client, at(NOW - 5 * 60));
+    })?;
+    snapshot("training_deleted_pod", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn training_of_a_run_whose_pod_is_kept() -> TestResult {
+    let mut app = ended_runpod_app(|pod| {
+        pod.keep = true;
+        pod.state = crate::runpod::PodState::Kept;
+    })?;
+    snapshot("training_kept_pod", &mut app)?;
     Ok(())
 }

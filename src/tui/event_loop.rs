@@ -2,7 +2,7 @@
 //! their messages, process signals and a clock tick, drawing the app when it
 //! changed. It owns the terminal and runs the effects the app asks for.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, SystemTime};
@@ -17,7 +17,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use super::app::{App, Effect, Exit};
-use super::tasks::{Done, Msg, TaskId, Tasks};
+use super::tasks::{Done, Msg, Task, TaskId, Tasks};
 use super::terminal::Screen;
 use super::ui;
 
@@ -86,6 +86,7 @@ where
         suspended: false,
         editor: None,
         last_draw: None,
+        pending: Vec::new(),
     };
     let result = looping.run(app).await;
     if let Some(mut editor) = looping.editor.take() {
@@ -122,6 +123,8 @@ struct Loop<'t, B: Backend> {
     /// The editor running, if any.
     editor: Option<Child>,
     last_draw: Option<Instant>,
+    /// Effects the loop could not run before it ended, for [`Loop::settle`].
+    pending: Vec<Effect>,
 }
 
 impl<B> Loop<'_, B>
@@ -132,9 +135,7 @@ where
     async fn run(&mut self, app: &mut App) -> anyhow::Result<()> {
         let mut effects = app.start();
         loop {
-            for effect in effects {
-                self.apply(effect).await?;
-            }
+            self.apply_all(effects).await?;
             effects = match self.wait(app).await {
                 Wake::Input(Some(Ok(event))) => app.on_input(&event),
                 Wake::Input(Some(Err(error))) => {
@@ -145,45 +146,148 @@ where
                     Vec::new()
                 },
                 Wake::Message(message) => self.on_message(app, message)?,
-                Wake::Done(id, result) => app.on_done(id, result),
+                Wake::Done(id, result) => self.finished(app, id, result)?,
                 Wake::Signal => app.on_signal(),
-                Wake::Tick => {
-                    app.on_tick(SystemTime::now());
-                    Vec::new()
-                },
+                Wake::Tick => app.on_tick(SystemTime::now()),
                 Wake::Draw => Vec::new(),
             };
-            self.draw(app)?;
-            match app.exit {
-                Some(Exit::Quit) => return Ok(()),
-                Some(Exit::Signal) => anyhow::bail!("interrupted by signal"),
-                None => {},
+            if let Err(error) = self.draw(app) {
+                self.pending = effects;
+                return Err(error);
+            }
+            if let Some(exit) = app.exit {
+                return self.exit(app, effects, exit);
             }
         }
     }
 
-    /// Once the loop ended with tasks still running (a terminal error, or its
-    /// input gone): they end as on a signal, and are waited for. A training task
-    /// is never aborted: dropped mid-start, it would leave a job or a pod that
-    /// nothing finds again. Their ends still reach the app, for its exit notes.
+    /// Applies `effects` in order; when one fails, the others are kept for
+    /// [`Loop::settle`].
+    async fn apply_all(&mut self, effects: Vec<Effect>) -> anyhow::Result<()> {
+        let mut effects = effects.into_iter();
+        while let Some(effect) = effects.next() {
+            if let Err(error) = self.apply(effect).await {
+                self.pending.extend(effects);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the loop for `exit`: the messages still in the inbox are handled,
+    /// and `effects` are kept for [`Loop::settle`].
+    fn exit(&mut self, app: &mut App, effects: Vec<Effect>, exit: Exit) -> anyhow::Result<()> {
+        self.pending = effects;
+        let more = self.drained(app)?;
+        self.pending.extend(more);
+        match exit {
+            Exit::Quit => Ok(()),
+            Exit::Signal => anyhow::bail!("interrupted by signal"),
+        }
+    }
+
+    /// Task `id` ended with `result`. Every message of a task is in the inbox
+    /// before its end: they are handled first, so its last lines are not lost.
+    fn finished(
+        &mut self,
+        app: &mut App,
+        id: TaskId,
+        result: Result<Done, String>,
+    ) -> anyhow::Result<Vec<Effect>> {
+        let mut effects = self.drained(app)?;
+        effects.extend(app.on_done(id, result));
+        Ok(effects)
+    }
+
+    /// Handles every message already in the inbox.
+    fn drained(&mut self, app: &mut App) -> anyhow::Result<Vec<Effect>> {
+        let mut effects = Vec::new();
+        while let Ok(message) = self.inbox.try_recv() {
+            effects.extend(self.on_message(app, message)?);
+        }
+        Ok(effects)
+    }
+
+    /// Once the loop ended with work left (a terminal error, its input gone, or
+    /// effects it could not run): the effects that must not be lost run (a
+    /// training task or an edit starts, a token is cancelled), then the tasks
+    /// end as on a signal and are waited for, however long: a training task is
+    /// never aborted, since dropped mid-start it would leave a job or a pod that
+    /// nothing finds again. With the real terminal, the screen is given back
+    /// first and stderr says what is waited for; a signal meanwhile acts as a
+    /// first one would. The ends still reach the app, for its exit notes.
     async fn settle(&mut self, app: &mut App) {
+        for effect in std::mem::take(&mut self.pending) {
+            self.apply_late(effect);
+        }
+        self.drain_late(app);
         if self.tasks.is_empty() {
             return;
         }
         // Why the loop ended stays what it was.
         let why = app.exit;
         for effect in app.on_signal() {
-            match effect {
-                Effect::Cancel(id) => self.tasks.cancel(id),
-                Effect::Abandon(id) => self.tasks.abandon(id),
-                Effect::Spawn(..) | Effect::OpenEditor { .. } => {},
+            self.apply_late(effect);
+        }
+        let lines = app.waiting_for();
+        if let Some(real) = &mut self.real
+            && !lines.is_empty()
+        {
+            real.screen.suspend().await.ok();
+            let mut stderr = io::stderr();
+            for line in &lines {
+                writeln!(stderr, "{line}").ok();
             }
         }
-        while let Some((id, result)) = self.tasks.next().await {
-            // Nothing new starts now: a reload or a cancel asked for is dropped.
-            app.on_done(id, result);
+        loop {
+            let signals = self.real.as_mut().map(|real| &mut real.signals);
+            let woke = tokio::select! {
+                next = self.tasks.next() => Some(next),
+                () = Signals::recv(signals, true) => None,
+            };
+            match woke {
+                Some(Some((id, result))) => {
+                    self.drain_late(app);
+                    for effect in app.on_done(id, result) {
+                        self.apply_late(effect);
+                    }
+                },
+                Some(None) => break,
+                None => {
+                    for effect in app.on_signal() {
+                        self.apply_late(effect);
+                    }
+                },
+            }
         }
+        self.drain_late(app);
         app.exit = why.or(app.exit);
+    }
+
+    /// Runs `effect` once the loop ended: a training task or an edit starts
+    /// (never lost, never cut), a token is cancelled, a task abandoned; a
+    /// reading, a stage or the editor does not start any more.
+    fn apply_late(&mut self, effect: Effect) {
+        match effect {
+            Effect::Spawn(id, task @ (Task::Train(_) | Task::Edit(_))) => {
+                self.tasks.spawn(id, task);
+            },
+            Effect::Cancel(id) => self.tasks.cancel(id),
+            Effect::Abandon(id) => self.tasks.abandon(id),
+            Effect::Spawn(..) | Effect::OpenEditor { .. } => {},
+        }
+    }
+
+    /// Handles every message in the inbox once the loop ended.
+    fn drain_late(&mut self, app: &mut App) {
+        while let Ok(message) = self.inbox.try_recv() {
+            if matches!(message, Msg::EditorExited(_)) {
+                continue;
+            }
+            for effect in app.on_message(message) {
+                self.apply_late(effect);
+            }
+        }
     }
 
     /// The next thing that happens.
@@ -458,11 +562,17 @@ mod tests {
         let mut app = app();
         app.project.dir = dir.path().to_path_buf();
         let (events, input) = mpsc::unbounded_channel();
-        events.send(Ok(key(KeyCode::Char('3'))))?;
-        events.send(Ok(key(KeyCode::Char('a'))))?;
-        events.send(Err(io::Error::other("the terminal is gone")))?;
-        let result =
-            tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await?;
+        let run_loop = drive(&mut terminal, &mut app, input, None);
+        let keys = async {
+            events.send(Ok(key(KeyCode::Char('3'))))?;
+            // The runs are listed by then.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            events.send(Ok(key(KeyCode::Char('a'))))?;
+            events.send(Err(io::Error::other("the terminal is gone")))
+        };
+        let (result, sent) =
+            tokio::time::timeout(LIMIT, async { tokio::join!(run_loop, keys) }).await?;
+        sent?;
         assert!(result.is_err());
         assert!(app.training.tasks.is_empty(), "the task was waited for");
         // No overbrainer.toml: the attach flow fails, and says why.
@@ -473,6 +583,85 @@ mod tests {
                 .is_some_and(|e| e.contains("overbrainer.toml")),
             "{ended:?}"
         );
+        Ok(())
+    }
+
+    /// A loop on `terminal` with no input, for the project in `dir`.
+    fn looping<'t>(
+        terminal: &'t mut Terminal<TestBackend>,
+        dir: &std::path::Path,
+    ) -> Loop<'t, TestBackend> {
+        let (messages, inbox) = mpsc::unbounded_channel();
+        Loop {
+            terminal,
+            input: mpsc::unbounded_channel().1,
+            tasks: Tasks::new(dir, messages.clone()),
+            messages,
+            inbox,
+            tick: tokio::time::interval(TICK),
+            real: None,
+            suspended: false,
+            editor: None,
+            last_draw: None,
+            pending: Vec::new(),
+        }
+    }
+
+    const RUN: &str = "20260921-133200-a1b2";
+
+    /// The app, following no run but for task 5, cancelling [`RUN`].
+    fn cancelling_app(dir: &std::path::Path) -> App {
+        use crate::tui::training::{Follow, Job};
+        let mut app = app();
+        app.project.dir = dir.to_path_buf();
+        app.training
+            .tasks
+            .insert(TaskId(5), Follow::new(Job::Cancel, RUN));
+        app
+    }
+
+    #[tokio::test]
+    async fn the_last_lines_of_a_task_reach_the_exit_notes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cli::front::Report;
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = looping(&mut terminal, dir.path());
+        let mut app = cancelling_app(dir.path());
+        app.leaving = Some(Exit::Quit);
+        let line = format!("train: run {RUN} cancelled");
+        looping
+            .messages
+            .send(Msg::Report(TaskId(5), Report::Line(line.clone())))?;
+        looping.finished(&mut app, TaskId(5), Ok(Done::Trained(Ok(()))))?;
+        assert_eq!(app.exit, Some(Exit::Quit));
+        assert_eq!(app.exit_notes, [line]);
+        Ok(())
+    }
+
+    /// An effect the loop could not run before it ended (here a cancel task)
+    /// still runs, and is waited for.
+    #[tokio::test]
+    async fn a_cancel_left_pending_runs_once_the_loop_ended()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::tasks::{Task, TrainJob};
+        let dir = crate::tui::snapshots::project()?;
+        let mut record = crate::tui::snapshots::run(RUN, "homelab", crate::runs::RunState::Failed);
+        record.job = None;
+        crate::runs::Runs::new(dir.path()).save(&record)?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = looping(&mut terminal, dir.path());
+        let mut app = cancelling_app(dir.path());
+        app.exit = Some(Exit::Quit);
+        looping.pending = vec![Effect::Spawn(
+            TaskId(5),
+            Task::Train(TrainJob::Cancel(RUN.into())),
+        )];
+        tokio::time::timeout(LIMIT, looping.settle(&mut app)).await?;
+        assert!(app.training.tasks.is_empty());
+        let error = app.training.ended.get(RUN).and_then(|e| e.error.clone());
+        assert_eq!(error, Some(format!("run {RUN} has not started")));
+        assert_eq!(app.exit, Some(Exit::Quit), "why the loop ended is kept");
         Ok(())
     }
 
