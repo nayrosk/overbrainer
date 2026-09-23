@@ -32,7 +32,8 @@ pub use keys::{
     write_known_hosts,
 };
 pub use orphans::{
-    PodRow, Removal, Removed, RowKind, orphan_warnings, pod_rows, remove_run_pods, table,
+    PodRow, Removal, Removed, RowKind, listed_rows, orphan_warnings, pod_rows, remove_run_pods,
+    table,
 };
 pub use provision::{
     PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, sweep, wait_gone,

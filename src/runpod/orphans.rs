@@ -111,11 +111,7 @@ impl PodRow {
 pub async fn pod_rows(ctx: &PodCtx<'_>) -> Result<Vec<PodRow>, PodError> {
     let pods = ctx.client.list_pods().await?;
     let known = Known::load(ctx.runs)?;
-    let mut rows: Vec<PodRow> = pods
-        .iter()
-        .filter(|pod| pod.run_id().is_some() || pod.name.starts_with("overbrainer-"))
-        .map(|pod| known.row(pod.run_id(), pod))
-        .collect();
+    let mut rows = known.listed(&pods);
     let unlisted = known.unlisted(&pods);
     let ids: Vec<PodId> = unlisted.iter().map(|entry| entry.id.clone()).collect();
     let looks = look_up_all(ctx, &ids).await;
@@ -124,6 +120,21 @@ pub async fn pod_rows(ctx: &PodCtx<'_>) -> Result<Vec<PodRow>, PodError> {
             rows.push(row);
         }
     }
+    rows.sort_by(|a, b| (&a.run, &a.pod_id).cmp(&(&b.run, &b.pod_id)));
+    Ok(rows)
+}
+
+/// The rows of the pods that one list of the account shows, as [`pod_rows`]
+/// makes them, with no look at any single pod and nothing recorded: what the
+/// orphan warning of `train` is built from. A recorded pod the list does not
+/// show has no row: it is not billing, or `pod ls` finds it.
+///
+/// # Errors
+///
+/// Returns a [`PodError`] when the API or `runs/` cannot be read.
+pub async fn listed_rows(ctx: &PodCtx<'_>) -> Result<Vec<PodRow>, PodError> {
+    let pods = ctx.client.list_pods().await?;
+    let mut rows = Known::load(ctx.runs)?.listed(&pods);
     rows.sort_by(|a, b| (&a.run, &a.pod_id).cmp(&(&b.run, &b.pod_id)));
     Ok(rows)
 }
@@ -166,6 +177,15 @@ impl<'a> Known<'a> {
             run_records,
             pod_records,
         })
+    }
+
+    /// The rows of the pods of `pods` that overbrainer created: those with a run
+    /// marker or named `overbrainer-*`.
+    fn listed(&self, pods: &[Pod]) -> Vec<PodRow> {
+        pods.iter()
+            .filter(|pod| pod.run_id().is_some() || pod.name.starts_with("overbrainer-"))
+            .map(|pod| self.row(pod.run_id(), pod))
+            .collect()
     }
 
     /// The recorded pods, and strays, that `pods` does not show.

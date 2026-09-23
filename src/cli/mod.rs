@@ -5,6 +5,7 @@ mod data;
 mod init;
 mod pod;
 mod progress;
+mod runpod_train;
 mod train;
 
 use std::path::PathBuf;
@@ -107,6 +108,10 @@ pub struct TrainArgs {
     /// Train on this target instead of training.target.
     #[arg(long)]
     pub target: Option<String>,
+    /// Runpod target only: keep the pod once the run ends, with no time limit.
+    /// Nothing deletes it then but `overbrainer pod rm <run-id>`.
+    #[arg(long)]
+    pub keep_pod: bool,
     /// Follow or stop an existing run instead of starting one.
     #[command(subcommand)]
     pub command: Option<TrainCommand>,

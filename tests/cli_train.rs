@@ -323,8 +323,9 @@ fn unusable_targets_are_refused() -> TestResult {
         .args(["train", "--target", "gpu"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("cannot train on yet"))
-        .stderr(predicate::str::contains("M4"));
+        .stderr(predicate::str::contains(
+            "no Runpod API key: set OVERBRAINER_RUNPOD__API_KEY",
+        ));
     assert!(!dir.path().join("runs").exists());
     overbrainer(dir.path())?
         .args(["train", "attach", "20260101-000000-abcd"])

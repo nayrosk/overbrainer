@@ -11,27 +11,37 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use std::sync::Mutex;
+
 use overbrainer::events::EventBus;
-use overbrainer::exec::{Executor, JobCommand, JobStatus, SshExecutor};
+use overbrainer::exec::{Executor, JobCommand, JobRuntime, JobStatus, SshExecutor};
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
     AttemptResult, Ending, PodCtx, PodError, PodId, PodKeys, PodPlan, PodRecord, PodState,
-    RunpodClient, RunpodTarget, SshEndpoint, Timing, alias, end_pod, provision, reconnect,
-    write_config,
+    RunpodClient, RunpodTarget, SshEndpoint, Timing, alias, end_pod, job_started, provision,
+    reconnect, write_config,
 };
-use overbrainer::runs::{RunRecord, RunState, Runs};
+use overbrainer::runs::{Launch, RunCtx, RunRecord, RunState, Runs, start};
+use overbrainer::train::{Artifacts, TrainError, Trainer};
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// What the CI ssh config says about the test sshd.
+/// Tests using the test sshd at once. Its `MaxStartups` (10 by default) drops
+/// handshakes beyond that many pending at once, and a test opens up to three
+/// connections at the same time.
+static SSHD_SLOTS: Semaphore = Semaphore::const_new(3);
+
+/// What the CI ssh config says about the test sshd, and this test's slot on it.
 struct Sshd {
     endpoint: SshEndpoint,
     identity: PathBuf,
     host_public: String,
+    _slot: SemaphorePermit<'static>,
 }
 
 /// The value of `key` in the ssh config `text`.
@@ -43,7 +53,7 @@ fn value(text: &str, key: &str) -> Option<String> {
     })
 }
 
-fn sshd() -> Result<Option<Sshd>, Box<dyn std::error::Error>> {
+async fn sshd() -> Result<Option<Sshd>, Box<dyn std::error::Error>> {
     if std::env::var_os("OVERBRAINER_TEST_SSH_HOST").is_none() {
         return Ok(None);
     }
@@ -65,6 +75,7 @@ fn sshd() -> Result<Option<Sshd>, Box<dyn std::error::Error>> {
         }
     }
     let host_public = host_public.ok_or("no ssh-ed25519 key in the test known_hosts")?;
+    let slot = SSHD_SLOTS.acquire().await?;
     Ok(Some(Sshd {
         endpoint: SshEndpoint {
             host: get("HostName")?,
@@ -73,6 +84,7 @@ fn sshd() -> Result<Option<Sshd>, Box<dyn std::error::Error>> {
         },
         identity: PathBuf::from(get("IdentityFile")?),
         host_public,
+        _slot: slot,
     }))
 }
 
@@ -123,7 +135,7 @@ fn is_host_key_failure(error: &(dyn std::error::Error + 'static)) -> bool {
 
 #[tokio::test]
 async fn the_per_run_config_reaches_the_pinned_host() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -135,7 +147,7 @@ async fn the_per_run_config_reaches_the_pinned_host() -> TestResult {
 
 #[tokio::test]
 async fn another_host_key_is_refused_through_the_per_run_config() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -336,7 +348,7 @@ async fn provision_against(
 
 #[tokio::test]
 async fn a_pod_is_ready_once_ssh_and_its_watchdog_answer() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -354,7 +366,7 @@ async fn a_pod_is_ready_once_ssh_and_its_watchdog_answer() -> TestResult {
 
 #[tokio::test]
 async fn a_watchdog_that_cannot_delete_its_pod_refuses_the_run() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -373,7 +385,7 @@ async fn a_watchdog_that_cannot_delete_its_pod_refuses_the_run() -> TestResult {
 
 #[tokio::test]
 async fn a_failed_bootstrap_deletes_the_pod_and_refuses_the_run() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -395,7 +407,7 @@ async fn a_failed_bootstrap_deletes_the_pod_and_refuses_the_run() -> TestResult 
 
 #[tokio::test]
 async fn a_pod_that_dies_while_its_verdict_is_awaited_is_deleted_at_once() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -496,7 +508,7 @@ async fn marker_exists(
 
 #[tokio::test]
 async fn a_retrieved_run_marks_its_pod_then_deletes_it_unless_kept() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -571,7 +583,7 @@ impl Respond for DeleteAfterMarker {
 
 #[tokio::test]
 async fn the_retrieved_marker_is_on_the_pod_before_its_delete() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -636,7 +648,7 @@ async fn the_retrieved_marker_is_on_the_pod_before_its_delete() -> TestResult {
 
 #[tokio::test]
 async fn a_duplicate_pod_whose_delete_fails_is_recorded_as_stray() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -694,7 +706,7 @@ async fn a_duplicate_pod_whose_delete_fails_is_recorded_as_stray() -> TestResult
 
 #[tokio::test]
 async fn an_unretrieved_run_leaves_its_pod_to_the_watchdog() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -727,7 +739,7 @@ async fn an_unretrieved_run_leaves_its_pod_to_the_watchdog() -> TestResult {
 
 #[tokio::test]
 async fn attach_reconnects_through_a_fresh_endpoint() -> TestResult {
-    let Some(sshd) = sshd()? else {
+    let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
@@ -769,5 +781,147 @@ async fn attach_reconnects_through_a_fresh_endpoint() -> TestResult {
         config.contains(&format!("Port {}", sshd.endpoint.port)),
         "{config}"
     );
+    Ok(())
+}
+
+/// A trainer with nothing to run, which notes what `run.json` and `pod.json`
+/// say when `runs::start` prepares the run: before its job is spawned and the
+/// run saved `Running`.
+struct Observer {
+    runs: Runs,
+    run_id: String,
+    seen: Mutex<Option<(RunState, Option<PodRecord>)>>,
+}
+
+impl Trainer for Observer {
+    fn prepare(&self, _run_dir: &Path, _root: &str) -> Result<(), TrainError> {
+        let run = self.runs.load(&self.run_id).map(|run| run.state);
+        let pod = PodRecord::load(&self.runs, &self.run_id).ok().flatten();
+        if let (Ok(run), Ok(mut seen)) = (run, self.seen.lock()) {
+            *seen = Some((run, pod));
+        }
+        Ok(())
+    }
+
+    fn commands(&self) -> Vec<Vec<String>> {
+        Vec::new()
+    }
+
+    fn env(&self, _root: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    fn metrics_file(&self) -> &'static str {
+        "metrics.jsonl"
+    }
+
+    fn artifacts(&self) -> Artifacts {
+        Artifacts {
+            entries: Vec::new(),
+            exclude: Vec::new(),
+            required: None,
+        }
+    }
+}
+
+/// `train`'s order on a pod: provisioning saves the pod's ID in `pod.json`, so
+/// by the time the job is started and the run saved `Running`, `pod rm` and
+/// `pod ls` already know which pod trains.
+#[tokio::test]
+async fn the_pod_id_is_saved_before_the_run_goes_running() -> TestResult {
+    let Some(sshd) = sshd().await? else {
+        skip();
+        return Ok(());
+    };
+    let run_id = new_run_id();
+    let workdir = format!("overbrainer-tests/runpod-{run_id}");
+    write_verdict(&sshd, &workdir, &run_id, "ready").await?;
+    let server = stub(&sshd, &run_id, None).await;
+    let project = tempfile::tempdir()?;
+    let runs = Runs::new(project.path());
+    let client = client(&server)?;
+    let timing = Timing {
+        ready_timeout: Duration::from_secs(30),
+        preflight_timeout: Duration::from_secs(30),
+        ..fast()
+    };
+    let (bus, interrupted) = (EventBus::new(), AtomicBool::new(false));
+    let ctx = PodCtx {
+        client: &client,
+        runs: &runs,
+        bus: &bus,
+        timing: &timing,
+        interrupted: &interrupted,
+    };
+    let target = RunpodTarget {
+        gpu_types: vec!["NVIDIA A40".into()],
+        gpu_count: 1,
+        image: "img".into(),
+        venv: "/venv".into(),
+        container_disk_gb: 50,
+        max_hours: 1.0,
+        boot_grace: Duration::from_secs(1800),
+        retrieve_grace: Duration::from_secs(3600),
+        data_center_ids: Vec::new(),
+        network_volume_id: None,
+    };
+    let keys = keys(&sshd, &sshd.host_public);
+    let ssh_dir = runs.run_dir(&run_id)?.join("ssh");
+    let plan = PodPlan {
+        run_id: &run_id,
+        target: &target,
+        keys: &keys,
+        ssh_dir: &ssh_dir,
+        workdir: &workdir,
+        api_url: client.base_url(),
+    };
+    let mut pod = PodRecord::new(&run_id, false, 1, &keys.host_public);
+    let provisioned = provision(&ctx, &plan, &mut pod).await?;
+    let record = RunRecord {
+        id: run_id.clone(),
+        target: "gpu_cloud".into(),
+        created: "2026-09-22T00:00:00Z".into(),
+        remote_dir: format!("{}/{run_id}", provisioned.executor.workdir()),
+        job: None,
+        state: RunState::Preparing,
+        message: None,
+    };
+    runs.save(&record)?;
+    let observer = Observer {
+        runs: Runs::new(project.path()),
+        run_id: run_id.clone(),
+        seen: Mutex::new(None),
+    };
+    let runtime = JobRuntime::Native {
+        venv: None,
+        env_file: None,
+    };
+    let run_ctx = RunCtx {
+        runs: &runs,
+        executor: &provisioned.executor,
+        bus: &bus,
+        poll: Duration::from_millis(50),
+    };
+    let launch = Launch {
+        runtime: &runtime,
+        secrets: Vec::new(),
+    };
+    let started = start(&run_ctx, &observer, launch, record).await?;
+    assert_eq!(started.state, RunState::Running);
+    let seen = observer
+        .seen
+        .lock()
+        .map_err(|_| "poisoned")?
+        .take()
+        .ok_or("start never prepared the run")?;
+    let (run_state, saved) = seen;
+    assert_eq!(run_state, RunState::Preparing);
+    let saved = saved.ok_or("no pod.json when the job was started")?;
+    assert_eq!(saved.pod_id.as_ref().map(PodId::as_str), Some("p1"));
+    assert_eq!(saved.state, PodState::Ready);
+    job_started(&runs, &mut pod)?;
+    let saved = PodRecord::load(&runs, &run_id)?.ok_or("no pod.json")?;
+    assert_eq!(saved.state, PodState::Running);
+    assert_eq!(saved.pod_id.as_ref().map(PodId::as_str), Some("p1"));
     Ok(())
 }
