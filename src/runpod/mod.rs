@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 mod bootstrap;
 mod client;
+mod flow;
 mod keys;
 mod provision;
 mod record;
@@ -21,6 +22,10 @@ pub use bootstrap::{
     HOST_KEY_ENV, JOB_ENV, PodSettings, bootstrap_functions, pod_command, pod_env, watchdog_script,
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
+pub use flow::{
+    DEADLINE_MARGIN, Ending, RETRIEVED_MARKER, WATCHDOG_LOG, end_pod, follow, forget_client_key,
+    job_started, reconnect, ssh_command, start_pod,
+};
 pub use keys::{
     CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,
     write_known_hosts,
@@ -111,4 +116,16 @@ pub enum PodError {
     /// A deleted pod still shows in the API.
     #[error("pod {0} could not be confirmed deleted: check `overbrainer pod ls`")]
     NotDeleted(PodId),
+    /// Following the run failed.
+    #[error(transparent)]
+    Run(#[from] crate::runs::RunError),
+    /// The client's own deadline fired: the pod was deleted before the job ended.
+    #[error("max_hours reached: the pod was deleted before the job ended")]
+    DeadlineReached,
+    /// The run's pod no longer exists.
+    #[error("pod {0} no longer exists")]
+    PodGone(PodId),
+    /// The pod exists but offers no SSH endpoint.
+    #[error("pod {0} has no SSH endpoint (status {1}); try again once it runs")]
+    NoEndpoint(PodId, String),
 }

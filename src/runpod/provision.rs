@@ -192,7 +192,7 @@ async fn after_failure(ctx: &PodCtx<'_>, record: &mut PodRecord) {
 }
 
 /// Records `stray` pods in `pod.json`, best effort.
-fn note_strays(ctx: &PodCtx<'_>, record: &mut PodRecord, stray: Vec<PodId>) {
+pub(super) fn note_strays(ctx: &PodCtx<'_>, record: &mut PodRecord, stray: Vec<PodId>) {
     if stray.is_empty() {
         return;
     }

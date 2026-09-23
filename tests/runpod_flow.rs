@@ -1,0 +1,354 @@
+//! The Runpod run steps against a local stub of the API, with the local executor
+//! standing in for the pod: a failed or interrupted provisioning fails the run,
+//! the client-side deadline deletes a pod still there, and a watch that loses a
+//! deleted pod fails the run. Ending a pod over SSH is covered in
+//! `tests/runpod_ssh.rs`.
+
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
+
+use overbrainer::events::EventBus;
+use overbrainer::exec::{Executor, JobCommand, LocalExecutor};
+use overbrainer::retry::RetryPolicy;
+use overbrainer::runpod::{
+    AttemptResult, PodCtx, PodError, PodRecord, PodState, RunpodClient, RunpodTarget, Timing,
+    follow, start_pod,
+};
+use overbrainer::runs::{RunCtx, RunRecord, RunState, Runs, create};
+use overbrainer::train::{Artifacts, TrainError, Trainer};
+use secrecy::SecretString;
+use serde_json::{Value, json};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+/// Runpod's answer when a GPU type has no capacity left.
+const CAPACITY: &str = "There are no longer any instances available with the requested specifications. Please refresh and try again.";
+
+struct Get {
+    deleted: Arc<AtomicBool>,
+    body: Value,
+}
+
+impl Respond for Get {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        if self.deleted.load(Ordering::SeqCst) {
+            ResponseTemplate::new(404).set_body_json(json!({
+                "detail": "pod not found",
+                "status": 404,
+                "title": "Not Found"
+            }))
+        } else {
+            ResponseTemplate::new(200).set_body_json(&self.body)
+        }
+    }
+}
+
+struct Delete(Arc<AtomicBool>);
+
+impl Respond for Delete {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        self.0.store(true, Ordering::SeqCst);
+        ResponseTemplate::new(204)
+    }
+}
+
+/// Serves pod `p1`, gone once deleted (or from the start with `gone`).
+async fn serve_p1(server: &MockServer, gone: bool) {
+    let deleted = Arc::new(AtomicBool::new(gone));
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Get {
+            deleted: Arc::clone(&deleted),
+            body: json!({"id": "p1", "status": "RUNNING", "cost": 0.5}),
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Delete(deleted))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": []})))
+        .mount(server)
+        .await;
+}
+
+struct Harness {
+    server: MockServer,
+    project: tempfile::TempDir,
+    runs: Runs,
+    bus: EventBus,
+    timing: Timing,
+    interrupted: AtomicBool,
+    client: RunpodClient,
+}
+
+impl Harness {
+    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let client = RunpodClient::new(&format!("{}/v2", server.uri()), &SecretString::from("k"))?
+            .with_policy(RetryPolicy {
+                max_retries: 1,
+                base: Duration::from_millis(1),
+                cap: Duration::from_millis(2),
+            });
+        Ok(Self {
+            server,
+            project,
+            runs,
+            bus: EventBus::new(),
+            timing: Timing {
+                poll: Duration::from_millis(5),
+                ready_timeout: Duration::from_millis(200),
+                preflight_timeout: Duration::from_millis(200),
+                reconcile_waits: [Duration::from_millis(5), Duration::from_millis(5)],
+                delete_timeout: Duration::from_millis(300),
+            },
+            interrupted: AtomicBool::new(false),
+            client,
+        })
+    }
+
+    fn ctx(&self) -> PodCtx<'_> {
+        PodCtx {
+            client: &self.client,
+            runs: &self.runs,
+            bus: &self.bus,
+            timing: &self.timing,
+            interrupted: &self.interrupted,
+        }
+    }
+}
+
+fn target() -> RunpodTarget {
+    RunpodTarget {
+        gpu_types: vec!["NVIDIA A40".into()],
+        gpu_count: 1,
+        image: "img".into(),
+        venv: "/venv".into(),
+        container_disk_gb: 50,
+        max_hours: 1.0,
+        boot_grace: Duration::from_secs(1800),
+        retrieve_grace: Duration::from_secs(3600),
+        data_center_ids: Vec::new(),
+        network_volume_id: None,
+    }
+}
+
+fn keygen_available() -> bool {
+    let available = std::process::Command::new("ssh-keygen")
+        .arg("-?")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+    if !available {
+        eprintln!("skipped: ssh-keygen is not installed");
+    }
+    available
+}
+
+#[tokio::test]
+async fn a_run_whose_pod_cannot_be_placed_is_failed() -> TestResult {
+    if !keygen_available() {
+        return Ok(());
+    }
+    let harness = Harness::new().await?;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"detail": CAPACITY})))
+        .mount(&harness.server)
+        .await;
+    let run = create(&harness.runs, "/workspace/overbrainer", "gpu_cloud")?;
+    let result = start_pod(&harness.ctx(), &target(), run.clone(), false).await;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    let saved = harness.runs.load(&run.id)?;
+    assert_eq!(saved.state, RunState::Failed);
+    assert!(
+        saved
+            .message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("no gpu_types entry could be placed")),
+        "{:?}",
+        saved.message
+    );
+    let pod = PodRecord::load(&harness.runs, &run.id)?.ok_or("no pod.json")?;
+    assert_eq!(pod.attempts[0].result, AttemptResult::Unavailable);
+    assert!(pod.host_key.starts_with("ssh-ed25519 "));
+    let ssh = harness.runs.run_dir(&run.id)?.join("ssh");
+    assert!(ssh.join("id_ed25519").is_file());
+    assert!(!ssh.join("host_ed25519").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn ctrl_c_before_the_pod_fails_the_run_as_interrupted() -> TestResult {
+    if !keygen_available() {
+        return Ok(());
+    }
+    let harness = Harness::new().await?;
+    harness.interrupted.store(true, Ordering::SeqCst);
+    let run = create(&harness.runs, "/workspace/overbrainer", "gpu_cloud")?;
+    let result = start_pod(&harness.ctx(), &target(), run.clone(), false).await;
+    assert!(matches!(result, Err(PodError::Interrupted)), "{result:?}");
+    let saved = harness.runs.load(&run.id)?;
+    assert_eq!(saved.state, RunState::Failed);
+    assert_eq!(
+        saved.message.as_deref(),
+        Some("interrupted before the job started")
+    );
+    Ok(())
+}
+
+/// A trainer with nothing to prepare or retrieve.
+struct Nothing;
+
+impl Trainer for Nothing {
+    fn prepare(&self, _run_dir: &Path, _root: &str) -> Result<(), TrainError> {
+        Ok(())
+    }
+
+    fn commands(&self) -> Vec<Vec<String>> {
+        Vec::new()
+    }
+
+    fn env(&self, _root: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    fn metrics_file(&self) -> &'static str {
+        "metrics.jsonl"
+    }
+
+    fn artifacts(&self) -> Artifacts {
+        Artifacts {
+            entries: Vec::new(),
+            exclude: Vec::new(),
+            required: None,
+        }
+    }
+}
+
+/// How many deletes the stub received.
+async fn deletes(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.method.as_str() == "DELETE")
+        .count()
+}
+
+/// A pod record for pod `p1`, created now, whose deadline passed `ago` ago.
+fn pod_record(
+    run_id: &str,
+    keep: bool,
+    ago: Duration,
+) -> Result<PodRecord, Box<dyn std::error::Error>> {
+    let mut record = PodRecord::new(run_id, keep, 1, "ssh-ed25519 AAAAhost");
+    let pod = serde_json::from_value(json!({"id": "p1", "status": "RUNNING", "cost": 0.5}))?;
+    record.begin_attempt(
+        "NVIDIA A40",
+        SystemTime::now() - Duration::from_secs(3600) - ago,
+        1.0,
+    );
+    record.created(&pod, AttemptResult::Created, SystemTime::now());
+    Ok(record)
+}
+
+#[tokio::test]
+async fn the_client_deletes_a_pod_past_its_deadline() -> TestResult {
+    let harness = Harness::new().await?;
+    serve_p1(&harness.server, false).await;
+    let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
+    let mut run = create(&harness.runs, executor.workdir(), "gpu_cloud")?;
+    let job = executor
+        .spawn(&JobCommand {
+            dir: run.remote_dir.clone(),
+            script: "sleep 30".into(),
+            secrets: Vec::new(),
+            container: None,
+        })
+        .await?;
+    run.job = Some(job.clone());
+    run.state = RunState::Running;
+    harness.runs.save(&run)?;
+    let mut pod = pod_record(&run.id, false, Duration::from_secs(600))?;
+    let run_ctx = RunCtx {
+        runs: &harness.runs,
+        executor: &executor,
+        bus: &harness.bus,
+        poll: Duration::from_millis(50),
+    };
+    let result = follow(&harness.ctx(), &run_ctx, &Nothing, run.clone(), &mut pod).await;
+    executor.cancel(&job).await?;
+    assert!(
+        matches!(result, Err(PodError::DeadlineReached)),
+        "{result:?}"
+    );
+    assert_eq!(pod.state, PodState::Deleted);
+    let saved = harness.runs.load(&run.id)?;
+    assert_eq!(saved.state, RunState::Failed);
+    assert_eq!(
+        saved.message.as_deref(),
+        Some("max_hours reached: the pod was deleted before the job ended")
+    );
+    assert_eq!(deletes(&harness.server).await, 1);
+    Ok(())
+}
+
+/// A started run whose job cannot be found: its watch fails at once.
+fn broken_run(runs: &Runs) -> Result<RunRecord, Box<dyn std::error::Error>> {
+    let mut run = create(runs, "/nonexistent/pod", "gpu_cloud")?;
+    run.state = RunState::Running;
+    runs.save(&run)?;
+    Ok(run)
+}
+
+#[tokio::test]
+async fn a_watch_that_loses_a_deleted_pod_fails_the_run() -> TestResult {
+    let harness = Harness::new().await?;
+    serve_p1(&harness.server, true).await;
+    let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
+    let run = broken_run(&harness.runs)?;
+    let mut pod = pod_record(&run.id, true, Duration::ZERO)?;
+    let run_ctx = RunCtx {
+        runs: &harness.runs,
+        executor: &executor,
+        bus: &harness.bus,
+        poll: Duration::from_millis(5),
+    };
+    let result = follow(&harness.ctx(), &run_ctx, &Nothing, run.clone(), &mut pod).await;
+    assert!(matches!(result, Err(PodError::PodGone(_))), "{result:?}");
+    assert_eq!(pod.state, PodState::Deleted);
+    let saved = harness.runs.load(&run.id)?;
+    assert_eq!(saved.state, RunState::Failed);
+    assert_eq!(saved.message.as_deref(), Some("pod p1 no longer exists"));
+    // A pod the API no longer shows is still sent its delete, to confirm it.
+    assert_eq!(deletes(&harness.server).await, 1);
+
+    let alive = Harness::new().await?;
+    serve_p1(&alive.server, false).await;
+    let run = broken_run(&alive.runs)?;
+    let mut pod = pod_record(&run.id, true, Duration::ZERO)?;
+    let run_ctx = RunCtx {
+        runs: &alive.runs,
+        executor: &executor,
+        bus: &alive.bus,
+        poll: Duration::from_millis(5),
+    };
+    let result = follow(&alive.ctx(), &run_ctx, &Nothing, run.clone(), &mut pod).await;
+    assert!(matches!(result, Err(PodError::Run(_))), "{result:?}");
+    assert_eq!(alive.runs.load(&run.id)?.state, RunState::Running);
+    assert_eq!(deletes(&alive.server).await, 0);
+    Ok(())
+}

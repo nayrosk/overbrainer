@@ -1,0 +1,446 @@
+//! The steps of a Runpod run around the generic run flows: provisioning its pod,
+//! following its job under a client-side deadline, and ending the pod once the
+//! results are retrieved. The CLI drives them and decides what Ctrl-C does.
+
+use std::fs;
+use std::io;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use secrecy::SecretString;
+
+use crate::events::Event;
+use crate::exec::{Executor, SshExecutor};
+use crate::runs::{Outcome, RunCtx, RunRecord, RunState, Runs, watch};
+use crate::train::Trainer;
+
+use super::provision::note_strays;
+use super::{
+    CLIENT_KEY, DeleteReason, DeletedBy, PodCtx, PodError, PodId, PodKeys, PodPlan, PodRecord,
+    PodState, PodStatus, Provisioned, RunpodTarget, SSH_DIR, SshEndpoint, alias, provision, remove,
+    sweep, wait_gone, write_config,
+};
+
+/// How long after the watchdog's deadline the client deletes the pod itself, when
+/// it is still there: the watchdog should have done it first.
+pub const DEADLINE_MARGIN: Duration = Duration::from_secs(5 * 60);
+
+/// Where the watchdog looks for the client's "retrieved" marker, in a run
+/// directory on the pod.
+pub const RETRIEVED_MARKER: &str = ".pod/retrieved";
+
+/// Creates the pod of the new run `run` (from `runs::create`) and waits until it is
+/// ready: keys in `runs/<id>/ssh/`, then `pod.json`, then provisioning. When that
+/// fails, the run is saved `Failed` with the reason (`interrupted before the job
+/// started` after Ctrl-C), and whatever pod was created is deleted.
+///
+/// # Errors
+///
+/// Returns the [`PodError`] of the step that failed.
+pub async fn start_pod(
+    ctx: &PodCtx<'_>,
+    target: &RunpodTarget,
+    mut run: RunRecord,
+    keep: bool,
+) -> Result<(PodRecord, Provisioned), PodError> {
+    let result = provision_run(ctx, target, &run, keep).await;
+    if let Err(error) = &result {
+        run.state = RunState::Failed;
+        run.message = Some(run_message(error));
+        if let Err(save_error) = ctx.runs.save(&run) {
+            tracing::warn!("cannot record run {} as failed: {save_error}", run.id);
+        }
+    }
+    result
+}
+
+/// The reason a failed provisioning gives in `run.json`: the error's message,
+/// except that an answer of the Runpod API is reduced to its status. A
+/// non-create call's error carries Runpod's own text (cleaned of the account
+/// key), which the log shows but `run.json` never keeps.
+fn run_message(error: &PodError) -> String {
+    match error {
+        PodError::Api(api) => match api.status() {
+            Some(status) => format!("Runpod answered {status}"),
+            None => error.to_string(),
+        },
+        _ => error.to_string(),
+    }
+}
+
+async fn provision_run(
+    ctx: &PodCtx<'_>,
+    target: &RunpodTarget,
+    run: &RunRecord,
+    keep: bool,
+) -> Result<(PodRecord, Provisioned), PodError> {
+    let ssh_dir = ctx.runs.run_dir(&run.id)?.join(SSH_DIR);
+    let keys = PodKeys::generate(&ssh_dir, &alias(&run.id))?;
+    let mut record = PodRecord::new(&run.id, keep, target.gpu_count, &keys.host_public);
+    record.save(ctx.runs)?;
+    let plan = PodPlan {
+        run_id: &run.id,
+        target,
+        keys: &keys,
+        ssh_dir: &ssh_dir,
+        workdir: target.workdir(),
+        api_url: ctx.client.base_url(),
+    };
+    let provisioned = provision(ctx, &plan, &mut record).await?;
+    Ok((record, provisioned))
+}
+
+/// Records that the job of the run was started on the pod.
+///
+/// # Errors
+///
+/// Returns [`PodError::Runs`] when `pod.json` cannot be saved.
+pub fn job_started(runs: &Runs, pod: &mut PodRecord) -> Result<(), PodError> {
+    pod.state = PodState::Running;
+    pod.save(runs)?;
+    Ok(())
+}
+
+/// Follows the started run `record` with `runs::watch`, until its job ends, with
+/// the client's own guard: at the watchdog's deadline plus [`DEADLINE_MARGIN`], a
+/// pod still there is deleted and the run saved `Failed` (never for a kept pod).
+///
+/// # Errors
+///
+/// Returns [`PodError::DeadlineReached`] after that guard fired,
+/// [`PodError::PodGone`] when the target stays unreachable because the pod no
+/// longer exists (the run is then saved `Failed`), and [`PodError::Run`] for any
+/// other failure of the watch (the job may keep running: attach again).
+pub async fn follow<E: Executor, T: Trainer>(
+    ctx: &PodCtx<'_>,
+    run_ctx: &RunCtx<'_, E>,
+    trainer: &T,
+    record: RunRecord,
+    pod: &mut PodRecord,
+) -> Result<Outcome, PodError> {
+    let id = record.id.clone();
+    let watched = match until_deadline(pod) {
+        Some(wait) => tokio::select! {
+            outcome = watch(run_ctx, trainer, record) => Some(outcome),
+            () = tokio::time::sleep(wait) => None,
+        },
+        None => Some(watch(run_ctx, trainer, record).await),
+    };
+    match watched {
+        Some(Ok(outcome)) => Ok(outcome),
+        Some(Err(error)) => Err(unreachable(ctx, pod, &id, error.into()).await),
+        None => Err(deadline_reached(ctx, pod, &id).await),
+    }
+}
+
+/// Time left until the client's own deadline, `None` for a kept pod.
+fn until_deadline(pod: &PodRecord) -> Option<Duration> {
+    if pod.keep {
+        return None;
+    }
+    let deadline = pod.deadline_unix?.saturating_add(DEADLINE_MARGIN.as_secs());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    Some(Duration::from_secs(deadline.saturating_sub(now)))
+}
+
+/// The pod outlived its deadline: deletes it (confirmed; recorded deleted by the
+/// watchdog when it was already gone), and fails the run.
+async fn deadline_reached(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> PodError {
+    if let Err(error) = remove(ctx, pod, DeleteReason::Deadline, DeletedBy::Client).await {
+        return error;
+    }
+    fail_run(
+        ctx.runs,
+        run_id,
+        "max_hours reached: the pod was deleted before the job ended",
+    );
+    PodError::DeadlineReached
+}
+
+/// The watch failed with `error`: when the pod is gone, the run is failed with
+/// that reason instead.
+async fn unreachable(
+    ctx: &PodCtx<'_>,
+    pod: &mut PodRecord,
+    run_id: &str,
+    error: PodError,
+) -> PodError {
+    match gone(ctx, pod).await {
+        Ok(true) => {
+            let id = pod.pod_id.clone();
+            if let Some(id) = &id {
+                fail_run(ctx.runs, run_id, &format!("pod {id} no longer exists"));
+            }
+            id.map_or(error, PodError::PodGone)
+        },
+        Ok(false) => error,
+        Err(check_error) => {
+            tracing::warn!("cannot look the pod up: {check_error}");
+            error
+        },
+    }
+}
+
+/// Whether the run's pod no longer exists; if so, its deletion is confirmed (see
+/// [`confirm_gone`]) and `pod.json` records it.
+async fn gone(ctx: &PodCtx<'_>, pod: &mut PodRecord) -> Result<bool, PodError> {
+    let Some(id) = pod.pod_id.clone() else {
+        return Ok(true);
+    };
+    if pod.state == PodState::Deleted {
+        return Ok(true);
+    }
+    if ctx.client.get_pod(&id).await?.is_some() {
+        return Ok(false);
+    }
+    confirm_gone(ctx, pod, id).await?;
+    Ok(true)
+}
+
+/// The API no longer shows the pod `id`: its delete is still sent, since a
+/// one-off 404 must never pass a live pod for deleted, and its absence awaited
+/// before `pod.json` records it deleted. Until then `pod.json` keeps the pod, as
+/// `Deleting`.
+async fn confirm_gone(ctx: &PodCtx<'_>, pod: &mut PodRecord, id: PodId) -> Result<(), PodError> {
+    pod.state = PodState::Deleting;
+    let saved = pod.save(ctx.runs);
+    let found = ctx.client.delete_pod(&id).await?;
+    wait_gone(ctx, &id).await?;
+    saved?;
+    let by = if found {
+        tracing::warn!("pod {id} was reported gone but still existed: it was deleted");
+        DeletedBy::Client
+    } else {
+        DeletedBy::Unknown
+    };
+    mark_gone(ctx, pod, id, by)
+}
+
+/// Records the pod `id` as deleted by `by`.
+fn mark_gone(
+    ctx: &PodCtx<'_>,
+    pod: &mut PodRecord,
+    id: PodId,
+    by: DeletedBy,
+) -> Result<(), PodError> {
+    let now = SystemTime::now();
+    let uptime = pod.uptime(now);
+    pod.deleted(by, now);
+    pod.save(ctx.runs)?;
+    forget_client_key(ctx.runs, &pod.run_id);
+    ctx.bus.publish(Event::PodStatus(PodStatus::Deleted {
+        pod_id: id,
+        uptime,
+        estimated_spend: pod.estimated_spend,
+    }));
+    Ok(())
+}
+
+/// Saves the run `run_id` as `Failed` with `message`, best effort.
+fn fail_run(runs: &Runs, run_id: &str, message: &str) {
+    let result = runs.load(run_id).and_then(|mut run| {
+        run.state = RunState::Failed;
+        run.message = Some(message.to_string());
+        runs.save(&run)
+    });
+    if let Err(error) = result {
+        tracing::warn!("cannot record run {run_id} as failed: {error}");
+    }
+}
+
+/// What became of a pod once its job ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// Deleted after its results were retrieved.
+    Deleted,
+    /// Kept (`--keep-pod`): only `overbrainer pod rm` deletes it.
+    Kept,
+    /// Its results were not retrieved: it stays for the watchdog's retrieve
+    /// grace, or until `train attach` retrieves them.
+    AwaitingRetrieval,
+}
+
+/// Ends the pod of the run `run` once its job ended, after copying the watchdog's
+/// log into `runs/<run-id>/.pod/`. Only when the results were `retrieved`
+/// ([`Outcome::retrieved`]: every file the pod has was downloaded and verified)
+/// is the "retrieved" marker written on the pod, first (so its watchdog deletes
+/// it even if this client's delete fails), then the pod is deleted unless kept
+/// and its deletion confirmed, other pods of the run are swept (any whose
+/// deletion cannot be confirmed is recorded in `pod.json`), and the run's
+/// private client key is removed. Otherwise the pod is left to its watchdog's
+/// retrieve grace (a kept pod stays kept), with a warning telling how to
+/// retrieve the results again or remove the pod.
+///
+/// # Errors
+///
+/// Returns a [`PodError`] when the delete fails or cannot be confirmed (the pod
+/// then stays in `pod.json`, as `Deleting`) or `pod.json` cannot be saved.
+pub async fn end_pod(
+    ctx: &PodCtx<'_>,
+    pod: &mut PodRecord,
+    executor: &SshExecutor,
+    run: &RunRecord,
+    retrieved: bool,
+) -> Result<Ending, PodError> {
+    fetch_watchdog_log(ctx.runs, executor, run).await;
+    if !retrieved {
+        return unretrieved(ctx, pod, &run.id);
+    }
+    let marker = format!("{}/{RETRIEVED_MARKER}", run.remote_dir);
+    if let Err(error) = executor.write_marker(&marker).await {
+        tracing::warn!(
+            "cannot mark the results of run {} retrieved on the pod: {error}",
+            run.id
+        );
+    }
+    if pod.keep {
+        pod.state = PodState::Kept;
+        pod.save(ctx.runs)?;
+        if let Some(id) = &pod.pod_id {
+            ctx.bus
+                .publish(Event::PodStatus(PodStatus::Kept { pod_id: id.clone() }));
+        }
+        return Ok(Ending::Kept);
+    }
+    remove(ctx, pod, DeleteReason::Retrieved, DeletedBy::Client).await?;
+    let stray = sweep(ctx, &run.id, None).await;
+    note_strays(ctx, pod, stray);
+    forget_client_key(ctx.runs, &run.id);
+    Ok(Ending::Deleted)
+}
+
+/// The results of the run `run_id` were not retrieved: the pod stays, for its
+/// watchdog's retrieve grace or, kept, until removed.
+fn unretrieved(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> Result<Ending, PodError> {
+    let name = pod
+        .pod_id
+        .as_ref()
+        .map_or_else(|| "(none)".to_string(), ToString::to_string);
+    let stays = if pod.keep {
+        pod.state = PodState::Kept;
+        "stays (--keep-pod), nothing deletes it automatically"
+    } else {
+        pod.state = PodState::AwaitingRetrieval;
+        "stays until its watchdog's retrieve grace ends"
+    };
+    pod.save(ctx.runs)?;
+    tracing::warn!(
+        "the results of run {run_id} were not retrieved: pod {name} {stays}; retrieve them with `overbrainer train attach {run_id}`, or remove the pod with `overbrainer pod rm {run_id}`"
+    );
+    Ok(Ending::AwaitingRetrieval)
+}
+
+/// The watchdog's log on the pod, in the run directory on the pod.
+pub const WATCHDOG_LOG: &str = ".pod/watchdog.log";
+
+/// Copies the watchdog's log of the run into `runs/<run-id>/.pod/`, best effort:
+/// the pod's own logs keep it too.
+async fn fetch_watchdog_log(runs: &Runs, executor: &SshExecutor, run: &RunRecord) {
+    let Ok(local) = runs.run_dir(&run.id) else {
+        return;
+    };
+    let entries = [WATCHDOG_LOG.to_string()];
+    if let Err(error) = executor
+        .download(&run.remote_dir, &local, &entries, &[])
+        .await
+    {
+        tracing::warn!("cannot copy the watchdog's log of run {}: {error}", run.id);
+    }
+}
+
+/// Removes the private client key of a run whose pod is gone, best effort.
+pub fn forget_client_key(runs: &Runs, run_id: &str) {
+    let Ok(dir) = runs.run_dir(run_id) else {
+        return;
+    };
+    let key = dir.join(SSH_DIR).join(CLIENT_KEY);
+    match fs::remove_file(&key) {
+        Ok(()) => {},
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+        Err(error) => tracing::warn!("cannot remove {}: {error}", key.display()),
+    }
+}
+
+/// Connects again to the pod of the run `run`, for `train attach` and `train
+/// cancel`: looks it up (its public port may have changed), rewrites the run's ssh
+/// config and connects. `None` when the pod no longer exists, which `pod.json`
+/// then records once its deletion is confirmed.
+///
+/// # Errors
+///
+/// Returns [`PodError::NoEndpoint`] when the pod exists but has no SSH endpoint
+/// (stopped or restarting), and another [`PodError`] when the API, the files or
+/// the connection fail.
+pub async fn reconnect(
+    ctx: &PodCtx<'_>,
+    pod: &mut PodRecord,
+    run: &RunRecord,
+) -> Result<Option<SshExecutor>, PodError> {
+    let Some(id) = pod.pod_id.clone() else {
+        return Ok(None);
+    };
+    if pod.state == PodState::Deleted {
+        return Ok(None);
+    }
+    let Some(remote) = ctx.client.get_pod(&id).await? else {
+        confirm_gone(ctx, pod, id).await?;
+        return Ok(None);
+    };
+    let direct = remote
+        .direct()
+        .ok_or_else(|| PodError::NoEndpoint(id.clone(), remote.status.name().to_string()))?;
+    let endpoint = SshEndpoint {
+        host: direct.host.clone(),
+        port: direct.port,
+        user: direct.username.clone(),
+    };
+    let ssh_dir = ctx.runs.run_dir(&run.id)?.join(SSH_DIR);
+    let keys = PodKeys::new(
+        ssh_dir.join(CLIENT_KEY),
+        String::new(),
+        pod.host_key.clone(),
+        SecretString::from(String::new()),
+    );
+    let alias = alias(&run.id);
+    let config = write_config(&ssh_dir, &alias, &endpoint, &keys)?;
+    let workdir = run
+        .remote_dir
+        .rsplit_once('/')
+        .map_or(run.remote_dir.as_str(), |(parent, _)| parent);
+    let executor = SshExecutor::connect(&alias, workdir, Some(&config)).await?;
+    pod.ssh = Some(endpoint);
+    pod.save(ctx.runs)?;
+    Ok(Some(executor))
+}
+
+/// The command reaching a kept pod: `ssh -F runs/<id>/ssh/config overbrainer-<id>`.
+#[must_use]
+pub fn ssh_command(run_id: &str) -> String {
+    format!(
+        "ssh -F runs/{run_id}/{SSH_DIR}/{} {}",
+        super::SSH_CONFIG,
+        alias(run_id)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runpod::ApiError;
+
+    #[test]
+    fn a_failed_run_keeps_only_the_status_of_an_api_answer() {
+        let answered = PodError::Api(ApiError::Status {
+            status: 500,
+            message: "server text".into(),
+            retry_after: None,
+            capacity: false,
+        });
+        assert_eq!(run_message(&answered), "Runpod answered 500");
+        assert_eq!(
+            run_message(&PodError::Interrupted),
+            "interrupted before the job started"
+        );
+    }
+}
