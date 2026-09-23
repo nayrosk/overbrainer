@@ -1,5 +1,7 @@
 //! The styles the views use: named ANSI colors, or modifiers only under `NO_COLOR`.
 
+use std::ffi::OsStr;
+
 use ratatui::style::{Color, Modifier, Style};
 use tracing::Level;
 
@@ -55,7 +57,13 @@ impl Theme {
     /// [`Theme::mono`] when `NO_COLOR` is set and not empty (no-color.org), else
     /// [`Theme::color`]. Read once, when the TUI starts.
     pub(super) fn detect() -> Self {
-        if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+        Self::from_no_color(std::env::var_os("NO_COLOR").as_deref())
+    }
+
+    /// The theme for a `NO_COLOR` of `value`: [`Theme::mono`] when it is set and
+    /// not empty, else [`Theme::color`].
+    pub(super) fn from_no_color(value: Option<&OsStr>) -> Self {
+        if value.is_some_and(|value| !value.is_empty()) {
             Self::mono()
         } else {
             Self::color()
@@ -70,5 +78,18 @@ impl Theme {
             Level::INFO => self.ok,
             _ => self.dim,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_color_set_and_not_empty_turns_color_off() {
+        assert_eq!(Theme::from_no_color(None), Theme::color());
+        assert_eq!(Theme::from_no_color(Some(OsStr::new(""))), Theme::color());
+        assert_eq!(Theme::from_no_color(Some(OsStr::new("1"))), Theme::mono());
+        assert_eq!(Theme::from_no_color(Some(OsStr::new("0"))), Theme::mono());
     }
 }
