@@ -271,7 +271,10 @@ pub(super) async fn look_up_all(ctx: &PodCtx<'_>, ids: &[PodId]) -> Vec<Look> {
     look_again_all(ctx, ids, &pending, &mut looks).await;
     looks
         .into_iter()
-        .map(|look| look.unwrap_or(Look::Gone))
+        .map(|look| {
+            // Every pod gets a look above; one without is undetermined, never gone.
+            look.unwrap_or_else(|| Look::Failed("the pod was not looked at".to_string()))
+        })
         .collect()
 }
 

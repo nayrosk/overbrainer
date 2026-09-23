@@ -39,6 +39,9 @@ pub enum RowKind {
     AwaitingRetrieval,
     /// One of its run's `stray_pods`.
     Stray,
+    /// One of its run's `stray_pods`, beside the run's pod kept or awaiting
+    /// retrieval: `pod rm` of the run deletes that pod too.
+    StrayBesideKept,
     /// Its run is not in this project's `runs/`: it may belong to another
     /// checkout.
     NotInRuns,
@@ -80,7 +83,11 @@ impl PodRow {
     pub fn is_orphan(&self) -> bool {
         matches!(
             self.kind,
-            RowKind::Ended | RowKind::Stray | RowKind::NotInRuns | RowKind::NoMarker
+            RowKind::Ended
+                | RowKind::Stray
+                | RowKind::StrayBesideKept
+                | RowKind::NotInRuns
+                | RowKind::NoMarker
         )
     }
 }
@@ -211,10 +218,20 @@ impl<'a> Known<'a> {
                 ),
             );
         };
+        let pod_state = self.pod_records.get(run).map(|pod| pod.state);
         if self.is_stray(id) {
-            return (RowKind::Stray, STRAY.to_string());
+            let kept = matches!(
+                pod_state,
+                Some(PodState::Kept | PodState::AwaitingRetrieval)
+            );
+            let kind = if kept {
+                RowKind::StrayBesideKept
+            } else {
+                RowKind::Stray
+            };
+            return (kind, STRAY.to_string());
         }
-        match (self.pod_records.get(run).map(|pod| pod.state), record.state) {
+        match (pod_state, record.state) {
             (Some(PodState::Kept), _) => (RowKind::Kept, "kept".to_string()),
             (Some(PodState::AwaitingRetrieval), _) => {
                 (RowKind::AwaitingRetrieval, "awaiting retrieval".to_string())
@@ -382,6 +399,10 @@ pub fn orphan_warnings(rows: &[PodRow]) -> Vec<String> {
                 RowKind::NotInRuns => {
                     format!("pod {} is still on Runpod{rate}: {}", row.pod_id, row.note)
                 },
+                RowKind::StrayBesideKept => format!(
+                    "pod {} ({}) is still on Runpod{rate}: remove it with `overbrainer pod rm {}` (this also deletes the run's kept pod)",
+                    row.pod_id, row.note, row.run
+                ),
                 _ => format!(
                     "pod {} ({}) is still on Runpod{rate}: remove it with `overbrainer pod rm {}`",
                     row.pod_id, row.note, row.run
@@ -430,7 +451,8 @@ pub struct Removal {
 /// A run absent from this project's `runs/` is refused unless `force`: its pods
 /// may belong to another checkout. So is a run still starting its pod (preparing,
 /// or running with a last create call that has no pod yet), with
-/// [`PodError::StillStarting`], and nothing is deleted. For a running run
+/// [`PodError::StillStarting`], and a running run whose pod is not recorded,
+/// with [`PodError::PodNotRecorded`]: nothing is deleted. For a running run
 /// without `force`, its training pod (the one in `pod.json`) is kept, every other
 /// pod is deleted, and [`PodError::RunStillRunning`] says so. Forced, the run is
 /// saved `Failed` once a pod was deleted. The run's private client key is removed
@@ -465,6 +487,10 @@ async fn remove_checked(
         .as_ref()
         .filter(|record| record.state != PodState::Deleted)
         .and_then(|record| record.pod_id.clone());
+    if keep_training && training.is_none() {
+        // Any pod carrying the marker may be the one training.
+        return Err(PodError::PodNotRecorded(run_id.to_string()));
+    }
     let mut failed = None;
     if !keep_training
         && let Some(mut record) = record

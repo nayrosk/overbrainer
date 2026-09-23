@@ -56,6 +56,7 @@ struct Account {
     listed: Vec<String>,
     forbidden: HashSet<String>,
     broken: HashSet<String>,
+    flaky: Mutex<HashSet<String>>,
     deleted: Mutex<HashSet<String>>,
 }
 
@@ -70,6 +71,14 @@ impl Account {
 
     fn forbid(mut self, id: &str) -> Self {
         self.forbidden.insert(id.to_string());
+        self
+    }
+
+    /// The next GET of `id` answers Runpod's 404, and the later ones the pod.
+    fn flaky(self, id: &str) -> Self {
+        if let Ok(mut flaky) = self.flaky.lock() {
+            flaky.insert(id.to_string());
+        }
         self
     }
 
@@ -112,6 +121,9 @@ impl Account {
     fn get(&self, id: &str) -> ResponseTemplate {
         if self.broken.contains(id) {
             return ResponseTemplate::new(400).set_body_json(json!({"status": 400}));
+        }
+        if self.flaky.lock().is_ok_and(|mut flaky| flaky.remove(id)) {
+            return not_found();
         }
         match self.pods.get(id) {
             Some(body) if !self.deleted(id) => ResponseTemplate::new(200).set_body_json(body),
@@ -297,6 +309,43 @@ async fn a_recorded_pod_answering_again_is_not_gone() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_pod_answering_again_in_a_later_round_is_not_gone() -> TestResult {
+    let harness = Harness::new(Account::default().with("p1", Some(RUN), false).flaky("p1")).await?;
+    harness.recorded(RUN, RunState::Running, "p1", PodState::Running)?;
+    let rows = pod_rows(&harness.ctx()).await?;
+    let row = find(&rows, "p1")?;
+    assert_eq!(
+        (row.status.as_str(), row.kind),
+        ("RUNNING", RowKind::InProgress)
+    );
+    assert_eq!(harness.calls("GET", "/v2/pods/p1").await, 2);
+    let record = harness.pod_json(RUN)?;
+    assert_eq!((record.state, record.deleted_by), (PodState::Running, None));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_stray_hint_of_a_kept_run_says_pod_rm_deletes_the_kept_pod_too() -> TestResult {
+    for pod_state in [PodState::Kept, PodState::AwaitingRetrieval] {
+        let account =
+            Account::default()
+                .with("p3", Some(ENDED), true)
+                .with("s1", Some(ENDED), true);
+        let harness = Harness::new(account).await?;
+        harness.recorded(ENDED, RunState::Succeeded, "p3", pod_state)?;
+        harness.strays(ENDED, &["s1"])?;
+        let rows = pod_rows(&harness.ctx()).await?;
+        assert_eq!(
+            orphan_warnings(&rows),
+            vec![format!(
+                "pod s1 (stray, not deleted) is still on Runpod at $0.53/h: remove it with `overbrainer pod rm {ENDED}` (this also deletes the run's kept pod)"
+            )]
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn strays_are_shown_and_dropped_once_confirmed_gone() -> TestResult {
     let account = Account::default()
         .with("p3", Some(ENDED), true)
@@ -446,6 +495,37 @@ async fn pod_rm_leaves_a_run_still_starting_its_pod_alone_unless_forced() -> Tes
         let forced = remove_run_pods(&harness.ctx(), RUN, true).await;
         forced.result?;
         assert_eq!(harness.deletes().await, vec!["p1", "s1", "x2"]);
+        assert_eq!(harness.runs.load(RUN)?.state, RunState::Failed);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pod_rm_leaves_a_running_run_whose_pod_is_not_recorded_alone() -> TestResult {
+    // No pod.json at all, then a pod.json without any pod.
+    for with_record in [false, true] {
+        let harness = Harness::new(Account::default().with("p1", Some(RUN), true)).await?;
+        harness.recorded(RUN, RunState::Running, "p1", PodState::Running)?;
+        let path = harness.runs.run_dir(RUN)?.join("pod.json");
+        std::fs::remove_file(&path)?;
+        if with_record {
+            PodRecord::new(RUN, false, 1, "ssh-ed25519 AAAA").save(&harness.runs)?;
+        }
+        let refused = remove_run_pods(&harness.ctx(), RUN, false).await;
+        let error = refused.result.err().ok_or("expected a refusal")?;
+        assert!(matches!(error, PodError::PodNotRecorded(_)), "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "run {RUN} is in progress but its pod is not recorded, so its pods are left alone; if the run is really dead, use `overbrainer pod rm {RUN} --force`"
+            )
+        );
+        assert!(refused.removed.is_empty());
+        assert!(harness.deletes().await.is_empty());
+        assert_eq!(harness.runs.load(RUN)?.state, RunState::Running);
+
+        remove_run_pods(&harness.ctx(), RUN, true).await.result?;
+        assert_eq!(harness.deletes().await, vec!["p1"]);
         assert_eq!(harness.runs.load(RUN)?.state, RunState::Failed);
     }
     Ok(())

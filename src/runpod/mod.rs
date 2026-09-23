@@ -146,6 +146,12 @@ pub enum PodError {
         "run {0} is still starting its pod; wait for it, or use `overbrainer train cancel {0}` once it runs, or `pod rm {0} --force`"
     )]
     StillStarting(String),
+    /// `pod rm` of a run in progress whose training pod is not recorded, without
+    /// `--force`: nothing was deleted, since any pod of the run may be training.
+    #[error(
+        "run {0} is in progress but its pod is not recorded, so its pods are left alone; if the run is really dead, use `overbrainer pod rm {0} --force`"
+    )]
+    PodNotRecorded(String),
     /// `pod rm` of a run absent from this project's `runs/`, without `--force`:
     /// its pods may belong to another checkout.
     #[error(
