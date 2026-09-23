@@ -60,6 +60,7 @@ jobs:
           sudo apt-get install -y dash busybox-static
           dash -c 'echo dash ready'
           busybox sh -c 'echo busybox ready'
+          curl --version
       - run: cargo test --all-targets --locked
 
   ssh:
@@ -106,10 +107,10 @@ jobs:
             UserKnownHostsFile $HOME/.ssh/overbrainer_known_hosts
           EOF
           echo "OVERBRAINER_TEST_SSH_CONFIG=$HOME/.ssh/overbrainer_config" >> "$GITHUB_ENV"
-      - name: Test the SSH executor against the sshd
+      - name: Test the SSH executor and Runpod pod access against the sshd
         env:
           OVERBRAINER_TEST_SSH_HOST: overbrainer-test
-        run: cargo test --locked --test exec_ssh
+        run: cargo test --locked --test exec_ssh --test runpod_ssh
 
   msrv:
     runs-on: ubuntu-latest
