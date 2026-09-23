@@ -12,8 +12,14 @@ use ratatui::style::{Color, Modifier};
 use tracing::Level;
 
 use super::app::{App, Overlay, Project, View};
+use super::dataset::{Node, TopicInfo};
+use super::tasks::{Done, TaskId};
 use super::theme::Theme;
 use super::ui;
+use crate::dataset::{
+    Dataset, Example, Exclusion, FinishReason, Id, Message, Meta, Question, ReasoningKind,
+    Rejected, Role, Subtopic,
+};
 use crate::logging::{LogBuffer, LogLine};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -34,8 +40,172 @@ pub(super) fn at(seconds: u64) -> SystemTime {
 pub(super) fn app() -> App {
     let project = Project {
         name: "rust_expert".into(),
+        dir: "/nonexistent/rust_expert".into(),
+        topics: Vec::new(),
+        eval_ratio: 0.1,
     };
     App::new(project, LogBuffer::new(100), Theme::color(), at(NOW))
+}
+
+/// The fixtures' topics: `ownership` and `traits`.
+pub(super) fn topics() -> Vec<TopicInfo> {
+    vec![
+        TopicInfo {
+            name: "ownership".into(),
+            description: Some("Moves, borrows and lifetimes in Rust".into()),
+            subtopics: 2,
+            questions_per_subtopic: 3,
+        },
+        TopicInfo {
+            name: "traits".into(),
+            description: None,
+            subtopics: 2,
+            questions_per_subtopic: 2,
+        },
+    ]
+}
+
+fn subtopic(topic: &str, name: &str) -> Subtopic {
+    Subtopic {
+        id: Id::subtopic(topic, name),
+        topic: topic.into(),
+        name: name.into(),
+    }
+}
+
+fn question(topic: &str, subtopic: &str, text: &str) -> Question {
+    let subtopic_id = Id::subtopic(topic, subtopic);
+    Question {
+        id: Id::question(&subtopic_id, text),
+        topic: topic.into(),
+        subtopic_id,
+        subtopic: subtopic.into(),
+        text: text.into(),
+    }
+}
+
+fn answer(
+    question: &Question,
+    reasoning: Option<&str>,
+    content: &str,
+    excluded: Option<Exclusion>,
+) -> Example {
+    Example {
+        id: question.id.clone(),
+        topic: question.topic.clone(),
+        subtopic: question.subtopic.clone(),
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: question.text.clone(),
+                reasoning_content: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: content.into(),
+                reasoning_content: reasoning.map(str::to_string),
+            },
+        ],
+        meta: Meta {
+            model: "deepseek-r1".into(),
+            input_tokens: 312,
+            output_tokens: 1840,
+            finish_reason: if excluded == Some(Exclusion::Truncated) {
+                FinishReason::Length
+            } else {
+                FinishReason::Stop
+            },
+            reasoning_kind: ReasoningKind::Raw,
+            excluded,
+        },
+    }
+}
+
+/// The first question of the fixture: answered, usable, with a reasoning.
+pub(super) const MOVED: &str = "What happens to a borrow when the owner is moved?";
+
+/// A dataset with every kind of node: answered, excluded and open questions, a
+/// question whose subtopic is gone, and a topic no longer configured.
+pub(super) fn dataset() -> Dataset {
+    let moved = question("ownership", "Borrowing", MOVED);
+    let coexist = question(
+        "ownership",
+        "Borrowing",
+        "Why can't a &mut and a & borrow coexist?",
+    );
+    let nll = question("ownership", "Borrowing", "When does NLL end a borrow?");
+    let lifetime = question(
+        "ownership",
+        "Lifetimes",
+        "What does 'a mean in fn f<'a>(x: &'a str)?",
+    );
+    let copy = question("ownership", "Moves", "Is a move a copy of the bytes?");
+    let legacy = question("old_topic", "Legacy", "Is this question still used?");
+    let reasoning = "Let me think about what a move does to a borrow.\n\
+                     The borrow checker tracks every live reference to the owner.\n\
+                     A move invalidates the owner's place, so no borrow may outlive it.";
+    let content = "The borrow must end before the move.\n\
+                   If a reference is still used after the move, the compiler reports E0505: \
+                   cannot move out of the value because it is borrowed.\n\
+                   Non-lexical lifetimes end a borrow at its last use, not at the end of \
+                   its scope, so many such programs compile.";
+    Dataset {
+        subtopics: vec![
+            subtopic("ownership", "Borrowing"),
+            subtopic("ownership", "Lifetimes"),
+            subtopic("old_topic", "Legacy"),
+        ],
+        answers: vec![
+            answer(&moved, Some(reasoning), content, None),
+            answer(
+                &coexist,
+                Some("Aliasing and mutation."),
+                "Because",
+                Some(Exclusion::Truncated),
+            ),
+            answer(&lifetime, None, "A lifetime parameter.", None),
+            answer(&copy, None, "Yes, a bitwise copy.", None),
+            answer(&legacy, None, "Maybe.", None),
+        ],
+        rejected: vec![Rejected::Question {
+            id: Id::question(&Id::subtopic("ownership", "Borrowing"), "What is a borrow?"),
+            topic: "ownership".into(),
+            subtopic_id: Id::subtopic("ownership", "Borrowing"),
+            text: "What is a borrow?".into(),
+        }],
+        questions: vec![moved, coexist, nll, lifetime, copy, legacy],
+    }
+}
+
+/// [`app`] on the `ownership` and `traits` topics with [`dataset`] loaded.
+pub(super) fn dataset_app() -> App {
+    let mut app = app();
+    app.project.topics = topics();
+    app.dataset.loaded(dataset(), &app.project.topics);
+    app
+}
+
+/// The tree path of a question of `ownership`/`Borrowing`, and of its answer.
+pub(super) fn path_to(text: &str, answer: bool) -> Vec<Node> {
+    let subtopic = Id::subtopic("ownership", "Borrowing");
+    let id = Id::question(&subtopic, text);
+    let mut path = vec![
+        Node::Topic("ownership".into()),
+        Node::Subtopic(subtopic),
+        Node::Question(id.clone()),
+    ];
+    if answer {
+        path.push(Node::Answer(id));
+    }
+    path
+}
+
+/// Opens every node of `path` but the last and selects it.
+pub(super) fn open_to(app: &mut App, path: &[Node]) {
+    for depth in 1..path.len() {
+        app.dataset.tree.open(path[..depth].to_vec());
+    }
+    app.dataset.tree.select(path.to_vec());
 }
 
 /// A key press.
@@ -197,7 +367,7 @@ fn a_terminal_below_80x24_says_so() -> TestResult {
 /// shows as reversed.
 #[test]
 fn the_monochrome_theme_uses_no_color() -> TestResult {
-    let mut app = app();
+    let mut app = dataset_app();
     logs(&app);
     app.theme = Theme::mono();
     for view in View::ALL {
@@ -221,5 +391,74 @@ fn the_monochrome_theme_uses_no_color() -> TestResult {
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn dataset_with_every_topic_collapsed() -> TestResult {
+    let mut app = dataset_app();
+    snapshot("dataset", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn dataset_on_an_answer_with_its_reasoning() -> TestResult {
+    let mut app = dataset_app();
+    open_to(&mut app, &path_to(MOVED, true));
+    snapshot("dataset_answer", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn dataset_on_an_excluded_question() -> TestResult {
+    let mut app = dataset_app();
+    open_to(
+        &mut app,
+        &path_to("Why can't a &mut and a & borrow coexist?", false),
+    );
+    snapshot("dataset_question", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn dataset_stats_pane() -> TestResult {
+    let mut app = dataset_app();
+    app.dataset.stats = true;
+    snapshot("dataset_stats", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn dataset_with_a_filter() -> TestResult {
+    let mut app = dataset_app();
+    app.dataset.apply_filter("BORROW".into());
+    app.dataset.tree.open(vec![Node::Topic("ownership".into())]);
+    app.dataset.tree.open(vec![
+        Node::Topic("ownership".into()),
+        Node::Subtopic(Id::subtopic("ownership", "Borrowing")),
+    ]);
+    snapshot("dataset_filter", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn dataset_with_missing_subtopic_and_unconfigured_topic() -> TestResult {
+    let mut app = dataset_app();
+    app.dataset.tree.open(vec![Node::Topic("ownership".into())]);
+    app.dataset.tree.open(vec![Node::Topic("old_topic".into())]);
+    app.dataset
+        .tree
+        .select(vec![Node::Topic("old_topic".into())]);
+    snapshot("dataset_leftovers", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn dataset_load_error() -> TestResult {
+    let mut app = app();
+    let error = "data/answers.jsonl:3: invalid record: expected value at line 1 column 2";
+    app.on_done(TaskId(1), Ok(Done::Loaded(Err(error.into()))));
+    app.status = None;
+    snapshot("dataset_error", &mut app)?;
     Ok(())
 }

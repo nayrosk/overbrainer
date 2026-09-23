@@ -25,8 +25,9 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
     .areas(area);
     render_header(frame, header, app);
     match app.view {
+        View::Dataset => views::dataset::render(frame, body, app),
         View::Logs => views::logs::render(frame, body, app),
-        View::Dataset | View::Pipeline | View::Training => {
+        View::Pipeline | View::Training => {
             let block = Block::bordered()
                 .title(Span::styled(
                     format!(" {} ", app.view.title()),

@@ -3,11 +3,13 @@
 //! writes nothing to stdout or stderr while the terminal shows it.
 
 mod app;
+mod dataset;
 mod event_loop;
 mod format;
 mod keys;
 #[cfg(test)]
 mod snapshots;
+mod tasks;
 mod terminal;
 mod theme;
 mod ui;
@@ -38,7 +40,7 @@ pub async fn run(project_dir: &Path, logs: LogBuffer) -> anyhow::Result<()> {
         bail!("overbrainer tui needs a terminal: stdout is not a TTY");
     }
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
-    let project = Project::new(&settings);
+    let project = Project::new(project_dir, &settings);
     let mut app = App::new(project, logs, Theme::detect(), SystemTime::now());
     let guard = TerminalGuard::enter();
     let mut terminal = terminal::init().context("cannot set up the terminal")?;

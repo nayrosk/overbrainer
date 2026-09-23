@@ -2,11 +2,14 @@
 //! reads the clock or touches the terminal: the loop feeds it input, ticks and
 //! signals, and renders it.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tracing::Level;
 
+use super::dataset::{DatasetView, TopicInfo};
+use super::tasks::{Done, Task, TaskId};
 use super::theme::Theme;
 use crate::config::Settings;
 use crate::logging::LogBuffer;
@@ -14,22 +17,47 @@ use crate::logging::LogBuffer;
 /// How long a status message stays on the status line.
 const STATUS_FOR: Duration = Duration::from_secs(10);
 /// Lines moved by `PgUp` and `PgDn`.
-pub(super) const PAGE: usize = 10;
+pub(super) const PAGE: u16 = 10;
 
 /// What the TUI knows of the project, read from `overbrainer.toml` when it starts.
 #[derive(Debug, Clone)]
 pub(super) struct Project {
     /// `project.name`.
     pub(super) name: String,
+    /// The project directory.
+    pub(super) dir: PathBuf,
+    /// The configured topics, in order.
+    pub(super) topics: Vec<TopicInfo>,
+    /// `pipeline.eval_ratio`.
+    pub(super) eval_ratio: f64,
 }
 
 impl Project {
-    /// The project configured by `settings`.
-    pub(super) fn new(settings: &Settings) -> Self {
+    /// The project in `dir`, configured by `settings`.
+    pub(super) fn new(dir: &Path, settings: &Settings) -> Self {
         Self {
             name: settings.project.name.clone(),
+            dir: dir.to_path_buf(),
+            topics: settings
+                .topics
+                .iter()
+                .map(|topic| TopicInfo {
+                    name: topic.name.clone(),
+                    description: topic.description.clone(),
+                    subtopics: topic.subtopics,
+                    questions_per_subtopic: topic.questions_per_subtopic,
+                })
+                .collect(),
+            eval_ratio: settings.pipeline.eval_ratio,
         }
     }
+}
+
+/// What the app asks the loop to do.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum Effect {
+    /// Start a background task.
+    Spawn(TaskId, Task),
 }
 
 /// The four views, switched with `1` to `4`.
@@ -167,8 +195,13 @@ pub(super) struct App {
     pub(super) status: Option<Status>,
     /// The app's clock, set by each tick: the only time the views use.
     pub(super) now: SystemTime,
+    /// The Dataset view's state.
+    pub(super) dataset: DatasetView,
     /// The Logs view's state.
     pub(super) log_view: LogView,
+    /// The load of the data files running, if any.
+    pub(super) load: Option<TaskId>,
+    next_task: u64,
     /// Whether something changed since the last draw.
     pub(super) dirty: bool,
     /// Set once the loop must end, with why.
@@ -189,6 +222,9 @@ impl App {
             overlay: None,
             status: None,
             now,
+            dataset: DatasetView::default(),
+            load: None,
+            next_task: 0,
             log_view: LogView {
                 min: Level::INFO,
                 anchor: None,
@@ -209,30 +245,93 @@ impl App {
         self.dirty = true;
     }
 
+    /// What to do when the loop starts: load the data.
+    pub(super) fn start(&mut self) -> Vec<Effect> {
+        self.reload()
+    }
+
+    /// A new task ID.
+    fn task_id(&mut self) -> TaskId {
+        self.next_task += 1;
+        TaskId(self.next_task)
+    }
+
+    /// Reloads the data files, unless a load already runs.
+    fn reload(&mut self) -> Vec<Effect> {
+        if self.load.is_some() {
+            return Vec::new();
+        }
+        let id = self.task_id();
+        self.load = Some(id);
+        vec![Effect::Spawn(id, Task::Load)]
+    }
+
+    /// The work running, as the status line shows it.
+    pub(super) fn work(&self) -> Vec<String> {
+        let mut work = Vec::new();
+        if self.load.is_some() {
+            work.push("loading".to_string());
+        }
+        work
+    }
+
+    /// Handles the end of task `id`: what it gave back, or how it failed.
+    pub(super) fn on_done(&mut self, id: TaskId, result: Result<Done, String>) -> Vec<Effect> {
+        if self.load == Some(id) {
+            self.load = None;
+        }
+        self.dirty = true;
+        match result {
+            Ok(Done::Loaded(Ok(data))) => self.dataset.loaded(data, &self.project.topics),
+            Ok(Done::Loaded(Err(error))) => {
+                self.dataset.model = None;
+                self.dataset.error = Some(error.clone());
+                self.say(Severity::Error, error);
+            },
+            Err(error) => {
+                tracing::error!("{error}");
+                self.say(Severity::Error, error);
+            },
+        }
+        Vec::new()
+    }
+
     /// Handles one terminal event.
-    pub(super) fn on_input(&mut self, event: &Event) {
+    pub(super) fn on_input(&mut self, event: &Event) -> Vec<Effect> {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(*key),
-            Event::Resize(..) => self.dirty = true,
-            _ => {},
+            Event::Resize(..) => {
+                self.dirty = true;
+                Vec::new()
+            },
+            _ => Vec::new(),
         }
     }
 
-    fn on_key(&mut self, key: KeyEvent) {
+    fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         self.dirty = true;
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
-        if ctrl_c || key.code == KeyCode::Char('q') {
+        if ctrl_c {
             self.quit();
-            return;
+            return Vec::new();
+        }
+        if self.view == View::Dataset && self.dataset.input.is_some() {
+            self.on_filter_key(key.code);
+            return Vec::new();
+        }
+        if key.code == KeyCode::Char('q') {
+            self.quit();
+            return Vec::new();
         }
         if self.overlay == Some(Overlay::Help) {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 self.overlay = None;
             }
-            return;
+            return Vec::new();
         }
         match key.code {
+            KeyCode::Char('R') => return self.reload(),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Char('1') => self.view = View::Dataset,
             KeyCode::Char('2') => self.view = View::Pipeline,
@@ -242,11 +341,60 @@ impl App {
             KeyCode::BackTab => self.view = self.view.shifted(View::ALL.len() - 1),
             code => self.on_view_key(code),
         }
+        Vec::new()
     }
 
     fn on_view_key(&mut self, code: KeyCode) {
-        if self.view == View::Logs {
-            self.on_logs_key(code);
+        match self.view {
+            View::Dataset => self.on_dataset_key(code),
+            View::Logs => self.on_logs_key(code),
+            View::Pipeline | View::Training => {},
+        }
+    }
+
+    fn on_dataset_key(&mut self, code: KeyCode) {
+        let view = &mut self.dataset;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => view.step(false),
+            KeyCode::Down | KeyCode::Char('j') => view.step(true),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+                view.tree.key_right();
+            },
+            KeyCode::Left | KeyCode::Char('h') => {
+                view.tree.key_left();
+                view.scroll = 0;
+            },
+            KeyCode::PageDown => view.scroll = view.scroll.saturating_add(PAGE),
+            KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(PAGE),
+            KeyCode::Char('s') => view.stats = !view.stats,
+            KeyCode::Char('/') => view.input = Some(view.filter.clone()),
+            _ => {},
+        }
+    }
+
+    /// A key while the filter is typed: Enter applies it, Esc clears it.
+    fn on_filter_key(&mut self, code: KeyCode) {
+        let view = &mut self.dataset;
+        match code {
+            KeyCode::Char(c) => {
+                if let Some(input) = &mut view.input {
+                    input.push(c);
+                }
+            },
+            KeyCode::Backspace => {
+                if let Some(input) = &mut view.input {
+                    input.pop();
+                }
+            },
+            KeyCode::Enter => {
+                let filter = view.input.take().unwrap_or_default();
+                view.apply_filter(filter);
+            },
+            KeyCode::Esc => {
+                view.input = None;
+                view.apply_filter(String::new());
+            },
+            _ => {},
         }
     }
 
@@ -254,8 +402,8 @@ impl App {
         match code {
             KeyCode::Up | KeyCode::Char('k') => self.scroll_logs(true, 1),
             KeyCode::Down | KeyCode::Char('j') => self.scroll_logs(false, 1),
-            KeyCode::PageUp => self.scroll_logs(true, PAGE),
-            KeyCode::PageDown => self.scroll_logs(false, PAGE),
+            KeyCode::PageUp => self.scroll_logs(true, usize::from(PAGE)),
+            KeyCode::PageDown => self.scroll_logs(false, usize::from(PAGE)),
             KeyCode::End | KeyCode::Char('G') => self.log_view.anchor = None,
             KeyCode::Char('f') => {
                 self.log_view.min = LogView::next_level(self.log_view.min);
@@ -335,15 +483,18 @@ mod tests {
     use std::convert::Infallible;
 
     use super::*;
+    use crate::dataset::Id;
     use crate::logging::LogLine;
-    use crate::tui::snapshots::{NOW, app, at, ctrl_c, draw, key, text};
+    use crate::tui::dataset::Node;
+    use crate::tui::snapshots::{NOW, app, at, ctrl_c, dataset_app, draw, key, text};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn press(app: &mut App, codes: &[KeyCode]) {
-        for code in codes {
-            app.on_input(&key(*code));
-        }
+    fn press(app: &mut App, codes: &[KeyCode]) -> Vec<Effect> {
+        codes
+            .iter()
+            .flat_map(|code| app.on_input(&key(*code)))
+            .collect()
     }
 
     #[test]
@@ -482,6 +633,9 @@ mod tests {
         let mut app = App::new(
             Project {
                 name: "rust_expert".into(),
+                dir: "/nonexistent/rust_expert".into(),
+                topics: Vec::new(),
+                eval_ratio: 0.1,
             },
             LogBuffer::new(25),
             Theme::color(),
@@ -556,5 +710,73 @@ mod tests {
         );
         app.on_tick(at(NOW + 11));
         assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn the_dataset_view_moves_expands_and_scrolls() {
+        let mut app = dataset_app();
+        press(
+            &mut app,
+            &[KeyCode::Enter, KeyCode::Char('j'), KeyCode::Char('l')],
+        );
+        assert_eq!(
+            app.dataset.tree.selected(),
+            [
+                Node::Topic("ownership".into()),
+                Node::Subtopic(Id::subtopic("ownership", "Borrowing"))
+            ]
+        );
+        press(&mut app, &[KeyCode::PageDown, KeyCode::PageDown]);
+        assert_eq!(app.dataset.scroll, 20);
+        press(&mut app, &[KeyCode::Down]);
+        assert_eq!(app.dataset.scroll, 0);
+        press(&mut app, &[KeyCode::Char('s')]);
+        assert!(app.dataset.stats);
+        press(&mut app, &[KeyCode::Char('h')]);
+        assert_eq!(app.dataset.tree.selected().len(), 2, "back to the subtopic");
+        press(&mut app, &[KeyCode::Char('h'), KeyCode::Char('h')]);
+        assert_eq!(
+            app.dataset.tree.selected().len(),
+            1,
+            "closed, then its topic"
+        );
+    }
+
+    #[test]
+    fn the_filter_takes_every_typed_key_until_enter_or_esc() {
+        let mut app = dataset_app();
+        press(
+            &mut app,
+            &[KeyCode::Char('/'), KeyCode::Char('q'), KeyCode::Char('x')],
+        );
+        assert_eq!(app.exit, None, "q is typed into the filter");
+        press(
+            &mut app,
+            &[KeyCode::Backspace, KeyCode::Char('?'), KeyCode::Enter],
+        );
+        assert_eq!(app.dataset.filter, "q?");
+        assert_eq!(app.dataset.input, None);
+        press(&mut app, &[KeyCode::Char('/'), KeyCode::Esc]);
+        assert_eq!(app.dataset.filter, "");
+        app.on_input(&ctrl_c());
+        assert_eq!(app.exit, Some(Exit::Quit));
+    }
+
+    #[test]
+    fn a_reload_runs_once_at_a_time_and_a_failed_task_is_shown() {
+        let mut app = app();
+        let effects = app.start();
+        let Some(Effect::Spawn(id, Task::Load)) = effects.first().cloned() else {
+            return assert_eq!(effects, []);
+        };
+        assert_eq!(press(&mut app, &[KeyCode::Char('R')]), []);
+        assert_eq!(app.work(), ["loading"]);
+        app.on_done(id, Err("a background task failed: task 1 panicked".into()));
+        assert_eq!(app.load, None);
+        assert_eq!(
+            app.status.as_ref().map(|s| s.severity),
+            Some(Severity::Error)
+        );
+        assert_eq!(press(&mut app, &[KeyCode::Char('R')]).len(), 1);
     }
 }

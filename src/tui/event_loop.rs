@@ -1,9 +1,10 @@
-//! The event loop: one task selecting over terminal input, process signals and a
-//! clock tick, drawing the app when it changed.
+//! The event loop: one task selecting over terminal input, background tasks,
+//! process signals and a clock tick, drawing the app when it changed.
 
 use std::io;
 use std::time::{Duration, SystemTime};
 
+use anyhow::Context;
 use crossterm::event::Event as TermEvent;
 use ratatui::backend::Backend;
 use ratatui::{DefaultTerminal, Terminal};
@@ -11,7 +12,8 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::app::{App, Exit};
+use super::app::{App, Effect, Exit};
+use super::tasks::Tasks;
 use super::terminal::InputTask;
 use super::ui;
 
@@ -27,43 +29,57 @@ const FRAME: Duration = Duration::from_millis(33);
 /// Returns an error when drawing fails, the terminal cannot be read, the signals
 /// cannot be caught, or a process signal ended the TUI.
 pub(super) async fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+    let signals = Signals::new().context("cannot catch the process signals")?;
     let (events, input) = mpsc::unbounded_channel();
     let reader = InputTask::start(events);
-    let result = drive(terminal, app, input).await;
+    let result = drive(terminal, app, input, Some(signals)).await;
     reader.stop().await;
     result
 }
 
-/// The loop itself, on any backend, reading terminal events from `input`. A read
-/// error on `input` ends the loop with that error; `input` closing quits.
+/// The loop itself, on any backend, reading terminal events from `input` and the
+/// process signals from `signals` when given. A read error on `input` ends the
+/// loop with that error; `input` closing quits. It starts the app's background
+/// tasks, and hands each one's end back to the app.
 ///
 /// # Errors
 ///
-/// See [`run`].
+/// Returns an error when drawing fails, the terminal cannot be read, or a
+/// process signal ended the TUI.
 pub(super) async fn drive<B>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     mut input: UnboundedReceiver<io::Result<TermEvent>>,
+    mut signals: Option<Signals>,
 ) -> anyhow::Result<()>
 where
     B: Backend,
     B::Error: Send + Sync + 'static,
 {
-    let mut signals = Signals::new()?;
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut tasks = Tasks::new(&app.project.dir);
     let mut last_draw: Option<Instant> = None;
+    let mut effects = app.start();
     loop {
+        for effect in effects.drain(..) {
+            match effect {
+                Effect::Spawn(id, task) => tasks.spawn(id, task),
+            }
+        }
         let next_draw = last_draw.map_or_else(Instant::now, |at| at + FRAME);
         tokio::select! {
             event = input.recv() => match event {
-                Some(Ok(event)) => app.on_input(&event),
+                Some(Ok(event)) => effects = app.on_input(&event),
                 Some(Err(error)) => {
                     return Err(anyhow::Error::new(error).context("cannot read the terminal"));
                 },
                 None => app.exit = Some(Exit::Quit),
             },
-            () = signals.recv() => app.on_signal(),
+            Some((id, result)) = tasks.next(), if !tasks.is_empty() => {
+                effects = app.on_done(id, result);
+            },
+            () = Signals::recv(signals.as_mut()) => app.on_signal(),
             _ = tick.tick() => app.on_tick(SystemTime::now()),
             () = tokio::time::sleep_until(next_draw), if app.dirty => {},
         }
@@ -82,7 +98,7 @@ where
 
 /// SIGINT, SIGTERM and SIGHUP: in raw mode they only come from outside (`kill`, a
 /// closed terminal), since Ctrl-C is a key.
-struct Signals {
+pub(super) struct Signals {
     interrupt: Signal,
     terminate: Signal,
     hangup: Signal,
@@ -97,12 +113,15 @@ impl Signals {
         })
     }
 
-    /// Waits for any of them.
-    async fn recv(&mut self) {
+    /// Waits for any of them; for ever without `signals`.
+    async fn recv(signals: Option<&mut Self>) {
+        let Some(signals) = signals else {
+            return std::future::pending().await;
+        };
         tokio::select! {
-            _ = self.interrupt.recv() => {},
-            _ = self.terminate.recv() => {},
-            _ = self.hangup.recv() => {},
+            _ = signals.interrupt.recv() => {},
+            _ = signals.terminate.recv() => {},
+            _ = signals.hangup.recv() => {},
         }
     }
 }
@@ -126,7 +145,7 @@ mod tests {
         events.send(Ok(TermEvent::Resize(100, 30)))?;
         events.send(Ok(key(KeyCode::Char('4'))))?;
         events.send(Ok(key(KeyCode::Char('q'))))?;
-        tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input)).await??;
+        tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await??;
         let area = terminal.backend().buffer().area;
         assert_eq!((area.width, area.height), (100, 30));
         assert_eq!(app.view, crate::tui::app::View::Logs);
@@ -139,8 +158,37 @@ mod tests {
         let mut app = app();
         let (events, input) = mpsc::unbounded_channel();
         drop(events);
-        tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input)).await??;
+        tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await??;
         assert_eq!(app.exit, Some(Exit::Quit));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_data_is_loaded_when_the_loop_starts() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let files = crate::dataset::DataFiles::new(dir.path());
+        crate::dataset::rewrite(
+            &files.subtopics,
+            &crate::tui::snapshots::dataset().subtopics,
+        )?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut app = app();
+        app.project.dir = dir.path().to_path_buf();
+        let (events, input) = mpsc::unbounded_channel();
+        let run = drive(&mut terminal, &mut app, input, None);
+        let quit = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            events.send(Ok(key(KeyCode::Char('q'))))
+        };
+        let (ran, sent) = tokio::time::timeout(LIMIT, async { tokio::join!(run, quit) }).await?;
+        ran?;
+        sent?;
+        let subtopics = app
+            .dataset
+            .model
+            .as_ref()
+            .map(|model| model.data.subtopics.len());
+        assert_eq!(subtopics, Some(3));
         Ok(())
     }
 
@@ -152,7 +200,8 @@ mod tests {
         let (events, input) = mpsc::unbounded_channel();
         events.send(Err(io::Error::other("the terminal is gone")))?;
         drop(events);
-        let result = tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input)).await?;
+        let result =
+            tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await?;
         let error = result.err().map(|error| format!("{error:#}"));
         assert_eq!(
             error.as_deref(),

@@ -10,7 +10,13 @@ use crate::tui::app::{App, Severity};
 /// Draws the status line in `area`.
 pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
-    let right = Line::from(vec![Span::styled("? help", theme.key)]).right_aligned();
+    let mut spans: Vec<Span> = app
+        .work()
+        .into_iter()
+        .map(|work| Span::styled(format!("{work}  "), theme.dim))
+        .collect();
+    spans.push(Span::styled("? help", theme.key));
+    let right = Line::from(spans).right_aligned();
     let width = u16::try_from(right.width()).unwrap_or(area.width);
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(width + 1)]).areas(area);

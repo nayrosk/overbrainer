@@ -27,6 +27,15 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
     row("1 2 3 4, Tab, Shift-Tab", "switch view"),
     row("?", "this help (Esc or ? closes it)"),
     row("q, Ctrl-C", "quit"),
+    row("R", "reload the data files"),
+];
+
+const DATASET: &[KeyHelp] = &[
+    row("k j, Up Down", "move"),
+    row("l h, Right Left, Enter", "expand, collapse"),
+    row("PgUp PgDn", "scroll the detail pane"),
+    row("/", "filter the tree (Enter keeps, Esc clears)"),
+    row("s", "stats pane"),
 ];
 
 const LOGS: &[KeyHelp] = &[
@@ -38,8 +47,9 @@ const LOGS: &[KeyHelp] = &[
 /// Keys of `view`.
 pub(super) fn of(view: View) -> &'static [KeyHelp] {
     match view {
+        View::Dataset => DATASET,
         View::Logs => LOGS,
-        View::Dataset | View::Pipeline | View::Training => &[],
+        View::Pipeline | View::Training => &[],
     }
 }
 
