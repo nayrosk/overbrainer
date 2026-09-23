@@ -202,6 +202,15 @@ pub(super) enum Action {
     Abandon(Vec<TaskId>),
 }
 
+/// What an exit note added while leaving is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NoteOf {
+    /// The pipeline stage stopped.
+    Stage,
+    /// Run `0`, detached or not cancelled.
+    Run(String),
+}
+
 /// Why the loop ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Exit {
@@ -301,9 +310,10 @@ pub(super) struct App {
     pub(super) prices: Option<TaskId>,
     /// Lines printed on stderr once the terminal is restored.
     pub(super) exit_notes: Vec<String>,
-    /// Which of `exit_notes` were added only because the TUI was leaving (a
-    /// stage stopped, a run detached): dropped when the user stays.
-    leaving_notes: Vec<usize>,
+    /// Which of `exit_notes` were added because the TUI was leaving (a stage
+    /// stopped, a run detached), with what they are about: dropped once that
+    /// work is taken up again, never merely because the user stays.
+    leaving_notes: Vec<(usize, NoteOf)>,
     /// How the TUI ends, set once it is to end while it waits for work to end:
     /// the pipeline task it stopped, and an edit being saved (never cut).
     pub(super) leaving: Option<Exit>,
@@ -561,7 +571,7 @@ impl App {
             Err(error) => (Severity::Error, format!("{name}: {error}")),
         };
         if self.leaving.is_some() {
-            self.note_leaving(said.clone());
+            self.note_leaving(said.clone(), NoteOf::Stage);
         }
         self.say(severity, said);
         self.pipeline.outcome = Some(outcome);
@@ -635,6 +645,7 @@ impl App {
         if self.refuse_new("one task at a time", "stage") {
             return Vec::new();
         }
+        self.forget_notes(&NoteOf::Stage);
         let id = self.task_id();
         self.pipeline_task = Some(id);
         self.pipeline_last = None;
@@ -643,11 +654,35 @@ impl App {
         vec![Effect::Spawn(id, Task::Pipeline(command))]
     }
 
-    /// Adds `note` to the exit notes because the TUI is leaving: it is dropped
-    /// if the user stays.
-    pub(super) fn note_leaving(&mut self, note: String) {
-        self.leaving_notes.push(self.exit_notes.len());
+    /// Adds `note`, about `of`, to the exit notes because the TUI is leaving:
+    /// it stays if the user stays, until `of` is taken up again.
+    pub(super) fn note_leaving(&mut self, note: String, of: NoteOf) {
+        self.leaving_notes.push((self.exit_notes.len(), of));
         self.exit_notes.push(note);
+    }
+
+    /// Drops the exit notes added while leaving about `of`, which is taken up
+    /// again (a run followed again, the stage run again): they no longer apply.
+    pub(super) fn forget_notes(&mut self, of: &NoteOf) {
+        let dropped: Vec<usize> = self
+            .leaving_notes
+            .iter()
+            .filter(|(_, about)| about == of)
+            .map(|(index, _)| *index)
+            .collect();
+        if dropped.is_empty() {
+            return;
+        }
+        let mut index = 0;
+        self.exit_notes.retain(|_| {
+            let keep = !dropped.contains(&index);
+            index += 1;
+            keep
+        });
+        self.leaving_notes.retain(|(_, about)| about != of);
+        for (index, _) in &mut self.leaving_notes {
+            *index -= dropped.iter().filter(|gone| **gone < *index).count();
+        }
     }
 
     /// Ends the TUI once nothing it waits for runs.
@@ -1176,17 +1211,10 @@ impl App {
 
     /// `n` or Esc while quitting: stays. A stage stopped and a run detached
     /// still end; a run waiting for its job to detach keeps being followed.
-    /// The exit notes added only because the TUI was leaving are dropped; those
-    /// of kept edit files and saved changes stay.
+    /// The exit notes stay: a run detached is no longer followed, a stage
+    /// stopped stays stopped, until taken up again.
     fn stay(&mut self) {
         self.leaving = None;
-        let dropped = std::mem::take(&mut self.leaving_notes);
-        let mut index = 0;
-        self.exit_notes.retain(|_| {
-            let keep = !dropped.contains(&index);
-            index += 1;
-            keep
-        });
         let mut still = Vec::new();
         if self.pipeline_task.is_some() {
             let name = self.pipeline.command.map_or("stage", command_name);
@@ -3299,35 +3327,63 @@ mod tests {
         }
     }
 
-    /// Staying after `y` drops the exit notes of a run detached and of a stage
-    /// stopped by the quit, and keeps that of a change saved meanwhile.
+    /// Staying after `y` keeps the note of a run the quit detached, and the
+    /// flow's lines: the run is no longer followed, so a later quit with
+    /// nothing running still says it was left running.
     #[test]
-    fn staying_drops_the_notes_of_leaving_and_keeps_saved_changes() {
-        let mut app = app();
+    fn staying_keeps_the_note_of_a_run_left_detached() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
         crate::tui::snapshots::pipeline_running(&mut app);
-        app.training.tasks.insert(
-            TaskId(9),
-            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, FIRST),
-        );
-        watching(&mut app, TaskId(9));
-        app.edit = Some(TaskId(40));
-        press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
-        app.on_done(TaskId(9), Ok(Done::Trained(Err(DETACHED.into()))));
-        let saved = Saved {
-            message: "question edited".into(),
-            split: Err("no eval".into()),
-        };
-        app.on_done(TaskId(40), Ok(Done::Saved(Ok(saved))));
-        let kept = "a change was saved: question edited, but split failed: no eval; run split";
-        assert_eq!(app.exit_notes, [DETACHED, kept]);
-        press(&mut app, &[KeyCode::Esc]);
+        let follow = attach(&mut app)?;
+        watching(&mut app, follow);
+        let effects = keys(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        assert!(effects.contains(&Effect::Cancel(follow)), "{effects:?}");
+        let warning = "train: remove the pod with `overbrainer pod rm`";
+        app.on_message(Msg::Report(follow, Report::Line(warning.into())));
+        ended(&mut app, follow, Ok(Done::Trained(Err(DETACHED.into()))));
+        keys(&mut app, &[KeyCode::Char('n')]);
         assert_eq!(app.leaving, None);
-        assert_eq!(app.exit_notes, [kept]);
-        app.on_done(TaskId(7), Ok(Done::Pipeline(Err("interrupted".into()))));
-        assert_eq!(app.exit_notes, [kept], "the stage ends after the stay");
-        press(&mut app, &[KeyCode::Char('q')]);
-        assert_eq!(app.exit, Some(Exit::Quit));
-        assert_eq!(app.exit_notes, [kept]);
+        ended(
+            &mut app,
+            TaskId(7),
+            Ok(Done::Pipeline(Err("interrupted".into()))),
+        );
+        assert_eq!(app.exit_notes, [warning, DETACHED]);
+        keys(&mut app, &[KeyCode::Char('q')]);
+        assert_eq!(app.exit, Some(Exit::Quit), "nothing left to wait for");
+        assert_eq!(app.exit_notes, [warning, DETACHED]);
+        Ok(())
+    }
+
+    /// A note of leaving goes once its work is taken up again: a run attached
+    /// again, the stage run again. The flow's lines stay.
+    #[test]
+    fn a_note_of_leaving_goes_once_its_work_is_taken_up_again()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        crate::tui::snapshots::pipeline_running(&mut app);
+        let follow = attach(&mut app)?;
+        watching(&mut app, follow);
+        app.edit = Some(TaskId(40));
+        keys(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        let warning = "train: remove the pod with `overbrainer pod rm`";
+        app.on_message(Msg::Report(follow, Report::Line(warning.into())));
+        ended(&mut app, follow, Ok(Done::Trained(Err(DETACHED.into()))));
+        ended(
+            &mut app,
+            TaskId(7),
+            Ok(Done::Pipeline(Err("interrupted".into()))),
+        );
+        assert_eq!(app.exit_notes, [warning, DETACHED, "run: interrupted"]);
+        keys(&mut app, &[KeyCode::Char('n')]);
+        ended(&mut app, TaskId(40), Err("a background task failed".into()));
+        attach(&mut app)?;
+        assert_eq!(app.exit_notes, [warning, "run: interrupted"]);
+        app.overlay = Some(Overlay::Menu(0));
+        keys(&mut app, &[KeyCode::Enter]);
+        assert!(app.pipeline_task.is_some(), "the stage runs again");
+        assert_eq!(app.exit_notes, [warning]);
+        Ok(())
     }
 
     #[test]

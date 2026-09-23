@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use crossterm::event::KeyCode;
 
-use super::app::{Action, App, Confirm, Effect, Exit, Overlay, Severity, View};
+use super::app::{Action, App, Confirm, Effect, Exit, NoteOf, Overlay, Severity, View};
 use super::start::{self, Prices, StartPlan};
 use super::tasks::{Msg, Task, TaskId, TrainJob};
 use super::training::{Detach, Ended, Follow, Job, Listing};
@@ -276,6 +276,9 @@ impl App {
             Job::Attach => TrainJob::Attach(run_id.to_string()),
             Job::Cancel => TrainJob::Cancel(run_id.to_string()),
         };
+        if !run_id.is_empty() {
+            self.forget_notes(&NoteOf::Run(run_id.to_string()));
+        }
         self.training.last.retain(|_, run| run != run_id);
         self.training.reading.remove(run_id);
         self.training.tasks.insert(id, Follow::new(job, run_id));
@@ -411,7 +414,8 @@ impl App {
             },
             Msg::Report(_, Report::Line(line)) => {
                 if self.leaving.is_some() {
-                    self.note_leaving(line.clone());
+                    // A flow's line (a pod warning) always stays.
+                    self.exit_notes.push(line.clone());
                 }
                 if let Some(ended) = self.training.ended.get_mut(&run) {
                     ended.lines.push(line);
@@ -434,11 +438,10 @@ impl App {
         let error = result.err();
         let cancel = follow.cancel_after && self.leaving != Some(Exit::Signal);
         if self.leaving.is_some() {
-            for line in &follow.lines {
-                self.note_leaving(line.clone());
-            }
+            // The flow's lines (pod warnings) always stay.
+            self.exit_notes.extend(follow.lines.iter().cloned());
             if !cancel && let Some(error) = &error {
-                self.note_leaving(error.clone());
+                self.note_leaving(error.clone(), NoteOf::Run(run.clone()));
             }
             if follow.cancel_after && !cancel {
                 // A start abandoned may have failed with no job, or detached
@@ -455,7 +458,7 @@ impl App {
                          cancel it with `overbrainer train cancel {run}`"
                     )
                 };
-                self.note_leaving(note);
+                self.note_leaving(note, NoteOf::Run(run.clone()));
             }
         }
         match &error {
