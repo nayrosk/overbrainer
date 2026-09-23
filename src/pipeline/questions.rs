@@ -25,9 +25,9 @@ struct Context<'a> {
 /// through a deduplicator shared by the whole topic, created by `new_dedup` and seeded
 /// with the questions already on disk and the topic's questions recorded in
 /// `data/rejected.jsonl` (deleted questions), so neither comes back; a topic with
-/// nothing left to fill is not seeded, so its stored questions are not embedded again. A subtopic stops at
-/// `questions_per_subtopic` or after `pipeline.max_retries` batches without a new
-/// question (at least one).
+/// nothing left to fill is not seeded, so its stored questions are not embedded
+/// again. A subtopic stops at `questions_per_subtopic` or after
+/// `pipeline.max_retries` batches without a new question (at least one).
 /// Batches run one after the other because each depends on the previous ones. A
 /// deduplicator error that survives its own retries stops the whole stage when it is
 /// fatal; otherwise it fails only the subtopic being filled, or, when it happens while
@@ -70,9 +70,11 @@ where
         let pending = subtopics.iter().any(|subtopic| {
             subtopic.topic == topic.name && needs_filling(subtopic, &existing, &[topic])
         });
-        let known = seed_texts(&topic.name, &existing, &rejected);
-        if pending && !seed(ctx, topic, &known, &mut dedup, &mut filler.stats).await? {
-            continue;
+        if pending {
+            let known = seed_texts(&topic.name, &existing, &rejected);
+            if !seed(ctx, topic, &known, &mut dedup, &mut filler.stats).await? {
+                continue;
+            }
         }
         for subtopic in subtopics.iter().filter(|s| s.topic == topic.name) {
             let accepted: Vec<String> = existing
