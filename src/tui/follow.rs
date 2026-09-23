@@ -7,6 +7,10 @@
 //! confirmed cancel always runs, quitting included; only a signal drops one not
 //! started yet, and says how to run it.
 //!
+//! A start (`t`) holds the data lock until its job started. Quitting while a
+//! Runpod run still provisions offers to abandon it instead of waiting: its pod
+//! is deleted and the run fails, as Ctrl-C does on the command line.
+//!
 //! Files are read by tasks, never on the loop's thread nor while drawing.
 
 use std::time::{Duration, SystemTime};
@@ -14,6 +18,7 @@ use std::time::{Duration, SystemTime};
 use crossterm::event::KeyCode;
 
 use super::app::{Action, App, Confirm, Effect, Exit, Overlay, Severity, View};
+use super::start::{self, Prices, StartPlan};
 use super::tasks::{Msg, Task, TaskId, TrainJob};
 use super::training::{Detach, Ended, Follow, Job, Listing};
 use crate::cli::front::Report;
@@ -133,6 +138,7 @@ impl App {
                 self.ask_cancel();
                 return Vec::new();
             },
+            KeyCode::Char('t') => return self.prepare_start(),
             _ => return Vec::new(),
         }
         self.read_selected()
@@ -165,11 +171,89 @@ impl App {
         self.train(Job::Attach, &id)
     }
 
+    /// Refuses a new run while the data is locked (a stage, an edit or another
+    /// start runs) or the TUI is quitting; says why.
+    fn start_refused(&mut self) -> bool {
+        let reason = match self.lock() {
+            Some(reason) => format!("{reason}; one task at a time"),
+            None if self.leaving.is_some() => "quitting; no run starts".to_string(),
+            None => return false,
+        };
+        self.say(Severity::Warn, format!("refused: {reason}"));
+        true
+    }
+
+    /// `t`: prepares the confirmation of a new run, in a task.
+    fn prepare_start(&mut self) -> Vec<Effect> {
+        if self.start_refused() || self.prepare.is_some() {
+            return Vec::new();
+        }
+        let id = self.task_id();
+        self.prepare = Some(id);
+        vec![Effect::Spawn(id, Task::Prepare)]
+    }
+
+    /// The plan of a new run is ready: asks to start it, and looks up the list
+    /// prices of a Runpod run meanwhile (an earlier lookup no longer counts).
+    /// Dropped once the TUI is quitting.
+    pub(super) fn prepared(&mut self, plan: Result<StartPlan, String>) -> Vec<Effect> {
+        self.prepare = None;
+        if self.leaving.is_some() {
+            return Vec::new();
+        }
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.say(Severity::Warn, format!("refused: {error}"));
+                return Vec::new();
+            },
+        };
+        let gpu_types = plan.runpod.as_ref().map(|runpod| runpod.gpu_types.clone());
+        self.overlay = Some(Overlay::Confirm(Confirm {
+            title: " Start a training run? ".to_string(),
+            text: start::text(&plan, None),
+            yes: "start",
+            no: "cancel",
+            action: Action::Start(Box::new(plan)),
+        }));
+        self.prices = None;
+        let Some(gpu_types) = gpu_types else {
+            return Vec::new();
+        };
+        let id = self.task_id();
+        self.prices = Some(id);
+        vec![Effect::Spawn(id, Task::Prices(gpu_types))]
+    }
+
+    /// The list prices arrived: shown in the start dialog if it is still open;
+    /// a type missing from `prices` has an unknown price.
+    pub(super) fn priced(&mut self, prices: &Prices) {
+        self.prices = None;
+        if let Some(Overlay::Confirm(confirm)) = &mut self.overlay
+            && let Action::Start(plan) = &confirm.action
+        {
+            confirm.text = start::text(plan, Some(prices));
+        }
+    }
+
+    /// Starts the run of `plan`, on `training.target` and without keeping its
+    /// pod, unless something started meanwhile.
+    pub(super) fn start_run(&mut self, plan: &StartPlan) -> Vec<Effect> {
+        if self.start_refused() {
+            return Vec::new();
+        }
+        let runpod = plan.runpod.is_some();
+        let effects = self.train(Job::Start { runpod }, "");
+        self.say(Severity::Info, format!("starting a run on {}", plan.target));
+        effects
+    }
+
     /// Starts a training task doing `job` on run `run_id`. The late messages of
     /// the run's earlier tasks, and a read of its metrics, no longer count.
     fn train(&mut self, job: Job, run_id: &str) -> Vec<Effect> {
         let id = self.task_id();
         let task = match job {
+            Job::Start { .. } => TrainJob::Start,
             Job::Attach => TrainJob::Attach(run_id.to_string()),
             Job::Cancel => TrainJob::Cancel(run_id.to_string()),
         };
@@ -216,13 +300,17 @@ impl App {
         let Some((task, _)) = self.training.task_of(run_id) else {
             return self.train(Job::Cancel, run_id);
         };
-        if let Some(follow) = self.training.tasks.get_mut(&task) {
-            follow.cancel_after = true;
-        }
-        self.say(
-            Severity::Info,
-            format!("detaching run {run_id}, then cancelling it"),
-        );
+        let Some(follow) = self.training.tasks.get_mut(&task) else {
+            return Vec::new();
+        };
+        follow.cancel_after = true;
+        let said = if follow.starting() {
+            // Interrupting a start would abandon it: its job is waited for.
+            format!("run {run_id} is starting: it is cancelled once its job started")
+        } else {
+            format!("detaching run {run_id}, then cancelling it")
+        };
+        self.say(Severity::Info, said);
         self.detach(task)
     }
 
@@ -323,6 +411,7 @@ impl App {
             return Vec::new();
         };
         let run = follow.run_id.clone();
+        let name = follow.run();
         let error = result.err();
         let cancel = follow.cancel_after && self.leaving != Some(Exit::Signal);
         if self.leaving.is_some() {
@@ -339,10 +428,15 @@ impl App {
         }
         match &error {
             Some(error) if !follow.cancel_after => {
-                self.say(Severity::Warn, format!("run {run}: {error}"));
+                self.say(Severity::Warn, format!("{name}: {error}"));
             },
             Some(_) => {},
-            None => self.say(Severity::Info, format!("run {run}: done")),
+            None => self.say(Severity::Info, format!("{name}: done")),
+        }
+        if run.is_empty() {
+            // A start that failed before its run was created: no run to show.
+            self.leave_when_idle();
+            return Vec::new();
         }
         self.training.ended.insert(
             run.clone(),
@@ -375,13 +469,22 @@ impl App {
             .values()
             .map(|follow| {
                 let run = &follow.run_id;
+                let pod = match follow.job {
+                    Job::Start { runpod: true } => " its pod",
+                    _ => "",
+                };
                 match follow.job {
                     Job::Cancel => format!("Run {run}: cancel in progress, quitting waits for it."),
-                    Job::Attach if follow.cancel_after => format!(
+                    _ if follow.cancel_after => format!(
                         "Run {run}: cancel pending, it starts once the run is detached; \
                          quitting waits for it."
                     ),
-                    Job::Attach => format!(
+                    Job::Start { .. } if follow.starting() => format!(
+                        "{} is starting{pod}: quitting waits until its job has started, then \
+                         leaves it running.",
+                        capitalized(&follow.run())
+                    ),
+                    Job::Start { .. } | Job::Attach => format!(
                         "Run {run} keeps running{}; attach again from here or with \
                          `overbrainer train attach {run}`.",
                         self.where_it_runs(run)
@@ -426,6 +529,58 @@ impl App {
             .collect()
     }
 
+    /// Quitting while Runpod runs still provision (and no signal abandoned them
+    /// yet): offers to abandon them rather than wait for their jobs.
+    pub(super) fn offer_abandon(&mut self) {
+        if self.leaving != Some(Exit::Quit) {
+            return;
+        }
+        let starting: Vec<(TaskId, String)> = self
+            .training
+            .tasks
+            .iter()
+            .filter(|(_, follow)| {
+                follow.job == Job::Start { runpod: true }
+                    && follow.starting()
+                    && follow.detach != Detach::Done
+            })
+            .map(|(id, follow)| (*id, follow.run()))
+            .collect();
+        if starting.is_empty() {
+            return;
+        }
+        let runs: Vec<&str> = starting.iter().map(|(_, run)| run.as_str()).collect();
+        let text = format!(
+            "Quitting waits until the job of {} has started, which can take minutes. Abandon \
+             it instead? Its pod is deleted and the run fails, as Ctrl-C does on the command \
+             line before the job starts.",
+            runs.join(", ")
+        );
+        self.overlay = Some(Overlay::Confirm(Confirm {
+            title: " Abandon a starting run? ".to_string(),
+            text: vec![text],
+            yes: "abandon",
+            no: "wait",
+            action: Action::Abandon(starting.into_iter().map(|(id, _)| id).collect()),
+        }));
+    }
+
+    /// Abandons the start tasks `ids` that still provision, once confirmed: as
+    /// a signal would, their pods are deleted and their runs fail.
+    pub(super) fn abandon(&mut self, ids: &[TaskId]) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for id in ids {
+            if let Some(follow) = self.training.tasks.get_mut(id)
+                && follow.starting()
+                && follow.detach != Detach::Done
+            {
+                follow.detach = Detach::Done;
+                effects.push(Effect::Abandon(*id));
+            }
+        }
+        effects
+    }
+
     /// On a process signal: every task that follows a run is abandoned at once,
     /// as Ctrl-C does on the command line (a Runpod run still provisioning
     /// deletes its pod and fails); cancels are waited for.
@@ -443,22 +598,36 @@ impl App {
 
     /// When quitting is called off: tasks still waiting for their job to detach
     /// keep following, unless a cancel waits for them. Returns how many runs
-    /// are detached all the same (their tokens are cancelled).
-    pub(super) fn keep_following(&mut self) -> usize {
-        let mut detached = 0;
+    /// are detached all the same (their tokens are cancelled), and how many
+    /// starts are abandoned all the same.
+    pub(super) fn keep_following(&mut self) -> (usize, usize) {
+        let (mut detached, mut abandoned) = (0, 0);
         for follow in self.training.tasks.values_mut() {
             if follow.detach == Detach::OnStart && !follow.cancel_after {
                 follow.detach = Detach::No;
             }
-            if follow.detach == Detach::Done && follow.job == Job::Attach {
+            if follow.detach != Detach::Done || follow.job == Job::Cancel {
+                continue;
+            }
+            if follow.starting() {
+                abandoned += 1;
+            } else {
                 detached += 1;
             }
         }
-        detached
+        (detached, abandoned)
     }
 
     /// When the runs were last read: never, for a new app.
     pub(super) fn never() -> SystemTime {
         SystemTime::UNIX_EPOCH
     }
+}
+
+/// `text` with its first letter in upper case.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }

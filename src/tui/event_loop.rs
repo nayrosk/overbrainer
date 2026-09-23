@@ -217,6 +217,8 @@ where
     /// first and stderr says what is waited for; a signal meanwhile acts as a
     /// first one would. The ends still reach the app, for its exit notes.
     async fn settle(&mut self, app: &mut App) {
+        // List prices are only read: nothing waits for them.
+        self.tasks.abort_lookups();
         for effect in std::mem::take(&mut self.pending) {
             self.apply_late(effect);
         }

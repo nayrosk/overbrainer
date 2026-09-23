@@ -12,6 +12,7 @@ mod keys;
 mod pipeline;
 #[cfg(test)]
 mod snapshots;
+mod start;
 mod tasks;
 mod terminal;
 mod theme;

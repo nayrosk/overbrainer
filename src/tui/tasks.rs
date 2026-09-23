@@ -16,6 +16,7 @@ use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::editor::Edited;
+use super::start::{Prices, StartPlan, list_prices, prepare};
 use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::Command;
 use crate::cli::front::{Frontend, Report};
@@ -57,11 +58,17 @@ pub(super) enum Task {
     Runs,
     /// Reads the local metrics file of a run.
     Series(String),
+    /// What a training run started now would use.
+    Prepare,
+    /// The list prices of these Runpod GPU types.
+    Prices(Vec<String>),
 }
 
 /// A training flow, run exactly as `overbrainer train` runs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TrainJob {
+    /// `train`, on `training.target`, without `--keep-pod`.
+    Start,
     /// `train attach <run-id>`.
     Attach(String),
     /// `train cancel <run-id>`.
@@ -72,6 +79,7 @@ impl TrainJob {
     /// The arguments `overbrainer train` would get.
     fn args(&self) -> TrainArgs {
         let command = match self {
+            Self::Start => return TrainArgs::default(),
             Self::Attach(run_id) => TrainCommand::Attach {
                 run_id: run_id.clone(),
             },
@@ -120,6 +128,10 @@ pub(super) enum Done {
         /// Its metrics.
         series: Option<Vec<TrainMetric>>,
     },
+    /// What a training run started now would use, or why none can start.
+    Prepared(Result<StartPlan, String>),
+    /// List prices of GPU types.
+    Prices(Prices),
 }
 
 /// A saved edit.
@@ -251,6 +263,8 @@ pub(super) struct Tasks {
     ids: HashMap<tokio::task::Id, TaskId>,
     tokens: HashMap<TaskId, CancellationToken>,
     abandons: HashMap<TaskId, Arc<AtomicBool>>,
+    /// The list price lookups running: only reads, aborted when the TUI ends.
+    lookups: HashMap<TaskId, AbortHandle>,
 }
 
 impl Tasks {
@@ -264,6 +278,15 @@ impl Tasks {
             ids: HashMap::new(),
             tokens: HashMap::new(),
             abandons: HashMap::new(),
+            lookups: HashMap::new(),
+        }
+    }
+
+    /// Aborts the list price lookups: they only read, so the TUI never waits
+    /// for them to end.
+    pub(super) fn abort_lookups(&mut self) {
+        for (_, lookup) in self.lookups.drain() {
+            lookup.abort();
         }
     }
 
@@ -336,6 +359,26 @@ impl Tasks {
                     }
                 })
             },
+            Task::Prepare => {
+                let dir = self.project_dir.clone();
+                self.set.spawn(async move {
+                    let plan =
+                        tokio::task::spawn_blocking(move || prepare(&dir, EnvSource::Process))
+                            .await;
+                    Done::Prepared(match plan {
+                        Ok(plan) => plan,
+                        Err(error) => Err(format!("cannot prepare the run: {error}")),
+                    })
+                })
+            },
+            Task::Prices(gpu_types) => {
+                let dir = self.project_dir.clone();
+                let handle = self.set.spawn(async move {
+                    Done::Prices(list_prices(&dir, EnvSource::Process, gpu_types).await)
+                });
+                self.lookups.insert(id, handle.clone());
+                handle
+            },
         };
         self.ids.insert(handle.id(), id);
     }
@@ -396,6 +439,7 @@ impl Tasks {
             if let Some(id) = self.ids.remove(&task) {
                 self.tokens.remove(&id);
                 self.abandons.remove(&id);
+                self.lookups.remove(&id);
                 return Some((id, result));
             }
         }
@@ -671,6 +715,135 @@ mod tests {
             assert_eq!(row.finished, row.total, "done first: {done_first}");
             assert!(row.total > 0);
         }
+        Ok(())
+    }
+
+    /// A fake `axolotl` (from `tests/cli_train.rs`): `train` waits for a
+    /// `release` file next to `bin/`, then writes three metrics lines and an
+    /// adapter.
+    const FAKE_AXOLOTL: &str = r#"#!/bin/sh
+here="$(dirname "$0")/.."
+[ "$1" = train ] || exit 0
+i=0
+until [ -f "$here/release" ]; do
+  i=$((i + 1))
+  [ "$i" -gt 600 ] && exit 3
+  sleep 0.1
+done
+printf '{"event": "begin", "time": 1, "max_steps": 2}\n' >> "$OVERBRAINER_METRICS"
+printf '{"event": "log", "time": 2, "step": 1, "epoch": 0.5, "max_steps": 2, "loss": 1.5}\n' >> "$OVERBRAINER_METRICS"
+printf '{"event": "log", "time": 3, "step": 2, "epoch": 1.0, "max_steps": 2, "eval_loss": 1.25}\n' >> "$OVERBRAINER_METRICS"
+mkdir -p output && echo adapter > output/adapter_model.safetensors
+exit 0
+"#;
+
+    /// A project training on a local target with [`FAKE_AXOLOTL`].
+    fn local_project() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = project()?;
+        let venv = dir.path().join("venv");
+        std::fs::create_dir_all(venv.join("bin"))?;
+        std::fs::write(venv.join("bin/axolotl"), FAKE_AXOLOTL)?;
+        std::fs::set_permissions(
+            venv.join("bin/axolotl"),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        let files = DataFiles::new(dir.path());
+        std::fs::write(&files.train, "{\"id\": 1}\n")?;
+        std::fs::write(&files.eval, "{\"id\": 2}\n")?;
+        let config = format!(
+            "{}\n[training]\ntarget = \"here\"\nbase_model = \"Qwen/Qwen3-4B\"\n\
+             adapter = \"qlora\"\n\n[targets.here]\nkind = \"local\"\nruntime = \"native\"\n\
+             venv = \"{}\"\n",
+            crate::tui::snapshots::CONFIG,
+            venv.display()
+        );
+        std::fs::write(dir.path().join("overbrainer.toml"), config)?;
+        Ok(dir)
+    }
+
+    /// Waits for the next message, at most a minute.
+    async fn next_message(
+        inbox: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
+    ) -> Result<Option<Msg>, tokio::time::error::Elapsed> {
+        tokio::time::timeout(Duration::from_secs(60), inbox.recv()).await
+    }
+
+    /// A real start on a local target: it reports its run, its token detaches
+    /// it once its job started (the run keeps running), and an attach then
+    /// forwards every metric and the command line's own outcome line.
+    #[tokio::test]
+    async fn a_training_task_reports_its_run_and_detaches_without_cancelling_it() -> TestResult {
+        let dir = local_project()?;
+        let (messages, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = Tasks::new(dir.path(), messages);
+        tasks.spawn(TaskId(1), Task::Train(TrainJob::Start));
+        let mut created = None;
+        loop {
+            match next_message(&mut inbox).await? {
+                Some(Msg::Report(TaskId(1), Report::RunCreated(id))) => created = Some(id),
+                Some(Msg::Event(TaskId(1), Event::JobStatus(_))) => break,
+                Some(_) => {},
+                None => return Err("the task ended before its job started".into()),
+            }
+        }
+        let run = created.ok_or("no RunCreated report before the job started")?;
+        tasks.cancel(TaskId(1));
+        let ended = tokio::time::timeout(Duration::from_secs(60), tasks.next()).await?;
+        let Some((TaskId(1), Ok(Done::Trained(Err(error))))) = ended else {
+            return Err(format!("{ended:?}").into());
+        };
+        assert_eq!(
+            error,
+            format!(
+                "interrupted: run {run} keeps running on target `here`; follow it again with \
+                 `overbrainer train attach {run}`"
+            )
+        );
+        let record = crate::runs::Runs::new(dir.path()).load(&run)?;
+        assert_eq!(
+            record.state,
+            crate::runs::RunState::Running,
+            "detached, not cancelled"
+        );
+
+        std::fs::write(dir.path().join("venv/release"), "")?;
+        tasks.spawn(TaskId(2), Task::Train(TrainJob::Attach(run.clone())));
+        let ended = tokio::time::timeout(Duration::from_secs(60), tasks.next()).await?;
+        assert!(
+            matches!(ended, Some((TaskId(2), Ok(Done::Trained(Ok(())))))),
+            "{ended:?}"
+        );
+        drop(tasks);
+        let (mut metrics, mut lines) = (0, Vec::new());
+        while let Some(message) = next_message(&mut inbox).await? {
+            match message {
+                Msg::Event(TaskId(2), Event::Metric(_)) => metrics += 1,
+                Msg::Report(TaskId(2), Report::Line(line)) => lines.push(line),
+                _ => {},
+            }
+        }
+        assert_eq!(metrics, 2, "every metric of the run, from its first");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with(&format!("train: run {run} succeeded; ")),
+            "the command line's own outcome line: {lines:?}"
+        );
+        Ok(())
+    }
+
+    /// A list price lookup is aborted when the TUI ends: it ends at once.
+    #[tokio::test]
+    async fn a_price_lookup_is_aborted_when_the_tui_ends() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
+        let handle = tasks.set.spawn(std::future::pending::<Done>());
+        tasks.ids.insert(handle.id(), TaskId(9));
+        tasks.lookups.insert(TaskId(9), handle);
+        tasks.abort_lookups();
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        assert!(matches!(next, Some((TaskId(9), Err(_)))), "{next:?}");
         Ok(())
     }
 }

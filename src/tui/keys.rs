@@ -22,6 +22,12 @@ const fn row(keys: &'static str, action: &'static str) -> KeyHelp {
     KeyHelp { keys, action }
 }
 
+/// The note under the keys: what the data lock refuses, and what it does not
+/// cover.
+pub(super) const NOTE: &str = "e, d, r and t are refused while a stage, an edit or a training \
+                               start runs in this TUI; an overbrainer command in another \
+                               terminal is not locked out.";
+
 /// Keys that work in every view.
 pub(super) const GLOBAL: &[KeyHelp] = &[
     row("1 2 3 4, Tab, Shift-Tab", "switch view"),
@@ -46,6 +52,7 @@ const TRAINING: &[KeyHelp] = &[
     row("k j, Up Down", "select a run"),
     row("a", "attach: follow the selected run again"),
     row("c", "cancel the selected run's job (asks first)"),
+    row("t", "start a training run (asks first)"),
 ];
 
 const LOGS: &[KeyHelp] = &[

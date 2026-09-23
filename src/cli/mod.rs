@@ -4,7 +4,7 @@ mod config_check;
 pub(crate) mod data;
 pub(crate) mod front;
 mod init;
-mod pod;
+pub(crate) mod pod;
 mod progress;
 mod runpod_train;
 pub(crate) mod train;

@@ -23,6 +23,11 @@ pub(super) struct RunRow {
 /// What a training task does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Job {
+    /// Starts a run, then follows it.
+    Start {
+        /// Whether its target is a Runpod one.
+        runpod: bool,
+    },
     /// Follows a run again.
     Attach,
     /// Cancels a run's job.
@@ -47,7 +52,7 @@ pub(super) enum Detach {
 pub(super) struct Follow {
     /// What it does.
     pub(super) job: Job,
-    /// Its run.
+    /// Its run; empty until a new run is created.
     pub(super) run_id: String,
     /// Whether its job's status was seen: its watch began.
     pub(super) watching: bool,
@@ -75,6 +80,21 @@ impl Follow {
             skipped: 0,
             cancel_after: false,
             detach: Detach::No,
+        }
+    }
+
+    /// Whether it is a start whose job has not started yet: it must not be
+    /// interrupted, and it holds the data lock.
+    pub(super) fn starting(&self) -> bool {
+        matches!(self.job, Job::Start { .. }) && !self.watching
+    }
+
+    /// Its run, or `a new run` before it is created.
+    pub(super) fn run(&self) -> String {
+        if self.run_id.is_empty() {
+            "a new run".to_string()
+        } else {
+            format!("run {}", self.run_id)
         }
     }
 }

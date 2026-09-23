@@ -13,6 +13,7 @@ use tracing::Level;
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
 use super::editor::{self, Session, Target};
 use super::pipeline::{PipelineView, STAGES, command_name};
+use super::start::StartPlan;
 use super::tasks::{Done, Edit, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
 use super::training::TrainingView;
@@ -147,7 +148,7 @@ pub(super) struct Status {
 }
 
 /// What is drawn over the view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum Overlay {
     /// The key table.
     Help,
@@ -167,7 +168,7 @@ pub(super) const MENU: [(Command, &str); 5] = [
 ];
 
 /// A confirmation dialog: `y` runs its action, anything else closes it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct Confirm {
     /// The title.
     pub(super) title: String,
@@ -182,7 +183,7 @@ pub(super) struct Confirm {
 }
 
 /// What a confirmed dialog runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum Action {
     /// A deletion, which must still remove `counts`.
     Delete {
@@ -195,6 +196,10 @@ pub(super) enum Action {
     Quit,
     /// Cancelling the job of run `0`.
     Cancel(String),
+    /// Starting a training run as planned.
+    Start(Box<StartPlan>),
+    /// Abandoning Runpod runs still provisioning, when quitting.
+    Abandon(Vec<TaskId>),
 }
 
 /// Why the loop ends.
@@ -289,6 +294,11 @@ pub(super) struct App {
     pub(super) training: TrainingView,
     /// When `runs/` was last read.
     pub(super) refreshed: SystemTime,
+    /// The task preparing a training start, if any.
+    pub(super) prepare: Option<TaskId>,
+    /// The task looking up list prices, if any; an earlier one's result is
+    /// ignored.
+    pub(super) prices: Option<TaskId>,
     /// Lines printed on stderr once the terminal is restored.
     pub(super) exit_notes: Vec<String>,
     /// How the TUI ends, set once it is to end while it waits for work to end:
@@ -326,6 +336,8 @@ impl App {
             pipeline_last: None,
             training: TrainingView::default(),
             refreshed: Self::never(),
+            prepare: None,
+            prices: None,
             exit_notes: Vec::new(),
             leaving: None,
             next_task: 0,
@@ -386,14 +398,21 @@ impl App {
         if self.edit.is_some() {
             work.push("saving".to_string());
         }
+        if self.prepare.is_some() || self.prices.is_some() {
+            work.push("preparing a run".to_string());
+        }
+        let followed = self.training.tasks.len();
+        if followed > 0 {
+            work.push(count(followed, "training task"));
+        }
         if self.lock().is_some() {
             work.push("edits locked".to_string());
         }
         work
     }
 
-    /// Why the dataset cannot be changed now, if it cannot: a stage or an edit
-    /// runs in this TUI.
+    /// Why the dataset cannot be changed now, if it cannot: a stage, an edit or
+    /// a training start (until its job started) runs in this TUI.
     pub(super) fn lock(&self) -> Option<String> {
         if self.pipeline_task.is_some() {
             let running = self.pipeline.progress().unwrap_or_default();
@@ -402,6 +421,9 @@ impl App {
         }
         if self.edit.is_some() || self.editing.is_some() {
             return Some("an edit is being saved".to_string());
+        }
+        if let Some(follow) = self.training.tasks.values().find(|f| f.starting()) {
+            return Some(format!("{} is starting", follow.run()));
         }
         None
     }
@@ -430,6 +452,12 @@ impl App {
             Ok(Done::Trained(result)) => self.trained(id, result),
             Ok(Done::Runs(listing)) => self.listed(id, listing),
             Ok(Done::Series { run, series }) => self.series_read(id, run, series),
+            Ok(Done::Prepared(plan)) if self.prepare == Some(id) => self.prepared(plan),
+            Ok(Done::Prices(prices)) if self.prices == Some(id) => {
+                self.priced(&prices);
+                Vec::new()
+            },
+            Ok(Done::Prepared(_) | Done::Prices(_)) => Vec::new(),
             Err(error) => self.failed(id, error),
         }
     }
@@ -459,6 +487,14 @@ impl App {
         }
         if self.training.tasks.contains_key(&id) {
             return self.trained(id, Err(error));
+        }
+        if self.prepare == Some(id) {
+            return self.prepared(Err(error));
+        }
+        if self.prices == Some(id) {
+            // Every price unknown: the dialog never keeps waiting.
+            self.priced(&Vec::new());
+            return Vec::new();
         }
         if self.read_failed(id, &error) {
             return Vec::new();
@@ -813,8 +849,14 @@ impl App {
             return Vec::new();
         }
         match confirm.action {
-            Action::Quit => self.leave(Exit::Quit),
+            Action::Quit => {
+                let effects = self.leave(Exit::Quit);
+                self.offer_abandon();
+                effects
+            },
             Action::Cancel(run_id) => self.cancel_run(&run_id),
+            Action::Start(plan) => self.start_run(&plan),
+            Action::Abandon(tasks) => self.abandon(&tasks),
             Action::Delete { deletion, counts } => {
                 if self.locked() {
                     return Vec::new();
@@ -1023,7 +1065,11 @@ impl App {
     /// becomes of each piece of work.
     fn quit(&mut self) -> Vec<Effect> {
         if self.leaving.is_some() {
-            self.say(Severity::Info, "quitting once the work running ends");
+            // A run still provisioning can be abandoned rather than waited for.
+            self.offer_abandon();
+            if self.overlay.is_none() {
+                self.say(Severity::Info, "quitting once the work running ends");
+            }
             return Vec::new();
         }
         let mut text = Vec::new();
@@ -1060,7 +1106,8 @@ impl App {
 
     /// Ends the TUI for `why`: stops the pipeline task, detaches the followed
     /// runs (abandons them on a signal), and waits for them, for cancels and for
-    /// an edit being saved. A signal is never turned back into a plain quit.
+    /// an edit being saved: a run still starting is detached once its job
+    /// started, never before. A signal is never turned back into a plain quit.
     fn leave(&mut self, why: Exit) -> Vec<Effect> {
         if self.leaving != Some(Exit::Signal) {
             self.leaving = Some(why);
@@ -1089,7 +1136,12 @@ impl App {
             let run = &follow.run_id;
             match follow.job {
                 super::training::Job::Cancel => format!("waiting for the cancel of run {run}..."),
-                super::training::Job::Attach => format!("waiting for run {run} to detach..."),
+                super::training::Job::Start { .. } if follow.starting() => {
+                    format!("waiting for {} to start or be abandoned...", follow.run())
+                },
+                super::training::Job::Start { .. } | super::training::Job::Attach => {
+                    format!("waiting for run {run} to detach...")
+                },
             }
         }));
         lines
@@ -1104,9 +1156,12 @@ impl App {
             let name = self.pipeline.command.map_or("stage", command_name);
             still.push(format!("{name} still stops"));
         }
-        let detached = self.keep_following();
+        let (detached, abandoned) = self.keep_following();
         if detached > 0 {
             still.push(format!("{} still detached", count(detached, "run")));
+        }
+        if abandoned > 0 {
+            still.push(format!("{} still abandoned", count(abandoned, "run")));
         }
         let said = if still.is_empty() {
             "not quitting".to_string()
@@ -2714,5 +2769,256 @@ mod tests {
             ["waiting for run 20260921-133200-a1b2 to detach..."]
         );
         Ok(())
+    }
+
+    #[test]
+    fn t_prepares_asks_with_list_prices_then_starts_one_run() -> Result<(), String> {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('3')]);
+        let effects = press(&mut app, &[KeyCode::Char('t')]);
+        let [Effect::Spawn(prepare, Task::Prepare)] = effects.as_slice() else {
+            return Err(format!("{effects:?}"));
+        };
+        let effects = app.on_done(
+            *prepare,
+            Ok(Done::Prepared(Ok(crate::tui::snapshots::runpod_plan()))),
+        );
+        let [Effect::Spawn(prices, Task::Prices(gpus))] = effects.as_slice() else {
+            return Err(format!("{effects:?}"));
+        };
+        assert_eq!(gpus.len(), 3);
+        let listed = vec![("NVIDIA A40".to_string(), Some(0.44))];
+        app.on_done(*prices, Ok(Done::Prices(listed)));
+        let Some(Overlay::Confirm(confirm)) = &app.overlay else {
+            return Err("no dialog".into());
+        };
+        assert!(confirm.text.iter().any(|line| line.ends_with("$0.44/h")));
+        let effects = press(&mut app, &[KeyCode::Char('y')]);
+        let [Effect::Spawn(start, Task::Train(TrainJob::Start))] = effects.as_slice() else {
+            return Err(format!("{effects:?}"));
+        };
+        assert_eq!(app.lock().as_deref(), Some("a new run is starting"));
+        for code in ['t', 'r'] {
+            assert_eq!(press(&mut app, &[KeyCode::Char(code)]), []);
+        }
+        app.on_message(Msg::Report(
+            *start,
+            Report::RunCreated("20260921-141320-ab12".into()),
+        ));
+        assert_eq!(
+            app.lock().as_deref(),
+            Some("run 20260921-141320-ab12 is starting")
+        );
+        app.on_message(Msg::Event(
+            *start,
+            crate::events::Event::JobStatus(crate::exec::JobStatus::Running),
+        ));
+        assert_eq!(app.lock(), None, "the lock ends once the job started");
+        Ok(())
+    }
+
+    #[test]
+    fn t_is_refused_without_training_or_while_the_data_is_locked() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('3')]);
+        let effects = press(&mut app, &[KeyCode::Char('t')]);
+        let [Effect::Spawn(prepare, _)] = effects.as_slice() else {
+            return assert_eq!(effects, []);
+        };
+        let refused = "no [training] section in overbrainer.toml";
+        assert_eq!(
+            app.on_done(*prepare, Ok(Done::Prepared(Err(refused.into())))),
+            []
+        );
+        assert_eq!(
+            status(&app),
+            Some("refused: no [training] section in overbrainer.toml")
+        );
+        app.edit = Some(TaskId(40));
+        assert_eq!(press(&mut app, &[KeyCode::Char('t')]), []);
+        assert_eq!(
+            status(&app),
+            Some("refused: an edit is being saved; one task at a time")
+        );
+    }
+
+    #[test]
+    fn quitting_never_cuts_a_start_and_abandons_only_when_confirmed() {
+        let mut app = app();
+        app.training.tasks.insert(
+            TaskId(4),
+            crate::tui::training::Follow::new(
+                crate::tui::training::Job::Start { runpod: true },
+                "",
+            ),
+        );
+        press(&mut app, &[KeyCode::Char('q')]);
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('y')]),
+            [],
+            "never during the start"
+        );
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Confirm(Confirm {
+                action: Action::Abandon(_),
+                ..
+            }))
+        ));
+        assert_eq!(press(&mut app, &[KeyCode::Char('n')]), [], "waiting");
+        let effects = app.on_message(Msg::Event(
+            TaskId(4),
+            crate::events::Event::JobStatus(crate::exec::JobStatus::Running),
+        ));
+        assert_eq!(
+            effects,
+            [Effect::Cancel(TaskId(4))],
+            "detached once its job started"
+        );
+
+        let mut app = super::super::snapshots::app();
+        app.training.tasks.insert(
+            TaskId(5),
+            crate::tui::training::Follow::new(
+                crate::tui::training::Job::Start { runpod: true },
+                "",
+            ),
+        );
+        press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('y')]),
+            [Effect::Abandon(TaskId(5))]
+        );
+    }
+
+    /// A start task on a Runpod target, bound to run [`FIRST`].
+    fn starting(app: &mut App, id: TaskId) {
+        app.training.tasks.insert(
+            id,
+            crate::tui::training::Follow::new(
+                crate::tui::training::Job::Start { runpod: true },
+                "",
+            ),
+        );
+        app.on_message(Msg::Report(id, Report::RunCreated(FIRST.into())));
+    }
+
+    #[test]
+    fn q_while_waiting_offers_to_abandon_again_and_a_signal_never_asks() {
+        let mut app = app();
+        starting(&mut app, TaskId(6));
+        press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        assert!(dialog(&app).starts_with("Quitting waits until the job of run 20260921-133200"));
+        press(&mut app, &[KeyCode::Char('n')]);
+        assert_eq!(app.overlay, None);
+        press(&mut app, &[KeyCode::Char('q')]);
+        assert!(
+            dialog(&app).starts_with("Quitting waits"),
+            "asked again: {:?}",
+            app.overlay
+        );
+        assert_eq!(
+            app.on_signal(),
+            [Effect::Abandon(TaskId(6))],
+            "a signal abandons at once"
+        );
+        assert_eq!(app.overlay, None);
+        press(&mut app, &[KeyCode::Char('q')]);
+        assert_eq!(app.overlay, None, "nothing left to abandon");
+        assert_eq!(
+            app.waiting_for(),
+            ["waiting for run 20260921-133200-a1b2 to start or be abandoned..."]
+        );
+    }
+
+    #[test]
+    fn staying_after_the_abandon_dialog_keeps_the_start_followed() {
+        let mut app = app();
+        starting(&mut app, TaskId(6));
+        press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        press(&mut app, &[KeyCode::Char('n'), KeyCode::Char('n')]);
+        assert_eq!(app.leaving, None);
+        assert_eq!(status(&app), Some("not quitting"));
+        assert_eq!(watching(&mut app, TaskId(6)), [], "still followed");
+    }
+
+    #[test]
+    fn c_on_a_starting_run_cancels_it_once_its_job_started() {
+        let mut app = app();
+        starting(&mut app, TaskId(6));
+        assert_eq!(app.cancel_run(FIRST), [], "never during the start");
+        assert_eq!(
+            status(&app),
+            Some("run 20260921-133200-a1b2 is starting: it is cancelled once its job started")
+        );
+        assert_eq!(watching(&mut app, TaskId(6)), [Effect::Cancel(TaskId(6))]);
+        let effects = app.on_done(TaskId(6), Ok(Done::Trained(Err(DETACHED.into()))));
+        assert!(
+            matches!(effects.as_slice(), [.., Effect::Spawn(_, Task::Train(TrainJob::Cancel(run)))] if run == FIRST),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_start_that_fails_before_its_run_exists_says_so() {
+        let mut app = app();
+        app.training.tasks.insert(
+            TaskId(6),
+            crate::tui::training::Follow::new(
+                crate::tui::training::Job::Start { runpod: false },
+                "",
+            ),
+        );
+        let effects = app.on_done(
+            TaskId(6),
+            Ok(Done::Trained(Err("training.target: unknown".into()))),
+        );
+        assert!(
+            effects
+                .iter()
+                .all(|e| !matches!(e, Effect::Spawn(_, Task::Series(_)))),
+            "{effects:?}"
+        );
+        assert_eq!(status(&app), Some("a new run: training.target: unknown"));
+        assert!(app.training.ended.is_empty());
+    }
+
+    #[test]
+    fn stale_or_failed_price_lookups_never_leave_the_dialog_waiting() -> Result<(), String> {
+        let mut app = app();
+        let plan = crate::tui::snapshots::runpod_plan();
+        let first = app.prepared(Ok(plan.clone()));
+        app.overlay = None;
+        let second = app.prepared(Ok(plan));
+        let ([Effect::Spawn(old, _)], [Effect::Spawn(new, _)]) =
+            (first.as_slice(), second.as_slice())
+        else {
+            return Err(format!("{first:?} {second:?}"));
+        };
+        let listed = vec![("NVIDIA A40".to_string(), Some(0.44))];
+        app.on_done(*old, Ok(Done::Prices(listed)));
+        assert!(dialog(&app).contains("looking up list prices..."), "stale");
+        app.on_done(*new, Err("a background task failed: cancelled".into()));
+        assert!(!dialog(&app).contains("looking up"), "{}", dialog(&app));
+        assert!(dialog(&app).contains("NVIDIA A40                 list price unknown"));
+        assert_eq!(app.prices, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_that_arrives_while_quitting_is_dropped() {
+        let mut app = app();
+        let effects = press(&mut app, &[KeyCode::Char('3'), KeyCode::Char('t')]);
+        let Some(Effect::Spawn(prepare, Task::Prepare)) = effects.last() else {
+            return assert_eq!(effects, []);
+        };
+        app.leaving = Some(Exit::Quit);
+        let effects = app.on_done(
+            *prepare,
+            Ok(Done::Prepared(Ok(crate::tui::snapshots::runpod_plan()))),
+        );
+        assert_eq!(effects, []);
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.prepare, None);
     }
 }

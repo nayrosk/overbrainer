@@ -859,6 +859,98 @@ fn the_cancel_dialog_and_the_quit_dialog_of_a_followed_run() -> TestResult {
     Ok(())
 }
 
+use crate::tui::app::{Action, Confirm};
+use crate::tui::start::{RunpodPlan, StartPlan};
+
+/// The plan of a run on the Runpod target `gpu_cloud`.
+pub(super) fn runpod_plan() -> StartPlan {
+    StartPlan {
+        target: "gpu_cloud".into(),
+        kind: "runpod, Secure Cloud".into(),
+        model: "Qwen/Qwen3-4B, qlora, 3 epochs, lr 2e-4".into(),
+        train: 1234,
+        eval: 137,
+        runpod: Some(RunpodPlan {
+            gpu_types: vec![
+                "NVIDIA GeForce RTX 4090".into(),
+                "NVIDIA RTX A6000".into(),
+                "NVIDIA A40".into(),
+            ],
+            gpu_count: 1,
+            max_hours: 6.0,
+        }),
+        warnings: vec!["qwen2 renders no reasoning_content (see the logs)".into()],
+    }
+}
+
+#[test]
+fn the_start_dialog_of_a_runpod_run_before_and_with_its_prices() -> TestResult {
+    let mut app = app();
+    app.view = View::Training;
+    app.prepared(Ok(runpod_plan()));
+    snapshot("start_runpod_looking_up", &mut app)?;
+    app.priced(&vec![
+        ("NVIDIA GeForce RTX 4090".to_string(), Some(0.74)),
+        ("NVIDIA RTX A6000".to_string(), Some(0.79)),
+        ("NVIDIA A40".to_string(), None),
+    ]);
+    snapshot("start_runpod", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn the_start_dialog_of_an_ssh_run() -> TestResult {
+    let mut app = app();
+    app.view = View::Training;
+    let plan = StartPlan {
+        target: "homelab".into(),
+        kind: "ssh, docker".into(),
+        runpod: None,
+        warnings: Vec::new(),
+        ..runpod_plan()
+    };
+    app.overlay = Some(Overlay::Confirm(Confirm {
+        title: " Start a training run? ".into(),
+        text: crate::tui::start::text(&plan, None),
+        yes: "start",
+        no: "cancel",
+        action: Action::Start(Box::new(plan)),
+    }));
+    snapshot("start_ssh", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn quitting_while_a_runpod_run_provisions_offers_to_abandon_it() -> TestResult {
+    let mut app = app();
+    app.view = View::Training;
+    app.training
+        .tasks
+        .insert(TaskId(4), Follow::new(Job::Start { runpod: true }, ""));
+    app.on_input(&key(KeyCode::Char('q')));
+    snapshot("quit_starting", &mut app)?;
+    app.on_input(&key(KeyCode::Char('y')));
+    snapshot("abandon_dialog", &mut app)?;
+    Ok(())
+}
+
+/// The help overlay of every view keeps its note whole at the minimum size.
+#[test]
+fn the_help_note_fits_every_view_at_80x24() -> TestResult {
+    let mut app = dataset_app();
+    app.overlay = Some(Overlay::Help);
+    for view in View::ALL {
+        app.view = view;
+        let rows = text(&draw(&mut app, 80, 24)?).join("\n");
+        assert!(
+            rows.contains("e, d, r and t are refused"),
+            "{view:?}\n{rows}"
+        );
+        assert!(rows.contains("is not locked out."), "{view:?}\n{rows}");
+    }
+    Ok(())
+}
+
 /// [`training_app`] with its Runpod run ended and followed by no task, its pod
 /// changed by `change`.
 fn ended_runpod_app(

@@ -112,6 +112,7 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
                 Some((_, follow)) if follow.job == Job::Cancel || follow.cancel_after => {
                     "cancelling"
                 },
+                Some((_, follow)) if follow.starting() => "starting",
                 Some(_) => "followed",
                 None => "",
             };
@@ -195,6 +196,7 @@ fn status_line(
     }
     let state = match follow {
         Some(follow) if follow.job == Job::Cancel || follow.cancel_after => "   cancelling",
+        Some(follow) if follow.starting() => "   starting",
         Some(_) => "   followed",
         None => "",
     };
