@@ -14,14 +14,15 @@ use super::{TrainArgs, TrainCommand};
 use crate::config::{DEFAULT_WORKDIR, EnvSource, Settings, Target, Training};
 use crate::dataset::DataFiles;
 use crate::events::EventBus;
-use crate::exec::{AnyExecutor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
+use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
+use crate::runpod::{PodRecord, RunpodTarget};
 use crate::runs::{
     Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, cancel, create, start, watch,
 };
 use crate::train::{Axolotl, OUTPUT_DIR, reasoning_template_warning};
 
 /// Time between two looks at a running job.
-const POLL: Duration = Duration::from_secs(2);
+pub(super) const POLL: Duration = Duration::from_secs(2);
 
 /// Runs `overbrainer train` or one of its subcommands.
 ///
@@ -33,7 +34,13 @@ pub async fn run(project_dir: &Path, args: &TrainArgs) -> anyhow::Result<()> {
     match &args.command {
         None => {
             let settings = crate::config::load(project_dir, EnvSource::Process)?;
-            train(project_dir, &settings, args.target.as_deref()).await
+            train(
+                project_dir,
+                &settings,
+                args.target.as_deref(),
+                args.keep_pod,
+            )
+            .await
         },
         Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id).await,
         Some(TrainCommand::Cancel { run_id }) => cancel_run(project_dir, run_id).await,
@@ -51,7 +58,7 @@ pub async fn after_run(project_dir: &Path) -> anyhow::Result<()> {
         no_training();
         return Ok(());
     }
-    train(project_dir, &settings, None).await
+    train(project_dir, &settings, None, false).await
 }
 
 fn no_training() {
@@ -62,6 +69,7 @@ async fn train(
     project_dir: &Path,
     settings: &Settings,
     target: Option<&str>,
+    keep_pod: bool,
 ) -> anyhow::Result<()> {
     let training = training(settings)?;
     let name = target.unwrap_or(&training.target);
@@ -69,7 +77,13 @@ async fn train(
         .targets
         .get(name)
         .with_context(|| format!("unknown target `{name}`"))?;
-    let runtime = JobRuntime::from_target(target).with_context(|| runpod_refused(name))?;
+    if let Some(spec) = RunpodTarget::from_target(target) {
+        return super::runpod_train::train(project_dir, settings, name, &spec, keep_pod).await;
+    }
+    if keep_pod {
+        bail!("--keep-pod only applies to a runpod target");
+    }
+    let runtime = JobRuntime::from_target(target).with_context(|| runpod_only(name))?;
     if let Some(warning) = reasoning_template_warning(training) {
         warn(&warning);
     }
@@ -79,7 +93,7 @@ async fn train(
     // Caught from before the run exists, so Ctrl-C never kills the process while
     // its job is being started and not yet recorded.
     let mut interrupt = Interrupt::catch();
-    let record = create(&runs, &executor, name)?;
+    let record = create(&runs, executor.workdir(), name)?;
     started(&record);
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let id = record.id.clone();
@@ -122,6 +136,9 @@ async fn attach(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
     let training = training(&settings)?;
     let runs = Runs::new(project_dir);
     let record = runs.load(run_id)?;
+    if let Some(pod) = PodRecord::load(&runs, run_id)? {
+        return super::runpod_train::attach(project_dir, &settings, record, pod).await;
+    }
     let executor = run_executor(project_dir, &settings, &record).await?;
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let bus = EventBus::new();
@@ -162,11 +179,14 @@ async fn cancel_run(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
         "cancel needs [training] to retrieve the run's artifacts: \
          no [training] section in overbrainer.toml",
     )?;
+    if let Some(pod) = PodRecord::load(&runs, run_id)? {
+        return super::runpod_train::cancel(project_dir, &settings, record, pod).await;
+    }
     let executor = run_executor(project_dir, &settings, &record).await?;
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     // Cancelling is never interrupted: dropping it between the `cancelling` marker
     // and the signal would leave that marker on the target for ever.
-    let (record, status) = Interrupt::catch()
+    let (record, status, _) = Interrupt::catch()
         .shield(cancel(&runs, &executor, &trainer, record))
         .await?;
     if status != JobStatus::Cancelled {
@@ -183,15 +203,28 @@ async fn cancel_run(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints the runs in `runs/`, oldest first: ID, state, target, creation time.
+/// Prints the runs in `runs/`, oldest first: ID, state, target, creation time,
+/// and, for a Runpod run, what `pod.json` says of its pod (no API call).
 ///
 /// # Errors
 ///
 /// Returns an error when a run record cannot be read.
 pub fn list(project_dir: &Path) -> anyhow::Result<()> {
-    for record in Runs::new(project_dir).list()? {
+    let runs = Runs::new(project_dir);
+    for record in runs.list()? {
+        let pod = match PodRecord::load(&runs, &record.id) {
+            Ok(Some(pod)) => format!("  {}", pod.summary()),
+            Ok(None) => String::new(),
+            Err(error) => {
+                warn(&format!(
+                    "cannot read the pod record of run {}: {error}",
+                    record.id
+                ));
+                String::new()
+            },
+        };
         println!(
-            "{}  {:<9}  {}  {}",
+            "{}  {:<9}  {}  {}{pod}",
             record.id,
             record.state.name(),
             record.target,
@@ -201,7 +234,7 @@ pub fn list(project_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn training(settings: &Settings) -> anyhow::Result<&Training> {
+pub(super) fn training(settings: &Settings) -> anyhow::Result<&Training> {
     settings
         .training
         .as_ref()
@@ -209,7 +242,9 @@ fn training(settings: &Settings) -> anyhow::Result<&Training> {
 }
 
 /// The Hugging Face token, resolved only now, for the job's environment.
-async fn secrets(settings: &Settings) -> anyhow::Result<Vec<(String, secrecy::SecretString)>> {
+pub(super) async fn secrets(
+    settings: &Settings,
+) -> anyhow::Result<Vec<(String, secrecy::SecretString)>> {
     let Some(token) = &settings.hf_token else {
         if settings
             .training
@@ -247,15 +282,14 @@ async fn executor(project_dir: &Path, name: &str, target: &Target) -> anyhow::Re
                 .with_context(|| format!("cannot reach target `{name}`"))?;
             Ok(AnyExecutor::Ssh(executor))
         },
-        Target::Runpod { .. } => bail!(runpod_refused(name)),
+        Target::Runpod { .. } => bail!(runpod_only(name)),
     }
 }
 
-fn runpod_refused(name: &str) -> String {
-    format!(
-        "target `{name}` is a runpod target, which overbrainer cannot train on yet \
-         (planned for M4): use a local or ssh target"
-    )
+/// A Runpod target has no executor until its run's pod exists: its runs go
+/// through `runpod_train`.
+fn runpod_only(name: &str) -> String {
+    format!("target `{name}` is a runpod target: its runs are reached through their pod")
 }
 
 /// The executor of the target a run was started on.
@@ -278,7 +312,7 @@ type CtrlC = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
 /// Ctrl-C, caught from [`Interrupt::catch`] on so that it no longer stops the
 /// process: a flow either runs to its end regardless ([`Interrupt::shield`]) or
 /// stops at the first Ctrl-C ([`Interrupt::race`]).
-enum Interrupt {
+pub(super) enum Interrupt {
     /// Waiting for Ctrl-C.
     Listening(CtrlC),
     /// Ctrl-C was pressed.
@@ -289,7 +323,7 @@ enum Interrupt {
 
 impl Interrupt {
     /// Starts catching Ctrl-C now.
-    fn catch() -> Self {
+    pub(super) fn catch() -> Self {
         let mut signal: CtrlC = Box::pin(tokio::signal::ctrl_c());
         // The handler is installed on the first poll; a later poll registers the
         // real waker.
@@ -311,12 +345,12 @@ impl Interrupt {
     }
 
     /// Whether Ctrl-C was pressed.
-    fn caught(&self) -> bool {
+    pub(super) fn caught(&self) -> bool {
         matches!(self, Self::Caught)
     }
 
     /// Runs `flow` to its end, noting a Ctrl-C pressed meanwhile.
-    async fn shield<T>(&mut self, flow: impl Future<Output = T>) -> T {
+    pub(super) async fn shield<T>(&mut self, flow: impl Future<Output = T>) -> T {
         let mut flow = pin!(flow);
         let result = match self {
             Self::Listening(signal) => tokio::select! {
@@ -330,7 +364,7 @@ impl Interrupt {
     }
 
     /// Runs `flow`, or `None` when Ctrl-C is pressed first (or was already).
-    async fn race<T>(&mut self, flow: impl Future<Output = T>) -> Option<T> {
+    pub(super) async fn race<T>(&mut self, flow: impl Future<Output = T>) -> Option<T> {
         let mut flow = pin!(flow);
         let result = match self {
             Self::Listening(signal) => tokio::select! {
@@ -350,7 +384,11 @@ impl Interrupt {
 }
 
 /// Prints the outcome on stdout, or explains how to follow an interrupted run.
-fn finish(runs: &Runs, id: &str, result: anyhow::Result<Option<Outcome>>) -> anyhow::Result<()> {
+pub(super) fn finish(
+    runs: &Runs,
+    id: &str,
+    result: anyhow::Result<Option<Outcome>>,
+) -> anyhow::Result<()> {
     let Some(outcome) = result? else {
         return interrupted(runs, id);
     };
@@ -394,11 +432,11 @@ fn interrupted(runs: &Runs, id: &str) -> anyhow::Result<()> {
     )
 }
 
-fn reattach(id: &str) -> String {
+pub(super) fn reattach(id: &str) -> String {
     format!("follow it again with `overbrainer train attach {id}`")
 }
 
-fn started(record: &RunRecord) {
+pub(super) fn started(record: &RunRecord) {
     tracing::info!(
         "train: run {} on target `{}`, in {}",
         record.id,
@@ -407,7 +445,7 @@ fn started(record: &RunRecord) {
     );
 }
 
-fn warn(message: &str) {
+pub(super) fn warn(message: &str) {
     tracing::warn!("{message}");
 }
 

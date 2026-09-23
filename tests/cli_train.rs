@@ -80,8 +80,7 @@ venv = "{}"
 
 [targets.gpu]
 kind = "runpod"
-gpu_type = "NVIDIA A40"
-image = "i"
+gpu_types = ["NVIDIA A40"]
 max_hours = 1.0
 "#,
             venv.display()
@@ -324,8 +323,9 @@ fn unusable_targets_are_refused() -> TestResult {
         .args(["train", "--target", "gpu"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("cannot train on yet"))
-        .stderr(predicate::str::contains("M4"));
+        .stderr(predicate::str::contains(
+            "no Runpod API key: set OVERBRAINER_RUNPOD__API_KEY",
+        ));
     assert!(!dir.path().join("runs").exists());
     overbrainer(dir.path())?
         .args(["train", "attach", "20260101-000000-abcd"])
@@ -408,6 +408,30 @@ fn cancel_refuses_a_run_that_has_not_started() -> TestResult {
         .stderr(predicate::str::contains(format!(
             "run {id} has not started"
         )));
+    Ok(())
+}
+
+#[test]
+fn a_malformed_run_json_is_reported_without_its_content() -> TestResult {
+    const MARKER: &str = "MARKER-3c9e71a0-never-printed";
+    let dir = project("ok")?;
+    let id = "20260101-000000-abcd";
+    let run = dir.path().join("runs").join(id);
+    fs::create_dir_all(&run)?;
+    fs::write(
+        run.join("run.json"),
+        format!(
+            r#"{{"id": "{id}", "target": "here", "created": "2026-01-01T00:00:00Z",
+"remote_dir": "/w/{id}", "job": null, "state": "{MARKER}", "message": null}}"#
+        ),
+    )?;
+    overbrainer(dir.path())?
+        .args(["train", "cancel", id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not a valid run record"))
+        .stderr(predicate::str::contains("line 2"))
+        .stderr(predicate::str::contains(MARKER).not());
     Ok(())
 }
 

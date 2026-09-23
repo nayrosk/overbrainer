@@ -70,6 +70,42 @@ fn config_check_masks_secrets() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn config_check_shows_a_runpod_target_with_its_defaults() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .success();
+    let toml = std::fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+    let runpod = "[targets.gpu_cloud]\nkind = \"runpod\"\ngpu_types = [\"NVIDIA A40\", \"NVIDIA L40S\"]\nmax_hours = 6\n";
+    std::fs::write(
+        dir.path().join("overbrainer.toml"),
+        format!("{toml}\n{runpod}"),
+    )?;
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["config", "check"])
+        .env("OVERBRAINER_RUNPOD__API_KEY", "rp-very-secret")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "targets.gpu_cloud = runpod 1x [NVIDIA A40, NVIDIA L40S], max 6h, image axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1@sha256:",
+        ))
+        .stdout(predicate::str::contains(
+            "venv /workspace/axolotl-venv, disk 50 GB, boot grace 30 min, retrieve grace 60 min, data centers any, network volume none",
+        ))
+        .stdout(predicate::str::contains("runpod.api_key = ***"))
+        .stdout(predicate::str::contains(
+            "runpod.base_url = https://api.runpod.io/v2",
+        ))
+        .stdout(predicate::str::contains("rp-very-secret").not());
+    Ok(())
+}
+
+#[test]
 fn config_check_reports_invalid_config() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     overbrainer()?

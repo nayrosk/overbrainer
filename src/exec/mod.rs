@@ -7,6 +7,7 @@
 //! directory. Any later overbrainer process can read its status, tail its files or
 //! cancel it from that directory alone.
 
+mod digest;
 mod lines;
 mod local;
 mod runtime;
@@ -20,10 +21,13 @@ use std::path::{Path, PathBuf};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
+pub use digest::{
+    FileDigest, glob_match, local_manifest, manifest_script, parse_manifest, sha256_file,
+};
 pub use lines::{LineStream, MAX_TAIL_READ, complete_lines};
 pub use local::LocalExecutor;
 pub use runtime::{JobRuntime, JobSpec, shell_path};
-pub use script::{cancel_script, job_script, parse_status, quote, status_script};
+pub use script::{GROUP_SIGNAL, cancel_script, job_script, parse_status, quote, status_script};
 pub use ssh::SshExecutor;
 
 use crate::config::Engine;
@@ -220,7 +224,9 @@ pub trait Executor: Send + Sync {
     /// Directory holding the run directories on the target, absolute.
     fn workdir(&self) -> &str;
 
-    /// Copies the content of the local directory `local` into `remote`, creating it.
+    /// Copies the content of the local directory `local` into `remote`, creating it,
+    /// except the top-level entries of `local` named in `skip`, which never leave
+    /// this machine.
     ///
     /// # Errors
     ///
@@ -229,6 +235,7 @@ pub trait Executor: Send + Sync {
         &self,
         local: &Path,
         remote: &str,
+        skip: &[String],
     ) -> impl Future<Output = Result<(), ExecError>> + Send;
 
     /// Starts `job` in the background and returns its handle. The job keeps running
@@ -317,6 +324,24 @@ pub trait Executor: Send + Sync {
         exclude: &[String],
     ) -> impl Future<Output = Result<(), ExecError>> + Send;
 
+    /// Every regular file under `entries` (relative to the target directory
+    /// `remote`) with the SHA-256 of its content, leaving out names matching an
+    /// `exclude` pattern at any depth, as [`Executor::download`] does. Missing
+    /// entries are skipped; symbolic links are not followed. Paths are relative to
+    /// `remote`, sorted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Command`] (message `<remote> does not exist`) when
+    /// `remote` itself is not a directory, and an [`ExecError`] when a file cannot
+    /// be read or the target cannot be reached.
+    fn manifest(
+        &self,
+        remote: &str,
+        entries: &[String],
+        exclude: &[String],
+    ) -> impl Future<Output = Result<Vec<FileDigest>, ExecError>> + Send;
+
     /// Follows the file `path` from byte `offset`, one complete line at a time.
     fn tail(&self, path: &str, offset: u64) -> LineStream<'_, Self>
     where
@@ -343,10 +368,10 @@ impl Executor for AnyExecutor {
         }
     }
 
-    async fn upload(&self, local: &Path, remote: &str) -> Result<(), ExecError> {
+    async fn upload(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {
         match self {
-            Self::Local(executor) => executor.upload(local, remote).await,
-            Self::Ssh(executor) => executor.upload(local, remote).await,
+            Self::Local(executor) => executor.upload(local, remote, skip).await,
+            Self::Ssh(executor) => executor.upload(local, remote, skip).await,
         }
     }
 
@@ -388,6 +413,18 @@ impl Executor for AnyExecutor {
         match self {
             Self::Local(executor) => executor.download(remote, local, entries, exclude).await,
             Self::Ssh(executor) => executor.download(remote, local, entries, exclude).await,
+        }
+    }
+
+    async fn manifest(
+        &self,
+        remote: &str,
+        entries: &[String],
+        exclude: &[String],
+    ) -> Result<Vec<FileDigest>, ExecError> {
+        match self {
+            Self::Local(executor) => executor.manifest(remote, entries, exclude).await,
+            Self::Ssh(executor) => executor.manifest(remote, entries, exclude).await,
         }
     }
 }

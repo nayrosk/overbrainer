@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::retry::Retryable;
+
 /// Errors from an LLM provider.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
@@ -31,16 +33,6 @@ pub enum LlmError {
 }
 
 impl LlmError {
-    /// Rate limits, server errors, timeouts and connection failures are worth retrying.
-    #[must_use]
-    pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::Status { status, .. } => *status == 408 || *status == 429 || *status >= 500,
-            Self::Transport(_) => true,
-            _ => false,
-        }
-    }
-
     /// Errors that will fail every request of a stage: bad credentials, missing model,
     /// unsupported operation. A stage stops at the first one instead of failing each item.
     #[must_use]
@@ -51,13 +43,49 @@ impl LlmError {
             Self::Transport(_) | Self::InvalidResponse(_) => false,
         }
     }
+}
+
+impl Retryable for LlmError {
+    /// Rate limits, server errors, timeouts and connection failures are worth retrying.
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Status { status, .. } => *status == 408 || *status == 429 || *status >= 500,
+            Self::Transport(_) => true,
+            _ => false,
+        }
+    }
 
     /// The provider's `Retry-After`, when it sent one.
-    #[must_use]
-    pub fn retry_after(&self) -> Option<Duration> {
+    fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Status { retry_after, .. } => *retry_after,
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(status: u16) -> LlmError {
+        LlmError::Status {
+            status,
+            message: String::new(),
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn classification_of_errors() {
+        for code in [408, 429, 500, 503, 529] {
+            assert!(status(code).is_retryable(), "{code}");
+        }
+        for code in [400, 401, 403, 404] {
+            assert!(!status(code).is_retryable(), "{code}");
+        }
+        assert!(status(401).is_fatal_for_stage());
+        assert!(!status(400).is_fatal_for_stage());
+        assert!(!status(429).is_fatal_for_stage());
     }
 }

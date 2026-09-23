@@ -267,13 +267,23 @@ async fn upload_and_download_copy_selected_trees() -> TestResult {
     fs::create_dir_all(local.join("data"))?;
     fs::write(local.join("axolotl.yaml"), "a: 1\n")?;
     fs::write(local.join("data/train.jsonl"), "{}\n")?;
+    fs::create_dir_all(local.join("ssh"))?;
+    fs::write(local.join("ssh/id_ed25519"), "private\n")?;
+    fs::write(local.join("pod.json"), "{}\n")?;
 
     let remote = format!("{}/r4", executor.workdir());
-    executor.upload(&local, &remote).await?;
+    let skip = ["ssh".to_string(), "pod.json".to_string()];
+    executor.upload(&local, &remote, &skip).await?;
     assert_eq!(
         fs::read_to_string(Path::new(&remote).join("data/train.jsonl"))?,
         "{}\n"
     );
+    assert!(Path::new(&remote).join("axolotl.yaml").is_file());
+    assert!(!Path::new(&remote).join("ssh").exists());
+    assert!(!Path::new(&remote).join("pod.json").exists());
+    let everything = format!("{}/r4-all", executor.workdir());
+    executor.upload(&local, &everything, &[]).await?;
+    assert!(Path::new(&everything).join("ssh/id_ed25519").is_file());
 
     fs::create_dir_all(Path::new(&remote).join("output/checkpoint-10"))?;
     fs::write(
@@ -301,7 +311,7 @@ async fn upload_and_download_copy_selected_trees() -> TestResult {
     assert!(!nothing.exists());
 
     // Same directory on both sides: nothing to copy.
-    executor.upload(Path::new(&remote), &remote).await?;
+    executor.upload(Path::new(&remote), &remote, &[]).await?;
     Ok(())
 }
 
@@ -335,7 +345,7 @@ async fn a_copy_into_its_own_source_is_refused() -> TestResult {
 
     let inside = local.join("nested/run");
     let refused = executor
-        .upload(&local, &inside.to_string_lossy())
+        .upload(&local, &inside.to_string_lossy(), &[])
         .await
         .err()
         .ok_or("a copy into its own source must be refused")?;
@@ -343,7 +353,7 @@ async fn a_copy_into_its_own_source_is_refused() -> TestResult {
     assert!(!local.join("nested").exists());
 
     let remote = format!("{}/r7", executor.workdir());
-    executor.upload(&local, &remote).await?;
+    executor.upload(&local, &remote, &[]).await?;
     let refused = executor
         .download(
             &remote,

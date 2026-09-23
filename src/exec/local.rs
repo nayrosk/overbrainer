@@ -12,9 +12,9 @@ use tokio::process::{Child, Command};
 
 use super::tar;
 use super::{
-    CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, JOB_LOG, JobCommand, JobId,
-    JobStatus, PID_FILE, Pid, cancel_script, check_secrets, job_script, parse_status,
-    status_script,
+    CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, FileDigest, JOB_LOG, JobCommand,
+    JobId, JobStatus, PID_FILE, Pid, cancel_script, check_secrets, job_script, local_manifest,
+    parse_status, status_script,
 };
 
 /// How often this process reaps its exited jobs while a status or cancel script runs.
@@ -206,9 +206,15 @@ impl Executor for LocalExecutor {
         &self.workdir
     }
 
-    async fn upload(&self, local: &Path, remote: &str) -> Result<(), ExecError> {
-        self.copy(local, Path::new(remote), &[".".to_string()], &[])
-            .await
+    async fn upload(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {
+        let entries = tar::upload_entries(local, skip)?;
+        if entries.is_empty() {
+            return fs::create_dir_all(remote).map_err(|source| ExecError::Io {
+                path: PathBuf::from(remote),
+                source,
+            });
+        }
+        self.copy(local, Path::new(remote), &entries, &[]).await
     }
 
     fn spawn(&self, job: &JobCommand) -> impl Future<Output = Result<JobId, ExecError>> + Send {
@@ -247,6 +253,22 @@ impl Executor for LocalExecutor {
             });
         }
         self.copy(from, local, entries, exclude).await
+    }
+
+    /// Computed here with the `sha2` crate, off the async runtime's threads, so a
+    /// local target needs no `sha256sum` (macOS has none).
+    async fn manifest(
+        &self,
+        remote: &str,
+        entries: &[String],
+        exclude: &[String],
+    ) -> Result<Vec<FileDigest>, ExecError> {
+        let dir = PathBuf::from(remote);
+        let entries = entries.to_vec();
+        let exclude = exclude.to_vec();
+        tokio::task::spawn_blocking(move || local_manifest(&dir, &entries, &exclude))
+            .await
+            .map_err(|error| ExecError::Protocol(format!("the manifest task failed: {error}")))?
     }
 }
 

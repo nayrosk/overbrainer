@@ -4,7 +4,7 @@ Distill knowledge from a large "parent" LLM into a smaller open-weights "child" 
 
 overbrainer generates questions on your topics with an LLM, collects answers (and reasoning) from a parent model, then fine-tunes a child model with Axolotl locally, over SSH or on Runpod, while showing live progress in a terminal UI.
 
-Status: early development. Available today: project setup, configuration checks, the data pipeline (subtopics, questions, answers, train/eval split), and fine-tuning with Axolotl on this machine or over SSH. Runpod and the terminal UI come next.
+Status: early development. Available today: project setup, configuration checks, the data pipeline (subtopics, questions, answers, train/eval split), and fine-tuning with Axolotl on this machine, over SSH or on a Runpod pod. The terminal UI comes next.
 
 ## Install
 
@@ -100,7 +100,9 @@ A missing file falls back to the built-in default.
 | `overbrainer train [--target NAME]` | Start a run and follow it until the job ends |
 | `overbrainer train attach RUN_ID` | Follow a run again, then retrieve its results |
 | `overbrainer train cancel RUN_ID` | Stop the job of a run and retrieve its artifacts |
-| `overbrainer runs ls` | List the runs: ID, state, target, creation time |
+| `overbrainer runs ls` | List the runs: ID, state, target, creation time, and the pod of a Runpod run |
+| `overbrainer pod ls` | List the Runpod pods overbrainer created, with their run |
+| `overbrainer pod rm RUN_ID [--force]` | Delete every pod of a run and wait until Runpod no longer shows them |
 
 A run gets an ID such as `20260922-143005-a1b2` and a directory `runs/<run-id>/` holding `axolotl.yaml`, copies of the train and eval files, the metrics plugin, `run.json` (target, job, state), and, once the job has ended, `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. Intermediate `checkpoint-*` directories stay on the target.
 
@@ -133,6 +135,45 @@ engine = "podman"              # docker (default) | podman
 - `docker` runtime: one container per run, named `overbrainer-<run-id>`, with all GPUs, the host IPC namespace and the run directory mounted at `/workspace/run`. The Hugging Face cache is `runs/.hf-cache` (local) or `<workdir>/.hf-cache` (SSH), shared by the runs of the target, so a base model is downloaded once. Docker needs the NVIDIA Container Toolkit (`--gpus all`); Podman needs its CDI specification (`--device nvidia.com/gpu=all`, generated with `nvidia-ctk cdi generate`). The default image is built for CUDA 13 and needs an NVIDIA driver from the 580 series or newer. With rootful Docker, the files the container writes are owned by root. Over SSH, if the remote machine kills user processes at logout (`KillUserProcesses=yes` without lingering, see the `native` bullet), the wrapper dies with the session while the container keeps running and holding the GPU; overbrainer then reports the run as failed. `overbrainer train cancel <run-id>` stops that container, whatever the run's recorded state, and `docker stop overbrainer-<run-id>` (or `podman stop overbrainer-<run-id>`) is the manual fallback.
 - `native` runtime: runs `<venv>/bin/axolotl` on the host. Over SSH, if systemd-logind kills user processes at logout (`KillUserProcesses=yes`), enable lingering for the SSH user (`loginctl enable-linger`) so the job survives the disconnection. The job's environment differs by target: on a local target it is overbrainer's own, without the `OVERBRAINER_*` and `VAULT_*` variables; over SSH it is whatever a non-interactive `sh -c` gets there, with no login shell and no `~/.bashrc`. A setup that a profile or a conda activation provides is not there over SSH: put it in the venv, or in the SSH server's environment.
 - SSH uses your `ssh` binary with `~/.ssh/config`, the agent and `known_hosts`; a host that is not already in `known_hosts` is refused. Files travel as `tar` streams over the connection, so the remote machine needs `tar`, `setsid` and `nohup` (any Linux distribution has them). overbrainer keeps one master connection open (OpenSSH `ControlMaster`); an `ssh` wrapper that kills background processes, such as a firejail profile, breaks it.
+
+### Runpod
+
+```toml
+[targets.gpu_cloud]
+kind = "runpod"
+gpu_types = ["NVIDIA GeForce RTX 4090", "NVIDIA RTX A6000", "NVIDIA A40"]  # tried in order
+max_hours = 6
+```
+
+A `runpod` target creates a pod for each run on Runpod's Secure Cloud, runs the job on it over SSH with the image's Axolotl, retrieves the results, then deletes the pod. It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), resolved only when a Runpod command runs, and `ssh-keygen` next to `ssh` on this machine.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `gpu_types` | required | Runpod GPU type IDs, tried in order until one can be placed. From the environment, one comma-separated value: `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES="NVIDIA GeForce RTX 4090,NVIDIA A40"`. |
+| `max_hours` | required | The pod's watchdog deletes the pod this long after it was created, whatever it is doing, at most 720. |
+| `gpu_count` | `1` | GPUs per pod. |
+| `image` | `axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1`, pinned by digest | Pod image (CUDA 13, driver 580 or newer). |
+| `venv` | `/workspace/axolotl-venv` | Virtual environment holding `bin/axolotl` on the pod. |
+| `container_disk_gb` | `50` | Container disk, at least 20. |
+| `boot_grace_minutes` | `30` | The watchdog deletes a pod whose job never started after this. |
+| `retrieve_grace_minutes` | `60` | The watchdog deletes a pod whose ended job was not retrieved after this. |
+| `data_center_ids` | any | Data centers the pod may be placed in, for example `["EU-RO-1"]`. |
+| `network_volume_id` | none | Network volume mounted at `/workspace/data`; runs and the Hugging Face cache then live on it. Needs exactly one `data_center_ids` entry, the volume's data center. overbrainer never deletes anything on it. |
+
+`gpu_type` became `gpu_types`: a configuration with the old key is rejected as `unknown field`.
+
+What happens to a pod:
+
+- Creation: before every create call, `runs/<run-id>/pod.json` records it, so a pod created by a client that dies right after is still found by `overbrainer pod ls` and `pod rm` (every pod carries its run ID in its environment). A GPU type Runpod reports as a capacity failure, or refuses with 403, makes overbrainer try the next one; 402 (no credits), 422, and any other 400 (overbrainer's own request is wrong) stop at once instead of repeating for every type. A create that gets no clear answer is not sent again blindly: overbrainer first looks for the pod by its run ID.
+- SSH: each run gets its own client key and its own pod host key in `runs/<run-id>/ssh/`. The pod's host key is generated here, sent in the create call's environment (which anyone holding the account API key can read) and pinned in `runs/<run-id>/ssh/known_hosts`; the image's own host keys are never trusted. overbrainer connects with `ssh -F runs/<run-id>/ssh/config`, which ignores `~/.ssh/config` and the agent. Neither `ssh/` nor `pod.json` is ever uploaded with the run directory. The pod is ready once SSH answers with that key, usually a few minutes after creation (the image is 8.5 GB); after 15 minutes it is deleted and the next GPU type tried.
+- The watchdog: the pod's command starts a small shell watchdog as its first process. At startup it checks that the pod's own Runpod key can read the pod, and overbrainer refuses to train (and deletes the pod) when it cannot. It then deletes the pod at `max_hours`, `boot_grace_minutes` after the pod started if no job ever did, `retrieve_grace_minutes` after the job ended if its results were not retrieved, and at once once overbrainer marks them retrieved. A bootstrap failure (for example sshd could not start) is deleted at once too, once the watchdog's own proof runs. Its log is `.pod/watchdog.log` in the run directory on the pod and the pod's Runpod logs.
+- The end: the results are downloaded and every file checked against the SHA-256 the pod computed for it (a successful run must also have something in `output/`); then the pod is deleted and overbrainer waits until Runpod no longer shows it. When the download fails or does not check out, the pod stays until the retrieve grace ends: `overbrainer train attach RUN_ID` retries.
+- Ctrl-C: before the job exists, the pod is deleted and the run fails as interrupted. Once the job runs, Ctrl-C only stops following it, as on any target; the pod keeps running and the watchdog bounds its cost.
+- `--keep-pod` keeps the pod with no time limit once its job exists: from then on neither overbrainer nor the watchdog deletes it for any reason, not even `max_hours`. Until then it is guarded like any other pod: a pod whose bootstrap failed is deleted at once, and one whose job never started is deleted after `boot_grace_minutes`. Once the job starts, `train` warns with its hourly rate; once the run ends, or is left running after Ctrl-C, it prints the `ssh -F ...` command that reaches it. Only `overbrainer pod rm RUN_ID` removes it.
+
+Every `train` on a Runpod target first lists the account's pods and warns about overbrainer pods that nothing will delete (their run ended, is a stray left by an ambiguous create, is not in `runs/`, or has no run marker); it never deletes them itself. A pod named like overbrainer's but without a usable run marker is not something `pod rm` can take: delete it from the Runpod console. `overbrainer pod rm RUN_ID` takes only a run ID, never a pod ID, and refuses to delete anything for a run absent from this project's `runs/` (another checkout may own it) or a run still starting its pod, unless `--force`. For a run in progress with a recorded pod, without `--force` it deletes every other pod of the run (strays, and any extra pod left by an ambiguous create), keeps the training pod, and still fails, naming what it kept and deleted; `--force` also deletes the training pod and marks the run failed. A run in progress whose pod is not recorded needs `--force` too, since any pod of the run could be the one training. `runs ls` shows each Runpod run's pod as `pod.json` last recorded it, with its rate or its estimated spend (rate times lifetime; Runpod bills per second, including the image pull).
+
+A custom `image` must keep an entrypoint that ends with `exec "$@"`, and provide `bash`, `sshd` (started with `service ssh`), `ssh-keygen`, `base64`, `curl`, `setsid`, `nohup`, `tar`, `find`, `sha256sum` and Axolotl in `venv`. Jobs on the pod start from `/etc/overbrainer/job.env`, which the pod writes with the image's `PATH`, its CUDA library path and `HF_HOME`, since an SSH session does not see the image's environment.
 
 ### The Hugging Face token
 

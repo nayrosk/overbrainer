@@ -20,6 +20,39 @@ pub(crate) fn create_args(dir: &str, entries: &[String], exclude: &[String]) -> 
     args
 }
 
+/// The entries of the local directory `dir` an upload sends: `.` (the whole
+/// directory) when nothing is skipped, otherwise every top-level name of `dir`
+/// but those in `skip`, sorted. Empty when nothing is left to send.
+///
+/// # Errors
+///
+/// Returns [`ExecError::Io`] when `dir` cannot be read, and
+/// [`ExecError::Command`] for a top-level name that is not UTF-8, which could
+/// not be passed to `tar` as is.
+pub(crate) fn upload_entries(dir: &Path, skip: &[String]) -> Result<Vec<String>, ExecError> {
+    let read = std::fs::read_dir(dir).map_err(io_error(dir))?;
+    if skip.is_empty() {
+        return Ok(vec![".".to_string()]);
+    }
+    let mut entries = Vec::new();
+    for entry in read {
+        let name = entry.map_err(io_error(dir))?.file_name();
+        let name = name.into_string().map_err(|name| ExecError::Command {
+            action: "upload",
+            message: format!(
+                "{} holds a name that is not UTF-8: {}",
+                dir.display(),
+                name.to_string_lossy()
+            ),
+        })?;
+        if !skip.contains(&name) {
+            entries.push(name);
+        }
+    }
+    entries.sort();
+    Ok(entries)
+}
+
 /// Starts a local `tar` writing `entries` of `dir` to its stdout.
 pub(crate) fn spawn_create(
     dir: &Path,
@@ -162,6 +195,23 @@ mod tests {
 
     fn exit(code: i32) -> std::process::ExitStatus {
         std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+
+    #[test]
+    fn an_upload_sends_everything_but_the_skipped_top_level_names() -> TestResult {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("ssh"))?;
+        fs::create_dir_all(dir.path().join("data/ssh"))?;
+        fs::write(dir.path().join("pod.json"), "{}")?;
+        fs::write(dir.path().join("run.json"), "{}")?;
+        let skip = ["ssh".to_string(), "pod.json".to_string()];
+        assert_eq!(upload_entries(dir.path(), &skip)?, vec!["data", "run.json"]);
+        assert_eq!(upload_entries(dir.path(), &[])?, vec!["."]);
+        assert!(matches!(
+            upload_entries(&dir.path().join("missing"), &skip),
+            Err(ExecError::Io { .. })
+        ));
+        Ok(())
     }
 
     #[test]

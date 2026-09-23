@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use overbrainer::dataset::{FinishReason, ReasoningKind};
-use overbrainer::llm::{CompletionRequest, LlmError, OpenAiClient, RetryPolicy, with_retry};
+use overbrainer::llm::{
+    CompletionRequest, LlmError, OpenAiClient, RetryPolicy, Retryable, with_retry,
+};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use wiremock::matchers::{body_partial_json, header, method, path};

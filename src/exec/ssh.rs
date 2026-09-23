@@ -10,9 +10,9 @@ use tokio::process::Child;
 
 use super::tar;
 use super::{
-    CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, JOB_LOG, JobCommand, JobId,
-    JobStatus, PID_FILE, Pid, cancel_script, check_secrets, job_script, parse_status, quote,
-    shell_path, status_script,
+    CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, FileDigest, JOB_LOG, JobCommand,
+    JobId, JobStatus, PID_FILE, Pid, cancel_script, check_secrets, job_script, manifest_script,
+    parse_manifest, parse_status, quote, shell_path, status_script,
 };
 
 /// Runs jobs on a remote Linux machine through the user's `ssh`: `~/.ssh/config`, the
@@ -87,6 +87,25 @@ impl SshExecutor {
         Ok(Self { session, workdir })
     }
 
+    /// Creates the empty file `path` on the target through a rename, so a reader
+    /// never sees it half made. A Runpod run writes its `.pod/retrieved` marker
+    /// with it; the parent directory must exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Command`] when the file cannot be created, and
+    /// [`ExecError::Ssh`] when the target cannot be reached.
+    pub async fn write_marker(&self, path: &str) -> Result<(), ExecError> {
+        let script = format!(
+            ": > {tmp} && mv -f {tmp} {path}",
+            tmp = quote(&format!("{path}.tmp")),
+            path = quote(path)
+        );
+        run(&self.session, &script, "write a marker")
+            .await
+            .map(drop)
+    }
+
     async fn start(&self, job: &JobCommand) -> Result<JobId, ExecError> {
         let launcher = launcher(job)?;
         let mut command = self.session.shell(launcher);
@@ -120,24 +139,25 @@ impl SshExecutor {
         })
     }
 
-    async fn send(&self, local: &Path, remote: &str) -> Result<(), ExecError> {
-        // Checked up front: a local `tar` that cannot even open the directory would
+    async fn send(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {
+        // Listed up front: a local `tar` that cannot even open the directory would
         // send an empty stream, and the remote `tar` complaining about that would hide
         // the real cause.
-        std::fs::read_dir(local).map_err(|source| ExecError::Io {
-            path: local.to_path_buf(),
-            source,
-        })?;
-        let mut command = self.session.shell(format!(
-            "mkdir -p -- {dir} && tar -C {dir} -xf -",
-            dir = quote(remote)
-        ));
+        let entries = tar::upload_entries(local, skip)?;
+        let dir = quote(remote);
+        if entries.is_empty() {
+            run(&self.session, &format!("mkdir -p -- {dir}"), "upload").await?;
+            return Ok(());
+        }
+        let mut command = self
+            .session
+            .shell(format!("mkdir -p -- {dir} && tar -C {dir} -xf -"));
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let mut child = command.spawn().await.map_err(ExecError::Ssh)?;
-        let create = tar::spawn_create(local, &[".".to_string()], &[])?;
+        let create = tar::spawn_create(local, &entries, &[])?;
         let (copied, errors, created) =
             transfer(create, child.stdin().take(), child.stderr().take()).await;
         let received = child.wait().await.map_err(ExecError::Ssh);
@@ -169,8 +189,8 @@ impl Executor for SshExecutor {
         &self.workdir
     }
 
-    async fn upload(&self, local: &Path, remote: &str) -> Result<(), ExecError> {
-        self.send(local, remote).await
+    async fn upload(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {
+        self.send(local, remote, skip).await
     }
 
     async fn spawn(&self, job: &JobCommand) -> Result<JobId, ExecError> {
@@ -205,6 +225,17 @@ impl Executor for SshExecutor {
         exclude: &[String],
     ) -> Result<(), ExecError> {
         self.fetch(remote, local, entries, exclude).await
+    }
+
+    async fn manifest(
+        &self,
+        remote: &str,
+        entries: &[String],
+        exclude: &[String],
+    ) -> Result<Vec<FileDigest>, ExecError> {
+        let script = manifest_script(remote, entries, exclude);
+        let output = run(&self.session, &script, "manifest").await?;
+        parse_manifest(&String::from_utf8_lossy(&output))
     }
 }
 

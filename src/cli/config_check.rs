@@ -5,7 +5,10 @@ use std::path::Path;
 use anyhow::Context;
 use secrecy::SecretString;
 
-use crate::config::{DEFAULT_IMAGE, DEFAULT_WORKDIR, Engine, EnvSource, Runtime, Settings, Target};
+use crate::config::{
+    DEFAULT_IMAGE, DEFAULT_RUNPOD_BASE_URL, DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV,
+    DEFAULT_WORKDIR, Engine, EnvSource, Runtime, Settings, Target,
+};
 
 /// Prints the resolved configuration with secrets masked. With `resolve`, also
 /// resolves every secret (testing Vault access) and fails on the first error.
@@ -95,6 +98,14 @@ fn describe(settings: &Settings) -> Vec<String> {
         "runpod.api_key = {}",
         masked(settings.runpod.api_key.as_ref())
     ));
+    lines.push(format!(
+        "runpod.base_url = {}",
+        settings
+            .runpod
+            .base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_RUNPOD_BASE_URL)
+    ));
     lines.push(format!("hf_token = {}", masked(settings.hf_token.as_ref())));
     lines
 }
@@ -123,13 +134,41 @@ fn target_summary(target: &Target) -> String {
             workdir.as_deref().unwrap_or(DEFAULT_WORKDIR),
             runtime_summary(*runtime, *engine, image.as_deref(), venv.as_deref())
         ),
-        Target::Runpod {
-            gpu_type,
-            gpu_count,
-            max_hours,
-            ..
-        } => format!("runpod {gpu_count}x {gpu_type}, max {max_hours}h"),
+        Target::Runpod { .. } => runpod_summary(target),
     }
+}
+
+/// A runpod target on one line, defaults applied.
+fn runpod_summary(target: &Target) -> String {
+    let Target::Runpod {
+        gpu_types,
+        gpu_count,
+        image,
+        venv,
+        container_disk_gb,
+        max_hours,
+        boot_grace_minutes,
+        retrieve_grace_minutes,
+        data_center_ids,
+        network_volume_id,
+    } = target
+    else {
+        return String::new();
+    };
+    let data_centers = if data_center_ids.is_empty() {
+        "any".to_string()
+    } else {
+        data_center_ids.join(", ")
+    };
+    format!(
+        "runpod {gpu_count}x [{}], max {max_hours}h, image {}, venv {}, disk {container_disk_gb} GB, \
+         boot grace {boot_grace_minutes} min, retrieve grace {retrieve_grace_minutes} min, \
+         data centers {data_centers}, network volume {}",
+        gpu_types.join(", "),
+        image.as_deref().unwrap_or(DEFAULT_RUNPOD_IMAGE),
+        venv.as_deref().unwrap_or(DEFAULT_RUNPOD_VENV),
+        network_volume_id.as_deref().unwrap_or("none"),
+    )
 }
 
 fn runtime_summary(

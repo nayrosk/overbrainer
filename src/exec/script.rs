@@ -21,7 +21,7 @@ pub fn quote(text: &str) -> String {
 /// forms in turn therefore works under every `sh` a target or a client runs, and
 /// keeps the exit code of a plain `kill`: zero when the group was signalled, non
 /// zero when it is gone. Both forms print nothing.
-const GROUP_SIGNAL: &str = "group_signal() { kill -s \"$1\" -- -\"$2\" 2>/dev/null || kill -s \"$1\" -\"$2\" 2>/dev/null; }\n";
+pub const GROUP_SIGNAL: &str = "group_signal() { kill -s \"$1\" -- -\"$2\" 2>/dev/null || kill -s \"$1\" -\"$2\" 2>/dev/null; }\n";
 
 /// Wraps the job's `script` so that it records its process ID first and its exit
 /// code last, in the current directory. Both are written through a rename, so a

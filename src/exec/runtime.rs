@@ -24,6 +24,11 @@ pub enum JobRuntime {
     Native {
         /// Virtual environment holding `bin/<tool>`.
         venv: Option<String>,
+        /// A POSIX shell file of `export` lines sourced before anything else, for a
+        /// target whose SSH sessions lack the environment the trainer needs (a
+        /// Runpod pod writes its image's `PATH` and CUDA libraries there). `None` on
+        /// local and SSH targets.
+        env_file: Option<String>,
     },
 }
 
@@ -69,7 +74,10 @@ impl JobRuntime {
                     engine: engine.unwrap_or(Engine::Docker),
                     image: image.clone().unwrap_or_else(|| DEFAULT_IMAGE.to_string()),
                 },
-                Runtime::Native => Self::Native { venv: venv.clone() },
+                Runtime::Native => Self::Native {
+                    venv: venv.clone(),
+                    env_file: None,
+                },
             }),
             Target::Runpod { .. } => None,
         }
@@ -99,7 +107,10 @@ impl JobRuntime {
                     }),
                 )
             },
-            Self::Native { venv } => (native_script(venv.as_deref(), &spec), None),
+            Self::Native { venv, env_file } => (
+                native_script(venv.as_deref(), env_file.as_deref(), &spec),
+                None,
+            ),
         };
         JobCommand {
             dir: spec.run_dir.to_string(),
@@ -162,21 +173,25 @@ fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>)
     )
 }
 
-fn native_script(venv: Option<&str>, spec: &JobSpec<'_>) -> String {
+fn native_script(venv: Option<&str>, env_file: Option<&str>, spec: &JobSpec<'_>) -> String {
     let resolve = |program: &str| match venv {
         Some(venv) => shell_path(&format!("{}/bin/{program}", venv.trim_end_matches('/'))),
         None => quote(program),
     };
-    let commands = chain(spec.commands, resolve);
-    if spec.env.is_empty() {
-        return commands;
+    let mut parts = Vec::new();
+    if let Some(env_file) = env_file {
+        parts.push(format!(". {}", shell_path(env_file)));
     }
-    let exports: Vec<String> = spec
-        .env
-        .iter()
-        .map(|(name, value)| export_word(name, value))
-        .collect();
-    format!("export {} && {commands}", exports.join(" "))
+    if !spec.env.is_empty() {
+        let exports: Vec<String> = spec
+            .env
+            .iter()
+            .map(|(name, value)| export_word(name, value))
+            .collect();
+        parts.push(format!("export {}", exports.join(" ")));
+    }
+    parts.push(chain(spec.commands, resolve));
+    parts.join(" && ")
 }
 
 /// One word passed to `export` for `name=value`. `PYTHONPATH` is prepended to the
@@ -287,6 +302,7 @@ mod tests {
         let env = [("PYTHONPATH".to_string(), "/w/r1/plugin".to_string())];
         let runtime = JobRuntime::Native {
             venv: Some("~/venvs/axo/".into()),
+            env_file: None,
         };
         let job = runtime.job(JobSpec {
             env: &env,
@@ -298,9 +314,12 @@ mod tests {
         );
         assert_eq!(job.container, None);
         assert_eq!(runtime.root("/w/r1"), "/w/r1");
-        let on_path = JobRuntime::Native { venv: None }
-            .job(spec(&commands[..1]))
-            .script;
+        let on_path = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        }
+        .job(spec(&commands[..1]))
+        .script;
         assert_eq!(on_path, "'axolotl' 'train' 'axolotl.yaml'");
     }
 
@@ -313,7 +332,11 @@ mod tests {
         }
         let commands = vec![vec!["true".to_string()]];
         let env = [("PYTHONPATH".to_string(), "/new".to_string())];
-        let job = JobRuntime::Native { venv: None }.job(JobSpec {
+        let job = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        }
+        .job(JobSpec {
             env: &env,
             ..spec(&commands)
         });
@@ -328,6 +351,47 @@ mod tests {
         let with_unset_inherited = run_probe(&probe, None)?;
         assert_eq!(with_unset_inherited, "/new");
 
+        Ok(())
+    }
+
+    #[test]
+    fn native_sources_the_env_file_first() {
+        let commands = commands();
+        let env = [("PYTHONPATH".to_string(), "/w/r1/plugin".to_string())];
+        let runtime = JobRuntime::Native {
+            venv: Some("/workspace/axolotl-venv".into()),
+            env_file: Some("/etc/overbrainer/job.env".into()),
+        };
+        let job = runtime.job(JobSpec {
+            env: &env,
+            ..spec(&commands[..1])
+        });
+        assert_eq!(
+            job.script,
+            ". '/etc/overbrainer/job.env' && export PYTHONPATH='/w/r1/plugin'\"${PYTHONPATH:+:$PYTHONPATH}\" && '/workspace/axolotl-venv/bin/axolotl' 'train' 'axolotl.yaml'"
+        );
+    }
+
+    #[test]
+    fn the_env_file_reaches_the_commands() -> Result<(), Box<dyn std::error::Error>> {
+        if !sh_available() {
+            eprintln!("skipped: sh is not installed");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let env_file = dir.path().join("job.env");
+        std::fs::write(
+            &env_file,
+            "export HF_HOME='/w/.hf-cache'\nexport ODD='it'\\''s a value'\n",
+        )?;
+        let commands = vec![vec!["true".to_string()]];
+        let job = JobRuntime::Native {
+            venv: None,
+            env_file: Some(env_file.to_string_lossy().into_owned()),
+        }
+        .job(spec(&commands));
+        let probe = format!("{} && printf '%s|%s' \"$HF_HOME\" \"$ODD\"", job.script);
+        assert_eq!(run_probe(&probe, None)?, "/w/.hf-cache|it's a value");
         Ok(())
     }
 

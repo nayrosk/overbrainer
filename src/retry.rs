@@ -1,10 +1,20 @@
+//! Retries with exponential backoff and jitter, shared by the HTTP clients (the LLM
+//! providers and the Runpod API).
+
 use std::future::Future;
 use std::time::Duration;
 
-use super::LlmError;
-
-/// Longest `Retry-After` honored. A provider asking for more is waited on this long.
+/// Longest `Retry-After` honored. A server asking for more is waited on this long.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+
+/// An error that may be worth trying again.
+pub trait Retryable {
+    /// Whether the failed operation is worth trying again.
+    fn is_retryable(&self) -> bool;
+
+    /// How long the server asked to wait before trying again, when it said so.
+    fn retry_after(&self) -> Option<Duration>;
+}
 
 /// Exponential backoff with jitter, honoring `Retry-After`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,15 +61,16 @@ impl RetryPolicy {
 /// # Errors
 ///
 /// Returns the last error when it is not retryable or when retries are exhausted.
-pub async fn with_retry<T, F, Fut, R>(
+pub async fn with_retry<T, E, F, Fut, R>(
     policy: &RetryPolicy,
     mut operation: F,
     mut on_retry: R,
-) -> Result<T, LlmError>
+) -> Result<T, E>
 where
+    E: Retryable,
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, LlmError>>,
-    R: FnMut(&LlmError, Duration),
+    Fut: Future<Output = Result<T, E>>,
+    R: FnMut(&E, Duration),
 {
     let mut attempt = 0;
     loop {
@@ -82,11 +93,19 @@ mod tests {
 
     use super::*;
 
-    fn status(status: u16) -> LlmError {
-        LlmError::Status {
-            status,
-            message: String::new(),
-            retry_after: None,
+    /// An error whose retryability the test chooses.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Failure {
+        retryable: bool,
+    }
+
+    impl Retryable for Failure {
+        fn is_retryable(&self) -> bool {
+            self.retryable
+        }
+
+        fn retry_after(&self) -> Option<Duration> {
+            None
         }
     }
 
@@ -120,19 +139,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn classification_of_errors() {
-        for code in [408, 429, 500, 503, 529] {
-            assert!(status(code).is_retryable(), "{code}");
-        }
-        for code in [400, 401, 403, 404] {
-            assert!(!status(code).is_retryable(), "{code}");
-        }
-        assert!(status(401).is_fatal_for_stage());
-        assert!(!status(400).is_fatal_for_stage());
-        assert!(!status(429).is_fatal_for_stage());
-    }
-
     fn fast(max_retries: u32) -> RetryPolicy {
         RetryPolicy {
             max_retries,
@@ -142,14 +148,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_retryable_errors_then_succeeds() -> Result<(), LlmError> {
+    async fn retries_retryable_errors_then_succeeds() -> Result<(), Failure> {
         let calls = AtomicU32::new(0);
         let mut retries = 0;
         let value = with_retry(
             &fast(3),
             || async {
                 if calls.fetch_add(1, Ordering::SeqCst) < 2 {
-                    Err(status(503))
+                    Err(Failure { retryable: true })
                 } else {
                     Ok(7)
                 }
@@ -170,12 +176,12 @@ mod tests {
             &fast(3),
             || async {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Err(status(400))
+                Err(Failure { retryable: false })
             },
             |_, _| {},
         )
         .await;
-        assert!(matches!(result, Err(LlmError::Status { status: 400, .. })));
+        assert_eq!(result, Err(Failure { retryable: false }));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -186,12 +192,12 @@ mod tests {
             &fast(2),
             || async {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Err(status(429))
+                Err(Failure { retryable: true })
             },
             |_, _| {},
         )
         .await;
-        assert!(matches!(result, Err(LlmError::Status { status: 429, .. })));
+        assert_eq!(result, Err(Failure { retryable: true }));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

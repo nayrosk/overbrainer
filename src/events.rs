@@ -8,6 +8,7 @@ use tokio::sync::broadcast;
 use crate::exec::JobStatus;
 use crate::llm::Usage;
 use crate::pricing::Price;
+use crate::runpod::PodStatus;
 use crate::train::TrainMetric;
 
 /// A pipeline stage.
@@ -69,7 +70,7 @@ impl StageStats {
     }
 }
 
-/// Something that happened in a stage or a training run. Pod events join in M4.
+/// Something that happened in a stage, a training run or its Runpod pod.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Event {
@@ -111,6 +112,8 @@ pub enum Event {
     Metric(TrainMetric),
     /// The training job is in a new state.
     JobStatus(JobStatus),
+    /// The Runpod pod of a run changed.
+    PodStatus(PodStatus),
 }
 
 /// Broadcast channel of [`Event`]s. Publishing never blocks and never fails: events
