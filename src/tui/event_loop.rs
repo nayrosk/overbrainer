@@ -2,7 +2,9 @@
 //! their messages, process signals and a clock tick, drawing the app when it
 //! changed. It owns the terminal and runs the effects the app asks for.
 
+use std::any::Any;
 use std::io::{self, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, SystemTime};
@@ -364,9 +366,25 @@ where
         self.last_draw.map_or_else(Instant::now, |at| at + FRAME)
     }
 
+    /// Draws `app` when it changed and the shortest time between two draws
+    /// passed. A panic while drawing is caught and returned as an error, as a
+    /// draw error is: the loop then ends and never draws again, and the tasks
+    /// are settled rather than dropped with the loop (a start never cut). The
+    /// owner thread's panic hook has restored the terminal by then.
     fn draw(&mut self, app: &mut App) -> anyhow::Result<()> {
         if app.dirty && !self.suspended && Instant::now() >= self.next_draw() {
-            self.terminal.draw(|frame| ui::render(frame, app))?;
+            let terminal = &mut *self.terminal;
+            let drawn = panic::catch_unwind(AssertUnwindSafe(|| {
+                terminal.draw(|frame| ui::render(frame, app)).map(drop)
+            }));
+            match drawn {
+                Ok(drawn) => drawn?,
+                Err(payload) => {
+                    let message = panic_message(payload.as_ref());
+                    tracing::error!("drawing the TUI panicked: {message}");
+                    anyhow::bail!("drawing the TUI panicked: {message}");
+                },
+            }
             app.dirty = false;
             self.last_draw = Some(Instant::now());
         }
@@ -479,6 +497,15 @@ impl Signals {
             _ = signals.hangup.recv() => {},
         }
     }
+}
+
+/// The message a panic carried, when it is text.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_string())
 }
 
 /// Waits for the editor to end; for ever without one.
@@ -645,12 +672,14 @@ mod tests {
         Ok(())
     }
 
-    /// A test backend that shares the text of its screen after each draw, and
-    /// whose draws fail once `fail` is set.
+    /// A test backend that shares the text of its screen after each draw,
+    /// whose draws fail once `fail` is set, and unwind, as a view that panics
+    /// would, once `unwind` is set.
     struct Shared {
         inner: TestBackend,
         frame: Arc<Mutex<String>>,
         fail: Arc<AtomicBool>,
+        unwind: Arc<AtomicBool>,
     }
 
     impl Shared {
@@ -659,6 +688,7 @@ mod tests {
                 inner: TestBackend::new(80, 24),
                 frame: Arc::new(Mutex::new(String::new())),
                 fail: Arc::new(AtomicBool::new(false)),
+                unwind: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -675,6 +705,9 @@ mod tests {
         where
             I: Iterator<Item = (u16, u16, &'a Cell)>,
         {
+            if self.unwind.load(Ordering::SeqCst) {
+                std::panic::resume_unwind(Box::new("a view failed"));
+            }
             if self.fail.load(Ordering::SeqCst) {
                 return Err(io::Error::other("the terminal is gone"));
             }
@@ -983,6 +1016,42 @@ mod tests {
         assert!(abandon.load(Ordering::SeqCst), "abandoned on the signal");
         assert!(app.training.tasks.is_empty());
         assert_eq!(app.exit, Some(Exit::Signal));
+        Ok(())
+    }
+
+    /// A panic while drawing ends the loop as a draw error does: the loop
+    /// never draws again, and a Runpod run still provisioning is waited for,
+    /// never dropped with the loop nor abandoned.
+    #[tokio::test]
+    async fn a_panic_while_drawing_ends_the_loop_as_a_draw_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let backend = Shared::new();
+        backend.unwind.store(true, Ordering::SeqCst);
+        let mut terminal = Terminal::new(backend)?;
+        let (_events, input) = mpsc::unbounded_channel();
+        let mut looping = Loop::new(&mut terminal, input, dir.path());
+        let mut app = provisioning_app(dir.path());
+        let release = tokio_util::sync::CancellationToken::new();
+        let abandon = looping.tasks.park(TaskId(4), release.clone());
+        let result = tokio::time::timeout(LIMIT, looping.run(&mut app)).await?;
+        let error = result.err().map(|error| format!("{error:#}"));
+        assert_eq!(
+            error.as_deref(),
+            Some("drawing the TUI panicked: a view failed")
+        );
+        let check = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let abandoned = abandon.load(Ordering::SeqCst);
+            release.cancel();
+            abandoned
+        };
+        let ((), abandoned) = tokio::time::timeout(LIMIT, async {
+            tokio::join!(looping.settle(&mut app), check)
+        })
+        .await?;
+        assert!(!abandoned);
+        assert!(app.training.tasks.is_empty(), "it was waited for");
         Ok(())
     }
 
