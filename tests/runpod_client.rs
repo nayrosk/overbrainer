@@ -2,6 +2,8 @@
 //! error messages without secrets, pagination.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use overbrainer::retry::RetryPolicy;
@@ -10,13 +12,39 @@ use overbrainer::runpod::{
 };
 use secrecy::SecretString;
 use serde_json::json;
-use wiremock::matchers::{body_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{body_json, header, method, path, query_param, query_param_is_missing};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const KEY: &str = "rp_test_key_5f1d";
 const HOST_KEY: &str = "b3BlbnNzaC1ob3N0LWtleQ";
+/// The exact and windowed redaction pass replaces 16-character pieces: any
+/// shorter fragment of a secret is not a claim this client makes.
+const REDACT_WINDOW: usize = 16;
+
+/// A realistic-looking base64 host key, `len` characters, deterministic so the
+/// test is reproducible.
+fn generated_host_key(len: usize) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut rng = fastrand::Rng::with_seed(1_234_567_890);
+    (0..len)
+        .map(|_| ALPHABET[rng.usize(0..ALPHABET.len())] as char)
+        .collect()
+}
+
+/// Asserts that `text` holds neither the whole of `key` nor any
+/// [`REDACT_WINDOW`]-character piece of it.
+fn assert_key_never_leaks(text: &str, key: &str) {
+    assert!(!text.contains(key), "full key leaked: {text}");
+    for start in 0..=(key.len() - REDACT_WINDOW) {
+        let piece = &key[start..start + REDACT_WINDOW];
+        assert!(
+            !text.contains(piece),
+            "key fragment `{piece}` leaked: {text}"
+        );
+    }
+}
 
 fn client(server: &MockServer) -> Result<RunpodClient, ApiError> {
     Ok(
@@ -122,6 +150,7 @@ async fn a_missing_pod_is_none_and_its_deletion_succeeds() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(path("/v2/pods/gone"))
         .respond_with(ResponseTemplate::new(404).set_body_json(json!({"title": "Not Found"})))
+        .expect(2)
         .mount(&server)
         .await;
     let client = client(&server)?;
@@ -138,11 +167,13 @@ async fn a_delete_is_retried_until_it_succeeds() -> TestResult {
         .and(path("/v2/pods/p1"))
         .respond_with(ResponseTemplate::new(500))
         .up_to_n_times(1)
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("DELETE"))
         .and(path("/v2/pods/p1"))
         .respond_with(ResponseTemplate::new(204))
+        .expect(1)
         .mount(&server)
         .await;
     client(&server)?.delete_pod(&PodId::new("p1")?).await?;
@@ -288,6 +319,213 @@ async fn a_create_is_retried_on_a_rate_limit_only() -> TestResult {
         server.received_requests().await.unwrap_or_default().len(),
         2
     );
+    Ok(())
+}
+
+async fn create_error_with_echoed_key(echoed: &str, key: &str) -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "title": "Unprocessable",
+            "detail": format!("host key rejected: {echoed}")
+        })))
+        .mount(&server)
+        .await;
+    let mut create = request();
+    create.env.host_key = SecretString::from(key.to_string());
+    let error = client(&server)?
+        .create_pod(&create)
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert_key_never_leaks(&format!("{error} {error:?}"), key);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_long_host_key_fully_echoed_never_leaks() -> TestResult {
+    let key = generated_host_key(400);
+    create_error_with_echoed_key(&key, &key).await
+}
+
+#[tokio::test]
+async fn a_long_host_key_echoed_only_at_its_start_never_leaks() -> TestResult {
+    let key = generated_host_key(400);
+    create_error_with_echoed_key(&key[..200], &key).await
+}
+
+#[tokio::test]
+async fn a_long_host_key_echoed_only_in_its_middle_never_leaks() -> TestResult {
+    let key = generated_host_key(400);
+    create_error_with_echoed_key(&key[150..250], &key).await
+}
+
+#[tokio::test]
+async fn a_decode_error_never_quotes_the_host_key_it_rejects() -> TestResult {
+    let server = MockServer::start().await;
+    let key = generated_host_key(400);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": key,
+            "status": "RUNNING"
+        })))
+        .mount(&server)
+        .await;
+    let mut create = request();
+    create.env.host_key = SecretString::from(key.clone());
+    let error = client(&server)?
+        .create_pod(&create)
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert!(matches!(error, ApiError::InvalidResponse(_)), "{error:?}");
+    assert_key_never_leaks(&format!("{error} {error:?}"), &key);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_repeated_pagination_cursor_is_an_error() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .and(query_param_is_missing("cursor"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "pods": [],
+            "pagination": {"hasNextPage": true, "nextCursor": "c2"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .and(query_param("cursor", "c2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "pods": [],
+            "pagination": {"hasNextPage": true, "nextCursor": "c2"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server)?.list_pods().await.err().ok_or("no error")?;
+    assert!(matches!(error, ApiError::InvalidResponse(_)), "{error:?}");
+    Ok(())
+}
+
+/// Always answers with another, never-repeating page, so `list_pods` can only
+/// stop by hitting its page cap.
+struct EndlessPager;
+
+impl Respond for EndlessPager {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let current: u64 = request
+            .url
+            .query_pairs()
+            .find(|(key, _)| key == "cursor")
+            .and_then(|(_, value)| value.parse().ok())
+            .unwrap_or(0);
+        ResponseTemplate::new(200).set_body_json(json!({
+            "pods": [],
+            "pagination": {"hasNextPage": true, "nextCursor": (current + 1).to_string()}
+        }))
+    }
+}
+
+#[tokio::test]
+async fn pagination_gives_up_after_its_page_cap() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(EndlessPager)
+        .mount(&server)
+        .await;
+    let error = client(&server)?.list_pods().await.err().ok_or("no error")?;
+    assert!(matches!(error, ApiError::InvalidResponse(_)), "{error:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_404_with_an_html_body_is_a_real_error_not_a_missing_pod() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("<html>not found</html>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server)?
+        .get_pod(&PodId::new("p1")?)
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert_eq!(error.status(), Some(404));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_404_with_an_empty_body_is_a_real_error_not_a_successful_delete() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server)?
+        .delete_pod(&PodId::new("p1")?)
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert_eq!(error.status(), Some(404));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_create_transport_failure_is_not_retried_and_is_ambiguous() -> TestResult {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let attempts = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&attempts);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    let broken = RunpodClient::new(&format!("http://{addr}/v2/"), &SecretString::from(KEY))?
+        .with_policy(RetryPolicy {
+            max_retries: 2,
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(2),
+        });
+    let error = broken
+        .create_pod(&request())
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert!(matches!(error, ApiError::Transport(_)), "{error:?}");
+    assert!(error.is_ambiguous());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_redirect_is_not_followed() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", "http://example.invalid/"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server)?
+        .get_pod(&PodId::new("p1")?)
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert_eq!(error.status(), Some(302));
     Ok(())
 }
 

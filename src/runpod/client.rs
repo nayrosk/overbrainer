@@ -1,6 +1,7 @@
 //! `RunpodClient`: the REST v2 calls overbrainer makes, with authentication,
 //! retries and error messages that never carry a secret.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER};
@@ -8,7 +9,7 @@ use reqwest::{Method, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 
-use super::types::{CreatePod, Pod, PodId, PodPage};
+use super::types::{CreatePod, Pagination, Pod, PodId, PodPage};
 use crate::retry::{RetryPolicy, Retryable, with_retry};
 
 /// `User-Agent` of every request. Runpod sits behind Cloudflare, which answers a
@@ -25,6 +26,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Pods asked for per page of `GET /pods`.
 const PAGE_SIZE: &str = "1000";
+/// Length of the substring windows checked against each secret, so a value
+/// Runpod echoes only in part still disappears.
+const REDACT_WINDOW: usize = 16;
+/// Shortest run of base64-alphabet characters treated as a secret in a create
+/// call's error body, regardless of whether it matches a known secret exactly.
+const MIN_BASE64_RUN: usize = 40;
+/// Pages of `GET /pods` followed before giving up: protects against a server
+/// whose pagination never reports `hasNextPage: false`.
+const MAX_PAGES: usize = 100;
 
 /// Errors of the Runpod API. No variant ever holds the API key or a pod's host
 /// key: messages built from an answer are cleaned of both.
@@ -94,6 +104,39 @@ impl Retryable for ApiError {
     }
 }
 
+/// What to do after fetching one page of `GET /pods`.
+#[derive(Debug)]
+enum NextPage {
+    /// No more pages follow.
+    Done,
+    /// The cursor of the next page, not seen before.
+    Cursor(String),
+}
+
+/// Decides what follows `pagination`, guarding against a cursor Runpod already
+/// sent: a page whose `nextCursor` repeats one already used would loop forever.
+fn next_page(
+    pagination: Option<Pagination>,
+    seen: &mut HashSet<String>,
+) -> Result<NextPage, ApiError> {
+    let Some(next) = pagination else {
+        return Ok(NextPage::Done);
+    };
+    if !next.has_next_page {
+        return Ok(NextPage::Done);
+    }
+    let Some(cursor) = next.next_cursor else {
+        return Ok(NextPage::Done);
+    };
+    if seen.insert(cursor.clone()) {
+        Ok(NextPage::Cursor(cursor))
+    } else {
+        Err(ApiError::InvalidResponse(format!(
+            "Runpod repeated the pagination cursor `{cursor}`"
+        )))
+    }
+}
+
 /// A client of the Runpod REST API (v2) with the account API key.
 #[derive(Debug, Clone)]
 pub struct RunpodClient {
@@ -106,6 +149,8 @@ pub struct RunpodClient {
 impl RunpodClient {
     /// A client of the API at `base_url` (for example `https://api.runpod.io/v2`)
     /// authenticated with `api_key`. `GET` and `DELETE` are retried 5 times.
+    /// Redirects are never followed: a redirected error surfaces as-is instead of
+    /// silently sending the API key to wherever Runpod points.
     ///
     /// # Errors
     ///
@@ -122,6 +167,7 @@ impl RunpodClient {
             .user_agent(USER_AGENT)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(ApiError::Client)?;
         Ok(Self {
@@ -147,13 +193,14 @@ impl RunpodClient {
 
     /// Creates a pod. Only a 429 is retried, after its `Retry-After`: Runpod turns
     /// a request away with it before processing it, so nothing was created. Any
-    /// other failure is returned at once; [`ApiError::is_ambiguous`] tells whether
-    /// the pod may exist anyway.
+    /// other failure, including a transport error or a timeout, is returned at
+    /// once; [`ApiError::is_ambiguous`] tells whether the pod may exist anyway.
     ///
     /// # Errors
     ///
     /// Returns an [`ApiError`] when the pod was not created or the answer cannot be
-    /// read. Its message never holds the request's host key nor the API key.
+    /// read. Its message never holds the request's host key nor the API key, even
+    /// truncated.
     pub async fn create_pod(&self, request: &CreatePod) -> Result<Pod, ApiError> {
         let secrets = [request.env.host_key.expose_secret()];
         let mut attempt = 0;
@@ -163,26 +210,27 @@ impl RunpodClient {
                 .post(self.url("pods"))
                 .json(request)
                 .timeout(CREATE_TIMEOUT);
-            match self.send(builder, &secrets).await {
-                Err(ApiError::Status {
-                    status: 429,
-                    retry_after,
-                    ..
-                }) if attempt < self.policy.max_retries => {
-                    let wait = self.policy.delay(attempt, retry_after, fastrand::f64());
-                    tracing::warn!(
-                        "Runpod is rate limiting pod creation; retrying in {}s",
-                        wait.as_secs()
-                    );
-                    tokio::time::sleep(wait).await;
-                    attempt += 1;
-                },
-                other => return decode(&other?),
+            let (status, body, retry_after) = self.fetch(builder).await?;
+            if status.is_success() {
+                return decode(&body, &self.hidden(&secrets), true);
             }
+            if status == StatusCode::TOO_MANY_REQUESTS && attempt < self.policy.max_retries {
+                let wait = self.policy.delay(attempt, retry_after, fastrand::f64());
+                tracing::warn!(
+                    "Runpod is rate limiting pod creation; retrying in {}s",
+                    wait.as_secs()
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+                continue;
+            }
+            return Err(self.status_error(status, &body, retry_after, &secrets));
         }
     }
 
-    /// The pod `id`, or `None` when Runpod does not know it (any more).
+    /// The pod `id`, or `None` when Runpod says so in its own error shape (a
+    /// `title`, `detail` or matching `status` field): a 404 with an unrelated
+    /// body, for example from a misconfigured base URL, is a real error instead.
     ///
     /// # Errors
     ///
@@ -192,54 +240,67 @@ impl RunpodClient {
         with_retry(
             &self.policy,
             || async {
-                match self.send(self.http.request(Method::GET, &url), &[]).await {
-                    Ok(body) => decode(&body).map(Some),
-                    Err(error) if error.status() == Some(404) => Ok(None),
-                    Err(error) => Err(error),
+                let (status, body, retry_after) =
+                    self.fetch(self.http.request(Method::GET, &url)).await?;
+                if status.is_success() {
+                    return decode(&body, &self.hidden(&[]), false).map(Some);
                 }
+                if status == StatusCode::NOT_FOUND && is_runpod_error_shape(status, &body) {
+                    return Ok(None);
+                }
+                Err(self.status_error(status, &body, retry_after, &[]))
             },
             log_retry,
         )
         .await
     }
 
-    /// Every pod of the account, following the pagination.
+    /// Every pod of the account, following the pagination up to [`MAX_PAGES`].
     ///
     /// # Errors
     ///
-    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
+    /// Returns an [`ApiError`] once retries are exhausted, on a fatal answer, when
+    /// a pagination cursor repeats, or when more than [`MAX_PAGES`] are followed.
     pub async fn list_pods(&self) -> Result<Vec<Pod>, ApiError> {
         let mut pods = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
-            let mut url = reqwest::Url::parse(&self.url("pods"))
-                .map_err(|error| ApiError::InvalidResponse(error.to_string()))?;
-            url.query_pairs_mut().append_pair("limit", PAGE_SIZE);
-            if let Some(cursor) = &cursor {
-                url.query_pairs_mut().append_pair("cursor", cursor);
-            }
-            let page: PodPage = with_retry(
-                &self.policy,
-                || async {
-                    let body = self
-                        .send(self.http.request(Method::GET, url.clone()), &[])
-                        .await?;
-                    decode(&body)
-                },
-                log_retry,
-            )
-            .await?;
+        let mut seen = HashSet::new();
+        for _ in 0..MAX_PAGES {
+            let page = self.list_page(cursor.as_deref()).await?;
             pods.extend(page.pods);
-            match page.pagination {
-                Some(next) if next.has_next_page && next.next_cursor.is_some() => {
-                    cursor = next.next_cursor;
-                },
-                _ => return Ok(pods),
+            match next_page(page.pagination, &mut seen)? {
+                NextPage::Done => return Ok(pods),
+                NextPage::Cursor(next) => cursor = Some(next),
             }
         }
+        Err(ApiError::InvalidResponse(format!(
+            "Runpod's pod list did not end after {MAX_PAGES} pages"
+        )))
     }
 
-    /// Deletes the pod `id`. A pod Runpod no longer knows counts as deleted.
+    /// One page of `GET /pods`, at `cursor` when given.
+    async fn list_page(&self, cursor: Option<&str>) -> Result<PodPage, ApiError> {
+        let mut url = reqwest::Url::parse(&self.url("pods"))
+            .map_err(|error| ApiError::InvalidResponse(error.to_string()))?;
+        url.query_pairs_mut().append_pair("limit", PAGE_SIZE);
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        with_retry(
+            &self.policy,
+            || async {
+                let body = self
+                    .send(self.http.request(Method::GET, url.clone()), &[])
+                    .await?;
+                decode(&body, &self.hidden(&[]), false)
+            },
+            log_retry,
+        )
+        .await
+    }
+
+    /// Deletes the pod `id`. A pod Runpod no longer knows, in its own error
+    /// shape, counts as deleted; a 404 with an unrelated body is a real error.
     ///
     /// # Errors
     ///
@@ -249,14 +310,15 @@ impl RunpodClient {
         with_retry(
             &self.policy,
             || async {
-                match self
-                    .send(self.http.request(Method::DELETE, &url), &[])
-                    .await
-                {
-                    Ok(_) => Ok(()),
-                    Err(error) if error.status() == Some(404) => Ok(()),
-                    Err(error) => Err(error),
+                let (status, body, retry_after) =
+                    self.fetch(self.http.request(Method::DELETE, &url)).await?;
+                if status.is_success() {
+                    return Ok(());
                 }
+                if status == StatusCode::NOT_FOUND && is_runpod_error_shape(status, &body) {
+                    return Ok(());
+                }
+                Err(self.status_error(status, &body, retry_after, &[]))
             },
             log_retry,
         )
@@ -267,27 +329,62 @@ impl RunpodClient {
         format!("{}/{path}", self.base_url)
     }
 
-    /// Sends `builder` and returns the body of a success answer. A failure's
-    /// message is cleaned of the API key and of every one of `secrets`.
+    /// `secrets` (the request's own, when it has any) together with the API key,
+    /// all of which must never appear in a message this client raises.
+    fn hidden<'a>(&'a self, secrets: &[&'a str]) -> Vec<&'a str> {
+        let mut hidden = vec![self.api_key.expose_secret()];
+        hidden.extend_from_slice(secrets);
+        hidden
+    }
+
+    /// Sends `builder` and returns its raw status, body and `Retry-After`. Only a
+    /// transport failure (connection, TLS, timeout) becomes an [`ApiError`] here:
+    /// a non-success HTTP status is returned as data, unredacted, so `get_pod` and
+    /// `delete_pod` can recognize Runpod's own "not found" shape before anyone
+    /// builds the client-facing, redacted error from it.
+    async fn fetch(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<(StatusCode, String, Option<Duration>), ApiError> {
+        let response = builder.send().await.map_err(ApiError::Transport)?;
+        let status = response.status();
+        let retry_after = retry_after(response.headers());
+        let body = response.text().await.map_err(ApiError::Transport)?;
+        Ok((status, body, retry_after))
+    }
+
+    /// Sends `builder` and returns the body of a success answer, or the client's
+    /// redacted [`ApiError::Status`] for a failure.
     async fn send(
         &self,
         builder: reqwest::RequestBuilder,
         secrets: &[&str],
     ) -> Result<String, ApiError> {
-        let response = builder.send().await.map_err(ApiError::Transport)?;
-        let status = response.status();
-        let retry_after = retry_after(response.headers());
-        let body = response.text().await.map_err(ApiError::Transport)?;
+        let (status, body, retry_after) = self.fetch(builder).await?;
         if status.is_success() {
             return Ok(body);
         }
-        let mut hidden = vec![self.api_key.expose_secret()];
-        hidden.extend_from_slice(secrets);
-        Err(ApiError::Status {
+        Err(self.status_error(status, &body, retry_after, secrets))
+    }
+
+    /// Builds the [`ApiError::Status`] a caller sees from a failed answer: `body`
+    /// is cleaned of every secret in `secrets` and the API key before any text is
+    /// extracted from it or truncated, so no truncation can ever leave a partial
+    /// secret in the message.
+    fn status_error(
+        &self,
+        status: StatusCode,
+        body: &str,
+        retry_after: Option<Duration>,
+        secrets: &[&str],
+    ) -> ApiError {
+        let hidden = self.hidden(secrets);
+        let cleaned = sanitize(body, &hidden, !secrets.is_empty());
+        ApiError::Status {
             status: status.as_u16(),
-            message: redact(&error_message(status, &body), &hidden),
+            message: error_message(status, &cleaned),
             retry_after,
-        })
+        }
     }
 }
 
@@ -295,9 +392,17 @@ fn log_retry(error: &ApiError, wait: Duration) {
     tracing::warn!("{error}; retrying in {}s", wait.as_secs());
 }
 
-/// Parses a success body. The serde error names what was wrong, never the body.
-fn decode<T: DeserializeOwned>(body: &str) -> Result<T, ApiError> {
-    serde_json::from_str(body).map_err(|error| ApiError::InvalidResponse(error.to_string()))
+/// Parses a success body. A parse failure's message can quote the offending
+/// value (a custom `Deserialize` does, for [`PodId`]), which may be a secret this
+/// call's body echoed back, so it is cleaned exactly like a failed answer's.
+fn decode<T: DeserializeOwned>(
+    body: &str,
+    hidden: &[&str],
+    strip_base64: bool,
+) -> Result<T, ApiError> {
+    serde_json::from_str(body).map_err(|error| {
+        ApiError::InvalidResponse(sanitize(&error.to_string(), hidden, strip_base64))
+    })
 }
 
 /// `Retry-After` in seconds. The HTTP-date form is ignored; backoff applies instead.
@@ -307,9 +412,26 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     Duration::try_from_secs_f64(seconds).ok()
 }
 
+/// Whether `body` looks like Runpod's own JSON error shape for `status` (a
+/// numeric `status` field matching the HTTP status, or a `title` or `detail`
+/// field), as opposed to an HTML page or an empty body a wrong base URL or an
+/// intermediary would produce for the same HTTP status.
+fn is_runpod_error_shape(status: StatusCode, body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let status_matches = object.get("status").and_then(serde_json::Value::as_u64)
+        == Some(u64::from(status.as_u16()));
+    status_matches || object.contains_key("title") || object.contains_key("detail")
+}
+
 /// What to say about a failed answer. A 401 never quotes Runpod; a 403 keeps a
 /// non-JSON body (Cloudflare's `error code: 1010` says what is wrong); anything
 /// else keeps the RFC 9457 `title`, `detail` and `errors[]`, or the body start.
+/// `body` must already be cleaned of secrets: this only extracts and truncates.
 fn error_message(status: StatusCode, body: &str) -> String {
     if status == StatusCode::UNAUTHORIZED {
         return "Runpod rejected the API key, check OVERBRAINER_RUNPOD__API_KEY".to_string();
@@ -354,12 +476,74 @@ fn cap(text: &str) -> String {
     text.chars().take(MAX_MESSAGE_CHARS).collect()
 }
 
-/// `text` with every non-empty one of `secrets` replaced by `***`.
+/// Cleans `text` of every secret in `hidden`; when `strip_base64` is set (the
+/// create call, whose failing body may echo the pod's host key, about 550 base64
+/// characters, in a form the exact and windowed passes of [`redact`] miss), also
+/// of any run of [`MIN_BASE64_RUN`] or more base64 characters. Order matters:
+/// this must run on the raw body before any text is extracted from it or capped,
+/// so a truncation can never leave a partial secret behind.
+fn sanitize(text: &str, hidden: &[&str], strip_base64: bool) -> String {
+    let cleaned = redact(text, hidden);
+    if strip_base64 {
+        redact_base64_runs(&cleaned)
+    } else {
+        cleaned
+    }
+}
+
+/// `text` with every non-empty one of `secrets` replaced by `***`: first every
+/// exact occurrence, then every [`REDACT_WINDOW`]-character piece of the secret
+/// at any offset, so a value Runpod echoes only in part still disappears.
 fn redact(text: &str, secrets: &[&str]) -> String {
     secrets
         .iter()
         .filter(|secret| !secret.is_empty())
-        .fold(text.to_string(), |text, secret| text.replace(secret, "***"))
+        .fold(text.to_string(), |text, secret| redact_one(&text, secret))
+}
+
+/// `redact`'s two passes for one `secret`.
+fn redact_one(text: &str, secret: &str) -> String {
+    let text = text.replace(secret, "***");
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() < REDACT_WINDOW {
+        return text;
+    }
+    (0..=chars.len() - REDACT_WINDOW).fold(text, |text, start| {
+        let window: String = chars[start..start + REDACT_WINDOW].iter().collect();
+        text.replace(&window, "***")
+    })
+}
+
+/// Replaces every run of [`MIN_BASE64_RUN`] or more base64-alphabet characters in
+/// `text` with `<redacted>`, regardless of whether it matches a known secret.
+fn redact_base64_runs(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut run = String::new();
+    for c in text.chars() {
+        if is_base64_char(c) {
+            run.push(c);
+        } else {
+            flush_base64_run(&mut result, &mut run);
+            result.push(c);
+        }
+    }
+    flush_base64_run(&mut result, &mut run);
+    result
+}
+
+/// Appends `run` to `result`, replaced by `<redacted>` when it reached
+/// [`MIN_BASE64_RUN`], then clears it.
+fn flush_base64_run(result: &mut String, run: &mut String) {
+    if run.chars().count() >= MIN_BASE64_RUN {
+        result.push_str("<redacted>");
+    } else {
+        result.push_str(run);
+    }
+    run.clear();
+}
+
+fn is_base64_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='
 }
 
 #[cfg(test)]
@@ -406,6 +590,117 @@ mod tests {
             redact("key k1 and host h1, k1 again", &["k1", "", "h1"]),
             "key *** and host ***, *** again"
         );
+    }
+
+    #[test]
+    fn windows_catch_a_partially_echoed_secret() {
+        let secret = "0123456789abcdefghijXYZ";
+        let piece = &secret[3..19];
+        assert_eq!(piece.len(), REDACT_WINDOW);
+        let text = format!("prefix {piece} suffix");
+        let cleaned = redact(&text, &[secret]);
+        assert!(!cleaned.contains(piece), "{cleaned}");
+        assert_eq!(cleaned, "prefix *** suffix");
+    }
+
+    #[test]
+    fn secrets_shorter_than_a_window_only_match_exactly() {
+        assert_eq!(redact("short s1 stays", &["s1"]), "short *** stays");
+    }
+
+    #[test]
+    fn long_base64_runs_are_redacted_regardless_of_a_known_secret() {
+        let run = "A".repeat(MIN_BASE64_RUN + 5);
+        let text = format!("prefix {run} suffix");
+        assert_eq!(redact_base64_runs(&text), "prefix <redacted> suffix");
+        let short = "B".repeat(MIN_BASE64_RUN - 1);
+        let text = format!("prefix {short} suffix");
+        assert_eq!(redact_base64_runs(&text), text);
+    }
+
+    #[test]
+    fn sanitize_orders_redaction_before_any_truncation_would_happen() {
+        let secret = "s".repeat(500);
+        let body = format!(r#"{{"detail": "bad key {secret}"}}"#);
+        let cleaned = sanitize(&body, &[&secret], true);
+        assert!(!cleaned.contains(&secret));
+        let message = error_message(StatusCode::BAD_REQUEST, &cleaned);
+        assert!(!message.contains(&secret[..REDACT_WINDOW]), "{message}");
+    }
+
+    #[test]
+    fn decode_errors_are_redacted() {
+        let secret = "topsecrethostkeyvalue1234567890";
+        let body = format!(r#"{{"id": "{secret}"}}"#);
+        let result: Result<PodId, ApiError> = decode(&body, &[secret], false);
+        let message = match result {
+            Err(ApiError::InvalidResponse(message)) => message,
+            Err(other) => other.to_string(),
+            Ok(_) => String::new(),
+        };
+        assert!(!message.is_empty(), "expected a decode error");
+        assert!(!message.contains(secret), "{message}");
+    }
+
+    #[test]
+    fn runpod_error_shape_recognition() {
+        assert!(is_runpod_error_shape(
+            StatusCode::NOT_FOUND,
+            r#"{"status": 404}"#
+        ));
+        assert!(is_runpod_error_shape(
+            StatusCode::NOT_FOUND,
+            r#"{"title": "Not Found"}"#
+        ));
+        assert!(is_runpod_error_shape(
+            StatusCode::NOT_FOUND,
+            r#"{"detail": "gone"}"#
+        ));
+        assert!(!is_runpod_error_shape(
+            StatusCode::NOT_FOUND,
+            "<html></html>"
+        ));
+        assert!(!is_runpod_error_shape(StatusCode::NOT_FOUND, ""));
+        assert!(!is_runpod_error_shape(
+            StatusCode::NOT_FOUND,
+            r#"{"status": 500}"#
+        ));
+        assert!(!is_runpod_error_shape(StatusCode::NOT_FOUND, "[1,2,3]"));
+    }
+
+    #[test]
+    fn next_page_detects_a_repeated_cursor() {
+        let mut seen = HashSet::new();
+        let page = Pagination {
+            has_next_page: true,
+            next_cursor: Some("c2".to_string()),
+        };
+        let first = next_page(Some(page.clone()), &mut seen);
+        assert!(matches!(first, Ok(NextPage::Cursor(ref c)) if c == "c2"));
+        let second = next_page(Some(page), &mut seen);
+        assert!(matches!(second, Err(ApiError::InvalidResponse(_))));
+    }
+
+    #[test]
+    fn next_page_stops_without_a_cursor_or_another_page() {
+        let mut seen = HashSet::new();
+        assert!(matches!(next_page(None, &mut seen), Ok(NextPage::Done)));
+        let no_more = Pagination {
+            has_next_page: false,
+            next_cursor: Some("c2".to_string()),
+        };
+        assert!(matches!(
+            next_page(Some(no_more), &mut seen),
+            Ok(NextPage::Done)
+        ));
+        let no_cursor = Pagination {
+            has_next_page: true,
+            next_cursor: None,
+        };
+        assert!(matches!(
+            next_page(Some(no_cursor), &mut seen),
+            Ok(NextPage::Done)
+        ));
     }
 
     #[test]
