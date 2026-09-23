@@ -138,7 +138,7 @@ async fn a_run_trains_merges_and_records_its_outcome() -> TestResult {
     };
     let training = fixture.settings.training.as_ref().ok_or("training")?;
     let trainer = Axolotl::new(training, &DataFiles::new(fixture.project()));
-    let created = create(&runs, &executor, "box")?;
+    let created = create(&runs, executor.workdir(), "box")?;
     assert_eq!(created.state, RunState::Preparing);
     let launch = Launch {
         runtime: &fixture.runtime,
@@ -155,6 +155,7 @@ async fn a_run_trains_merges_and_records_its_outcome() -> TestResult {
         "{:?}",
         outcome.record.message
     );
+    assert!(outcome.retrieved);
     assert_eq!(outcome.summary.step, 2);
     assert_eq!(outcome.summary.eval_loss, Some(1.25));
     let run = runs.run_dir(&outcome.record.id)?;
@@ -224,7 +225,13 @@ async fn run_to_end(mode: &str) -> Result<overbrainer::runs::Outcome, Box<dyn st
         runtime: &fixture.runtime,
         secrets: Vec::new(),
     };
-    let record = start(&ctx, &trainer, launch, create(&runs, &executor, "box")?).await?;
+    let record = start(
+        &ctx,
+        &trainer,
+        launch,
+        create(&runs, executor.workdir(), "box")?,
+    )
+    .await?;
     Ok(watch(&ctx, &trainer, record).await?)
 }
 
@@ -266,10 +273,17 @@ async fn a_running_job_can_be_cancelled() -> TestResult {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
     };
-    let record = start(&ctx, &trainer, launch, create(&runs, &executor, "box")?).await?;
+    let record = start(
+        &ctx,
+        &trainer,
+        launch,
+        create(&runs, executor.workdir(), "box")?,
+    )
+    .await?;
     let local_log = runs.run_dir(&record.id)?.join("job.log");
     assert!(!local_log.exists());
-    let (cancelled, status) = cancel(&runs, &executor, &trainer, record.clone()).await?;
+    let (cancelled, status, retrieved) = cancel(&runs, &executor, &trainer, record.clone()).await?;
+    assert!(retrieved);
     assert_eq!(status, JobStatus::Cancelled);
     assert_eq!(cancelled.state, RunState::Cancelled);
     assert_eq!(cancelled.message, None);
@@ -299,13 +313,20 @@ async fn cancelling_an_ended_job_leaves_the_run_running() -> TestResult {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
     };
-    let record = start(&ctx, &trainer, launch, create(&runs, &executor, "box")?).await?;
+    let record = start(
+        &ctx,
+        &trainer,
+        launch,
+        create(&runs, executor.workdir(), "box")?,
+    )
+    .await?;
     let job = record.job.clone().ok_or("no job")?;
     assert_eq!(
         wait_until_ended(&executor, &job).await?,
         JobStatus::Exited(0)
     );
-    let (unchanged, status) = cancel(&runs, &executor, &trainer, record.clone()).await?;
+    let (unchanged, status, retrieved) = cancel(&runs, &executor, &trainer, record.clone()).await?;
+    assert!(!retrieved);
     assert_eq!(status, JobStatus::Exited(0));
     assert_eq!(unchanged, record);
     assert_eq!(runs.load(&record.id)?.state, RunState::Running);
@@ -333,7 +354,13 @@ async fn a_run_whose_directory_vanished_records_why_nothing_was_retrieved() -> T
         runtime: &fixture.runtime,
         secrets: Vec::new(),
     };
-    let record = start(&ctx, &trainer, launch, create(&runs, &executor, "box")?).await?;
+    let record = start(
+        &ctx,
+        &trainer,
+        launch,
+        create(&runs, executor.workdir(), "box")?,
+    )
+    .await?;
     let job = record.job.clone().ok_or("no job")?;
     wait_until_ended(&executor, &job).await?;
     // On the local executor the remote run directory is the local one.
@@ -342,14 +369,16 @@ async fn a_run_whose_directory_vanished_records_why_nothing_was_retrieved() -> T
 
     let outcome = watch(&ctx, &trainer, record).await?;
     assert_eq!(outcome.record.state, RunState::Failed);
+    assert!(!outcome.retrieved);
     let message = outcome.record.message.clone().unwrap_or_default();
     assert!(
         message.contains("stopped without an exit code"),
         "{message}"
     );
+    // The manifest, taken before the download, is the first to find it gone.
     assert!(
         message.ends_with(" does not exist)")
-            && message.contains(" (artifacts not retrieved: download failed: "),
+            && message.contains(" (artifacts not retrieved: manifest failed: "),
         "{message}"
     );
     assert_eq!(runs.load(&outcome.record.id)?, outcome.record);
@@ -375,10 +404,15 @@ async fn a_start_without_data_is_recorded_as_failed() -> TestResult {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
     };
-    let error = start(&ctx, &trainer, launch, create(&runs, &executor, "box")?)
-        .await
-        .err()
-        .ok_or("start succeeded")?;
+    let error = start(
+        &ctx,
+        &trainer,
+        launch,
+        create(&runs, executor.workdir(), "box")?,
+    )
+    .await
+    .err()
+    .ok_or("start succeeded")?;
     assert!(
         error.to_string().contains("run `overbrainer split` first"),
         "{error}"

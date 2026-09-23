@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use secrecy::SecretString;
@@ -6,7 +6,8 @@ use secrecy::SecretString;
 use super::{MetricsSummary, RunRecord, RunState, Runs, RunsError, new_run_id, rfc3339};
 use crate::events::{Event, EventBus};
 use crate::exec::{
-    ExecError, Executor, JOB_LOG, JobId, JobRuntime, JobSpec, JobStatus, LineStream,
+    ExecError, Executor, FileDigest, JOB_LOG, JobId, JobRuntime, JobSpec, JobStatus, LineStream,
+    sha256_file,
 };
 use crate::train::{TrainError, Trainer};
 
@@ -19,6 +20,10 @@ pub const HF_CACHE_DIR: &str = ".hf-cache";
 /// poll loop starts the count again; the drain that follows the job's end spends
 /// what is left of it.
 const MAX_FAILURES: u32 = 5;
+
+/// Start of the note added to a run's message when its artifacts could not be
+/// retrieved.
+const NOT_RETRIEVED: &str = "artifacts not retrieved: ";
 
 /// Errors of the train, attach and cancel flows.
 #[derive(Debug, thiserror::Error)]
@@ -67,23 +72,24 @@ pub struct Outcome {
     pub record: RunRecord,
     /// What the metric lines add up to.
     pub summary: MetricsSummary,
+    /// Whether the artifacts and the job log were downloaded and each file checked
+    /// against the SHA-256 the target computed for it.
+    pub retrieved: bool,
 }
 
-/// Creates a run for `target` on `executor`: a new ID, and its record saved as
-/// `Preparing`.
+/// Creates a run for `target`, whose run directories live in `workdir` on the
+/// target: a new ID, and its record saved as `Preparing`. `workdir` is the
+/// executor's [`Executor::workdir`], or, for a target whose executor only exists
+/// later (a Runpod pod), the directory it will have.
 ///
 /// # Errors
 ///
 /// Returns [`RunsError`] when the record cannot be saved.
-pub fn create<E: Executor>(
-    runs: &Runs,
-    executor: &E,
-    target: &str,
-) -> Result<RunRecord, RunsError> {
+pub fn create(runs: &Runs, workdir: &str, target: &str) -> Result<RunRecord, RunsError> {
     let now = SystemTime::now();
     let id = new_run_id(now);
     let record = RunRecord {
-        remote_dir: format!("{}/{id}", executor.workdir()),
+        remote_dir: format!("{workdir}/{id}"),
         id,
         target: target.to_string(),
         created: rfc3339(now),
@@ -173,11 +179,17 @@ async fn launch_job<E: Executor, T: Trainer>(
 /// then retrieves the artifacts and saves the outcome. A run already ended is not
 /// followed again: its outcome comes from the local metrics file.
 ///
+/// Retrieving means taking the SHA-256 manifest of the files on the target,
+/// downloading them, and checking every local copy against it; a succeeded job
+/// must also have left at least one file in the trainer's required entry
+/// ([`Artifacts::required`](crate::train::Artifacts::required)).
+///
 /// When the artifacts cannot be retrieved, a run that would have succeeded is left
 /// `Running` and the error is returned, so a later attach tries again. A run that
 /// failed or was cancelled is saved in that state anyway, with
-/// `artifacts not retrieved: <error>` added to its message: there is nothing worth
-/// retrying for.
+/// `artifacts not retrieved: <error>` added to its message and
+/// [`Outcome::retrieved`] false: there is nothing worth retrying for, though
+/// [`collect`] can still fetch its files.
 ///
 /// # Errors
 ///
@@ -197,14 +209,21 @@ pub async fn watch<E: Executor, T: Trainer>(
     let local = ctx.runs.run_dir(&record.id)?;
     if record.state != RunState::Running {
         let summary = local_summary(&local.join(trainer.metrics_file()))?;
-        return Ok(Outcome { record, summary });
+        let retrieved = !artifacts_missing(&record);
+        return Ok(Outcome {
+            record,
+            summary,
+            retrieved,
+        });
     }
     let metrics = format!("{}/{}", record.remote_dir, trainer.metrics_file());
     let mut stream = ctx.executor.tail(&metrics, 0);
     let mut summary = MetricsSummary::default();
     let status = follow(ctx, &job, &mut stream, &mut summary).await?;
     let (state, message) = outcome(status, &summary, &record.id);
-    let downloaded = retrieve(ctx.executor, trainer, &record.remote_dir, &local).await;
+    let succeeded = state == RunState::Succeeded;
+    let downloaded = retrieve(ctx.executor, trainer, &record.remote_dir, &local, succeeded).await;
+    let retrieved = downloaded.is_ok();
     record.message = match downloaded {
         Ok(()) => message,
         Err(error) if state == RunState::Succeeded => return Err(error.into()),
@@ -212,30 +231,145 @@ pub async fn watch<E: Executor, T: Trainer>(
     };
     record.state = state;
     ctx.runs.save(&record)?;
-    Ok(Outcome { record, summary })
+    Ok(Outcome {
+        record,
+        summary,
+        retrieved,
+    })
 }
 
-/// Copies the trainer's artifacts and the job log from `remote` into `local`.
+/// Copies the trainer's artifacts and the job log from `remote` into `local`, then
+/// checks every copy against the SHA-256 manifest taken on the target before the
+/// download. When `succeeded`, the trainer's required entry must hold a file.
 async fn retrieve<E: Executor, T: Trainer>(
     executor: &E,
     trainer: &T,
     remote: &str,
     local: &Path,
+    succeeded: bool,
 ) -> Result<(), ExecError> {
     let artifacts = trainer.artifacts();
     let mut entries = artifacts.entries;
     entries.push(JOB_LOG.to_string());
+    let manifest = executor
+        .manifest(remote, &entries, &artifacts.exclude)
+        .await?;
+    if succeeded && let Some(required) = &artifacts.required {
+        check_required(&manifest, required)?;
+    }
     executor
         .download(remote, local, &entries, &artifacts.exclude)
+        .await?;
+    let local = local.to_path_buf();
+    tokio::task::spawn_blocking(move || verify(&local, &manifest))
         .await
+        .map_err(|error| ExecError::Protocol(format!("the verification task failed: {error}")))?
+}
+
+/// Fails unless `manifest` holds a file at or under `required`.
+fn check_required(manifest: &[FileDigest], required: &str) -> Result<(), ExecError> {
+    let inside = format!("{required}/");
+    if manifest
+        .iter()
+        .any(|file| file.path == required || file.path.starts_with(&inside))
+    {
+        Ok(())
+    } else {
+        Err(verify_error(format!(
+            "{required}/ holds no file on the target"
+        )))
+    }
+}
+
+/// Checks that every file of `manifest` exists under `local` with the SHA-256 the
+/// target computed for it.
+fn verify(local: &Path, manifest: &[FileDigest]) -> Result<(), ExecError> {
+    for file in manifest {
+        let path: PathBuf = local.join(&file.path);
+        let sha256 = match sha256_file(&path) {
+            Ok(sha256) => sha256,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(verify_error(format!("{} is missing locally", file.path)));
+            },
+            Err(source) => return Err(ExecError::Io { path, source }),
+        };
+        if sha256 != file.sha256 {
+            return Err(verify_error(format!(
+                "{} differs from the target (SHA-256 mismatch)",
+                file.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_error(message: String) -> ExecError {
+    ExecError::Command {
+        action: "verify",
+        message,
+    }
 }
 
 /// `message` with the reason the artifacts could not be retrieved added to it.
 fn not_retrieved(message: Option<String>, error: &ExecError) -> String {
     match message {
-        Some(message) => format!("{message} (artifacts not retrieved: {error})"),
-        None => format!("artifacts not retrieved: {error}"),
+        Some(message) => format!("{message} ({NOT_RETRIEVED}{error})"),
+        None => format!("{NOT_RETRIEVED}{error}"),
     }
+}
+
+/// Whether the record of an ended run says its artifacts were not retrieved.
+#[must_use]
+pub fn artifacts_missing(record: &RunRecord) -> bool {
+    record
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains(NOT_RETRIEVED))
+}
+
+/// `message` without the note [`not_retrieved`] added to it.
+fn without_note(message: Option<String>) -> Option<String> {
+    let message = message?;
+    if message.starts_with(NOT_RETRIEVED) {
+        return None;
+    }
+    match message.find(&format!(" ({NOT_RETRIEVED}")) {
+        Some(index) => Some(message[..index].to_string()),
+        None => Some(message),
+    }
+}
+
+/// Retrieves again the artifacts of a run already in a final state, whose target
+/// still holds its files: downloads them, checks them against the target's
+/// SHA-256 manifest, and on success removes the `artifacts not retrieved` note
+/// from the record's message and saves it. A failure to retrieve is logged and
+/// leaves the record as it was. Returns the record and whether the files were
+/// retrieved.
+///
+/// # Errors
+///
+/// Returns [`RunError::Runs`] when the run directory is invalid or the updated
+/// record cannot be saved.
+pub async fn collect<E: Executor, T: Trainer>(
+    ctx: &RunCtx<'_, E>,
+    trainer: &T,
+    mut record: RunRecord,
+) -> Result<(RunRecord, bool), RunError> {
+    let local = ctx.runs.run_dir(&record.id)?;
+    let succeeded = record.state == RunState::Succeeded;
+    if let Err(error) = retrieve(ctx.executor, trainer, &record.remote_dir, &local, succeeded).await
+    {
+        tracing::warn!(
+            "cannot retrieve the artifacts of run {}: {error}",
+            record.id
+        );
+        return Ok((record, false));
+    }
+    if artifacts_missing(&record) {
+        record.message = without_note(record.message.take());
+        ctx.runs.save(&record)?;
+    }
+    Ok((record, true))
 }
 
 /// Reads new metric lines and the job status until the job ends, then drains the
@@ -370,12 +504,13 @@ fn local_summary(path: &Path) -> Result<MetricsSummary, RunError> {
 ///
 /// Only when the job reads [`JobStatus::Cancelled`] is the record changed: it is
 /// saved as `Cancelled`, without a message, and the trainer's artifacts and the
-/// job log are then copied into the local run directory, since nobody may be
-/// watching the run to do it. That copy is best effort: when it fails, the failure
-/// is logged and the record stays `Cancelled` with
-/// `artifacts not retrieved: <error>` as its message. Saving that message is best
-/// effort too: `Cancelled` is already on disk, so a failure to save it is logged
-/// and the cancel still succeeds.
+/// job log are then copied into the local run directory and checked against the
+/// target's SHA-256 manifest, since nobody may be watching the run to do it. That
+/// copy is best effort: when it fails, the failure is logged and the record stays
+/// `Cancelled` with `artifacts not retrieved: <error>` as its message. Saving that
+/// message is best effort too: `Cancelled` is already on disk, so a failure to
+/// save it is logged and the cancel still succeeds. The returned flag says whether
+/// the files were retrieved and verified.
 ///
 /// A job that had already ended before the cancel is left alone by the target, so
 /// its status stays [`JobStatus::Exited`] or [`JobStatus::Lost`]; the record is
@@ -396,40 +531,42 @@ pub async fn cancel<E: Executor, T: Trainer>(
     executor: &E,
     trainer: &T,
     mut record: RunRecord,
-) -> Result<(RunRecord, JobStatus), RunError> {
+) -> Result<(RunRecord, JobStatus, bool), RunError> {
     let job = record
         .job
         .clone()
         .ok_or_else(|| RunError::NotStarted(record.id.clone()))?;
     executor.cancel(&job).await?;
     let status = executor.status(&job).await?;
+    let mut retrieved = false;
     if status == JobStatus::Cancelled {
         record.state = RunState::Cancelled;
         record.message = None;
         runs.save(&record)?;
-        retrieve_cancelled(runs, executor, trainer, &mut record).await?;
+        retrieved = retrieve_cancelled(runs, executor, trainer, &mut record).await?;
     }
-    Ok((record, status))
+    Ok((record, status, retrieved))
 }
 
 /// Copies the artifacts of the cancelled run `record`, best effort: a failure is
-/// logged and noted in its message, which is saved when possible.
+/// logged and noted in its message, which is saved when possible. Returns whether
+/// they were retrieved.
 async fn retrieve_cancelled<E: Executor, T: Trainer>(
     runs: &Runs,
     executor: &E,
     trainer: &T,
     record: &mut RunRecord,
-) -> Result<(), RunError> {
+) -> Result<bool, RunError> {
     let local = runs.run_dir(&record.id)?;
-    let Err(error) = retrieve(executor, trainer, &record.remote_dir, &local).await else {
-        return Ok(());
+    let Err(error) = retrieve(executor, trainer, &record.remote_dir, &local, false).await else {
+        return Ok(true);
     };
     cancelled_warning("retrieve the artifacts of", &record.id, &error);
     record.message = Some(not_retrieved(None, &error));
     if let Err(save_error) = runs.save(record) {
         cancelled_warning("note the missing artifacts of", &record.id, &save_error);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn cancelled_warning(what: &str, id: &str, error: &dyn std::fmt::Display) {
@@ -501,6 +638,8 @@ mod tests {
         failing_read: Option<u32>,
         /// A directory created when a download is asked for, before it fails.
         dir_on_download: Option<PathBuf>,
+        /// What the target's manifest lists.
+        manifest: Vec<FileDigest>,
         reads: AtomicU32,
         cancels: AtomicU32,
     }
@@ -514,6 +653,7 @@ mod tests {
                 download_fails: false,
                 failing_read: None,
                 dir_on_download: None,
+                manifest: Vec::new(),
                 reads: AtomicU32::new(0),
                 cancels: AtomicU32::new(0),
             }
@@ -616,7 +756,7 @@ mod tests {
             _entries: &[String],
             _exclude: &[String],
         ) -> impl Future<Output = Result<Vec<FileDigest>, ExecError>> + Send {
-            ready(Ok(Vec::new()))
+            ready(Ok(self.manifest.clone()))
         }
     }
 
@@ -643,6 +783,36 @@ mod tests {
             Artifacts {
                 entries: Vec::new(),
                 exclude: Vec::new(),
+                required: None,
+            }
+        }
+    }
+
+    /// A trainer whose successful runs must leave a file in `output/`.
+    struct WithOutput;
+
+    impl Trainer for WithOutput {
+        fn prepare(&self, _run_dir: &Path, _root: &str) -> Result<(), TrainError> {
+            Ok(())
+        }
+
+        fn commands(&self) -> Vec<Vec<String>> {
+            Vec::new()
+        }
+
+        fn env(&self, _root: &str) -> Vec<(String, String)> {
+            Vec::new()
+        }
+
+        fn metrics_file(&self) -> &'static str {
+            "metrics.jsonl"
+        }
+
+        fn artifacts(&self) -> Artifacts {
+            Artifacts {
+                entries: vec!["output".to_string()],
+                exclude: Vec::new(),
+                required: Some("output".to_string()),
             }
         }
     }
@@ -748,7 +918,7 @@ mod tests {
         let runs = Runs::new(project.path());
         let bus = EventBus::new();
         let fake = Fake::new(JobStatus::Running);
-        let created = create(&runs, &fake, "box")?;
+        let created = create(&runs, fake.workdir(), "box")?;
         break_saves(&runs, &created.id)?;
         let launch = Launch {
             runtime: &JobRuntime::Native {
@@ -773,7 +943,7 @@ mod tests {
             spawn_fails: true,
             ..Fake::new(JobStatus::Running)
         };
-        let created = create(&runs, &fake, "box")?;
+        let created = create(&runs, fake.workdir(), "box")?;
         break_saves(&runs, &created.id)?;
         let launch = Launch {
             runtime: &JobRuntime::Native {
@@ -808,7 +978,8 @@ mod tests {
         };
         let record = running()?;
         runs.save(&record)?;
-        let (cancelled, status) = cancel(&runs, &fake, &NoFiles, record).await?;
+        let (cancelled, status, retrieved) = cancel(&runs, &fake, &NoFiles, record).await?;
+        assert!(!retrieved);
         assert_eq!(status, JobStatus::Cancelled);
         assert_eq!(cancelled.state, RunState::Cancelled);
         assert_eq!(
@@ -832,7 +1003,8 @@ mod tests {
             dir_on_download: Some(runs.run_dir(RUN_ID)?.join(format!(".{RECORD_FILE}.tmp"))),
             ..Fake::new(JobStatus::Cancelled)
         };
-        let (cancelled, status) = cancel(&runs, &fake, &NoFiles, record).await?;
+        let (cancelled, status, retrieved) = cancel(&runs, &fake, &NoFiles, record).await?;
+        assert!(!retrieved);
         assert_eq!(status, JobStatus::Cancelled);
         assert_eq!(cancelled.state, RunState::Cancelled);
         assert!(
@@ -868,5 +1040,150 @@ mod tests {
         }
         assert_eq!(statuses, vec![JobStatus::Exited(0)]);
         Ok(())
+    }
+
+    /// SHA-256 of `b"w"`.
+    const W: &str = "50e721e49c013f00c62cf59f2163542a9d8df02464efeb615d31051b0fddc326";
+
+    fn listed(path: &str) -> FileDigest {
+        FileDigest {
+            path: path.to_string(),
+            sha256: W.to_string(),
+        }
+    }
+
+    /// Writes `content` at `path` inside the local run directory, as a download
+    /// would have.
+    fn downloaded(
+        runs: &Runs,
+        path: &str,
+        content: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = runs.run_dir(RUN_ID)?.join(path);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(file, content)?;
+        Ok(())
+    }
+
+    async fn watch_with(
+        manifest: Vec<FileDigest>,
+        files: &[(&str, &str)],
+    ) -> Result<(Runs, tempfile::TempDir, Result<Outcome, RunError>), Box<dyn std::error::Error>>
+    {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            manifest,
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        runs.save(&running()?)?;
+        for (path, content) in files {
+            downloaded(&runs, path, content)?;
+        }
+        let result = watch(&ctx(&runs, &fake, &bus), &WithOutput, running()?).await;
+        Ok((runs, project, result))
+    }
+
+    #[tokio::test]
+    async fn verified_files_make_a_retrieved_success() -> Result<(), Box<dyn std::error::Error>> {
+        let (_, _project, result) = watch_with(
+            vec![listed("output/adapter.bin"), listed("job.log")],
+            &[("output/adapter.bin", "w"), ("job.log", "w")],
+        )
+        .await?;
+        let outcome = result?;
+        assert_eq!(outcome.record.state, RunState::Succeeded);
+        assert!(outcome.retrieved);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_different_file_leaves_a_success_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                &[("job.log", "w")][..],
+                "verify failed: output/adapter.bin is missing locally",
+            ),
+            (
+                &[("output/adapter.bin", "x"), ("job.log", "w")][..],
+                "verify failed: output/adapter.bin differs from the target (SHA-256 mismatch)",
+            ),
+        ];
+        for (files, expected) in cases {
+            let (runs, _project, result) =
+                watch_with(vec![listed("output/adapter.bin"), listed("job.log")], files).await?;
+            let error = result.err().ok_or("the watch succeeded")?;
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(runs.load(RUN_ID)?.state, RunState::Running);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_success_without_output_is_not_retrieved() -> Result<(), Box<dyn std::error::Error>> {
+        let (_, _project, result) =
+            watch_with(vec![listed("job.log")], &[("job.log", "w")]).await?;
+        let error = result.err().ok_or("the watch succeeded")?;
+        assert_eq!(
+            error.to_string(),
+            "verify failed: output/ holds no file on the target"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collect_retrieves_again_and_clears_the_note() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let mut record = running()?;
+        record.state = RunState::Failed;
+        record.message = Some(
+            "the job exited with code 2 (artifacts not retrieved: download failed: reset)"
+                .to_string(),
+        );
+        runs.save(&record)?;
+        let broken = Fake {
+            download_fails: true,
+            ..Fake::new(JobStatus::Exited(2))
+        };
+        let (kept, retrieved) = collect(&ctx(&runs, &broken, &bus), &NoFiles, record).await?;
+        assert!(!retrieved);
+        assert!(artifacts_missing(&kept));
+        let fake = Fake {
+            manifest: vec![listed("job.log")],
+            ..Fake::new(JobStatus::Exited(2))
+        };
+        downloaded(&runs, "job.log", "w")?;
+        let (collected, retrieved) = collect(&ctx(&runs, &fake, &bus), &NoFiles, kept).await?;
+        assert!(retrieved);
+        assert_eq!(
+            collected.message.as_deref(),
+            Some("the job exited with code 2")
+        );
+        assert_eq!(runs.load(RUN_ID)?, collected);
+        Ok(())
+    }
+
+    #[test]
+    fn the_note_is_removed_from_either_form_of_message() {
+        assert_eq!(
+            without_note(Some("artifacts not retrieved: x".to_string())),
+            None
+        );
+        assert_eq!(
+            without_note(Some("boom (artifacts not retrieved: x)".to_string())),
+            Some("boom".to_string())
+        );
+        assert_eq!(
+            without_note(Some("boom".to_string())),
+            Some("boom".to_string())
+        );
+        assert_eq!(without_note(None), None);
     }
 }

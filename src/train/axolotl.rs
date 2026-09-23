@@ -222,6 +222,7 @@ impl Trainer for Axolotl<'_> {
         Artifacts {
             entries: vec![OUTPUT_DIR.into(), METRICS_FILE.into()],
             exclude: vec!["checkpoint-*".into()],
+            required: Some(OUTPUT_DIR.into()),
         }
     }
 }

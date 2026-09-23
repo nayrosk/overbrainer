@@ -14,7 +14,7 @@ use super::{TrainArgs, TrainCommand};
 use crate::config::{DEFAULT_WORKDIR, EnvSource, Settings, Target, Training};
 use crate::dataset::DataFiles;
 use crate::events::EventBus;
-use crate::exec::{AnyExecutor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
+use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
 use crate::runs::{
     Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, cancel, create, start, watch,
 };
@@ -79,7 +79,7 @@ async fn train(
     // Caught from before the run exists, so Ctrl-C never kills the process while
     // its job is being started and not yet recorded.
     let mut interrupt = Interrupt::catch();
-    let record = create(&runs, &executor, name)?;
+    let record = create(&runs, executor.workdir(), name)?;
     started(&record);
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let id = record.id.clone();
@@ -166,7 +166,7 @@ async fn cancel_run(project_dir: &Path, run_id: &str) -> anyhow::Result<()> {
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     // Cancelling is never interrupted: dropping it between the `cancelling` marker
     // and the signal would leave that marker on the target for ever.
-    let (record, status) = Interrupt::catch()
+    let (record, status, _) = Interrupt::catch()
         .shield(cancel(&runs, &executor, &trainer, record))
         .await?;
     if status != JobStatus::Cancelled {

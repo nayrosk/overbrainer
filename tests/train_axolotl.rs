@@ -187,6 +187,7 @@ fn commands_env_and_artifacts() -> TestResult {
         Artifacts {
             entries: vec!["output".into(), "metrics.jsonl".into()],
             exclude: vec!["checkpoint-*".into()],
+            required: Some("output".into()),
         }
     );
     Ok(())

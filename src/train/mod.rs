@@ -52,6 +52,10 @@ pub struct Artifacts {
     pub entries: Vec<String>,
     /// Name patterns left out, at any depth (`tar --exclude`).
     pub exclude: Vec<String>,
+    /// The entry that must hold at least one file once the job has succeeded (the
+    /// trained model), if any. A successful run whose target has nothing there is
+    /// not considered retrieved.
+    pub required: Option<String>,
 }
 
 /// A fine-tuning framework: what a run needs on the target, and how to start it.
