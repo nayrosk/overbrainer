@@ -10,6 +10,7 @@ use crate::exec::{
     ExecError, Executor, FileDigest, JOB_LOG, JobId, JobRuntime, JobSpec, JobStatus, LineStream,
     local_manifest,
 };
+use crate::runpod::{POD_FILE, SSH_DIR};
 use crate::train::{TrainError, Trainer};
 
 /// Hugging Face cache on the target, under the executor's work directory. Shared
@@ -177,7 +178,12 @@ async fn launch_job<E: Executor, T: Trainer>(
     let local = ctx.runs.run_dir(&record.id)?;
     let root = launch.runtime.root(&record.remote_dir);
     trainer.prepare(&local, &root)?;
-    ctx.executor.upload(&local, &record.remote_dir).await?;
+    // A Runpod run's private SSH keys and pod record never leave this machine:
+    // on a network volume, what the pod receives outlives the pod.
+    let local_only = [SSH_DIR.to_string(), POD_FILE.to_string()];
+    ctx.executor
+        .upload(&local, &record.remote_dir, &local_only)
+        .await?;
     let cache_dir = format!("{}/{HF_CACHE_DIR}", ctx.executor.workdir());
     let job = launch.runtime.job(JobSpec {
         run_id: &record.id,
@@ -760,6 +766,7 @@ mod tests {
             &self,
             _local: &Path,
             _remote: &str,
+            _skip: &[String],
         ) -> impl Future<Output = Result<(), ExecError>> + Send {
             ready(Ok(()))
         }

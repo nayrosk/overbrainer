@@ -224,7 +224,9 @@ pub trait Executor: Send + Sync {
     /// Directory holding the run directories on the target, absolute.
     fn workdir(&self) -> &str;
 
-    /// Copies the content of the local directory `local` into `remote`, creating it.
+    /// Copies the content of the local directory `local` into `remote`, creating it,
+    /// except the top-level entries of `local` named in `skip`, which never leave
+    /// this machine.
     ///
     /// # Errors
     ///
@@ -233,6 +235,7 @@ pub trait Executor: Send + Sync {
         &self,
         local: &Path,
         remote: &str,
+        skip: &[String],
     ) -> impl Future<Output = Result<(), ExecError>> + Send;
 
     /// Starts `job` in the background and returns its handle. The job keeps running
@@ -365,10 +368,10 @@ impl Executor for AnyExecutor {
         }
     }
 
-    async fn upload(&self, local: &Path, remote: &str) -> Result<(), ExecError> {
+    async fn upload(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {
         match self {
-            Self::Local(executor) => executor.upload(local, remote).await,
-            Self::Ssh(executor) => executor.upload(local, remote).await,
+            Self::Local(executor) => executor.upload(local, remote, skip).await,
+            Self::Ssh(executor) => executor.upload(local, remote, skip).await,
         }
     }
 

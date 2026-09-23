@@ -206,9 +206,15 @@ impl Executor for LocalExecutor {
         &self.workdir
     }
 
-    async fn upload(&self, local: &Path, remote: &str) -> Result<(), ExecError> {
-        self.copy(local, Path::new(remote), &[".".to_string()], &[])
-            .await
+    async fn upload(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {
+        let entries = tar::upload_entries(local, skip)?;
+        if entries.is_empty() {
+            return fs::create_dir_all(remote).map_err(|source| ExecError::Io {
+                path: PathBuf::from(remote),
+                source,
+            });
+        }
+        self.copy(local, Path::new(remote), &entries, &[]).await
     }
 
     fn spawn(&self, job: &JobCommand) -> impl Future<Output = Result<JobId, ExecError>> + Send {

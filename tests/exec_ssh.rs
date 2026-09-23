@@ -294,11 +294,36 @@ async fn upload_and_download_move_trees_through_tar() -> TestResult {
     let local = tempfile::tempdir()?;
     fs::create_dir_all(local.path().join("up/data"))?;
     fs::write(local.path().join("up/data/train.jsonl"), "{}\n")?;
+    fs::create_dir_all(local.path().join("up/ssh"))?;
+    fs::write(local.path().join("up/ssh/id_ed25519"), "private\n")?;
+    fs::write(local.path().join("up/pod.json"), "{}\n")?;
     let remote = format!("{}/r3", executor.workdir());
-    executor.upload(&local.path().join("up"), &remote).await?;
+    let skip = ["ssh".to_string(), "pod.json".to_string()];
+    executor
+        .upload(&local.path().join("up"), &remote, &skip)
+        .await?;
     assert_eq!(
         read(&executor, &format!("{remote}/data/train.jsonl")).await?,
         "{}\n"
+    );
+    let skipped = executor
+        .spawn(&job(remote.clone(), "test ! -e ssh && test ! -e pod.json"))
+        .await?;
+    assert_eq!(
+        wait_finished(&executor, &skipped).await?,
+        JobStatus::Exited(0),
+        "the skipped entries reached the target"
+    );
+    let empty = tempfile::tempdir()?;
+    fs::write(empty.path().join("pod.json"), "{}\n")?;
+    let bare = format!("{}/r3-bare", executor.workdir());
+    executor.upload(empty.path(), &bare, &skip).await?;
+    let made_bare = executor
+        .spawn(&job(bare.clone(), "test ! -e pod.json"))
+        .await?;
+    assert_eq!(
+        wait_finished(&executor, &made_bare).await?,
+        JobStatus::Exited(0)
     );
 
     let made = executor

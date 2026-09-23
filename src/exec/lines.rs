@@ -148,6 +148,7 @@ mod tests {
             &self,
             _local: &Path,
             _remote: &str,
+            _skip: &[String],
         ) -> impl Future<Output = Result<(), ExecError>> + Send {
             std::future::ready(Ok(()))
         }

@@ -295,6 +295,44 @@ async fn a_running_job_can_be_cancelled() -> TestResult {
     Ok(())
 }
 
+/// The run's private SSH keys and its pod record never leave this machine: a
+/// Runpod run's directory holds them, and whatever reaches the pod may outlive
+/// it on a network volume. The local executor stands in for the pod.
+#[tokio::test]
+async fn the_run_keys_and_the_pod_record_are_never_uploaded() -> TestResult {
+    let fixture = Fixture::new("slow")?;
+    let runs = Runs::new(fixture.project());
+    let workdir = tempfile::tempdir()?;
+    let executor = LocalExecutor::new(workdir.path())?;
+    let bus = EventBus::new();
+    let ctx = RunCtx {
+        runs: &runs,
+        executor: &executor,
+        bus: &bus,
+        poll: Duration::from_millis(50),
+    };
+    let training = fixture.settings.training.as_ref().ok_or("training")?;
+    let trainer = Axolotl::new(training, &DataFiles::new(fixture.project()));
+    let launch = Launch {
+        runtime: &fixture.runtime,
+        secrets: Vec::new(),
+    };
+    let created = create(&runs, executor.workdir(), "box")?;
+    let local = runs.run_dir(&created.id)?;
+    fs::create_dir_all(local.join("ssh"))?;
+    fs::write(local.join("ssh/id_ed25519"), "private key")?;
+    fs::write(local.join("pod.json"), "{}")?;
+    let record = start(&ctx, &trainer, launch, created).await?;
+    let remote = Path::new(&record.remote_dir);
+    assert!(remote.join("run.json").is_file(), "nothing was uploaded");
+    assert!(!remote.join("ssh").exists(), "the keys were uploaded");
+    assert!(!remote.join("pod.json").exists(), "pod.json was uploaded");
+    assert!(local.join("ssh/id_ed25519").is_file());
+    assert!(local.join("pod.json").is_file());
+    cancel(&runs, &executor, &trainer, record).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn cancelling_an_ended_job_leaves_the_run_running() -> TestResult {
     let fixture = Fixture::new("silent")?;
