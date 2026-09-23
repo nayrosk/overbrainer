@@ -169,9 +169,9 @@ fn next_page(
     if seen.insert(cursor.clone()) {
         Ok(NextPage::Cursor(cursor))
     } else {
-        Err(ApiError::InvalidResponse(format!(
-            "Runpod repeated the pagination cursor `{cursor}`"
-        )))
+        Err(ApiError::InvalidResponse(
+            "Runpod repeated a pagination cursor".to_string(),
+        ))
     }
 }
 
