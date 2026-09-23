@@ -99,6 +99,7 @@ async fn train(
     let mut interrupt = front.interrupt();
     let record = create(&runs, executor.workdir(), name)?;
     started(&record);
+    front.run_created(&record.id);
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let id = record.id.clone();
     let guard = front.open_bus();

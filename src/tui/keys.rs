@@ -42,6 +42,12 @@ const DATASET: &[KeyHelp] = &[
     row("y, n Esc", "in a dialog: confirm, cancel (default: no)"),
 ];
 
+const TRAINING: &[KeyHelp] = &[
+    row("k j, Up Down", "select a run"),
+    row("a", "attach: follow the selected run again"),
+    row("c", "cancel the selected run's job (asks first)"),
+];
+
 const LOGS: &[KeyHelp] = &[
     row("k j, Up Down, PgUp PgDn", "scroll"),
     row("G, End", "follow the newest lines"),
@@ -52,8 +58,9 @@ const LOGS: &[KeyHelp] = &[
 pub(super) fn of(view: View) -> &'static [KeyHelp] {
     match view {
         View::Dataset => DATASET,
+        View::Training => TRAINING,
         View::Logs => LOGS,
-        View::Pipeline | View::Training => &[],
+        View::Pipeline => &[],
     }
 }
 

@@ -15,6 +15,7 @@ use super::editor::{self, Session, Target};
 use super::pipeline::{PipelineView, STAGES, command_name};
 use super::tasks::{Done, Edit, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
+use super::training::TrainingView;
 use crate::cli::data::Command;
 use crate::cli::front::Report;
 use crate::config::Settings;
@@ -68,8 +69,10 @@ impl Project {
 pub(super) enum Effect {
     /// Start a background task.
     Spawn(TaskId, Task),
-    /// Cancel the token of a task: a pipeline stops.
+    /// Cancel the token of a task: a pipeline stops, a training detaches.
     Cancel(TaskId),
+    /// Set the abandon flag of a training task and cancel its token.
+    Abandon(TaskId),
     /// Hand the terminal to the editor `command`, on the file `path`.
     OpenEditor {
         /// The program and its arguments.
@@ -190,6 +193,8 @@ pub(super) enum Action {
     },
     /// Quitting while work runs.
     Quit,
+    /// Cancelling the job of run `0`.
+    Cancel(String),
 }
 
 /// Why the loop ends.
@@ -280,6 +285,10 @@ pub(super) struct App {
     /// The pipeline task that ended last, until the next one starts: its late
     /// messages still update the view.
     pipeline_last: Option<TaskId>,
+    /// The Training view's state, with the training tasks.
+    pub(super) training: TrainingView,
+    /// When `runs/` was last read.
+    pub(super) refreshed: SystemTime,
     /// Lines printed on stderr once the terminal is restored.
     pub(super) exit_notes: Vec<String>,
     /// How the TUI ends, set once it is to end while it waits for work to end:
@@ -315,6 +324,8 @@ impl App {
             pipeline: PipelineView::default(),
             pipeline_task: None,
             pipeline_last: None,
+            training: TrainingView::default(),
+            refreshed: Self::never(),
             exit_notes: Vec::new(),
             leaving: None,
             next_task: 0,
@@ -344,7 +355,7 @@ impl App {
     }
 
     /// A new task ID.
-    fn task_id(&mut self) -> TaskId {
+    pub(super) fn task_id(&mut self) -> TaskId {
         self.next_task += 1;
         TaskId(self.next_task)
     }
@@ -416,6 +427,7 @@ impl App {
             Ok(Done::Loaded(loaded)) => self.on_loaded(id, loaded),
             Ok(Done::Saved(saved)) => self.saved(saved),
             Ok(Done::Pipeline(outcome)) => self.pipeline_ended(id, outcome),
+            Ok(Done::Trained(result)) => self.trained(id, result),
             Err(error) => self.failed(id, error),
         }
     }
@@ -442,6 +454,9 @@ impl App {
         }
         if self.pipeline_task == Some(id) {
             return self.pipeline_ended(id, Err(error));
+        }
+        if self.training.tasks.contains_key(&id) {
+            return self.trained(id, Err(error));
         }
         if self.load == Some(id) {
             self.load = None;
@@ -505,21 +520,28 @@ impl App {
         self.reload()
     }
 
-    /// A message of a task: the events, lag and lines of the pipeline task
-    /// running, or of the last one (a message handled after its end); those of
-    /// any other task are dropped.
-    pub(super) fn on_message(&mut self, message: Msg) {
+    /// A message of a task: the events, lag and lines of a training task, or of
+    /// the pipeline task running or the last one (a message handled after its
+    /// end); those of any other task are dropped.
+    pub(super) fn on_message(&mut self, message: Msg) -> Vec<Effect> {
         self.dirty = true;
-        match message {
-            Msg::Event(id, event) if self.is_pipeline(id) => self.pipeline.event(&event),
-            Msg::Lagged(id, skipped) if self.is_pipeline(id) => {
-                self.pipeline.skipped += skipped;
-            },
-            Msg::Report(id, Report::Line(line)) if self.is_pipeline(id) => {
-                self.pipeline.results.push(line);
-            },
-            _ => {},
+        let id = match &message {
+            Msg::Event(id, _) | Msg::Lagged(id, _) | Msg::Report(id, _) => *id,
+            Msg::EditorExited(_) => return Vec::new(),
+        };
+        if self.training.is_training(id) {
+            return self.on_training_message(id, message);
         }
+        if !self.is_pipeline(id) {
+            return Vec::new();
+        }
+        match message {
+            Msg::Event(_, event) => self.pipeline.event(&event),
+            Msg::Lagged(_, skipped) => self.pipeline.skipped += skipped,
+            Msg::Report(_, Report::Line(line)) => self.pipeline.results.push(line),
+            Msg::Report(_, Report::RunCreated(_)) | Msg::EditorExited(_) => {},
+        }
+        Vec::new()
     }
 
     /// Whether task `id` is the pipeline task running or the last one.
@@ -576,8 +598,10 @@ impl App {
     }
 
     /// Ends the TUI once nothing it waits for runs.
-    fn leave_when_idle(&mut self) {
-        if self.leaving.is_some() && self.edit.is_none() && self.pipeline_task.is_none() {
+    pub(super) fn leave_when_idle(&mut self) {
+        let idle =
+            self.edit.is_none() && self.pipeline_task.is_none() && self.training.tasks.is_empty();
+        if self.leaving.is_some() && idle {
             self.exit = self.leaving;
         }
     }
@@ -747,30 +771,31 @@ impl App {
         }
         if self.leaving == Some(Exit::Quit) && matches!(key.code, KeyCode::Esc | KeyCode::Char('n'))
         {
-            self.leaving = None;
-            let stopping = self.pipeline_task.is_some().then(|| {
-                let name = self.pipeline.command.map_or("stage", command_name);
-                format!("not quitting; {name} still stops")
-            });
-            self.say(
-                Severity::Info,
-                stopping.unwrap_or_else(|| "not quitting".to_string()),
-            );
+            self.stay();
             return Vec::new();
         }
         match key.code {
             KeyCode::Char('R') => return self.reload(),
             KeyCode::Char('r') => self.run_menu(),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
-            KeyCode::Char('1') => self.view = View::Dataset,
-            KeyCode::Char('2') => self.view = View::Pipeline,
-            KeyCode::Char('3') => self.view = View::Training,
-            KeyCode::Char('4') => self.view = View::Logs,
-            KeyCode::Tab => self.view = self.view.shifted(1),
-            KeyCode::BackTab => self.view = self.view.shifted(View::ALL.len() - 1),
+            KeyCode::Char('1') => self.show(View::Dataset),
+            KeyCode::Char('2') => self.show(View::Pipeline),
+            KeyCode::Char('3') => self.show(View::Training),
+            KeyCode::Char('4') => self.show(View::Logs),
+            KeyCode::Tab => self.show(self.view.shifted(1)),
+            KeyCode::BackTab => self.show(self.view.shifted(View::ALL.len() - 1)),
             code => return self.on_view_key(code),
         }
         Vec::new()
+    }
+
+    /// Shows `view`; the Training view reads `runs/` again. Leaving a view never
+    /// touches a task.
+    fn show(&mut self, view: View) {
+        self.view = view;
+        if view == View::Training {
+            self.refresh_runs();
+        }
     }
 
     /// `y` runs the dialog's action; any other key closes it.
@@ -783,6 +808,7 @@ impl App {
         }
         match confirm.action {
             Action::Quit => self.leave(Exit::Quit),
+            Action::Cancel(run_id) => self.cancel_run(&run_id),
             Action::Delete { deletion, counts } => {
                 if self.locked() {
                     return Vec::new();
@@ -800,8 +826,9 @@ impl App {
     fn on_view_key(&mut self, code: KeyCode) -> Vec<Effect> {
         match self.view {
             View::Dataset => return self.on_dataset_key(code),
+            View::Training => return self.on_training_key(code),
             View::Logs => self.on_logs_key(code),
-            View::Pipeline | View::Training => {},
+            View::Pipeline => {},
         }
         Vec::new()
     }
@@ -1010,6 +1037,7 @@ impl App {
         if self.edit.is_some() {
             text.push("An edit is being saved: quitting waits for it.".to_string());
         }
+        text.extend(self.training_quit_text());
         if text.is_empty() {
             self.exit = Some(Exit::Quit);
             return Vec::new();
@@ -1024,33 +1052,65 @@ impl App {
         Vec::new()
     }
 
-    /// Ends the TUI for `why`: stops the pipeline task, and waits for it and for
+    /// Ends the TUI for `why`: stops the pipeline task, detaches the followed
+    /// runs (abandons them on a signal), and waits for them, for cancels and for
     /// an edit being saved. A signal is never turned back into a plain quit.
     fn leave(&mut self, why: Exit) -> Vec<Effect> {
         if self.leaving != Some(Exit::Signal) {
             self.leaving = Some(why);
         }
-        let effects = self.pipeline_task.map(Effect::Cancel).into_iter().collect();
+        let mut effects: Vec<Effect> = self.pipeline_task.map(Effect::Cancel).into_iter().collect();
+        effects.extend(match self.leaving {
+            Some(Exit::Signal) => self.abandon_all(),
+            _ => self.detach_all(),
+        });
         self.leave_when_idle();
         effects
     }
 
+    /// `n` or Esc while quitting: stays. A stage stopped and a run detached
+    /// still end; a run waiting for its job to detach keeps being followed.
+    fn stay(&mut self) {
+        self.leaving = None;
+        let mut still = Vec::new();
+        if self.pipeline_task.is_some() {
+            let name = self.pipeline.command.map_or("stage", command_name);
+            still.push(format!("{name} still stops"));
+        }
+        let detached = self.keep_following();
+        if detached > 0 {
+            still.push(format!("{} still detached", count(detached, "run")));
+        }
+        let said = if still.is_empty() {
+            "not quitting".to_string()
+        } else {
+            format!("not quitting; {}", still.join(", "))
+        };
+        self.say(Severity::Info, said);
+    }
+
     /// SIGINT, SIGTERM or SIGHUP from outside: quits without asking, as Ctrl-C
-    /// does on the command line: the stage stops, an edit being saved is waited
-    /// for (it is never cut, design 3.6).
+    /// does on the command line: the stage stops, the training tasks are
+    /// abandoned, an edit being saved and a cancel are waited for (they are never
+    /// cut, design 3.6).
     pub(super) fn on_signal(&mut self) -> Vec<Effect> {
         self.overlay = None;
         let effects = self.leave(Exit::Signal);
         if self.exit.is_none() {
-            let waited = if self.edit.is_some() {
-                "the edit is saved".to_string()
-            } else {
+            let mut waited = Vec::new();
+            if self.edit.is_some() {
+                waited.push("the edit is saved".to_string());
+            }
+            if self.pipeline_task.is_some() {
                 let name = self.pipeline.command.map_or("stage", command_name);
-                format!("{name} stops")
-            };
+                waited.push(format!("{name} stops"));
+            }
+            if !self.training.tasks.is_empty() {
+                waited.push("the training tasks end".to_string());
+            }
             self.say(
                 Severity::Warn,
-                format!("interrupted: exiting once {waited}"),
+                format!("interrupted: exiting once {}", waited.join(" and ")),
             );
         }
         effects
@@ -1060,6 +1120,7 @@ impl App {
     /// lines, and the newest warning or error on the status line.
     pub(super) fn on_tick(&mut self, now: SystemTime) {
         self.now = now;
+        self.refresh_when_due();
         if self.status.as_ref().is_some_and(|status| {
             now.duration_since(status.at)
                 .is_ok_and(|shown| shown >= STATUS_FOR)
@@ -1225,6 +1286,7 @@ mod tests {
         MOVED, NOW, app, at, ctrl_c, dataset, dataset_app, draw, key, open_to, path_to, project,
         text,
     };
+    use crate::tui::tasks::TrainJob;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -2092,5 +2154,291 @@ mod tests {
                 .iter()
                 .all(|row| row.state != super::super::pipeline::StageState::Running)
         );
+    }
+
+    fn runs_app() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
+        let (dir, mut app) = project_app()?;
+        let runs = crate::runs::Runs::new(dir.path());
+        for (id, state) in [
+            ("20260921-133200-a1b2", crate::runs::RunState::Running),
+            ("20260920-101500-9f00", crate::runs::RunState::Succeeded),
+        ] {
+            runs.save(&crate::tui::snapshots::run(id, "homelab", state))?;
+        }
+        std::fs::write(
+            runs.run_dir("20260920-101500-9f00")?
+                .join(crate::train::METRICS_FILE),
+            "{\"event\": \"log\", \"time\": 2, \"step\": 1, \"loss\": 1.5}\n",
+        )?;
+        press(&mut app, &[KeyCode::Char('3')]);
+        Ok((dir, app))
+    }
+
+    /// `a` on the selected run: the task it spawns.
+    fn attach(app: &mut App) -> Result<TaskId, String> {
+        let effects = press(app, &[KeyCode::Char('a')]);
+        match effects.as_slice() {
+            [Effect::Spawn(id, Task::Train(TrainJob::Attach(_)))] => Ok(*id),
+            _ => Err(format!("{effects:?}")),
+        }
+    }
+
+    /// The first job status of task `id`: its watch began.
+    fn watching(app: &mut App, id: TaskId) -> Vec<Effect> {
+        app.on_message(Msg::Event(
+            id,
+            crate::events::Event::JobStatus(crate::exec::JobStatus::Running),
+        ))
+    }
+
+    const DETACHED: &str = "interrupted: run 20260921-133200-a1b2 keeps running on target \
+                            `homelab`; follow it again with `overbrainer train attach \
+                            20260921-133200-a1b2`";
+
+    #[test]
+    fn the_training_view_lists_runs_newest_first_and_reads_local_metrics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let ids: Vec<&str> = app
+            .training
+            .runs
+            .iter()
+            .map(|r| r.record.id.as_str())
+            .collect();
+        assert_eq!(ids, ["20260921-133200-a1b2", "20260920-101500-9f00"]);
+        assert!(!app.training.series.contains_key("20260921-133200-a1b2"));
+        press(&mut app, &[KeyCode::Char('j')]);
+        assert_eq!(
+            app.training
+                .series
+                .get("20260920-101500-9f00")
+                .map(Vec::len),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_runs_are_read_again_every_two_seconds_only_while_shown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (dir, mut app) = runs_app()?;
+        let runs = crate::runs::Runs::new(dir.path());
+        runs.save(&crate::tui::snapshots::run(
+            "20260922-080000-beef",
+            "homelab",
+            crate::runs::RunState::Preparing,
+        ))?;
+        app.on_tick(at(NOW + 1));
+        assert_eq!(app.training.runs.len(), 2, "read at most every 2 s");
+        app.on_tick(at(NOW + 2));
+        assert_eq!(app.training.runs.len(), 3);
+        assert_eq!(app.training.runs[0].record.id, "20260922-080000-beef");
+        runs.save(&crate::tui::snapshots::run(
+            "20260923-080000-cafe",
+            "homelab",
+            crate::runs::RunState::Preparing,
+        ))?;
+        press(&mut app, &[KeyCode::Char('1')]);
+        app.on_tick(at(NOW + 10));
+        assert_eq!(app.training.runs.len(), 3, "not read while hidden");
+        Ok(())
+    }
+
+    #[test]
+    fn a_attaches_once_and_its_events_feed_the_run() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let id = attach(&mut app)?;
+        let run = "20260921-133200-a1b2";
+        assert_eq!(press(&mut app, &[KeyCode::Char('a')]), []);
+        assert_eq!(
+            status(&app),
+            Some("run 20260921-133200-a1b2 is already followed")
+        );
+        let metric = crate::train::TrainMetric {
+            time: 1.0,
+            step: 1,
+            epoch: None,
+            max_steps: Some(4),
+            loss: Some(2.0),
+            eval_loss: None,
+            learning_rate: None,
+            grad_norm: None,
+        };
+        app.on_message(Msg::Event(id, crate::events::Event::Metric(metric.clone())));
+        assert_eq!(watching(&mut app, id), []);
+        app.on_message(Msg::Lagged(id, 3));
+        app.on_message(Msg::Report(
+            id,
+            Report::Line("train: run ... succeeded".into()),
+        ));
+        let follow = app.training.tasks.get(&id).cloned();
+        assert_eq!(
+            follow
+                .as_ref()
+                .map(|f| (f.watching, f.skipped, f.lines.len())),
+            Some((true, 3, 1))
+        );
+        assert_eq!(app.training.series.get(run).map(Vec::len), Some(1));
+        app.on_done(id, Ok(Done::Trained(Ok(()))));
+        assert!(app.training.tasks.is_empty());
+        assert_eq!(app.training.ended.get(run).map(|e| e.lines.len()), Some(1));
+        // Messages handled after the end still count: no local file holds them.
+        app.on_message(Msg::Report(id, Report::Line("late".into())));
+        app.on_message(Msg::Event(id, crate::events::Event::Metric(metric)));
+        assert_eq!(app.training.ended.get(run).map(|e| e.lines.len()), Some(2));
+        assert_eq!(app.training.series.get(run).map(Vec::len), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn late_metrics_of_a_run_read_again_from_its_file_are_dropped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        press(&mut app, &[KeyCode::Char('j')]);
+        let id = attach(&mut app)?;
+        let run = "20260920-101500-9f00";
+        assert_eq!(app.training.series.get(run), None, "attach replays it all");
+        app.on_done(id, Ok(Done::Trained(Ok(()))));
+        assert_eq!(app.training.series.get(run).map(Vec::len), Some(1));
+        let metric = crate::train::TrainMetric {
+            time: 2.0,
+            step: 1,
+            epoch: None,
+            max_steps: None,
+            loss: Some(1.5),
+            eval_loss: None,
+            learning_rate: None,
+            grad_norm: None,
+        };
+        app.on_message(Msg::Event(id, crate::events::Event::Metric(metric)));
+        assert_eq!(app.training.series.get(run).map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_a_followed_run_detaches_it_first() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let follow = attach(&mut app)?;
+        watching(&mut app, follow);
+        press(&mut app, &[KeyCode::Char('c')]);
+        assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('y')]),
+            [Effect::Cancel(follow)]
+        );
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('c'), KeyCode::Char('y')]),
+            []
+        );
+        let detached = "interrupted: run 20260921-133200-a1b2 keeps running on target `homelab`";
+        let effects = app.on_done(follow, Ok(Done::Trained(Err(detached.into()))));
+        let [Effect::Spawn(_, Task::Train(TrainJob::Cancel(run)))] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        assert_eq!(run, "20260921-133200-a1b2");
+        press(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(app.overlay, None, "a cancel already runs");
+        Ok(())
+    }
+
+    #[test]
+    fn a_run_whose_job_has_not_started_is_detached_once_it_did()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let follow = attach(&mut app)?;
+        press(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(press(&mut app, &[KeyCode::Char('y')]), [], "no token cut");
+        let creating = crate::events::Event::PodStatus(crate::runpod::PodStatus::Creating {
+            name: "overbrainer-20260921-133200-a1b2-1".into(),
+            gpu_type: "NVIDIA GeForce RTX 4090".into(),
+        });
+        assert_eq!(app.on_message(Msg::Event(follow, creating)), []);
+        assert_eq!(watching(&mut app, follow), [Effect::Cancel(follow)]);
+        assert_eq!(watching(&mut app, follow), []);
+        Ok(())
+    }
+
+    #[test]
+    fn quitting_detaches_followed_runs_and_waits_for_cancels()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let follow = attach(&mut app)?;
+        watching(&mut app, follow);
+        press(&mut app, &[KeyCode::Char('j')]);
+        press(&mut app, &[KeyCode::Char('c')]);
+        let cancel = press(&mut app, &[KeyCode::Char('y')]);
+        let [Effect::Spawn(cancelling, _)] = cancel.as_slice() else {
+            return Err(format!("{cancel:?}").into());
+        };
+        press(&mut app, &[KeyCode::Char('q')]);
+        let effects = press(&mut app, &[KeyCode::Char('y')]);
+        assert_eq!(effects, [Effect::Cancel(follow)]);
+        app.on_done(follow, Ok(Done::Trained(Err(DETACHED.into()))));
+        assert_eq!(app.exit, None, "the cancel is waited for");
+        app.on_done(*cancelling, Ok(Done::Trained(Ok(()))));
+        assert_eq!(app.exit, Some(Exit::Quit));
+        assert_eq!(app.exit_notes, [DETACHED]);
+        Ok(())
+    }
+
+    #[test]
+    fn staying_keeps_following_a_run_whose_job_has_not_started()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let follow = attach(&mut app)?;
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]),
+            []
+        );
+        assert_eq!(app.leaving, Some(Exit::Quit));
+        press(&mut app, &[KeyCode::Char('n')]);
+        assert_eq!(status(&app), Some("not quitting"));
+        assert_eq!(watching(&mut app, follow), [], "still followed");
+        Ok(())
+    }
+
+    #[test]
+    fn quitting_waits_for_a_start_then_detaches_it() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let follow = attach(&mut app)?;
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]),
+            []
+        );
+        assert_eq!(watching(&mut app, follow), [Effect::Cancel(follow)]);
+        app.on_done(follow, Ok(Done::Trained(Err(DETACHED.into()))));
+        assert_eq!(app.exit, Some(Exit::Quit));
+        assert_eq!(app.exit_notes, [DETACHED]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_signal_abandons_followed_runs() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let follow = attach(&mut app)?;
+        assert_eq!(app.on_signal(), [Effect::Abandon(follow)]);
+        assert_eq!(
+            status(&app),
+            Some("interrupted: exiting once the training tasks end")
+        );
+        app.on_done(follow, Err("a background task failed".into()));
+        assert_eq!(app.exit, Some(Exit::Signal));
+        assert_eq!(app.exit_notes, ["a background task failed"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_signal_while_quitting_abandons_the_runs_already_detached()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let follow = attach(&mut app)?;
+        watching(&mut app, follow);
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]),
+            [Effect::Cancel(follow)]
+        );
+        assert_eq!(app.on_signal(), [Effect::Abandon(follow)]);
+        assert_eq!(app.leaving, Some(Exit::Signal));
+        Ok(())
     }
 }

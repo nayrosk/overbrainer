@@ -330,6 +330,60 @@ pub(super) fn pipeline_running(app: &mut App) {
     }
 }
 
+/// A run record of the fixtures.
+pub(super) fn run(id: &str, target: &str, state: crate::runs::RunState) -> crate::runs::RunRecord {
+    crate::runs::RunRecord {
+        id: id.into(),
+        target: target.into(),
+        created: "2026-09-21T13:00:00Z".into(),
+        remote_dir: format!("/workspace/overbrainer/{id}"),
+        job: None,
+        state,
+        message: None,
+    }
+}
+
+/// The pod of a Runpod run created 41 minutes before [`NOW`], at $0.53/h.
+pub(super) fn pod(run_id: &str) -> Result<crate::runpod::PodRecord, serde_json::Error> {
+    let mut record = crate::runpod::PodRecord::new(run_id, false, 1, "ssh-ed25519 AAAAhost");
+    let remote: crate::runpod::Pod = serde_json::from_value(serde_json::json!({
+        "id": "k3x9abc", "status": "RUNNING", "cost": 0.53,
+        "gpu": {"id": "NVIDIA GeForce RTX 4090", "count": 1}
+    }))?;
+    let created = at(NOW - 41 * 60);
+    record.begin_attempt("NVIDIA GeForce RTX 4090", created, 6.0);
+    record.created(&remote, crate::runpod::AttemptResult::Created, created);
+    let endpoint = crate::runpod::SshEndpoint {
+        host: "203.0.113.7".into(),
+        port: 40022,
+        user: "root".into(),
+    };
+    record.ready(endpoint, at(NOW - 38 * 60));
+    Ok(record)
+}
+
+/// 1200 steps of a 4000-step run at half a step per second: a training log every
+/// 10 steps, an evaluation every 200.
+pub(super) fn series() -> Vec<crate::train::TrainMetric> {
+    (1..=120_u32)
+        .map(|n| {
+            let step = n * 10;
+            let x = f64::from(step) / 1200.0;
+            let eval = step % 200 == 0;
+            crate::train::TrainMetric {
+                time: 1000.0 + f64::from(step) * 2.0,
+                step: u64::from(step),
+                epoch: Some(f64::from(step) / 1333.0),
+                max_steps: Some(4000),
+                loss: (!eval).then_some(0.8 + 1.1 * (1.0 - x) * (1.0 - x)),
+                eval_loss: eval.then_some(0.9 + 1.0 * (1.0 - x) * (1.0 - x)),
+                learning_rate: Some(2e-4 * (0.2 + 0.8 * x.min(0.5) * 2.0).min(1.0)),
+                grad_norm: Some(0.7 + 0.05 * f64::from(n % 5)),
+            }
+        })
+        .collect()
+}
+
 /// A key press.
 pub(super) fn key(code: KeyCode) -> TermEvent {
     TermEvent::Key(KeyEvent {
@@ -712,5 +766,94 @@ fn the_quit_dialog_says_what_becomes_of_the_work() -> TestResult {
     app.edit = Some(TaskId(8));
     app.on_input(&key(KeyCode::Char('q')));
     snapshot("quit_dialog", &mut app)?;
+    Ok(())
+}
+
+use crate::runs::RunState;
+use crate::tui::training::{Ended, Follow, Job, RunRow};
+
+const FOLLOWED: &str = "20260921-133200-a1b2";
+const FINISHED: &str = "20260920-101500-9f00";
+const LEFT: &str = "20260919-090000-c3d4";
+
+/// Three runs: a Runpod run followed live, a finished local run, and a run left
+/// running that nothing follows.
+fn training_app() -> Result<App, serde_json::Error> {
+    let mut app = app();
+    app.view = View::Training;
+    app.training.runs = vec![
+        RunRow {
+            record: run(FOLLOWED, "gpu_cloud", RunState::Running),
+            pod: Some(pod(FOLLOWED)?),
+        },
+        RunRow {
+            record: run(FINISHED, "homelab", RunState::Succeeded),
+            pod: None,
+        },
+        RunRow {
+            record: run(LEFT, "homelab", RunState::Running),
+            pod: None,
+        },
+    ];
+    let mut follow = Follow::new(Job::Attach, FOLLOWED);
+    follow.watching = true;
+    app.training.tasks.insert(TaskId(3), follow);
+    app.training.series.insert(FOLLOWED.into(), series());
+    Ok(app)
+}
+
+#[test]
+fn training_without_runs() -> TestResult {
+    let mut app = app();
+    app.view = View::Training;
+    snapshot("training_empty", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn training_of_a_followed_runpod_run() -> TestResult {
+    let mut app = training_app()?;
+    snapshot("training_followed", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn training_of_a_finished_local_run() -> TestResult {
+    let mut app = training_app()?;
+    app.training.selected = 1;
+    let mut metrics = series();
+    metrics.truncate(40);
+    app.training.series.insert(FINISHED.into(), metrics);
+    app.training.ended.insert(
+        FINISHED.into(),
+        Ended {
+            lines: vec![
+                "train: run 20260920-101500-9f00 succeeded; 400 steps in 13m; loss 0.91; \
+                 output in runs/20260920-101500-9f00/output"
+                    .into(),
+            ],
+            error: None,
+        },
+    );
+    snapshot("training_finished", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn training_of_a_run_nothing_follows() -> TestResult {
+    let mut app = training_app()?;
+    app.training.selected = 2;
+    snapshot("training_not_followed", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn the_cancel_dialog_and_the_quit_dialog_of_a_followed_run() -> TestResult {
+    let mut app = training_app()?;
+    app.on_input(&key(KeyCode::Char('c')));
+    snapshot("training_cancel", &mut app)?;
+    app.overlay = None;
+    app.on_input(&key(KeyCode::Char('q')));
+    snapshot("training_quit", &mut app)?;
     Ok(())
 }

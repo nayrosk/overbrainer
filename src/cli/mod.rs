@@ -7,7 +7,7 @@ mod init;
 mod pod;
 mod progress;
 mod runpod_train;
-mod train;
+pub(crate) mod train;
 
 use std::path::{Path, PathBuf};
 

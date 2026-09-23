@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Tabs};
+use ratatui::widgets::{Paragraph, Tabs};
 
 use super::app::{App, Overlay, View};
 use super::views;
@@ -28,15 +28,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
         View::Dataset => views::dataset::render(frame, body, app),
         View::Logs => views::logs::render(frame, body, app),
         View::Pipeline => views::pipeline::render(frame, body, app),
-        View::Training => {
-            let block = Block::bordered()
-                .title(Span::styled(
-                    format!(" {} ", app.view.title()),
-                    app.theme.title,
-                ))
-                .border_style(app.theme.dim);
-            frame.render_widget(block, body);
-        },
+        View::Training => views::training::render(frame, body, app),
     }
     status::render(frame, footer, app);
     match &app.overlay {

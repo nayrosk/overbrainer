@@ -24,6 +24,12 @@ pub(super) struct Theme {
     pub(super) key: Style,
     /// The filled part of a progress gauge.
     pub(super) gauge: Style,
+    /// The training loss line.
+    pub(super) loss: Style,
+    /// The eval loss points.
+    pub(super) eval_loss: Style,
+    /// Sparklines.
+    pub(super) sparkline: Style,
 }
 
 impl Theme {
@@ -41,6 +47,9 @@ impl Theme {
             error: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             key: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             gauge: Style::new().fg(Color::Green),
+            loss: Style::new().fg(Color::Cyan),
+            eval_loss: Style::new().fg(Color::Yellow),
+            sparkline: Style::new().fg(Color::Green),
         }
     }
 
@@ -55,6 +64,9 @@ impl Theme {
             error: Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             key: Style::new().add_modifier(Modifier::BOLD),
             gauge: Style::new().add_modifier(Modifier::BOLD),
+            loss: Style::new(),
+            eval_loss: Style::new().add_modifier(Modifier::BOLD),
+            sparkline: Style::new(),
         }
     }
 

@@ -91,6 +91,7 @@ where
     if let Some(mut editor) = looping.editor.take() {
         stop_editor(&mut editor).await;
     }
+    looping.settle(app).await;
     if let Some(real) = looping.real {
         real.screen.stop().await;
     }
@@ -161,6 +162,30 @@ where
         }
     }
 
+    /// Once the loop ended with tasks still running (a terminal error, or its
+    /// input gone): they end as on a signal, and are waited for. A training task
+    /// is never aborted: dropped mid-start, it would leave a job or a pod that
+    /// nothing finds again. Their ends still reach the app, for its exit notes.
+    async fn settle(&mut self, app: &mut App) {
+        if self.tasks.is_empty() {
+            return;
+        }
+        // Why the loop ended stays what it was.
+        let why = app.exit;
+        for effect in app.on_signal() {
+            match effect {
+                Effect::Cancel(id) => self.tasks.cancel(id),
+                Effect::Abandon(id) => self.tasks.abandon(id),
+                Effect::Spawn(..) | Effect::OpenEditor { .. } => {},
+            }
+        }
+        while let Some((id, result)) = self.tasks.next().await {
+            // Nothing new starts now: a reload or a cancel asked for is dropped.
+            app.on_done(id, result);
+        }
+        app.exit = why.or(app.exit);
+    }
+
     /// The next thing that happens.
     async fn wait(&mut self, app: &App) -> Wake {
         let next_draw = self.next_draw();
@@ -199,6 +224,7 @@ where
         match effect {
             Effect::Spawn(id, task) => self.tasks.spawn(id, task),
             Effect::Cancel(id) => self.tasks.cancel(id),
+            Effect::Abandon(id) => self.tasks.abandon(id),
             Effect::OpenEditor { command, path } => self.open_editor(&command, path).await?,
         }
         Ok(())
@@ -256,10 +282,7 @@ where
                 app.dirty = true;
                 Ok(app.on_editor_exit(status))
             },
-            message => {
-                app.on_message(message);
-                Ok(Vec::new())
-            },
+            message => Ok(app.on_message(message)),
         }
     }
 }
@@ -415,6 +438,40 @@ mod tests {
         assert_eq!(
             error.as_deref(),
             Some("cannot read the terminal: the terminal is gone")
+        );
+        Ok(())
+    }
+
+    /// A terminal error ends the loop, but a training task still running is
+    /// waited for, never aborted, and its end reaches the app.
+    #[tokio::test]
+    async fn a_terminal_error_waits_for_the_training_tasks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let run = "20260921-133200-a1b2";
+        crate::runs::Runs::new(dir.path()).save(&crate::tui::snapshots::run(
+            run,
+            "homelab",
+            crate::runs::RunState::Running,
+        ))?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut app = app();
+        app.project.dir = dir.path().to_path_buf();
+        let (events, input) = mpsc::unbounded_channel();
+        events.send(Ok(key(KeyCode::Char('3'))))?;
+        events.send(Ok(key(KeyCode::Char('a'))))?;
+        events.send(Err(io::Error::other("the terminal is gone")))?;
+        let result =
+            tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await?;
+        assert!(result.is_err());
+        assert!(app.training.tasks.is_empty(), "the task was waited for");
+        // No overbrainer.toml: the attach flow fails, and says why.
+        let ended = app.training.ended.get(run).and_then(|e| e.error.clone());
+        assert!(
+            ended
+                .as_deref()
+                .is_some_and(|e| e.contains("overbrainer.toml")),
+            "{ended:?}"
         );
         Ok(())
     }

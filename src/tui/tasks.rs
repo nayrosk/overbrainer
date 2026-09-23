@@ -12,13 +12,13 @@ use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::editor::Edited;
-use crate::cli::StageArgs;
 use crate::cli::data::Command;
 use crate::cli::front::{Frontend, Report};
+use crate::cli::{StageArgs, TrainArgs, TrainCommand};
 use crate::config::EnvSource;
 use crate::dataset::{Counts, DataFiles, Dataset, Deletion};
 use crate::events::{Event, EventBus};
@@ -31,7 +31,7 @@ use crate::prompts::Prompts;
 /// drain.
 pub(super) const BUS_CAPACITY: usize = 32_768;
 
-/// How long a pipeline task waits for its forwarder once its flow is dropped:
+/// How long a pipeline or training task waits for its forwarder once its flow is dropped:
 /// only a sender kept by a task the flow spawned and has not yet dropped can
 /// hold it that long.
 const FORWARD_GRACE: Duration = Duration::from_secs(5);
@@ -49,6 +49,35 @@ pub(super) enum Task {
     Edit(Edit),
     /// A pipeline command, on every topic, without `--force`.
     Pipeline(Command),
+    /// A training flow of the command line.
+    Train(TrainJob),
+}
+
+/// A training flow, run exactly as `overbrainer train` runs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TrainJob {
+    /// `train attach <run-id>`.
+    Attach(String),
+    /// `train cancel <run-id>`.
+    Cancel(String),
+}
+
+impl TrainJob {
+    /// The arguments `overbrainer train` would get.
+    fn args(&self) -> TrainArgs {
+        let command = match self {
+            Self::Attach(run_id) => TrainCommand::Attach {
+                run_id: run_id.clone(),
+            },
+            Self::Cancel(run_id) => TrainCommand::Cancel {
+                run_id: run_id.clone(),
+            },
+        };
+        TrainArgs {
+            command: Some(command),
+            ..TrainArgs::default()
+        }
+    }
 }
 
 /// A change to the dataset files.
@@ -74,6 +103,8 @@ pub(super) enum Done {
     Saved(Result<Saved, String>),
     /// How a pipeline command ended.
     Pipeline(Result<(), String>),
+    /// How a training flow ended.
+    Trained(Result<(), String>),
 }
 
 /// A saved edit.
@@ -118,6 +149,20 @@ pub(super) fn forward(
             }
         }
     })
+}
+
+/// Drops `front`, which closes its bus, then waits for `forwarder` to send what
+/// is left and end, so every message of the task is in the app's inbox before
+/// its end is. `what` names the task in the warning of a forwarder that does not
+/// end within [`FORWARD_GRACE`].
+async fn forwarded(front: Frontend, forwarder: JoinHandle<()>, what: &str) {
+    drop(front);
+    if tokio::time::timeout(FORWARD_GRACE, forwarder)
+        .await
+        .is_err()
+    {
+        tracing::warn!("the events of the {what} were not all forwarded");
+    }
 }
 
 /// A TUI front end for task `id`: its own bus, forwarded to `messages` by the
@@ -190,6 +235,7 @@ pub(super) struct Tasks {
     set: JoinSet<Done>,
     ids: HashMap<tokio::task::Id, TaskId>,
     tokens: HashMap<TaskId, CancellationToken>,
+    abandons: HashMap<TaskId, Arc<AtomicBool>>,
 }
 
 impl Tasks {
@@ -202,7 +248,18 @@ impl Tasks {
             set: JoinSet::new(),
             ids: HashMap::new(),
             tokens: HashMap::new(),
+            abandons: HashMap::new(),
         }
+    }
+
+    /// Sets the abandon flag of task `id` and cancels its token: a Runpod run
+    /// still provisioning deletes its pod and fails, as Ctrl-C does on the
+    /// command line; any other flow detaches.
+    pub(super) fn abandon(&self, id: TaskId) {
+        if let Some(abandon) = self.abandons.get(&id) {
+            abandon.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.cancel(id);
     }
 
     /// Cancels the token of task `id`: a pipeline stops, a training detaches.
@@ -220,58 +277,72 @@ impl Tasks {
     /// Starts `task` as `id`.
     pub(super) fn spawn(&mut self, id: TaskId, task: Task) {
         let files = DataFiles::new(&self.project_dir);
-        let handle =
-            match task {
-                Task::Load => self.set.spawn(async move {
-                    let read = tokio::task::spawn_blocking(move || Dataset::read(&files)).await;
-                    Done::Loaded(match read {
-                        Ok(Ok(data)) => Ok(data),
-                        Ok(Err(error)) => Err(format!("{:#}", anyhow::Error::from(error))),
-                        Err(error) => Err(format!("cannot read the data files: {error}")),
-                    })
-                }),
-                Task::Edit(edit) => {
-                    let dir = self.project_dir.clone();
-                    self.set.spawn(async move {
-                        let saved = tokio::task::spawn_blocking(move || {
-                            save(&dir, &edit, EnvSource::Process)
-                        })
-                        .await;
-                        Done::Saved(match saved {
-                            Ok(saved) => saved,
-                            Err(error) => Err(format!("the edit failed: {error}")),
-                        })
-                    })
-                },
-                Task::Pipeline(command) => {
-                    let dir = self.project_dir.clone();
-                    let token = CancellationToken::new();
-                    let abandon = Arc::new(AtomicBool::new(false));
-                    let (front, forwarder) = front_end(id, &self.messages, &token, &abandon);
-                    self.tokens.insert(id, token.clone());
-                    self.set.spawn(async move {
-                    let args = StageArgs::default();
-                    let outcome = {
-                        let run = crate::cli::data::run(&dir, command, &args, &front);
-                        tokio::select! {
-                            result = run => result.map_err(|error| format!("{error:#}")),
-                            () = token.cancelled() => {
-                                Err("interrupted: the stage resumes on its next run".to_string())
-                            },
-                        }
-                    };
-                    // The bus closes with the front end: the forwarder then sends
-                    // what is left and ends, so every message of the task is in
-                    // the app's inbox before its end is.
-                    drop(front);
-                    if tokio::time::timeout(FORWARD_GRACE, forwarder).await.is_err() {
-                        tracing::warn!("the events of the stage were not all forwarded");
-                    }
-                    Done::Pipeline(outcome)
+        let handle = match task {
+            Task::Load => self.set.spawn(async move {
+                let read = tokio::task::spawn_blocking(move || Dataset::read(&files)).await;
+                Done::Loaded(match read {
+                    Ok(Ok(data)) => Ok(data),
+                    Ok(Err(error)) => Err(format!("{:#}", anyhow::Error::from(error))),
+                    Err(error) => Err(format!("cannot read the data files: {error}")),
                 })
-                },
-            };
+            }),
+            Task::Edit(edit) => {
+                let dir = self.project_dir.clone();
+                self.set.spawn(async move {
+                    let saved =
+                        tokio::task::spawn_blocking(move || save(&dir, &edit, EnvSource::Process))
+                            .await;
+                    Done::Saved(match saved {
+                        Ok(saved) => saved,
+                        Err(error) => Err(format!("the edit failed: {error}")),
+                    })
+                })
+            },
+            Task::Pipeline(command) => self.spawn_pipeline(id, command),
+            Task::Train(job) => self.spawn_train(id, job),
+        };
         self.ids.insert(handle.id(), id);
+    }
+
+    /// Starts the pipeline `command` as `id`: its token drops the stage.
+    fn spawn_pipeline(&mut self, id: TaskId, command: Command) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        let token = CancellationToken::new();
+        let abandon = Arc::new(AtomicBool::new(false));
+        let (front, forwarder) = front_end(id, &self.messages, &token, &abandon);
+        self.tokens.insert(id, token.clone());
+        self.set.spawn(async move {
+            let args = StageArgs::default();
+            let outcome = {
+                let run = crate::cli::data::run(&dir, command, &args, &front);
+                tokio::select! {
+                    result = run => result.map_err(|error| format!("{error:#}")),
+                    () = token.cancelled() => {
+                        Err("interrupted: the stage resumes on its next run".to_string())
+                    },
+                }
+            };
+            forwarded(front, forwarder, "stage").await;
+            Done::Pipeline(outcome)
+        })
+    }
+
+    /// Starts the training flow `job` as `id`: its token detaches the flow, and
+    /// its abandon flag makes a Runpod provisioning delete its pod.
+    fn spawn_train(&mut self, id: TaskId, job: TrainJob) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        let token = CancellationToken::new();
+        let abandon = Arc::new(AtomicBool::new(false));
+        let (front, forwarder) = front_end(id, &self.messages, &token, &abandon);
+        self.tokens.insert(id, token);
+        self.abandons.insert(id, abandon);
+        self.set.spawn(async move {
+            // Never aborted: the flow shields its starts and cancels, and only
+            // its token detaches it.
+            let result = crate::cli::train::run(&dir, &job.args(), &front).await;
+            forwarded(front, forwarder, "training").await;
+            Done::Trained(result.map_err(|error| format!("{error:#}")))
+        })
     }
 
     /// The next task to end, with what it gave back or how it failed (a panic).
@@ -288,6 +359,7 @@ impl Tasks {
             };
             if let Some(id) = self.ids.remove(&task) {
                 self.tokens.remove(&id);
+                self.abandons.remove(&id);
                 return Some((id, result));
             }
         }
@@ -390,6 +462,45 @@ mod tests {
         assert_eq!(std::fs::read(&files.answers)?, before);
         assert!(!files.train.exists());
         Ok(())
+    }
+
+    /// A real `train cancel` task on a run that has no job: the command line's
+    /// flow refuses it, and its error comes back as the task's end.
+    #[tokio::test]
+    async fn a_cancel_task_runs_the_command_line_flow() -> TestResult {
+        let dir = project()?;
+        let run = "20260921-133200-a1b2";
+        let mut record = crate::tui::snapshots::run(run, "homelab", crate::runs::RunState::Failed);
+        record.job = None;
+        crate::runs::Runs::new(dir.path()).save(&record)?;
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
+        tasks.spawn(TaskId(3), Task::Train(TrainJob::Cancel(run.into())));
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        let Some((TaskId(3), Ok(Done::Trained(Err(error))))) = next else {
+            return Err(format!("unexpected end: {next:?}").into());
+        };
+        assert_eq!(error, format!("run {run} has not started"));
+        assert!(tasks.is_empty());
+        Ok(())
+    }
+
+    /// Abandoning a task sets its flag and cancels its token; a task already
+    /// ended is ignored.
+    #[test]
+    fn abandon_sets_the_flag_then_cancels_the_token() {
+        let mut tasks = Tasks::new(
+            Path::new("/nonexistent"),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        let token = CancellationToken::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        tasks.tokens.insert(TaskId(1), token.clone());
+        tasks.abandons.insert(TaskId(1), Arc::clone(&flag));
+        tasks.abandon(TaskId(2));
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        tasks.abandon(TaskId(1));
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(token.is_cancelled());
     }
 
     /// A copy of a message of the pipeline task, which [`Msg`] cannot clone.

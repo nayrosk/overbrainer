@@ -38,6 +38,8 @@ pub(crate) enum Frontend {
 pub(crate) enum Report {
     /// A line the command line prints on stdout.
     Line(String),
+    /// A training run was created, with this ID (the command line says nothing).
+    RunCreated(String),
 }
 
 impl Frontend {
@@ -107,6 +109,14 @@ impl Frontend {
         match self {
             Self::Cli => println!("{line}"),
             Self::Tui { report, .. } => report(Report::Line(line.to_string())),
+        }
+    }
+
+    /// Says that training run `id` was created: the TUI binds its task to it.
+    pub(crate) fn run_created(&self, id: &str) {
+        match self {
+            Self::Cli => {},
+            Self::Tui { report, .. } => report(Report::RunCreated(id.to_string())),
         }
     }
 }
