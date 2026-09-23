@@ -428,15 +428,22 @@ impl App {
         None
     }
 
-    /// Refuses a change to the dataset while it is locked.
+    /// Refuses a change to the dataset while it is locked or the TUI is leaving.
     fn locked(&mut self) -> bool {
-        let Some(reason) = self.lock() else {
-            return false;
+        self.refuse_new("edits resume when it ends", "edit")
+    }
+
+    /// Refuses new work of kind `new` (a stage, an edit, a run) while the data
+    /// is locked, saying `wait` after why, or while the TUI is leaving (a quit
+    /// waits or a signal came): the status line says why. Returns whether it
+    /// refused.
+    pub(super) fn refuse_new(&mut self, wait: &str, new: &str) -> bool {
+        let reason = match self.lock() {
+            Some(reason) => format!("{reason}; {wait}"),
+            None if self.leaving.is_some() => format!("quitting; no {new} starts"),
+            None => return false,
         };
-        self.say(
-            Severity::Warn,
-            format!("refused: {reason}; edits resume when it ends"),
-        );
+        self.say(Severity::Warn, format!("refused: {reason}"));
         true
     }
 
@@ -590,13 +597,10 @@ impl App {
         self.pipeline_task == Some(id) || self.pipeline_last == Some(id)
     }
 
-    /// `r`: the menu of pipeline commands, unless the data is locked.
+    /// `r`: the menu of pipeline commands, unless the data is locked or the TUI
+    /// is leaving.
     fn run_menu(&mut self) {
-        if let Some(reason) = self.lock() {
-            self.say(
-                Severity::Warn,
-                format!("refused: {reason}; one task at a time"),
-            );
+        if self.refuse_new("one task at a time", "stage") {
             return;
         }
         self.overlay = Some(Overlay::Menu(0));
@@ -621,13 +625,10 @@ impl App {
         Vec::new()
     }
 
-    /// Starts the pipeline `command` and shows the Pipeline view.
+    /// Starts the pipeline `command` and shows the Pipeline view, unless the
+    /// data is locked or the TUI is leaving.
     fn run_pipeline(&mut self, command: Command) -> Vec<Effect> {
-        if let Some(reason) = self.lock() {
-            self.say(
-                Severity::Warn,
-                format!("refused: {reason}; one task at a time"),
-            );
+        if self.refuse_new("one task at a time", "stage") {
             return Vec::new();
         }
         let id = self.task_id();
@@ -1943,6 +1944,68 @@ mod tests {
             [Effect::Spawn(_, Task::Edit(Edit::Delete { deletion: Deletion::Answer(answer), counts }))]
                 if *answer == id && *counts == Counts { questions: 0, answers: 1 }
         ));
+    }
+
+    /// [`dataset_app`] on an answer, following a run, and leaving: after a
+    /// signal, or with a quit waiting for that run.
+    fn leaving_app(signal: bool) -> App {
+        let mut app = dataset_app();
+        open_to(&mut app, &path_to(MOVED, true));
+        app.training.tasks.insert(
+            TaskId(9),
+            crate::tui::training::Follow::new(
+                crate::tui::training::Job::Attach,
+                "20260921-133200-a1b2",
+            ),
+        );
+        if signal {
+            app.on_signal();
+        } else {
+            press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        }
+        app
+    }
+
+    /// Once the TUI is leaving, after a signal or while a quit waits for a
+    /// followed run, no stage, edit or deletion starts, not even one confirmed
+    /// in a dialog.
+    #[test]
+    fn no_new_work_starts_while_leaving() -> Result<(), String> {
+        for signal in [true, false] {
+            let mut app = leaving_app(signal);
+            assert!(app.leaving.is_some(), "{signal}");
+            assert_eq!(app.lock(), None, "nothing locks the data");
+            let effects = press(&mut app, &[KeyCode::Char('r'), KeyCode::Enter]);
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::Spawn(..))),
+                "{effects:?}"
+            );
+            assert_eq!(app.overlay, None);
+            assert_eq!(status(&app), Some("refused: quitting; no stage starts"));
+            app.status = None;
+            app.overlay = Some(Overlay::Menu(0));
+            assert_eq!(press(&mut app, &[KeyCode::Enter]), []);
+            assert_eq!(status(&app), Some("refused: quitting; no stage starts"));
+            no_edit_starts(&mut app)?;
+        }
+        Ok(())
+    }
+
+    /// `e`, `d` and a confirmed deletion start nothing in `app`, and say why.
+    fn no_edit_starts(app: &mut App) -> Result<(), String> {
+        for code in ['e', 'd'] {
+            app.status = None;
+            assert_eq!(press(app, &[KeyCode::Char(code)]), []);
+            assert_eq!(app.overlay, None);
+            assert_eq!(status(app), Some("refused: quitting; no edit starts"));
+        }
+        let model = app.dataset.model.as_ref().ok_or("no model")?;
+        let confirm = deletion(model, app.dataset.tree.selected(), &app.project.topics)?;
+        app.overlay = Some(Overlay::Confirm(confirm));
+        app.status = None;
+        assert_eq!(press(app, &[KeyCode::Char('y')]), []);
+        assert_eq!(status(app), Some("refused: quitting; no edit starts"));
+        Ok(())
     }
 
     #[test]

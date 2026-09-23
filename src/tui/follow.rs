@@ -174,13 +174,7 @@ impl App {
     /// Refuses a new run while the data is locked (a stage, an edit or another
     /// start runs) or the TUI is quitting; says why.
     fn start_refused(&mut self) -> bool {
-        let reason = match self.lock() {
-            Some(reason) => format!("{reason}; one task at a time"),
-            None if self.leaving.is_some() => "quitting; no run starts".to_string(),
-            None => return false,
-        };
-        self.say(Severity::Warn, format!("refused: {reason}"));
-        true
+        self.refuse_new("one task at a time", "run")
     }
 
     /// `t`: prepares the confirmation of a new run, in a task.
