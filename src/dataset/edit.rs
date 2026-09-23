@@ -1,8 +1,8 @@
 //! Edits of the dataset files, as the terminal UI makes them: editing a question, an
 //! answer or a subtopic name, with the IDs recomputed and the dependent records kept
-//! consistent, and deleting with a cascade. Every operation works on a freshly read [`Dataset`] and checks first
-//! that what it changes is still what the user saw; [`Dataset::save`] then writes
-//! every touched file at once.
+//! consistent, and deleting with a cascade. Every operation works on a freshly read
+//! [`Dataset`] and checks first that what it changes is still what the user saw;
+//! [`Dataset::save`] then writes every touched file at once.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -455,7 +455,8 @@ impl Dataset {
         })
     }
 
-    /// The questions `deletion` removes, subtopic and answer deletions aside.
+    /// The questions `deletion` removes; empty only for an answer deletion, which
+    /// removes no question.
     fn doomed_questions(&self, deletion: &Deletion) -> BTreeSet<Id> {
         match deletion {
             Deletion::Subtopic(id) => self
@@ -1196,6 +1197,120 @@ mod tests {
         data.save(&files, &change)?;
         data.rejected.extend(change.append);
         assert_eq!(Dataset::read(&files)?, data);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_subtopic_deletion_is_scoped_to_its_topic() -> Result<(), EditError> {
+        let mut data = dataset();
+        data.subtopics.remove(0);
+        let second_topic = "closures";
+        let orphan_id = Id::question(
+            &Id::subtopic(second_topic, "Capturing"),
+            "What is a capture?",
+        );
+        let orphan_question = Question {
+            id: orphan_id.clone(),
+            topic: second_topic.into(),
+            subtopic_id: Id::subtopic(second_topic, "Capturing"),
+            subtopic: "Capturing".into(),
+            text: "What is a capture?".into(),
+        };
+        let orphan_answer = Example {
+            id: orphan_id,
+            topic: second_topic.into(),
+            subtopic: "Capturing".into(),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: orphan_question.text.clone(),
+                    reasoning_content: None,
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: "Because.".into(),
+                    reasoning_content: None,
+                },
+            ],
+            meta: Meta {
+                model: "m".into(),
+                input_tokens: 1,
+                output_tokens: 2,
+                finish_reason: FinishReason::Stop,
+                reasoning_kind: ReasoningKind::Raw,
+                excluded: None,
+            },
+        };
+        data.questions.push(orphan_question.clone());
+        data.answers.push(orphan_answer.clone());
+        let expected = Counts {
+            questions: 2,
+            answers: 1,
+        };
+        assert_eq!(
+            data.counts(&Deletion::MissingSubtopic(TOPIC.into())),
+            Some(expected)
+        );
+        let change = data.delete(&Deletion::MissingSubtopic(TOPIC.into()), expected)?;
+        assert_eq!(data.questions, [orphan_question]);
+        assert_eq!(data.answers, [orphan_answer]);
+        assert!(change.append.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn subtopic_deletion_is_scoped_to_its_own_questions() -> Result<(), EditError> {
+        let mut data = dataset();
+        let lifetimes = data.subtopics[1].clone();
+        let lifetime_question = question(&lifetimes, "What is a lifetime 'a?");
+        let lifetime_answer = answer(&lifetime_question, None);
+        data.questions.push(lifetime_question.clone());
+        data.answers.push(lifetime_answer.clone());
+        let expected = Counts {
+            questions: 2,
+            answers: 1,
+        };
+        assert_eq!(
+            data.counts(&Deletion::Subtopic(borrowing_id())),
+            Some(expected)
+        );
+        let change = data.delete(&Deletion::Subtopic(borrowing_id()), expected)?;
+        assert_eq!(data.subtopics, [subtopic("Lifetimes")]);
+        assert_eq!(data.questions, [lifetime_question]);
+        assert_eq!(data.answers, [lifetime_answer]);
+        assert_eq!(
+            change.touched,
+            Touched::SUBTOPICS
+                .and(Touched::QUESTIONS)
+                .and(Touched::ANSWERS)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_a_subtopic_round_trips_through_save() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let files = DataFiles::new(dir.path());
+        let mut data = dataset();
+        data.save(&files, &Change::new(Touched::ALL, ""))?;
+        let expected = Counts {
+            questions: 2,
+            answers: 1,
+        };
+        let change = data.delete(&Deletion::Subtopic(borrowing_id()), expected)?;
+        data.save(&files, &change)?;
+        let on_disk = Dataset::read(&files)?;
+        assert_eq!(on_disk.subtopics, [subtopic("Lifetimes")]);
+        assert!(on_disk.questions.is_empty());
+        assert!(on_disk.answers.is_empty());
+        assert_eq!(
+            on_disk.rejected,
+            [Rejected::Subtopic {
+                id: borrowing_id(),
+                topic: TOPIC.into(),
+                name: "Borrowing".into(),
+            }]
+        );
         Ok(())
     }
 }
