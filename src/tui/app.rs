@@ -198,9 +198,10 @@ pub(super) enum Action {
     Cancel(String),
     /// Starting a training run as planned.
     Start(Box<StartPlan>),
-    /// Abandoning Runpod runs still provisioning: when quitting, or one run
-    /// with `c`.
+    /// Abandoning Runpod runs still provisioning, when quitting.
     Abandon(Vec<TaskId>),
+    /// Abandoning the Runpod start `0` still provisioning, asked for with `c`.
+    AbandonStart(TaskId),
 }
 
 /// What an exit note added while leaving is about.
@@ -913,6 +914,7 @@ impl App {
             Action::Cancel(run_id) => self.cancel_run(&run_id),
             Action::Start(plan) => self.start_run(&plan),
             Action::Abandon(tasks) => self.abandon(&tasks),
+            Action::AbandonStart(task) => self.abandon_start(task),
             Action::Delete { deletion, counts } => {
                 if self.locked() {
                     return Vec::new();
@@ -2877,9 +2879,9 @@ mod tests {
     fn abandoning(app: &App) -> Option<&[TaskId]> {
         match &app.overlay {
             Some(Overlay::Confirm(Confirm {
-                action: Action::Abandon(tasks),
+                action: Action::AbandonStart(task),
                 ..
-            })) => Some(tasks),
+            })) => Some(std::slice::from_ref(task)),
             _ => None,
         }
     }
@@ -2945,6 +2947,80 @@ mod tests {
             Some(format!("run {FIRST}: {failed}"))
         );
         assert!(app.training.tasks.contains_key(&second));
+        Ok(())
+    }
+
+    #[test]
+    fn y_after_the_job_started_does_not_abandon_and_says_so()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let [first, _] = starts(&mut app, true);
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(abandoning(&app), Some([first].as_slice()));
+        assert_eq!(watching(&mut app, first), [], "still followed");
+        assert_eq!(keys(&mut app, &[KeyCode::Char('y')]), [], "no abandon");
+        assert_eq!(
+            status(&app),
+            Some(
+                "run 20260921-133200-a1b2: its job started, so it was not abandoned; press c \
+                 to cancel it"
+            )
+        );
+        assert_eq!(
+            app.status.as_ref().map(|status| status.severity),
+            Some(Severity::Warn)
+        );
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(Confirm { action: Action::Cancel(run), .. })) if run == FIRST
+            ),
+            "{:?}",
+            app.overlay
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn c_then_y_while_a_quit_is_pending_abandons_only_that_start()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::training::Detach;
+        let (_dir, mut app) = runs_app()?;
+        let [first, second] = starts(&mut app, true);
+        keys(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        assert!(
+            dialog(&app).starts_with("Quitting waits"),
+            "{}",
+            dialog(&app)
+        );
+        keys(&mut app, &[KeyCode::Char('n')]);
+        assert_eq!(app.leaving, Some(Exit::Quit));
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(abandoning(&app), Some([first].as_slice()));
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('y')]),
+            [Effect::Abandon(first)]
+        );
+        assert_eq!(status(&app), Some("abandoning run 20260921-133200-a1b2"));
+        let other = app.training.tasks.get(&second).map(|f| f.detach);
+        assert_eq!(other, Some(Detach::OnStart), "still waited for");
+        assert_eq!((app.leaving, app.exit), (Some(Exit::Quit), None));
+        Ok(())
+    }
+
+    #[test]
+    fn a_signal_while_the_c_dialog_is_open_closes_it_and_abandons_every_task()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let [first, second] = starts(&mut app, true);
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(abandoning(&app), Some([first].as_slice()));
+        let mut effects = app.on_signal();
+        effects.sort_by_key(|effect| format!("{effect:?}"));
+        assert_eq!(effects, [Effect::Abandon(first), Effect::Abandon(second)]);
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.leaving, Some(Exit::Signal));
         Ok(())
     }
 

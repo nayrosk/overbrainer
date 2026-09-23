@@ -326,7 +326,7 @@ impl App {
                 text: vec![text],
                 yes: "abandon",
                 no: "keep it",
-                action: Action::Abandon(vec![task]),
+                action: Action::AbandonStart(task),
             }));
             return;
         }
@@ -633,11 +633,9 @@ impl App {
     /// Abandons the start tasks `ids` that still provision, once confirmed: as
     /// a signal would, their pods are deleted and their runs fail. A cancel
     /// asked for meanwhile is dropped: an abandoned run has no job to cancel,
-    /// and its flow's error says what became of it. Unless the TUI is quitting,
-    /// the status line says which runs are abandoned.
+    /// and its flow's error says what became of it.
     pub(super) fn abandon(&mut self, ids: &[TaskId]) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let mut runs = Vec::new();
         for id in ids {
             if let Some(follow) = self.training.tasks.get_mut(id)
                 && follow.starting()
@@ -645,14 +643,34 @@ impl App {
             {
                 follow.detach = Detach::Done;
                 follow.cancel_after = false;
-                runs.push(follow.run());
                 effects.push(Effect::Abandon(*id));
             }
         }
-        if self.leaving.is_none() && !runs.is_empty() {
-            self.say(Severity::Info, format!("abandoning {}", runs.join(", ")));
-        }
         effects
+    }
+
+    /// Abandons start task `id`, once confirmed after `c`, as [`App::abandon`]
+    /// does, and says so, quitting or not. Its job may have started since the
+    /// dialog opened: it is then not abandoned, and the status line says how
+    /// to cancel it, since its pod keeps billing.
+    pub(super) fn abandon_start(&mut self, id: TaskId) -> Vec<Effect> {
+        let Some(follow) = self.training.tasks.get(&id) else {
+            return Vec::new();
+        };
+        let run = follow.run();
+        if !follow.starting() {
+            self.say(
+                Severity::Warn,
+                format!("{run}: its job started, so it was not abandoned; press c to cancel it"),
+            );
+            return Vec::new();
+        }
+        if follow.detach == Detach::Done {
+            self.say(Severity::Info, format!("{run} is being abandoned"));
+            return Vec::new();
+        }
+        self.say(Severity::Info, format!("abandoning {run}"));
+        self.abandon(&[id])
     }
 
     /// On a process signal: every task that follows a run is abandoned at once,
