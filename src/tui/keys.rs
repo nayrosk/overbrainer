@@ -33,8 +33,9 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
     row("1 2 3 4, Tab, Shift-Tab", "switch view"),
     row("?", "this help (Esc, ? or q closes it)"),
     row("q, Ctrl-C", "quit"),
-    row("R", "reload the data files"),
+    row("R", "reload the data files and runs"),
     row("r", "run a pipeline stage, or run (asks which)"),
+    row("y, n Esc", "in a dialog: confirm, cancel (default: no)"),
 ];
 
 const DATASET: &[KeyHelp] = &[
@@ -45,7 +46,6 @@ const DATASET: &[KeyHelp] = &[
     row("s", "stats pane"),
     row("e", "edit in $EDITOR (question, answer, subtopic)"),
     row("d", "delete, with what depends on it (asks first)"),
-    row("y, n Esc", "in a dialog: confirm, cancel (default: no)"),
 ];
 
 const TRAINING: &[KeyHelp] = &[

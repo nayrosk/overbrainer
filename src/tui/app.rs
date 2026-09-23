@@ -818,7 +818,11 @@ impl App {
             return Vec::new();
         }
         match key.code {
-            KeyCode::Char('R') => return self.reload(),
+            KeyCode::Char('R') => {
+                let mut effects = self.reload();
+                effects.extend(self.refresh_runs());
+                return effects;
+            },
             KeyCode::Char('r') => self.run_menu(),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Char('1') => return self.show(View::Dataset),
@@ -1701,6 +1705,14 @@ mod tests {
         }
     }
 
+    /// `effects` but the reads of `runs/` that `R` starts too.
+    fn but_runs(effects: Vec<Effect>) -> Vec<Effect> {
+        effects
+            .into_iter()
+            .filter(|effect| !matches!(effect, Effect::Spawn(_, Task::Runs)))
+            .collect()
+    }
+
     #[test]
     fn a_failed_load_task_is_shown_in_the_view_and_frees_the_load() -> TestResult {
         let mut app = app();
@@ -1714,7 +1726,7 @@ mod tests {
             app.status.as_ref().map(|s| s.severity),
             Some(Severity::Error)
         );
-        only_load(&press(&mut app, &[KeyCode::Char('R')]))?;
+        only_load(&but_runs(press(&mut app, &[KeyCode::Char('R')])))?;
         Ok(())
     }
 
@@ -1723,7 +1735,7 @@ mod tests {
         let mut app = app();
         let first = only_load(&app.start())?;
         assert_eq!(
-            press(&mut app, &[KeyCode::Char('R'), KeyCode::Char('R')]),
+            but_runs(press(&mut app, &[KeyCode::Char('R'), KeyCode::Char('R')])),
             []
         );
         let second = only_load(&app.on_done(first, Ok(Done::Loaded(Ok(dataset())))))?;
@@ -3304,6 +3316,19 @@ mod tests {
         press(&mut app, &[KeyCode::Char('q')]);
         assert_eq!(app.exit, Some(Exit::Quit));
         assert_eq!(app.exit_notes, [kept]);
+    }
+
+    #[test]
+    fn capital_r_reloads_the_data_files_and_the_runs() {
+        let mut app = app();
+        let effects = press(&mut app, &[KeyCode::Char('R')]);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Spawn(_, Task::Load), Effect::Spawn(_, Task::Runs)]
+            ),
+            "{effects:?}"
+        );
     }
 
     #[test]
