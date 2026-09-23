@@ -4,12 +4,14 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use crossterm::event::Event as TermEvent;
 use ratatui::backend::Backend;
 use ratatui::{DefaultTerminal, Terminal};
+use tokio::process::Child;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -80,9 +82,13 @@ where
         tick,
         real,
         suspended: false,
+        editor: None,
         last_draw: None,
     };
     let result = looping.run(app).await;
+    if let Some(mut editor) = looping.editor.take() {
+        stop_editor(&mut editor).await;
+    }
     if let Some(real) = looping.real {
         real.screen.stop().await;
     }
@@ -107,8 +113,11 @@ struct Loop<'t, B: Backend> {
     inbox: UnboundedReceiver<Msg>,
     tick: Interval,
     real: Option<Real>,
-    /// Whether the editor has the terminal: no input is read, nothing is drawn.
+    /// Whether the editor has the terminal: no input is read, nothing is drawn,
+    /// and SIGINT is ignored (it comes from a Ctrl-C typed in the editor).
     suspended: bool,
+    /// The editor running, if any.
+    editor: Option<Child>,
     last_draw: Option<Instant>,
 }
 
@@ -158,13 +167,17 @@ where
         let next_draw = self.next_draw();
         let draw = app.dirty && !self.suspended;
         let signals = self.real.as_mut().map(|real| &mut real.signals);
+        let interrupt = !self.suspended;
         tokio::select! {
             event = self.input.recv(), if !self.suspended => Wake::Input(event),
             Some(message) = self.inbox.recv() => Wake::Message(message),
+            status = wait_editor(self.editor.as_mut()), if self.editor.is_some() => {
+                Wake::Message(Msg::EditorExited(status))
+            },
             Some((id, result)) = self.tasks.next(), if !self.tasks.is_empty() => {
                 Wake::Done(id, result)
             },
-            () = Signals::recv(signals) => Wake::Signal,
+            () = Signals::recv(signals, interrupt) => Wake::Signal,
             _ = self.tick.tick() => Wake::Tick,
             () = tokio::time::sleep_until(next_draw), if draw => Wake::Draw,
         }
@@ -186,39 +199,41 @@ where
     async fn apply(&mut self, effect: Effect) -> anyhow::Result<()> {
         match effect {
             Effect::Spawn(id, task) => self.tasks.spawn(id, task),
-            Effect::OpenEditor { command, path } => self.open_editor(command, path).await?,
+            Effect::OpenEditor { command, path } => self.open_editor(&command, path).await?,
         }
         Ok(())
     }
 
-    /// Hands the terminal to the editor: stops reading input and leaves the
-    /// alternate screen, then runs the editor as a task whose end comes back as
+    /// Hands the terminal to the editor: stops reading input, drops the keys
+    /// read before (they were typed for the TUI, not the editor) and leaves the
+    /// alternate screen, then starts the editor, whose end comes back as
     /// [`Msg::EditorExited`]. Messages and tasks keep being handled meanwhile.
     ///
     /// The editor is started without a shell: its first word is the program, the
     /// others and the file its arguments.
-    async fn open_editor(&mut self, command: Vec<String>, path: PathBuf) -> anyhow::Result<()> {
+    async fn open_editor(&mut self, command: &[String], path: PathBuf) -> anyhow::Result<()> {
         if let Some(real) = &mut self.real {
             real.screen
                 .suspend()
                 .await
                 .context("cannot hand the terminal to the editor")?;
         }
+        while self.input.try_recv().is_ok() {}
         self.suspended = true;
-        let messages = self.messages.clone();
-        tokio::spawn(async move {
-            let status = match command.split_first() {
-                Some((program, args)) => {
-                    tokio::process::Command::new(program)
-                        .args(args)
-                        .arg(&path)
-                        .status()
-                        .await
-                },
-                None => Err(io::Error::other("no editor command")),
-            };
-            messages.send(Msg::EditorExited(status)).ok();
-        });
+        let started = match command.split_first() {
+            Some((program, args)) => tokio::process::Command::new(program)
+                .args(args)
+                .arg(&path)
+                .kill_on_drop(true)
+                .spawn(),
+            None => Err(io::Error::other("no editor command")),
+        };
+        match started {
+            Ok(child) => self.editor = Some(child),
+            Err(error) => {
+                self.messages.send(Msg::EditorExited(Err(error))).ok();
+            },
+        }
         Ok(())
     }
 
@@ -227,10 +242,14 @@ where
     fn on_message(&mut self, app: &mut App, message: Msg) -> anyhow::Result<Vec<Effect>> {
         match message {
             Msg::EditorExited(status) => {
+                self.editor = None;
                 if let Some(real) = &mut self.real {
                     real.screen
                         .resume()
                         .context("cannot take the terminal back from the editor")?;
+                    real.signals
+                        .forget_interrupts()
+                        .context("cannot catch the process signals")?;
                 }
                 self.terminal.clear()?;
                 self.suspended = false;
@@ -258,16 +277,41 @@ impl Signals {
         })
     }
 
-    /// Waits for any of them; for ever without `signals`.
-    async fn recv(signals: Option<&mut Self>) {
+    /// Drops a SIGINT received while it was not listened to: a new listener
+    /// only sees the ones sent after it.
+    fn forget_interrupts(&mut self) -> io::Result<()> {
+        self.interrupt = signal(SignalKind::interrupt())?;
+        Ok(())
+    }
+
+    /// Waits for any of them, SIGINT only when `interrupt`; for ever without
+    /// `signals`. A SIGINT sent meanwhile is kept until
+    /// [`Signals::forget_interrupts`].
+    async fn recv(signals: Option<&mut Self>, interrupt: bool) {
         let Some(signals) = signals else {
             return std::future::pending().await;
         };
         tokio::select! {
-            _ = signals.interrupt.recv() => {},
+            _ = signals.interrupt.recv(), if interrupt => {},
             _ = signals.terminate.recv() => {},
             _ = signals.hangup.recv() => {},
         }
+    }
+}
+
+/// Waits for the editor to end; for ever without one.
+async fn wait_editor(editor: Option<&mut Child>) -> io::Result<ExitStatus> {
+    match editor {
+        Some(editor) => editor.wait().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Kills the editor still running when the TUI ends, and waits for it, so it no
+/// longer uses the terminal the guard restores.
+async fn stop_editor(editor: &mut Child) {
+    if let Err(error) = editor.kill().await {
+        tracing::error!("cannot stop the editor: {error}");
     }
 }
 
@@ -378,6 +422,8 @@ mod tests {
             KeyCode::Char('j'),
             KeyCode::Char('j'),
             KeyCode::Char('e'),
+            // Typed before the editor took the terminal: dropped, not replayed.
+            KeyCode::Char('4'),
         ];
         let quit = async {
             // The data is loaded by then.
@@ -401,6 +447,52 @@ mod tests {
         assert!(texts.contains(&"When does a borrow end?"), "{texts:?}");
         assert!(!texts.contains(&"When does NLL end a borrow?"));
         assert!(app.exit_notes.is_empty());
+        assert_eq!(app.view, crate::tui::app::View::Dataset, "4 was dropped");
+        Ok(())
+    }
+
+    /// Sends `signal` to this test process, through a shell's `kill`.
+    fn raise(signal: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let status = std::process::Command::new("sh")
+            .args(["-c", &format!("kill -{signal} \"$PPID\"")])
+            .status()?;
+        if !status.success() {
+            return Err(format!("kill -{signal}: {status}").into());
+        }
+        Ok(())
+    }
+
+    /// While the editor has the terminal a SIGINT is ignored, and forgotten when
+    /// the TUI takes it back; SIGTERM still ends the TUI. The listeners are
+    /// installed before any signal is sent, so the test process catches them.
+    #[tokio::test]
+    async fn sigint_is_ignored_while_the_editor_runs_and_forgotten_after()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let short = Duration::from_millis(300);
+        let mut signals = Signals::new()?;
+        raise("INT")?;
+        let suspended = tokio::time::timeout(short, Signals::recv(Some(&mut signals), false));
+        assert!(suspended.await.is_err(), "SIGINT woke a suspended loop");
+        signals.forget_interrupts()?;
+        let resumed = tokio::time::timeout(short, Signals::recv(Some(&mut signals), true));
+        assert!(resumed.await.is_err(), "the old SIGINT was replayed");
+        raise("INT")?;
+        tokio::time::timeout(LIMIT, Signals::recv(Some(&mut signals), true)).await?;
+        raise("TERM")?;
+        tokio::time::timeout(LIMIT, Signals::recv(Some(&mut signals), false)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_editor_left_running_is_killed_and_reaped() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut editor = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()?;
+        tokio::time::timeout(LIMIT, stop_editor(&mut editor)).await?;
+        let status = editor.try_wait()?;
+        assert!(status.is_some_and(|status| !status.success()), "{status:?}");
         Ok(())
     }
 }
