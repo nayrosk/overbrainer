@@ -1,6 +1,6 @@
 //! Edits of the dataset files, as the terminal UI makes them: editing a question, an
 //! answer or a subtopic name, with the IDs recomputed and the dependent records kept
-//! consistent. Every operation works on a freshly read [`Dataset`] and checks first
+//! consistent, and deleting with a cascade. Every operation works on a freshly read [`Dataset`] and checks first
 //! that what it changes is still what the user saw; [`Dataset::save`] then writes
 //! every touched file at once.
 
@@ -42,6 +42,32 @@ pub enum EditError {
     /// The edit empties the reasoning of an answer that has one.
     #[error("emptying the reasoning of an answer is refused: delete the answer instead")]
     ReasoningRemoved,
+    /// A deletion would remove other counts than the confirmed ones.
+    #[error("changed on disk; reloaded; press d again")]
+    CountsChanged,
+}
+
+/// What a deletion removes, with what depends on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Deletion {
+    /// A subtopic, its questions and their answers; the subtopic is recorded as
+    /// rejected.
+    Subtopic(Id),
+    /// A question and its answer; the question is recorded as rejected.
+    Question(Id),
+    /// An answer only.
+    Answer(Id),
+    /// The questions of a topic whose subtopic no longer exists, and their answers.
+    MissingSubtopic(String),
+}
+
+/// How many questions and answers a [`Deletion`] removes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Questions removed.
+    pub questions: usize,
+    /// Answers removed.
+    pub answers: usize,
 }
 
 /// Which dataset files a change rewrites.
@@ -417,6 +443,174 @@ impl Dataset {
                 plural(answers)
             ),
         )
+    }
+}
+
+impl Dataset {
+    /// The questions of `topic` whose subtopic is not in `data/subtopics.jsonl`.
+    pub fn missing_subtopic<'a>(&'a self, topic: &'a str) -> impl Iterator<Item = &'a Question> {
+        let subtopics: BTreeSet<&Id> = self.subtopics.iter().map(|subtopic| &subtopic.id).collect();
+        self.questions.iter().filter(move |question| {
+            question.topic == topic && !subtopics.contains(&question.subtopic_id)
+        })
+    }
+
+    /// The questions `deletion` removes, subtopic and answer deletions aside.
+    fn doomed_questions(&self, deletion: &Deletion) -> BTreeSet<Id> {
+        match deletion {
+            Deletion::Subtopic(id) => self
+                .questions
+                .iter()
+                .filter(|question| &question.subtopic_id == id)
+                .map(|question| question.id.clone())
+                .collect(),
+            Deletion::Question(id) => self
+                .questions
+                .iter()
+                .filter(|question| &question.id == id)
+                .map(|question| question.id.clone())
+                .collect(),
+            Deletion::Answer(_) => BTreeSet::new(),
+            Deletion::MissingSubtopic(topic) => self
+                .missing_subtopic(topic)
+                .map(|question| question.id.clone())
+                .collect(),
+        }
+    }
+
+    /// Whether the item `deletion` names exists.
+    fn exists(&self, deletion: &Deletion) -> bool {
+        match deletion {
+            Deletion::Subtopic(id) => self.subtopics.iter().any(|subtopic| &subtopic.id == id),
+            Deletion::Question(id) => self.questions.iter().any(|question| &question.id == id),
+            Deletion::Answer(id) => self.answers.iter().any(|example| &example.id == id),
+            Deletion::MissingSubtopic(topic) => self.missing_subtopic(topic).next().is_some(),
+        }
+    }
+
+    /// The IDs of the answers `deletion` removes: those of its questions, or the
+    /// answer itself.
+    fn doomed_answers(&self, deletion: &Deletion, questions: &BTreeSet<Id>) -> BTreeSet<Id> {
+        self.answers
+            .iter()
+            .filter(|example| match deletion {
+                Deletion::Answer(id) => &example.id == id,
+                _ => questions.contains(&example.id),
+            })
+            .map(|example| example.id.clone())
+            .collect()
+    }
+
+    /// What `deletion` removes, or `None` when what it names does not exist.
+    #[must_use]
+    pub fn counts(&self, deletion: &Deletion) -> Option<Counts> {
+        if !self.exists(deletion) {
+            return None;
+        }
+        let questions = self.doomed_questions(deletion);
+        let answers = self.doomed_answers(deletion, &questions);
+        Some(Counts {
+            questions: questions.len(),
+            answers: answers.len(),
+        })
+    }
+
+    /// Applies `deletion`, which must still remove `expected`; the change records a
+    /// deleted subtopic or question in `data/rejected.jsonl`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditError::Changed`] when what `deletion` names is gone, and
+    /// [`EditError::CountsChanged`] when it would remove other counts.
+    pub fn delete(&mut self, deletion: &Deletion, expected: Counts) -> Result<Change, EditError> {
+        let counts = self.counts(deletion).ok_or(EditError::Changed)?;
+        if counts != expected {
+            return Err(EditError::CountsChanged);
+        }
+        let questions = self.doomed_questions(deletion);
+        let answers = self.doomed_answers(deletion, &questions);
+        let append: Vec<Rejected> = self.rejection(deletion).into_iter().collect();
+        let message = deleted(deletion, &append, counts);
+        let mut touched = Touched::NONE;
+        if let Deletion::Subtopic(id) = deletion {
+            self.subtopics.retain(|subtopic| &subtopic.id != id);
+            touched = Touched::SUBTOPICS;
+        }
+        if !questions.is_empty() {
+            self.questions
+                .retain(|question| !questions.contains(&question.id));
+            touched = touched.and(Touched::QUESTIONS);
+        }
+        if !answers.is_empty() {
+            self.answers
+                .retain(|example| !answers.contains(&example.id));
+            touched = touched.and(Touched::ANSWERS);
+        }
+        Ok(Change {
+            touched,
+            append,
+            message,
+        })
+    }
+
+    /// The record of a deleted subtopic or question for `data/rejected.jsonl`.
+    fn rejection(&self, deletion: &Deletion) -> Option<Rejected> {
+        match deletion {
+            Deletion::Subtopic(id) => self
+                .subtopics
+                .iter()
+                .find(|subtopic| &subtopic.id == id)
+                .map(|subtopic| Rejected::Subtopic {
+                    id: subtopic.id.clone(),
+                    topic: subtopic.topic.clone(),
+                    name: subtopic.name.clone(),
+                }),
+            Deletion::Question(id) => self
+                .questions
+                .iter()
+                .find(|question| &question.id == id)
+                .map(|question| Rejected::Question {
+                    id: question.id.clone(),
+                    topic: question.topic.clone(),
+                    subtopic_id: question.subtopic_id.clone(),
+                    text: question.text.clone(),
+                }),
+            Deletion::Answer(_) | Deletion::MissingSubtopic(_) => None,
+        }
+    }
+}
+
+/// What a deletion did, for the user; `rejected` holds its rejected record.
+fn deleted(deletion: &Deletion, rejected: &[Rejected], counts: Counts) -> String {
+    let Counts { questions, answers } = counts;
+    match deletion {
+        Deletion::Subtopic(_) => {
+            let name = rejected
+                .iter()
+                .find_map(|record| match record {
+                    Rejected::Subtopic { name, .. } => Some(name.as_str()),
+                    Rejected::Question { .. } => None,
+                })
+                .unwrap_or_default();
+            format!(
+                "subtopic \"{name}\" deleted with its {questions} question{} and {answers} answer{}; \
+                 recorded in data/rejected.jsonl",
+                plural(questions),
+                plural(answers)
+            )
+        },
+        Deletion::Question(_) if answers > 0 => {
+            "question deleted with its answer; recorded in data/rejected.jsonl".to_string()
+        },
+        Deletion::Question(_) => "question deleted; recorded in data/rejected.jsonl".to_string(),
+        Deletion::Answer(_) => {
+            "answer deleted; the next answers run asks the parent again".to_string()
+        },
+        Deletion::MissingSubtopic(_) => format!(
+            "{questions} question{} whose subtopic no longer exists deleted, and their {answers} answer{}",
+            plural(questions),
+            plural(answers)
+        ),
     }
 }
 
@@ -837,6 +1031,171 @@ mod tests {
         let mut expected = data.rejected.clone();
         expected.push(appended);
         assert_eq!(read::<Rejected>(&files.rejected)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn counts_say_what_a_deletion_removes() {
+        let mut data = dataset();
+        let open = Id::question(&borrowing_id(), OPEN);
+        let counts = |questions, answers| Some(Counts { questions, answers });
+        assert_eq!(
+            data.counts(&Deletion::Subtopic(borrowing_id())),
+            counts(2, 1)
+        );
+        assert_eq!(
+            data.counts(&Deletion::Question(answered_id())),
+            counts(1, 1)
+        );
+        assert_eq!(data.counts(&Deletion::Question(open)), counts(1, 0));
+        assert_eq!(data.counts(&Deletion::Answer(answered_id())), counts(0, 1));
+        assert_eq!(data.counts(&Deletion::Answer(Id::of(&["none"]))), None);
+        assert_eq!(data.counts(&Deletion::MissingSubtopic(TOPIC.into())), None);
+        data.subtopics.remove(0);
+        assert_eq!(
+            data.counts(&Deletion::MissingSubtopic(TOPIC.into())),
+            counts(2, 1)
+        );
+        assert_eq!(data.missing_subtopic(TOPIC).count(), 2);
+    }
+
+    #[test]
+    fn deleting_a_subtopic_cascades_and_records_only_the_subtopic() -> Result<(), EditError> {
+        let mut data = dataset();
+        let expected = Counts {
+            questions: 2,
+            answers: 1,
+        };
+        let change = data.delete(&Deletion::Subtopic(borrowing_id()), expected)?;
+        assert_eq!(data.subtopics, [subtopic("Lifetimes")]);
+        assert!(data.questions.is_empty());
+        assert!(data.answers.is_empty());
+        assert_eq!(
+            change.append,
+            [Rejected::Subtopic {
+                id: borrowing_id(),
+                topic: TOPIC.into(),
+                name: "Borrowing".into(),
+            }]
+        );
+        assert_eq!(
+            change.touched,
+            Touched::SUBTOPICS
+                .and(Touched::QUESTIONS)
+                .and(Touched::ANSWERS)
+        );
+        assert_eq!(
+            change.message,
+            "subtopic \"Borrowing\" deleted with its 2 questions and 1 answer; recorded in data/rejected.jsonl"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_a_question_takes_its_answer_and_records_the_question() -> Result<(), EditError> {
+        let mut data = dataset();
+        let expected = Counts {
+            questions: 1,
+            answers: 1,
+        };
+        let change = data.delete(&Deletion::Question(answered_id()), expected)?;
+        assert_eq!(data.questions.len(), 1);
+        assert!(data.answers.is_empty());
+        assert_eq!(
+            change.append,
+            [Rejected::Question {
+                id: answered_id(),
+                topic: TOPIC.into(),
+                subtopic_id: borrowing_id(),
+                text: ANSWERED.into(),
+            }]
+        );
+        assert_eq!(change.touched, Touched::QUESTIONS.and(Touched::ANSWERS));
+        assert_eq!(
+            change.message,
+            "question deleted with its answer; recorded in data/rejected.jsonl"
+        );
+        let open = Id::question(&borrowing_id(), OPEN);
+        let expected = Counts {
+            questions: 1,
+            answers: 0,
+        };
+        let change = data.delete(&Deletion::Question(open), expected)?;
+        assert_eq!(change.touched, Touched::QUESTIONS);
+        assert_eq!(
+            change.message,
+            "question deleted; recorded in data/rejected.jsonl"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_an_answer_keeps_its_question_and_records_nothing() -> Result<(), EditError> {
+        let mut data = dataset();
+        let expected = Counts {
+            questions: 0,
+            answers: 1,
+        };
+        let change = data.delete(&Deletion::Answer(answered_id()), expected)?;
+        assert_eq!(data.questions.len(), 2);
+        assert!(data.answers.is_empty());
+        assert!(change.append.is_empty());
+        assert_eq!(change.touched, Touched::ANSWERS);
+        assert_eq!(
+            change.message,
+            "answer deleted; the next answers run asks the parent again"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_the_missing_subtopic_group_records_nothing() -> Result<(), EditError> {
+        let mut data = dataset();
+        data.subtopics.remove(0);
+        let expected = Counts {
+            questions: 2,
+            answers: 1,
+        };
+        let change = data.delete(&Deletion::MissingSubtopic(TOPIC.into()), expected)?;
+        assert!(data.questions.is_empty());
+        assert!(data.answers.is_empty());
+        assert!(change.append.is_empty());
+        assert_eq!(
+            change.message,
+            "2 questions whose subtopic no longer exists deleted, and their 1 answer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deletion_whose_counts_changed_on_disk_is_refused() {
+        let mut data = dataset();
+        let before = data.clone();
+        let stale = Counts {
+            questions: 3,
+            answers: 1,
+        };
+        let result = data.delete(&Deletion::Subtopic(borrowing_id()), stale);
+        assert!(matches!(result, Err(EditError::CountsChanged)));
+        let gone = data.delete(&Deletion::Answer(Id::of(&["none"])), Counts::default());
+        assert!(matches!(gone, Err(EditError::Changed)));
+        assert_eq!(data, before);
+    }
+
+    #[test]
+    fn save_appends_the_rejected_records() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let files = DataFiles::new(dir.path());
+        let mut data = dataset();
+        data.save(&DataFiles::new(dir.path()), &Change::new(Touched::ALL, ""))?;
+        let expected = Counts {
+            questions: 1,
+            answers: 1,
+        };
+        let change = data.delete(&Deletion::Question(answered_id()), expected)?;
+        data.save(&files, &change)?;
+        data.rejected.extend(change.append);
+        assert_eq!(Dataset::read(&files)?, data);
         Ok(())
     }
 }
