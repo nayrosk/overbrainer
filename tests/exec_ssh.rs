@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use overbrainer::exec::{
-    ExecError, Executor, JobCommand, JobId, JobStatus, MAX_TAIL_READ, SshExecutor,
+    ExecError, Executor, JobCommand, JobId, JobStatus, MAX_TAIL_READ, SshExecutor, sha256_file,
 };
 use secrecy::SecretString;
 use tokio::sync::Semaphore;
@@ -446,5 +446,74 @@ async fn an_unknown_host_key_is_refused() -> TestResult {
         result.is_err(),
         "connected to a host missing from known_hosts"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_manifest_of_the_target_matches_the_downloaded_files() -> TestResult {
+    let Some(executor) = connect("manifest").await? else {
+        skip();
+        return Ok(());
+    };
+    let remote = format!("{}/r9", executor.workdir());
+    let made = executor
+        .spawn(&job(
+            remote.clone(),
+            "mkdir -p output/checkpoint-5 output/nested && echo w > output/adapter.bin && echo n > output/nested/config.json && echo s > output/checkpoint-5/state",
+        ))
+        .await?;
+    assert_eq!(wait_finished(&executor, &made).await?, JobStatus::Exited(0));
+    let entries = [
+        "output".to_string(),
+        "job.log".to_string(),
+        "missing".to_string(),
+    ];
+    let exclude = ["checkpoint-*".to_string()];
+    let manifest = executor.manifest(&remote, &entries, &exclude).await?;
+    let paths: Vec<&str> = manifest.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["job.log", "output/adapter.bin", "output/nested/config.json"]
+    );
+    let local = tempfile::tempdir()?;
+    executor
+        .download(&remote, local.path(), &entries, &exclude)
+        .await?;
+    for file in &manifest {
+        assert_eq!(
+            sha256_file(&local.path().join(&file.path))?,
+            file.sha256,
+            "{}",
+            file.path
+        );
+    }
+    let gone = executor
+        .manifest(&format!("{remote}/gone"), &entries, &exclude)
+        .await;
+    assert!(
+        matches!(&gone, Err(ExecError::Command { action: "manifest", message }) if message.ends_with("does not exist")),
+        "{gone:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_marker_is_written_through_a_rename() -> TestResult {
+    let Some(executor) = connect("marker").await? else {
+        skip();
+        return Ok(());
+    };
+    let dir = format!("{}/r10/.pod", executor.workdir());
+    let made = executor.spawn(&job(dir.clone(), "true")).await?;
+    assert_eq!(wait_finished(&executor, &made).await?, JobStatus::Exited(0));
+    let marker = format!("{dir}/retrieved");
+    executor.write_marker(&marker).await?;
+    let listing = probe(&executor, dir.clone(), "ls -a").await?;
+    assert!(listing.lines().any(|name| name == "retrieved"), "{listing}");
+    assert!(!listing.contains("retrieved.tmp"), "{listing}");
+    let missing = executor
+        .write_marker(&format!("{}/no/such/dir/retrieved", executor.workdir()))
+        .await;
+    assert!(missing.is_err());
     Ok(())
 }

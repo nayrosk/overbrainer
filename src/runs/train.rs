@@ -443,7 +443,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::exec::{JobCommand, MAX_TAIL_READ, Pid};
+    use crate::exec::{FileDigest, JobCommand, MAX_TAIL_READ, Pid};
     use crate::runs::RECORD_FILE;
     use crate::train::Artifacts;
 
@@ -608,6 +608,15 @@ mod tests {
             } else {
                 Ok(())
             })
+        }
+
+        fn manifest(
+            &self,
+            _remote: &str,
+            _entries: &[String],
+            _exclude: &[String],
+        ) -> impl Future<Output = Result<Vec<FileDigest>, ExecError>> + Send {
+            ready(Ok(Vec::new()))
         }
     }
 

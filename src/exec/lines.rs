@@ -106,7 +106,7 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::exec::{JobCommand, JobId, JobStatus};
+    use crate::exec::{FileDigest, JobCommand, JobId, JobStatus};
 
     use super::*;
 
@@ -191,6 +191,15 @@ mod tests {
             _exclude: &[String],
         ) -> impl Future<Output = Result<(), ExecError>> + Send {
             std::future::ready(Ok(()))
+        }
+
+        fn manifest(
+            &self,
+            _remote: &str,
+            _entries: &[String],
+            _exclude: &[String],
+        ) -> impl Future<Output = Result<Vec<FileDigest>, ExecError>> + Send {
+            std::future::ready(Ok(Vec::new()))
         }
     }
 

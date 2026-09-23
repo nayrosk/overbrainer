@@ -10,9 +10,9 @@ use tokio::process::Child;
 
 use super::tar;
 use super::{
-    CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, JOB_LOG, JobCommand, JobId,
-    JobStatus, PID_FILE, Pid, cancel_script, check_secrets, job_script, parse_status, quote,
-    shell_path, status_script,
+    CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, FileDigest, JOB_LOG, JobCommand,
+    JobId, JobStatus, PID_FILE, Pid, cancel_script, check_secrets, job_script, manifest_script,
+    parse_manifest, parse_status, quote, shell_path, status_script,
 };
 
 /// Runs jobs on a remote Linux machine through the user's `ssh`: `~/.ssh/config`, the
@@ -85,6 +85,25 @@ impl SshExecutor {
             )));
         }
         Ok(Self { session, workdir })
+    }
+
+    /// Creates the empty file `path` on the target through a rename, so a reader
+    /// never sees it half made. A Runpod run writes its `.pod/retrieved` marker
+    /// with it; the parent directory must exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Command`] when the file cannot be created, and
+    /// [`ExecError::Ssh`] when the target cannot be reached.
+    pub async fn write_marker(&self, path: &str) -> Result<(), ExecError> {
+        let script = format!(
+            ": > {tmp} && mv -f {tmp} {path}",
+            tmp = quote(&format!("{path}.tmp")),
+            path = quote(path)
+        );
+        run(&self.session, &script, "write a marker")
+            .await
+            .map(drop)
     }
 
     async fn start(&self, job: &JobCommand) -> Result<JobId, ExecError> {
@@ -205,6 +224,17 @@ impl Executor for SshExecutor {
         exclude: &[String],
     ) -> Result<(), ExecError> {
         self.fetch(remote, local, entries, exclude).await
+    }
+
+    async fn manifest(
+        &self,
+        remote: &str,
+        entries: &[String],
+        exclude: &[String],
+    ) -> Result<Vec<FileDigest>, ExecError> {
+        let script = manifest_script(remote, entries, exclude);
+        let output = run(&self.session, &script, "manifest").await?;
+        parse_manifest(&String::from_utf8_lossy(&output))
     }
 }
 
