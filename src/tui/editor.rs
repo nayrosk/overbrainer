@@ -217,7 +217,12 @@ pub(super) fn check(session: &Session, bytes: Vec<u8>) -> Result<Edited, Refusal
         },
         Target::Answer { id, before } => {
             let after = answer(&text)?;
-            if &after == before {
+            // The original goes through the same parse, so the newlines the
+            // sections lose there do not count as a change.
+            let original = text_of(&session.target)
+                .ok()
+                .and_then(|text| answer(&text).ok());
+            if &after == before || original.as_ref() == Some(&after) {
                 return Err(Refusal::drop("unchanged"));
             }
             Ok(Edited::Answer {
@@ -411,6 +416,17 @@ mod tests {
         };
         assert_eq!(after.content, "Because of moves.");
         assert_eq!(after.reasoning.as_deref(), Some("Let me think.\nAgain."));
+        Ok(())
+    }
+
+    #[test]
+    fn an_answer_opened_and_closed_as_is_is_unchanged() -> Result<(), String> {
+        let session = session(answer_target(Some("\nLet me think."), "Because.\n"));
+        let text = text_of(&session.target)?;
+        assert_eq!(
+            check(&session, text.into_bytes()),
+            Err(Refusal::drop("unchanged"))
+        );
         Ok(())
     }
 
