@@ -127,6 +127,30 @@ fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// The message with its chain of causes, as `{:#}` prints it at the top level.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        text = format!("{text}: {next}");
+        cause = next.source();
+    }
+    text
+}
+
+#[test]
+fn a_read_error_names_its_cause_once() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let Err(error) = load(dir.path(), env(&[])) else {
+        return Err("expected an error".into());
+    };
+    for text in [error.to_string(), chain(&error)] {
+        assert!(text.starts_with("cannot read "), "{text}");
+        assert_eq!(text.matches("(os error 2)").count(), 1, "{text}");
+    }
+    Ok(())
+}
+
 const TARGETS: &str = r#"
 [targets.gpu]
 kind = "runpod"

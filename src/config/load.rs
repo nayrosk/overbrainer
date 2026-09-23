@@ -24,14 +24,14 @@ pub enum EnvSource {
 /// Everything that can go wrong while loading configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// The configuration file could not be read.
-    #[error("cannot read {}: {source}", path.display())]
+    /// The configuration file could not be read. The I/O error is part of the
+    /// message and not a source, so a chain of causes (`{:#}`) names it once.
+    #[error("cannot read {}: {error}", path.display())]
     Read {
         /// Path to the file that could not be read.
         path: PathBuf,
         /// Underlying I/O error.
-        #[source]
-        source: std::io::Error,
+        error: std::io::Error,
     },
     /// The file or environment could not be parsed into `Settings`. The message names
     /// the key and the expected type, never the offending value, which may be a secret
@@ -112,9 +112,9 @@ fn redact(message: &str) -> String {
 /// when an env-only key is set in the file.
 pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError> {
     let path = project_dir.join(CONFIG_FILE);
-    let content = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
+    let content = std::fs::read_to_string(&path).map_err(|error| ConfigError::Read {
         path: path.clone(),
-        source,
+        error,
     })?;
     let env: Option<config::Map<String, String>> = match env {
         EnvSource::Process => None,
