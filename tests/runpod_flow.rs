@@ -15,7 +15,7 @@ use overbrainer::exec::{Executor, JobCommand, LocalExecutor};
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
     AttemptResult, DeletedBy, PodCtx, PodError, PodRecord, PodState, RunpodClient, RunpodTarget,
-    Timing, follow, reconnect, start_pod,
+    Timing, Watched, follow, reconnect, settle_watch, start_pod, watch_on_pod,
 };
 use overbrainer::runs::{RunCtx, RunRecord, RunState, Runs, create};
 use overbrainer::train::{Artifacts, TrainError, Trainer};
@@ -371,6 +371,49 @@ async fn the_client_deletes_a_pod_past_its_deadline() -> TestResult {
         saved.message.as_deref(),
         Some("max_hours reached: the pod was deleted before the job ended")
     );
+    assert_eq!(deletes(&harness.server).await, 1);
+    Ok(())
+}
+
+/// The CLI races the watch against Ctrl-C, which may drop it: past the
+/// deadline, the watch itself deletes nothing, and the delete comes from
+/// `settle_watch`, which the CLI shields.
+#[tokio::test]
+async fn a_watch_past_its_deadline_deletes_nothing_until_settled() -> TestResult {
+    let harness = Harness::new().await?;
+    serve_p1(&harness.server, false).await;
+    let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
+    let mut run = create(&harness.runs, executor.workdir(), "gpu_cloud")?;
+    let job = executor
+        .spawn(&JobCommand {
+            dir: run.remote_dir.clone(),
+            script: "sleep 30".into(),
+            secrets: Vec::new(),
+            container: None,
+        })
+        .await?;
+    run.job = Some(job.clone());
+    run.state = RunState::Running;
+    harness.runs.save(&run)?;
+    let mut pod = pod_record(&run.id, false, Duration::from_secs(600))?;
+    let run_ctx = RunCtx {
+        runs: &harness.runs,
+        executor: &executor,
+        bus: &harness.bus,
+        poll: Duration::from_millis(50),
+    };
+    let watched = watch_on_pod(&run_ctx, &Nothing, run.clone(), &pod).await;
+    assert!(matches!(watched, Watched::DeadlinePassed));
+    assert_eq!(deletes(&harness.server).await, 0);
+    assert_eq!(harness.runs.load(&run.id)?.state, RunState::Running);
+    let result = settle_watch(&harness.ctx(), &mut pod, &run.id, watched).await;
+    executor.cancel(&job).await?;
+    assert!(
+        matches!(result, Err(PodError::DeadlineReached)),
+        "{result:?}"
+    );
+    assert_eq!(pod.state, PodState::Deleted);
+    assert_eq!(harness.runs.load(&run.id)?.state, RunState::Failed);
     assert_eq!(deletes(&harness.server).await, 1);
     Ok(())
 }

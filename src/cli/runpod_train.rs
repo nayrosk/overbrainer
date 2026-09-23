@@ -20,8 +20,8 @@ use crate::events::EventBus;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{
     DeleteReason, DeletedBy, Ending, PodCtx, PodError, PodRecord, PodState, RunpodClient,
-    RunpodTarget, Timing, chain, end_pod, follow, forget_client_key, job_started, listed_rows,
-    orphan_warnings, reconnect, remove, ssh_command, start_pod,
+    RunpodTarget, Timing, chain, end_pod, forget_client_key, job_started, listed_rows,
+    orphan_warnings, reconnect, remove, settle_watch, ssh_command, start_pod, watch_on_pod,
 };
 use crate::runs::{
     Launch, Outcome, RunCtx, RunRecord, RunState, Runs, artifacts_missing, cancel as cancel_job,
@@ -159,9 +159,6 @@ impl Job<'_> {
             Err(PodError::Interrupted) => bail!(interrupted_before_job(&self.session.runs, &id)),
             Err(error) => return Err(error.into()),
         };
-        if keep {
-            warn(&keep_warning(&pod, &id));
-        }
         if interrupt.caught() || self.session.interrupted.load(Ordering::SeqCst) {
             return abandon(&ctx, interrupt, &mut pod, &id).await;
         }
@@ -189,7 +186,20 @@ impl Job<'_> {
                 return Err(error.into());
             },
         };
-        job_started(&self.session.runs, &mut pod)?;
+        if keep {
+            // Only now: until the job started, Ctrl-C or a failure deleted the pod.
+            warn(&keep_warning(&pod, &id));
+        }
+        // The job runs on a billed pod: the error says how to reach or remove it.
+        job_started(&self.session.runs, &mut pod).with_context(|| {
+            format!(
+                "the job of run {id} runs on pod {}{}; {}, or delete the pod with \
+                 `overbrainer pod rm {id}`",
+                pod_name(&pod),
+                rate(&pod),
+                reattach(&id)
+            )
+        })?;
         if interrupt.caught() {
             bail!(detached(&pod, &id, self.spec));
         }
@@ -208,22 +218,29 @@ impl Job<'_> {
     ) -> anyhow::Result<()> {
         let ctx = self.session.ctx();
         let id = record.id.clone();
-        let followed = interrupt
-            .race(follow(
-                &ctx,
+        // Only the watch is raced: it never calls the API, so Ctrl-C drops
+        // nothing half done. Acting on it (deleting the pod past the deadline)
+        // is shielded.
+        let watched = interrupt
+            .race(watch_on_pod(
                 &self.run_ctx(executor),
                 self.trainer,
                 record,
                 pod,
             ))
             .await;
-        let outcome = match followed {
-            None => bail!(detached(pod, &id, self.spec)),
-            Some(Err(error @ PodError::Run(_))) => {
+        let Some(watched) = watched else {
+            bail!(detached(pod, &id, self.spec));
+        };
+        let settled = interrupt
+            .shield(settle_watch(&ctx, pod, &id, watched))
+            .await;
+        let outcome = match settled {
+            Err(error @ PodError::Run(_)) => {
                 return Err(anyhow::Error::new(error).context(reattach(&id)));
             },
-            Some(Err(error)) => return Err(error.into()),
-            Some(Ok(outcome)) => outcome,
+            Err(error) => return Err(error.into()),
+            Ok(outcome) => outcome,
         };
         self.end(interrupt, executor, pod, outcome).await
     }
@@ -437,7 +454,10 @@ fn keep_warning(pod: &PodRecord, id: &str) -> String {
 /// The message of a run left running on its pod after Ctrl-C.
 fn detached(pod: &PodRecord, id: &str, spec: &RunpodTarget) -> String {
     let guard = if pod.keep {
-        "The pod is kept with no time limit (--keep-pod).".to_string()
+        format!(
+            "The pod is kept with no time limit (--keep-pod): `{}`.",
+            ssh_command(id)
+        )
     } else {
         format!(
             "The watchdog deletes the pod {} min after the job ends if its results are not retrieved, and by {} in any case.",
@@ -454,12 +474,21 @@ fn detached(pod: &PodRecord, id: &str, spec: &RunpodTarget) -> String {
     )
 }
 
-/// Says what became of the pod once the job ended. A deleted pod was already
-/// reported by its events, and one awaiting retrieval by `end_pod`.
+/// Says what became of the pod once the job ended: see [`report_line`].
 fn report(pod: &PodRecord, ending: Ending, id: &str) {
+    if let Some(line) = report_line(pod, ending, id) {
+        warn(&line);
+    }
+}
+
+/// What to say of the pod once the job ended. Nothing for a deleted pod, which
+/// its events already reported, nor for one awaiting retrieval, which `end_pod`
+/// reported, unless it is kept: how to reach a kept pod is said here.
+fn report_line(pod: &PodRecord, ending: Ending, id: &str) -> Option<String> {
     match ending {
-        Ending::Deleted | Ending::AwaitingRetrieval => {},
-        Ending::Kept => warn(&format!(
+        Ending::Deleted => None,
+        Ending::AwaitingRetrieval if !pod.keep => None,
+        Ending::Kept | Ending::AwaitingRetrieval => Some(format!(
             "pod {} kept (--keep-pod): `{}`; remove it with `overbrainer pod rm {id}`; \
              nothing deletes it automatically",
             pod_name(pod),
@@ -625,10 +654,29 @@ mod tests {
                  not retrieved, and by {deadline} in any case."
             )
         );
-        assert!(
-            detached(&pod(true)?, "r1", &target())
-                .ends_with("The pod is kept with no time limit (--keep-pod).")
+        assert!(detached(&pod(true)?, "r1", &target()).ends_with(
+            "The pod is kept with no time limit (--keep-pod): \
+             `ssh -F runs/r1/ssh/config overbrainer-r1`."
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_kept_pod_is_reported_with_its_ssh_command_even_unretrieved()
+    -> Result<(), serde_json::Error> {
+        let kept = "pod k3x9abc kept (--keep-pod): `ssh -F runs/r1/ssh/config overbrainer-r1`; \
+                    remove it with `overbrainer pod rm r1`; nothing deletes it automatically";
+        let (keep, guarded) = (pod(true)?, pod(false)?);
+        assert_eq!(
+            report_line(&keep, Ending::Kept, "r1").as_deref(),
+            Some(kept)
         );
+        assert_eq!(
+            report_line(&keep, Ending::AwaitingRetrieval, "r1").as_deref(),
+            Some(kept)
+        );
+        assert_eq!(report_line(&guarded, Ending::AwaitingRetrieval, "r1"), None);
+        assert_eq!(report_line(&guarded, Ending::Deleted, "r1"), None);
         Ok(())
     }
 }

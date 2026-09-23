@@ -824,11 +824,13 @@ impl Trainer for Observer {
     }
 }
 
-/// `train`'s order on a pod: provisioning saves the pod's ID in `pod.json`, so
-/// by the time the job is started and the run saved `Running`, `pod rm` and
-/// `pod ls` already know which pod trains.
+/// The library order the CLI's `train` relies on: `provision` has saved the
+/// pod's ID in `pod.json` when it returns, so when `runs::start` then prepares
+/// the run (before it spawns the job and saves the run `Running`), `pod.json`
+/// already names the pod. It does not drive the CLI itself: that one generates
+/// a host key only a real pod's bootstrap installs.
 #[tokio::test]
-async fn the_pod_id_is_saved_before_the_run_goes_running() -> TestResult {
+async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestResult {
     let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());

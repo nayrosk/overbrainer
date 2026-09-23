@@ -4,14 +4,16 @@
 
 use std::path::Path;
 use std::process::{Output, Stdio};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use assert_cmd::Command;
-use overbrainer::runpod::{AttemptResult, Pod, PodRecord, PodState};
+use overbrainer::runpod::{AttemptResult, Pod, PodId, PodRecord, PodState};
 use overbrainer::runs::{RunRecord, RunState, Runs};
 use serde_json::json;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -255,22 +257,13 @@ async fn keep_pod_is_refused_off_runpod_and_a_missing_key_is_named() -> TestResu
     Ok(())
 }
 
+/// A pod recorded deleted is never looked up again: finding a pod gone (three
+/// 404s in a row and a list without it) is covered by `tests/runpod_flow.rs`.
 #[tokio::test]
 async fn a_run_whose_pod_is_gone_has_nothing_to_cancel_and_fails_on_attach() -> TestResult {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v2/pods/p1"))
-        .respond_with(not_found())
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v2/pods"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": []})))
-        .mount(&server)
-        .await;
     let dir = project()?;
-    recorded_run(dir.path(), RUN, RunState::Running, "p1", PodState::Running)?;
-    // Three 404s in a row and a list without it: the pod is gone.
+    recorded_run(dir.path(), RUN, RunState::Running, "p1", PodState::Deleted)?;
     let mut cmd = overbrainer(dir.path(), &server)?;
     cmd.args(["train", "cancel", RUN]);
     let cancelled = output(cmd).await?;
@@ -281,17 +274,8 @@ async fn a_run_whose_pod_is_gone_has_nothing_to_cancel_and_fails_on_attach() -> 
         "{stderr}"
     );
     let runs = Runs::new(dir.path());
-    let pod = PodRecord::load(&runs, RUN)?.ok_or("no pod.json")?;
-    assert_eq!(pod.state, PodState::Deleted);
-    let requests = server.received_requests().await.unwrap_or_default();
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.method.as_str() == "GET")
-    );
-    assert_eq!(requests.len(), 4, "3 looks at the pod and 1 list");
+    assert_eq!(runs.load(RUN)?.state, RunState::Running);
 
-    // The pod is recorded deleted: attach fails the run from its local files.
     let mut cmd = overbrainer(dir.path(), &server)?;
     cmd.args(["train", "attach", RUN]);
     let attached = output(cmd).await?;
@@ -307,11 +291,172 @@ async fn a_run_whose_pod_is_gone_has_nothing_to_cancel_and_fails_on_attach() -> 
         String::from_utf8_lossy(&attached.stdout)
     );
     assert_eq!(runs.load(RUN)?.state, RunState::Failed);
-    assert_eq!(
-        server.received_requests().await.unwrap_or_default().len(),
-        4,
-        "attach looked at a pod recorded deleted"
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "a pod recorded deleted was looked up"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn train_options_are_refused_with_attach_and_cancel() -> TestResult {
+    let server = MockServer::start().await;
+    let dir = project()?;
+    for args in [
+        vec!["train", "--keep-pod", "attach", RUN],
+        vec!["train", "--keep-pod", "cancel", RUN],
+        vec!["train", "--target", "here", "attach", RUN],
+        vec!["train", "--target", "here", "cancel", RUN],
+    ] {
+        let mut cmd = overbrainer(dir.path(), &server)?;
+        cmd.args(&args);
+        let refused = output(cmd).await?;
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains("cannot be used with"), "{args:?}: {stderr}");
+    }
+    assert!(!dir.path().join("runs").exists());
+    Ok(())
+}
+
+/// `POST /pods` creates pod `p1`, which never offers an SSH endpoint; a DELETE
+/// removes it, and the stub counts the calls.
+async fn serve_unreachable_pod(server: &MockServer) {
+    let deleted = Arc::new(AtomicBool::new(false));
+    let body = json!({
+        "id": "p1",
+        "name": "overbrainer-pod-1",
+        "status": "RUNNING",
+        "cost": 0.44
+    });
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&body))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Present {
+            deleted: Arc::clone(&deleted),
+            body,
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Deleted(deleted))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": []})))
+        .mount(server)
+        .await;
+}
+
+/// `GET /pods/p1`: the pod until deleted, then Runpod's 404.
+struct Present {
+    deleted: Arc<AtomicBool>,
+    body: serde_json::Value,
+}
+
+impl Respond for Present {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        if self.deleted.load(Ordering::SeqCst) {
+            not_found()
+        } else {
+            ResponseTemplate::new(200).set_body_json(&self.body)
+        }
+    }
+}
+
+struct Deleted(Arc<AtomicBool>);
+
+impl Respond for Deleted {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        self.0.store(true, Ordering::SeqCst);
+        ResponseTemplate::new(204)
+    }
+}
+
+async fn count(server: &MockServer, verb: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.method.as_str() == verb)
+        .count()
+}
+
+#[tokio::test]
+async fn ctrl_c_while_the_pod_starts_deletes_it_and_fails_the_run() -> TestResult {
+    if !keygen_available() {
+        return Ok(());
+    }
+    let server = MockServer::start().await;
+    serve_unreachable_pod(&server).await;
+    let dir = project()?;
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("overbrainer"));
+    cmd.env_clear()
+        .env("NO_COLOR", "1")
+        .env("HOME", "/nonexistent")
+        .env("PATH", "/usr/bin:/bin")
+        .env("OVERBRAINER_RUNPOD__API_KEY", KEY)
+        .env(
+            "OVERBRAINER_RUNPOD__BASE_URL",
+            format!("{}/v2", server.uri()),
+        )
+        .arg("-C")
+        .arg(dir.path())
+        .arg("train")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn()?;
+    let limit = Instant::now() + Duration::from_secs(30);
+    while count(&server, "POST").await == 0 {
+        if Instant::now() > limit {
+            return Err("the pod was never created".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let status = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()?;
+    assert!(status.success());
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || child.wait_with_output()),
+    )
+    .await???;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(stdout, "");
+    assert!(!stderr.contains(KEY) && !stdout.contains(KEY));
+    assert!(
+        stderr.contains("stopped before its job started; it has no pod left"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("pod: deleting p1 (interrupted before the job started)"),
+        "{stderr}"
+    );
+    assert_eq!(count(&server, "DELETE").await, 1);
+    let runs = Runs::new(dir.path());
+    let run = runs.list()?.pop().ok_or("no run")?;
+    assert_eq!(run.state, RunState::Failed);
+    assert_eq!(
+        run.message.as_deref(),
+        Some("interrupted before the job started")
+    );
+    let pod = PodRecord::load(&runs, &run.id)?.ok_or("no pod.json")?;
+    assert_eq!(pod.state, PodState::Deleted);
+    assert_eq!(pod.pod_id.as_ref().map(PodId::as_str), Some("p1"));
     Ok(())
 }
 

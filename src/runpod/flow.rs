@@ -10,7 +10,7 @@ use secrecy::SecretString;
 
 use crate::events::Event;
 use crate::exec::{Executor, SshExecutor};
-use crate::runs::{Outcome, RunCtx, RunRecord, RunState, Runs, watch};
+use crate::runs::{Outcome, RunCtx, RunError, RunRecord, RunState, Runs, watch};
 use crate::train::Trainer;
 
 use super::provision::note_strays;
@@ -106,6 +106,7 @@ pub fn job_started(runs: &Runs, pod: &mut PodRecord) -> Result<(), PodError> {
 /// Follows the started run `record` with `runs::watch`, until its job ends, with
 /// the client's own guard: at the watchdog's deadline plus [`DEADLINE_MARGIN`], a
 /// pod still there is deleted and the run saved `Failed` (never for a kept pod).
+/// That is [`watch_on_pod`], then [`settle_watch`].
 ///
 /// # Errors
 ///
@@ -121,17 +122,58 @@ pub async fn follow<E: Executor, T: Trainer>(
     pod: &mut PodRecord,
 ) -> Result<Outcome, PodError> {
     let id = record.id.clone();
-    let watched = match until_deadline(pod) {
+    let watched = watch_on_pod(run_ctx, trainer, record, pod).await;
+    settle_watch(ctx, pod, &id, watched).await
+}
+
+/// How [`watch_on_pod`] ended.
+#[derive(Debug)]
+pub enum Watched {
+    /// The watch ended first, with its outcome or its error.
+    Ended(Box<Result<Outcome, RunError>>),
+    /// The client's deadline passed first; nothing was deleted yet.
+    DeadlinePassed,
+}
+
+/// Watches the started run `record` until its job ends or the client's deadline
+/// (the watchdog's plus [`DEADLINE_MARGIN`]; none for a kept pod) passes. It
+/// never calls the Runpod API, so dropping it (on Ctrl-C) loses nothing: what
+/// it found is acted on by [`settle_watch`].
+pub async fn watch_on_pod<E: Executor, T: Trainer>(
+    run_ctx: &RunCtx<'_, E>,
+    trainer: &T,
+    record: RunRecord,
+    pod: &PodRecord,
+) -> Watched {
+    match until_deadline(pod) {
         Some(wait) => tokio::select! {
-            outcome = watch(run_ctx, trainer, record) => Some(outcome),
-            () = tokio::time::sleep(wait) => None,
+            outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
+            () = tokio::time::sleep(wait) => Watched::DeadlinePassed,
         },
-        None => Some(watch(run_ctx, trainer, record).await),
-    };
+        None => Watched::Ended(Box::new(watch(run_ctx, trainer, record).await)),
+    }
+}
+
+/// Acts on what [`watch_on_pod`] found for the run `run_id`: past the deadline,
+/// deletes the pod and fails the run; after a failed watch, fails the run when
+/// its pod is gone. Callers must not drop it midway (the CLI shields it from
+/// Ctrl-C), since it may be deleting the pod.
+///
+/// # Errors
+///
+/// As [`follow`].
+pub async fn settle_watch(
+    ctx: &PodCtx<'_>,
+    pod: &mut PodRecord,
+    run_id: &str,
+    watched: Watched,
+) -> Result<Outcome, PodError> {
     match watched {
-        Some(Ok(outcome)) => Ok(outcome),
-        Some(Err(error)) => Err(unreachable(ctx, pod, &id, error.into()).await),
-        None => Err(deadline_reached(ctx, pod, &id).await),
+        Watched::Ended(ended) => match *ended {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(unreachable(ctx, pod, run_id, error.into()).await),
+        },
+        Watched::DeadlinePassed => Err(deadline_reached(ctx, pod, run_id).await),
     }
 }
 
