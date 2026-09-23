@@ -348,13 +348,14 @@ impl RunpodClient {
         .await
     }
 
-    /// Deletes the pod `id`. A pod Runpod no longer knows, in its own error
-    /// shape, counts as deleted; a 404 with an unrelated body is a real error.
+    /// Deletes the pod `id`: `true` when Runpod deleted it, `false` when it
+    /// already did not know it (a 404 in its own error shape, which counts as
+    /// deleted); a 404 with an unrelated body is a real error.
     ///
     /// # Errors
     ///
     /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
-    pub async fn delete_pod(&self, id: &PodId) -> Result<(), ApiError> {
+    pub async fn delete_pod(&self, id: &PodId) -> Result<bool, ApiError> {
         let url = self.url(&format!("pods/{id}"));
         with_retry(
             &self.policy,
@@ -362,10 +363,10 @@ impl RunpodClient {
                 let (status, body, retry_after) =
                     self.fetch(self.http.request(Method::DELETE, &url)).await?;
                 if status.is_success() {
-                    return Ok(());
+                    return Ok(true);
                 }
                 if status == StatusCode::NOT_FOUND && is_runpod_error_shape(status, &body) {
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(self.status_error(status, &body, retry_after, false))
             },

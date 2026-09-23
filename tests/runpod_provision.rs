@@ -453,8 +453,7 @@ async fn a_pod_gone_or_dead_before_ssh_ends_its_attempt_at_once() -> TestResult 
         .iter()
         .map(|request| request.url.path().to_string())
         .collect();
-    // p1 was already gone: nothing to delete, only confirmed by its 404.
-    assert_eq!(deleted, vec!["/v2/pods/p2"]);
+    assert_eq!(deleted, vec!["/v2/pods/p1", "/v2/pods/p2"]);
     assert_eq!(record.pod_id, None);
     Ok(())
 }
@@ -955,7 +954,42 @@ async fn a_pod_already_gone_is_recorded_deleted_by_its_watchdog() -> TestResult 
     .await?;
     assert_eq!(record.state, PodState::Deleted);
     assert_eq!(record.deleted_by, Some(DeletedBy::Watchdog));
-    assert!(harness.calls("DELETE").await.is_empty());
+    assert_eq!(
+        harness.calls("DELETE").await.len(),
+        1,
+        "the delete is always sent"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_404_on_the_get_alone_still_deletes_and_is_recorded_as_the_client() -> TestResult {
+    let harness = Harness::new().await?;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(gone())
+        .mount(&harness.server)
+        .await;
+    // The pod was still there: Runpod deletes it now.
+    Mock::given(method("DELETE"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&harness.server)
+        .await;
+    let pod: overbrainer::runpod::Pod = serde_json::from_value(pod("p1", "n1", "RUNNING"))?;
+    let mut record = PodRecord::new(RUN, false, 1, "ssh-ed25519 AAAAhost");
+    record.begin_attempt("NVIDIA A40", SystemTime::now(), 6.0);
+    record.created(&pod, AttemptResult::Created, SystemTime::now());
+    remove(
+        &harness.ctx(),
+        &mut record,
+        DeleteReason::NotReady,
+        DeletedBy::Client,
+    )
+    .await?;
+    assert_eq!(harness.calls("DELETE").await.len(), 1);
+    assert_eq!(record.state, PodState::Deleted);
+    assert_eq!(record.deleted_by, Some(DeletedBy::Client));
     Ok(())
 }
 

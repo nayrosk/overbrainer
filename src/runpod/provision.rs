@@ -649,18 +649,25 @@ pub async fn remove(
     });
     record.state = super::PodState::Deleting;
     let saved = record.save(ctx.runs);
-    // A pod already gone was deleted by its watchdog (after a failed bootstrap,
-    // for example); an error here only means the delete is sent.
+    // The first look only names who deleted the pod: the delete is always sent,
+    // since a one-off 404 must never pass a live pod for deleted. When both the
+    // look and the delete say Runpod no longer knows it, its watchdog deleted it
+    // (after a failed bootstrap, for example).
     let gone = matches!(ctx.client.get_pod(&id).await, Ok(None));
-    if !gone {
-        let deleted = delete_confirmed(ctx, &id).await;
-        if deleted.is_err() {
-            return saved_then_removed(saved, deleted);
-        }
-    }
+    let found = match delete_confirmed(ctx, &id).await {
+        Ok(found) => found,
+        Err(error) => return saved_then_removed(saved, Err(error)),
+    };
     let now = SystemTime::now();
     let uptime = record.uptime(now);
-    record.deleted(if gone { DeletedBy::Watchdog } else { by }, now);
+    record.deleted(
+        if gone && !found {
+            DeletedBy::Watchdog
+        } else {
+            by
+        },
+        now,
+    );
     let recorded = record.save(ctx.runs);
     ctx.publish(PodStatus::Deleted {
         pod_id: id,
@@ -672,10 +679,12 @@ pub async fn remove(
     Ok(())
 }
 
-/// Sends the delete of `id` and waits until the API no longer knows it.
-async fn delete_confirmed(ctx: &PodCtx<'_>, id: &PodId) -> Result<(), PodError> {
-    ctx.client.delete_pod(id).await?;
-    wait_gone(ctx, id).await
+/// Sends the delete of `id` and waits until the API no longer knows it. `true`
+/// when the delete found the pod, `false` when Runpod already did not know it.
+async fn delete_confirmed(ctx: &PodCtx<'_>, id: &PodId) -> Result<bool, PodError> {
+    let found = ctx.client.delete_pod(id).await?;
+    wait_gone(ctx, id).await?;
+    Ok(found)
 }
 
 /// Polls until the API no longer knows the pod `id`, for at most
@@ -782,7 +791,7 @@ async fn delete_duplicate(ctx: &PodCtx<'_>, id: &PodId) -> bool {
         reason: DeleteReason::Duplicate,
     });
     match delete_confirmed(ctx, id).await {
-        Ok(()) => true,
+        Ok(_) => true,
         Err(error) => {
             tracing::warn!(
                 "cannot confirm the deletion of duplicate pod {id}: {error}; its watchdog deletes it after its boot grace"

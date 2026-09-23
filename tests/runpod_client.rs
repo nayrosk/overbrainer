@@ -209,7 +209,7 @@ async fn a_missing_pod_is_none_and_its_deletion_succeeds() -> TestResult {
     let client = client(&server)?;
     let id = PodId::new("gone")?;
     assert!(client.get_pod(&id).await?.is_none());
-    client.delete_pod(&id).await?;
+    assert!(!client.delete_pod(&id).await?, "reported as deleted now");
     Ok(())
 }
 
@@ -229,7 +229,7 @@ async fn a_delete_is_retried_until_it_succeeds() -> TestResult {
         .expect(1)
         .mount(&server)
         .await;
-    client(&server)?.delete_pod(&PodId::new("p1")?).await?;
+    assert!(client(&server)?.delete_pod(&PodId::new("p1")?).await?);
     Ok(())
 }
 
