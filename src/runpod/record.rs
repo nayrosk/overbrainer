@@ -234,7 +234,7 @@ impl PodRecord {
         };
         serde_json::from_slice(&content)
             .map(Some)
-            .map_err(|source| RunsError::Invalid { path, source })
+            .map_err(|e| RunsError::invalid(path, &e))
     }
 
     /// Writes the record, replacing the file atomically.
@@ -249,10 +249,8 @@ impl PodRecord {
             path: dir.clone(),
             source,
         })?;
-        let mut content = serde_json::to_vec_pretty(self).map_err(|source| RunsError::Invalid {
-            path: dir.join(POD_FILE),
-            source,
-        })?;
+        let mut content = serde_json::to_vec_pretty(self)
+            .map_err(|e| RunsError::invalid(dir.join(POD_FILE), &e))?;
         content.push(b'\n');
         write_atomic(&dir, POD_FILE, &content)
     }
@@ -604,15 +602,17 @@ mod tests {
             format!("{{\"version\": 1, \"{MARKER}\": "),
             // Valid JSON, but not the shape of a `PodRecord`.
             format!("[\"{MARKER}\", 1, 2]"),
+            // A value serde quotes in its message.
+            format!("{{\"version\": \"{MARKER}\"}}"),
         ] {
             fs::write(&path, &content)?;
             let error = PodRecord::load(&runs, RUN)
                 .err()
                 .ok_or("expected an error")?;
             assert!(matches!(error, RunsError::Invalid { .. }), "{content}");
-            let display = error.to_string();
+            let chain = crate::runs::tests::chain(&error);
             let debug = format!("{error:?}");
-            assert!(!display.contains(MARKER), "{display}");
+            assert!(!chain.contains(MARKER), "{chain}");
             assert!(!debug.contains(MARKER), "{debug}");
         }
         Ok(())

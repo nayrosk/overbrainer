@@ -412,6 +412,30 @@ fn cancel_refuses_a_run_that_has_not_started() -> TestResult {
 }
 
 #[test]
+fn a_malformed_run_json_is_reported_without_its_content() -> TestResult {
+    const MARKER: &str = "MARKER-3c9e71a0-never-printed";
+    let dir = project("ok")?;
+    let id = "20260101-000000-abcd";
+    let run = dir.path().join("runs").join(id);
+    fs::create_dir_all(&run)?;
+    fs::write(
+        run.join("run.json"),
+        format!(
+            r#"{{"id": "{id}", "target": "here", "created": "2026-01-01T00:00:00Z",
+"remote_dir": "/w/{id}", "job": null, "state": "{MARKER}", "message": null}}"#
+        ),
+    )?;
+    overbrainer(dir.path())?
+        .args(["train", "cancel", id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not a valid run record"))
+        .stderr(predicate::str::contains("line 2"))
+        .stderr(predicate::str::contains(MARKER).not());
+    Ok(())
+}
+
+#[test]
 fn cancelling_a_job_that_already_ended_asks_to_attach() -> TestResult {
     let dir = project("ok")?;
     overbrainer(dir.path())?.arg("train").assert().success();

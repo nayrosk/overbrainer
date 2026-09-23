@@ -5,7 +5,6 @@ mod id;
 mod summary;
 mod train;
 
-use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -27,7 +26,7 @@ pub const RUNS_DIR: &str = "runs";
 pub const RECORD_FILE: &str = "run.json";
 
 /// Errors reading or writing run records.
-#[derive(thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum RunsError {
     /// A run file or directory could not be read or written.
     #[error("cannot access {}", path.display())]
@@ -38,14 +37,16 @@ pub enum RunsError {
         #[source]
         source: io::Error,
     },
-    /// A `run.json` or `pod.json` is not a valid record.
-    #[error("{} is not a valid run record", path.display())]
+    /// A `run.json` or `pod.json` is not a valid record. Only where the JSON
+    /// error is is kept: its message can quote a value straight from the file.
+    #[error("{} is not a valid run record (line {line}, column {column})", path.display())]
     Invalid {
         /// The file.
         path: PathBuf,
-        /// Underlying JSON error.
-        #[source]
-        source: serde_json::Error,
+        /// Line of the JSON error, from 1 (0 when not reading a file).
+        line: usize,
+        /// Column of the JSON error, from 1 (0 when not reading a file).
+        column: usize,
     },
     /// An ID cannot name a run directory.
     #[error("{0} is not a valid run ID")]
@@ -55,27 +56,13 @@ pub enum RunsError {
     NotFound(String),
 }
 
-impl fmt::Debug for RunsError {
-    /// Same fields as the derived `Debug`, except `Invalid`'s JSON error, whose
-    /// message can quote the offending value straight from the file it failed to
-    /// parse; only its position is shown, never that text.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io { path, source } => f
-                .debug_struct("Io")
-                .field("path", path)
-                .field("source", source)
-                .finish(),
-            Self::Invalid { path, source } => f
-                .debug_struct("Invalid")
-                .field("path", path)
-                .field(
-                    "source",
-                    &format_args!("line {} column {}", source.line(), source.column()),
-                )
-                .finish(),
-            Self::InvalidId(id) => f.debug_tuple("InvalidId").field(id).finish(),
-            Self::NotFound(id) => f.debug_tuple("NotFound").field(id).finish(),
+impl RunsError {
+    /// [`RunsError::Invalid`] for `path`, keeping only the position of `error`.
+    pub(crate) fn invalid(path: PathBuf, error: &serde_json::Error) -> Self {
+        Self::Invalid {
+            path,
+            line: error.line(),
+            column: error.column(),
         }
     }
 }
@@ -178,10 +165,7 @@ impl Runs {
         fs::create_dir_all(&dir).map_err(io_error(&dir))?;
         let path = dir.join(RECORD_FILE);
         let mut content =
-            serde_json::to_vec_pretty(record).map_err(|source| RunsError::Invalid {
-                path: path.clone(),
-                source,
-            })?;
+            serde_json::to_vec_pretty(record).map_err(|e| RunsError::invalid(path, &e))?;
         content.push(b'\n');
         write_atomic(&dir, RECORD_FILE, &content)
     }
@@ -203,7 +187,7 @@ impl Runs {
             },
             Err(e) => return Err(io_error(&path)(e)),
         };
-        serde_json::from_slice(&content).map_err(|source| RunsError::Invalid { path, source })
+        serde_json::from_slice(&content).map_err(|e| RunsError::invalid(path, &e))
     }
 
     /// Every run with a readable record, oldest first. Directories without
@@ -323,6 +307,39 @@ pub(crate) mod tests {
             }
         }
         Ok(left)
+    }
+
+    /// `error` and its sources, joined as the CLI prints an error with `{:#}`.
+    pub(crate) fn chain(error: &dyn std::error::Error) -> String {
+        let mut text = error.to_string();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            text.push_str(": ");
+            text.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        text
+    }
+
+    #[test]
+    fn a_malformed_run_json_is_reported_by_position_only() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const MARKER: &str = "MARKER-0d4a8e52-never-printed";
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let id = "20260922-143005-bbbb";
+        let dir = runs.run_dir(id)?;
+        fs::create_dir_all(&dir)?;
+        let content = format!("{{\n  \"id\": \"{id}\",\n  \"state\": \"{MARKER}\"\n}}\n");
+        fs::write(dir.join(RECORD_FILE), content)?;
+        let error = runs.load(id).err().ok_or("expected an error")?;
+        let chain = chain(&error);
+        assert!(!chain.contains(MARKER), "{chain}");
+        assert!(chain.contains("is not a valid run record"), "{chain}");
+        assert!(chain.contains("line 3"), "{chain}");
+        let debug = format!("{error:?}");
+        assert!(!debug.contains(MARKER), "{debug}");
+        Ok(())
     }
 
     #[test]
