@@ -3235,6 +3235,26 @@ mod tests {
         assert_eq!(app.exit_notes, [failed]);
     }
 
+    /// A signal abandons a start whose cancel was asked for: no note says the
+    /// run was not cancelled, its flow's error says what became of it.
+    #[test]
+    fn a_signal_drops_a_cancel_asked_for_during_the_start() {
+        let mut app = app();
+        starting(&mut app, TaskId(6));
+        app.cancel_run(FIRST);
+        assert_eq!(app.on_signal(), [Effect::Abandon(TaskId(6))]);
+        let failed = "interrupted before its job started: run 20260921-133200-a1b2 failed";
+        let effects = app.on_done(TaskId(6), Ok(Done::Trained(Err(failed.into()))));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Spawn(_, Task::Train(TrainJob::Cancel(_))))),
+            "{effects:?}"
+        );
+        assert_eq!(app.exit, Some(Exit::Signal));
+        assert_eq!(app.exit_notes, [failed]);
+    }
+
     #[test]
     fn a_plan_that_arrives_while_quitting_is_dropped() {
         let mut app = app();

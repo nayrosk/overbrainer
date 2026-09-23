@@ -606,7 +606,9 @@ impl App {
 
     /// On a process signal: every task that follows a run is abandoned at once,
     /// as Ctrl-C does on the command line (a Runpod run still provisioning
-    /// deletes its pod and fails); cancels are waited for.
+    /// deletes its pod and fails); cancels are waited for. A cancel asked for
+    /// during a start is dropped, as [`App::abandon`] drops it: its flow's
+    /// error says what became of the run.
     pub(super) fn abandon_all(&mut self) -> Vec<Effect> {
         self.training
             .tasks
@@ -614,6 +616,9 @@ impl App {
             .filter(|(_, follow)| follow.job != Job::Cancel)
             .map(|(id, follow)| {
                 follow.detach = Detach::Done;
+                if follow.starting() {
+                    follow.cancel_after = false;
+                }
                 Effect::Abandon(*id)
             })
             .collect()
