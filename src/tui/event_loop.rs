@@ -4,7 +4,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
@@ -25,6 +25,8 @@ use super::ui;
 const TICK: Duration = Duration::from_millis(250);
 /// Shortest time between two draws.
 const FRAME: Duration = Duration::from_millis(33);
+/// How long an editor asked to end with SIGTERM gets before SIGKILL.
+const EDITOR_GRACE: Duration = Duration::from_secs(2);
 
 /// What the real terminal adds to the loop: process signals, and the screen the
 /// editor borrows.
@@ -307,9 +309,26 @@ async fn wait_editor(editor: Option<&mut Child>) -> io::Result<ExitStatus> {
     }
 }
 
-/// Kills the editor still running when the TUI ends, and waits for it, so it no
-/// longer uses the terminal the guard restores.
+/// Stops the editor still running when the TUI ends, and waits for it, so it no
+/// longer uses the terminal the guard restores: SIGTERM first, so it can put the
+/// terminal back as it found it, then SIGKILL after [`EDITOR_GRACE`].
 async fn stop_editor(editor: &mut Child) {
+    if let Some(pid) = editor.id() {
+        let asked = tokio::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        if asked.is_ok_and(|status| status.success())
+            && tokio::time::timeout(EDITOR_GRACE, editor.wait())
+                .await
+                .is_ok()
+        {
+            return;
+        }
+    }
     if let Err(error) = editor.kill().await {
         tracing::error!("cannot stop the editor: {error}");
     }
@@ -468,6 +487,7 @@ mod tests {
     #[tokio::test]
     async fn sigint_is_ignored_while_the_editor_runs_and_forgotten_after()
     -> Result<(), Box<dyn std::error::Error>> {
+        let _signals = crate::test_support::SIGNALS.lock().await;
         let short = Duration::from_millis(300);
         let mut signals = Signals::new()?;
         raise("INT")?;
@@ -483,16 +503,50 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn an_editor_left_running_is_killed_and_reaped() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut editor = tokio::process::Command::new("sleep")
-            .arg("30")
+    /// An editor, as `sh`, running `on_term` on SIGTERM; returned once its trap
+    /// is set, so the signal cannot come first.
+    async fn editor_trapping(on_term: &str) -> io::Result<Child> {
+        use tokio::io::AsyncBufReadExt;
+        let mut editor = tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!("trap '{on_term}' TERM; echo ready; while :; do sleep 0.1; done"),
+            ])
+            .stdout(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
+        let Some(stdout) = editor.stdout.take() else {
+            return Err(io::Error::other("no stdout"));
+        };
+        let mut ready = String::new();
+        tokio::io::BufReader::new(stdout)
+            .read_line(&mut ready)
+            .await?;
+        Ok(editor)
+    }
+
+    #[tokio::test]
+    async fn an_editor_left_running_is_asked_to_end_then_reaped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut editor = tokio::time::timeout(LIMIT, editor_trapping("exit 3")).await??;
         tokio::time::timeout(LIMIT, stop_editor(&mut editor)).await?;
         let status = editor.try_wait()?;
-        assert!(status.is_some_and(|status| !status.success()), "{status:?}");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(3),
+            "SIGTERM first"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_editor_ignoring_sigterm_is_killed_then_reaped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::process::ExitStatusExt;
+        let mut editor = tokio::time::timeout(LIMIT, editor_trapping("")).await??;
+        tokio::time::timeout(LIMIT, stop_editor(&mut editor)).await?;
+        let status = editor.try_wait()?;
+        assert_eq!(status.and_then(|status| status.signal()), Some(9));
         Ok(())
     }
 }

@@ -6,9 +6,10 @@ use std::mem::ManuallyDrop;
 use std::panic::{self, PanicHookInfo};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{Event, EventStream};
+use crossterm::event::{self, Event, EventStream};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -116,8 +117,8 @@ impl Screen {
 
     /// Hands the terminal over: stops reading it first and waits until the
     /// `EventStream` is dropped (so its reader thread takes no keystroke from the
-    /// editor), then leaves the alternate screen and raw mode, and shows the
-    /// cursor.
+    /// editor), drops the keys read but not handled, then leaves the alternate
+    /// screen and raw mode, and shows the cursor.
     ///
     /// # Errors
     ///
@@ -125,6 +126,11 @@ impl Screen {
     pub(super) async fn suspend(&mut self) -> io::Result<()> {
         if let Some(reader) = self.reader.take() {
             reader.stop().await;
+        }
+        // Keys crossterm already parsed stay in its global buffer, and would come
+        // back after the editor: drop them, with any the tty still holds.
+        while event::poll(Duration::ZERO)? {
+            event::read()?;
         }
         execute!(io::stdout(), LeaveAlternateScreen, Show)?;
         disable_raw_mode()
