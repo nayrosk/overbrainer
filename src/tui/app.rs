@@ -2637,6 +2637,16 @@ mod tests {
     }
 
     #[test]
+    fn c_is_refused_after_a_signal() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        app.on_signal();
+        assert_eq!(keys(&mut app, &[KeyCode::Char('c')]), []);
+        assert_eq!(app.overlay, None);
+        assert_eq!(status(&app), Some("refused: interrupted, exiting"));
+        Ok(())
+    }
+
+    #[test]
     fn staying_keeps_following_a_run_whose_job_has_not_started()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = runs_app()?;

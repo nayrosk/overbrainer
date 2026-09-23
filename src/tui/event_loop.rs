@@ -220,12 +220,20 @@ where
         for effect in std::mem::take(&mut self.pending) {
             self.apply_late(effect);
         }
-        self.drain_late(app);
-        if self.tasks.is_empty() {
-            return;
+        if !self.tasks.is_empty() {
+            // Why the loop ended stays what it was.
+            let why = app.exit;
+            self.wait_tasks(app).await;
+            app.exit = why.or(app.exit);
         }
-        // Why the loop ended stays what it was.
-        let why = app.exit;
+        self.drain_late(app);
+    }
+
+    /// Ends the tasks as on a signal and waits for them, a later signal acting
+    /// as a first one would; with the real terminal, gives the screen back and
+    /// says on stderr what is waited for. The messages in the inbox are handled
+    /// before each end.
+    async fn wait_tasks(&mut self, app: &mut App) {
         for effect in app.on_signal() {
             self.apply_late(effect);
         }
@@ -245,23 +253,18 @@ where
                 next = self.tasks.next() => Some(next),
                 () = Signals::recv(signals, true) => None,
             };
-            match woke {
+            let effects = match woke {
                 Some(Some((id, result))) => {
                     self.drain_late(app);
-                    for effect in app.on_done(id, result) {
-                        self.apply_late(effect);
-                    }
+                    app.on_done(id, result)
                 },
                 Some(None) => break,
-                None => {
-                    for effect in app.on_signal() {
-                        self.apply_late(effect);
-                    }
-                },
+                None => app.on_signal(),
+            };
+            for effect in effects {
+                self.apply_late(effect);
             }
         }
-        self.drain_late(app);
-        app.exit = why.or(app.exit);
     }
 
     /// Runs `effect` once the loop ended: a training task or an edit starts
@@ -465,8 +468,14 @@ async fn stop_editor(editor: &mut Child) {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use crossterm::event::KeyCode;
-    use ratatui::backend::TestBackend;
+    use ratatui::backend::{ClearType, TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
 
     use super::*;
     use crate::tui::snapshots::{app, key};
@@ -558,17 +567,19 @@ mod tests {
             "homelab",
             crate::runs::RunState::Running,
         ))?;
-        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let backend = Shared::new();
+        let frame = Arc::clone(&backend.frame);
+        let mut terminal = Terminal::new(backend)?;
         let mut app = app();
         app.project.dir = dir.path().to_path_buf();
         let (events, input) = mpsc::unbounded_channel();
         let run_loop = drive(&mut terminal, &mut app, input, None);
         let keys = async {
             events.send(Ok(key(KeyCode::Char('3'))))?;
-            // The runs are listed by then.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            drawn(&frame, run).await?;
             events.send(Ok(key(KeyCode::Char('a'))))?;
-            events.send(Err(io::Error::other("the terminal is gone")))
+            events.send(Err(io::Error::other("the terminal is gone")))?;
+            Ok::<_, Box<dyn std::error::Error>>(())
         };
         let (result, sent) =
             tokio::time::timeout(LIMIT, async { tokio::join!(run_loop, keys) }).await?;
@@ -583,6 +594,137 @@ mod tests {
                 .is_some_and(|e| e.contains("overbrainer.toml")),
             "{ended:?}"
         );
+        Ok(())
+    }
+
+    /// A test backend that shares the text of its screen after each draw, and
+    /// whose draws fail once `fail` is set.
+    struct Shared {
+        inner: TestBackend,
+        frame: Arc<Mutex<String>>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl Shared {
+        fn new() -> Self {
+            Self {
+                inner: TestBackend::new(80, 24),
+                frame: Arc::new(Mutex::new(String::new())),
+                fail: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    /// The error a [`TestBackend`] never returns.
+    fn never(error: Infallible) -> io::Error {
+        match error {}
+    }
+
+    impl Backend for Shared {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(io::Error::other("the terminal is gone"));
+            }
+            self.inner.draw(content).map_err(never)?;
+            let text: String = self
+                .inner
+                .buffer()
+                .content()
+                .iter()
+                .map(Cell::symbol)
+                .collect();
+            if let Ok(mut frame) = self.frame.lock() {
+                *frame = text;
+            }
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.inner.hide_cursor().map_err(never)
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.inner.show_cursor().map_err(never)
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            self.inner.get_cursor_position().map_err(never)
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.inner.set_cursor_position(position).map_err(never)
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            self.inner.clear().map_err(never)
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            self.inner.clear_region(clear_type).map_err(never)
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            self.inner.size().map_err(never)
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            self.inner.window_size().map_err(never)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush().map_err(never)
+        }
+    }
+
+    /// Waits until `text` is on the screen shared in `frame`, 10 s at most.
+    async fn drawn(frame: &Mutex<String>, text: &str) -> Result<(), String> {
+        for _ in 0..1000 {
+            if frame.lock().is_ok_and(|frame| frame.contains(text)) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(format!("never drawn: {text}"))
+    }
+
+    /// The effects of a wake whose draw failed still run: a confirmed cancel
+    /// starts, and is waited for.
+    #[tokio::test]
+    async fn the_effects_of_a_failed_draw_still_run() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = crate::tui::snapshots::project()?;
+        let mut record = crate::tui::snapshots::run(RUN, "homelab", crate::runs::RunState::Failed);
+        record.job = None;
+        crate::runs::Runs::new(dir.path()).save(&record)?;
+        let backend = Shared::new();
+        let (frame, fail) = (Arc::clone(&backend.frame), Arc::clone(&backend.fail));
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = app();
+        app.project.dir = dir.path().to_path_buf();
+        let (events, input) = mpsc::unbounded_channel();
+        let run_loop = drive(&mut terminal, &mut app, input, None);
+        let keys = async {
+            events.send(Ok(key(KeyCode::Char('3'))))?;
+            drawn(&frame, RUN).await?;
+            events.send(Ok(key(KeyCode::Char('c'))))?;
+            drawn(&frame, "Cancel a run?").await?;
+            // Past the shortest time between two draws: `y` is drawn at once.
+            tokio::time::sleep(FRAME * 2).await;
+            fail.store(true, Ordering::SeqCst);
+            events.send(Ok(key(KeyCode::Char('y'))))?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        let (result, sent) =
+            tokio::time::timeout(LIMIT, async { tokio::join!(run_loop, keys) }).await?;
+        sent?;
+        let error = result.err().map(|error| format!("{error:#}"));
+        assert_eq!(error.as_deref(), Some("the terminal is gone"));
+        let ended = app.training.ended.get(RUN).and_then(|e| e.error.clone());
+        assert_eq!(ended, Some(format!("run {RUN} has not started")));
         Ok(())
     }
 
@@ -662,6 +804,36 @@ mod tests {
         let error = app.training.ended.get(RUN).and_then(|e| e.error.clone());
         assert_eq!(error, Some(format!("run {RUN} has not started")));
         assert_eq!(app.exit, Some(Exit::Quit), "why the loop ended is kept");
+        Ok(())
+    }
+
+    /// Once the loop ended, the messages of a task are handled before its end:
+    /// its lines come before its error in the exit notes.
+    #[tokio::test]
+    async fn the_last_lines_of_a_task_waited_for_come_before_its_end()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cli::front::Report;
+        use crate::tui::tasks::{Task, TrainJob};
+        let dir = crate::tui::snapshots::project()?;
+        let mut record = crate::tui::snapshots::run(RUN, "homelab", crate::runs::RunState::Failed);
+        record.job = None;
+        crate::runs::Runs::new(dir.path()).save(&record)?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = looping(&mut terminal, dir.path());
+        let mut app = cancelling_app(dir.path());
+        app.leaving = Some(Exit::Quit);
+        looping.pending = vec![Effect::Spawn(
+            TaskId(5),
+            Task::Train(TrainJob::Cancel(RUN.into())),
+        )];
+        looping
+            .messages
+            .send(Msg::Report(TaskId(5), Report::Line("a line".into())))?;
+        tokio::time::timeout(LIMIT, looping.settle(&mut app)).await?;
+        assert_eq!(
+            app.exit_notes,
+            ["a line".to_string(), format!("run {RUN} has not started")]
+        );
         Ok(())
     }
 

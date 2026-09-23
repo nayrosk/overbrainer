@@ -894,3 +894,47 @@ fn training_of_a_run_whose_pod_is_kept() -> TestResult {
     snapshot("training_kept_pod", &mut app)?;
     Ok(())
 }
+
+/// The pod line of `app` drawn at 120x40: rows 9 and 10 of the detail pane,
+/// joined as one text.
+fn pod_text(app: &mut App) -> Result<String, Infallible> {
+    let rows = text(&draw(app, 120, 40)?);
+    let words: Vec<&str> = rows
+        .iter()
+        .skip(9)
+        .take(2)
+        .map(|row| row.trim_matches('│').trim())
+        .collect();
+    Ok(words.join(" "))
+}
+
+#[test]
+fn a_pod_asked_to_be_kept_is_kept_only_once_its_job_starts() -> TestResult {
+    let mut app = training_app()?;
+    app.training.tasks.clear();
+    let pod = app
+        .training
+        .runs
+        .first_mut()
+        .and_then(|row| row.pod.as_mut())
+        .ok_or("no pod")?;
+    pod.keep = true;
+    let line = pod_text(&mut app)?;
+    assert!(
+        line.contains("kept once its job starts  deleted by the watchdog by 2026-09-21T19:32:20Z"),
+        "{line}"
+    );
+    assert!(!line.contains("no time limit"), "{line}");
+    if let Some(pod) = app
+        .training
+        .runs
+        .first_mut()
+        .and_then(|row| row.pod.as_mut())
+    {
+        pod.state = crate::runpod::PodState::Running;
+    }
+    let line = pod_text(&mut app)?;
+    assert!(line.contains("kept, no time limit"), "{line}");
+    assert!(!line.contains("watchdog"), "{line}");
+    Ok(())
+}

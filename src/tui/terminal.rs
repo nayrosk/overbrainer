@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::mem::ManuallyDrop;
 use std::panic::{self, PanicHookInfo};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -82,14 +83,24 @@ impl Drop for TerminalGuard {
 ///
 /// Returns an error when the terminal cannot be set up.
 pub(super) fn init() -> io::Result<ManuallyDrop<DefaultTerminal>> {
+    RESTORED.store(false, Ordering::SeqCst);
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
     Terminal::new(CrosstermBackend::new(io::stdout())).map(ManuallyDrop::new)
 }
 
-/// Leaves the alternate screen and raw mode, and shows the cursor. A failure is
-/// written to stderr, ignoring a failed write: the terminal may be gone.
+/// Set while [`Screen::suspend`] has put the terminal back in its normal mode
+/// (the editor has it, or the TUI waits for its work once its loop ended):
+/// [`restore`] then has nothing to undo.
+static RESTORED: AtomicBool = AtomicBool::new(false);
+
+/// Leaves the alternate screen and raw mode, and shows the cursor, unless
+/// [`Screen::suspend`] already did. A failure is written to stderr, ignoring a
+/// failed write: the terminal may be gone.
 fn restore() {
+    if RESTORED.load(Ordering::SeqCst) {
+        return;
+    }
     if let Err(error) = ratatui::try_restore() {
         writeln!(io::stderr(), "cannot restore the terminal: {error}").ok();
     }
@@ -118,22 +129,26 @@ impl Screen {
     /// Hands the terminal over: stops reading it first and waits until the
     /// `EventStream` is dropped (so its reader thread takes no keystroke from the
     /// editor), drops the keys read but not handled, then leaves the alternate
-    /// screen and raw mode, and shows the cursor.
+    /// screen and raw mode, and shows the cursor. The terminal is put back in
+    /// its normal mode even when the keys cannot be dropped.
     ///
     /// # Errors
     ///
-    /// Returns an error when the terminal cannot be switched back.
+    /// Returns an error when the keys cannot be dropped or the terminal cannot
+    /// be switched back.
     pub(super) async fn suspend(&mut self) -> io::Result<()> {
         if let Some(reader) = self.reader.take() {
             reader.stop().await;
         }
         // Keys crossterm already parsed stay in its global buffer, and would come
         // back after the editor: drop them, with any the tty still holds.
-        while event::poll(Duration::ZERO)? {
-            event::read()?;
+        let dropped = drop_keys();
+        let left = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        let normal = disable_raw_mode();
+        if left.is_ok() && normal.is_ok() {
+            RESTORED.store(true, Ordering::SeqCst);
         }
-        execute!(io::stdout(), LeaveAlternateScreen, Show)?;
-        disable_raw_mode()
+        dropped.and(left).and(normal)
     }
 
     /// Takes the terminal back: raw mode, the alternate screen and a hidden
@@ -144,6 +159,7 @@ impl Screen {
     ///
     /// Returns an error when the terminal cannot be set up again.
     pub(super) fn resume(&mut self) -> io::Result<()> {
+        RESTORED.store(false, Ordering::SeqCst);
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, Hide)?;
         self.reader = Some(InputTask::start(self.events.clone()));
@@ -156,6 +172,14 @@ impl Screen {
             reader.stop().await;
         }
     }
+}
+
+/// Reads and drops every key crossterm already parsed or the tty holds.
+fn drop_keys() -> io::Result<()> {
+    while event::poll(Duration::ZERO)? {
+        event::read()?;
+    }
+    Ok(())
 }
 
 /// The task owning crossterm's `EventStream`, forwarding its events, then its

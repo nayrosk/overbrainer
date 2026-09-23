@@ -284,12 +284,19 @@ fn live_line(id: &str, record: &PodRecord, latest: Option<&PodStatus>, app: &App
         });
         write!(text, "  up {}{spend}", duration(up)).ok();
     }
-    let kept = record.keep
-        || record.state == PodState::Kept
+    // `--keep-pod` holds only once the job started: until then a failed start
+    // or the boot grace can still delete the pod (decision 39).
+    let kept = record.state == PodState::Kept
+        || (record.keep && record.state == PodState::Running)
         || matches!(latest, Some(PodStatus::Kept { .. }));
     if kept {
         text.push_str("  kept, no time limit");
-    } else if let Some(at) = &record.deadline {
+        return text;
+    }
+    if record.keep {
+        text.push_str("  kept once its job starts");
+    }
+    if let Some(at) = &record.deadline {
         write!(text, "  deleted by the watchdog by {at}").ok();
     }
     text
