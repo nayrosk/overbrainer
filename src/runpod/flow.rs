@@ -200,11 +200,18 @@ pub async fn settle_watch(
 
 /// Time left until the client's own deadline, `None` for a kept pod.
 fn until_deadline(pod: &PodRecord) -> Option<Duration> {
+    until_deadline_at(pod, SystemTime::now())
+}
+
+/// Time left at `now` until the client's own deadline (the watchdog's plus
+/// [`DEADLINE_MARGIN`]), zero once it passed; `None` for a kept pod, or one
+/// without a deadline.
+pub(super) fn until_deadline_at(pod: &PodRecord, now: SystemTime) -> Option<Duration> {
     if pod.keep {
         return None;
     }
     let deadline = pod.deadline_unix?.saturating_add(DEADLINE_MARGIN.as_secs());
-    let now = SystemTime::now()
+    let now = now
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
     Some(Duration::from_secs(deadline.saturating_sub(now)))

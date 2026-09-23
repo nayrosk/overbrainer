@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use crate::runs::{RECORD_FILE, RunRecord, RunState, Runs, RunsError};
 
 use super::flow::{Look, look_up_all, mark_gone};
-use super::provision::delete_confirmed;
+use super::provision::{delete_confirmed, one_line};
 use super::{
     DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId, PodRecord, PodState, forget_client_key,
     remove,
@@ -15,6 +15,12 @@ use super::{
 
 /// Characters kept of a table cell taken from the Runpod account.
 const CELL_CHARS: usize = 64;
+
+/// `text`, from the Runpod account or a local record, as a table cell: one
+/// short line of printable ASCII (see [`one_line`]).
+fn cell_text(text: &str) -> String {
+    one_line(text, CELL_CHARS)
+}
 
 /// The note of a stray pod: another pod of a run, left by an ambiguous create,
 /// whose delete could not be confirmed (`stray_pods` in `pod.json`), or any pod
@@ -278,12 +284,12 @@ impl<'a> Known<'a> {
     fn row(&self, run: Option<&str>, pod: &Pod) -> PodRow {
         let (kind, note) = self.classify(run, &pod.id);
         PodRow {
-            run: cell(run.unwrap_or("-")),
+            run: cell_text(run.unwrap_or("-")),
             pod_id: pod.id.to_string(),
             status: pod.status.name().to_string(),
-            gpu: cell(pod.gpu_type().unwrap_or("-")),
+            gpu: cell_text(pod.gpu_type().unwrap_or("-")),
             rate: pod.cost,
-            created: cell(pod.created_at.as_deref().unwrap_or_default()),
+            created: cell_text(pod.created_at.as_deref().unwrap_or_default()),
             note,
             kind,
         }
@@ -293,16 +299,16 @@ impl<'a> Known<'a> {
     fn recorded_row(&self, entry: &Unlisted, status: &str, kind: RowKind, note: String) -> PodRow {
         let record = self.pod_records.get(&entry.run_id).filter(|_| !entry.stray);
         PodRow {
-            run: cell(&entry.run_id),
+            run: cell_text(&entry.run_id),
             pod_id: entry.id.to_string(),
             status: status.to_string(),
-            gpu: cell(
+            gpu: cell_text(
                 record
                     .and_then(|record| record.gpu_type.as_deref())
                     .unwrap_or("-"),
             ),
             rate: None,
-            created: cell(
+            created: cell_text(
                 record
                     .and_then(|record| record.created_at.as_deref())
                     .unwrap_or_default(),
@@ -378,15 +384,6 @@ fn edit_record(
         record.save(runs)?;
     }
     Ok(())
-}
-
-/// `text`, from the Runpod account or a local record, as one short line of
-/// printable ASCII.
-fn cell(text: &str) -> String {
-    text.chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .take(CELL_CHARS)
-        .collect()
 }
 
 /// The rows as the aligned table `pod ls` prints, header first; nothing when
@@ -535,7 +532,7 @@ async fn remove_checked(
     if in_progress
         && !keep_training
         && !removed.is_empty()
-        && let Err(error) = fail_run(ctx.runs, run_id)
+        && let Err(error) = fail_run_by_pod_rm(ctx.runs, run_id)
     {
         failed.get_or_insert(error);
     }
@@ -665,7 +662,7 @@ fn record_stray(runs: &Runs, run_id: &str, id: &PodId, error: &PodError) {
 }
 
 /// Saves the run `run_id`, read again just before, `Failed` by `pod rm`.
-fn fail_run(runs: &Runs, run_id: &str) -> Result<(), PodError> {
+fn fail_run_by_pod_rm(runs: &Runs, run_id: &str) -> Result<(), PodError> {
     let mut run = runs.load(run_id)?;
     run.state = RunState::Failed;
     run.message = Some(FAILED_BY_POD_RM.to_string());
@@ -749,12 +746,6 @@ mod tests {
                 "20260921-090000-ffff  k3x9abc         RUNNING       NVIDIA A40                 0.49  2026-09-21T09:00:03Z  run succeeded, not deleted".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn text_from_the_account_is_one_short_printable_line() {
-        assert_eq!(cell("run\u{1b}[31m\nx\u{e9}"), "run[31mx");
-        assert_eq!(cell(&"y".repeat(500)).len(), CELL_CHARS);
     }
 
     #[test]

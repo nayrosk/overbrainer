@@ -35,9 +35,7 @@ pub use orphans::{
     PodRow, Removal, Removed, RowKind, listed_rows, orphan_warnings, pod_rows, remove_run_pods,
     table,
 };
-pub use provision::{
-    PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, sweep, wait_gone,
-};
+pub use provision::{PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, sweep};
 pub use record::{
     Attempt, AttemptResult, DeletedBy, POD_FILE, POD_RECORD_VERSION, PodRecord, PodState,
     SshEndpoint, hours,

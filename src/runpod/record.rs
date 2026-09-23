@@ -371,13 +371,6 @@ impl PodRecord {
         self.deleted_by = Some(by);
     }
 
-    /// Whether the watchdog may still hold the pod after `now` + `margin`.
-    #[must_use]
-    pub fn past_deadline(&self, now: SystemTime, margin: Duration) -> bool {
-        self.deadline_unix
-            .is_some_and(|deadline| unix(now) >= deadline.saturating_add(margin.as_secs()))
-    }
-
     /// One line for `runs ls`: `pod running k3x9abc $0.53/h`, `pod deleted about
     /// $0.64`, `pod kept k3x9abc`, and so on, followed by `+N stray` when
     /// [`PodRecord::stray_pods`] is not empty.
@@ -423,6 +416,7 @@ fn write(path: &Path, content: &[u8]) -> Result<(), RunsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runpod::flow::until_deadline_at;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -464,8 +458,19 @@ mod tests {
         );
         record.state = PodState::Running;
         assert_eq!(record.summary(), "pod running k3x9abc $0.53/h");
-        assert!(!record.past_deadline(at(1_790_021_901), Duration::from_secs(300)));
-        assert!(record.past_deadline(at(1_790_021_902), Duration::from_secs(300)));
+        // The client's deadline: the watchdog's (1_790_021_602) plus its margin.
+        assert_eq!(
+            until_deadline_at(&record, at(1_790_021_901)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            until_deadline_at(&record, at(1_790_021_902)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            until_deadline_at(&record, at(1_790_030_000)),
+            Some(Duration::ZERO)
+        );
         record.deleted(DeletedBy::Client, at(1_790_004_323));
         assert_eq!(record.summary(), "pod deleted about $0.64");
         assert_eq!(record.deleted_by, Some(DeletedBy::Client));
@@ -479,7 +484,7 @@ mod tests {
         assert_eq!(attempt.deadline_unix, None);
         record.created(&pod()?, AttemptResult::Created, at(1_790_000_001));
         assert_eq!(record.deadline, None);
-        assert!(!record.past_deadline(at(u64::from(u32::MAX)), Duration::ZERO));
+        assert_eq!(until_deadline_at(&record, at(u64::from(u32::MAX))), None);
         record.state = PodState::Kept;
         assert_eq!(record.summary(), "pod kept k3x9abc");
         Ok(())

@@ -630,7 +630,7 @@ async fn preflight(
         ctx.check().map_err(Wait::Failed)?;
         match executor.read_from(path, 0, VERDICT_BYTES).await {
             Ok(bytes) => {
-                let text = one_line(&String::from_utf8_lossy(&bytes));
+                let text = one_line(&String::from_utf8_lossy(&bytes), VERDICT_CHARS);
                 if text == "ready" {
                     return Ok(());
                 }
@@ -658,12 +658,13 @@ async fn preflight(
     }
 }
 
-/// `text` as one short line of printable ASCII: control and non-ASCII
-/// characters dropped, at most [`VERDICT_CHARS`] kept.
-fn one_line(text: &str) -> String {
+/// `text`, from a pod or the Runpod account, as one short line of printable
+/// ASCII: control and non-ASCII characters dropped, at most `max` kept, and
+/// the spaces around it trimmed.
+pub(super) fn one_line(text: &str, max: usize) -> String {
     text.chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .take(VERDICT_CHARS)
+        .take(max)
         .collect::<String>()
         .trim()
         .to_string()
@@ -739,7 +740,7 @@ pub(super) async fn delete_confirmed(ctx: &PodCtx<'_>, id: &PodId) -> Result<boo
 ///
 /// Returns [`PodError::NotDeleted`] when the pod still shows after that, and
 /// [`PodError::Api`] when the API fails.
-pub async fn wait_gone(ctx: &PodCtx<'_>, id: &PodId) -> Result<(), PodError> {
+pub(crate) async fn wait_gone(ctx: &PodCtx<'_>, id: &PodId) -> Result<(), PodError> {
     let started = Instant::now();
     loop {
         if ctx.client.get_pod(id).await?.is_none() {
@@ -864,14 +865,19 @@ mod tests {
 
     #[test]
     fn a_verdict_is_one_short_line_of_printable_ascii() {
-        assert_eq!(one_line("ready\n"), "ready");
+        assert_eq!(one_line("ready\n", VERDICT_CHARS), "ready");
         assert_eq!(
-            one_line("failed http_403\u{1b}[31m\r\nsecond line\u{7}"),
+            one_line(
+                "failed http_403\u{1b}[31m\r\nsecond line\u{7}",
+                VERDICT_CHARS
+            ),
             "failed http_403[31msecond line"
         );
-        assert_eq!(one_line("failed caf\u{e9}"), "failed caf");
+        assert_eq!(one_line("failed caf\u{e9}", VERDICT_CHARS), "failed caf");
+        assert_eq!(one_line("run\u{1b}[31m\nx\u{e9}", 64), "run[31mx");
         let long = format!("failed {}", "x".repeat(5000));
-        assert_eq!(one_line(&long).len(), VERDICT_CHARS);
+        assert_eq!(one_line(&long, VERDICT_CHARS).len(), VERDICT_CHARS);
+        assert_eq!(one_line(&long, 64).len(), 64);
     }
 
     #[test]
