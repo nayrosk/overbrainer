@@ -952,6 +952,8 @@ fn a_tall_dialog_keeps_its_keys_and_its_cost_at_80x24() -> TestResult {
     app.priced(&gpus.iter().map(|gpu| (gpu.clone(), Some(0.5))).collect());
     let rows = text(&draw(&mut app, 80, 24)?).join("\n");
     for shown in [
+        "warning     warning number 1 about this run",
+        "warning     warning number 4 about this run",
         "[y] start",
         "[n] cancel",
         "max_hours   6",

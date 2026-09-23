@@ -202,11 +202,12 @@ pub(super) fn text(plan: &StartPlan, prices: Option<&Prices>) -> Vec<String> {
             plan.train, plan.eval
         ),
     ];
-    if let Some(runpod) = &plan.runpod {
-        text.extend(gpu_lines(runpod, prices));
-    }
+    // Before the GPU list: a dialog too tall for the terminal cuts after them.
     for warning in &plan.warnings {
         text.push(format!("warning     {warning}"));
+    }
+    if let Some(runpod) = &plan.runpod {
+        text.extend(gpu_lines(runpod, prices));
     }
     text.push(
         "The run keeps going when you leave this view or quit; attach again here or with \
@@ -219,10 +220,11 @@ pub(super) fn text(plan: &StartPlan, prices: Option<&Prices>) -> Vec<String> {
 /// The position in [`text`] of the line saying what a Runpod run costs at
 /// most (`max_hours`): a dialog too tall for the terminal keeps it.
 pub(super) fn cost_line(plan: &StartPlan) -> Option<usize> {
-    // After the target, model and data lines, the GPU header and its types.
+    // After the target, model and data lines, the warnings, the GPU header
+    // and its types.
     plan.runpod
         .as_ref()
-        .map(|runpod| 3 + 1 + runpod.gpu_types.len())
+        .map(|runpod| 3 + plan.warnings.len() + 1 + runpod.gpu_types.len())
 }
 
 /// The GPU types of `runpod`, each with its list price times the GPU count
@@ -291,7 +293,8 @@ mod tests {
 
     #[test]
     fn the_cost_line_is_the_max_hours_line() {
-        let runpod = plan(true);
+        let mut runpod = plan(true);
+        runpod.warnings = vec!["one".into(), "two".into()];
         let line = cost_line(&runpod).and_then(|at| text(&runpod, None).get(at).cloned());
         assert!(
             line.as_deref()
