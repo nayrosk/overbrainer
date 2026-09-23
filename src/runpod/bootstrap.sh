@@ -2,14 +2,41 @@
 # entrypoint. It installs the run's host key and authorized key, writes the job's
 # environment file and the watchdog, starts sshd, then becomes the watchdog.
 #
+# The run directory and the watchdog file are created FIRST, before anything else
+# is touched: if a later step fails, `fail` can still exec into the watchdog it
+# already wrote, so the pod always ends up guarded, even one that never reaches
+# sshd. A handful of the paths bootstrap_main writes to are overridable through
+# OVERBRAINER_* variables, defaulting to the real pod's paths, so tests can point
+# them at a temporary directory instead of the real /etc and /root.
+#
 # Only functions are defined here, so tests can source this file and call them on
 # temporary directories; overbrainer appends write_watchdog and the call to
 # bootstrap_main when it builds the pod's command. POSIX sh.
 
 log() { printf '%s bootstrap: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
+# The watchdog file's path: OVERBRAINER_WATCHDOG_FILE when set (tests), the real
+# pod's path otherwise. Shared by bootstrap_main and fail so both agree on it.
+watchdog_path() {
+  printf '%s' "${OVERBRAINER_WATCHDOG_FILE:-/etc/overbrainer/watchdog.sh}"
+}
+
+# fail REASON: logs REASON, records it in .pod/bootstrap_failed (plain text, never
+# a secret: every caller passes a fixed literal), then, if the watchdog file has
+# already been written, execs into it with OVERBRAINER_BOOT_FAILED=1 so the pod
+# still gets a proof attempt, a verdict and, unless kept, gets deleted. Only when
+# the watchdog itself could not be written does this exit without a guard, as
+# before: nothing is left that could run it.
 fail() {
   log "failed: $*"
+  if [ -n "${OVERBRAINER_RUN_DIR:-}" ]; then
+    { mkdir -p "$OVERBRAINER_RUN_DIR/.pod" &&
+        printf '%s\n' "$*" > "$OVERBRAINER_RUN_DIR/.pod/bootstrap_failed"; } 2>/dev/null || true
+  fi
+  watchdog_file=$(watchdog_path)
+  if [ -f "$watchdog_file" ]; then
+    OVERBRAINER_BOOT_FAILED=1 exec bash "$watchdog_file"
+  fi
   exit 1
 }
 
@@ -61,13 +88,18 @@ bootstrap_main() {
   set -eu
   umask 077
   log "run ${OVERBRAINER_RUN_ID:-unknown}"
-  install_host_key /etc/ssh || fail "cannot install the host key"
-  install_authorized_key /root/.ssh || fail "cannot install the authorized key"
-  write_job_env /etc/overbrainer/job.env /workspace/axolotl/scripts/cuda13_env.sh ||
-    fail "cannot write the job environment"
+  watchdog_file=$(watchdog_path)
+  etc_ssh_dir=${OVERBRAINER_ETC_SSH_DIR:-/etc/ssh}
+  authorized_keys_dir=${OVERBRAINER_AUTHORIZED_KEYS_DIR:-/root/.ssh}
+  job_env_file=${OVERBRAINER_JOB_ENV_FILE:-/etc/overbrainer/job.env}
+  cuda_env_script=${OVERBRAINER_CUDA_ENV_SCRIPT:-/workspace/axolotl/scripts/cuda13_env.sh}
   mkdir -p "$OVERBRAINER_RUN_DIR/.pod" || fail "cannot create the run directory"
-  write_watchdog /etc/overbrainer/watchdog.sh || fail "cannot write the watchdog"
+  write_watchdog "$watchdog_file" || fail "cannot write the watchdog"
+  install_host_key "$etc_ssh_dir" || fail "cannot install the host key"
+  install_authorized_key "$authorized_keys_dir" || fail "cannot install the authorized key"
+  write_job_env "$job_env_file" "$cuda_env_script" ||
+    fail "cannot write the job environment"
   unset OVERBRAINER_HOST_KEY OVERBRAINER_AUTHORIZED_KEY
   service ssh restart || fail "cannot start sshd"
-  exec bash /etc/overbrainer/watchdog.sh
+  exec bash "$watchdog_file"
 }

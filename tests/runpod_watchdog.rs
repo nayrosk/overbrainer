@@ -382,10 +382,15 @@ async fn an_ended_job_is_deleted_after_the_retrieve_grace_or_at_once_when_retrie
         fs::write(pod.file("job.pid"), "999999\n")?;
         fs::write(pod.file("exit_code"), "0\n")?;
         let started = Instant::now();
+        // A grace of 3, not 2: `now()` is `date +%s`, whole seconds, so a grace
+        // of 2 can fire after little more than 1 real second (ended_at sampled
+        // just before its second ticks over, the check just after the next one
+        // does), which would make the `>= 2s` assertion below flaky. A grace of
+        // 3 keeps the same assertion comfortably clear of that rounding.
         let child = pod.start(
             shell,
             &server,
-            &[("OVERBRAINER_RETRIEVE_GRACE", "2".into())],
+            &[("OVERBRAINER_RETRIEVE_GRACE", "3".into())],
         )?;
         let (code, output) = finished(child, Duration::from_secs(15)).await?;
         assert_eq!(code, 0, "{shell}: {output}");
@@ -507,7 +512,361 @@ async fn a_failed_delete_falls_back_to_terminate_then_stop() -> TestResult {
             "{shell}"
         );
         assert!(output.contains("terminate 403"), "{shell}: {output}");
+        assert!(
+            output.contains("stopped (the volume keeps billing until overbrainer pod rm)"),
+            "{shell}: {output}"
+        );
+        assert!(!output.contains(" deleted\n"), "{shell}: {output}");
         assert_clean(&server, &pod, &output, shell).await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_that_fails_once_is_retried_and_succeeds() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        // A fresh server, not `stub()`: it would mount its own unconditional
+        // DELETE mock alongside these two, and an already-matching earlier mock
+        // wins over a later, more specific one.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/pods/{POD}")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v2/pods/{POD}")))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v2/pods/{POD}")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/pods/{POD}/action")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let pod = Pod::new()?;
+        let child = pod.start(
+            shell,
+            &server,
+            &[("OVERBRAINER_DEADLINE", (unix_now() - 1).to_string())],
+        )?;
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert_eq!(deletes(&server).await, 2, "{shell}: {output}");
+        assert_eq!(
+            output.matches("delete reason=deadline").count(),
+            2,
+            "{shell}: {output}"
+        );
+        assert!(output.contains("DELETE 500"), "{shell}: {output}");
+        assert!(output.contains("DELETE 204"), "{shell}: {output}");
+        assert!(output.contains(" deleted\n"), "{shell}: {output}");
+        assert_clean(&server, &pod, &output, shell).await;
+    }
+    Ok(())
+}
+
+/// A directory on `PATH` holding a `runpodctl` that succeeds a `pod delete` and
+/// fails everything else, and its full path.
+fn fake_runpodctl() -> Result<(tempfile::TempDir, String), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let script = dir.path().join("runpodctl");
+    fs::write(
+        &script,
+        "#!/bin/sh\ncase \"$1 $2\" in\n'pod delete') exit 0 ;;\n*) exit 1 ;;\nesac\n",
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Ok((dir, path))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runpodctl_on_path_is_the_last_fallback() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 500).await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/pods/{POD}/action")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let pod = Pod::new()?;
+        let (_dir, path_with_runpodctl) = fake_runpodctl()?;
+        let child = pod.start(
+            shell,
+            &server,
+            &[
+                ("OVERBRAINER_DEADLINE", (unix_now() - 1).to_string()),
+                ("PATH", path_with_runpodctl),
+            ],
+        )?;
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert!(output.contains("runpodctl delete ok"), "{shell}: {output}");
+        assert!(output.contains(" deleted\n"), "{shell}: {output}");
+        assert_clean(&server, &pod, &output, shell).await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_marker_ends_the_job() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        fs::write(pod.file("job.pid"), "999999\n")?;
+        fs::write(pod.file("cancelled"), "")?;
+        let child = pod.start(
+            shell,
+            &server,
+            &[("OVERBRAINER_RETRIEVE_GRACE", "3".into())],
+        )?;
+        let started = Instant::now();
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert!(started.elapsed() >= Duration::from_secs(2), "{shell}");
+        assert!(output.contains("job ended"), "{shell}: {output}");
+        assert!(
+            output.contains("delete reason=abandoned"),
+            "{shell}: {output}"
+        );
+    }
+    Ok(())
+}
+
+/// A `PATH` with every command the watchdog needs except `curl`: real copies of
+/// `sh`, `dash`, `busybox`, and the plain utilities the script calls, resolved
+/// through the current `PATH` (so it works whether they are external programs or,
+/// for busybox, an internal applet), symlinked into a fresh directory. `curl`
+/// itself is never linked in, so `command -v curl` genuinely fails.
+fn path_without_curl() -> Result<(tempfile::TempDir, String), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    for name in [
+        "sh", "dash", "busybox", "date", "mkdir", "cat", "mv", "sleep", "kill", "printf", "env",
+    ] {
+        let Ok(output) = StdCommand::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {name}"))
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !found.is_empty() {
+            let _ = std::os::unix::fs::symlink(&found, dir.path().join(name));
+        }
+    }
+    let path = dir.path().to_string_lossy().into_owned();
+    Ok((dir, path))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pod_with_no_curl_on_path_is_a_failed_verdict() -> TestResult {
+    for &shell in shells() {
+        let (_dir, path) = path_without_curl()?;
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        let child = pod.start(
+            shell,
+            &server,
+            &[("OVERBRAINER_KEEP_POD", "1".into()), ("PATH", path)],
+        )?;
+        assert!(
+            until(Duration::from_secs(10), || {
+                pod.read(".pod/watchdog") == "failed no_curl\n"
+            })
+            .await,
+            "{shell}: {:?}",
+            pod.read(".pod/watchdog")
+        );
+        drop(child);
+        assert!(requests(&server).await.is_empty(), "{shell}");
+    }
+    Ok(())
+}
+
+/// Runs `bootstrap_functions()` then `bootstrap_main`, under `shell`, with a
+/// `write_watchdog` that copies the real watchdog content (from
+/// `OVERBRAINER_TEST_WATCHDOG_SRC`) to its target instead of embedding a
+/// here-document, so a test can drive the real bootstrap failure path without
+/// touching the pod's actual `/etc` or `/root`.
+fn start_bootstrap(shell: Shell, env: &[(&str, String)]) -> std::io::Result<Child> {
+    let mut command = Command::new(shell.0[0]);
+    command
+        .args(&shell.0[1..])
+        .arg("-c")
+        .arg(format!(
+            "{}\nwrite_watchdog() {{\n  mkdir -p \"$(dirname \"$1\")\" || return 1\n  cp \"$OVERBRAINER_TEST_WATCHDOG_SRC\" \"$1\" || return 1\n}}\nbootstrap_main\n",
+            bootstrap_functions()
+        ))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.spawn()
+}
+
+/// Everything a `start_bootstrap` run of `bootstrap_main` needs, in one temporary
+/// tree: the run's SSH keys, a stub-reachable API, and every path `bootstrap_main`
+/// would otherwise hard-code redirected under `root`.
+struct FailingBootstrap {
+    // Held only for its `Drop`: removes the temporary tree once the test is done.
+    _root: tempfile::TempDir,
+    run_dir: PathBuf,
+    env: Vec<(&'static str, String)>,
+}
+
+impl FailingBootstrap {
+    fn new(server: &MockServer) -> Result<Self, Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let run_dir = root.path().join("run");
+        let watchdog_file = root.path().join("watchdog.sh");
+        let watchdog_src = root.path().join("watchdog_src.sh");
+        fs::write(&watchdog_src, watchdog_script())?;
+        let etc_ssh = root.path().join("etc/ssh");
+        // A directory whose parent cannot be written into, so
+        // install_authorized_key's own `mkdir -p` fails: the target is never
+        // created, regardless of what permissions it would otherwise get.
+        let readonly_root = root.path().join("readonly");
+        fs::create_dir_all(&readonly_root)?;
+        fs::set_permissions(&readonly_root, fs::Permissions::from_mode(0o500))?;
+        let authorized_keys_dir = readonly_root.join("ssh");
+        let keys = PodKeys::generate(&root.path().join("ssh-keys"), "overbrainer-r1")?;
+        let env = vec![
+            ("OVERBRAINER_RUN_ID", "r1".to_string()),
+            (
+                "OVERBRAINER_RUN_DIR",
+                run_dir.to_string_lossy().into_owned(),
+            ),
+            (
+                "OVERBRAINER_WORKDIR",
+                root.path().join("workdir").to_string_lossy().into_owned(),
+            ),
+            (
+                "OVERBRAINER_WATCHDOG_FILE",
+                watchdog_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "OVERBRAINER_TEST_WATCHDOG_SRC",
+                watchdog_src.to_string_lossy().into_owned(),
+            ),
+            (
+                "OVERBRAINER_ETC_SSH_DIR",
+                etc_ssh.to_string_lossy().into_owned(),
+            ),
+            (
+                "OVERBRAINER_AUTHORIZED_KEYS_DIR",
+                authorized_keys_dir.to_string_lossy().into_owned(),
+            ),
+            (
+                "OVERBRAINER_HOST_KEY",
+                keys.host_private().expose_secret().to_string(),
+            ),
+            ("OVERBRAINER_AUTHORIZED_KEY", keys.client_public.clone()),
+            ("RUNPOD_API_KEY", KEY.to_string()),
+            ("RUNPOD_POD_ID", POD.to_string()),
+            ("OVERBRAINER_API_URL", format!("{}/v2", server.uri())),
+            ("OVERBRAINER_INTERVAL", "1".to_string()),
+            ("OVERBRAINER_PROBE_WAIT", "0".to_string()),
+            ("OVERBRAINER_VERSION", "9.9.9".to_string()),
+        ];
+        Ok(Self {
+            _root: root,
+            run_dir,
+            env,
+        })
+    }
+
+    fn read(&self, name: &str) -> String {
+        fs::read_to_string(self.run_dir.join(name)).unwrap_or_default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bootstrap_failure_still_deletes_a_guarded_pod() -> TestResult {
+    if !curl_available() || !keygen_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let setup = FailingBootstrap::new(&server)?;
+        let child = start_bootstrap(shell, &setup.env)?;
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert_eq!(
+            setup.read(".pod/bootstrap_failed"),
+            "cannot install the authorized key\n",
+            "{shell}: {output}"
+        );
+        assert_eq!(
+            setup.read(".pod/watchdog"),
+            "failed bootstrap: cannot install the authorized key\n",
+            "{shell}: {output}"
+        );
+        assert!(
+            output.contains("delete reason=bootstrap_failed"),
+            "{shell}: {output}"
+        );
+        assert_eq!(deletes(&server).await, 1, "{shell}: {output}");
+        assert!(!output.contains(KEY), "{shell}: {output}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bootstrap_failure_in_keep_mode_only_logs() -> TestResult {
+    if !curl_available() || !keygen_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let setup = FailingBootstrap::new(&server)?;
+        let mut env = setup.env.clone();
+        env.push(("OVERBRAINER_KEEP_POD", "1".to_string()));
+        let child = start_bootstrap(shell, &env)?;
+        assert!(
+            until(Duration::from_secs(10), || {
+                setup.read(".pod/watchdog")
+                    == "failed bootstrap: cannot install the authorized key\n"
+            })
+            .await,
+            "{shell}: {:?}",
+            setup.read(".pod/watchdog")
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            deletes(&server).await,
+            0,
+            "{shell}: a kept, failed pod was deleted"
+        );
+        drop(child);
+        let log = setup.read(".pod/watchdog.log");
+        assert!(log.contains("bootstrap failed, kept"), "{shell}: {log}");
     }
     Ok(())
 }

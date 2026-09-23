@@ -5,6 +5,13 @@
 # says so. Keep mode (--keep-pod) never deletes. The API key only ever reaches
 # curl on its standard input: it is never in a command line, a file or a log.
 #
+# When the bootstrap itself failed (OVERBRAINER_BOOT_FAILED=1, set by bootstrap.sh's
+# `fail` once the watchdog file exists), this still runs: the pod's own key is
+# already installed by then, so the proof can still be attempted, but the verdict
+# always reports the bootstrap failure and the pod is deleted at once (unless kept).
+# This is what stops a pod that failed early, before sshd even started, from
+# sitting unguarded and unbilled-for-nothing until its deadline.
+#
 # POSIX sh: it runs under bash on the pod and is tested under sh, dash and busybox.
 # group_signal comes from overbrainer's job scripts and is prepended to this file.
 
@@ -17,6 +24,7 @@ BOOT_GRACE=${OVERBRAINER_BOOT_GRACE:-1800}
 RETRIEVE_GRACE=${OVERBRAINER_RETRIEVE_GRACE:-3600}
 KEEP=${OVERBRAINER_KEEP_POD:-0}
 DEADLINE=${OVERBRAINER_DEADLINE:-}
+BOOT_FAILED=${OVERBRAINER_BOOT_FAILED:-0}
 API=${OVERBRAINER_API_URL:-https://api.runpod.io/v2}
 AGENT="overbrainer-watchdog/${OVERBRAINER_VERSION:-unknown}"
 
@@ -75,6 +83,10 @@ verdict() {
 
 # Whether the job has ended: an exit code or a cancel marker, or a recorded
 # process group that is gone (a job killed before writing its exit code).
+#
+# group_signal's `kill -0` reads as "gone" only on a signal failure: on the pod
+# everything runs as root, so a live process group can never refuse the signal
+# with EPERM, the one case where that would wrongly read as ended.
 job_ended() {
   [ -f "$RUN_DIR/exit_code" ] && return 0
   [ -f "$RUN_DIR/cancelled" ] && return 0
@@ -87,21 +99,24 @@ job_ended() {
 }
 
 # Deletes the pod, falling back to terminate, then stop, then runpodctl. Returns
-# non-zero when every way failed; the next tick tries again.
+# non-zero when every way failed; the next tick tries again. Sets DELETE_METHOD to
+# which one worked, since only `stop` leaves the pod's volume billed until the
+# owner removes it: the caller logs that case differently.
 delete_pod() {
   log "delete reason=$1"
   code=$(api DELETE "/pods/$RUNPOD_POD_ID")
   log "DELETE $code"
-  case $code in 200 | 202 | 204 | 404) return 0 ;; esac
+  case $code in 200 | 202 | 204 | 404) DELETE_METHOD=delete; return 0 ;; esac
   code=$(api POST "/pods/$RUNPOD_POD_ID/action" '{"action":"terminate"}')
   log "terminate $code"
-  case $code in 200 | 202 | 204) return 0 ;; esac
+  case $code in 200 | 202 | 204) DELETE_METHOD=terminate; return 0 ;; esac
   code=$(api POST "/pods/$RUNPOD_POD_ID/action" '{"action":"stop"}')
   log "stop $code"
-  case $code in 200 | 202 | 204) return 0 ;; esac
+  case $code in 200 | 202 | 204) DELETE_METHOD=stop; return 0 ;; esac
   if command -v runpodctl >/dev/null 2>&1; then
     if runpodctl pod delete "$RUNPOD_POD_ID" >/dev/null 2>&1; then
       log "runpodctl delete ok"
+      DELETE_METHOD=runpodctl
       return 0
     fi
     log "runpodctl delete failed"
@@ -113,8 +128,15 @@ trap 'log "stopping"; exit 0' TERM INT
 
 mkdir -p "$POD_DIR"
 start=$(now)
-log "start deadline=${DEADLINE:-none} boot_grace=$BOOT_GRACE retrieve_grace=$RETRIEVE_GRACE keep=$KEEP"
+log "start deadline=${DEADLINE:-none} boot_grace=$BOOT_GRACE retrieve_grace=$RETRIEVE_GRACE keep=$KEEP boot_failed=$BOOT_FAILED"
 result=$(probe)
+if [ "$BOOT_FAILED" = 1 ]; then
+  boot_reason=$(cat "$POD_DIR/bootstrap_failed" 2>/dev/null)
+  result="failed bootstrap: ${boot_reason:-unknown}"
+  if [ "$KEEP" = 1 ]; then
+    log "bootstrap failed, kept (keep mode): ${boot_reason:-unknown}"
+  fi
+fi
 verdict "$result"
 log "probe $result"
 
@@ -137,7 +159,9 @@ while :; do
   fi
   reason=
   if [ "$KEEP" != 1 ]; then
-    if [ -n "$DEADLINE" ] && [ "$n" -ge "$DEADLINE" ]; then
+    if [ "$BOOT_FAILED" = 1 ]; then
+      reason=bootstrap_failed
+    elif [ -n "$DEADLINE" ] && [ "$n" -ge "$DEADLINE" ]; then
       reason=deadline
     elif [ "$retrieved" = 1 ]; then
       reason=retrieved
@@ -148,7 +172,11 @@ while :; do
     fi
   fi
   if [ -n "$reason" ] && delete_pod "$reason"; then
-    log "deleted"
+    if [ "$DELETE_METHOD" = stop ]; then
+      log "stopped (the volume keeps billing until overbrainer pod rm)"
+    else
+      log "deleted"
+    fi
     exit 0
   fi
   sleep "$INTERVAL"
