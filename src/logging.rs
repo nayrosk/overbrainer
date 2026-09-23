@@ -165,6 +165,18 @@ impl LogBuffer {
             .count()
     }
 
+    /// The kept lines at `min` or more severe pushed after the line numbered
+    /// `seq`, oldest first.
+    #[must_use]
+    pub fn since(&self, min: Level, seq: u64) -> Vec<LogLine> {
+        self.lock()
+            .lines
+            .iter()
+            .filter(|line| line.level <= min && line.seq > seq)
+            .cloned()
+            .collect()
+    }
+
     /// The newest line at `min` or more severe.
     #[must_use]
     pub fn latest(&self, min: Level) -> Option<LogLine> {
@@ -308,6 +320,18 @@ mod tests {
             3,
             "the dropped line counts all"
         );
+    }
+
+    #[test]
+    fn since_copies_matching_lines_after_a_sequence_number() {
+        let buffer = LogBuffer::new(10);
+        buffer.push(line(Level::WARN, "w1"));
+        buffer.push(line(Level::INFO, "i1"));
+        buffer.push(line(Level::ERROR, "e1"));
+        buffer.push(line(Level::WARN, "w2"));
+        assert_eq!(messages(&buffer.since(Level::WARN, 1)), ["e1", "w2"]);
+        assert_eq!(messages(&buffer.since(Level::TRACE, 0)).len(), 4);
+        assert!(buffer.since(Level::WARN, 4).is_empty());
     }
 
     #[test]

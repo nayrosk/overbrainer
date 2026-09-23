@@ -17,6 +17,7 @@ use tokio::process::Child;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
+use tracing::Level;
 
 use super::app::{App, Effect, Exit};
 use super::tasks::{Done, Msg, Task, TaskId, Tasks, TrainJob};
@@ -90,6 +91,16 @@ where
     result
 }
 
+/// What woke the loop while it settles.
+enum Settling {
+    /// A task ended, or none is left.
+    Ended(Option<(TaskId, Result<Done, String>)>),
+    /// A process signal.
+    Signal,
+    /// Time to write the new log lines.
+    Tick,
+}
+
 /// What woke the loop.
 enum Wake {
     Input(Option<io::Result<TermEvent>>),
@@ -114,6 +125,8 @@ struct Loop<'t, B: Backend> {
     /// Where lines are written once the loop ended and the screen was given
     /// back: stderr, with the real terminal.
     console: Option<Box<dyn Write + Send>>,
+    /// The sequence number of the last log line written to the console.
+    logged: u64,
     /// Whether the editor has the terminal: no input is read, nothing is drawn,
     /// and SIGINT is ignored (it comes from a Ctrl-C typed in the editor).
     suspended: bool,
@@ -149,6 +162,7 @@ where
             signals: None,
             screen: None,
             console: None,
+            logged: 0,
             suspended: false,
             editor: None,
             last_draw: None,
@@ -242,6 +256,7 @@ where
     /// stderr says what is waited for; a signal meanwhile acts as a first one
     /// would. The ends still reach the app, for its exit notes.
     async fn settle(&mut self, app: &mut App) {
+        self.logged = app.logs.seq();
         // List prices are only read: nothing waits for them.
         self.tasks.abort_lookups();
         for effect in std::mem::take(&mut self.pending) {
@@ -254,6 +269,7 @@ where
             app.exit = why.or(app.exit);
         }
         self.drain_late(app);
+        self.write_logs(app);
     }
 
     /// Ends the tasks as a confirmed quit does and waits for them: a run still
@@ -274,22 +290,39 @@ where
             self.console.get_or_insert_with(|| Box::new(io::stderr()));
         }
         self.write(&lines);
+        let mut tick = tokio::time::interval(TICK);
         loop {
             let woke = tokio::select! {
-                next = self.tasks.next() => Some(next),
-                () = Signals::recv(self.signals.as_mut(), true) => None,
+                next = self.tasks.next() => Settling::Ended(next),
+                () = Signals::recv(self.signals.as_mut(), true) => Settling::Signal,
+                _ = tick.tick() => Settling::Tick,
             };
             let effects = match woke {
-                Some(Some((id, result))) => {
+                Settling::Ended(Some((id, result))) => {
                     self.drain_late(app);
                     app.on_done(id, result)
                 },
-                Some(None) => break,
-                None => self.interrupted(app),
+                Settling::Ended(None) => break,
+                Settling::Signal => self.interrupted(app),
+                Settling::Tick => Vec::new(),
             };
             for effect in effects {
                 self.apply_late(app, effect);
             }
+            self.write_logs(app);
+        }
+    }
+
+    /// Writes the WARN and ERROR lines logged since the last ones written (the
+    /// lines the Logs view shows, such as a flow's "remove the pod" warning),
+    /// once the screen was given back; nothing before.
+    fn write_logs(&mut self, app: &App) {
+        let Some(console) = &mut self.console else {
+            return;
+        };
+        for line in app.logs.since(Level::WARN, self.logged) {
+            writeln!(console, "{} {}: {}", line.level, line.target, line.message).ok();
+            self.logged = line.seq;
         }
     }
 
@@ -1052,6 +1085,93 @@ mod tests {
         .await?;
         assert!(!abandoned);
         assert!(app.training.tasks.is_empty(), "it was waited for");
+        Ok(())
+    }
+
+    /// A writer sharing what it gets, standing for stderr.
+    #[derive(Clone, Default)]
+    struct Console(Arc<Mutex<Vec<u8>>>);
+
+    impl Console {
+        fn text(&self) -> String {
+            self.0
+                .lock()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        }
+    }
+
+    impl Write for Console {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A log line of the flows at `level`.
+    fn logged(level: tracing::Level, message: &str) -> crate::logging::LogLine {
+        crate::logging::LogLine {
+            seq: 0,
+            level,
+            target: "overbrainer::runpod_train".into(),
+            time: SystemTime::UNIX_EPOCH,
+            message: message.into(),
+        }
+    }
+
+    /// Once the screen is given back, what is waited for is written, then each
+    /// warning or error the flows log as it arrives, and those logged last
+    /// before the exit; never the other lines.
+    #[tokio::test]
+    async fn warnings_logged_while_the_loop_ends_are_written()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = failing_input(&mut terminal, dir.path())?;
+        let console = Console::default();
+        looping.console = Some(Box::new(console.clone()));
+        let mut app = provisioning_app(dir.path());
+        let logs = app.logs.clone();
+        let release = tokio_util::sync::CancellationToken::new();
+        looping.tasks.park(TaskId(4), release.clone());
+        let result = tokio::time::timeout(LIMIT, looping.run(&mut app)).await?;
+        assert!(result.is_err());
+        let remove = "remove the pod with `overbrainer pod rm`";
+        let check = async {
+            logs.push(logged(tracing::Level::INFO, "not written"));
+            logs.push(logged(tracing::Level::WARN, remove));
+            for _ in 0..500 {
+                if console.text().contains(remove) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let written = console.text().contains(remove);
+            logs.push(logged(tracing::Level::ERROR, "the last line"));
+            release.cancel();
+            written
+        };
+        let ((), written) = tokio::time::timeout(LIMIT, async {
+            tokio::join!(looping.settle(&mut app), check)
+        })
+        .await?;
+        assert!(written, "written as it arrived: {}", console.text());
+        let text = console.text();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "waiting for run 20260921-133200-a1b2 to start; Ctrl-C abandons it...",
+                &format!("WARN overbrainer::runpod_train: {remove}"),
+                "ERROR overbrainer::runpod_train: the last line",
+            ]
+        );
         Ok(())
     }
 
