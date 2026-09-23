@@ -52,6 +52,7 @@ const TRAINING: &[KeyHelp] = &[
     row("k j, Up Down", "select a run"),
     row("a", "attach: follow the selected run again"),
     row("c", "cancel the selected run's job (asks first)"),
+    row("c, Runpod run starting", "abandon it instead (asks first)"),
     row("t", "start a training run (asks first)"),
 ];
 

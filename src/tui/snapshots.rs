@@ -934,6 +934,20 @@ fn quitting_while_a_runpod_run_provisions_offers_to_abandon_it() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn c_on_a_starting_runpod_run_offers_to_abandon_it() -> TestResult {
+    let mut app = training_app()?;
+    app.training.tasks.insert(
+        TaskId(3),
+        Follow::new(Job::Start { runpod: true }, FOLLOWED),
+    );
+    // No job yet, so no metric.
+    app.training.series.remove(FOLLOWED);
+    app.on_input(&key(KeyCode::Char('c')));
+    snapshot("abandon_starting_run", &mut app)?;
+    Ok(())
+}
+
 /// A start dialog taller than the terminal keeps its key line and its
 /// most-it-can-cost line, and marks the text it cut; so does a quit dialog.
 #[test]

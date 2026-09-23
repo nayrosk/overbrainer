@@ -198,7 +198,8 @@ pub(super) enum Action {
     Cancel(String),
     /// Starting a training run as planned.
     Start(Box<StartPlan>),
-    /// Abandoning Runpod runs still provisioning, when quitting.
+    /// Abandoning Runpod runs still provisioning: when quitting, or one run
+    /// with `c`.
     Abandon(Vec<TaskId>),
 }
 
@@ -2858,6 +2859,120 @@ mod tests {
                     .to_string(),
             ]
         );
+        Ok(())
+    }
+
+    /// Start tasks bound to [`FIRST`] and [`SECOND`], on Runpod when `runpod`.
+    fn starts(app: &mut App, runpod: bool) -> [TaskId; 2] {
+        use crate::tui::training::{Follow, Job};
+        for (id, run) in [(TaskId(90), FIRST), (TaskId(91), SECOND)] {
+            app.training
+                .tasks
+                .insert(id, Follow::new(Job::Start { runpod }, run));
+        }
+        [TaskId(90), TaskId(91)]
+    }
+
+    /// The tasks the open dialog abandons, if it is an abandon dialog.
+    fn abandoning(app: &App) -> Option<&[TaskId]> {
+        match &app.overlay {
+            Some(Overlay::Confirm(Confirm {
+                action: Action::Abandon(tasks),
+                ..
+            })) => Some(tasks),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn c_on_a_starting_runpod_run_offers_to_abandon_it_and_n_keeps_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::training::Detach;
+        let (_dir, mut app) = runs_app()?;
+        let [first, _] = starts(&mut app, true);
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            keys(&mut app, &[KeyCode::Char('c')]);
+            assert!(
+                dialog(&app).starts_with(
+                    "Run 20260921-133200-a1b2 is still starting, so it has no job to cancel \
+                     yet. Abandon it instead? If its pod is still being prepared, it is \
+                     deleted"
+                ),
+                "{}",
+                dialog(&app)
+            );
+            assert_eq!(abandoning(&app), Some([first].as_slice()));
+            assert_eq!(keys(&mut app, &[code]), [], "{code:?}");
+            assert_eq!(app.overlay, None);
+            let follow = app
+                .training
+                .tasks
+                .get(&first)
+                .map(|f| (f.detach, f.cancel_after));
+            assert_eq!(follow, Some((Detach::No, false)), "{code:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn c_then_y_abandons_only_the_selected_start_and_the_tui_stays()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::training::Detach;
+        let (_dir, mut app) = runs_app()?;
+        let [first, second] = starts(&mut app, true);
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('c'), KeyCode::Char('y')]),
+            [Effect::Abandon(first)]
+        );
+        assert_eq!(status(&app), Some("abandoning run 20260921-133200-a1b2"));
+        assert_eq!((app.leaving, app.exit), (None, None));
+        let other = app.training.tasks.get(&second).map(|f| f.detach);
+        assert_eq!(other, Some(Detach::No), "only the selected run");
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(app.overlay, None);
+        assert_eq!(
+            status(&app),
+            Some("run 20260921-133200-a1b2 is being abandoned")
+        );
+        let failed = "interrupted: run 20260921-133200-a1b2 stopped before its job started; it \
+                      has no pod left";
+        ended(&mut app, first, Ok(Done::Trained(Err(failed.into()))));
+        assert_eq!((app.leaving, app.exit), (None, None));
+        let error = app.training.ended.get(FIRST).and_then(|e| e.error.clone());
+        assert_eq!(error.as_deref(), Some(failed));
+        assert_eq!(
+            status(&app).map(String::from),
+            Some(format!("run {FIRST}: {failed}"))
+        );
+        assert!(app.training.tasks.contains_key(&second));
+        Ok(())
+    }
+
+    #[test]
+    fn c_on_a_starting_local_run_still_cancels_it_once_its_job_started()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let [first, _] = starts(&mut app, false);
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(Confirm { action: Action::Cancel(run), .. })) if run == FIRST
+            ),
+            "{:?}",
+            app.overlay
+        );
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('y')]),
+            [],
+            "never during the start"
+        );
+        assert_eq!(
+            status(&app),
+            Some("run 20260921-133200-a1b2 is starting: it is cancelled once its job started")
+        );
+        assert_eq!(watching(&mut app, first), [Effect::Cancel(first)]);
+        assert_eq!(app.leaving, None);
         Ok(())
     }
 
