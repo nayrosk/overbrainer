@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use secrecy::SecretString;
@@ -7,7 +8,7 @@ use super::{MetricsSummary, RunRecord, RunState, Runs, RunsError, new_run_id, rf
 use crate::events::{Event, EventBus};
 use crate::exec::{
     ExecError, Executor, FileDigest, JOB_LOG, JobId, JobRuntime, JobSpec, JobStatus, LineStream,
-    local_manifest, sha256_file,
+    local_manifest,
 };
 use crate::train::{TrainError, Trainer};
 
@@ -77,8 +78,17 @@ pub struct Outcome {
     pub record: RunRecord,
     /// What the metric lines add up to.
     pub summary: MetricsSummary,
-    /// Whether the artifacts and the job log were downloaded and each file checked
-    /// against the SHA-256 the target computed for it.
+    /// Whether every file the target has for this run (its artifacts and its job
+    /// log, whatever that turns out to be) was downloaded and verified against the
+    /// SHA-256 the target computed for it: what decides whether the pod that ran
+    /// it may be deleted without losing anything.
+    ///
+    /// A succeeded job whose required entry holds no file is recorded `Failed`
+    /// (see [`watch`]), but is still `retrieved` once what did exist was
+    /// downloaded and verified: there was nothing more on the target to lose. Only
+    /// a file that could not be retrieved or verified, or, for an already-ended
+    /// run, a job log never downloaded locally, makes this false. `watch` and
+    /// [`collect`] agree on this for the same run.
     pub retrieved: bool,
 }
 
@@ -202,7 +212,8 @@ async fn launch_job<E: Executor, T: Trainer>(
 /// ([`Artifacts::required`](crate::train::Artifacts::required)) is different: that
 /// is permanent, not something a retry could fix, so once what does exist (the job
 /// log, the metrics) has been downloaded and verified, the run is recorded
-/// `Failed` instead, with a message saying so.
+/// `Failed` instead, with a message saying so, and [`Outcome::retrieved`] true:
+/// nothing the target had was left behind.
 ///
 /// # Errors
 ///
@@ -238,8 +249,10 @@ pub async fn watch<E: Executor, T: Trainer>(
     let (state, message, retrieved) =
         match retrieve(ctx.executor, trainer, &record.remote_dir, &local, succeeded).await {
             Ok(Retrieved::Ok) => (state, message, true),
+            // Recorded Failed, not Succeeded, but everything the target had was
+            // still downloaded and verified: retrieved is still true.
             Ok(Retrieved::NoOutput) => {
-                (RunState::Failed, Some(no_output_message(&record.id)), false)
+                (RunState::Failed, Some(no_output_message(&record.id)), true)
             },
             Err(error) if succeeded => return Err(error.into()),
             Err(error) => (state, Some(not_retrieved(message, &error)), false),
@@ -316,33 +329,35 @@ fn has_required(manifest: &[FileDigest], required: &str) -> bool {
 
 /// Checks that the local files under `entries` of `local` are exactly the files
 /// `manifest` lists, each with the SHA-256 the target computed for it: none
-/// missing, none with a different hash, and none the target did not have.
+/// missing, none with a different hash, and none the target did not have. Every
+/// local file is hashed exactly once, by [`local_manifest`], and compared as a
+/// map: a multi-gigabyte file is never hashed twice to answer this.
 fn verify(
     local: &Path,
     entries: &[String],
     exclude: &[String],
     manifest: &[FileDigest],
 ) -> Result<(), ExecError> {
+    let local_files = local_manifest(local, entries, exclude)?;
+    let local_by_path: HashMap<&str, &str> = local_files
+        .iter()
+        .map(|file| (file.path.as_str(), file.sha256.as_str()))
+        .collect();
     for file in manifest {
-        let path: PathBuf = local.join(&file.path);
-        let sha256 = match sha256_file(&path) {
-            Ok(sha256) => sha256,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(verify_error(format!("{:?} is missing locally", file.path)));
-            },
-            Err(source) => return Err(ExecError::Io { path, source }),
+        let Some(sha256) = local_by_path.get(file.path.as_str()).copied() else {
+            return Err(verify_error(format!("{:?} is missing locally", file.path)));
         };
-        if sha256 != file.sha256 {
+        if sha256 != file.sha256.as_str() {
             return Err(verify_error(format!(
                 "{:?} differs from the target (SHA-256 mismatch)",
                 file.path
             )));
         }
     }
-    let local_files = local_manifest(local, entries, exclude)?;
+    let manifest_paths: HashSet<&str> = manifest.iter().map(|file| file.path.as_str()).collect();
     if let Some(extra) = local_files
         .iter()
-        .find(|file| !manifest.iter().any(|listed| listed.path == file.path))
+        .find(|file| !manifest_paths.contains(file.path.as_str()))
     {
         return Err(verify_error(format!(
             "{:?} is not on the target",
@@ -1199,7 +1214,9 @@ mod tests {
             watch_with(vec![listed("job.log")], &[("job.log", "w")]).await?;
         let outcome = result?;
         assert_eq!(outcome.record.state, RunState::Failed);
-        assert!(!outcome.retrieved);
+        // Everything the target had (just the job log here) was downloaded and
+        // verified, so this still counts as retrieved: the pod may be deleted.
+        assert!(outcome.retrieved);
         assert_eq!(
             outcome.record.message.as_deref(),
             Some(
@@ -1208,6 +1225,34 @@ mod tests {
             )
         );
         assert_eq!(runs.load(RUN_ID)?, outcome.record);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_permanent_failure_without_output_is_retrieved_on_every_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runs, _project, result) =
+            watch_with(vec![listed("job.log")], &[("job.log", "w")]).await?;
+        let outcome = result?;
+        assert_eq!(outcome.record.state, RunState::Failed);
+        assert!(outcome.retrieved);
+
+        let bus = EventBus::new();
+        let fake = Fake {
+            manifest: vec![listed("job.log")],
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        // A later watch, on the now-ended record, agrees.
+        let again = watch(
+            &ctx(&runs, &fake, &bus),
+            &WithOutput,
+            outcome.record.clone(),
+        )
+        .await?;
+        assert!(again.retrieved);
+        // So does collect.
+        let (_, collected) = collect(&ctx(&runs, &fake, &bus), &WithOutput, outcome.record).await?;
+        assert!(collected);
         Ok(())
     }
 
