@@ -79,6 +79,7 @@ impl Fixture {
         let settings = load(dir.path(), EnvSource::Vars(Vec::new()))?;
         let runtime = JobRuntime::Native {
             venv: Some(venv.to_string_lossy().into_owned()),
+            env_file: None,
         };
         Ok(Self {
             dir,

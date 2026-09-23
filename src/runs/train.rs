@@ -742,7 +742,10 @@ mod tests {
         let created = create(&runs, &fake, "box")?;
         break_saves(&runs, &created.id)?;
         let launch = Launch {
-            runtime: &JobRuntime::Native { venv: None },
+            runtime: &JobRuntime::Native {
+                venv: None,
+                env_file: None,
+            },
             secrets: Vec::new(),
         };
         let result = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await;
@@ -764,7 +767,10 @@ mod tests {
         let created = create(&runs, &fake, "box")?;
         break_saves(&runs, &created.id)?;
         let launch = Launch {
-            runtime: &JobRuntime::Native { venv: None },
+            runtime: &JobRuntime::Native {
+                venv: None,
+                env_file: None,
+            },
             secrets: Vec::new(),
         };
         let result = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await;
