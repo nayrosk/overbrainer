@@ -689,8 +689,10 @@ mod tests {
             events.send(Err(io::Error::other("the terminal is gone")))?;
             Ok::<_, Box<dyn std::error::Error>>(())
         };
-        let (result, sent) =
-            tokio::time::timeout(LIMIT, async { tokio::join!(run_loop, keys) }).await?;
+        let joined = tokio::time::timeout(LIMIT, async { tokio::join!(run_loop, keys) }).await;
+        let Ok((result, sent)) = joined else {
+            return Err(stalled("waiting for the loop", &app, &frame).into());
+        };
         sent?;
         assert!(result.is_err());
         assert!(app.training.tasks.is_empty(), "the task was waited for");
@@ -806,6 +808,19 @@ mod tests {
         Err(format!("never drawn: {text}"))
     }
 
+    /// Why a test timed out: what `app` was at and the last screen drawn, so a
+    /// timeout on a slow runner says where it stopped.
+    fn stalled(stage: &str, app: &App, frame: &Mutex<String>) -> String {
+        let screen = frame.lock().map(|frame| frame.clone()).unwrap_or_default();
+        format!(
+            "timed out {stage}: view {:?}, exit {:?}, {} training task(s), status {:?}, screen {screen:?}",
+            app.view,
+            app.exit,
+            app.training.tasks.len(),
+            app.status.as_ref().map(|status| status.text.clone()),
+        )
+    }
+
     /// The effects of a wake whose draw failed still run: a confirmed cancel
     /// starts, and is waited for.
     #[tokio::test]
@@ -832,8 +847,10 @@ mod tests {
             events.send(Ok(key(KeyCode::Char('y'))))?;
             Ok::<_, Box<dyn std::error::Error>>(())
         };
-        let (result, sent) =
-            tokio::time::timeout(LIMIT, async { tokio::join!(run_loop, keys) }).await?;
+        let joined = tokio::time::timeout(LIMIT, async { tokio::join!(run_loop, keys) }).await;
+        let Ok((result, sent)) = joined else {
+            return Err(stalled("waiting for the loop", &app, &frame).into());
+        };
         sent?;
         let error = result.err().map(|error| format!("{error:#}"));
         assert_eq!(error.as_deref(), Some("the terminal is gone"));
@@ -1061,13 +1078,17 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let backend = Shared::new();
         backend.unwind.store(true, Ordering::SeqCst);
+        let frame = Arc::clone(&backend.frame);
         let mut terminal = Terminal::new(backend)?;
         let (_events, input) = mpsc::unbounded_channel();
         let mut looping = Loop::new(&mut terminal, input, dir.path());
         let mut app = provisioning_app(dir.path());
         let release = tokio_util::sync::CancellationToken::new();
         let abandon = looping.tasks.park(TaskId(4), release.clone());
-        let result = tokio::time::timeout(LIMIT, looping.run(&mut app)).await?;
+        let ran = tokio::time::timeout(LIMIT, looping.run(&mut app)).await;
+        let Ok(result) = ran else {
+            return Err(stalled("running the loop", &app, &frame).into());
+        };
         let error = result.err().map(|error| format!("{error:#}"));
         assert_eq!(
             error.as_deref(),
@@ -1079,10 +1100,13 @@ mod tests {
             release.cancel();
             abandoned
         };
-        let ((), abandoned) = tokio::time::timeout(LIMIT, async {
+        let settled = tokio::time::timeout(LIMIT, async {
             tokio::join!(looping.settle(&mut app), check)
         })
-        .await?;
+        .await;
+        let Ok(((), abandoned)) = settled else {
+            return Err(stalled("settling", &app, &frame).into());
+        };
         assert!(!abandoned);
         assert!(app.training.tasks.is_empty(), "it was waited for");
         Ok(())
