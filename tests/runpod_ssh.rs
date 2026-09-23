@@ -40,13 +40,18 @@ fn sshd() -> Result<Option<Sshd>, Box<dyn std::error::Error>> {
     let text = fs::read_to_string(config)?;
     let get = |key: &str| value(&text, key).ok_or(format!("no {key} in the test ssh config"));
     let known_hosts = fs::read_to_string(get("UserKnownHostsFile")?)?;
-    let host_public = known_hosts
-        .lines()
-        .find_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            (fields.get(1) == Some(&"ssh-ed25519")).then(|| fields[1..3].join(" "))
-        })
-        .ok_or("no ssh-ed25519 key in the test known_hosts")?;
+    let mut host_public = None;
+    for line in known_hosts.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.get(1) == Some(&"ssh-ed25519") {
+            let pair = fields
+                .get(1..3)
+                .ok_or("a known_hosts line names ssh-ed25519 but has no key")?;
+            host_public = Some(pair.join(" "));
+            break;
+        }
+    }
+    let host_public = host_public.ok_or("no ssh-ed25519 key in the test known_hosts")?;
     Ok(Some(Sshd {
         endpoint: SshEndpoint {
             host: get("HostName")?,
@@ -87,6 +92,22 @@ async fn connect(
     Ok(SshExecutor::connect(&alias, &workdir, Some(&config)).await?)
 }
 
+/// Whether `error`'s chain names a host key check failure, rather than some
+/// other reason the connection could have failed.
+fn is_host_key_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = current {
+        let text = e.to_string().to_lowercase();
+        if text.contains("host key verification failed")
+            || text.contains("remote host identification has changed")
+        {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
 #[tokio::test]
 async fn the_per_run_config_reaches_the_pinned_host() -> TestResult {
     let Some(sshd) = sshd()? else {
@@ -108,6 +129,12 @@ async fn another_host_key_is_refused_through_the_per_run_config() -> TestResult 
     let dir = tempfile::tempdir()?;
     let other = PodKeys::generate(&dir.path().join("other"), "other")?;
     let result = connect(dir.path(), &sshd, &keys(&sshd, &other.host_public)).await;
-    assert!(result.is_err(), "connected although the pinned key differs");
+    let Err(error) = result else {
+        return Err("connected although the pinned key differs".into());
+    };
+    assert!(
+        is_host_key_failure(error.as_ref()),
+        "expected a host key verification failure, got: {error}"
+    );
     Ok(())
 }

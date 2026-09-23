@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use secrecy::SecretString;
+use secrecy::zeroize::Zeroizing;
+
+use crate::runs::is_valid_run_id;
 
 use super::{PodError, SshEndpoint};
 
@@ -67,7 +70,7 @@ impl PodKeys {
 
     /// Generates both keys with `ssh-keygen` (ed25519, no passphrase), the client
     /// key into `dir` (created with mode 700). The host key file is read and
-    /// removed at once.
+    /// removed at once, whether the read succeeds or fails.
     ///
     /// # Errors
     ///
@@ -82,14 +85,12 @@ impl PodKeys {
         let client_public = read_public(&client_key)?;
         let host_key = dir.join(HOST_KEY);
         keygen(&host_key, comment)?;
-        let host_public = read_public(&host_key)?;
-        let host_private = fs::read(&host_key).map_err(io_error(&host_key))?;
-        remove_pair(&host_key)?;
+        let (host_public, host_private) = take_host_key(&host_key)?;
         Ok(Self {
             client_key,
             client_public,
-            host_public: key_fields(&host_public),
-            host_private: SecretString::from(base64(&host_private)),
+            host_public,
+            host_private,
         })
     }
 
@@ -129,6 +130,26 @@ fn read_public(path: &Path) -> Result<String, PodError> {
     Ok(text.trim().to_string())
 }
 
+/// Reads the host key pair at `host_key` (its public key and the base64 of its
+/// private key file, wiped from memory as soon as it is encoded) and removes
+/// both files, whether the read succeeds or fails: the pair never stays on disk.
+fn take_host_key(host_key: &Path) -> Result<(String, SecretString), PodError> {
+    let read = read_public(host_key).and_then(|host_public| {
+        fs::read(host_key)
+            .map(Zeroizing::new)
+            .map_err(io_error(host_key))
+            .map(|raw| {
+                let encoded = Zeroizing::new(base64(&raw));
+                (
+                    key_fields(&host_public),
+                    SecretString::from(encoded.as_str()),
+                )
+            })
+    });
+    remove_pair(host_key)?;
+    read
+}
+
 fn public_path(path: &Path) -> PathBuf {
     let mut public = path.as_os_str().to_owned();
     public.push(".pub");
@@ -155,13 +176,29 @@ fn key_fields(line: &str) -> String {
         .join(" ")
 }
 
+/// Checks that `alias` is safe to interpolate into an ssh config or a
+/// `known_hosts` line: the same allow-list as a run ID, letters, digits and
+/// `-`, non-empty.
+fn valid_alias(alias: &str) -> Result<(), PodError> {
+    if is_valid_run_id(alias) {
+        Ok(())
+    } else {
+        Err(PodError::InvalidPath(format!(
+            "{} is not a valid ssh alias: only letters, digits and `-`",
+            alias.escape_debug()
+        )))
+    }
+}
+
 /// Writes `known_hosts` into `dir`: one line pinning `host_public` for `alias`.
 /// Returns its path.
 ///
 /// # Errors
 ///
-/// Returns [`PodError::Io`] when the file cannot be written.
+/// Returns [`PodError::InvalidPath`] when `alias` is not a safe ssh alias, and
+/// [`PodError::Io`] when the file cannot be written.
 pub fn write_known_hosts(dir: &Path, alias: &str, host_public: &str) -> Result<PathBuf, PodError> {
+    valid_alias(alias)?;
     let path = dir.join(KNOWN_HOSTS);
     let line = format!("{alias} {}\n", key_fields(host_public));
     fs::write(&path, line).map_err(io_error(&path))?;
@@ -175,8 +212,9 @@ pub fn write_known_hosts(dir: &Path, alias: &str, host_public: &str) -> Result<P
 /// # Errors
 ///
 /// Returns [`PodError::InvalidPath`] when a path cannot be written in an ssh
-/// config, [`PodError::InvalidEndpoint`] when Runpod's endpoint holds characters
-/// no host or user name has, and [`PodError::Io`] when a file cannot be written.
+/// config or `alias` is not a safe ssh alias, [`PodError::InvalidEndpoint`] when
+/// Runpod's endpoint holds characters no host or user name has, and
+/// [`PodError::Io`] when a file cannot be written.
 pub fn write_config(
     dir: &Path,
     alias: &str,
@@ -203,6 +241,7 @@ pub fn ssh_config(
     identity: &Path,
     known_hosts: &Path,
 ) -> Result<String, PodError> {
+    valid_alias(alias)?;
     let host_ok = !endpoint.host.is_empty()
         && endpoint
             .host
@@ -374,6 +413,34 @@ mod tests {
             fs::read_to_string(path)?,
             "overbrainer-r1 ssh-ed25519 AAAAkey\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_bad_alias_is_refused_everywhere_it_is_interpolated() -> TestResult {
+        for bad in ["a b", "a*b", "a,b", "a\nb", ""] {
+            let config = ssh_config(bad, &endpoint(), Path::new("/id"), Path::new("/kh"));
+            assert!(matches!(config, Err(PodError::InvalidPath(_))), "{bad:?}");
+
+            let dir = tempfile::tempdir()?;
+            let known_hosts = write_known_hosts(dir.path(), bad, "ssh-ed25519 AAAAkey");
+            assert!(
+                matches!(known_hosts, Err(PodError::InvalidPath(_))),
+                "{bad:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn take_host_key_removes_the_pair_even_when_the_public_half_is_missing() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let host_key = dir.path().join(HOST_KEY);
+        fs::write(&host_key, b"not a real private key")?;
+        // No `.pub` file next to it: `read_public` fails.
+        let result = take_host_key(&host_key);
+        assert!(result.is_err());
+        assert!(!host_key.exists(), "the private key was left on disk");
         Ok(())
     }
 
