@@ -392,24 +392,94 @@ pub enum Target {
         /// Without it, `axolotl` must be on the remote `PATH`.
         venv: Option<String>,
     },
-    /// Runs on a Runpod-provisioned GPU pod.
+    /// Runs on a Runpod GPU pod, created for the run and deleted after it.
     Runpod {
-        /// Runpod GPU type identifier.
-        gpu_type: String,
+        /// Runpod GPU type IDs, tried in order until one can be placed. A TOML array,
+        /// or a comma-separated string from env.
+        #[serde(deserialize_with = "string_list")]
+        gpu_types: Vec<String>,
         /// Number of GPUs to provision. Must be at least 1.
         #[serde(default = "default_gpu_count", deserialize_with = "number")]
         gpu_count: u32,
-        /// Container image to run.
-        image: String,
-        /// Container disk size, in gigabytes.
+        /// Container image of the pod. Defaults to [`DEFAULT_RUNPOD_IMAGE`].
+        image: Option<String>,
+        /// Virtual environment on the pod holding `bin/axolotl`, absolute. Defaults
+        /// to [`DEFAULT_RUNPOD_VENV`].
+        venv: Option<String>,
+        /// Container disk size, in gigabytes. Must be at least 20.
         #[serde(default = "default_container_disk_gb", deserialize_with = "number")]
         container_disk_gb: u32,
-        /// Maximum pod lifetime, in hours. Must be greater than 0.
+        /// Hours after which the pod watchdog deletes the pod, whatever it is doing.
+        /// Must be greater than 0 and at most 720. Not applied to a pod kept with
+        /// `--keep-pod`.
         #[serde(deserialize_with = "number")]
         max_hours: f64,
-        /// Network volume to attach, if any.
+        /// Minutes the watchdog waits for a job to start before deleting the pod.
+        /// Must be at least 5.
+        #[serde(default = "default_boot_grace_minutes", deserialize_with = "number")]
+        boot_grace_minutes: u32,
+        /// Minutes the watchdog keeps a pod whose ended job was not retrieved. Must
+        /// be at least 1.
+        #[serde(
+            default = "default_retrieve_grace_minutes",
+            deserialize_with = "number"
+        )]
+        retrieve_grace_minutes: u32,
+        /// Runpod data centers the pod may be placed in, for example `EU-RO-1`.
+        /// Any when empty.
+        #[serde(default, deserialize_with = "string_list")]
+        data_center_ids: Vec<String>,
+        /// Network volume mounted at `/workspace/data`. Requires exactly one entry
+        /// in `data_center_ids`, the volume's data center.
         network_volume_id: Option<String>,
     },
+}
+
+/// Image of a Runpod pod when a target sets none: Axolotl 0.19.0's cloud image for
+/// CUDA 13 (NVIDIA driver 580 or newer), pinned by its index digest.
+pub const DEFAULT_RUNPOD_IMAGE: &str = "axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1@sha256:f7b94da82913920a003e28e091d8528f57f76da7360fca87e95faf62fa32a680";
+
+/// Virtual environment holding Axolotl in [`DEFAULT_RUNPOD_IMAGE`].
+pub const DEFAULT_RUNPOD_VENV: &str = "/workspace/axolotl-venv";
+
+/// Base URL of the Runpod REST API (v2) when `runpod.base_url` is unset.
+pub const DEFAULT_RUNPOD_BASE_URL: &str = "https://api.runpod.io/v2";
+
+/// Deserializes a list of strings given as a TOML array or, since env values
+/// always arrive as strings, as one comma-separated string. Every item is trimmed.
+fn string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ListVisitor;
+
+    impl<'de> Visitor<'de> for ListVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a list of strings or a comma-separated string")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Vec<String>, E> {
+            if value.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(value
+                .split(',')
+                .map(|item| item.trim().to_string())
+                .collect())
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<String>, A::Error> {
+            let mut items = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                items.push(item.trim().to_string());
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_any(ListVisitor)
 }
 
 /// Deserializes a number that may arrive as a string.
@@ -467,11 +537,20 @@ fn default_gpu_count() -> u32 {
 fn default_container_disk_gb() -> u32 {
     50
 }
+fn default_boot_grace_minutes() -> u32 {
+    30
+}
+fn default_retrieve_grace_minutes() -> u32 {
+    60
+}
 
-/// Credentials for the Runpod API.
+/// Access to the Runpod API.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Runpod {
-    /// Env only.
+    /// Env only. Literal value or `vault:<mount>/<path>#<field>`.
     pub api_key: Option<SecretString>,
+    /// Env only. Base URL of the REST API, [`DEFAULT_RUNPOD_BASE_URL`] when unset.
+    /// Must be `https`, or `http` on a loopback host (a test stub).
+    pub base_url: Option<String>,
 }

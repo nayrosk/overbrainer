@@ -25,6 +25,7 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
     check_pipeline(settings, &mut problems);
     check_training(settings, &mut problems);
     check_targets(settings, &mut problems);
+    check_runpod(settings, &mut problems);
     problems
 }
 
@@ -346,19 +347,158 @@ fn check_targets(settings: &Settings, problems: &mut Vec<String>) {
                 check_target_venv(name, venv.as_deref(), problems);
                 check_target_workdir(name, workdir.as_deref(), problems);
             },
-            Target::Runpod {
-                max_hours,
-                gpu_count,
-                ..
-            } => {
-                if max_hours.is_nan() || *max_hours <= 0.0 {
-                    problems.push(format!("targets.{name}.max_hours: must be greater than 0"));
-                }
-                if *gpu_count == 0 {
-                    problems.push(format!("targets.{name}.gpu_count: must be at least 1"));
-                }
-            },
+            Target::Runpod { .. } => check_runpod_target(name, target, problems),
         }
+    }
+}
+
+/// Longest `max_hours`: 30 days, which keeps the deadline arithmetic sane.
+const MAX_RUNPOD_HOURS: f64 = 720.0;
+
+/// Smallest `container_disk_gb`: the model, its checkpoints and a merged copy.
+const MIN_CONTAINER_DISK_GB: u32 = 20;
+
+/// Smallest `boot_grace_minutes`: connecting, the watchdog proof and the upload
+/// must fit before the watchdog gives up on a job that never started.
+const MIN_BOOT_GRACE_MINUTES: u32 = 5;
+
+/// Values of a `runpod` target that serde cannot check.
+fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) {
+    let Target::Runpod {
+        gpu_types,
+        gpu_count,
+        image,
+        venv,
+        container_disk_gb,
+        max_hours,
+        boot_grace_minutes,
+        retrieve_grace_minutes,
+        data_center_ids,
+        network_volume_id,
+    } = target
+    else {
+        return;
+    };
+    check_gpu_types(name, gpu_types, problems);
+    let minimums = [
+        ("gpu_count", *gpu_count, 1),
+        (
+            "container_disk_gb",
+            *container_disk_gb,
+            MIN_CONTAINER_DISK_GB,
+        ),
+        (
+            "boot_grace_minutes",
+            *boot_grace_minutes,
+            MIN_BOOT_GRACE_MINUTES,
+        ),
+        ("retrieve_grace_minutes", *retrieve_grace_minutes, 1),
+    ];
+    for (field, value, minimum) in minimums {
+        if value < minimum {
+            problems.push(format!(
+                "targets.{name}.{field}: must be at least {minimum}"
+            ));
+        }
+    }
+    if !(max_hours.is_finite() && *max_hours > 0.0 && *max_hours <= MAX_RUNPOD_HOURS) {
+        problems.push(format!(
+            "targets.{name}.max_hours: must be greater than 0 and at most {MAX_RUNPOD_HOURS}"
+        ));
+    }
+    check_target_image(name, image.as_deref(), problems);
+    check_target_venv(name, venv.as_deref(), problems);
+    if venv.as_deref().is_some_and(|venv| !venv.starts_with('/')) {
+        problems.push(format!("targets.{name}.venv: must be an absolute path"));
+    }
+    check_data_centers(
+        name,
+        data_center_ids,
+        network_volume_id.as_deref(),
+        problems,
+    );
+}
+
+/// `gpu_types` holds at least one entry, each non-empty, unique, without a comma
+/// (the env separator) and without a control character.
+fn check_gpu_types(name: &str, gpu_types: &[String], problems: &mut Vec<String>) {
+    if gpu_types.is_empty() {
+        problems.push(format!(
+            "targets.{name}.gpu_types: must list at least one GPU type"
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for gpu in gpu_types {
+        if gpu.is_empty() {
+            problems.push(format!("targets.{name}.gpu_types: an entry is empty"));
+        } else if gpu.contains(',') || gpu.chars().any(char::is_control) {
+            problems.push(format!(
+                "targets.{name}.gpu_types: `{gpu}` must not contain a comma or a control character"
+            ));
+        } else if !seen.insert(gpu.as_str()) {
+            problems.push(format!("targets.{name}.gpu_types: `{gpu}` is listed twice"));
+        }
+    }
+}
+
+/// Data center IDs use `[A-Z0-9-]` and are unique; a network volume ID uses
+/// `[A-Za-z0-9]` and needs exactly one data center, its own.
+fn check_data_centers(
+    name: &str,
+    data_center_ids: &[String],
+    network_volume_id: Option<&str>,
+    problems: &mut Vec<String>,
+) {
+    let mut seen = std::collections::BTreeSet::new();
+    for id in data_center_ids {
+        let valid = !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-');
+        if !valid {
+            problems.push(format!(
+                "targets.{name}.data_center_ids: `{id}` must use only A-Z, 0-9 and -"
+            ));
+        } else if !seen.insert(id.as_str()) {
+            problems.push(format!(
+                "targets.{name}.data_center_ids: `{id}` is listed twice"
+            ));
+        }
+    }
+    let Some(volume) = network_volume_id else {
+        return;
+    };
+    if volume.is_empty() || !volume.chars().all(|c| c.is_ascii_alphanumeric()) {
+        problems.push(format!(
+            "targets.{name}.network_volume_id: must use only letters and digits"
+        ));
+    }
+    if data_center_ids.len() != 1 {
+        problems.push(format!(
+            "targets.{name}.network_volume_id: needs data_center_ids with exactly one entry, the volume's data center"
+        ));
+    }
+}
+
+/// `runpod.base_url`, when set, is an `https` URL, or `http` on a loopback host.
+fn check_runpod(settings: &Settings, problems: &mut Vec<String>) {
+    let Some(base_url) = &settings.runpod.base_url else {
+        return;
+    };
+    let allowed = url::Url::parse(base_url).is_ok_and(|url| match url.scheme() {
+        "https" => url.host().is_some(),
+        "http" => match url.host() {
+            Some(url::Host::Domain(domain)) => domain == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    });
+    if !allowed {
+        problems.push(
+            "runpod.base_url: must be an https URL (http only on a loopback host)".to_string(),
+        );
     }
 }
 
@@ -490,6 +630,7 @@ pub(crate) fn env_only_in_file(file: &config::Config) -> Vec<String> {
         keys.push(format!("targets.{name}.host"));
     }
     keys.push("runpod.api_key".to_string());
+    keys.push("runpod.base_url".to_string());
     keys.push("hf_token".to_string());
     keys.push("log".to_string());
 
@@ -575,20 +716,170 @@ mod tests {
         Ok(())
     }
 
+    /// `VALID` plus a runpod target `cloud` with `extra` lines.
+    fn with_runpod(extra: &str) -> String {
+        format!(
+            "{VALID}\n[targets.cloud]\nkind = \"runpod\"\ngpu_types = [\"NVIDIA A40\"]\nmax_hours = 6\n{extra}\n"
+        )
+    }
+
     #[test]
-    fn runpod_max_hours_must_be_a_positive_number() -> Result<(), config::ConfigError> {
-        for value in ["0.0", "-1.0", "nan"] {
-            let toml = format!(
-                "{VALID}\n[targets.cloud]\nkind = \"runpod\"\ngpu_type = \"g\"\nimage = \"i\"\nmax_hours = {value}\n"
-            );
-            let problems = check(&settings(&toml)?);
+    fn a_minimal_runpod_target_is_valid_and_has_defaults() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let settings = settings(&with_runpod(""))?;
+        assert_eq!(check(&settings), Vec::<String>::new());
+        match settings.targets.get("cloud") {
+            Some(Target::Runpod {
+                gpu_count,
+                image,
+                venv,
+                container_disk_gb,
+                boot_grace_minutes,
+                retrieve_grace_minutes,
+                data_center_ids,
+                network_volume_id,
+                ..
+            }) => {
+                assert_eq!(*gpu_count, 1);
+                assert_eq!(*image, None);
+                assert_eq!(*venv, None);
+                assert_eq!(*container_disk_gb, 50);
+                assert_eq!(*boot_grace_minutes, 30);
+                assert_eq!(*retrieve_grace_minutes, 60);
+                assert!(data_center_ids.is_empty());
+                assert_eq!(*network_volume_id, None);
+            },
+            other => return Err(format!("expected a runpod target, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn runpod_max_hours_must_be_in_range() -> Result<(), config::ConfigError> {
+        for value in ["0.0", "-1.0", "nan", "721", "inf"] {
+            let toml = with_runpod("").replace("max_hours = 6", &format!("max_hours = {value}"));
             assert_eq!(
-                problems,
-                vec!["targets.cloud.max_hours: must be greater than 0".to_string()],
+                check(&settings(&toml)?),
+                vec!["targets.cloud.max_hours: must be greater than 0 and at most 720".to_string()],
                 "max_hours = {value}"
             );
         }
+        let toml = with_runpod("").replace("max_hours = 6", "max_hours = 720");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
         Ok(())
+    }
+
+    #[test]
+    fn runpod_gpu_types_are_checked() -> Result<(), config::ConfigError> {
+        let cases = [
+            (
+                "[]",
+                "targets.cloud.gpu_types: must list at least one GPU type",
+            ),
+            (
+                "[\"NVIDIA A40\", \" \"]",
+                "targets.cloud.gpu_types: an entry is empty",
+            ),
+            (
+                "[\"NVIDIA A40\", \"NVIDIA A40\"]",
+                "targets.cloud.gpu_types: `NVIDIA A40` is listed twice",
+            ),
+            (
+                "[\"a\\u0007b\"]",
+                "targets.cloud.gpu_types: `a\u{7}b` must not contain a comma or a control character",
+            ),
+        ];
+        for (value, problem) in cases {
+            let toml = with_runpod("").replace(
+                "gpu_types = [\"NVIDIA A40\"]",
+                &format!("gpu_types = {value}"),
+            );
+            assert_eq!(
+                check(&settings(&toml)?),
+                vec![problem.to_string()],
+                "{value}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn runpod_minimums_are_checked() -> Result<(), config::ConfigError> {
+        let toml = with_runpod(
+            "gpu_count = 0\ncontainer_disk_gb = 19\nboot_grace_minutes = 4\nretrieve_grace_minutes = 0",
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "targets.cloud.gpu_count: must be at least 1".to_string(),
+                "targets.cloud.container_disk_gb: must be at least 20".to_string(),
+                "targets.cloud.boot_grace_minutes: must be at least 5".to_string(),
+                "targets.cloud.retrieve_grace_minutes: must be at least 1".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runpod_venv_must_be_absolute_and_image_safe() -> Result<(), config::ConfigError> {
+        let toml = with_runpod("venv = \"venvs/axolotl\"\nimage = \"img;rm\"");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "targets.cloud.image: only letters, digits and . _ / : @ - are allowed".to_string(),
+                "targets.cloud.venv: must be an absolute path".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_network_volume_needs_exactly_one_data_center() -> Result<(), config::ConfigError> {
+        let toml = with_runpod("network_volume_id = \"abc123\"");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "targets.cloud.network_volume_id: needs data_center_ids with exactly one entry, the volume's data center"
+                    .to_string()
+            ]
+        );
+        let toml = with_runpod(
+            "network_volume_id = \"abc123\"\ndata_center_ids = [\"EU-RO-1\", \"US-KS-2\"]",
+        );
+        assert_eq!(check(&settings(&toml)?).len(), 1);
+        let toml = with_runpod("network_volume_id = \"abc123\"\ndata_center_ids = [\"EU-RO-1\"]");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn runpod_ids_use_their_charsets() -> Result<(), config::ConfigError> {
+        let toml = with_runpod(
+            "network_volume_id = \"abc-1\"\ndata_center_ids = [\"eu-ro-1\", \"EU-RO-1\", \"EU-RO-1\"]",
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "targets.cloud.data_center_ids: `eu-ro-1` must use only A-Z, 0-9 and -".to_string(),
+                "targets.cloud.data_center_ids: `EU-RO-1` is listed twice".to_string(),
+                "targets.cloud.network_volume_id: must use only letters and digits".to_string(),
+                "targets.cloud.network_volume_id: needs data_center_ids with exactly one entry, the volume's data center"
+                    .to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_old_gpu_type_key_is_rejected() {
+        let toml = with_runpod("gpu_type = \"NVIDIA A40\"");
+        let error = settings(&toml).err().map(|error| error.to_string());
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown field `gpu_type`")),
+            "{error:?}"
+        );
     }
 
     #[test]

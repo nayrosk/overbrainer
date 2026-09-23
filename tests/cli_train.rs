@@ -80,8 +80,7 @@ venv = "{}"
 
 [targets.gpu]
 kind = "runpod"
-gpu_type = "NVIDIA A40"
-image = "i"
+gpu_types = ["NVIDIA A40"]
 max_hours = 1.0
 "#,
             venv.display()

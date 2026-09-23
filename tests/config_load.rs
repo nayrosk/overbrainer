@@ -130,8 +130,7 @@ fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
 const TARGETS: &str = r#"
 [targets.gpu]
 kind = "runpod"
-gpu_type = "NVIDIA A40"
-image = "axolotl:latest"
+gpu_types = ["NVIDIA A40"]
 max_hours = 1.5
 
 [targets.box]
@@ -211,6 +210,83 @@ fn non_numeric_env_value_for_a_numeric_target_field_is_rejected()
         ),
         Err(ConfigError::Parse(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn runpod_lists_come_from_a_comma_separated_env_value() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TARGETS}"))?;
+    let settings = load(
+        dir.path(),
+        env(&[
+            (
+                "OVERBRAINER_TARGETS__GPU__GPU_TYPES",
+                "NVIDIA GeForce RTX 4090, NVIDIA A40",
+            ),
+            ("OVERBRAINER_TARGETS__GPU__DATA_CENTER_IDS", "EU-RO-1"),
+            ("OVERBRAINER_TARGETS__GPU__NETWORK_VOLUME_ID", "vol123"),
+            ("OVERBRAINER_TARGETS__GPU__BOOT_GRACE_MINUTES", "45"),
+            ("OVERBRAINER_TARGETS__GPU__RETRIEVE_GRACE_MINUTES", "90"),
+        ]),
+    )?;
+    match settings.targets.get("gpu") {
+        Some(Target::Runpod {
+            gpu_types,
+            data_center_ids,
+            network_volume_id,
+            boot_grace_minutes,
+            retrieve_grace_minutes,
+            ..
+        }) => {
+            assert_eq!(gpu_types, &["NVIDIA GeForce RTX 4090", "NVIDIA A40"]);
+            assert_eq!(data_center_ids, &["EU-RO-1"]);
+            assert_eq!(network_volume_id.as_deref(), Some("vol123"));
+            assert_eq!(*boot_grace_minutes, 45);
+            assert_eq!(*retrieve_grace_minutes, 90);
+            Ok(())
+        },
+        other => Err(format!("expected runpod target, got {other:?}").into()),
+    }
+}
+
+#[test]
+fn the_runpod_base_url_comes_from_env_and_must_be_https() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = project(BASE)?;
+    for url in [
+        "https://api.runpod.io/v2",
+        "http://127.0.0.1:8080/v2",
+        "http://localhost:1",
+    ] {
+        let settings = load(dir.path(), env(&[("OVERBRAINER_RUNPOD__BASE_URL", url)]))?;
+        assert_eq!(settings.runpod.base_url.as_deref(), Some(url));
+    }
+    for url in ["http://api.runpod.io/v2", "ftp://127.0.0.1/", "not a url"] {
+        match load(dir.path(), env(&[("OVERBRAINER_RUNPOD__BASE_URL", url)])) {
+            Err(ConfigError::Invalid(problems)) => assert_eq!(
+                problems,
+                vec![
+                    "runpod.base_url: must be an https URL (http only on a loopback host)"
+                        .to_string()
+                ],
+                "{url}"
+            ),
+            other => return Err(format!("{url}: expected Invalid, got {other:?}").into()),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn runpod_base_url_in_file_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let toml = format!("{BASE}\n[runpod]\nbase_url = \"https://api.runpod.io/v2\"\n");
+    let problems = env_only_problems(&toml)?;
+    assert!(
+        problems.contains(
+            &"runpod.base_url: must be set through env, not in overbrainer.toml".to_string()
+        ),
+        "{problems:?}"
+    );
     Ok(())
 }
 
