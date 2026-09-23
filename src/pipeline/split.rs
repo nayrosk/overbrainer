@@ -20,6 +20,35 @@ pub struct SplitReport {
     pub orphaned: usize,
 }
 
+/// How [`split`] treats one example of `data/answers.jsonl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitClass {
+    /// Left out: its topic is not configured or its question is gone.
+    Orphaned,
+    /// Left out for this reason (`meta.excluded`).
+    Excluded(Exclusion),
+    /// Written to train or eval.
+    Usable,
+}
+
+/// How [`split`] treats `example`: orphaned when its topic is not in `configured`
+/// or its ID is not in `known` (the IDs of `data/questions.jsonl`), excluded when
+/// `meta.excluded` is set, usable otherwise.
+#[must_use]
+pub fn split_class(
+    configured: &BTreeSet<&str>,
+    known: &BTreeSet<&Id>,
+    example: &Example,
+) -> SplitClass {
+    if !configured.contains(example.topic.as_str()) || !known.contains(&example.id) {
+        return SplitClass::Orphaned;
+    }
+    example
+        .meta
+        .excluded
+        .map_or(SplitClass::Usable, SplitClass::Excluded)
+}
+
 /// Rewrites `data/train.jsonl` and `data/eval.jsonl` from the usable examples of
 /// `data/answers.jsonl` (those with `meta.excluded = null`), stratified by subtopic.
 ///
@@ -39,12 +68,12 @@ pub fn split(ctx: &Ctx<'_>) -> Result<SplitReport, PipelineError> {
     let examples: Vec<Example> = read(&ctx.files.answers)?;
     let questions: Vec<Question> = read(&ctx.files.questions)?;
     let known: BTreeSet<&Id> = questions.iter().map(|question| &question.id).collect();
-    let configured = |example: &Example| {
-        ctx.settings
-            .topics
-            .iter()
-            .any(|topic| topic.name == example.topic)
-    };
+    let configured: BTreeSet<&str> = ctx
+        .settings
+        .topics
+        .iter()
+        .map(|topic| topic.name.as_str())
+        .collect();
     ctx.bus.publish(Event::StageStarted {
         stage: Stage::Split,
         total: examples.iter().filter(|example| counted(example)).count(),
@@ -53,17 +82,16 @@ pub fn split(ctx: &Ctx<'_>) -> Result<SplitReport, PipelineError> {
     let mut usable = Vec::new();
     let mut orphaned_usable = 0;
     for example in examples {
-        if !configured(&example) || !known.contains(&example.id) {
-            report.orphaned += usize::from(counted(&example));
-            orphaned_usable += usize::from(example.meta.excluded.is_none());
-            continue;
-        }
-        match example.meta.excluded {
-            Some(reason) if counted(&example) => {
+        match split_class(&configured, &known, &example) {
+            SplitClass::Orphaned => {
+                report.orphaned += usize::from(counted(&example));
+                orphaned_usable += usize::from(example.meta.excluded.is_none());
+            },
+            SplitClass::Excluded(reason) if counted(&example) => {
                 *report.excluded.entry(reason).or_default() += 1;
             },
-            Some(_) => {},
-            None => usable.push(example),
+            SplitClass::Excluded(_) => {},
+            SplitClass::Usable => usable.push(example),
         }
     }
     if every_usable_answer_orphaned(orphaned_usable, usable.len()) {
@@ -100,7 +128,7 @@ pub fn split(ctx: &Ctx<'_>) -> Result<SplitReport, PipelineError> {
 /// order.
 #[must_use]
 pub fn stratify(examples: Vec<Example>, ratio: f64, seed: u64) -> (Vec<Example>, Vec<Example>) {
-    let eval_total = eval_count(examples.len(), ratio);
+    let eval_total = eval_size(examples.len(), ratio);
     let mut topics: BTreeMap<String, BTreeMap<String, Vec<Example>>> = BTreeMap::new();
     for example in examples {
         topics
@@ -143,9 +171,10 @@ fn pick(mut group: Vec<Example>, quota: usize, seed: u64) -> (Vec<Example>, Vec<
     (group, rest)
 }
 
-/// Size of the eval set for `total` usable examples: `max(1, round(total * ratio))`
-/// capped at `total - 1`, or 0 below 2 examples.
-fn eval_count(total: usize, ratio: f64) -> usize {
+/// Size of the eval set [`stratify`] makes from `total` usable examples:
+/// `max(1, round(total * ratio))` capped at `total - 1`, or 0 below 2 examples.
+#[must_use]
+pub fn eval_size(total: usize, ratio: f64) -> usize {
     if total < 2 {
         return 0;
     }
@@ -354,5 +383,47 @@ mod tests {
         let (_, first) = stratify(dataset(), 0.2, 1);
         let (_, second) = stratify(dataset(), 0.2, 2);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn split_class_orphans_unknown_topics_and_questions_then_reads_the_exclusion() {
+        let configured = BTreeSet::from(["t"]);
+        let usable = example("a", 1);
+        let mut excluded = example("a", 2);
+        excluded.meta.excluded = Some(Exclusion::Refused);
+        let mut elsewhere = example("a", 3);
+        elsewhere.topic = "gone".into();
+        let unknown = example("a", 4);
+        let known = BTreeSet::from([&usable.id, &excluded.id, &elsewhere.id]);
+        assert_eq!(
+            split_class(&configured, &known, &usable),
+            SplitClass::Usable
+        );
+        assert_eq!(
+            split_class(&configured, &known, &excluded),
+            SplitClass::Excluded(Exclusion::Refused)
+        );
+        assert_eq!(
+            split_class(&configured, &known, &elsewhere),
+            SplitClass::Orphaned
+        );
+        assert_eq!(
+            split_class(&configured, &known, &unknown),
+            SplitClass::Orphaned
+        );
+    }
+
+    #[test]
+    fn eval_size_is_the_size_stratify_gives() {
+        for (groups, size, ratio) in [
+            (1, 1, 0.1),
+            (2, 1, 0.1),
+            (7, 15, 0.1),
+            (2, 1, 0.9),
+            (3, 7, 0.25),
+        ] {
+            let (_, eval) = stratify(uniform(groups, size), ratio, 42);
+            assert_eq!(eval_size(groups * size, ratio), eval.len());
+        }
     }
 }
