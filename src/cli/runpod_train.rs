@@ -483,12 +483,11 @@ fn report(pod: &PodRecord, ending: Ending, id: &str) {
 
 /// What to say of the pod once the job ended. Nothing for a deleted pod, which
 /// its events already reported, nor for one awaiting retrieval, which `end_pod`
-/// reported, unless it is kept: how to reach a kept pod is said here.
+/// reported: how to reach a kept pod, its results retrieved or not, is said here.
 fn report_line(pod: &PodRecord, ending: Ending, id: &str) -> Option<String> {
     match ending {
-        Ending::Deleted => None,
-        Ending::AwaitingRetrieval if !pod.keep => None,
-        Ending::Kept | Ending::AwaitingRetrieval => Some(format!(
+        Ending::Deleted | Ending::AwaitingRetrieval => None,
+        Ending::Kept => Some(format!(
             "pod {} kept (--keep-pod): `{}`; remove it with `overbrainer pod rm {id}`; \
              nothing deletes it automatically",
             pod_name(pod),
@@ -662,17 +661,12 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_pod_is_reported_with_its_ssh_command_even_unretrieved()
-    -> Result<(), serde_json::Error> {
+    fn a_kept_pod_is_reported_with_its_ssh_command() -> Result<(), serde_json::Error> {
         let kept = "pod k3x9abc kept (--keep-pod): `ssh -F runs/r1/ssh/config overbrainer-r1`; \
                     remove it with `overbrainer pod rm r1`; nothing deletes it automatically";
         let (keep, guarded) = (pod(true)?, pod(false)?);
         assert_eq!(
             report_line(&keep, Ending::Kept, "r1").as_deref(),
-            Some(kept)
-        );
-        assert_eq!(
-            report_line(&keep, Ending::AwaitingRetrieval, "r1").as_deref(),
             Some(kept)
         );
         assert_eq!(report_line(&guarded, Ending::AwaitingRetrieval, "r1"), None);

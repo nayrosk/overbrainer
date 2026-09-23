@@ -432,10 +432,11 @@ fn fail_run(runs: &Runs, run_id: &str, message: &str) {
 pub enum Ending {
     /// Deleted after its results were retrieved.
     Deleted,
-    /// Kept (`--keep-pod`): only `overbrainer pod rm` deletes it.
+    /// Kept (`--keep-pod`), its results retrieved or not: only `overbrainer pod
+    /// rm` deletes it.
     Kept,
-    /// Its results were not retrieved: it stays for the watchdog's retrieve
-    /// grace, or until `train attach` retrieves them.
+    /// Its results were not retrieved and it is not kept: it stays for the
+    /// watchdog's retrieve grace, or until `train attach` retrieves them.
     AwaitingRetrieval,
 }
 
@@ -495,18 +496,24 @@ fn unretrieved(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> Result<En
         .pod_id
         .as_ref()
         .map_or_else(|| "(none)".to_string(), ToString::to_string);
-    let stays = if pod.keep {
+    let (stays, ending) = if pod.keep {
         pod.state = PodState::Kept;
-        "stays (--keep-pod), nothing deletes it automatically"
+        (
+            "stays (--keep-pod), nothing deletes it automatically",
+            Ending::Kept,
+        )
     } else {
         pod.state = PodState::AwaitingRetrieval;
-        "stays until its watchdog's retrieve grace ends"
+        (
+            "stays until its watchdog's retrieve grace ends",
+            Ending::AwaitingRetrieval,
+        )
     };
     pod.save(ctx.runs)?;
     tracing::warn!(
         "the results of run {run_id} were not retrieved: pod {name} {stays}; retrieve them with `overbrainer train attach {run_id}`, or remove the pod with `overbrainer pod rm {run_id}`"
     );
-    Ok(Ending::AwaitingRetrieval)
+    Ok(ending)
 }
 
 /// The watchdog's log on the pod, in the run directory on the pod.

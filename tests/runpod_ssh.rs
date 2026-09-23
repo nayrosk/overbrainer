@@ -705,35 +705,43 @@ async fn a_duplicate_pod_whose_delete_fails_is_recorded_as_stray() -> TestResult
 }
 
 #[tokio::test]
-async fn an_unretrieved_run_leaves_its_pod_to_the_watchdog() -> TestResult {
+async fn an_unretrieved_run_leaves_its_pod_to_the_watchdog_or_kept() -> TestResult {
     let Some(sshd) = sshd().await? else {
         skip();
         return Ok(());
     };
-    let project = tempfile::tempdir()?;
-    let runs = Runs::new(project.path());
-    let (run, mut pod, executor) = started_run(&sshd, &runs, false).await?;
-    let server = stub(&sshd, &run.id, None).await;
-    let client = client(&server)?;
-    let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
-    let ctx = PodCtx {
-        client: &client,
-        runs: &runs,
-        bus: &bus,
-        timing: &timing,
-        interrupted: &interrupted,
-    };
-    let ending = end_pod(&ctx, &mut pod, &executor, &run, false).await?;
-    assert_eq!(ending, Ending::AwaitingRetrieval);
-    assert_eq!(pod.state, PodState::AwaitingRetrieval);
-    assert!(!marker_exists(&executor, &run).await?);
-    assert!(
-        server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .is_empty()
-    );
+    for keep in [false, true] {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let (run, mut pod, executor) = started_run(&sshd, &runs, keep).await?;
+        let server = stub(&sshd, &run.id, None).await;
+        let client = client(&server)?;
+        let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
+        let ctx = PodCtx {
+            client: &client,
+            runs: &runs,
+            bus: &bus,
+            timing: &timing,
+            interrupted: &interrupted,
+        };
+        let ending = end_pod(&ctx, &mut pod, &executor, &run, false).await?;
+        if keep {
+            assert_eq!(ending, Ending::Kept);
+            assert_eq!(pod.state, PodState::Kept);
+        } else {
+            assert_eq!(ending, Ending::AwaitingRetrieval);
+            assert_eq!(pod.state, PodState::AwaitingRetrieval);
+        }
+        assert!(!marker_exists(&executor, &run).await?, "keep = {keep}");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert_eq!(PodRecord::load(&runs, &run.id)?, Some(pod));
+    }
     Ok(())
 }
 
