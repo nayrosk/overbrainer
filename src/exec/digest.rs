@@ -72,7 +72,8 @@ pub fn manifest_script(remote: &str, entries: &[String], exclude: &[String]) -> 
 /// NUL that terminates every record: without it, an output cut short mid-record
 /// would otherwise read as a shorter, wrong path. Also returns
 /// [`ExecError::Protocol`] for a record that is not `<64 hex digits>`, a space
-/// and a path.
+/// and a path, or whose path is absolute or holds a `..` component (a line break
+/// in a name stays legal: only `/`-separated components are checked).
 pub fn parse_manifest(output: &str) -> Result<Vec<FileDigest>, ExecError> {
     if !output.is_empty() && !output.ends_with('\0') {
         return Err(ExecError::Protocol(
@@ -99,6 +100,11 @@ fn parse_record(record: &str) -> Result<FileDigest, ExecError> {
         .and_then(|tail| tail.strip_prefix(' '))
         .ok_or_else(invalid)?;
     let path = name.strip_prefix("./").unwrap_or(name).to_string();
+    if path.starts_with('/') || path.split('/').any(|part| part == "..") {
+        return Err(ExecError::Protocol(format!(
+            "unsafe manifest path {path:?}"
+        )));
+    }
     Ok(FileDigest {
         path,
         sha256: hash.to_ascii_lowercase(),
@@ -149,9 +155,13 @@ pub fn local_manifest(
     exclude: &[String],
 ) -> Result<Vec<FileDigest>, ExecError> {
     if !dir.is_dir() {
+        // Debug-quoted (through its already-lossy display text, to sidestep
+        // clippy's own Path-Debug lint) so a control character in `dir` cannot
+        // reach the terminal raw.
+        let dir = dir.display().to_string();
         return Err(ExecError::Command {
             action: "manifest",
-            message: format!("{} does not exist", dir.display()),
+            message: format!("{dir:?} does not exist"),
         });
     }
     let mut digests = Vec::new();
@@ -307,6 +317,33 @@ mod tests {
         assert_eq!(parse_manifest("")?, Vec::new());
         let cut_short = format!("{W} output/a.bin\0{W} output/b");
         assert!(parse_manifest(&cut_short).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn absolute_paths_and_dot_dot_components_are_rejected() {
+        assert!(parse_manifest(&format!("{W} /etc/passwd\0")).is_err());
+        assert!(parse_manifest(&format!("{W} a/../b\0")).is_err());
+        assert!(parse_manifest(&format!("{W} ..\0")).is_err());
+        assert!(parse_manifest(&format!("{W} ../output/a.bin\0")).is_err());
+        // A line break inside a name stays legal: only `/`-separated components
+        // are checked, not the raw bytes of the name.
+        assert!(parse_manifest(&format!("{W} a\nb\0")).is_ok());
+    }
+
+    #[test]
+    fn the_missing_directory_message_is_debug_quoted() -> TestResult {
+        let root = tempfile::tempdir()?;
+        // A name a naive `{}` format would print raw, hiding the control character.
+        let gone = root.path().join("go\ne");
+        let error = local_manifest(&gone, &entries(), &[])
+            .err()
+            .ok_or("expected an error")?;
+        let display = gone.display().to_string();
+        assert_eq!(
+            error.to_string(),
+            format!("manifest failed: {display:?} does not exist")
+        );
         Ok(())
     }
 
