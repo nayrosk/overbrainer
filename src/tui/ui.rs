@@ -3,6 +3,7 @@
 //! motion over them. Reads nothing but the app: never the clock.
 
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Tabs};
@@ -50,6 +51,11 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
         View::Training => views::training::render(frame, body, app),
     };
     let toast = status::render(frame, footer, app);
+    if app.overlay.is_some() {
+        // The view under an overlay goes dim, its symbols kept: muted text in
+        // color, the dim attribute in monochrome.
+        frame.buffer_mut().set_style(body, app.theme.dim);
+    }
     let overlay = match &app.overlay {
         Some(Overlay::Help) => Some(help::render(frame, area, app)),
         Some(Overlay::Confirm(confirm)) => {
@@ -65,6 +71,9 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
         Some(Overlay::Menu(selected)) => Some(menu::render(frame, area, *selected, &app.theme)),
         None => None,
     };
+    if let Some(popup) = overlay {
+        clear_margin(frame.buffer_mut(), popup, body);
+    }
     let areas = Areas {
         body,
         overlay,
@@ -72,6 +81,25 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
         pulse: pulse.filter(|_| app.pulse_shown()),
     };
     app.motion.apply(frame.buffer_mut(), &areas);
+}
+
+/// Blanks the cells of `body` in a one-cell margin around `popup`, so no
+/// glyph of the view touches the overlay's border; their style is kept.
+fn clear_margin(buffer: &mut Buffer, popup: Rect, body: Rect) {
+    let around = Rect {
+        x: popup.x.saturating_sub(1),
+        y: popup.y.saturating_sub(1),
+        width: popup.width.saturating_add(2),
+        height: popup.height.saturating_add(2),
+    }
+    .intersection(body);
+    for position in around.positions() {
+        if !popup.contains(position)
+            && let Some(cell) = buffer.cell_mut(position)
+        {
+            cell.set_symbol(" ");
+        }
+    }
 }
 
 /// The brand, the tabs and the project name, each in its own columns. The
@@ -127,8 +155,12 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use crossterm::event::KeyCode;
+    use ratatui::style::Modifier;
+
     use super::*;
-    use crate::tui::snapshots::{app, draw, text};
+    use crate::tui::snapshots::{app, draw, key, text, training_app};
+    use crate::tui::theme::Theme;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -167,6 +199,62 @@ mod tests {
         let row = header(&app, 38)?;
         let kept: String = TABS.chars().take(38).collect();
         assert_eq!(row, kept, "the tabs keep the columns there are");
+        Ok(())
+    }
+
+    /// Where the dialog titled `title` is on `rows`: its left, top, right
+    /// and bottom columns and rows, borders included.
+    fn dialog(rows: &[String], title: &str) -> Option<(usize, usize, usize, usize)> {
+        let top = rows.iter().position(|row| row.contains(title))?;
+        let chars: Vec<char> = rows.get(top)?.chars().collect();
+        let left = chars.iter().position(|c| *c == '╭')?;
+        let right = chars.iter().position(|c| *c == '╮')?;
+        let bottom = (top..rows.len()).find(|y| {
+            rows.get(*y)
+                .and_then(|row| row.chars().nth(left))
+                .is_some_and(|c| c == '╰')
+        })?;
+        Some((left, top, right, bottom))
+    }
+
+    #[test]
+    fn no_glyph_of_the_view_touches_an_overlay() -> TestResult {
+        let mut app = training_app()?;
+        app.on_input(&key(KeyCode::Char('c')));
+        let rows = text(&draw(&mut app, 80, 24)?);
+        let (left, top, right, bottom) = dialog(&rows, "╭ Cancel a run? ").ok_or("no dialog")?;
+        let (before, above) = (left.saturating_sub(1), top.saturating_sub(1));
+        let at = |x: usize, y: usize| rows.get(y).and_then(|row| row.chars().nth(x));
+        for y in above..=bottom + 1 {
+            assert_eq!(at(before, y), Some(' '), "left of row {y}: {rows:#?}");
+            assert_eq!(at(right + 1, y), Some(' '), "right of row {y}: {rows:#?}");
+        }
+        for x in before..=right + 1 {
+            assert_eq!(at(x, above), Some(' '), "above column {x}: {rows:#?}");
+            assert_eq!(at(x, bottom + 1), Some(' '), "under column {x}: {rows:#?}");
+        }
+        let past = before.saturating_sub(1);
+        assert_ne!(at(past, top), Some(' '), "the view shows past the margin");
+        Ok(())
+    }
+
+    #[test]
+    fn the_view_under_an_overlay_goes_dim_with_its_symbols() -> TestResult {
+        let mut app = training_app()?;
+        let before = text(&draw(&mut app, 80, 24)?);
+        app.on_input(&key(KeyCode::Char('c')));
+        let terminal = draw(&mut app, 80, 24)?;
+        let buffer = terminal.backend().buffer();
+        let run = buffer.cell((2, 3)).ok_or("no cell")?;
+        assert_eq!(Some(run.fg), app.theme.dim.fg, "muted in color");
+        let rows = text(&terminal);
+        assert_eq!(rows.get(3), before.get(3), "symbols kept");
+        let footer = buffer.cell((1, 23)).ok_or("no cell")?;
+        assert_ne!(Some(footer.fg), app.theme.dim.fg, "the footer stays lit");
+        app.theme = Theme::mono();
+        let terminal = draw(&mut app, 80, 24)?;
+        let run = terminal.backend().buffer().cell((2, 3)).ok_or("no cell")?;
+        assert!(run.modifier.contains(Modifier::DIM), "dim in monochrome");
         Ok(())
     }
 }

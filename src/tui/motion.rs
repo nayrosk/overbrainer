@@ -385,9 +385,10 @@ impl App {
     }
 
     /// Whether the followed run's `●` pulses on screen: the Training view on a
-    /// run a task follows, with color effects on.
+    /// run a task follows, with color effects on and no overlay over it.
     pub(super) fn pulse_shown(&self) -> bool {
         self.motion.pulses()
+            && self.overlay.is_none()
             && self.view == View::Training
             && self.training.selected_activity() == RunActivity::Followed
     }
@@ -735,6 +736,18 @@ mod tests {
         app.on_frame(PULSE_HALF);
         assert_eq!(cell(&draw(&mut app, 80, 24)?, 2, y)?.fg, bright);
         assert!(app.pulse_shown());
+        app.on_input(&key(KeyCode::Char('c')));
+        assert!(app.overlay.is_some(), "the cancel dialog");
+        assert!(!app.pulse_shown(), "under an overlay");
+        app.on_frame(PULSE_HALF);
+        let marker = cell(&draw(&mut app, 80, 24)?, 2, y)?;
+        assert_eq!(marker.symbol(), "●");
+        assert_eq!(
+            Some(marker.fg),
+            app.theme.dim.fg,
+            "dimmed with the view, never pulsed"
+        );
+        app.overlay = None;
         app.training.tasks.clear();
         assert!(!app.pulse_shown(), "no run followed");
         Ok(())
