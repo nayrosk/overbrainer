@@ -2978,8 +2978,8 @@ mod tests {
         assert_eq!(
             status(&app),
             Some(
-                "run 20260921-133200-a1b2: its job started, so it was not abandoned; press c \
-                 to cancel it"
+                "run 20260921-133200-a1b2: its job started, so it was not abandoned and its pod \
+                 keeps billing; press c to cancel it"
             )
         );
         assert_eq!(

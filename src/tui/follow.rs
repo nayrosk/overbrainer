@@ -661,7 +661,10 @@ impl App {
         if !follow.starting() {
             self.say(
                 Severity::Warn,
-                format!("{run}: its job started, so it was not abandoned; press c to cancel it"),
+                format!(
+                    "{run}: its job started, so it was not abandoned and its pod keeps billing; \
+                     press c to cancel it"
+                ),
             );
             return Vec::new();
         }
