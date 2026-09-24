@@ -116,6 +116,19 @@ fn unknown_env_variable_with_prefix_is_rejected() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn the_tui_variables_are_not_configuration_keys() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(BASE)?;
+    load(
+        dir.path(),
+        env(&[
+            ("OVERBRAINER_TUI_COLOR", "256"),
+            ("OVERBRAINER_TUI_MOTION", "off"),
+        ]),
+    )?;
+    Ok(())
+}
+
+#[test]
 fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     match load(dir.path(), env(&[])) {

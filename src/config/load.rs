@@ -10,6 +10,9 @@ use super::{Settings, validate};
 pub const CONFIG_FILE: &str = "overbrainer.toml";
 /// Prefix required on every environment variable read into the configuration.
 pub const ENV_PREFIX: &str = "OVERBRAINER";
+/// Prefix of the variables the terminal UI reads itself (`OVERBRAINER_TUI_COLOR`,
+/// `OVERBRAINER_TUI_MOTION`): they are not configuration keys, so [`load`] skips them.
+pub const TUI_ENV_PREFIX: &str = "OVERBRAINER_TUI_";
 
 /// Where [`load`] reads `OVERBRAINER_*` environment variable overrides from.
 #[derive(Debug, Clone)]
@@ -116,10 +119,16 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
         path: path.clone(),
         error,
     })?;
-    let env: Option<config::Map<String, String>> = match env {
-        EnvSource::Process => None,
-        EnvSource::Vars(pairs) => Some(pairs.into_iter().collect()),
+    let pairs: Vec<(String, String)> = match env {
+        EnvSource::Process => std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect(),
+        EnvSource::Vars(pairs) => pairs,
     };
+    let env: config::Map<String, String> = pairs
+        .into_iter()
+        .filter(|(key, _)| !key.starts_with(TUI_ENV_PREFIX))
+        .collect();
 
     let file_only = Config::builder()
         .add_source(File::from_str(&content, FileFormat::Toml))
@@ -133,7 +142,7 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
                 .prefix_separator("_")
                 .separator("__")
                 .try_parsing(false)
-                .source(env),
+                .source(Some(env)),
         )
         .build()?
         .try_deserialize()?;
