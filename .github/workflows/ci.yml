@@ -127,6 +127,18 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo check --all-targets --locked
 
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch; toolchain set below
+        with:
+          toolchain: "stable"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo check --all-targets --locked
+
   deny:
     runs-on: ubuntu-latest
     steps:
@@ -196,7 +208,7 @@ jobs:
         env:
           BRANCH: ${{ github.head_ref }}
         run: |
-          pattern='^((feature|feat|bugfix|fix|hotfix|chore)/[a-z0-9]+(-[a-z0-9]+)*|release/v[0-9]+\.[0-9]+\.[0-9]+([-.][a-z0-9.]+)?|release-plz-[0-9TZ-]+|dependabot/.+)$'
+          pattern='^((feature|feat|bugfix|fix|hotfix|chore)/[a-z0-9]+(-[a-z0-9]+)*|(release/v|chore/release-v)[0-9]+\.[0-9]+\.[0-9]+([-.][a-z0-9.]+)?|dependabot/.+)$'
           if ! printf '%s\n' "$BRANCH" | grep -Eq "$pattern"; then
             echo "::error::Branch name does not follow Conventional Branch: $BRANCH"
             exit 1
