@@ -234,7 +234,7 @@ fn head_line(
             head.push(Span::styled(bar(shown, STEP_BAR), theme.gauge));
             head.push(Span::raw(format!(
                 " {}%",
-                now.step.saturating_mul(100) / max
+                (now.step.saturating_mul(100) / max).min(100)
             )));
         },
         _ => head.push(Span::raw(format!("  step {}", now.step))),

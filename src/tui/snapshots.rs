@@ -933,6 +933,21 @@ fn training_of_a_followed_runpod_run() -> TestResult {
 }
 
 #[test]
+fn a_step_past_max_steps_reads_100_percent() -> TestResult {
+    let mut app = training_app()?;
+    let mut metrics = series();
+    for metric in &mut metrics {
+        metric.max_steps = Some(1000);
+    }
+    app.training.series.insert(FOLLOWED.into(), metrics);
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains("step 1200/1000"), "{shown}");
+    assert!(shown.contains(" 100%"), "{shown}");
+    assert!(!shown.contains("120%"), "{shown}");
+    Ok(())
+}
+
+#[test]
 fn training_of_a_finished_local_run() -> TestResult {
     let mut app = training_app()?;
     app.training.selected = 1;

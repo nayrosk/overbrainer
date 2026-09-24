@@ -11,6 +11,7 @@ use ratatui::widgets::Paragraph;
 use crate::tui::app::{App, Overlay, Severity, Status, View};
 use crate::tui::keys::{self, Context, HELP_HINT, Hint, SEPARATOR};
 use crate::tui::theme::Theme;
+use crate::tui::training::RunActivity;
 
 /// Draws the footer in `area`; returns where the status message is, when one
 /// shows.
@@ -54,7 +55,9 @@ pub(in crate::tui) fn context(app: &App) -> Context {
         Some(Overlay::Help) => Context::Help,
         Some(Overlay::Menu(_)) => Context::Menu,
         None if app.view == View::Dataset && app.dataset.input.is_some() => Context::Filter,
-        None if app.view == View::Training && app.training.selected_activity().abandons() => {
+        None if app.view == View::Training
+            && app.training.selected_activity() == RunActivity::Starting { runpod: true } =>
+        {
             Context::Abandon
         },
         None => Context::View(app.view),
@@ -105,7 +108,7 @@ mod tests {
     use crate::tui::app::{Severity, View};
     use crate::tui::snapshots::{NOW, app, at, draw, pipeline_running, run, text};
     use crate::tui::tasks::TaskId;
-    use crate::tui::training::{Follow, Job, RunRow};
+    use crate::tui::training::{Detach, Follow, Job, RunRow};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -166,6 +169,11 @@ mod tests {
             .tasks
             .insert(TaskId(4), Follow::new(Job::Start { runpod: true }, id));
         assert!(footer(&mut app)?.contains("c abandon"));
+        if let Some(follow) = app.training.tasks.get_mut(&TaskId(4)) {
+            follow.detach = Detach::Done;
+        }
+        let shown = footer(&mut app)?;
+        assert!(!shown.contains("c abandon"), "{shown}");
         Ok(())
     }
 }
