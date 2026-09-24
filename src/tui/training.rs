@@ -287,6 +287,16 @@ impl TrainingView {
         self.runs.get(self.selected)
     }
 
+    /// Whether `c` abandons the selected run rather than cancel it: it is a
+    /// Runpod run still starting, which has no job to cancel yet.
+    pub(super) fn selected_abandons(&self) -> bool {
+        self.selected_run()
+            .and_then(|row| self.task_of(&row.record.id))
+            .is_some_and(|(_, follow)| {
+                follow.job == (Job::Start { runpod: true }) && follow.starting()
+            })
+    }
+
     /// The task following or cancelling run `id`, if any.
     pub(super) fn task_of(&self, id: &str) -> Option<(TaskId, &Follow)> {
         self.tasks

@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "    questions: 36 done, 0 skipped, 0 failed, 0 excluded; tokens 40210 in, 9120  "
 "      out; cost $0.0123                                                         "
 "                                                                                "
-"                                           answers 120/400  edits locked  ? help"
+" r run a stage · 1-4 views · q quit         … answers 120/400 · locked · ? help "

@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "│                                                                              │"
 "│                                                                              │"
 "╰──────────────────────────────────────────────────────────────────────────────╯"
-"                                   answers 120/400  saving  edits locked  ? help"
+" y quit · n, Esc or Enter stay   … answers 120/400 · … saving · locked · ? help "

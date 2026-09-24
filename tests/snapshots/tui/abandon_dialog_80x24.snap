@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                        quitting: waiting  1 training task  edits locked  ? help"
+" y abandon            … quitting: waiting · … 1 training task · locked · ? help "

@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "  step 10                                                                 1200  "
 "  lr        ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄ 2.00e-4    "
 "  grad_norm  ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█  0.700      "
-"                                                         1 training task  ? help"
+" y cancel the run · n, Esc or Enter keep it          … 1 training task · ? help "

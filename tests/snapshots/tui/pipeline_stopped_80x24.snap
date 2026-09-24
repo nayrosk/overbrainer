@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "      out; cost $0.0123                                                         "
 "    ✗ interrupted: the stage resumes on its next run                            "
 "                                                                                "
-"                                                                 loading  ? help"
+" r run a stage · 1-4 views · q quit                          … loading · ? help "

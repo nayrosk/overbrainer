@@ -399,7 +399,7 @@ impl App {
         vec![Effect::Spawn(id, Task::Load)]
     }
 
-    /// The work running, as the status line shows it.
+    /// The work running, as the footer shows it, each with a spinner.
     pub(super) fn work(&self) -> Vec<String> {
         let mut work = Vec::new();
         if self.leaving.is_some() {
@@ -420,9 +420,6 @@ impl App {
         let followed = self.training.tasks.len();
         if followed > 0 {
             work.push(count(followed, "training task"));
-        }
-        if self.lock().is_some() {
-            work.push("edits locked".to_string());
         }
         work
     }

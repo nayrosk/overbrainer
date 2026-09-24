@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
-"                                                                quitting: waiting  1 training task  edits locked  ? help"
+" y abandon · n, Esc or Enter wait                             … quitting: waiting · … 1 training task · locked · ? help "

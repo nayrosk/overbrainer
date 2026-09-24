@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "    ╰──────────────────────────────────────────────────────────────────────╯    "
 "                                                                                "
 "                                                                                "
-"                                                         preparing a run  ? help"
+" y start · n, Esc or Enter cancel                    … preparing a run · ? help "

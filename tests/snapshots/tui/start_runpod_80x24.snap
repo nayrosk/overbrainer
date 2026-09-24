@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "    ╰──────────────────────────────────────────────────────────────────────╯    "
 "                                                                                "
 "                                                                                "
-"                                                                          ? help"
+" y start · n, Esc or Enter cancel                                        ? help "

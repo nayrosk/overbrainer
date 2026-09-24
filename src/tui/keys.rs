@@ -1,4 +1,4 @@
-//! The key table the help overlay shows, as data.
+//! The key tables the help overlay and the footer show, as data.
 
 use super::app::View;
 
@@ -37,7 +37,10 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
     row("q, Ctrl-C", "quit"),
     row("R", "reload the data files and runs"),
     row("r", "run a pipeline stage, or run (asks which)"),
-    row("y, n Esc", "in a dialog: confirm, cancel (default: no)"),
+    row(
+        "y, n Esc Enter",
+        "in a dialog: confirm, cancel (the default, n)",
+    ),
 ];
 
 const DATASET: &[KeyHelp] = &[
@@ -64,6 +67,114 @@ const LOGS: &[KeyHelp] = &[
     row("f", "cycle level: error, warn, info, debug, trace"),
 ];
 
+/// One key hint of the footer: a key and what it does, in a word or two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Hint {
+    /// The key.
+    pub(super) key: &'static str,
+    /// What it does.
+    pub(super) label: &'static str,
+    /// Whether the data lock refuses it: drawn crossed out while it holds.
+    pub(super) locks: bool,
+}
+
+const fn hint(key: &'static str, label: &'static str) -> Hint {
+    Hint {
+        key,
+        label,
+        locks: false,
+    }
+}
+
+const fn locking(key: &'static str, label: &'static str) -> Hint {
+    Hint {
+        key,
+        label,
+        locks: true,
+    }
+}
+
+/// What separates two hints, and two pieces of work.
+pub(super) const SEPARATOR: &str = " · ";
+/// The last hint on the right of the footer, always shown.
+pub(super) const HELP_HINT: &str = "? help";
+
+/// What the keys act on, which picks the footer's hints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Context {
+    /// A view, with no overlay.
+    View(View),
+    /// The Training view on a Runpod run still starting: `c` abandons it.
+    Abandon,
+    /// The filter being typed.
+    Filter,
+    /// A dialog answered with `y`, labelled `yes` and `no`.
+    Dialog {
+        /// What `y` does.
+        yes: &'static str,
+        /// What `n`, Esc and Enter do.
+        no: &'static str,
+    },
+    /// The help overlay.
+    Help,
+    /// The `r` menu.
+    Menu,
+}
+
+const FOOTER_DATASET: &[Hint] = &[
+    hint("j/k", "move"),
+    hint("l", "open"),
+    hint("/", "filter"),
+    hint("s", "stats"),
+    locking("e", "edit"),
+    locking("d", "delete"),
+];
+const FOOTER_PIPELINE: &[Hint] = &[
+    locking("r", "run a stage"),
+    hint("1-4", "views"),
+    hint("q", "quit"),
+];
+const FOOTER_TRAINING: &[Hint] = &[
+    hint("j/k", "select"),
+    hint("a", "attach"),
+    hint("c", "cancel"),
+    locking("t", "start"),
+];
+const FOOTER_ABANDON: &[Hint] = &[
+    hint("j/k", "select"),
+    hint("a", "attach"),
+    hint("c", "abandon"),
+    locking("t", "start"),
+];
+const FOOTER_LOGS: &[Hint] = &[
+    hint("j/k", "scroll"),
+    hint("G", "follow"),
+    hint("f", "level"),
+];
+const FOOTER_FILTER: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "clear")];
+const FOOTER_HELP: &[Hint] = &[hint("Esc", "close")];
+const FOOTER_MENU: &[Hint] = &[
+    hint("j/k", "move"),
+    hint("Enter", "run"),
+    hint("Esc", "close"),
+];
+
+/// The footer's hints in `context`, most useful first: the footer drops them
+/// from the end when it runs out of room.
+pub(super) fn footer(context: Context) -> Vec<Hint> {
+    match context {
+        Context::View(View::Dataset) => FOOTER_DATASET.to_vec(),
+        Context::View(View::Pipeline) => FOOTER_PIPELINE.to_vec(),
+        Context::View(View::Training) => FOOTER_TRAINING.to_vec(),
+        Context::View(View::Logs) => FOOTER_LOGS.to_vec(),
+        Context::Abandon => FOOTER_ABANDON.to_vec(),
+        Context::Filter => FOOTER_FILTER.to_vec(),
+        Context::Dialog { yes, no } => vec![hint("y", yes), hint("n, Esc or Enter", no)],
+        Context::Help => FOOTER_HELP.to_vec(),
+        Context::Menu => FOOTER_MENU.to_vec(),
+    }
+}
+
 /// Keys of `view`.
 pub(super) fn of(view: View) -> &'static [KeyHelp] {
     match view {
@@ -89,6 +200,32 @@ mod tests {
                 action.chars().count() <= usize::from(ACTION_WIDTH),
                 "{action}"
             );
+        }
+    }
+
+    /// Every context's hints fit 80 columns with `? help` and the margins, so
+    /// none is dropped when no work is shown.
+    #[test]
+    fn every_footer_fits_80_columns_with_help() {
+        let dialog = Context::Dialog {
+            yes: "cancel the run",
+            no: "keep it",
+        };
+        let others = [
+            Context::Abandon,
+            Context::Filter,
+            dialog,
+            Context::Help,
+            Context::Menu,
+        ];
+        for context in View::ALL.map(Context::View).into_iter().chain(others) {
+            let hints = footer(context);
+            let text: Vec<String> = hints
+                .iter()
+                .map(|hint| format!("{} {}", hint.key, hint.label))
+                .collect();
+            let line = format!(" {}  {HELP_HINT} ", text.join(SEPARATOR));
+            assert!(line.chars().count() <= 80, "{context:?}: {line}");
         }
     }
 }

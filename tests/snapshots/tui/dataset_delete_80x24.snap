@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "│                                  ││                                          │"
 "│                                  ││                                          │"
 "╰ / filter ────────────────────────╯╰───────────────────────────────────── 4/4 ╯"
-"                                                                          ? help"
+" y delete · n, Esc or Enter cancel                                       ? help "

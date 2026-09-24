@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "  lr             ▁▁▁▁▁▂▂▂▂▂▃▃▃▃▃▄▄▄▄▄▅▅▅▅▅▆▆▆▆▆▇▇▇▇█                                                         1.47e-4    "
 "  grad_norm ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█ ▂▄▆█                                                          0.700      "
 "  train: run 20260920-101500-9f00 succeeded; 400 steps in 13m; loss 0.91; output in runs/20260920-101500-9f00/output    "
-"                                                                                                 1 training task  ? help"
+" j/k select · a attach · c cancel · t start                                                  … 1 training task · ? help "

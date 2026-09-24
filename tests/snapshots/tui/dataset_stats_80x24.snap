@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "│                                  ││                                          │"
 "│                                  ││                                          │"
 "╰ / filter ────────────────────────╯╰──────────────────────────────────────────╯"
-"                                                                          ? help"
+" j/k move · l open · / filter · s stats · e edit · d delete              ? help "
