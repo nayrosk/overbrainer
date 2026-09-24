@@ -99,6 +99,68 @@ impl Follow {
     }
 }
 
+/// What a training task does to its run, as the Training view shows it:
+/// computed in one place, [`RunActivity::of`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunActivity {
+    /// No task on the run.
+    None,
+    /// A task follows the run: its job started, or it attached to it.
+    Followed,
+    /// A start whose job has not started yet; `c` abandons a Runpod one.
+    Starting {
+        /// Whether its target is a Runpod one.
+        runpod: bool,
+    },
+    /// A start whose job has not started yet, being abandoned: its token is
+    /// cancelled.
+    Abandoning {
+        /// Whether its target is a Runpod one.
+        runpod: bool,
+    },
+    /// A cancel task, or a task whose run is cancelled once it ended.
+    Cancelling,
+}
+
+impl RunActivity {
+    /// What `follow`, the task on a run if any, does to it.
+    pub(super) fn of(follow: Option<&Follow>) -> Self {
+        let Some(follow) = follow else {
+            return Self::None;
+        };
+        if follow.job == Job::Cancel || follow.cancel_after {
+            return Self::Cancelling;
+        }
+        let runpod = follow.job == (Job::Start { runpod: true });
+        match (follow.starting(), follow.detach) {
+            (true, Detach::Done) => Self::Abandoning { runpod },
+            (true, _) => Self::Starting { runpod },
+            (false, _) => Self::Followed,
+        }
+    }
+
+    /// The activity in one word, as the runs table shows it; empty for none.
+    /// A start being abandoned still reads `starting`: it is, until its
+    /// flow ends.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Followed => "followed",
+            Self::Starting { .. } | Self::Abandoning { .. } => "starting",
+            Self::Cancelling => "cancelling",
+        }
+    }
+
+    /// Whether `c` abandons the run rather than cancel it: a Runpod start
+    /// still starting, which has no job to cancel yet.
+    pub(super) fn abandons(self) -> bool {
+        matches!(
+            self,
+            Self::Starting { runpod: true } | Self::Abandoning { runpod: true }
+        )
+    }
+}
+
 /// How the last task of a run ended.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Ended {
@@ -296,24 +358,15 @@ impl TrainingView {
         Some((float(now.step) / float(max)).min(1.0))
     }
 
-    /// Whether a task follows the selected run: not a start still starting,
-    /// nor a cancel.
-    pub(super) fn selected_followed(&self) -> bool {
-        self.selected_run()
-            .and_then(|row| self.task_of(&row.record.id))
-            .is_some_and(|(_, follow)| {
-                follow.job != Job::Cancel && !follow.cancel_after && !follow.starting()
-            })
+    /// What the task on run `id`, if any, does to it.
+    pub(super) fn activity(&self, id: &str) -> RunActivity {
+        RunActivity::of(self.task_of(id).map(|(_, follow)| follow))
     }
 
-    /// Whether `c` abandons the selected run rather than cancel it: it is a
-    /// Runpod run still starting, which has no job to cancel yet.
-    pub(super) fn selected_abandons(&self) -> bool {
+    /// What the task on the selected run, if any, does to it.
+    pub(super) fn selected_activity(&self) -> RunActivity {
         self.selected_run()
-            .and_then(|row| self.task_of(&row.record.id))
-            .is_some_and(|(_, follow)| {
-                follow.job == (Job::Start { runpod: true }) && follow.starting()
-            })
+            .map_or(RunActivity::None, |row| self.activity(&row.record.id))
     }
 
     /// The task following or cancelling run `id`, if any.
@@ -342,8 +395,7 @@ impl TrainingView {
     /// Whether run `id` is being cancelled: by a cancel task, or by one that
     /// detaches its task first.
     pub(super) fn cancelling(&self, id: &str) -> bool {
-        self.task_of(id)
-            .is_some_and(|(_, follow)| follow.job == Job::Cancel || follow.cancel_after)
+        self.activity(id) == RunActivity::Cancelling
     }
 
     /// Records `event` of task `id`. Returns whether it is the first job status
@@ -400,6 +452,51 @@ mod tests {
         assert_eq!(progress(&series[..1]).and_then(|p| p.eta), None);
         assert_eq!(progress(&[]), None);
         Ok(())
+    }
+
+    #[test]
+    fn one_activity_says_what_a_task_does_to_its_run() {
+        let runpod = Job::Start { runpod: true };
+        let task = |job: &Job, change: &dyn Fn(&mut Follow)| {
+            let mut follow = Follow::new(job.clone(), "run");
+            change(&mut follow);
+            RunActivity::of(Some(&follow))
+        };
+        let keep = |_: &mut Follow| {};
+        assert_eq!(RunActivity::of(None), RunActivity::None);
+        assert_eq!(task(&Job::Attach, &keep), RunActivity::Followed);
+        assert_eq!(task(&runpod, &|f| f.watching = true), RunActivity::Followed);
+        assert_eq!(task(&runpod, &keep), RunActivity::Starting { runpod: true });
+        assert_eq!(
+            task(&Job::Start { runpod: false }, &keep),
+            RunActivity::Starting { runpod: false }
+        );
+        assert_eq!(
+            task(&runpod, &|f| f.detach = Detach::Done),
+            RunActivity::Abandoning { runpod: true }
+        );
+        assert_eq!(task(&Job::Cancel, &keep), RunActivity::Cancelling);
+        assert_eq!(
+            task(&runpod, &|f| f.cancel_after = true),
+            RunActivity::Cancelling
+        );
+        assert!(task(&runpod, &keep).abandons());
+        assert!(task(&runpod, &|f| f.detach = Detach::Done).abandons());
+        assert!(!task(&Job::Start { runpod: false }, &keep).abandons());
+        assert!(!task(&Job::Attach, &keep).abandons());
+        let labels: Vec<&str> = [
+            RunActivity::None,
+            RunActivity::Followed,
+            RunActivity::Starting { runpod: true },
+            RunActivity::Abandoning { runpod: true },
+            RunActivity::Cancelling,
+        ]
+        .map(RunActivity::label)
+        .to_vec();
+        assert_eq!(
+            labels,
+            ["", "followed", "starting", "starting", "cancelling"]
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::tui::app::App;
 use crate::tui::format::duration;
 use crate::tui::motion::Bar;
 use crate::tui::theme::Theme;
-use crate::tui::training::{Ended, Follow, Job, RunRow, float, progress};
+use crate::tui::training::{Ended, Follow, RunActivity, RunRow, float, progress};
 use crate::tui::views::dataset::failed;
 use crate::tui::widgets::bar::bar;
 
@@ -71,15 +71,15 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option
     };
     let pod_rows = pod.as_ref().map_or(0, |pod| rows(pod, POD_ROWS));
     let message_rows = rows(&messages, MESSAGE_ROWS);
-    let state = task_state(follow);
+    let activity = view.activity(&row.record.id);
     let shown = app
         .motion
         .bar(Bar::Step, view.selected_ratio().unwrap_or(0.0));
-    let head = head_line(&row.record, series, (state, shown), theme);
+    let head = head_line(&row.record, series, (activity, shown), theme);
     let facts = facts_line(
         series,
         (follow, ended),
-        (state, app.motion.spinner()),
+        (activity, app.motion.spinner()),
         theme,
     );
     let facts_rows = u16::from(!facts.spans.is_empty());
@@ -123,7 +123,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option
     let hidden = u16::try_from(messages.line_count(inner.width))
         .map_or(0, |total| total.saturating_sub(message_rows));
     frame.render_widget(messages.scroll((hidden, 0)), notes);
-    (state == "followed").then(|| Rect::new(status.x, status.y, 1, 1))
+    (activity == RunActivity::Followed).then(|| Rect::new(status.x, status.y, 1, 1))
 }
 
 fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
@@ -133,20 +133,12 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
         .runs
         .iter()
         .map(|row: &RunRow| {
-            let followed = match view.task_of(&row.record.id) {
-                Some((_, follow)) if follow.job == Job::Cancel || follow.cancel_after => {
-                    "cancelling"
-                },
-                Some((_, follow)) if follow.starting() => "starting",
-                Some(_) => "followed",
-                None => "",
-            };
             Row::new(vec![
                 row.record.id.clone(),
                 row.record.state.name().to_string(),
                 row.record.target.clone(),
                 row.pod.as_ref().map(pod_summary).unwrap_or_default(),
-                followed.to_string(),
+                view.activity(&row.record.id).label().to_string(),
             ])
         })
         .collect();
@@ -191,26 +183,20 @@ fn pod_summary(record: &PodRecord) -> String {
         .map_or_else(|| summary.clone(), str::to_string)
 }
 
-/// What a task does to a run, in one word; empty when no task follows it.
-fn task_state(follow: Option<&Follow>) -> &'static str {
-    match follow {
-        Some(follow) if follow.job == Job::Cancel || follow.cancel_after => "cancelling",
-        Some(follow) if follow.starting() => "starting",
-        Some(_) => "followed",
-        None => "",
-    }
-}
-
 /// The selected run's first status line: `●` when a task follows it, its ID,
 /// its step with a bar filled to `shown` and a percentage, and its ETA while
 /// its job runs.
 fn head_line(
     record: &RunRecord,
     series: &[TrainMetric],
-    (state, shown): (&str, f64),
+    (activity, shown): (RunActivity, f64),
     theme: &Theme,
 ) -> Line<'static> {
-    let marker = if state == "followed" { "● " } else { "  " };
+    let marker = if activity == RunActivity::Followed {
+        "● "
+    } else {
+        "  "
+    };
     let mut head = vec![
         Span::styled(marker, theme.title),
         Span::styled(record.id.clone(), theme.title),
@@ -244,17 +230,20 @@ fn head_line(
 fn facts_line(
     series: &[TrainMetric],
     (follow, ended): (Option<&Follow>, Option<&Ended>),
-    (state, spinner): (&str, &str),
+    (activity, spinner): (RunActivity, &str),
     theme: &Theme,
 ) -> Line<'static> {
     let mut facts: Vec<Span<'static>> = Vec::new();
     if let Some(epoch) = progress(series).and_then(|now| now.epoch) {
         facts.push(Span::raw(format!("epoch {epoch:.2}")));
     }
-    match state {
-        "starting" => facts.push(Span::styled(format!("{spinner} starting"), theme.accent)),
-        "cancelling" => facts.push(Span::styled("cancelling", theme.accent)),
-        _ => {},
+    match activity {
+        RunActivity::Starting { .. } | RunActivity::Abandoning { .. } => facts.push(Span::styled(
+            format!("{spinner} {}", activity.label()),
+            theme.accent,
+        )),
+        RunActivity::Cancelling => facts.push(Span::styled(activity.label(), theme.accent)),
+        RunActivity::None | RunActivity::Followed => {},
     }
     let missing = match (follow, ended) {
         (Some(follow), _) => follow.skipped,

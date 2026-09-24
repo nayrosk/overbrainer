@@ -54,7 +54,9 @@ pub(in crate::tui) fn context(app: &App) -> Context {
         Some(Overlay::Help) => Context::Help,
         Some(Overlay::Menu(_)) => Context::Menu,
         None if app.view == View::Dataset && app.dataset.input.is_some() => Context::Filter,
-        None if app.view == View::Training && app.training.selected_abandons() => Context::Abandon,
+        None if app.view == View::Training && app.training.selected_activity().abandons() => {
+            Context::Abandon
+        },
         None => Context::View(app.view),
     }
 }

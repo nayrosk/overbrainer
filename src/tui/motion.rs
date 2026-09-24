@@ -24,6 +24,7 @@ use super::app::{App, Overlay, View};
 use super::format::WORKING;
 use super::pipeline::{STAGES, StageState};
 use super::theme::{ColorLevel, LookEnv, Theme};
+use super::training::RunActivity;
 
 /// The frames of the spinner of running work.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -386,7 +387,9 @@ impl App {
     /// Whether the followed run's `●` pulses on screen: the Training view on a
     /// run a task follows, with color effects on.
     pub(super) fn pulse_shown(&self) -> bool {
-        self.motion.pulses() && self.view == View::Training && self.training.selected_followed()
+        self.motion.pulses()
+            && self.view == View::Training
+            && self.training.selected_activity() == RunActivity::Followed
     }
 
     /// Starts the color effects of what changed since the last draw: called

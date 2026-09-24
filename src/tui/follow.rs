@@ -21,7 +21,7 @@ use crossterm::event::KeyCode;
 use super::app::{Action, App, Confirm, Effect, Exit, NoteOf, Overlay, Severity, View};
 use super::start::{self, Prices, StartPlan};
 use super::tasks::{Msg, Task, TaskId, TrainJob};
-use super::training::{Detach, Ended, Follow, Job, Listing};
+use super::training::{Detach, Ended, Follow, Job, Listing, RunActivity};
 use crate::cli::front::Report;
 use crate::events::Event;
 use crate::train::TrainMetric;
@@ -306,11 +306,12 @@ impl App {
             self.say(Severity::Warn, "refused: interrupted, exiting");
             return;
         }
+        let activity = self.training.activity(&id);
         let starting = self
             .training
             .task_of(&id)
-            .filter(|(_, follow)| follow.job == (Job::Start { runpod: true }) && follow.starting())
-            .map(|(task, follow)| (task, follow.detach == Detach::Done));
+            .filter(|_| activity.abandons())
+            .map(|(task, _)| (task, matches!(activity, RunActivity::Abandoning { .. })));
         if let Some((task, abandoned)) = starting {
             // A Runpod start has no job to cancel yet: it is abandoned instead.
             if abandoned {
