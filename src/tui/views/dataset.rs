@@ -10,7 +10,6 @@ use crate::dataset::{AnswerText, Example, FinishReason, Id, ReasoningKind};
 use crate::pipeline::SplitClass;
 use crate::tui::app::App;
 use crate::tui::dataset::{Model, Node, Stats, exclusion, sizes};
-use crate::tui::format::WORKING;
 use crate::tui::theme::Theme;
 
 /// A rounded pane with a column of padding, its border drawn in `border`.
@@ -27,14 +26,16 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
     let onboarding = app.training.runs.is_empty();
+    let loading = app
+        .motion
+        .shows_load(app.load_at)
+        .then(|| format!("{} reading data/…", app.motion.spinner()));
     let view = &mut app.dataset;
     let Some(model) = &view.model else {
-        let text = match view.error.clone() {
-            Some(error) => failed(&error, &theme),
-            None => vec![Line::from(Span::styled(
-                format!("{WORKING} reading data/…"),
-                theme.dim,
-            ))],
+        let text = match (view.error.clone(), loading) {
+            (Some(error), _) => failed(&error, &theme),
+            (None, Some(loading)) => vec![Line::from(Span::styled(loading, theme.dim))],
+            (None, None) => Vec::new(),
         };
         let block = pane(theme.border_focus).title(Span::styled(" data ", theme.title));
         frame.render_widget(

@@ -9,7 +9,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::tui::app::{App, Overlay, Severity, Status, View};
-use crate::tui::format::WORKING;
 use crate::tui::keys::{self, Context, HELP_HINT, Hint, SEPARATOR};
 use crate::tui::theme::Theme;
 
@@ -17,9 +16,10 @@ use crate::tui::theme::Theme;
 pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let locked = app.lock().is_some();
+    let spinner = app.motion.spinner();
     let mut right = Vec::new();
     for work in app.work() {
-        right.push(Span::styled(format!("{WORKING} "), theme.accent));
+        right.push(Span::styled(format!("{spinner} "), theme.accent));
         right.push(Span::styled(work, theme.dim));
         right.push(Span::styled(SEPARATOR, theme.dim));
     }

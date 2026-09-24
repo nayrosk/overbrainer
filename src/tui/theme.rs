@@ -34,6 +34,10 @@ pub(super) struct LookEnv {
     pub(super) colorterm: Option<OsString>,
     /// `TERM`: a name containing `256color` means 256 colors.
     pub(super) term: Option<OsString>,
+    /// `OVERBRAINER_TUI_MOTION`: `on`, `reduced` or `off`.
+    pub(super) motion: Option<OsString>,
+    /// Whether `SSH_CONNECTION` or `SSH_TTY` is set: motion is reduced.
+    pub(super) ssh: bool,
 }
 
 impl LookEnv {
@@ -44,10 +48,13 @@ impl LookEnv {
             color: std::env::var_os("OVERBRAINER_TUI_COLOR"),
             colorterm: std::env::var_os("COLORTERM"),
             term: std::env::var_os("TERM"),
+            motion: std::env::var_os("OVERBRAINER_TUI_MOTION"),
+            ssh: std::env::var_os("SSH_CONNECTION").is_some()
+                || std::env::var_os("SSH_TTY").is_some(),
         }
     }
 
-    /// What the TUI logs about these variables when it starts: a value it
+    /// What the TUI logs about these variables when it starts: each value it
     /// does not know, which it ignores.
     pub(super) fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
@@ -56,6 +63,14 @@ impl LookEnv {
         {
             warnings.push(format!(
                 "OVERBRAINER_TUI_COLOR={} is not truecolor, 256 or 16: ignored",
+                value.display()
+            ));
+        }
+        if let Some(value) = filled(self.motion.as_deref())
+            && super::motion::MotionLevel::chosen(value).is_none()
+        {
+            warnings.push(format!(
+                "OVERBRAINER_TUI_MOTION={} is not on, reduced or off: ignored",
                 value.display()
             ));
         }
@@ -375,6 +390,14 @@ mod tests {
         assert_eq!(
             env(&[("OVERBRAINER_TUI_COLOR", "purple")]).warnings(),
             ["OVERBRAINER_TUI_COLOR=purple is not truecolor, 256 or 16: ignored"]
+        );
+        let motion = LookEnv {
+            motion: Some(OsString::from("fast")),
+            ..LookEnv::default()
+        };
+        assert_eq!(
+            motion.warnings(),
+            ["OVERBRAINER_TUI_MOTION=fast is not on, reduced or off: ignored"]
         );
     }
 

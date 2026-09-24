@@ -17,7 +17,7 @@ use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, RunState};
 use crate::train::TrainMetric;
 use crate::tui::app::App;
-use crate::tui::format::{WORKING, duration};
+use crate::tui::format::duration;
 use crate::tui::theme::Theme;
 use crate::tui::training::{Ended, Follow, Job, RunRow, float, progress};
 use crate::tui::views::dataset::failed;
@@ -71,7 +71,12 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     let message_rows = rows(&messages, MESSAGE_ROWS);
     let state = task_state(follow);
     let head = head_line(&row.record, series, state, theme);
-    let facts = facts_line(series, (follow, ended), state, theme);
+    let facts = facts_line(
+        series,
+        (follow, ended),
+        (state, app.motion.spinner()),
+        theme,
+    );
     let facts_rows = u16::from(!facts.spans.is_empty());
     let [status, facts_area, pod_area, chart, lr, grad, notes] = Layout::vertical([
         Constraint::Length(1),
@@ -227,13 +232,13 @@ fn head_line(
     Line::from(head)
 }
 
-/// The selected run's second status line: its epoch, whether a task starts or
-/// cancels it, and the points its forwarder skipped; empty when there is none
-/// of them.
+/// The selected run's second status line: its epoch, whether a task starts
+/// (with the spinner) or cancels it, and the points its forwarder skipped;
+/// empty when there is none of them.
 fn facts_line(
     series: &[TrainMetric],
     (follow, ended): (Option<&Follow>, Option<&Ended>),
-    state: &str,
+    (state, spinner): (&str, &str),
     theme: &Theme,
 ) -> Line<'static> {
     let mut facts: Vec<Span<'static>> = Vec::new();
@@ -241,7 +246,7 @@ fn facts_line(
         facts.push(Span::raw(format!("epoch {epoch:.2}")));
     }
     match state {
-        "starting" => facts.push(Span::styled(format!("{WORKING} starting"), theme.accent)),
+        "starting" => facts.push(Span::styled(format!("{spinner} starting"), theme.accent)),
         "cancelling" => facts.push(Span::styled("cancelling", theme.accent)),
         _ => {},
     }

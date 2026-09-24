@@ -9,6 +9,7 @@ mod event_loop;
 mod follow;
 mod format;
 mod keys;
+mod motion;
 mod pipeline;
 #[cfg(test)]
 mod snapshots;
@@ -28,6 +29,7 @@ use std::time::SystemTime;
 use anyhow::{Context, bail};
 
 use self::app::{App, Project};
+use self::motion::{Motion, MotionLevel};
 use self::terminal::TerminalGuard;
 use self::theme::{ColorLevel, LookEnv, Theme};
 use crate::config::EnvSource;
@@ -47,8 +49,10 @@ pub async fn run(project_dir: &Path, logs: LogBuffer) -> anyhow::Result<()> {
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
     let project = Project::new(project_dir, &settings);
     let env = LookEnv::from_process();
-    let theme = Theme::new(ColorLevel::detect(&env));
+    let color = ColorLevel::detect(&env);
+    let theme = Theme::new(color);
     let mut app = App::new(project, logs, &theme, SystemTime::now());
+    app.motion = Motion::new(MotionLevel::detect(&env, color));
     for warning in env.warnings() {
         tracing::warn!("{warning}");
     }

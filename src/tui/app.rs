@@ -12,6 +12,7 @@ use tracing::Level;
 
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
 use super::editor::{self, Session, Target};
+use super::motion::{Motion, MotionLevel};
 use super::pipeline::{PipelineView, STAGES, command_name};
 use super::start::StartPlan;
 use super::tasks::{Done, Edit, Msg, Saved, Task, TaskId};
@@ -291,6 +292,10 @@ pub(super) struct App {
     pub(super) log_view: LogView,
     /// The load of the data files running, if any.
     pub(super) load: Option<TaskId>,
+    /// When the last load started, by the motion clock.
+    pub(super) load_at: Option<Duration>,
+    /// What moves on screen, and its clock.
+    pub(super) motion: Motion,
     /// Whether a reload was asked for while a load ran: it starts once that load
     /// ends, so it reads what changed meanwhile.
     reload_pending: bool,
@@ -351,6 +356,8 @@ impl App {
                 ..DatasetView::default()
             },
             load: None,
+            load_at: None,
+            motion: Motion::new(MotionLevel::Off),
             reload_pending: false,
             edit: None,
             editing: None,
@@ -405,6 +412,7 @@ impl App {
         }
         let id = self.task_id();
         self.load = Some(id);
+        self.load_at = Some(self.motion.clock());
         vec![Effect::Spawn(id, Task::Load)]
     }
 

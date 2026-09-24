@@ -9,7 +9,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::events::Stage;
 use crate::tui::app::App;
-use crate::tui::format::{WORKING, hang};
+use crate::tui::format::hang;
 use crate::tui::pipeline::{PipelineView, STAGES, StageState, command_name};
 use crate::tui::theme::Theme;
 use crate::tui::training::float;
@@ -40,8 +40,9 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
         counts,
     );
     let row_areas = Layout::vertical([Constraint::Length(1); 4]).split(rows);
+    let spinner = app.motion.spinner();
     for (stage, row_area) in STAGES.iter().zip(row_areas.iter()) {
-        render_row(frame, *row_area, view, *stage, theme);
+        render_row(frame, *row_area, (view, *stage, spinner), theme);
     }
     // The oldest item failures give way first, so the summary lines and the
     // final error stay in view on a small terminal.
@@ -79,16 +80,21 @@ pub(in crate::tui) fn ratio(finished: usize, total: usize) -> f64 {
     }
 }
 
-/// One stage: `✓` done, [`WORKING`] running, `·` pending, `✗` stopped; its
+/// One stage: `✓` done, `spinner` running, `·` pending, `✗` stopped; its
 /// name, its bar (the word `pending` or `stopped` in the empty part), its
 /// count and its request counters.
-fn render_row(frame: &mut Frame, area: Rect, view: &PipelineView, stage: Stage, theme: &Theme) {
+fn render_row(
+    frame: &mut Frame,
+    area: Rect,
+    (view, stage, spinner): (&PipelineView, Stage, &str),
+    theme: &Theme,
+) {
     let [glyph_area, name_area, bar_area, label_area, counts_area] = columns(area);
     let row = view.row(stage);
     let (glyph, glyph_style, name_style) = match row.state {
         StageState::Idle => (" ", theme.dim, Style::new()),
         StageState::Pending => ("·", theme.dim, theme.dim),
-        StageState::Running => (WORKING, theme.accent, theme.accent),
+        StageState::Running => (spinner, theme.accent, theme.accent),
         StageState::Done => ("✓", theme.ok, Style::new()),
         StageState::Stopped => ("✗", theme.error, Style::new()),
     };
