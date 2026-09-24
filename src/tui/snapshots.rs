@@ -16,7 +16,7 @@ use tracing::Level;
 use super::app::{App, Effect, Overlay, Project, View};
 use super::dataset::{Node, TopicInfo};
 use super::tasks::{Done, TaskId};
-use super::theme::Theme;
+use super::theme::{ColorLevel, Theme};
 use super::ui;
 use crate::cli::data::Command;
 use crate::dataset::{
@@ -41,7 +41,7 @@ pub(super) fn at(seconds: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(seconds)
 }
 
-/// An app on the project `rust_expert` at [`NOW`], with the color theme.
+/// An app on the project `rust_expert` at [`NOW`], with the 24-bit theme.
 pub(super) fn app() -> App {
     let project = Project {
         name: "rust_expert".into(),
@@ -50,7 +50,12 @@ pub(super) fn app() -> App {
         eval_ratio: 0.1,
         concurrency: 8,
     };
-    App::new(project, LogBuffer::new(100), Theme::color(), at(NOW))
+    App::new(
+        project,
+        LogBuffer::new(100),
+        &Theme::new(ColorLevel::TrueColor),
+        at(NOW),
+    )
 }
 
 /// The fixtures' topics: `ownership` and `traits`.

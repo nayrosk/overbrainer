@@ -29,7 +29,7 @@ use anyhow::{Context, bail};
 
 use self::app::{App, Project};
 use self::terminal::TerminalGuard;
-use self::theme::Theme;
+use self::theme::{ColorLevel, LookEnv, Theme};
 use crate::config::EnvSource;
 use crate::logging::LogBuffer;
 
@@ -46,7 +46,12 @@ pub async fn run(project_dir: &Path, logs: LogBuffer) -> anyhow::Result<()> {
     }
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
     let project = Project::new(project_dir, &settings);
-    let mut app = App::new(project, logs, Theme::detect(), SystemTime::now());
+    let env = LookEnv::from_process();
+    let theme = Theme::new(ColorLevel::detect(&env));
+    let mut app = App::new(project, logs, &theme, SystemTime::now());
+    for warning in env.warnings() {
+        tracing::warn!("{warning}");
+    }
     app.editor = editor::command(std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
     let guard = TerminalGuard::enter();
     let mut terminal = terminal::init().context("cannot set up the terminal")?;

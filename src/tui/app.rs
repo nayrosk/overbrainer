@@ -330,10 +330,10 @@ pub(super) struct App {
 
 impl App {
     /// A new app for `project`, logging into `logs`, at `now`.
-    pub(super) fn new(project: Project, logs: LogBuffer, theme: Theme, now: SystemTime) -> Self {
+    pub(super) fn new(project: Project, logs: LogBuffer, theme: &Theme, now: SystemTime) -> Self {
         Self {
             project,
-            theme,
+            theme: *theme,
             seen_log: logs.seq(),
             logs,
             view: View::Dataset,
@@ -1604,7 +1604,7 @@ mod tests {
                 concurrency: 8,
             },
             LogBuffer::new(25),
-            Theme::color(),
+            &Theme::new(crate::tui::theme::ColorLevel::TrueColor),
             at(NOW),
         );
         for n in 0..25 {

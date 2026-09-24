@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -92,8 +93,14 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(Span::styled(note, theme.dim)), chart);
     } else {
         render_chart(frame, chart, series, theme);
-        render_sparkline(frame, lr, ("lr", |m| m.learning_rate), series, theme);
-        render_sparkline(frame, grad, ("grad_norm", |m| m.grad_norm), series, theme);
+        render_sparkline(frame, lr, ("lr", |m| m.learning_rate), series, theme.lr);
+        render_sparkline(
+            frame,
+            grad,
+            ("grad_norm", |m| m.grad_norm),
+            series,
+            theme.grad_norm,
+        );
     }
     // The newest lines stay in view when they need more rows than they get.
     let hidden = u16::try_from(messages.line_count(inner.width))
@@ -389,7 +396,7 @@ fn render_sparkline(
     area: Rect,
     (label, value): (&'static str, fn(&TrainMetric) -> Option<f64>),
     series: &[TrainMetric],
-    theme: &Theme,
+    style: Style,
 ) {
     let [name, line, latest] = Layout::horizontal([
         Constraint::Length(10),
@@ -412,12 +419,9 @@ fn render_sparkline(
             }
         })
         .collect();
-    frame.render_widget(Paragraph::new(Span::styled(label, theme.dim)), name);
+    frame.render_widget(Paragraph::new(Span::styled(label, style)), name);
     frame.render_widget(
-        Sparkline::default()
-            .data(&scaled)
-            .max(1000)
-            .style(theme.sparkline),
+        Sparkline::default().data(&scaled).max(1000).style(style),
         line,
     );
     let text = match (values.last(), label) {
