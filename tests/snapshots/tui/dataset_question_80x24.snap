@@ -11,7 +11,7 @@ source: src/tui/snapshots.rs
 "│   ▶ Lifetimes  1 q, 1 a          ││                                          │"
 "│   ▶ (missing subtopic)  1 q, 1 a ││                                          │"
 "│   traits  0 sub, 0 q, 0 a        ││                                          │"
-"│ ▶ (not configured) old_topic  1  ││                                          │"
+"│ ▶ old_topic (not configured)  1  ││                                          │"
 "│                                  ││                                          │"
 "│                                  ││                                          │"
 "│                                  ││                                          │"

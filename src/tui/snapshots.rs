@@ -43,19 +43,20 @@ pub(super) fn at(seconds: u64) -> SystemTime {
 
 /// An app on the project `rust_expert` at [`NOW`], with the 24-bit theme.
 pub(super) fn app() -> App {
+    app_with(&Theme::new(ColorLevel::TrueColor))
+}
+
+/// An app on the project `rust_expert` at [`NOW`], with `theme`.
+pub(super) fn app_with(theme: &Theme) -> App {
     let project = Project {
         name: "rust_expert".into(),
         dir: "/nonexistent/rust_expert".into(),
         topics: Vec::new(),
         eval_ratio: 0.1,
         concurrency: 8,
+        target: Some("gpu_cloud".into()),
     };
-    App::new(
-        project,
-        LogBuffer::new(100),
-        &Theme::new(ColorLevel::TrueColor),
-        at(NOW),
-    )
+    App::new(project, LogBuffer::new(100), theme, at(NOW))
 }
 
 /// The fixtures' topics: `ownership` and `traits`.
@@ -190,7 +191,12 @@ pub(super) fn dataset() -> Dataset {
 
 /// [`app`] on the `ownership` and `traits` topics with [`dataset`] loaded.
 pub(super) fn dataset_app() -> App {
-    let mut app = app();
+    dataset_app_with(&Theme::new(ColorLevel::TrueColor))
+}
+
+/// [`dataset_app`] with `theme`.
+pub(super) fn dataset_app_with(theme: &Theme) -> App {
+    let mut app = app_with(theme);
     app.project.topics = topics();
     app.dataset.loaded(dataset(), &app.project.topics);
     app
@@ -548,9 +554,8 @@ fn a_terminal_below_80x24_says_so() -> TestResult {
 /// shows as reversed.
 #[test]
 fn the_monochrome_theme_uses_no_color() -> TestResult {
-    let mut app = dataset_app();
+    let mut app = dataset_app_with(&Theme::mono());
     logs(&app);
-    app.theme = Theme::mono();
     for view in View::ALL {
         app.view = view;
         for overlay in [None, Some(Overlay::Help)] {
@@ -631,6 +636,23 @@ fn dataset_with_missing_subtopic_and_unconfigured_topic() -> TestResult {
         .tree
         .select(vec![Node::Topic("old_topic".into())]);
     snapshot("dataset_leftovers", &mut app)?;
+    Ok(())
+}
+
+/// No data and no run: the empty tree says which key fills it, and the first
+/// keys to know.
+#[test]
+fn dataset_empty_on_a_new_project() -> TestResult {
+    let mut app = app();
+    app.project.topics = topics();
+    app.dataset.loaded(Dataset::default(), &app.project.topics);
+    snapshot("dataset_empty", &mut app)?;
+    let rows = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(rows.contains("No data yet: press r to generate"), "{rows}");
+    assert!(
+        rows.contains("r generates data · t trains · ? all keys"),
+        "{rows}"
+    );
     Ok(())
 }
 

@@ -3,8 +3,8 @@ source: src/tui/snapshots.rs
 ---
 " ⠿ overbrainer   1 Dataset  2 Pipeline  3 Training  4 Logs          rust_expert "
 "╭ data ────────────────────────────────────────────────────────────────────────╮"
-"│ data/answers.jsonl:3: invalid record: expected value at line 1 column 2      │"
-"│                                                                              │"
+"│ ✗ data/answers.jsonl:3: invalid record: expected value at line 1 column 2    │"
+"│ R reloads                                                                    │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

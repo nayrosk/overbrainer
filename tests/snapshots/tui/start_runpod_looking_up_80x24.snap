@@ -6,7 +6,7 @@ source: src/tui/snapshots.rs
 "│ run                   state      target     pod                              │"
 "│                                                                              │"
 "╰───╭ Start a training run? ───────────────────────────────────────────────╮───╯"
-"  no│                                                                      │    "
+"  No│                                                                      │    "
 "    │  target      gpu_cloud (runpod, Secure Cloud)                        │    "
 "    │  model       Qwen/Qwen3-4B, qlora, 3 epochs, lr 2e-4                 │    "
 "    │  data        data/train.jsonl 1234 examples, data/eval.jsonl 137     │    "

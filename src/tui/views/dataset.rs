@@ -10,6 +10,7 @@ use crate::dataset::{AnswerText, Example, FinishReason, Id, ReasoningKind};
 use crate::pipeline::SplitClass;
 use crate::tui::app::App;
 use crate::tui::dataset::{Model, Node, Stats, exclusion, sizes};
+use crate::tui::format::WORKING;
 use crate::tui::theme::Theme;
 
 /// A rounded pane with a column of padding, its border drawn in `border`.
@@ -25,12 +26,16 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
+    let onboarding = app.training.runs.is_empty();
     let view = &mut app.dataset;
     let Some(model) = &view.model else {
-        let text = view.error.clone().map_or_else(
-            || Line::from(Span::styled("loading data/...", theme.dim)),
-            |error| Line::from(Span::styled(error, theme.error)),
-        );
+        let text = match view.error.clone() {
+            Some(error) => failed(&error, &theme),
+            None => vec![Line::from(Span::styled(
+                format!("{WORKING} reading data/…"),
+                theme.dim,
+            ))],
+        };
         let block = pane(theme.border_focus).title(Span::styled(" data ", theme.title));
         frame.render_widget(
             Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
@@ -51,15 +56,20 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = pane(theme.border_focus)
         .title(Span::styled(title, theme.title))
         .title_bottom(Span::styled(bottom, theme.dim));
+    let data = &model.data;
+    let nothing = data.subtopics.is_empty() && data.questions.is_empty() && data.answers.is_empty();
     match &model.items {
-        Ok(items) if items.is_empty() => {
-            let note = if model.matches.is_some() {
-                "nothing matches the filter"
+        Ok(items) if items.is_empty() || (nothing && model.matches.is_none()) => {
+            let lines = if model.matches.is_some() {
+                vec![Line::from(Span::styled(
+                    "Nothing matches the filter: Esc clears it.",
+                    theme.dim,
+                ))]
             } else {
-                "no data yet"
+                empty(onboarding, &theme)
             };
             frame.render_widget(
-                Paragraph::new(Span::styled(note, theme.dim)).block(block),
+                Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
                 left,
             );
         },
@@ -83,8 +93,32 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// What an empty dataset says: which key fills it; with no run either, the
+/// first keys to know.
+fn empty(onboarding: bool, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(
+        "No data yet: press r to generate subtopics, questions and answers.",
+    )];
+    if onboarding {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "r generates data · t trains · ? all keys",
+            theme.dim,
+        )));
+    }
+    lines
+}
+
+/// What a failed read says: `✗`, the error, and the key that reads again.
+pub(in crate::tui) fn failed(error: &str, theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(format!("✗ {error}"), theme.error)),
+        Line::from(Span::styled("R reloads", theme.dim)),
+    ]
+}
+
 fn error_pane(frame: &mut Frame, area: Rect, block: Block, error: &str, theme: &Theme) {
-    let text = Paragraph::new(Span::styled(error.to_string(), theme.error))
+    let text = Paragraph::new(failed(error, theme))
         .wrap(Wrap { trim: false })
         .block(block);
     frame.render_widget(text, area);

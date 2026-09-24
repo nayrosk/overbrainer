@@ -4,7 +4,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use ratatui::text::Line;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use tui_tree_widget::{TreeItem, TreeState};
 
 use crate::dataset::{Dataset, Example, Exclusion, Id, Question, Subtopic, normalize};
@@ -65,6 +66,8 @@ pub(super) struct Model {
     classes: Vec<SplitClass>,
     /// Stats of each topic, and of all topics under `None`.
     pub(super) stats: BTreeMap<Option<String>, Stats>,
+    /// The style of the `(not configured)` label of a topic.
+    warn: Style,
 }
 
 /// Counts and sizes of one topic, or of all topics.
@@ -127,8 +130,8 @@ impl Lengths {
 
 impl Model {
     /// The model of `data` for the configured `topics`: stats now, and the tree
-    /// filtered by `filter`.
-    pub(super) fn new(data: Dataset, topics: &[TopicInfo], filter: &str) -> Self {
+    /// filtered by `filter`, a topic not configured labelled in `warn`.
+    pub(super) fn new(data: Dataset, topics: &[TopicInfo], filter: &str, warn: Style) -> Self {
         let configured: BTreeSet<String> = topics.iter().map(|topic| topic.name.clone()).collect();
         let found: BTreeSet<&str> = data
             .subtopics
@@ -174,6 +177,7 @@ impl Model {
             first_question,
             classes,
             stats: BTreeMap::new(),
+            warn,
         };
         model.stats = model.all_stats(topics);
         model.filter(filter);
@@ -402,16 +406,18 @@ impl<'a> Tree<'a> {
         TreeItem::new(node, label, children).map(Some)
     }
 
+    /// A topic's name, `(not configured)` after it when it is not in
+    /// `overbrainer.toml`, then its counts.
     fn topic_label(&self, topic: &str) -> Line<'static> {
         let [subtopics, questions, answers] = self.counts.get(topic).copied().unwrap_or_default();
-        let name = if self.model.is_configured(topic) {
-            topic.to_string()
-        } else {
-            format!("(not configured) {topic}")
-        };
-        Line::from(format!(
-            "{name}  {subtopics} sub, {questions} q, {answers} a"
-        ))
+        let mut spans = vec![Span::raw(topic.to_string())];
+        if !self.model.is_configured(topic) {
+            spans.push(Span::styled(" (not configured)", self.model.warn));
+        }
+        spans.push(Span::raw(format!(
+            "  {subtopics} sub, {questions} q, {answers} a"
+        )));
+        Line::from(spans)
     }
 
     /// The group at `path` (its topic, then the group itself: a subtopic or the
@@ -504,13 +510,15 @@ pub(super) struct DatasetView {
     pub(super) scroll: u16,
     /// The last split run in this session.
     pub(super) split: Option<SplitReport>,
+    /// The style of the `(not configured)` label of a topic.
+    pub(super) warn: Style,
 }
 
 impl DatasetView {
     /// Shows a newly loaded `data`, keeping the selection and open nodes when the
     /// selected node is still shown, else selecting the first node.
     pub(super) fn loaded(&mut self, data: Dataset, topics: &[TopicInfo]) {
-        self.model = Some(Model::new(data, topics, &self.filter));
+        self.model = Some(Model::new(data, topics, &self.filter, self.warn));
         self.error = None;
         if !self.shown(self.tree.selected()) {
             self.tree.select(Vec::new());
@@ -717,7 +725,7 @@ mod tests {
         let mut second = data.answers[0].clone();
         second.meta.excluded = Some(Exclusion::Refused);
         data.answers.push(second);
-        let model = Model::new(data, &topics(), "");
+        let model = Model::new(data, &topics(), "", Style::new());
         let id = &model.data.answers[0].id;
         assert_eq!(model.class(id), Some(SplitClass::Usable));
         let first = model.answer(id).ok_or("no answer")?;

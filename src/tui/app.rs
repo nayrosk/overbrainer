@@ -41,6 +41,8 @@ pub(super) struct Project {
     pub(super) eval_ratio: f64,
     /// `pipeline.concurrency`.
     pub(super) concurrency: usize,
+    /// `training.target`, when training is configured.
+    pub(super) target: Option<String>,
 }
 
 impl Project {
@@ -61,6 +63,10 @@ impl Project {
                 .collect(),
             eval_ratio: settings.pipeline.eval_ratio,
             concurrency: settings.pipeline.concurrency,
+            target: settings
+                .training
+                .as_ref()
+                .map(|training| training.target.clone()),
         }
     }
 }
@@ -340,7 +346,10 @@ impl App {
             overlay: None,
             status: None,
             now,
-            dataset: DatasetView::default(),
+            dataset: DatasetView {
+                warn: theme.warn,
+                ..DatasetView::default()
+            },
             load: None,
             reload_pending: false,
             edit: None,
@@ -1600,6 +1609,7 @@ mod tests {
                 topics: Vec::new(),
                 eval_ratio: 0.1,
                 concurrency: 8,
+                target: None,
             },
             LogBuffer::new(25),
             &Theme::new(crate::tui::theme::ColorLevel::TrueColor),

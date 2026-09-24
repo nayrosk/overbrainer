@@ -12,7 +12,7 @@ source: src/tui/snapshots.rs
 "│   ▶ Lifetimes  1 q, 1 a                            ││ it.                                                            │"
 "│   ▶ (missing subtopic)  1 q, 1 a                   ││ ── answer ──                                                   │"
 "│   traits  0 sub, 0 q, 0 a                          ││ The borrow must end before the move.                           │"
-"│ ▶ (not configured) old_topic  1 sub, 1 q, 1 a      ││ If a reference is still used after the move, the compiler      │"
+"│ ▶ old_topic (not configured)  1 sub, 1 q, 1 a      ││ If a reference is still used after the move, the compiler      │"
 "│                                                    ││ reports E0505: cannot move out of the value because it is      │"
 "│                                                    ││ borrowed.                                                      │"
 "│                                                    ││ Non-lexical lifetimes end a borrow at its last use, not at the │"

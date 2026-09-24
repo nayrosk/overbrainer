@@ -136,7 +136,7 @@ fn details(view: &PipelineView, theme: &Theme, errors: usize, width: u16) -> Vec
     let mut lines = Vec::new();
     if view.command.is_none() {
         lines.push(Line::from(Span::styled(
-            "nothing ran yet in this TUI: r runs a stage",
+            "Nothing ran yet in this TUI: press r to run a stage.",
             theme.dim,
         )));
         return lines;

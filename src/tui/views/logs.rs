@@ -60,9 +60,14 @@ fn render_line<'a>(line: &'a LogLine, theme: &crate::tui::theme::Theme) -> Line<
             theme.level(line.level),
         ),
         Span::raw(" "),
-        Span::styled(format!("{}: ", line.target), theme.dim),
+        Span::styled(format!("{}: ", short_target(&line.target)), theme.dim),
         Span::raw(line.message.as_str()),
     ])
+}
+
+/// A log target without the crate's own `overbrainer::` prefix.
+fn short_target(target: &str) -> &str {
+    target.strip_prefix("overbrainer::").unwrap_or(target)
 }
 
 /// The level in upper case.

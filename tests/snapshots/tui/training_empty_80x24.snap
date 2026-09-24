@@ -6,7 +6,7 @@ source: src/tui/snapshots.rs
 "│ run                   state      target     pod                              │"
 "│                                                                              │"
 "╰──────────────────────────────────────────────────────────────────────────────╯"
-"  no run yet                                                                    "
+"  No runs yet: press t to start one on gpu_cloud.                               "
 "                                                                                "
 "                                                                                "
 "                                                                                "

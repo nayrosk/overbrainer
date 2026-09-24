@@ -3,7 +3,7 @@ source: src/tui/snapshots.rs
 ---
 " ⠿ overbrainer   1 Dataset  2 Pipeline  3 Training  4 Logs          rust_expert "
 "╭ data ────────────────────────────────────────────────────────────────────────╮"
-"│ loading data/...                                                             │"
+"│ … reading data/…                                                             │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

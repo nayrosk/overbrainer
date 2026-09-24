@@ -20,6 +20,7 @@ use crate::tui::app::App;
 use crate::tui::format::{WORKING, duration};
 use crate::tui::theme::Theme;
 use crate::tui::training::{Ended, Follow, Job, RunRow, float, progress};
+use crate::tui::views::dataset::failed;
 use crate::tui::widgets::bar::bar;
 
 /// Rows the pod line may wrap to.
@@ -40,11 +41,16 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     // The selected run's detail has no frame: a two-column margin.
     let inner = detail.inner(Margin::new(2, 0));
     let Some(row) = view.selected_run() else {
-        let text = view
-            .error
-            .clone()
-            .unwrap_or_else(|| "no run yet".to_string());
-        frame.render_widget(Paragraph::new(Span::styled(text, theme.dim)), inner);
+        let text = match (&view.error, &app.project.target) {
+            (Some(error), _) => failed(error, theme),
+            (None, Some(target)) => vec![Line::from(format!(
+                "No runs yet: press t to start one on {target}."
+            ))],
+            (None, None) => vec![Line::from(
+                "No runs yet: add a [training] section to overbrainer.toml, then press t.",
+            )],
+        };
+        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
         return;
     };
     let follow = view.task_of(&row.record.id).map(|(_, follow)| follow);
@@ -90,7 +96,10 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
         };
         frame.render_widget(Paragraph::new(Span::styled(note, theme.dim)), chart);
     } else {
-        render_chart(frame, chart, series, theme);
+        let [legend, plot] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(chart);
+        render_legend(frame, legend, theme);
+        render_chart(frame, plot, series, theme);
         render_sparkline(frame, lr, ("lr", |m| m.learning_rate), series, theme.lr);
         render_sparkline(
             frame,
@@ -375,6 +384,19 @@ fn downsample(points: Vec<(f64, f64)>, width: u16) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// The chart's label on the left, and what its marks are on the right.
+fn render_legend(frame: &mut Frame, area: Rect, theme: &Theme) {
+    frame.render_widget(Paragraph::new(Span::styled("loss", theme.dim)), area);
+    let legend = Line::from(vec![
+        Span::styled("─", theme.loss),
+        Span::styled(" train  ", theme.dim),
+        Span::styled("•", theme.eval_loss),
+        Span::styled(" eval", theme.dim),
+    ])
+    .right_aligned();
+    frame.render_widget(Paragraph::new(legend), area);
+}
+
 fn render_chart(frame: &mut Frame, area: Rect, series: &[TrainMetric], theme: &Theme) {
     let width = area.width.saturating_sub(8);
     let points = |value: fn(&TrainMetric) -> Option<f64>| {
@@ -395,13 +417,11 @@ fn render_chart(frame: &mut Frame, area: Rect, series: &[TrainMetric], theme: &T
     let x1 = if x1 > x0 { x1 } else { x0 + 1.0 };
     let datasets = vec![
         Dataset::default()
-            .name("loss")
             .marker(Marker::HalfBlock)
             .graph_type(GraphType::Line)
             .style(theme.loss)
             .data(&loss),
         Dataset::default()
-            .name("eval_loss")
             .marker(Marker::Dot)
             .graph_type(GraphType::Scatter)
             .style(theme.eval_loss)
