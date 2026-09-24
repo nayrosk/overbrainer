@@ -7,8 +7,8 @@ description = "Distill a large LLM into a smaller open-weights model: generate q
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nayrosk/overbrainer"
 readme = "README.md"
-keywords = ["llm", "distillation", "fine-tuning", "cli", "tui"]
-categories = ["command-line-utilities", "science"]
+keywords = ["llm", "distillation", "fine-tuning", "synthetic-data", "cli"]
+categories = ["command-line-utilities", "science", "science::ml"]
 include = ["src/**/*", "templates/**/*", "LICENSE-*", "README.md"]
 
 [lints.rust]
