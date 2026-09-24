@@ -30,31 +30,27 @@ const POD_ROWS: u16 = 2;
 const MESSAGE_ROWS: u16 = 4;
 /// Cells of the selected run's step bar.
 const STEP_BAR: u16 = 16;
+/// Rows of the view from which a blank row parts the detail's sections (its
+/// head, its pod, its chart): a terminal of 30 rows or more. Below, the rows
+/// go to the chart.
+const GAPS_FROM: u16 = 28;
 
 /// Draws the Training view in `area`; returns the cell of the followed run's
 /// `●`, when it shows.
 pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option<Rect> {
     let view = &app.training;
     let theme = &app.theme;
-    let shown = u16::try_from(view.runs.len().clamp(1, 5)).unwrap_or(5);
+    if view.runs.is_empty() {
+        render_no_runs(frame, area, app);
+        return None;
+    }
+    let shown = u16::try_from(view.runs.len().min(5)).unwrap_or(5);
     let [list, detail] =
         Layout::vertical([Constraint::Length(shown + 3), Constraint::Fill(1)]).areas(area);
     render_runs(frame, list, app);
     // The selected run's detail has no frame: a two-column margin.
     let inner = detail.inner(Margin::new(2, 0));
-    let Some(row) = view.selected_run() else {
-        let text = match (&view.error, &app.project.target) {
-            (Some(error), _) => failed(error, theme),
-            (None, Some(target)) => vec![Line::from(format!(
-                "No runs yet: press t to start one on {target}."
-            ))],
-            (None, None) => vec![Line::from(
-                "No runs yet: add a [training] section to overbrainer.toml, then press t.",
-            )],
-        };
-        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
-        return None;
-    };
+    let row = view.selected_run()?;
     let follow = view.task_of(&row.record.id).map(|(_, follow)| follow);
     let series = view
         .series
@@ -83,10 +79,13 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option
         theme,
     );
     let facts_rows = u16::from(!facts.spans.is_empty());
-    let [status, facts_area, pod_area, chart, lr, grad, notes] = Layout::vertical([
+    let gap = u16::from(area.height >= GAPS_FROM);
+    let [status, facts_area, _, pod_area, _, chart, lr, grad, notes] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(facts_rows),
+        Constraint::Length(gap),
         Constraint::Length(pod_rows),
+        Constraint::Length(gap.min(pod_rows)),
         Constraint::Fill(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -126,6 +125,40 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option
     (activity == RunActivity::Followed).then(|| Rect::new(status.x, status.y, 1, 1))
 }
 
+/// The runs box with no run in it: what to do to start one, or why the runs
+/// cannot be listed, in place of the table.
+fn render_no_runs(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let text = match (&app.training.error, &app.project.target) {
+        (Some(error), _) => failed(error, theme),
+        (None, Some(target)) => vec![Line::from(format!(
+            "No runs yet: press t to start one on {target}."
+        ))],
+        (None, None) => vec![Line::from(
+            "No runs yet: add a [training] section to overbrainer.toml, then press t.",
+        )],
+    };
+    let block = runs_block(" runs ", theme);
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: true });
+    let inner_width = block.inner(area).width;
+    let rows = u16::try_from(paragraph.line_count(inner_width)).unwrap_or(u16::MAX);
+    let [list, _] = Layout::vertical([
+        Constraint::Length(rows.saturating_add(2)),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    frame.render_widget(paragraph.block(block), list);
+}
+
+/// The rounded, focused box of the runs, titled `title`.
+fn runs_block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border_focus)
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(title, theme.title))
+}
+
 fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
     let view = &app.training;
     let theme = &app.theme;
@@ -155,22 +188,15 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
     )
     .header(header)
     .row_highlight_style(theme.selected)
-    .block(
-        Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(theme.border_focus)
-            .padding(Padding::horizontal(1))
-            .title(Span::styled(
-                if view.error.is_some() && !view.runs.is_empty() {
-                    " runs (stale: cannot list the runs) "
-                } else {
-                    " runs "
-                },
-                theme.title,
-            )),
-    );
-    let mut state =
-        TableState::default().with_selected((!view.runs.is_empty()).then_some(view.selected));
+    .block(runs_block(
+        if view.error.is_some() {
+            " runs (stale: cannot list the runs) "
+        } else {
+            " runs "
+        },
+        theme,
+    ));
+    let mut state = TableState::default().with_selected(Some(view.selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -192,15 +218,13 @@ fn head_line(
     (activity, shown): (RunActivity, f64),
     theme: &Theme,
 ) -> Line<'static> {
-    let marker = if activity == RunActivity::Followed {
-        "● "
-    } else {
-        "  "
-    };
-    let mut head = vec![
-        Span::styled(marker, theme.title),
-        Span::styled(record.id.clone(), theme.title),
-    ];
+    // No stand-in for the marker: the ID of a run nothing follows starts in
+    // the column of the lines under it.
+    let mut head = Vec::new();
+    if activity == RunActivity::Followed {
+        head.push(Span::styled("● ", theme.title));
+    }
+    head.push(Span::styled(record.id.clone(), theme.title));
     let Some(now) = progress(series) else {
         return Line::from(head);
     };

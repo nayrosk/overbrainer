@@ -8,7 +8,7 @@ source: src/tui/snapshots.rs
 "│ 20260920-101500-9f00  succeeded  homelab                                     │"
 "│ 20260919-090000-c3d4  running    homelab                                     │"
 "╰──────────────────────────────────────────────────────────────────────────────╯"
-"    20260921-133200-a1b2                                                        "
+"  20260921-133200-a1b2                                                          "
 "  pod k3x9abc kept $0.53/h  up 41m (about $0.36)  kept, no time limit           "
 "  not followed: press a to attach                                               "
 "                                                                                "

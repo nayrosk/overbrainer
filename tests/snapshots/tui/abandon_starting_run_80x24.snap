@@ -8,7 +8,7 @@ source: src/tui/snapshots.rs
 "│ 20260920-101500-9f00  succeeded  homelab                                     │"
 "│ 20260919-090000-c3d4  running    homelab                                     │"
 "╰──────────────────────────────────────────────────────────────────────────────╯"
-"    ╭ Abandon a starting run? ─────────────────────────────────────────────╮    "
+"  20╭ Abandon a starting run? ─────────────────────────────────────────────╮    "
 "  … │                                                                      │    "
 "  po│  Run 20260921-133200-a1b2 is still starting, so it has no job to     │y   "
 "  20│  cancel yet. Abandon it instead? If its pod is still being           │    "

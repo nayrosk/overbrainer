@@ -3,10 +3,10 @@ source: src/tui/snapshots.rs
 ---
 " ⠿ overbrainer   1 Dataset  2 Pipeline  3 Training  4 Logs          rust_expert "
 "╭ runs ────────────────────────────────────────────────────────────────────────╮"
-"│ run                   state      target     pod                              │"
-"│                                                                              │"
+"│ No runs yet: press t to start one on gpu_cloud.                              │"
 "╰──────────────────────────────────────────────────────────────────────────────╯"
-"  No runs yet: press t to start one on gpu_cloud.                               "
+"                                                                                "
+"                                                                                "
 "                                                                                "
 "    ╭ Abandon a starting run? ─────────────────────────────────────────────╮    "
 "    │                                                                      │    "
