@@ -1,5 +1,6 @@
 //! Pieces drawn over or around the views.
 
+pub(super) mod bar;
 pub(super) mod dialog;
 pub(super) mod help;
 pub(super) mod menu;

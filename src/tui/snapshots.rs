@@ -720,6 +720,38 @@ fn pipeline_stopped_by_quitting() -> TestResult {
     Ok(())
 }
 
+/// Progress stays readable without color: bars are blocks, stages have glyphs.
+#[test]
+fn progress_shows_without_color() -> TestResult {
+    let mut app = app();
+    app.theme = Theme::mono();
+    app.view = View::Pipeline;
+    pipeline_running(&mut app);
+    let rows = text(&draw(&mut app, 80, 24)?);
+    let answers = rows
+        .iter()
+        .find(|row| row.contains("answers") && row.contains("120/400"))
+        .ok_or("no answers row")?;
+    assert!(answers.contains("███████▌ "), "{answers}");
+    assert!(
+        rows.iter().any(|row| row.starts_with("  ✓ subtopics")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("  · split       pending")),
+        "{rows:#?}"
+    );
+    let mut app = training_app()?;
+    app.theme = Theme::mono();
+    let rows = text(&draw(&mut app, 80, 24)?).join("\n");
+    assert!(
+        rows.contains("● 20260921-133200-a1b2  step 1200/4000 ████▊"),
+        "{rows}"
+    );
+    Ok(())
+}
+
 /// A failed `run` at the minimum size still shows its final error and its
 /// newest item failures: older failures give way first.
 #[test]

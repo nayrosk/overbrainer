@@ -17,14 +17,17 @@ use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, RunState};
 use crate::train::TrainMetric;
 use crate::tui::app::App;
-use crate::tui::format::duration;
+use crate::tui::format::{WORKING, duration};
 use crate::tui::theme::Theme;
 use crate::tui::training::{Ended, Follow, Job, RunRow, float, progress};
+use crate::tui::widgets::bar::bar;
 
 /// Rows the pod line may wrap to.
 const POD_ROWS: u16 = 2;
 /// Rows the messages under the chart may take.
 const MESSAGE_ROWS: u16 = 4;
+/// Cells of the selected run's step bar.
+const STEP_BAR: u16 = 16;
 
 /// Draws the Training view in `area`.
 pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
@@ -60,8 +63,13 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     };
     let pod_rows = pod.as_ref().map_or(0, |pod| rows(pod, POD_ROWS));
     let message_rows = rows(&messages, MESSAGE_ROWS);
-    let [status, pod_area, chart, lr, grad, notes] = Layout::vertical([
+    let state = task_state(follow);
+    let head = head_line(&row.record, series, state, theme);
+    let facts = facts_line(series, (follow, ended), state, theme);
+    let facts_rows = u16::from(!facts.spans.is_empty());
+    let [status, facts_area, pod_area, chart, lr, grad, notes] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(facts_rows),
         Constraint::Length(pod_rows),
         Constraint::Fill(1),
         Constraint::Length(1),
@@ -69,10 +77,8 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(message_rows),
     ])
     .areas(inner);
-    let mut line = status_line(&row.record, series, (follow, ended), theme);
-    line.spans
-        .insert(0, Span::styled(format!("{}  ", row.record.id), theme.title));
-    frame.render_widget(Paragraph::new(line), status);
+    frame.render_widget(Paragraph::new(head), status);
+    frame.render_widget(Paragraph::new(facts), facts_area);
     if let Some(pod) = pod {
         frame.render_widget(pod, pod_area);
     }
@@ -165,43 +171,71 @@ fn pod_summary(record: &PodRecord) -> String {
         .map_or_else(|| summary.clone(), str::to_string)
 }
 
-/// The run's step, epoch and, while its job runs, ETA; then whether a task
-/// follows or cancels it, and the points its forwarder skipped.
-fn status_line(
+/// What a task does to a run, in one word; empty when no task follows it.
+fn task_state(follow: Option<&Follow>) -> &'static str {
+    match follow {
+        Some(follow) if follow.job == Job::Cancel || follow.cancel_after => "cancelling",
+        Some(follow) if follow.starting() => "starting",
+        Some(_) => "followed",
+        None => "",
+    }
+}
+
+/// The selected run's first status line: `●` when a task follows it, its ID,
+/// its step with a bar and a percentage, and its ETA while its job runs.
+fn head_line(
     record: &RunRecord,
     series: &[TrainMetric],
-    (follow, ended): (Option<&Follow>, Option<&Ended>),
+    state: &str,
     theme: &Theme,
 ) -> Line<'static> {
-    let running = matches!(record.state, RunState::Preparing | RunState::Running);
-    let mut spans = Vec::new();
-    if let Some(now) = progress(series) {
-        let step = match now.max_steps {
-            Some(max) if max > 0 => format!(
-                "step {}/{max} ({}%)",
-                now.step,
-                now.step.saturating_mul(100) / max
-            ),
-            _ => format!("step {}", now.step),
-        };
-        spans.push(Span::raw(step));
-        if let Some(epoch) = now.epoch {
-            spans.push(Span::raw(format!("  epoch {epoch:.2}")));
-        }
-        if running {
-            spans.push(Span::raw(match now.eta {
-                Some(eta) => format!("  ETA {}", duration(eta)),
-                None => "  ETA unknown".to_string(),
-            }));
-        }
-    }
-    let state = match follow {
-        Some(follow) if follow.job == Job::Cancel || follow.cancel_after => "   cancelling",
-        Some(follow) if follow.starting() => "   starting",
-        Some(_) => "   followed",
-        None => "",
+    let marker = if state == "followed" { "● " } else { "  " };
+    let mut head = vec![
+        Span::styled(marker, theme.title),
+        Span::styled(record.id.clone(), theme.title),
+    ];
+    let Some(now) = progress(series) else {
+        return Line::from(head);
     };
-    spans.push(Span::styled(state, theme.ok));
+    match now.max_steps {
+        Some(max) if max > 0 => {
+            head.push(Span::raw(format!("  step {}/{max} ", now.step)));
+            let ratio = (float(now.step) / float(max)).min(1.0);
+            head.push(Span::styled(bar(ratio, STEP_BAR), theme.gauge));
+            head.push(Span::raw(format!(
+                " {}%",
+                now.step.saturating_mul(100) / max
+            )));
+        },
+        _ => head.push(Span::raw(format!("  step {}", now.step))),
+    }
+    if matches!(record.state, RunState::Preparing | RunState::Running) {
+        head.push(Span::raw(match now.eta {
+            Some(eta) => format!("  ETA {}", duration(eta)),
+            None => "  ETA unknown".to_string(),
+        }));
+    }
+    Line::from(head)
+}
+
+/// The selected run's second status line: its epoch, whether a task starts or
+/// cancels it, and the points its forwarder skipped; empty when there is none
+/// of them.
+fn facts_line(
+    series: &[TrainMetric],
+    (follow, ended): (Option<&Follow>, Option<&Ended>),
+    state: &str,
+    theme: &Theme,
+) -> Line<'static> {
+    let mut facts: Vec<Span<'static>> = Vec::new();
+    if let Some(epoch) = progress(series).and_then(|now| now.epoch) {
+        facts.push(Span::raw(format!("epoch {epoch:.2}")));
+    }
+    match state {
+        "starting" => facts.push(Span::styled(format!("{WORKING} starting"), theme.accent)),
+        "cancelling" => facts.push(Span::styled("cancelling", theme.accent)),
+        _ => {},
+    }
     let missing = match (follow, ended) {
         (Some(follow), _) => follow.skipped,
         (None, Some(ended)) if !ended.healed => ended.skipped,
@@ -213,12 +247,19 @@ fn status_line(
         } else {
             "(no local metrics file to read them from)"
         };
-        spans.push(Span::styled(
-            format!("   {missing} points missing {until}"),
+        facts.push(Span::styled(
+            format!("{missing} points missing {until}"),
             theme.warn,
         ));
     }
-    Line::from(spans)
+    let mut spaced = Vec::new();
+    for (index, span) in facts.into_iter().enumerate() {
+        if index > 0 {
+            spaced.push(Span::raw("  "));
+        }
+        spaced.push(span);
+    }
+    Line::from(spaced)
 }
 
 /// The pod line: its ID and state, rate, uptime and spend estimate, and what
