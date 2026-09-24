@@ -32,6 +32,19 @@ pub(super) fn duration(duration: std::time::Duration) -> String {
     }
 }
 
+/// `text` as it fits `width` characters: whole, or cut and ended by `…`;
+/// empty when `width` is 0.
+pub(super) fn cut(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let kept: String = text.chars().take(width - 1).collect();
+    format!("{kept}…")
+}
+
 /// `text` wrapped at `width` columns between words, its first line indented
 /// by `indent` spaces and the others by two more: a hanging indent. Spaces
 /// between words are kept; a word longer than a line stays whole.
@@ -66,6 +79,15 @@ mod tests {
         let time = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
         assert_eq!(clock(time), "14:13:20");
         assert_eq!(clock(UNIX_EPOCH), "00:00:00");
+    }
+
+    #[test]
+    fn a_cut_text_ends_with_an_ellipsis() {
+        assert_eq!(cut("rust_expert", 11), "rust_expert");
+        assert_eq!(cut("rust_expert", 20), "rust_expert");
+        assert_eq!(cut("rust_expert", 5), "rust…");
+        assert_eq!(cut("rust_expert", 1), "…");
+        assert_eq!(cut("rust_expert", 0), "");
     }
 
     #[test]
