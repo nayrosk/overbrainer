@@ -32,7 +32,7 @@ if [ "$#" -lt 1 ]; then
   echo "usage: $0 DEMO_PROJECT [TAPE...]" >&2
   exit 2
 fi
-demo_src="$(cd "$1" && pwd)"
+demo_src="$(cd "$1" && pwd -P)"
 shift
 
 assets="$(cd "$(dirname "$0")" && pwd)"
@@ -69,6 +69,11 @@ echo "building overbrainer" >&2
 binary="$cache/target/release/overbrainer"
 
 demo="$cache/demo"
+mkdir -p "$demo"
+if [ "$demo_src" = "$(cd "$demo" && pwd -P)" ]; then
+  echo "the demo project must not be $demo, which this script empties" >&2
+  exit 2
+fi
 rm -rf "$demo"
 mkdir -p "$demo"
 (
