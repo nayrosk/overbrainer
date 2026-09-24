@@ -5,7 +5,7 @@ source: src/tui/snapshots.rs
 "╭ data ────────────────────────────╮╭ topic ───────────────────────────────────╮"
 "│ ▶ ownership  2 sub, 5 q, 4 a     ││ ownership                                │"
 "│   traits  0 sub, 0 q, 0 a        ││ Moves, borrows and lifetimes in Rust     │"
-"│ ▶ old_topic (not configured)  1  ││ configured: 2 subtopics, 3 questions     │"
+"│ ▶ old_topic (not configured)     ││ configured: 2 subtopics, 3 questions     │"
 "│                                  ││ each                                     │"
 "│                                  ││ subtopics 2, questions 5, answers 4,     │"
 "│                                  ││ unanswered 1                             │"

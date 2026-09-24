@@ -8,7 +8,7 @@ source: src/tui/snapshots.rs
 "│   ▶ Lifetimes  1 q, 1 a          ││ its answers as orphaned                  │"
 "│   ▶ (missing subtopic)  1 q, 1 a ││ subtopics 1, questions 1, answers 1,     │"
 "│   traits  0 sub, 0 q, 0 a        ││ unanswered 0                             │"
-"│ ▼ old_topic (not configured)  1  ││                                          │"
+"│ ▼ old_topic (not configured)     ││                                          │"
 "│   ▶ Legacy  1 q, 1 a             ││                                          │"
 "│                                  ││                                          │"
 "│                                  ││                                          │"

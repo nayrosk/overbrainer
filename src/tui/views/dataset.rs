@@ -10,7 +10,14 @@ use crate::dataset::{AnswerText, Example, FinishReason, Id, ReasoningKind};
 use crate::pipeline::SplitClass;
 use crate::tui::app::App;
 use crate::tui::dataset::{Model, Node, Stats, exclusion, sizes};
+use crate::tui::format::WORKING;
 use crate::tui::theme::Theme;
+
+/// Columns of the tree's open or closed marker before a topic's label.
+const TOGGLE: u16 = 2;
+/// The first keys to know on a new project, in the order they are dropped
+/// from the end when they do not all fit.
+const FIRST_KEYS: [&str; 3] = ["r generates data", "t trains", "? all keys"];
 
 /// A rounded pane with a column of padding, its border drawn in `border`.
 fn pane<'a>(border: ratatui::style::Style) -> Block<'a> {
@@ -26,12 +33,15 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
     let onboarding = app.training.runs.is_empty();
-    let loading = app
-        .motion
-        .shows_load(app.load_at)
-        .then(|| format!("{} reading data/…", app.motion.spinner()));
+    let loading = app.motion.shows_load(app.load_at).then(|| {
+        // The static glyph already ends in an ellipsis: none after the path.
+        match app.motion.spinner() {
+            WORKING => format!("{WORKING} reading data/"),
+            spinner => format!("{spinner} reading data/…"),
+        }
+    });
     let view = &mut app.dataset;
-    let Some(model) = &view.model else {
+    let Some(model) = &mut view.model else {
         let text = match (view.error.clone(), loading) {
             (Some(error), _) => failed(&error, &theme),
             (None, Some(loading)) => vec![Line::from(Span::styled(loading, theme.dim))],
@@ -57,24 +67,35 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = pane(theme.border_focus)
         .title(Span::styled(title, theme.title))
         .title_bottom(Span::styled(bottom, theme.dim));
+    let inner = block.inner(left);
+    model.fit(usize::from(inner.width.saturating_sub(TOGGLE)));
     let data = &model.data;
     let nothing = data.subtopics.is_empty() && data.questions.is_empty() && data.answers.is_empty();
     match &model.items {
-        Ok(items) if items.is_empty() || (nothing && model.matches.is_none()) => {
-            let lines = if model.matches.is_some() {
-                vec![Line::from(Span::styled(
-                    "Nothing matches the filter: Esc clears it.",
-                    theme.dim,
-                ))]
-            } else {
-                empty(onboarding, &theme)
-            };
-            frame.render_widget(
-                Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
-                left,
-            );
-        },
         Ok(items) => match Tree::new(items) {
+            Ok(tree) if items.is_empty() || (nothing && model.matches.is_none()) => {
+                // The topics stay listed, their counts at zero, the selection
+                // on one of them; what fills them comes under them.
+                let lines = if model.matches.is_some() {
+                    vec![Line::from(Span::styled(
+                        "Nothing matches the filter: Esc clears it.",
+                        theme.dim,
+                    ))]
+                } else {
+                    empty(onboarding, inner.width, &theme)
+                };
+                let rows = u16::try_from(items.len()).unwrap_or(u16::MAX);
+                let [listed, _, text] = Layout::vertical([
+                    Constraint::Length(rows),
+                    Constraint::Length(u16::from(rows > 0)),
+                    Constraint::Fill(1),
+                ])
+                .areas(inner);
+                frame.render_widget(block, left);
+                let tree = tree.highlight_style(theme.selected);
+                frame.render_stateful_widget(tree, listed, &mut view.tree);
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
+            },
             Ok(tree) => {
                 let tree = tree.block(block).highlight_style(theme.selected);
                 frame.render_stateful_widget(tree, left, &mut view.tree);
@@ -95,19 +116,37 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// What an empty dataset says: which key fills it; with no run either, the
-/// first keys to know.
-fn empty(onboarding: bool, theme: &Theme) -> Vec<Line<'static>> {
+/// first keys to know, as many whole as fit `width` on one line.
+fn empty(onboarding: bool, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(
         "No data yet: press r to generate subtopics, questions and answers.",
     )];
     if onboarding {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "r generates data · t trains · ? all keys",
+            first_keys(usize::from(width)),
             theme.dim,
         )));
     }
     lines
+}
+
+/// The first keys to know, joined by ` · `: as many as fit `width` whole,
+/// in order.
+fn first_keys(width: usize) -> String {
+    let mut line = String::new();
+    for hint in FIRST_KEYS {
+        let joined = if line.is_empty() {
+            hint.to_string()
+        } else {
+            format!("{line} · {hint}")
+        };
+        if joined.chars().count() > width {
+            break;
+        }
+        line = joined;
+    }
+    line
 }
 
 /// What a failed read says: `✗`, the error, and the key that reads again.

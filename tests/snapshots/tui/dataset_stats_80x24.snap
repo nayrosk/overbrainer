@@ -5,7 +5,7 @@ source: src/tui/snapshots.rs
 "╭ data ────────────────────────────╮╭ stats: ownership ────────────────────────╮"
 "│ ▶ ownership  2 sub, 5 q, 4 a     ││ subtopics        2 / 2                   │"
 "│   traits  0 sub, 0 q, 0 a        ││ questions        5 / 6                   │"
-"│ ▶ old_topic (not configured)  1  ││ answers          4                       │"
+"│ ▶ old_topic (not configured)     ││ answers          4                       │"
 "│                                  ││ unanswered       1                       │"
 "│                                  ││ usable           3                       │"
 "│                                  ││ excluded         1 (truncated 1)         │"

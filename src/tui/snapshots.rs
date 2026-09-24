@@ -662,6 +662,39 @@ fn dataset_empty_on_a_new_project() -> TestResult {
         rows.contains("r generates data · t trains · ? all keys"),
         "{rows}"
     );
+    let rows = text(&draw(&mut app, 80, 24)?);
+    let listed = |y: usize, label: &str| rows.get(y).is_some_and(|row| row.contains(label));
+    assert!(listed(2, "ownership  0 sub, 0 q, 0 a"), "{rows:#?}");
+    assert!(listed(3, "traits  0 sub, 0 q, 0 a"), "{rows:#?}");
+    let keys = rows
+        .iter()
+        .find(|row| row.contains("r generates data"))
+        .ok_or("no first keys")?;
+    assert!(
+        keys.contains("r generates data · t trains ") && !keys.contains('?'),
+        "whole hints only: {keys}"
+    );
+    Ok(())
+}
+
+/// A topic's counts that do not fit whole are left out, never cut.
+#[test]
+fn a_topic_whose_counts_do_not_fit_shows_none() -> TestResult {
+    let mut app = dataset_app();
+    let rows = text(&draw(&mut app, 80, 24)?);
+    let old = rows
+        .iter()
+        .find(|row| row.contains("old_topic"))
+        .ok_or("no old_topic")?;
+    assert!(
+        old.starts_with("│ ▶ old_topic (not configured)     │"),
+        "{old}"
+    );
+    let rows = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(
+        rows.contains("old_topic (not configured)  1 sub, 1 q, 1 a"),
+        "{rows}"
+    );
     Ok(())
 }
 

@@ -617,7 +617,7 @@ mod tests {
         let shown = |app: &mut App| -> Result<bool, Box<dyn std::error::Error>> {
             Ok(text(&draw(app, 80, 24)?)
                 .join("\n")
-                .contains("reading data/…"))
+                .contains("reading data/"))
         };
         assert!(!shown(&mut app)?);
         app.on_frame(Duration::from_millis(80));
@@ -629,6 +629,8 @@ mod tests {
         let mut still = self::app();
         still.start();
         assert!(shown(&mut still)?, "at once when motion is off");
+        let rows = text(&draw(&mut still, 80, 24)?).join("\n");
+        assert!(rows.contains("… reading data/ "), "one ellipsis: {rows}");
         Ok(())
     }
 
