@@ -37,7 +37,7 @@ const GAPS_FROM: u16 = 28;
 
 /// Draws the Training view in `area`; returns the cell of the followed run's
 /// `●`, when it shows.
-pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option<Rect> {
+pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Option<Rect> {
     let view = &app.training;
     let theme = &app.theme;
     if view.runs.is_empty() {
@@ -70,7 +70,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option
     let activity = view.activity(&row.record.id);
     let shown = app
         .motion
-        .bar(Bar::Step, view.selected_ratio().unwrap_or(0.0));
+        .bar(Bar::Step, view.selected_ratio().unwrap_or(0.0), STEP_BAR);
     let head = head_line(&row.record, series, (activity, shown), theme);
     let facts = facts_line(
         series,

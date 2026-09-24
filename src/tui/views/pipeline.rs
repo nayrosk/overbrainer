@@ -18,7 +18,7 @@ use crate::tui::widgets::bar::bar;
 /// Draws the Pipeline view in `area`: no frame, a two-column margin, a title
 /// row that also heads the count columns, the stage rows, a blank row, then
 /// the details.
-pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
+pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let view = &app.pipeline;
     let area = area.inner(Margin::new(2, 0));
@@ -42,7 +42,10 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     let row_areas = Layout::vertical([Constraint::Length(1); 4]).split(rows);
     for (index, (stage, row_area)) in STAGES.iter().zip(row_areas.iter()).enumerate() {
         let row = view.row(*stage);
-        let shown = app.motion.bar(Bar::Stage(index), row.ratio());
+        let [_, _, bar_area, ..] = columns(*row_area);
+        let shown = app
+            .motion
+            .bar(Bar::Stage(index), row.ratio(), bar_area.width);
         let glyph = app.motion.spinner();
         render_row(frame, *row_area, (view, *stage), (glyph, shown), theme);
     }

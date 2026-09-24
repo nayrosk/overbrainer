@@ -25,6 +25,7 @@ use super::format::WORKING;
 use super::pipeline::{STAGES, StageState};
 use super::theme::{ColorLevel, LookEnv, Theme};
 use super::training::RunActivity;
+use super::widgets::bar::round_to;
 
 /// The frames of the spinner of running work.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -44,10 +45,11 @@ const VIEW_FADE: Duration = Duration::from_millis(160);
 const OVERLAY_FADE: Duration = Duration::from_millis(140);
 /// How long a new status message takes to fade in.
 const TOAST_FADE: Duration = Duration::from_millis(200);
-/// Half the pulse of the followed run: from bright to dim crimson.
+/// Half the pulse of the followed run: from bright to dim crimson. The pulse
+/// has no frame period of its own: it moves at the spinner's [`SPIN`], a step
+/// too small to see in a swing this slow, and a pulse beside a spinner then
+/// never wakes the loop at a second pace.
 const PULSE_HALF: Duration = Duration::from_millis(1200);
-/// The time between frames while only the pulse moves.
-pub(super) const PULSE: Duration = Duration::from_millis(100);
 
 /// What a color effect is for; one of each runs at most.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -154,6 +156,9 @@ pub(super) struct Motion {
     clock: Duration,
     /// What each bar on screen shows, easing toward its true value.
     bars: BTreeMap<Bar, f64>,
+    /// The cells of each bar on screen, at its last draw: what it shows moves
+    /// on screen only by an eighth of one.
+    cells: BTreeMap<Bar, u16>,
     /// The colors of the color effects; `None` when they are off (motion not
     /// `on`, or no 24-bit color).
     colors: Option<Colors>,
@@ -172,6 +177,7 @@ impl Motion {
             level,
             clock: Duration::ZERO,
             bars: BTreeMap::new(),
+            cells: BTreeMap::new(),
             colors: None,
             effects: BTreeMap::new(),
             pulse: None,
@@ -309,10 +315,18 @@ impl Motion {
         SPINNER[usize::try_from(frame).unwrap_or(0)]
     }
 
+    /// What bar `key`, drawn `cells` wide, shows when its true value is
+    /// `target`, as [`Motion::shown`] says; its cells are kept, for
+    /// [`App::on_frame`] to redraw it only when it moves on screen.
+    pub(super) fn bar(&mut self, key: Bar, target: f64, cells: u16) -> f64 {
+        self.cells.insert(key, cells);
+        self.shown(key, target)
+    }
+
     /// What bar `key` shows when its true value is `target`: that value when
     /// motion is off or the bar is new, never more than it, else the eased
     /// value.
-    pub(super) fn bar(&self, key: Bar, target: f64) -> f64 {
+    fn shown(&self, key: Bar, target: f64) -> f64 {
         if self.level == MotionLevel::Off {
             return target;
         }
@@ -324,37 +338,52 @@ impl Motion {
     /// Eases each bar of `targets` (a bar, its true value, and whether it
     /// lands on it at once: its stage ended) over `elapsed`. A new bar starts
     /// at its value, a bar whose value dropped lands on it; a bar no longer
-    /// shown is forgotten. Returns whether a bar moved.
+    /// shown is forgotten. Returns whether a bar moved on screen: by an
+    /// eighth of a cell once it was drawn, by any amount before.
     fn ease(&mut self, targets: &[(Bar, f64, bool)], elapsed: Duration) -> bool {
         let closed = 1.0 - (-elapsed.as_secs_f64() / TAU).exp();
         let mut moved = false;
         for (key, target, snap) in targets {
-            let shown = self.bars.entry(*key).or_insert(*target);
-            let next = if *snap || *target <= *shown {
+            let shown = *self.bars.entry(*key).or_insert(*target);
+            let next = if *snap || *target <= shown {
                 *target
             } else {
-                let eased = *shown + (*target - *shown) * closed;
+                let eased = shown + (*target - shown) * closed;
                 if *target - eased < SETTLED {
                     *target
                 } else {
                     eased
                 }
             };
-            moved |= (next - *shown).abs() > f64::EPSILON;
-            *shown = next;
+            moved |= self.apart(*key, shown, next);
+            self.bars.insert(*key, next);
         }
-        self.bars
-            .retain(|key, _| targets.iter().any(|(target, _, _)| target == key));
+        let shown = |key: &Bar| targets.iter().any(|(target, _, _)| target == key);
+        self.bars.retain(|key, _| shown(key));
+        self.cells.retain(|key, _| shown(key));
         moved
     }
 
-    /// Whether a bar of `targets` is still easing toward its value.
+    /// Whether bar `key` draws `one` and `other` apart: in eighths of a cell
+    /// once it was drawn, else as soon as they differ.
+    fn apart(&self, key: Bar, one: f64, other: f64) -> bool {
+        match self.cells.get(&key) {
+            Some(cells) => {
+                let eighths = u32::from(*cells) * 8;
+                let at = |value: f64| round_to(value.clamp(0.0, 1.0) * f64::from(eighths), eighths);
+                at(one) != at(other)
+            },
+            None => (one - other).abs() >= SETTLED,
+        }
+    }
+
+    /// Whether a bar of `targets` still shows short of its value.
     fn easing(&self, targets: &[(Bar, f64, bool)]) -> bool {
         self.level != MotionLevel::Off
             && targets.iter().any(|(key, target, _)| {
                 self.bars
                     .get(key)
-                    .is_some_and(|shown| target - shown >= SETTLED)
+                    .is_some_and(|shown| self.apart(*key, *shown, *target))
             })
     }
 
@@ -368,9 +397,9 @@ impl Motion {
 
 impl App {
     /// How long until the loop must draw the next frame, while something moves
-    /// on screen: [`FAST`] while a fade runs or a bar eases, [`SPIN`] while a
-    /// spinner shows, [`PULSE`] while the pulse does; `None` when nothing
-    /// moves, so an idle TUI never wakes up.
+    /// on screen: [`FAST`] while a fade runs or a bar of the view eases,
+    /// [`SPIN`] while a spinner or the pulse shows; `None` when nothing moves,
+    /// so an idle TUI never wakes up.
     pub(super) fn frame_period(&self) -> Option<Duration> {
         if self.motion.level() == MotionLevel::Off {
             return None;
@@ -378,10 +407,7 @@ impl App {
         if !self.motion.effects.is_empty() || self.motion.easing(&self.bar_targets()) {
             return Some(FAST);
         }
-        if !self.work().is_empty() {
-            return Some(SPIN);
-        }
-        self.pulse_shown().then_some(PULSE)
+        (!self.work().is_empty() || self.pulse_shown()).then_some(SPIN)
     }
 
     /// Whether the followed run's `●` pulses on screen: the Training view on a
@@ -412,11 +438,22 @@ impl App {
         });
     }
 
-    /// The true value of every smoothed bar, and whether it lands on it at
-    /// once: the stages started (a stage that ended lands), and the selected
-    /// run's steps.
+    /// The true value of every smoothed bar of the view shown, and whether
+    /// it lands on it at once: the stages started on the Pipeline view (a
+    /// stage that ended lands), the selected run's steps on the Training
+    /// view. A bar out of view is not eased: it shows its value once seen.
     fn bar_targets(&self) -> Vec<(Bar, f64, bool)> {
         let mut targets = Vec::new();
+        match self.view {
+            View::Pipeline => {},
+            View::Training => {
+                if let Some(ratio) = self.training.selected_ratio() {
+                    targets.push((Bar::Step, ratio, false));
+                }
+                return targets;
+            },
+            View::Dataset | View::Logs => return targets,
+        }
         for (index, stage) in STAGES.iter().enumerate() {
             let row = self.pipeline.row(*stage);
             let ended = match row.state {
@@ -425,9 +462,6 @@ impl App {
                 StageState::Idle | StageState::Pending => continue,
             };
             targets.push((Bar::Stage(index), row.ratio(), ended));
-        }
-        if let Some(ratio) = self.training.selected_ratio() {
-            targets.push((Bar::Step, ratio, false));
         }
         targets
     }
@@ -555,49 +589,40 @@ mod tests {
             "a new bar starts at its value"
         );
         assert!(
-            (motion.bar(Bar::Step, 0.6) - 0.2).abs() < 1e-9,
+            (motion.shown(Bar::Step, 0.6) - 0.2).abs() < 1e-9,
             "not eased yet"
         );
         assert!(motion.easing(&step(0.6, false)));
         assert!(motion.ease(&step(0.6, false), Duration::from_millis(250)));
         let one_tau = 0.2 + 0.4 * (1.0 - (-1.0_f64).exp());
-        assert!((motion.bar(Bar::Step, 0.6) - one_tau).abs() < 1e-9);
+        assert!((motion.shown(Bar::Step, 0.6) - one_tau).abs() < 1e-9);
         motion.ease(&step(0.6, false), Duration::from_secs(10));
         assert!(
-            (motion.bar(Bar::Step, 0.6) - 0.6).abs() < f64::EPSILON,
+            (motion.shown(Bar::Step, 0.6) - 0.6).abs() < f64::EPSILON,
             "landed"
         );
         assert!(!motion.easing(&step(0.6, false)));
         motion.ease(&step(0.1, false), Duration::from_millis(16));
         assert!(
-            (motion.bar(Bar::Step, 0.1) - 0.1).abs() < f64::EPSILON,
+            (motion.shown(Bar::Step, 0.1) - 0.1).abs() < f64::EPSILON,
             "a drop lands at once"
         );
         motion.ease(&step(0.9, true), Duration::from_millis(16));
         assert!(
-            (motion.bar(Bar::Step, 0.9) - 0.9).abs() < f64::EPSILON,
+            (motion.shown(Bar::Step, 0.9) - 0.9).abs() < f64::EPSILON,
             "an ended stage lands"
         );
         motion.ease(&[], Duration::from_millis(16));
         assert!(
-            (motion.bar(Bar::Step, 0.4) - 0.4).abs() < f64::EPSILON,
+            (motion.shown(Bar::Step, 0.4) - 0.4).abs() < f64::EPSILON,
             "forgotten: new again"
         );
         let off = Motion::new(MotionLevel::Off);
-        assert!((off.bar(Bar::Step, 0.7) - 0.7).abs() < f64::EPSILON);
+        assert!((off.shown(Bar::Step, 0.7) - 0.7).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn frames_come_fast_while_a_bar_eases() {
-        let mut app = app();
-        app.motion = Motion::new(MotionLevel::On);
-        pipeline_running(&mut app);
-        app.on_frame(Duration::ZERO);
-        assert_eq!(
-            app.frame_period(),
-            Some(SPIN),
-            "settled: the spinner's pace"
-        );
+    /// 80 more answers done: the answers bar has 200/400 to show.
+    fn answers_done(app: &mut App) {
         for n in 120..200 {
             app.pipeline.event(&crate::events::Event::ItemDone {
                 stage: crate::events::Stage::Answers,
@@ -605,9 +630,61 @@ mod tests {
                 usage: None,
             });
         }
+    }
+
+    #[test]
+    fn frames_come_fast_while_a_bar_eases() -> TestResult {
+        let mut app = app();
+        app.motion = Motion::new(MotionLevel::On);
+        pipeline_running(&mut app);
+        app.view = View::Pipeline;
+        app.on_frame(Duration::ZERO);
+        draw(&mut app, 80, 24)?;
+        assert_eq!(
+            app.frame_period(),
+            Some(SPIN),
+            "settled: the spinner's pace"
+        );
+        answers_done(&mut app);
         assert_eq!(app.frame_period(), Some(FAST), "easing to 200/400");
         app.on_frame(Duration::from_secs(10));
         assert_eq!(app.frame_period(), Some(SPIN));
+        Ok(())
+    }
+
+    #[test]
+    fn a_bar_out_of_view_never_speeds_the_frames_up() {
+        let mut app = app();
+        app.motion = Motion::new(MotionLevel::On);
+        pipeline_running(&mut app);
+        assert_eq!(app.view, View::Dataset);
+        app.on_frame(Duration::ZERO);
+        answers_done(&mut app);
+        app.on_frame(Duration::from_millis(1));
+        assert_eq!(app.frame_period(), Some(SPIN), "the spinner's pace only");
+        app.view = View::Pipeline;
+        app.on_frame(Duration::from_millis(1));
+        assert_eq!(app.frame_period(), Some(SPIN), "seen at its value");
+    }
+
+    #[test]
+    fn a_bar_redraws_only_when_it_moves_by_an_eighth_of_a_cell() -> TestResult {
+        let mut app = app();
+        app.motion = Motion::new(MotionLevel::On);
+        pipeline_running(&mut app);
+        app.view = View::Pipeline;
+        app.on_frame(Duration::ZERO);
+        draw(&mut app, 80, 24)?;
+        answers_done(&mut app);
+        app.dirty = false;
+        // 29 cells: an eighth of one is 1/232 of the bar, and 0.2 of it
+        // closes by far less in 10 µs.
+        app.on_frame(Duration::from_micros(10));
+        assert!(!app.dirty, "the same eighth on screen");
+        assert_eq!(app.frame_period(), Some(FAST), "still easing");
+        app.on_frame(Duration::from_millis(30));
+        assert!(app.dirty, "an eighth further");
+        Ok(())
     }
 
     #[test]
@@ -690,7 +767,12 @@ mod tests {
             .iter()
             .position(|row| row.contains("Everywhere"))
             .ok_or("no help")?;
-        let x = rows[y].chars().position(|c| c == 'E').ok_or("no E")?;
+        let x = rows
+            .get(y)
+            .ok_or("no row")?
+            .chars()
+            .position(|c| c == 'E')
+            .ok_or("no E")?;
         let (x, y) = (u16::try_from(x)?, u16::try_from(y)?);
         assert_eq!(cell(&draw(&mut app, 80, 24)?, x, y)?.fg, surface);
         app.on_frame(OVERLAY_FADE);
@@ -794,6 +876,41 @@ mod tests {
             settled(&draw(&mut on, 80, 24)?),
             settled(&draw(&mut off, 80, 24)?)
         );
+        Ok(())
+    }
+
+    /// Every fade changes colors only: halfway through, the symbols are those
+    /// motion off draws.
+    #[test]
+    fn a_fade_never_changes_a_symbol() -> TestResult {
+        let changes = |app: &mut App| -> TestResult {
+            draw(app, 80, 24)?;
+            app.on_input(&key(KeyCode::Char('2')));
+            app.say(Severity::Info, "deletion saved");
+            app.overlay = Some(Overlay::Help);
+            Ok(())
+        };
+        let mut on = moving(dataset_app());
+        changes(&mut on)?;
+        let mut off = dataset_app();
+        changes(&mut off)?;
+        let still = text(&draw(&mut off, 80, 24)?);
+        assert_eq!(text(&draw(&mut on, 80, 24)?), still, "as they start");
+        on.on_frame(OVERLAY_FADE / 2);
+        assert!(!on.motion.effects.is_empty(), "halfway");
+        assert_eq!(text(&draw(&mut on, 80, 24)?), still, "halfway");
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_wakes_the_loop_on_a_run_nothing_follows() -> TestResult {
+        let mut app = moving(training_app()?);
+        draw(&mut app, 80, 24)?;
+        assert_eq!(app.frame_period(), Some(SPIN), "the followed run pulses");
+        app.training.tasks.clear();
+        assert_eq!(app.view, View::Training);
+        assert!(app.motion.pulses());
+        assert_eq!(app.frame_period(), None, "no run followed: nothing moves");
         Ok(())
     }
 

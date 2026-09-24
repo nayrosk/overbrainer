@@ -412,15 +412,17 @@ where
     }
 
     /// When the next frame of motion is due: `period` after the last one (the
-    /// first one a period from now), while something moves and the editor
-    /// does not have the terminal; `None` otherwise, and the frames stop.
+    /// first one a period from now), and never before the next draw may come,
+    /// so each frame that changes the screen draws it; while something moves
+    /// and the editor does not have the terminal. `None` otherwise, and the
+    /// frames stop.
     fn next_frame(&mut self, period: Option<Duration>) -> Option<Instant> {
         let Some(period) = period.filter(|_| !self.suspended) else {
             self.frame_at = None;
             return None;
         };
-        let last = *self.frame_at.get_or_insert_with(Instant::now);
-        Some(last + period)
+        let due = *self.frame_at.get_or_insert_with(Instant::now) + period;
+        Some(self.last_draw.map_or(due, |at| due.max(at + FRAME)))
     }
 
     /// The time since the last frame of motion, which is now.
@@ -448,6 +450,13 @@ where
         // frame would then never be drawn.
         let due = self.last_draw.is_none_or(|at| Instant::now() >= at + FRAME);
         if app.dirty && !self.suspended && due {
+            // While frames run, the motion clock catches up with the time
+            // since the last one first: an effect this draw starts (a key
+            // opened a view or a dialog) starts now, not at that frame.
+            if self.frame_at.is_some() {
+                let elapsed = self.frame_elapsed();
+                app.on_frame(elapsed);
+            }
             let terminal = &mut *self.terminal;
             let drawn = panic::catch_unwind(AssertUnwindSafe(|| {
                 terminal.draw(|frame| ui::render(frame, app)).map(drop)
@@ -883,6 +892,46 @@ mod tests {
         looping.suspended = true;
         assert_eq!(looping.next_frame(Some(period)), None);
         assert_eq!(looping.frame_at, None, "the frames stop");
+        Ok(())
+    }
+
+    /// A frame never comes before the next draw may: each frame that changes
+    /// the screen draws it, rather than wake the loop once for the frame and
+    /// once more for the draw.
+    #[tokio::test]
+    async fn a_frame_comes_at_or_after_the_draw_it_needs() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::tui::motion::FAST;
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = looping(&mut terminal, dir.path());
+        let started = Instant::now();
+        looping.frame_at = Some(started);
+        looping.last_draw = Some(started + Duration::from_millis(5));
+        let frame = looping.next_frame(Some(FAST)).ok_or("no frame")?;
+        assert_eq!(frame, started + Duration::from_millis(5) + FRAME);
+        looping.last_draw = Some(started - FRAME);
+        let frame = looping.next_frame(Some(FAST)).ok_or("no frame")?;
+        assert_eq!(frame, started + FAST, "the draw is due already");
+        Ok(())
+    }
+
+    /// While frames run, a draw first brings the motion clock to now: an
+    /// effect a key starts begins when it was pressed, not at the last frame.
+    #[tokio::test]
+    async fn a_draw_brings_the_motion_clock_to_now() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::motion::{Motion, MotionLevel};
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = looping(&mut terminal, dir.path());
+        let mut app = app();
+        app.motion = Motion::new(MotionLevel::On);
+        let gap = Duration::from_millis(50);
+        looping.frame_at = Some(Instant::now().checked_sub(gap).ok_or("no instant")?);
+        app.dirty = true;
+        looping.draw(&mut app)?;
+        assert!(app.motion.clock() >= gap, "{:?}", app.motion.clock());
+        assert!(!app.dirty, "drawn");
         Ok(())
     }
 

@@ -36,7 +36,8 @@ pub(super) struct LookEnv {
     pub(super) term: Option<OsString>,
     /// `OVERBRAINER_TUI_MOTION`: `on`, `reduced` or `off`.
     pub(super) motion: Option<OsString>,
-    /// Whether `SSH_CONNECTION` or `SSH_TTY` is set: motion is reduced.
+    /// Whether `SSH_CONNECTION` or `SSH_TTY` is set and not empty: motion is
+    /// reduced.
     pub(super) ssh: bool,
 }
 
@@ -49,8 +50,10 @@ impl LookEnv {
             colorterm: std::env::var_os("COLORTERM"),
             term: std::env::var_os("TERM"),
             motion: std::env::var_os("OVERBRAINER_TUI_MOTION"),
-            ssh: std::env::var_os("SSH_CONNECTION").is_some()
-                || std::env::var_os("SSH_TTY").is_some(),
+            ssh: over_ssh(
+                std::env::var_os("SSH_CONNECTION").as_deref(),
+                std::env::var_os("SSH_TTY").as_deref(),
+            ),
         }
     }
 
@@ -76,6 +79,12 @@ impl LookEnv {
         }
         warnings
     }
+}
+
+/// Whether an `SSH_CONNECTION` of `connection` or an `SSH_TTY` of `tty`
+/// says the TUI runs over SSH: either set and not empty.
+fn over_ssh(connection: Option<&OsStr>, tty: Option<&OsStr>) -> bool {
+    filled(connection).is_some() || filled(tty).is_some()
 }
 
 /// `value` when it is set and not empty.
@@ -347,6 +356,17 @@ mod tests {
             }
         }
         env
+    }
+
+    #[test]
+    fn an_empty_ssh_variable_is_unset() {
+        let set = Some(OsStr::new("10.0.0.2 51234 10.0.0.1 22"));
+        let empty = Some(OsStr::new(""));
+        assert!(over_ssh(set, None));
+        assert!(over_ssh(None, Some(OsStr::new("/dev/pts/3"))));
+        assert!(!over_ssh(None, None));
+        assert!(!over_ssh(empty, empty), "empty is unset");
+        assert!(over_ssh(empty, Some(OsStr::new("/dev/pts/3"))));
     }
 
     #[test]
