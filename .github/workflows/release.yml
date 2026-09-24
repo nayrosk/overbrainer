@@ -1,8 +1,19 @@
 name: release
 
+# A signed `v<version>` tag pushed on main verifies the crate, builds the
+# binaries, publishes the crate to crates.io and creates the GitHub release with
+# the binaries attached. A manual run only verifies and builds, from any branch:
+# it never publishes.
+
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Verify and build only. A manual run never publishes; publishing needs a tag push.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -15,6 +26,11 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
+      - name: Refuse a manual run that asks to publish
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+        run: |
+          echo "::error::a manual run never publishes; push a signed v<version> tag instead"
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -25,6 +41,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check that the tag matches Cargo.toml and is on main
+        if: github.event_name == 'push'
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -41,6 +58,11 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --all-targets --locked
       - run: cargo publish --dry-run --locked
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: cargo-semver-checks@0.50.0
+      - name: Check the library API against the version on crates.io
+        run: cargo semver-checks check-release
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
       - name: Install the MSRV toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch; toolchain set below
@@ -49,8 +71,96 @@ jobs:
       - name: Check the MSRV
         run: cargo check --all-targets --locked
 
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch; toolchain set below
+        with:
+          toolchain: "stable"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl-tools
+        if: contains(matrix.target, 'musl')
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          musl-gcc --version
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Check that the binary is statically linked
+        if: contains(matrix.target, 'musl')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          bin="target/$TARGET/release/overbrainer"
+          description="$(file "$bin")"
+          echo "$description"
+          if ! printf '%s\n' "$description" | grep -Eq 'static-pie linked|statically linked'; then
+            echo "::error::$bin is not statically linked"
+            exit 1
+          fi
+          libraries="$(ldd "$bin" 2>&1 || true)"
+          echo "$libraries"
+          if printf '%s\n' "$libraries" | grep -q '=>'; then
+            echo "::error::$bin loads shared libraries"
+            exit 1
+          fi
+      - name: Run the binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: "\"target/$TARGET/release/overbrainer\" --version"
+      - name: Package the binary with its README and licenses
+        env:
+          TARGET: ${{ matrix.target }}
+          # macOS tar would add AppleDouble `._*` files without it.
+          COPYFILE_DISABLE: "1"
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            label="$GITHUB_REF_NAME"
+          else
+            label=dev
+          fi
+          name="overbrainer-$label-$TARGET"
+          mkdir -p staging dist
+          cp "target/$TARGET/release/overbrainer" README.md LICENSE-MIT LICENSE-APACHE staging/
+          tar -czf "dist/$name.tar.gz" -C staging overbrainer README.md LICENSE-MIT LICENSE-APACHE
+          cd dist
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+          cat "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: overbrainer-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
   publish:
-    needs: verify
+    needs: [verify, build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -74,6 +184,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: overbrainer-*
+          path: dist
+          merge-multiple: true
+      - name: Check the checksums of the binaries
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum -c ./*.sha256
       - name: Extract the CHANGELOG section of this version
         env:
           TAG: ${{ github.ref_name }}
@@ -88,8 +208,8 @@ jobs:
             echo "::error::CHANGELOG.md has no section for $version"
             exit 1
           fi
-      - name: Create the GitHub release
+      - name: Create the GitHub release with the binaries
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file release-notes.md --verify-tag
+        run: gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file release-notes.md --verify-tag dist/*

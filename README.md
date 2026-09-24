@@ -31,13 +31,40 @@ A generator model writes the subtopics and questions, and drops near-duplicates.
 
 ## Install
 
+### Download a binary
+
+Each [GitHub release](https://github.com/nayrosk/overbrainer/releases) has a binary for three targets:
+
+- `x86_64-unknown-linux-musl`: Linux on x86-64, statically linked
+- `aarch64-unknown-linux-musl`: Linux on ARM64, statically linked
+- `aarch64-apple-darwin`: macOS on Apple silicon
+
+Each archive holds `overbrainer`, the README and the licenses, next to a `.sha256` file. On Linux:
+
+```bash
+version=v0.1.1
+target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
+file="overbrainer-$version-$target.tar.gz"
+curl -LO "https://github.com/nayrosk/overbrainer/releases/download/$version/$file"
+curl -LO "https://github.com/nayrosk/overbrainer/releases/download/$version/$file.sha256"
+sha256sum -c "$file.sha256"
+tar xzf "$file" overbrainer
+sudo install overbrainer /usr/local/bin/
+```
+
+On macOS, set `target=aarch64-apple-darwin` and check the archive with `shasum -a 256 -c "$file.sha256"`.
+
+### Build with cargo
+
 ```bash
 cargo install --locked overbrainer
 ```
 
-The latest code from `main` installs with `cargo install --locked --git https://github.com/nayrosk/overbrainer`. There are no prebuilt binaries. You need:
+The latest code from `main` installs with `cargo install --locked --git https://github.com/nayrosk/overbrainer`.
 
-- Rust 1.89 or newer to build it. CI builds and tests on Linux.
+### Requirements
+
+- Rust 1.89 or newer to build it. CI builds and tests on Linux, and checks that it builds on macOS.
 - `ssh` for SSH targets, and `ssh` with `ssh-keygen` for Runpod targets.
 - For training on this machine: Axolotl 0.19 in a virtual environment or on `PATH`, or Docker or Podman with NVIDIA GPU access to run the Axolotl image.
 
@@ -125,10 +152,12 @@ The TUI draws its own crimson theme in 24-bit or 256 colors, and falls back to t
 
 Releases are cut by hand from `main`:
 
-1. Merging to `main` runs release-plz, which opens or updates a release pull request with the version bump and the `CHANGELOG.md` entry.
+1. Open a release pull request from a `chore/release-vX.Y.Z` branch. It bumps the version in `Cargo.toml` (cargo updates `Cargo.lock` on the next build) and regenerates the changelog with [git-cliff](https://git-cliff.org): `git cliff --tag vX.Y.Z -o CHANGELOG.md`. `cliff.toml` holds the changelog format.
 2. Review and merge that pull request.
-3. Tag the merge commit with a signed tag and push it: `git tag -s v0.2.0 -m v0.2.0 && git push origin v0.2.0`.
-4. The tag runs the checks, publishes the crate to crates.io and creates the GitHub release from the changelog entry.
+3. Tag the merge commit with a signed tag and push it: `git tag -s vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
+4. The tag runs `.github/workflows/release.yml`. It checks that the tag matches `Cargo.toml`, runs the checks and `cargo semver-checks`, builds the binaries, publishes the crate to crates.io and creates the GitHub release from the changelog entry with the binaries attached.
+
+To test the release build from a branch without publishing, run the release workflow by hand: a manual run verifies and builds, and never publishes.
 
 ## Terms of service
 
