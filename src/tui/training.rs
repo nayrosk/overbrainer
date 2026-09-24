@@ -287,6 +287,15 @@ impl TrainingView {
         self.runs.get(self.selected)
     }
 
+    /// The share of its steps the selected run did, when its metrics say how
+    /// many it has.
+    pub(super) fn selected_ratio(&self) -> Option<f64> {
+        let row = self.selected_run()?;
+        let now = progress(self.series.get(&row.record.id)?)?;
+        let max = now.max_steps.filter(|max| *max > 0)?;
+        Some((float(now.step) / float(max)).min(1.0))
+    }
+
     /// Whether `c` abandons the selected run rather than cancel it: it is a
     /// Runpod run still starting, which has no job to cancel yet.
     pub(super) fn selected_abandons(&self) -> bool {

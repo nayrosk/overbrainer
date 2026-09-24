@@ -10,9 +10,9 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::events::Stage;
 use crate::tui::app::App;
 use crate::tui::format::hang;
+use crate::tui::motion::Bar;
 use crate::tui::pipeline::{PipelineView, STAGES, StageState, command_name};
 use crate::tui::theme::Theme;
-use crate::tui::training::float;
 use crate::tui::widgets::bar::bar;
 
 /// Draws the Pipeline view in `area`: no frame, a two-column margin, a title
@@ -40,9 +40,11 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
         counts,
     );
     let row_areas = Layout::vertical([Constraint::Length(1); 4]).split(rows);
-    let spinner = app.motion.spinner();
-    for (stage, row_area) in STAGES.iter().zip(row_areas.iter()) {
-        render_row(frame, *row_area, (view, *stage, spinner), theme);
+    for (index, (stage, row_area)) in STAGES.iter().zip(row_areas.iter()).enumerate() {
+        let row = view.row(*stage);
+        let shown = app.motion.bar(Bar::Stage(index), row.ratio());
+        let glyph = app.motion.spinner();
+        render_row(frame, *row_area, (view, *stage), (glyph, shown), theme);
     }
     // The oldest item failures give way first, so the summary lines and the
     // final error stay in view on a small terminal.
@@ -70,23 +72,14 @@ fn columns(area: Rect) -> [Rect; 5] {
     .areas(area)
 }
 
-/// The share of a stage's items finished, 1 when it has none.
-pub(in crate::tui) fn ratio(finished: usize, total: usize) -> f64 {
-    let count = |n: usize| float(u64::try_from(n).unwrap_or(u64::MAX));
-    if total == 0 {
-        1.0
-    } else {
-        count(finished) / count(total)
-    }
-}
-
 /// One stage: `✓` done, `spinner` running, `·` pending, `✗` stopped; its
-/// name, its bar (the word `pending` or `stopped` in the empty part), its
-/// count and its request counters.
+/// name, its bar filled to `shown` (the word `pending` or `stopped` in the
+/// empty part), its count and its request counters.
 fn render_row(
     frame: &mut Frame,
     area: Rect,
-    (view, stage, spinner): (&PipelineView, Stage, &str),
+    (view, stage): (&PipelineView, Stage),
+    (spinner, shown): (&str, f64),
     theme: &Theme,
 ) {
     let [glyph_area, name_area, bar_area, label_area, counts_area] = columns(area);
@@ -112,7 +105,7 @@ fn render_row(
     ) {
         return;
     }
-    let filled = bar(ratio(row.finished, row.total), bar_area.width);
+    let filled = bar(shown, bar_area.width);
     let mut spans = vec![Span::styled(filled.trim_end().to_string(), theme.gauge)];
     if row.state == StageState::Stopped {
         let room = filled.chars().count() - filled.trim_end().chars().count();

@@ -18,6 +18,7 @@ use crate::runs::{RunRecord, RunState};
 use crate::train::TrainMetric;
 use crate::tui::app::App;
 use crate::tui::format::duration;
+use crate::tui::motion::Bar;
 use crate::tui::theme::Theme;
 use crate::tui::training::{Ended, Follow, Job, RunRow, float, progress};
 use crate::tui::views::dataset::failed;
@@ -70,7 +71,10 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     let pod_rows = pod.as_ref().map_or(0, |pod| rows(pod, POD_ROWS));
     let message_rows = rows(&messages, MESSAGE_ROWS);
     let state = task_state(follow);
-    let head = head_line(&row.record, series, state, theme);
+    let shown = app
+        .motion
+        .bar(Bar::Step, view.selected_ratio().unwrap_or(0.0));
+    let head = head_line(&row.record, series, (state, shown), theme);
     let facts = facts_line(
         series,
         (follow, ended),
@@ -196,11 +200,12 @@ fn task_state(follow: Option<&Follow>) -> &'static str {
 }
 
 /// The selected run's first status line: `●` when a task follows it, its ID,
-/// its step with a bar and a percentage, and its ETA while its job runs.
+/// its step with a bar filled to `shown` and a percentage, and its ETA while
+/// its job runs.
 fn head_line(
     record: &RunRecord,
     series: &[TrainMetric],
-    state: &str,
+    (state, shown): (&str, f64),
     theme: &Theme,
 ) -> Line<'static> {
     let marker = if state == "followed" { "● " } else { "  " };
@@ -214,8 +219,7 @@ fn head_line(
     match now.max_steps {
         Some(max) if max > 0 => {
             head.push(Span::raw(format!("  step {}/{max} ", now.step)));
-            let ratio = (float(now.step) / float(max)).min(1.0);
-            head.push(Span::styled(bar(ratio, STEP_BAR), theme.gauge));
+            head.push(Span::styled(bar(shown, STEP_BAR), theme.gauge));
             head.push(Span::raw(format!(
                 " {}%",
                 now.step.saturating_mul(100) / max
