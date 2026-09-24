@@ -116,6 +116,19 @@ fn unknown_env_variable_with_prefix_is_rejected() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn the_tui_variables_are_not_configuration_keys() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(BASE)?;
+    load(
+        dir.path(),
+        env(&[
+            ("OVERBRAINER_TUI_COLOR", "256"),
+            ("OVERBRAINER_TUI_MOTION", "off"),
+        ]),
+    )?;
+    Ok(())
+}
+
+#[test]
 fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     match load(dir.path(), env(&[])) {
@@ -125,6 +138,30 @@ fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
         },
         other => Err(format!("expected Read, got {other:?}").into()),
     }
+}
+
+/// The message with its chain of causes, as `{:#}` prints it at the top level.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        text = format!("{text}: {next}");
+        cause = next.source();
+    }
+    text
+}
+
+#[test]
+fn a_read_error_names_its_cause_once() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let Err(error) = load(dir.path(), env(&[])) else {
+        return Err("expected an error".into());
+    };
+    for text in [error.to_string(), chain(&error)] {
+        assert!(text.starts_with("cannot read "), "{text}");
+        assert_eq!(text.matches("(os error 2)").count(), 1, "{text}");
+    }
+    Ok(())
 }
 
 const TARGETS: &str = r#"

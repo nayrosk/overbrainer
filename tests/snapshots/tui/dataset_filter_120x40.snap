@@ -1,13 +1,13 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" 1 Dataset   2 Pipeline   3 Training   4 Logs                                                               rust_expert "
-"┌ data: 4 matches ───────────────────────────────────┐┌ topic ─────────────────────────────────────────────────────────┐"
-"│▼ ownership  2 sub, 5 q, 4 a                        ││ownership                                                       │"
-"│  ▼ Borrowing  3 q, 2 a                             ││Moves, borrows and lifetimes in Rust                            │"
-"│    ▶ [a] What happens to a borrow when the owner is││configured: 2 subtopics, 3 questions each                       │"
-"│    ▶ [x] Why can't a &mut and a & borrow coexist?  ││subtopics 2, questions 5, answers 4, unanswered 1               │"
-"│      [ ] When does NLL end a borrow?               ││                                                                │"
+" ⠿ overbrainer   1 Dataset  2 Pipeline  3 Training  4 Logs                                                  rust_expert "
+"╭ data: 4 matches ───────────────────────────────────╮╭ topic ─────────────────────────────────────────────────────────╮"
+"│ ▼ ownership  2 sub, 5 q, 4 a                       ││ ownership                                                      │"
+"│   ▼ Borrowing  3 q, 2 a                            ││ Moves, borrows and lifetimes in Rust                           │"
+"│     ▶ [a] What happens to a borrow when the owner  ││ configured: 2 subtopics, 3 questions each                      │"
+"│     ▶ [x] Why can't a &mut and a & borrow coexist? ││ subtopics 2, questions 5, answers 4, unanswered 1              │"
+"│       [ ] When does NLL end a borrow?              ││                                                                │"
 "│                                                    ││                                                                │"
 "│                                                    ││                                                                │"
 "│                                                    ││                                                                │"
@@ -39,5 +39,5 @@ source: src/tui/snapshots.rs
 "│                                                    ││                                                                │"
 "│                                                    ││                                                                │"
 "│                                                    ││                                                                │"
-"└ filter: BORROW (Esc clears) ───────────────────────┘└─────────────────────────────────────────────────────────── 4/4 ┘"
-"                                                                                                                  ? help"
+"╰ filter: BORROW (Esc clears) ───────────────────────╯╰─────────────────────────────────────────────────────────── 4/4 ╯"
+" j/k move · l open · / filter · s stats · e edit · d delete                                                      ? help "

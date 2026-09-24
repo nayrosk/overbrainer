@@ -9,7 +9,8 @@
 //!
 //! A start (`t`) holds the data lock until its job started. Quitting while a
 //! Runpod run still provisions offers to abandon it instead of waiting: its pod
-//! is deleted and the run fails, as Ctrl-C does on the command line.
+//! is deleted and the run fails, as Ctrl-C does on the command line. `c` on such
+//! a run offers the same for that run alone, and the TUI stays open.
 //!
 //! Files are read by tasks, never on the loop's thread nor while drawing.
 
@@ -20,13 +21,18 @@ use crossterm::event::KeyCode;
 use super::app::{Action, App, Confirm, Effect, Exit, NoteOf, Overlay, Severity, View};
 use super::start::{self, Prices, StartPlan};
 use super::tasks::{Msg, Task, TaskId, TrainJob};
-use super::training::{Detach, Ended, Follow, Job, Listing};
+use super::training::{Detach, Ended, Follow, Job, Listing, RunActivity};
 use crate::cli::front::Report;
 use crate::events::Event;
 use crate::train::TrainMetric;
 
 /// Time between two reads of `runs/` while the Training view is shown.
 const REFRESH: Duration = Duration::from_secs(2);
+
+/// What abandoning a Runpod start does, for the dialogs that offer it.
+const ABANDONED: &str = "If its pod is still being prepared, it is deleted and the run fails, \
+                         as Ctrl-C does on the command line; once its job is being sent, the \
+                         run is detached instead.";
 
 impl App {
     /// Reads `runs/` again, in a task; while one reads, once more after it.
@@ -285,7 +291,8 @@ impl App {
         vec![Effect::Spawn(id, Task::Train(task))]
     }
 
-    /// `c`: asks to cancel the selected run's job; refused after a signal.
+    /// `c`: asks to cancel the selected run's job, or to abandon it while it is
+    /// a Runpod start still starting; refused after a signal.
     fn ask_cancel(&mut self) {
         let Some(row) = self.training.selected_run() else {
             return;
@@ -297,6 +304,31 @@ impl App {
         }
         if self.leaving == Some(Exit::Signal) {
             self.say(Severity::Warn, "refused: interrupted, exiting");
+            return;
+        }
+        let activity = self.training.activity(&id);
+        let starting = self
+            .training
+            .task_of(&id)
+            .filter(|_| activity.abandons())
+            .map(|(task, _)| (task, matches!(activity, RunActivity::Abandoning { .. })));
+        if let Some((task, abandoned)) = starting {
+            // A Runpod start has no job to cancel yet: it is abandoned instead.
+            if abandoned {
+                self.say(Severity::Info, format!("run {id} is being abandoned"));
+                return;
+            }
+            let text = format!(
+                "Run {id} is still starting, so it has no job to cancel yet. Abandon it \
+                 instead? {ABANDONED}"
+            );
+            self.overlay = Some(Overlay::Confirm(Confirm {
+                title: " Abandon a starting run? ".to_string(),
+                text: vec![text],
+                yes: "abandon",
+                no: "keep it",
+                action: Action::AbandonStart(task),
+            }));
             return;
         }
         self.overlay = Some(Overlay::Confirm(Confirm {
@@ -587,9 +619,7 @@ impl App {
         let runs: Vec<&str> = starting.iter().map(|(_, run)| run.as_str()).collect();
         let text = format!(
             "Quitting waits until the job of {} has started, which can take minutes. Abandon \
-             it instead? If its pod is still being prepared, it is deleted and the run fails, \
-             as Ctrl-C does on the command line; once its job is being sent, the run is \
-             detached instead.",
+             it instead? {ABANDONED}",
             runs.join(", ")
         );
         self.overlay = Some(Overlay::Confirm(Confirm {
@@ -618,6 +648,33 @@ impl App {
             }
         }
         effects
+    }
+
+    /// Abandons start task `id`, once confirmed after `c`, as [`App::abandon`]
+    /// does, and says so, quitting or not. Its job may have started since the
+    /// dialog opened: it is then not abandoned, and the status line says how
+    /// to cancel it, since its pod keeps billing.
+    pub(super) fn abandon_start(&mut self, id: TaskId) -> Vec<Effect> {
+        let Some(follow) = self.training.tasks.get(&id) else {
+            return Vec::new();
+        };
+        let run = follow.run();
+        if !follow.starting() {
+            self.say(
+                Severity::Warn,
+                format!(
+                    "{run}: its job started, so it was not abandoned and its pod keeps billing; \
+                     press c to cancel it"
+                ),
+            );
+            return Vec::new();
+        }
+        if follow.detach == Detach::Done {
+            self.say(Severity::Info, format!("{run} is being abandoned"));
+            return Vec::new();
+        }
+        self.say(Severity::Info, format!("abandoning {run}"));
+        self.abandon(&[id])
     }
 
     /// On a process signal: every task that follows a run is abandoned at once,

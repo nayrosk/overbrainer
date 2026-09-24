@@ -2,53 +2,59 @@
 //! summary lines of the current or last pipeline task.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, LineGauge, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::events::Stage;
 use crate::tui::app::App;
+use crate::tui::format::hang;
+use crate::tui::motion::Bar;
 use crate::tui::pipeline::{PipelineView, STAGES, StageState, command_name};
 use crate::tui::theme::Theme;
+use crate::tui::widgets::bar::bar;
 
-/// Draws the Pipeline view in `area`.
-pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
+/// Draws the Pipeline view in `area`: no frame, a two-column margin, a title
+/// row that also heads the count columns, the stage rows, a blank row, then
+/// the details.
+pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let view = &app.pipeline;
-    let title = match (view.command, view.running) {
-        (Some(command), true) => format!(" pipeline: {} running ", command_name(command)),
-        (Some(command), false) => format!(" pipeline: last run {} ", command_name(command)),
-        (None, _) => " pipeline ".to_string(),
-    };
-    let block = Block::bordered()
-        .title(Span::styled(title, theme.title))
-        .border_style(theme.dim);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let [header, rows, rest] = Layout::vertical([
+    let area = area.inner(Margin::new(2, 0));
+    let [title_row, rows, _, rest] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(4),
+        Constraint::Length(1),
         Constraint::Fill(1),
     ])
-    .areas(inner);
-    let [name, state, progress, counts] = columns(header);
-    for (text, column) in [
-        (" stage", name),
-        ("state", state),
-        ("progress", progress),
-        ("in flight  retries  failed", counts),
-    ] {
-        frame.render_widget(Paragraph::new(Span::styled(text, theme.dim)), column);
-    }
+    .areas(area);
+    let title = match view.command {
+        Some(command) => format!("Pipeline · {}", command_name(command)),
+        None => "Pipeline".to_string(),
+    };
+    frame.render_widget(Paragraph::new(Span::styled(title, theme.title)), title_row);
+    let [.., counts] = columns(title_row);
+    frame.render_widget(
+        Paragraph::new(Span::styled(" in flight  retries  failed", theme.dim)),
+        counts,
+    );
     let row_areas = Layout::vertical([Constraint::Length(1); 4]).split(rows);
-    for (stage, row_area) in STAGES.iter().zip(row_areas.iter()) {
-        render_row(frame, *row_area, view, *stage, theme);
+    for (index, (stage, row_area)) in STAGES.iter().zip(row_areas.iter()).enumerate() {
+        let row = view.row(*stage);
+        let [_, _, bar_area, ..] = columns(*row_area);
+        let shown = app
+            .motion
+            .bar(Bar::Stage(index), row.ratio(), bar_area.width);
+        let glyph = app.motion.spinner();
+        render_row(frame, *row_area, (view, *stage), (glyph, shown), theme);
     }
     // The oldest item failures give way first, so the summary lines and the
     // final error stay in view on a small terminal.
     let mut errors = view.errors.len();
     let paragraph = loop {
-        let paragraph = Paragraph::new(details(view, theme, errors)).wrap(Wrap { trim: false });
+        let lines = details(view, theme, errors, rest.width);
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         if errors == 0 || paragraph.line_count(rest.width) <= usize::from(rest.height) {
             break paragraph;
         }
@@ -57,63 +63,82 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, rest);
 }
 
-/// The stage, state, progress and counts columns of a row.
-fn columns(area: Rect) -> [Rect; 4] {
+/// The glyph, name, bar, count and counts columns of a row.
+fn columns(area: Rect) -> [Rect; 5] {
     Layout::horizontal([
+        Constraint::Length(2),
         Constraint::Length(12),
-        Constraint::Length(10),
         Constraint::Fill(1),
+        Constraint::Length(10),
         Constraint::Length(27),
     ])
     .areas(area)
 }
 
-fn render_row(frame: &mut Frame, area: Rect, view: &PipelineView, stage: Stage, theme: &Theme) {
-    let [name_area, state_area, gauge_area, counts_area] = columns(area);
+/// One stage: `✓` done, `spinner` running, `·` pending, `✗` stopped; its
+/// name, its bar filled to `shown` (the word `pending` or `stopped` in the
+/// empty part), its count and its request counters.
+fn render_row(
+    frame: &mut Frame,
+    area: Rect,
+    (view, stage): (&PipelineView, Stage),
+    (spinner, shown): (&str, f64),
+    theme: &Theme,
+) {
+    let [glyph_area, name_area, bar_area, label_area, counts_area] = columns(area);
     let row = view.row(stage);
-    frame.render_widget(Paragraph::new(format!(" {stage}")), name_area);
-    let (label, style) = match row.state {
-        StageState::Idle => ("", theme.dim),
-        StageState::Pending => ("pending", theme.dim),
-        StageState::Running => ("running", theme.warn),
-        StageState::Done => ("done", theme.ok),
-        StageState::Stopped => ("stopped", theme.error),
+    let (glyph, glyph_style, name_style) = match row.state {
+        StageState::Idle => (" ", theme.dim, Style::new()),
+        StageState::Pending => ("·", theme.dim, theme.dim),
+        StageState::Running => (spinner, theme.accent, theme.accent),
+        StageState::Done => ("✓", theme.ok, Style::new()),
+        StageState::Stopped => ("✗", theme.error, Style::new()),
     };
-    frame.render_widget(Paragraph::new(Span::styled(label, style)), state_area);
-    if matches!(
+    frame.render_widget(Paragraph::new(Span::styled(glyph, glyph_style)), glyph_area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(stage.to_string(), name_style)),
+        name_area,
+    );
+    if row.state == StageState::Pending {
+        frame.render_widget(Paragraph::new(Span::styled("pending", theme.dim)), bar_area);
+    }
+    if !matches!(
         row.state,
         StageState::Running | StageState::Done | StageState::Stopped
     ) {
-        let ratio = if row.total == 0 {
-            1.0
-        } else {
-            f64::from(u32::try_from(row.finished).unwrap_or(u32::MAX))
-                / f64::from(u32::try_from(row.total).unwrap_or(u32::MAX))
-        };
-        let gauge_widget = LineGauge::default()
-            .ratio(ratio)
-            .label(format!("{}/{}", row.finished, row.total))
-            .filled_style(theme.gauge)
-            .unfilled_style(theme.dim);
-        frame.render_widget(gauge_widget, gauge_area);
-        frame.render_widget(
-            Paragraph::new(format!(
-                " {:>9}  {:>7}  {:>6}",
-                view.in_flight(stage),
-                row.retries,
-                row.failed
-            )),
-            counts_area,
-        );
+        return;
     }
+    let filled = bar(shown, bar_area.width);
+    let mut spans = vec![Span::styled(filled.trim_end().to_string(), theme.gauge)];
+    if row.state == StageState::Stopped {
+        let room = filled.chars().count() - filled.trim_end().chars().count();
+        if room > " stopped".len() {
+            spans.push(Span::styled(" stopped", theme.error));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), bar_area);
+    frame.render_widget(
+        Paragraph::new(format!("{}/{}", row.finished, row.total)).right_aligned(),
+        label_area,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {:>9}  {:>7}  {:>6}",
+            view.in_flight(stage),
+            row.retries,
+            row.failed
+        )),
+        counts_area,
+    );
 }
 
-/// The lines under the stage rows, with the newest `errors` item failures.
-fn details(view: &PipelineView, theme: &Theme, errors: usize) -> Vec<Line<'static>> {
+/// The lines under the stage rows, with the newest `errors` item failures,
+/// wrapped at `width` with a hanging indent.
+fn details(view: &PipelineView, theme: &Theme, errors: usize, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if view.command.is_none() {
         lines.push(Line::from(Span::styled(
-            " nothing ran yet in this TUI: r runs a stage",
+            "Nothing ran yet in this TUI: press r to run a stage.",
             theme.dim,
         )));
         return lines;
@@ -135,38 +160,46 @@ fn details(view: &PipelineView, theme: &Theme, errors: usize) -> Vec<Line<'stati
             |cost| format!("cost ${cost:.4}"),
         );
     lines.push(Line::from(format!(
-        " tokens  in {}  out {}        {cost}",
+        "tokens  in {}  out {}        {cost}",
         usage.input_tokens, usage.output_tokens
     )));
     if view.skipped > 0 {
         lines.push(Line::from(Span::styled(
             format!(
-                " {} events skipped: counts catch up when each stage finishes",
+                "{} events skipped: counts catch up when each stage finishes",
                 view.skipped
             ),
             theme.warn,
         )));
     }
     if errors > 0 {
-        lines.push(Line::from(Span::styled(" last errors", theme.title)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Last errors", theme.title)));
         let older = view.errors.len().saturating_sub(errors);
         for failure in view.errors.iter().skip(older) {
-            lines.push(Line::from(format!(
-                "   {} {}  {}",
+            let text = format!(
+                "{} {}  {}",
                 failure.stage,
                 short(&failure.id),
                 failure.error
-            )));
+            );
+            lines.extend(hang(&text, width, 2).into_iter().map(Line::from));
         }
     }
     if !view.results.is_empty() || view.outcome.is_some() {
-        lines.push(Line::from(Span::styled(" results", theme.title)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Results", theme.title)));
     }
     for result in &view.results {
-        lines.push(Line::from(format!("   {result}")));
+        lines.extend(hang(result, width, 2).into_iter().map(Line::from));
     }
     if let Some(Err(error)) = &view.outcome {
-        lines.push(Line::from(Span::styled(format!("   {error}"), theme.error)));
+        let wrapped = hang(&format!("✗ {error}"), width, 2);
+        lines.extend(
+            wrapped
+                .into_iter()
+                .map(|line| Line::from(Span::styled(line, theme.error))),
+        );
     }
     lines
 }

@@ -64,6 +64,16 @@ impl Row {
             stats: None,
         }
     }
+
+    /// The share of its items finished, 1 when it has none.
+    pub(super) fn ratio(&self) -> f64 {
+        let count = |n: usize| super::training::float(u64::try_from(n).unwrap_or(u64::MAX));
+        if self.total == 0 {
+            1.0
+        } else {
+            count(self.finished) / count(self.total)
+        }
+    }
 }
 
 /// A recent item failure.

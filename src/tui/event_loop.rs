@@ -1,6 +1,7 @@
 //! The event loop: one task selecting over terminal input, background tasks and
-//! their messages, process signals and a clock tick, drawing the app when it
-//! changed. It owns the terminal and runs the effects the app asks for.
+//! their messages, process signals, a clock tick and, while something moves on
+//! screen, the frames of motion, drawing the app when it changed. It owns the
+//! terminal and runs the effects the app asks for.
 
 use std::any::Any;
 use std::io::{self, Write};
@@ -109,6 +110,8 @@ enum Wake {
     Signal,
     Tick,
     Draw,
+    /// A frame of motion is due.
+    Frame,
 }
 
 struct Loop<'t, B: Backend> {
@@ -133,6 +136,9 @@ struct Loop<'t, B: Backend> {
     /// The editor running, if any.
     editor: Option<Child>,
     last_draw: Option<Instant>,
+    /// When the last frame of motion was, while something moves on screen;
+    /// `None` while nothing does.
+    frame_at: Option<Instant>,
     /// Effects the loop could not run before it ended, for [`Loop::settle`].
     pending: Vec<Effect>,
 }
@@ -166,6 +172,7 @@ where
             suspended: false,
             editor: None,
             last_draw: None,
+            frame_at: None,
             pending: Vec::new(),
         }
     }
@@ -188,6 +195,11 @@ where
                 Wake::Signal => app.on_signal(),
                 Wake::Tick => app.on_tick(SystemTime::now()),
                 Wake::Draw => Vec::new(),
+                Wake::Frame => {
+                    let elapsed = self.frame_elapsed();
+                    app.on_frame(elapsed);
+                    Vec::new()
+                },
             };
             if let Err(error) = self.draw(app) {
                 self.pending = effects;
@@ -378,6 +390,7 @@ where
     async fn wait(&mut self, app: &App) -> Wake {
         let next_draw = self.next_draw();
         let draw = app.dirty && !self.suspended;
+        let frame = self.next_frame(app.frame_period());
         let signals = self.signals.as_mut();
         let interrupt = !self.suspended;
         tokio::select! {
@@ -392,7 +405,34 @@ where
             () = Signals::recv(signals, interrupt) => Wake::Signal,
             _ = self.tick.tick() => Wake::Tick,
             () = tokio::time::sleep_until(next_draw), if draw => Wake::Draw,
+            () = tokio::time::sleep_until(frame.unwrap_or(next_draw)), if frame.is_some() => {
+                Wake::Frame
+            },
         }
+    }
+
+    /// When the next frame of motion is due: `period` after the last one (the
+    /// first one a period from now), and never before the next draw may come,
+    /// so each frame that changes the screen draws it; while something moves
+    /// and the editor does not have the terminal. `None` otherwise, and the
+    /// frames stop.
+    fn next_frame(&mut self, period: Option<Duration>) -> Option<Instant> {
+        let Some(period) = period.filter(|_| !self.suspended) else {
+            self.frame_at = None;
+            return None;
+        };
+        let due = *self.frame_at.get_or_insert_with(Instant::now) + period;
+        Some(self.last_draw.map_or(due, |at| due.max(at + FRAME)))
+    }
+
+    /// The time since the last frame of motion, which is now.
+    fn frame_elapsed(&mut self) -> Duration {
+        let now = Instant::now();
+        let elapsed = self
+            .frame_at
+            .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
+        self.frame_at = Some(now);
+        elapsed
     }
 
     fn next_draw(&self) -> Instant {
@@ -410,6 +450,13 @@ where
         // frame would then never be drawn.
         let due = self.last_draw.is_none_or(|at| Instant::now() >= at + FRAME);
         if app.dirty && !self.suspended && due {
+            // While frames run, the motion clock catches up with the time
+            // since the last one first: an effect this draw starts (a key
+            // opened a view or a dialog) starts now, not at that frame.
+            if self.frame_at.is_some() {
+                let elapsed = self.frame_elapsed();
+                app.on_frame(elapsed);
+            }
             let terminal = &mut *self.terminal;
             let drawn = panic::catch_unwind(AssertUnwindSafe(|| {
                 terminal.draw(|frame| ui::render(frame, app)).map(drop)
@@ -823,6 +870,95 @@ mod tests {
             app.training.tasks.len(),
             app.status.as_ref().map(|status| status.text.clone()),
         )
+    }
+
+    /// Frames of motion come only while something moves: the first one a
+    /// period from now, then one period after the last; none once nothing
+    /// moves or the editor has the terminal.
+    #[tokio::test]
+    async fn frames_come_only_while_something_moves() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = looping(&mut terminal, dir.path());
+        assert_eq!(looping.next_frame(None), None);
+        assert_eq!(looping.frame_at, None);
+        let period = Duration::from_millis(80);
+        let first = looping.next_frame(Some(period)).ok_or("no frame")?;
+        let started = looping.frame_at.ok_or("no start")?;
+        assert_eq!(first, started + period);
+        assert_eq!(looping.next_frame(Some(period)), Some(first), "not moved");
+        let elapsed = looping.frame_elapsed();
+        assert_eq!(looping.frame_at, Some(started + elapsed));
+        looping.suspended = true;
+        assert_eq!(looping.next_frame(Some(period)), None);
+        assert_eq!(looping.frame_at, None, "the frames stop");
+        Ok(())
+    }
+
+    /// A frame never comes before the next draw may: each frame that changes
+    /// the screen draws it, rather than wake the loop once for the frame and
+    /// once more for the draw.
+    #[tokio::test]
+    async fn a_frame_comes_at_or_after_the_draw_it_needs() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::tui::motion::FAST;
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = looping(&mut terminal, dir.path());
+        let started = Instant::now();
+        looping.frame_at = Some(started);
+        looping.last_draw = Some(started + Duration::from_millis(5));
+        let frame = looping.next_frame(Some(FAST)).ok_or("no frame")?;
+        assert_eq!(frame, started + Duration::from_millis(5) + FRAME);
+        looping.last_draw = Some(started - FRAME);
+        let frame = looping.next_frame(Some(FAST)).ok_or("no frame")?;
+        assert_eq!(frame, started + FAST, "the draw is due already");
+        Ok(())
+    }
+
+    /// While frames run, a draw first brings the motion clock to now: an
+    /// effect a key starts begins when it was pressed, not at the last frame.
+    #[tokio::test]
+    async fn a_draw_brings_the_motion_clock_to_now() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::motion::{Motion, MotionLevel};
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut looping = looping(&mut terminal, dir.path());
+        let mut app = app();
+        app.motion = Motion::new(MotionLevel::On);
+        let gap = Duration::from_millis(50);
+        looping.frame_at = Some(Instant::now().checked_sub(gap).ok_or("no instant")?);
+        app.dirty = true;
+        looping.draw(&mut app)?;
+        assert!(app.motion.clock() >= gap, "{:?}", app.motion.clock());
+        assert!(!app.dirty, "drawn");
+        Ok(())
+    }
+
+    /// With motion on, the spinner of running work turns on screen while the
+    /// loop waits for nothing else.
+    #[tokio::test]
+    async fn the_spinner_turns_while_work_runs() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::motion::{Motion, MotionLevel};
+        let backend = Shared::new();
+        let frame = Arc::clone(&backend.frame);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = app();
+        app.motion = Motion::new(MotionLevel::On);
+        crate::tui::snapshots::pipeline_running(&mut app);
+        let (events, input) = mpsc::unbounded_channel();
+        let run_loop = drive(&mut terminal, &mut app, input, None);
+        let watch = async move {
+            drawn(&frame, "⠋ answers 120/400").await?;
+            drawn(&frame, "⠙ answers 120/400").await?;
+            drop(events);
+            Ok::<_, String>(())
+        };
+        let (result, watched) =
+            tokio::time::timeout(LIMIT, async { tokio::join!(run_loop, watch) }).await?;
+        watched?;
+        result?;
+        Ok(())
     }
 
     /// The effects of a wake whose draw failed still run: a confirmed cancel

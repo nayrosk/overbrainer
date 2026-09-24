@@ -1,29 +1,42 @@
 //! The Logs view: the captured log lines, newest at the bottom.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem};
+use ratatui::widgets::{List, ListItem, Paragraph};
 use tracing::Level;
 
 use crate::logging::LogLine;
 use crate::tui::app::App;
 use crate::tui::format::clock;
 
-/// Draws the Logs view in `area`.
-/// Records the rows it has, which bound how far back the view scrolls.
+/// Draws the Logs view in `area`: no frame, a two-column margin, a title row,
+/// a blank row, then the lines. Records the rows the lines have, which bound
+/// how far back the view scrolls.
 pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
-    app.log_view.height = usize::from(area.height.saturating_sub(2));
+    let area = area.inner(Margin::new(2, 0));
+    let [title_row, _, lines] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    app.log_view.height = usize::from(lines.height);
     let theme = &app.theme;
     let view = app.log_view;
     let offset = view.offset(&app.logs);
     let window = app.logs.window(view.min, view.height, offset);
-    let note = if view.anchor.is_some() {
-        format!("({offset} newer lines below: G follows) ")
-    } else {
-        String::new()
-    };
-    let title = format!(" logs: {} and above {note}", level_name(view.min));
+    let mut title = vec![Span::styled(
+        format!("Logs · {} and above", level_name(view.min)),
+        theme.title,
+    )];
+    if view.anchor.is_some() {
+        title.push(Span::styled(
+            format!("  ({offset} newer lines below: G follows)"),
+            theme.dim,
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(title)), title_row);
     let mut items: Vec<ListItem> = window
         .lines
         .iter()
@@ -35,10 +48,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             theme.dim,
         )));
     }
-    let block = Block::bordered()
-        .title(Span::styled(title, theme.title))
-        .border_style(theme.dim);
-    frame.render_widget(List::new(items).block(block), area);
+    frame.render_widget(List::new(items), lines);
 }
 
 fn render_line<'a>(line: &'a LogLine, theme: &crate::tui::theme::Theme) -> Line<'a> {
@@ -50,9 +60,14 @@ fn render_line<'a>(line: &'a LogLine, theme: &crate::tui::theme::Theme) -> Line<
             theme.level(line.level),
         ),
         Span::raw(" "),
-        Span::styled(format!("{}: ", line.target), theme.dim),
+        Span::styled(format!("{}: ", short_target(&line.target)), theme.dim),
         Span::raw(line.message.as_str()),
     ])
+}
+
+/// A log target without the crate's own `overbrainer::` prefix.
+fn short_target(target: &str) -> &str {
+    target.strip_prefix("overbrainer::").unwrap_or(target)
 }
 
 /// The level in upper case.

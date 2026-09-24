@@ -15,8 +15,9 @@ use tracing::Level;
 
 use super::app::{App, Effect, Overlay, Project, View};
 use super::dataset::{Node, TopicInfo};
+use super::motion::MotionLevel;
 use super::tasks::{Done, TaskId};
-use super::theme::Theme;
+use super::theme::{ColorLevel, LookEnv, Theme};
 use super::ui;
 use crate::cli::data::Command;
 use crate::dataset::{
@@ -41,16 +42,22 @@ pub(super) fn at(seconds: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(seconds)
 }
 
-/// An app on the project `rust_expert` at [`NOW`], with the color theme.
+/// An app on the project `rust_expert` at [`NOW`], with the 24-bit theme.
 pub(super) fn app() -> App {
+    app_with(&Theme::new(ColorLevel::TrueColor))
+}
+
+/// An app on the project `rust_expert` at [`NOW`], with `theme`.
+pub(super) fn app_with(theme: &Theme) -> App {
     let project = Project {
         name: "rust_expert".into(),
         dir: "/nonexistent/rust_expert".into(),
         topics: Vec::new(),
         eval_ratio: 0.1,
         concurrency: 8,
+        target: Some("gpu_cloud".into()),
     };
-    App::new(project, LogBuffer::new(100), Theme::color(), at(NOW))
+    App::new(project, LogBuffer::new(100), theme, at(NOW))
 }
 
 /// The fixtures' topics: `ownership` and `traits`.
@@ -185,7 +192,12 @@ pub(super) fn dataset() -> Dataset {
 
 /// [`app`] on the `ownership` and `traits` topics with [`dataset`] loaded.
 pub(super) fn dataset_app() -> App {
-    let mut app = app();
+    dataset_app_with(&Theme::new(ColorLevel::TrueColor))
+}
+
+/// [`dataset_app`] with `theme`.
+pub(super) fn dataset_app_with(theme: &Theme) -> App {
+    let mut app = app_with(theme);
     app.project.topics = topics();
     app.dataset.loaded(dataset(), &app.project.topics);
     app
@@ -540,12 +552,19 @@ fn a_terminal_below_80x24_says_so() -> TestResult {
 }
 
 /// Every view drawn with the monochrome theme uses no color, and the selection
-/// shows as reversed.
+/// shows as reversed; `NO_COLOR` also turns motion off.
 #[test]
 fn the_monochrome_theme_uses_no_color() -> TestResult {
-    let mut app = dataset_app();
+    let env = LookEnv {
+        no_color: Some("1".into()),
+        motion: Some("on".into()),
+        ..LookEnv::default()
+    };
+    let level = ColorLevel::detect(&env);
+    assert_eq!(level, ColorLevel::Mono);
+    assert_eq!(MotionLevel::detect(&env, level), MotionLevel::Off);
+    let mut app = dataset_app_with(&Theme::mono());
     logs(&app);
-    app.theme = Theme::mono();
     for view in View::ALL {
         app.view = view;
         for overlay in [None, Some(Overlay::Help)] {
@@ -617,6 +636,20 @@ fn dataset_with_a_filter() -> TestResult {
     Ok(())
 }
 
+/// A filter being typed: the footer says what Enter and Esc do with it.
+#[test]
+fn dataset_while_a_filter_is_typed() -> TestResult {
+    let mut app = dataset_app();
+    for code in [KeyCode::Char('/'), KeyCode::Char('b'), KeyCode::Char('o')] {
+        app.on_input(&key(code));
+    }
+    snapshot("dataset_filter_typing", &mut app)?;
+    let rows = text(&draw(&mut app, 80, 24)?);
+    let footer = rows.last().ok_or("no footer")?;
+    assert!(footer.contains("Enter keep · Esc clear"), "{footer}");
+    Ok(())
+}
+
 #[test]
 fn dataset_with_missing_subtopic_and_unconfigured_topic() -> TestResult {
     let mut app = dataset_app();
@@ -626,6 +659,56 @@ fn dataset_with_missing_subtopic_and_unconfigured_topic() -> TestResult {
         .tree
         .select(vec![Node::Topic("old_topic".into())]);
     snapshot("dataset_leftovers", &mut app)?;
+    Ok(())
+}
+
+/// No data and no run: the empty tree says which key fills it, and the first
+/// keys to know.
+#[test]
+fn dataset_empty_on_a_new_project() -> TestResult {
+    let mut app = app();
+    app.project.topics = topics();
+    app.dataset.loaded(Dataset::default(), &app.project.topics);
+    snapshot("dataset_empty", &mut app)?;
+    let rows = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(rows.contains("No data yet: press r to generate"), "{rows}");
+    assert!(
+        rows.contains("r generates data · t trains · ? all keys"),
+        "{rows}"
+    );
+    let rows = text(&draw(&mut app, 80, 24)?);
+    let listed = |y: usize, label: &str| rows.get(y).is_some_and(|row| row.contains(label));
+    assert!(listed(2, "ownership  0 sub, 0 q, 0 a"), "{rows:#?}");
+    assert!(listed(3, "traits  0 sub, 0 q, 0 a"), "{rows:#?}");
+    let keys = rows
+        .iter()
+        .find(|row| row.contains("r generates data"))
+        .ok_or("no first keys")?;
+    assert!(
+        keys.contains("r generates data · t trains ") && !keys.contains('?'),
+        "whole hints only: {keys}"
+    );
+    Ok(())
+}
+
+/// A topic's counts that do not fit whole are left out, never cut.
+#[test]
+fn a_topic_whose_counts_do_not_fit_shows_none() -> TestResult {
+    let mut app = dataset_app();
+    let rows = text(&draw(&mut app, 80, 24)?);
+    let old = rows
+        .iter()
+        .find(|row| row.contains("old_topic"))
+        .ok_or("no old_topic")?;
+    assert!(
+        old.starts_with("│ ▶ old_topic (not configured)     │"),
+        "{old}"
+    );
+    let rows = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(
+        rows.contains("old_topic (not configured)  1 sub, 1 q, 1 a"),
+        "{rows}"
+    );
     Ok(())
 }
 
@@ -715,6 +798,38 @@ fn pipeline_stopped_by_quitting() -> TestResult {
     Ok(())
 }
 
+/// Progress stays readable without color: bars are blocks, stages have glyphs.
+#[test]
+fn progress_shows_without_color() -> TestResult {
+    let mut app = app();
+    app.theme = Theme::mono();
+    app.view = View::Pipeline;
+    pipeline_running(&mut app);
+    let rows = text(&draw(&mut app, 80, 24)?);
+    let answers = rows
+        .iter()
+        .find(|row| row.contains("answers") && row.contains("120/400"))
+        .ok_or("no answers row")?;
+    assert!(answers.contains("███████▌ "), "{answers}");
+    assert!(
+        rows.iter().any(|row| row.starts_with("  ✓ subtopics")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("  · split       pending")),
+        "{rows:#?}"
+    );
+    let mut app = training_app()?;
+    app.theme = Theme::mono();
+    let rows = text(&draw(&mut app, 80, 24)?).join("\n");
+    assert!(
+        rows.contains("● 20260921-133200-a1b2  step 1200/4000 ████▊"),
+        "{rows}"
+    );
+    Ok(())
+}
+
 /// A failed `run` at the minimum size still shows its final error and its
 /// newest item failures: older failures give way first.
 #[test]
@@ -778,7 +893,7 @@ const LEFT: &str = "20260919-090000-c3d4";
 
 /// Three runs: a Runpod run followed live, a finished local run, and a run left
 /// running that nothing follows.
-fn training_app() -> Result<App, serde_json::Error> {
+pub(super) fn training_app() -> Result<App, serde_json::Error> {
     let mut app = app();
     app.view = View::Training;
     app.training.runs = vec![
@@ -814,6 +929,21 @@ fn training_without_runs() -> TestResult {
 fn training_of_a_followed_runpod_run() -> TestResult {
     let mut app = training_app()?;
     snapshot("training_followed", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn a_step_past_max_steps_reads_100_percent() -> TestResult {
+    let mut app = training_app()?;
+    let mut metrics = series();
+    for metric in &mut metrics {
+        metric.max_steps = Some(1000);
+    }
+    app.training.series.insert(FOLLOWED.into(), metrics);
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains("step 1200/1000"), "{shown}");
+    assert!(shown.contains(" 100%"), "{shown}");
+    assert!(!shown.contains("120%"), "{shown}");
     Ok(())
 }
 
@@ -934,6 +1064,20 @@ fn quitting_while_a_runpod_run_provisions_offers_to_abandon_it() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn c_on_a_starting_runpod_run_offers_to_abandon_it() -> TestResult {
+    let mut app = training_app()?;
+    app.training.tasks.insert(
+        TaskId(3),
+        Follow::new(Job::Start { runpod: true }, FOLLOWED),
+    );
+    // No job yet, so no metric.
+    app.training.series.remove(FOLLOWED);
+    app.on_input(&key(KeyCode::Char('c')));
+    snapshot("abandon_starting_run", &mut app)?;
+    Ok(())
+}
+
 /// A start dialog taller than the terminal keeps its key line and its
 /// most-it-can-cost line, and marks the text it cut; so does a quit dialog.
 #[test]
@@ -954,8 +1098,8 @@ fn a_tall_dialog_keeps_its_keys_and_its_cost_at_80x24() -> TestResult {
     for shown in [
         "warning     warning number 1 about this run",
         "warning     warning number 4 about this run",
-        "[y] start",
-        "[n] cancel",
+        "y start",
+        "n cancel",
         "max_hours   6",
         "…",
         "target      gpu_cloud",
@@ -971,7 +1115,7 @@ fn a_tall_dialog_keeps_its_keys_and_its_cost_at_80x24() -> TestResult {
     }
     app.on_input(&key(KeyCode::Char('q')));
     let rows = text(&draw(&mut app, 80, 24)?).join("\n");
-    for shown in ["[y] quit", "[n] stay", "…"] {
+    for shown in ["y quit", "n stay", "…"] {
         assert!(rows.contains(shown), "{shown}\n{rows}");
     }
     Ok(())
@@ -1030,15 +1174,19 @@ fn training_of_a_run_whose_pod_is_kept() -> TestResult {
     Ok(())
 }
 
-/// The pod line of `app` drawn at 120x40: rows 9 and 10 of the detail pane,
-/// joined as one text.
+/// The pod line of `app` drawn at 120x40: the row that starts with `pod ` and
+/// the row under it, joined as one text.
 fn pod_text(app: &mut App) -> Result<String, Infallible> {
     let rows = text(&draw(app, 120, 40)?);
+    let start = rows
+        .iter()
+        .position(|row| row.trim_start().starts_with("pod "))
+        .unwrap_or(rows.len());
     let words: Vec<&str> = rows
         .iter()
-        .skip(9)
+        .skip(start)
         .take(2)
-        .map(|row| row.trim_matches('│').trim())
+        .map(|row| row.trim())
         .collect();
     Ok(words.join(" "))
 }

@@ -12,6 +12,7 @@ use tracing::Level;
 
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
 use super::editor::{self, Session, Target};
+use super::motion::{Motion, MotionLevel};
 use super::pipeline::{PipelineView, STAGES, command_name};
 use super::start::StartPlan;
 use super::tasks::{Done, Edit, Msg, Saved, Task, TaskId};
@@ -41,6 +42,8 @@ pub(super) struct Project {
     pub(super) eval_ratio: f64,
     /// `pipeline.concurrency`.
     pub(super) concurrency: usize,
+    /// `training.target`, when training is configured.
+    pub(super) target: Option<String>,
 }
 
 impl Project {
@@ -61,6 +64,10 @@ impl Project {
                 .collect(),
             eval_ratio: settings.pipeline.eval_ratio,
             concurrency: settings.pipeline.concurrency,
+            target: settings
+                .training
+                .as_ref()
+                .map(|training| training.target.clone()),
         }
     }
 }
@@ -200,6 +207,8 @@ pub(super) enum Action {
     Start(Box<StartPlan>),
     /// Abandoning Runpod runs still provisioning, when quitting.
     Abandon(Vec<TaskId>),
+    /// Abandoning the Runpod start `0` still provisioning, asked for with `c`.
+    AbandonStart(TaskId),
 }
 
 /// What an exit note added while leaving is about.
@@ -283,6 +292,10 @@ pub(super) struct App {
     pub(super) log_view: LogView,
     /// The load of the data files running, if any.
     pub(super) load: Option<TaskId>,
+    /// When the last load started, by the motion clock.
+    pub(super) load_at: Option<Duration>,
+    /// What moves on screen, and its clock.
+    pub(super) motion: Motion,
     /// Whether a reload was asked for while a load ran: it starts once that load
     /// ends, so it reads what changed meanwhile.
     reload_pending: bool,
@@ -328,18 +341,23 @@ pub(super) struct App {
 
 impl App {
     /// A new app for `project`, logging into `logs`, at `now`.
-    pub(super) fn new(project: Project, logs: LogBuffer, theme: Theme, now: SystemTime) -> Self {
+    pub(super) fn new(project: Project, logs: LogBuffer, theme: &Theme, now: SystemTime) -> Self {
         Self {
             project,
-            theme,
+            theme: *theme,
             seen_log: logs.seq(),
             logs,
             view: View::Dataset,
             overlay: None,
             status: None,
             now,
-            dataset: DatasetView::default(),
+            dataset: DatasetView {
+                warn: theme.warn,
+                ..DatasetView::default()
+            },
             load: None,
+            load_at: None,
+            motion: Motion::new(MotionLevel::Off),
             reload_pending: false,
             edit: None,
             editing: None,
@@ -394,10 +412,11 @@ impl App {
         }
         let id = self.task_id();
         self.load = Some(id);
+        self.load_at = Some(self.motion.clock());
         vec![Effect::Spawn(id, Task::Load)]
     }
 
-    /// The work running, as the status line shows it.
+    /// The work running, as the footer shows it, each with a spinner.
     pub(super) fn work(&self) -> Vec<String> {
         let mut work = Vec::new();
         if self.leaving.is_some() {
@@ -418,9 +437,6 @@ impl App {
         let followed = self.training.tasks.len();
         if followed > 0 {
             work.push(count(followed, "training task"));
-        }
-        if self.lock().is_some() {
-            work.push("edits locked".to_string());
         }
         work
     }
@@ -912,6 +928,7 @@ impl App {
             Action::Cancel(run_id) => self.cancel_run(&run_id),
             Action::Start(plan) => self.start_run(&plan),
             Action::Abandon(tasks) => self.abandon(&tasks),
+            Action::AbandonStart(task) => self.abandon_start(task),
             Action::Delete { deletion, counts } => {
                 if self.locked() {
                     return Vec::new();
@@ -1516,11 +1533,12 @@ mod tests {
     /// The Logs view at 80x24 shows 20 lines.
     const ROWS: usize = 20;
 
-    /// The title row and the rows of lines of the Logs view drawn at 80x24.
+    /// The title row and the rows of lines of the Logs view drawn at 80x24:
+    /// the title, a blank row, then the lines.
     fn logs_view(app: &mut App) -> Result<(String, Vec<String>), Infallible> {
         let rows = text(&draw(app, 80, 24)?);
         let title = rows.get(1).cloned().unwrap_or_default();
-        Ok((title, rows.into_iter().skip(2).take(ROWS).collect()))
+        Ok((title, rows.into_iter().skip(3).take(ROWS).collect()))
     }
 
     #[test]
@@ -1599,9 +1617,10 @@ mod tests {
                 topics: Vec::new(),
                 eval_ratio: 0.1,
                 concurrency: 8,
+                target: None,
             },
             LogBuffer::new(25),
-            Theme::color(),
+            &Theme::new(crate::tui::theme::ColorLevel::TrueColor),
             at(NOW),
         );
         for n in 0..25 {
@@ -2858,6 +2877,194 @@ mod tests {
                     .to_string(),
             ]
         );
+        Ok(())
+    }
+
+    /// Start tasks bound to [`FIRST`] and [`SECOND`], on Runpod when `runpod`.
+    fn starts(app: &mut App, runpod: bool) -> [TaskId; 2] {
+        use crate::tui::training::{Follow, Job};
+        for (id, run) in [(TaskId(90), FIRST), (TaskId(91), SECOND)] {
+            app.training
+                .tasks
+                .insert(id, Follow::new(Job::Start { runpod }, run));
+        }
+        [TaskId(90), TaskId(91)]
+    }
+
+    /// The tasks the open dialog abandons, if it is an abandon dialog.
+    fn abandoning(app: &App) -> Option<&[TaskId]> {
+        match &app.overlay {
+            Some(Overlay::Confirm(Confirm {
+                action: Action::AbandonStart(task),
+                ..
+            })) => Some(std::slice::from_ref(task)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn c_on_a_starting_runpod_run_offers_to_abandon_it_and_n_keeps_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::training::Detach;
+        let (_dir, mut app) = runs_app()?;
+        let [first, _] = starts(&mut app, true);
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            keys(&mut app, &[KeyCode::Char('c')]);
+            assert!(
+                dialog(&app).starts_with(
+                    "Run 20260921-133200-a1b2 is still starting, so it has no job to cancel \
+                     yet. Abandon it instead? If its pod is still being prepared, it is \
+                     deleted"
+                ),
+                "{}",
+                dialog(&app)
+            );
+            assert_eq!(abandoning(&app), Some([first].as_slice()));
+            assert_eq!(keys(&mut app, &[code]), [], "{code:?}");
+            assert_eq!(app.overlay, None);
+            let follow = app
+                .training
+                .tasks
+                .get(&first)
+                .map(|f| (f.detach, f.cancel_after));
+            assert_eq!(follow, Some((Detach::No, false)), "{code:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn c_then_y_abandons_only_the_selected_start_and_the_tui_stays()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::training::Detach;
+        let (_dir, mut app) = runs_app()?;
+        let [first, second] = starts(&mut app, true);
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('c'), KeyCode::Char('y')]),
+            [Effect::Abandon(first)]
+        );
+        assert_eq!(status(&app), Some("abandoning run 20260921-133200-a1b2"));
+        assert_eq!((app.leaving, app.exit), (None, None));
+        let other = app.training.tasks.get(&second).map(|f| f.detach);
+        assert_eq!(other, Some(Detach::No), "only the selected run");
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(app.overlay, None);
+        assert_eq!(
+            status(&app),
+            Some("run 20260921-133200-a1b2 is being abandoned")
+        );
+        let failed = "interrupted: run 20260921-133200-a1b2 stopped before its job started; it \
+                      has no pod left";
+        ended(&mut app, first, Ok(Done::Trained(Err(failed.into()))));
+        assert_eq!((app.leaving, app.exit), (None, None));
+        let error = app.training.ended.get(FIRST).and_then(|e| e.error.clone());
+        assert_eq!(error.as_deref(), Some(failed));
+        assert_eq!(
+            status(&app).map(String::from),
+            Some(format!("run {FIRST}: {failed}"))
+        );
+        assert!(app.training.tasks.contains_key(&second));
+        Ok(())
+    }
+
+    #[test]
+    fn y_after_the_job_started_does_not_abandon_and_says_so()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let [first, _] = starts(&mut app, true);
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(abandoning(&app), Some([first].as_slice()));
+        assert_eq!(watching(&mut app, first), [], "still followed");
+        assert_eq!(keys(&mut app, &[KeyCode::Char('y')]), [], "no abandon");
+        assert_eq!(
+            status(&app),
+            Some(
+                "run 20260921-133200-a1b2: its job started, so it was not abandoned and its pod \
+                 keeps billing; press c to cancel it"
+            )
+        );
+        assert_eq!(
+            app.status.as_ref().map(|status| status.severity),
+            Some(Severity::Warn)
+        );
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(Confirm { action: Action::Cancel(run), .. })) if run == FIRST
+            ),
+            "{:?}",
+            app.overlay
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn c_then_y_while_a_quit_is_pending_abandons_only_that_start()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tui::training::Detach;
+        let (_dir, mut app) = runs_app()?;
+        let [first, second] = starts(&mut app, true);
+        keys(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+        assert!(
+            dialog(&app).starts_with("Quitting waits"),
+            "{}",
+            dialog(&app)
+        );
+        keys(&mut app, &[KeyCode::Char('n')]);
+        assert_eq!(app.leaving, Some(Exit::Quit));
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(abandoning(&app), Some([first].as_slice()));
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('y')]),
+            [Effect::Abandon(first)]
+        );
+        assert_eq!(status(&app), Some("abandoning run 20260921-133200-a1b2"));
+        let other = app.training.tasks.get(&second).map(|f| f.detach);
+        assert_eq!(other, Some(Detach::OnStart), "still waited for");
+        assert_eq!((app.leaving, app.exit), (Some(Exit::Quit), None));
+        Ok(())
+    }
+
+    #[test]
+    fn a_signal_while_the_c_dialog_is_open_closes_it_and_abandons_every_task()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let [first, second] = starts(&mut app, true);
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert_eq!(abandoning(&app), Some([first].as_slice()));
+        let mut effects = app.on_signal();
+        effects.sort_by_key(|effect| format!("{effect:?}"));
+        assert_eq!(effects, [Effect::Abandon(first), Effect::Abandon(second)]);
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.leaving, Some(Exit::Signal));
+        Ok(())
+    }
+
+    #[test]
+    fn c_on_a_starting_local_run_still_cancels_it_once_its_job_started()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = runs_app()?;
+        let [first, _] = starts(&mut app, false);
+        keys(&mut app, &[KeyCode::Char('c')]);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(Confirm { action: Action::Cancel(run), .. })) if run == FIRST
+            ),
+            "{:?}",
+            app.overlay
+        );
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('y')]),
+            [],
+            "never during the start"
+        );
+        assert_eq!(
+            status(&app),
+            Some("run 20260921-133200-a1b2 is starting: it is cancelled once its job started")
+        );
+        assert_eq!(watching(&mut app, first), [Effect::Cancel(first)]);
+        assert_eq!(app.leaving, None);
         Ok(())
     }
 

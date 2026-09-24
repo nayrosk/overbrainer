@@ -106,6 +106,22 @@ fn config_check_shows_a_runpod_target_with_its_defaults() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn a_missing_config_names_its_cause_once() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let output = overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["pod", "ls"])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.starts_with("error: cannot read "), "{stderr}");
+    assert!(stderr.contains("overbrainer.toml: "), "{stderr}");
+    assert_eq!(stderr.matches("(os error 2)").count(), 1, "{stderr}");
+    Ok(())
+}
+
+#[test]
 fn config_check_reports_invalid_config() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     overbrainer()?

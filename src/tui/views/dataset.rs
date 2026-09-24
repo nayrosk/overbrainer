@@ -3,27 +3,51 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Row, Table, Wrap};
 use tui_tree_widget::Tree;
 
 use crate::dataset::{AnswerText, Example, FinishReason, Id, ReasoningKind};
 use crate::pipeline::SplitClass;
 use crate::tui::app::App;
 use crate::tui::dataset::{Model, Node, Stats, exclusion, sizes};
+use crate::tui::format::WORKING;
 use crate::tui::theme::Theme;
+
+/// Columns of the tree's open or closed marker before a topic's label.
+const TOGGLE: u16 = 2;
+/// The first keys to know on a new project, in the order they are dropped
+/// from the end when they do not all fit.
+const FIRST_KEYS: [&str; 3] = ["r generates data", "t trains", "? all keys"];
+
+/// A rounded pane with a column of padding, its border drawn in `border`.
+fn pane<'a>(border: ratatui::style::Style) -> Block<'a> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border)
+        .padding(Padding::horizontal(1))
+}
 
 /// Draws the Dataset view in `area`.
 pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
+    let onboarding = app.training.runs.is_empty();
+    let loading = app.motion.shows_load(app.load_at).then(|| {
+        // The static glyph already ends in an ellipsis: none after the path.
+        match app.motion.spinner() {
+            WORKING => format!("{WORKING} reading data/"),
+            spinner => format!("{spinner} reading data/…"),
+        }
+    });
     let view = &mut app.dataset;
-    let Some(model) = &view.model else {
-        let text = view.error.clone().map_or_else(
-            || Line::from(Span::styled("loading data/...", theme.dim)),
-            |error| Line::from(Span::styled(error, theme.error)),
-        );
-        let block = Block::bordered().title(Span::styled(" data ", theme.title));
+    let Some(model) = &mut view.model else {
+        let text = match (view.error.clone(), loading) {
+            (Some(error), _) => failed(&error, &theme),
+            (None, Some(loading)) => vec![Line::from(Span::styled(loading, theme.dim))],
+            (None, None) => Vec::new(),
+        };
+        let block = pane(theme.border_focus).title(Span::styled(" data ", theme.title));
         frame.render_widget(
             Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
             area,
@@ -40,23 +64,38 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         (None, true) => " / filter ".to_string(),
         (None, false) => format!(" filter: {} (Esc clears) ", view.filter),
     };
-    let block = Block::bordered()
+    let block = pane(theme.border_focus)
         .title(Span::styled(title, theme.title))
-        .title_bottom(Span::styled(bottom, theme.dim))
-        .border_style(theme.dim);
+        .title_bottom(Span::styled(bottom, theme.dim));
+    let inner = block.inner(left);
+    model.fit(usize::from(inner.width.saturating_sub(TOGGLE)));
+    let data = &model.data;
+    let nothing = data.subtopics.is_empty() && data.questions.is_empty() && data.answers.is_empty();
     match &model.items {
-        Ok(items) if items.is_empty() => {
-            let note = if model.matches.is_some() {
-                "nothing matches the filter"
-            } else {
-                "no data yet"
-            };
-            frame.render_widget(
-                Paragraph::new(Span::styled(note, theme.dim)).block(block),
-                left,
-            );
-        },
         Ok(items) => match Tree::new(items) {
+            Ok(tree) if items.is_empty() || (nothing && model.matches.is_none()) => {
+                // The topics stay listed, their counts at zero, the selection
+                // on one of them; what fills them comes under them.
+                let lines = if model.matches.is_some() {
+                    vec![Line::from(Span::styled(
+                        "Nothing matches the filter: Esc clears it.",
+                        theme.dim,
+                    ))]
+                } else {
+                    empty(onboarding, inner.width, &theme)
+                };
+                let rows = u16::try_from(items.len()).unwrap_or(u16::MAX);
+                let [listed, _, text] = Layout::vertical([
+                    Constraint::Length(rows),
+                    Constraint::Length(u16::from(rows > 0)),
+                    Constraint::Fill(1),
+                ])
+                .areas(inner);
+                frame.render_widget(block, left);
+                let tree = tree.highlight_style(theme.selected);
+                frame.render_stateful_widget(tree, listed, &mut view.tree);
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
+            },
             Ok(tree) => {
                 let tree = tree.block(block).highlight_style(theme.selected);
                 frame.render_stateful_widget(tree, left, &mut view.tree);
@@ -76,8 +115,50 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// What an empty dataset says: which key fills it; with no run either, the
+/// first keys to know, as many whole as fit `width` on one line.
+fn empty(onboarding: bool, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(
+        "No data yet: press r to generate subtopics, questions and answers.",
+    )];
+    if onboarding {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            first_keys(usize::from(width)),
+            theme.dim,
+        )));
+    }
+    lines
+}
+
+/// The first keys to know, joined by ` · `: as many as fit `width` whole,
+/// in order.
+fn first_keys(width: usize) -> String {
+    let mut line = String::new();
+    for hint in FIRST_KEYS {
+        let joined = if line.is_empty() {
+            hint.to_string()
+        } else {
+            format!("{line} · {hint}")
+        };
+        if joined.chars().count() > width {
+            break;
+        }
+        line = joined;
+    }
+    line
+}
+
+/// What a failed read says: `✗`, the error, and the key that reads again.
+pub(in crate::tui) fn failed(error: &str, theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(format!("✗ {error}"), theme.error)),
+        Line::from(Span::styled("R reloads", theme.dim)),
+    ]
+}
+
 fn error_pane(frame: &mut Frame, area: Rect, block: Block, error: &str, theme: &Theme) {
-    let text = Paragraph::new(Span::styled(error.to_string(), theme.error))
+    let text = Paragraph::new(failed(error, theme))
         .wrap(Wrap { trim: false })
         .block(block);
     frame.render_widget(text, area);
@@ -98,7 +179,7 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
         None => " detail ",
     };
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let inner_width = area.width.saturating_sub(2);
+    let inner_width = area.width.saturating_sub(4);
     let height = usize::from(area.height.saturating_sub(2));
     let total = paragraph.line_count(inner_width);
     let last = u16::try_from(total.saturating_sub(height)).unwrap_or(u16::MAX);
@@ -108,10 +189,9 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
         (usize::from(view.scroll) + height).min(total),
         total
     );
-    let block = Block::bordered()
+    let block = pane(theme.border)
         .title(Span::styled(title, theme.title))
-        .title_bottom(Line::from(Span::styled(position, theme.dim)).right_aligned())
-        .border_style(theme.dim);
+        .title_bottom(Line::from(Span::styled(position, theme.dim)).right_aligned());
     frame.render_widget(paragraph.scroll((view.scroll, 0)).block(block), area);
 }
 
@@ -342,9 +422,7 @@ fn render_stats(frame: &mut Frame, area: Rect, app: &App, topic: Option<&str>) {
         .map(|(label, value)| Row::new(vec![Span::styled(label, theme.dim), Span::raw(value)]))
         .collect();
     let title = format!(" stats: {} ", topic.unwrap_or("all topics"));
-    let block = Block::bordered()
-        .title(Span::styled(title, theme.title))
-        .border_style(theme.dim);
+    let block = pane(theme.border).title(Span::styled(title, theme.title));
     let table = Table::new(rows, [Constraint::Length(16), Constraint::Fill(1)]).block(block);
     frame.render_widget(table, area);
 }

@@ -4,11 +4,13 @@
 use std::fmt::Write as _;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use ratatui::style::Style;
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Chart, Dataset, GraphType, Paragraph, Row, Sparkline, Table, TableState, Wrap,
+    Axis, Block, BorderType, Chart, Dataset, GraphType, Padding, Paragraph, Row, Sparkline, Table,
+    TableState, Wrap,
 };
 
 use crate::runpod::{PodRecord, PodState, PodStatus};
@@ -16,42 +18,40 @@ use crate::runs::{RunRecord, RunState};
 use crate::train::TrainMetric;
 use crate::tui::app::App;
 use crate::tui::format::duration;
+use crate::tui::motion::Bar;
 use crate::tui::theme::Theme;
-use crate::tui::training::{Ended, Follow, Job, RunRow, float, progress};
+use crate::tui::training::{Ended, Follow, RunActivity, RunRow, float, progress};
+use crate::tui::views::dataset::failed;
+use crate::tui::widgets::bar::bar;
 
 /// Rows the pod line may wrap to.
 const POD_ROWS: u16 = 2;
 /// Rows the messages under the chart may take.
 const MESSAGE_ROWS: u16 = 4;
+/// Cells of the selected run's step bar.
+const STEP_BAR: u16 = 16;
+/// Rows of the view from which a blank row parts the detail's sections (its
+/// head, its pod, its chart): a terminal of 30 rows or more. Below, the rows
+/// go to the chart.
+const GAPS_FROM: u16 = 28;
 
-/// Draws the Training view in `area`.
-pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
+/// Draws the Training view in `area`; returns the cell of the followed run's
+/// `●`, when it shows.
+pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Option<Rect> {
     let view = &app.training;
     let theme = &app.theme;
-    let shown = u16::try_from(view.runs.len().clamp(1, 5)).unwrap_or(5);
+    if view.runs.is_empty() {
+        render_no_runs(frame, area, app);
+        return None;
+    }
+    let shown = u16::try_from(view.runs.len().min(5)).unwrap_or(5);
     let [list, detail] =
         Layout::vertical([Constraint::Length(shown + 3), Constraint::Fill(1)]).areas(area);
     render_runs(frame, list, app);
-    let Some(row) = view.selected_run() else {
-        let text = view
-            .error
-            .clone()
-            .unwrap_or_else(|| "no run yet".to_string());
-        let block = Block::bordered()
-            .title(Span::styled(" run ", theme.title))
-            .border_style(theme.dim);
-        frame.render_widget(
-            Paragraph::new(Span::styled(text, theme.dim)).block(block),
-            detail,
-        );
-        return;
-    };
+    // The selected run's detail has no frame: a two-column margin.
+    let inner = detail.inner(Margin::new(2, 0));
+    let row = view.selected_run()?;
     let follow = view.task_of(&row.record.id).map(|(_, follow)| follow);
-    let block = Block::bordered()
-        .title(Span::styled(format!(" {} ", row.record.id), theme.title))
-        .border_style(theme.dim);
-    let inner = block.inner(detail);
-    frame.render_widget(block, detail);
     let series = view
         .series
         .get(&row.record.id)
@@ -67,19 +67,33 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     };
     let pod_rows = pod.as_ref().map_or(0, |pod| rows(pod, POD_ROWS));
     let message_rows = rows(&messages, MESSAGE_ROWS);
-    let [status, pod_area, chart, lr, grad, notes] = Layout::vertical([
+    let activity = view.activity(&row.record.id);
+    let shown = app
+        .motion
+        .bar(Bar::Step, view.selected_ratio().unwrap_or(0.0), STEP_BAR);
+    let head = head_line(&row.record, series, (activity, shown), theme);
+    let facts = facts_line(
+        series,
+        (follow, ended),
+        (activity, app.motion.spinner()),
+        theme,
+    );
+    let facts_rows = u16::from(!facts.spans.is_empty());
+    let gap = u16::from(area.height >= GAPS_FROM);
+    let [status, facts_area, _, pod_area, _, chart, lr, grad, notes] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(facts_rows),
+        Constraint::Length(gap),
         Constraint::Length(pod_rows),
+        Constraint::Length(gap.min(pod_rows)),
         Constraint::Fill(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(message_rows),
     ])
     .areas(inner);
-    frame.render_widget(
-        Paragraph::new(status_line(&row.record, series, (follow, ended), theme)),
-        status,
-    );
+    frame.render_widget(Paragraph::new(head), status);
+    frame.render_widget(Paragraph::new(facts), facts_area);
     if let Some(pod) = pod {
         frame.render_widget(pod, pod_area);
     }
@@ -91,14 +105,58 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
         };
         frame.render_widget(Paragraph::new(Span::styled(note, theme.dim)), chart);
     } else {
-        render_chart(frame, chart, series, theme);
-        render_sparkline(frame, lr, ("lr", |m| m.learning_rate), series, theme);
-        render_sparkline(frame, grad, ("grad_norm", |m| m.grad_norm), series, theme);
+        let [legend, plot] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(chart);
+        render_legend(frame, legend, theme);
+        render_chart(frame, plot, series, theme);
+        render_sparkline(frame, lr, ("lr", |m| m.learning_rate), series, theme.lr);
+        render_sparkline(
+            frame,
+            grad,
+            ("grad_norm", |m| m.grad_norm),
+            series,
+            theme.grad_norm,
+        );
     }
     // The newest lines stay in view when they need more rows than they get.
     let hidden = u16::try_from(messages.line_count(inner.width))
         .map_or(0, |total| total.saturating_sub(message_rows));
     frame.render_widget(messages.scroll((hidden, 0)), notes);
+    (activity == RunActivity::Followed).then(|| Rect::new(status.x, status.y, 1, 1))
+}
+
+/// The runs box with no run in it: what to do to start one, or why the runs
+/// cannot be listed, in place of the table.
+fn render_no_runs(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let text = match (&app.training.error, &app.project.target) {
+        (Some(error), _) => failed(error, theme),
+        (None, Some(target)) => vec![Line::from(format!(
+            "No runs yet: press t to start one on {target}."
+        ))],
+        (None, None) => vec![Line::from(
+            "No runs yet: add a [training] section to overbrainer.toml, then press t.",
+        )],
+    };
+    let block = runs_block(" runs ", theme);
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: true });
+    let inner_width = block.inner(area).width;
+    let rows = u16::try_from(paragraph.line_count(inner_width)).unwrap_or(u16::MAX);
+    let [list, _] = Layout::vertical([
+        Constraint::Length(rows.saturating_add(2)),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    frame.render_widget(paragraph.block(block), list);
+}
+
+/// The rounded, focused box of the runs, titled `title`.
+fn runs_block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border_focus)
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(title, theme.title))
 }
 
 fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
@@ -108,20 +166,12 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
         .runs
         .iter()
         .map(|row: &RunRow| {
-            let followed = match view.task_of(&row.record.id) {
-                Some((_, follow)) if follow.job == Job::Cancel || follow.cancel_after => {
-                    "cancelling"
-                },
-                Some((_, follow)) if follow.starting() => "starting",
-                Some(_) => "followed",
-                None => "",
-            };
             Row::new(vec![
                 row.record.id.clone(),
                 row.record.state.name().to_string(),
                 row.record.target.clone(),
                 row.pod.as_ref().map(pod_summary).unwrap_or_default(),
-                followed.to_string(),
+                view.activity(&row.record.id).label().to_string(),
             ])
         })
         .collect();
@@ -138,20 +188,15 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
     )
     .header(header)
     .row_highlight_style(theme.selected)
-    .block(
-        Block::bordered()
-            .title(Span::styled(
-                if view.error.is_some() && !view.runs.is_empty() {
-                    " runs (stale: cannot list the runs) "
-                } else {
-                    " runs "
-                },
-                theme.title,
-            ))
-            .border_style(theme.dim),
-    );
-    let mut state =
-        TableState::default().with_selected((!view.runs.is_empty()).then_some(view.selected));
+    .block(runs_block(
+        if view.error.is_some() {
+            " runs (stale: cannot list the runs) "
+        } else {
+            " runs "
+        },
+        theme,
+    ));
+    let mut state = TableState::default().with_selected(Some(view.selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -164,43 +209,66 @@ fn pod_summary(record: &PodRecord) -> String {
         .map_or_else(|| summary.clone(), str::to_string)
 }
 
-/// The run's step, epoch and, while its job runs, ETA; then whether a task
-/// follows or cancels it, and the points its forwarder skipped.
-fn status_line(
+/// The selected run's first status line: `●` when a task follows it, its ID,
+/// its step with a bar filled to `shown` and a percentage, and its ETA while
+/// its job runs.
+fn head_line(
     record: &RunRecord,
     series: &[TrainMetric],
-    (follow, ended): (Option<&Follow>, Option<&Ended>),
+    (activity, shown): (RunActivity, f64),
     theme: &Theme,
 ) -> Line<'static> {
-    let running = matches!(record.state, RunState::Preparing | RunState::Running);
-    let mut spans = Vec::new();
-    if let Some(now) = progress(series) {
-        let step = match now.max_steps {
-            Some(max) if max > 0 => format!(
-                "step {}/{max} ({}%)",
-                now.step,
-                now.step.saturating_mul(100) / max
-            ),
-            _ => format!("step {}", now.step),
-        };
-        spans.push(Span::raw(step));
-        if let Some(epoch) = now.epoch {
-            spans.push(Span::raw(format!("  epoch {epoch:.2}")));
-        }
-        if running {
-            spans.push(Span::raw(match now.eta {
-                Some(eta) => format!("  ETA {}", duration(eta)),
-                None => "  ETA unknown".to_string(),
-            }));
-        }
+    // No stand-in for the marker: the ID of a run nothing follows starts in
+    // the column of the lines under it.
+    let mut head = Vec::new();
+    if activity == RunActivity::Followed {
+        head.push(Span::styled("● ", theme.title));
     }
-    let state = match follow {
-        Some(follow) if follow.job == Job::Cancel || follow.cancel_after => "   cancelling",
-        Some(follow) if follow.starting() => "   starting",
-        Some(_) => "   followed",
-        None => "",
+    head.push(Span::styled(record.id.clone(), theme.title));
+    let Some(now) = progress(series) else {
+        return Line::from(head);
     };
-    spans.push(Span::styled(state, theme.ok));
+    match now.max_steps {
+        Some(max) if max > 0 => {
+            head.push(Span::raw(format!("  step {}/{max} ", now.step)));
+            head.push(Span::styled(bar(shown, STEP_BAR), theme.gauge));
+            head.push(Span::raw(format!(
+                " {}%",
+                (now.step.saturating_mul(100) / max).min(100)
+            )));
+        },
+        _ => head.push(Span::raw(format!("  step {}", now.step))),
+    }
+    if matches!(record.state, RunState::Preparing | RunState::Running) {
+        head.push(Span::raw(match now.eta {
+            Some(eta) => format!("  ETA {}", duration(eta)),
+            None => "  ETA unknown".to_string(),
+        }));
+    }
+    Line::from(head)
+}
+
+/// The selected run's second status line: its epoch, whether a task starts
+/// (with the spinner) or cancels it, and the points its forwarder skipped;
+/// empty when there is none of them.
+fn facts_line(
+    series: &[TrainMetric],
+    (follow, ended): (Option<&Follow>, Option<&Ended>),
+    (activity, spinner): (RunActivity, &str),
+    theme: &Theme,
+) -> Line<'static> {
+    let mut facts: Vec<Span<'static>> = Vec::new();
+    if let Some(epoch) = progress(series).and_then(|now| now.epoch) {
+        facts.push(Span::raw(format!("epoch {epoch:.2}")));
+    }
+    match activity {
+        RunActivity::Starting { .. } | RunActivity::Abandoning { .. } => facts.push(Span::styled(
+            format!("{spinner} {}", activity.label()),
+            theme.accent,
+        )),
+        RunActivity::Cancelling => facts.push(Span::styled(activity.label(), theme.accent)),
+        RunActivity::None | RunActivity::Followed => {},
+    }
     let missing = match (follow, ended) {
         (Some(follow), _) => follow.skipped,
         (None, Some(ended)) if !ended.healed => ended.skipped,
@@ -212,12 +280,19 @@ fn status_line(
         } else {
             "(no local metrics file to read them from)"
         };
-        spans.push(Span::styled(
-            format!("   {missing} points missing {until}"),
+        facts.push(Span::styled(
+            format!("{missing} points missing {until}"),
             theme.warn,
         ));
     }
-    Line::from(spans)
+    let mut spaced = Vec::new();
+    for (index, span) in facts.into_iter().enumerate() {
+        if index > 0 {
+            spaced.push(Span::raw("  "));
+        }
+        spaced.push(span);
+    }
+    Line::from(spaced)
 }
 
 /// The pod line: its ID and state, rate, uptime and spend estimate, and what
@@ -333,6 +408,19 @@ fn downsample(points: Vec<(f64, f64)>, width: u16) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// The chart's label on the left, and what its marks are on the right.
+fn render_legend(frame: &mut Frame, area: Rect, theme: &Theme) {
+    frame.render_widget(Paragraph::new(Span::styled("loss", theme.dim)), area);
+    let legend = Line::from(vec![
+        Span::styled("─", theme.loss),
+        Span::styled(" train  ", theme.dim),
+        Span::styled("•", theme.eval_loss),
+        Span::styled(" eval", theme.dim),
+    ])
+    .right_aligned();
+    frame.render_widget(Paragraph::new(legend), area);
+}
+
 fn render_chart(frame: &mut Frame, area: Rect, series: &[TrainMetric], theme: &Theme) {
     let width = area.width.saturating_sub(8);
     let points = |value: fn(&TrainMetric) -> Option<f64>| {
@@ -353,13 +441,11 @@ fn render_chart(frame: &mut Frame, area: Rect, series: &[TrainMetric], theme: &T
     let x1 = if x1 > x0 { x1 } else { x0 + 1.0 };
     let datasets = vec![
         Dataset::default()
-            .name("loss")
             .marker(Marker::HalfBlock)
             .graph_type(GraphType::Line)
             .style(theme.loss)
             .data(&loss),
         Dataset::default()
-            .name("eval_loss")
             .marker(Marker::Dot)
             .graph_type(GraphType::Scatter)
             .style(theme.eval_loss)
@@ -389,7 +475,7 @@ fn render_sparkline(
     area: Rect,
     (label, value): (&'static str, fn(&TrainMetric) -> Option<f64>),
     series: &[TrainMetric],
-    theme: &Theme,
+    style: Style,
 ) {
     let [name, line, latest] = Layout::horizontal([
         Constraint::Length(10),
@@ -412,12 +498,9 @@ fn render_sparkline(
             }
         })
         .collect();
-    frame.render_widget(Paragraph::new(Span::styled(label, theme.dim)), name);
+    frame.render_widget(Paragraph::new(Span::styled(label, style)), name);
     frame.render_widget(
-        Sparkline::default()
-            .data(&scaled)
-            .max(1000)
-            .style(theme.sparkline),
+        Sparkline::default().data(&scaled).max(1000).style(style),
         line,
     );
     let text = match (values.last(), label) {

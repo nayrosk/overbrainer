@@ -4,7 +4,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use ratatui::text::Line;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use tui_tree_widget::{TreeItem, TreeState};
 
 use crate::dataset::{Dataset, Example, Exclusion, Id, Question, Subtopic, normalize};
@@ -65,6 +66,13 @@ pub(super) struct Model {
     classes: Vec<SplitClass>,
     /// Stats of each topic, and of all topics under `None`.
     pub(super) stats: BTreeMap<Option<String>, Stats>,
+    /// The style of the `(not configured)` label of a topic.
+    warn: Style,
+    /// The filter the tree was built for, normalized.
+    needle: String,
+    /// The columns a topic's label gets in the tree, once drawn: its counts
+    /// are left out when they do not fit whole.
+    room: Option<usize>,
 }
 
 /// Counts and sizes of one topic, or of all topics.
@@ -127,8 +135,13 @@ impl Lengths {
 
 impl Model {
     /// The model of `data` for the configured `topics`: stats now, and the tree
-    /// filtered by `filter`.
-    pub(super) fn new(data: Dataset, topics: &[TopicInfo], filter: &str) -> Self {
+    /// filtered by `filter`, a topic not configured labelled in `warn`.
+    pub(super) fn new(
+        data: Dataset,
+        topics: &[TopicInfo],
+        (filter, room): (&str, Option<usize>),
+        warn: Style,
+    ) -> Self {
         let configured: BTreeSet<String> = topics.iter().map(|topic| topic.name.clone()).collect();
         let found: BTreeSet<&str> = data
             .subtopics
@@ -174,6 +187,9 @@ impl Model {
             first_question,
             classes,
             stats: BTreeMap::new(),
+            warn,
+            needle: String::new(),
+            room,
         };
         model.stats = model.all_stats(topics);
         model.filter(filter);
@@ -184,18 +200,33 @@ impl Model {
     /// texts and subtopic names. A matching subtopic keeps all its questions, a
     /// matching question its parents.
     pub(super) fn filter(&mut self, filter: &str) {
-        let needle = normalize(filter);
-        let tree = Tree::new(self, &needle);
+        self.needle = normalize(filter);
+        let (items, matches, open) = self.build();
+        self.items = items;
+        self.matches = (!self.needle.is_empty()).then_some(matches);
+        self.open = open;
+    }
+
+    /// Gives a topic's label `room` columns: the tree is built again when
+    /// they changed, each topic's counts left out when they do not fit.
+    pub(super) fn fit(&mut self, room: usize) {
+        if self.room != Some(room) {
+            self.room = Some(room);
+            self.items = self.build().0;
+        }
+    }
+
+    /// The tree for the filter, the matches it counts and the nodes to open
+    /// so they show.
+    fn build(&self) -> (Result<Vec<Item>, String>, usize, Vec<Vec<Node>>) {
+        let tree = Tree::new(self, &self.needle);
         let items: Result<Vec<_>, _> = self
             .topics
             .iter()
             .filter_map(|topic| tree.topic(topic).transpose())
             .collect();
-        let matches = tree.matches.get();
-        let open = tree.open.take();
-        self.items = items.map_err(|error| format!("cannot show the dataset tree: {error}"));
-        self.matches = (!needle.is_empty()).then_some(matches);
-        self.open = open;
+        let items = items.map_err(|error| format!("cannot show the dataset tree: {error}"));
+        (items, tree.matches.get(), tree.open.take())
     }
 
     /// Whether `topic` is in `overbrainer.toml`.
@@ -402,16 +433,24 @@ impl<'a> Tree<'a> {
         TreeItem::new(node, label, children).map(Some)
     }
 
+    /// A topic's name, `(not configured)` after it when it is not in
+    /// `overbrainer.toml`, then its counts when they fit the label's room
+    /// whole.
     fn topic_label(&self, topic: &str) -> Line<'static> {
         let [subtopics, questions, answers] = self.counts.get(topic).copied().unwrap_or_default();
-        let name = if self.model.is_configured(topic) {
-            topic.to_string()
-        } else {
-            format!("(not configured) {topic}")
-        };
-        Line::from(format!(
-            "{name}  {subtopics} sub, {questions} q, {answers} a"
-        ))
+        let mut label = Line::from(topic.to_string());
+        if !self.model.is_configured(topic) {
+            label.push_span(Span::styled(" (not configured)", self.model.warn));
+        }
+        let counts = Span::raw(format!("  {subtopics} sub, {questions} q, {answers} a"));
+        if self
+            .model
+            .room
+            .is_none_or(|room| label.width() + counts.width() <= room)
+        {
+            label.push_span(counts);
+        }
+        label
     }
 
     /// The group at `path` (its topic, then the group itself: a subtopic or the
@@ -504,13 +543,16 @@ pub(super) struct DatasetView {
     pub(super) scroll: u16,
     /// The last split run in this session.
     pub(super) split: Option<SplitReport>,
+    /// The style of the `(not configured)` label of a topic.
+    pub(super) warn: Style,
 }
 
 impl DatasetView {
     /// Shows a newly loaded `data`, keeping the selection and open nodes when the
     /// selected node is still shown, else selecting the first node.
     pub(super) fn loaded(&mut self, data: Dataset, topics: &[TopicInfo]) {
-        self.model = Some(Model::new(data, topics, &self.filter));
+        let room = self.model.as_ref().and_then(|model| model.room);
+        self.model = Some(Model::new(data, topics, (&self.filter, room), self.warn));
         self.error = None;
         if !self.shown(self.tree.selected()) {
             self.tree.select(Vec::new());
@@ -717,7 +759,7 @@ mod tests {
         let mut second = data.answers[0].clone();
         second.meta.excluded = Some(Exclusion::Refused);
         data.answers.push(second);
-        let model = Model::new(data, &topics(), "");
+        let model = Model::new(data, &topics(), ("", None), Style::new());
         let id = &model.data.answers[0].id;
         assert_eq!(model.class(id), Some(SplitClass::Usable));
         let first = model.answer(id).ok_or("no answer")?;

@@ -66,7 +66,11 @@ pub(crate) async fn client(settings: &Settings) -> anyhow::Result<RunpodClient> 
 }
 
 async fn ls(ctx: &PodCtx<'_>) -> anyhow::Result<()> {
-    for line in table(&pod_rows(ctx).await?) {
+    let rows = pod_rows(ctx).await?;
+    if rows.is_empty() {
+        println!("pod: no overbrainer pod on this account");
+    }
+    for line in table(&rows) {
         println!("{line}");
     }
     Ok(())
