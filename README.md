@@ -36,7 +36,7 @@ cargo install --locked --git https://github.com/nayrosk/overbrainer
 
 There are no prebuilt binaries. You need:
 
-- Rust 1.89 or newer to build it. Linux and macOS are supported.
+- Rust 1.89 or newer to build it. CI builds and tests on Linux.
 - `ssh` for SSH targets, and `ssh` with `ssh-keygen` for Runpod targets.
 - For training on this machine: Axolotl 0.19 in a virtual environment or on `PATH`, or Docker or Podman with NVIDIA GPU access to run the Axolotl image.
 
