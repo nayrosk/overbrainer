@@ -636,6 +636,20 @@ fn dataset_with_a_filter() -> TestResult {
     Ok(())
 }
 
+/// A filter being typed: the footer says what Enter and Esc do with it.
+#[test]
+fn dataset_while_a_filter_is_typed() -> TestResult {
+    let mut app = dataset_app();
+    for code in [KeyCode::Char('/'), KeyCode::Char('b'), KeyCode::Char('o')] {
+        app.on_input(&key(code));
+    }
+    snapshot("dataset_filter_typing", &mut app)?;
+    let rows = text(&draw(&mut app, 80, 24)?);
+    let footer = rows.last().ok_or("no footer")?;
+    assert!(footer.contains("Enter keep · Esc clear"), "{footer}");
+    Ok(())
+}
+
 #[test]
 fn dataset_with_missing_subtopic_and_unconfigured_topic() -> TestResult {
     let mut app = dataset_app();
