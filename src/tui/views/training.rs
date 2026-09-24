@@ -31,8 +31,9 @@ const MESSAGE_ROWS: u16 = 4;
 /// Cells of the selected run's step bar.
 const STEP_BAR: u16 = 16;
 
-/// Draws the Training view in `area`.
-pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
+/// Draws the Training view in `area`; returns the cell of the followed run's
+/// `●`, when it shows.
+pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option<Rect> {
     let view = &app.training;
     let theme = &app.theme;
     let shown = u16::try_from(view.runs.len().clamp(1, 5)).unwrap_or(5);
@@ -52,7 +53,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
             )],
         };
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
-        return;
+        return None;
     };
     let follow = view.task_of(&row.record.id).map(|(_, follow)| follow);
     let series = view
@@ -122,6 +123,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     let hidden = u16::try_from(messages.line_count(inner.width))
         .map_or(0, |total| total.saturating_sub(message_rows));
     frame.render_widget(messages.scroll((hidden, 0)), notes);
+    (state == "followed").then(|| Rect::new(status.x, status.y, 1, 1))
 }
 
 fn render_runs(frame: &mut Frame, area: Rect, app: &App) {

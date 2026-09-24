@@ -15,8 +15,9 @@ use tracing::Level;
 
 use super::app::{App, Effect, Overlay, Project, View};
 use super::dataset::{Node, TopicInfo};
+use super::motion::MotionLevel;
 use super::tasks::{Done, TaskId};
-use super::theme::{ColorLevel, Theme};
+use super::theme::{ColorLevel, LookEnv, Theme};
 use super::ui;
 use crate::cli::data::Command;
 use crate::dataset::{
@@ -551,9 +552,17 @@ fn a_terminal_below_80x24_says_so() -> TestResult {
 }
 
 /// Every view drawn with the monochrome theme uses no color, and the selection
-/// shows as reversed.
+/// shows as reversed; `NO_COLOR` also turns motion off.
 #[test]
 fn the_monochrome_theme_uses_no_color() -> TestResult {
+    let env = LookEnv {
+        no_color: Some("1".into()),
+        motion: Some("on".into()),
+        ..LookEnv::default()
+    };
+    let level = ColorLevel::detect(&env);
+    assert_eq!(level, ColorLevel::Mono);
+    assert_eq!(MotionLevel::detect(&env, level), MotionLevel::Off);
     let mut app = dataset_app_with(&Theme::mono());
     logs(&app);
     for view in View::ALL {
@@ -837,7 +846,7 @@ const LEFT: &str = "20260919-090000-c3d4";
 
 /// Three runs: a Runpod run followed live, a finished local run, and a run left
 /// running that nothing follows.
-fn training_app() -> Result<App, serde_json::Error> {
+pub(super) fn training_app() -> Result<App, serde_json::Error> {
     let mut app = app();
     app.view = View::Training;
     app.training.runs = vec![

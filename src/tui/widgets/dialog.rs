@@ -40,14 +40,14 @@ pub(in crate::tui) fn destructive(action: &Action, stage_running: bool) -> bool 
 /// Draws `confirm` centered over `area`. The key line always shows; when the
 /// text does not fit, the paragraphs that do come first, then [`CUT`], then
 /// the start dialog's most-it-can-cost line, which is never cut. `y` is drawn
-/// as an error when `destructive`.
+/// as an error when `destructive`. Returns where the dialog is.
 pub(in crate::tui) fn render(
     frame: &mut Frame,
     area: Rect,
     confirm: &Confirm,
     theme: &Theme,
     destructive: bool,
-) {
+) -> Rect {
     let width = area.width.saturating_sub(2 * MARGIN).min(MAX_WIDTH);
     let pinned = match &confirm.action {
         Action::Start(plan) => start::cost_line(plan),
@@ -89,6 +89,7 @@ pub(in crate::tui) fn render(
         body,
     );
     frame.render_widget(Paragraph::new(answers), keys);
+    popup
 }
 
 /// Rows `paragraph` takes wrapped at `width`.
@@ -179,7 +180,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
         for (stage_running, style) in [(true, theme.error), (false, theme.accent)] {
             let destructive = destructive(&quit.action, stage_running);
-            terminal.draw(|frame| render(frame, frame.area(), &quit, &theme, destructive))?;
+            terminal.draw(|frame| {
+                render(frame, frame.area(), &quit, &theme, destructive);
+            })?;
             let yes = find(&terminal, "y quit").ok_or("no y key")?;
             assert_eq!(Some(yes.fg), style.fg, "stage running: {stage_running}");
             let no = find(&terminal, "n stay").ok_or("no n key")?;

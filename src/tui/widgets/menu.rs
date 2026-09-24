@@ -13,8 +13,14 @@ use crate::tui::theme::Theme;
 /// Width of the menu, borders included.
 const WIDTH: u16 = 70;
 
-/// Draws the menu with entry `selected` highlighted, centered over `area`.
-pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, selected: usize, theme: &Theme) {
+/// Draws the menu with entry `selected` highlighted, centered over `area`;
+/// returns where.
+pub(in crate::tui) fn render(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    theme: &Theme,
+) -> Rect {
     let rows: Vec<Row> = MENU
         .iter()
         .map(|(command, what)| {
@@ -39,4 +45,5 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, selected: usize, the
         .highlight_symbol("▶ ");
     let mut state = TableState::default().with_selected(Some(selected));
     frame.render_stateful_widget(table, popup, &mut state);
+    popup
 }

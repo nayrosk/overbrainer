@@ -12,8 +12,9 @@ use crate::tui::app::{App, Overlay, Severity, Status, View};
 use crate::tui::keys::{self, Context, HELP_HINT, Hint, SEPARATOR};
 use crate::tui::theme::Theme;
 
-/// Draws the footer in `area`.
-pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
+/// Draws the footer in `area`; returns where the status message is, when one
+/// shows.
+pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option<Rect> {
     let theme = &app.theme;
     let locked = app.lock().is_some();
     let spinner = app.motion.spinner();
@@ -40,6 +41,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(Paragraph::new(left), left_area);
     frame.render_widget(Paragraph::new(right), right_area);
+    app.status.as_ref().map(|_| left_area)
 }
 
 /// What the keys act on now.

@@ -52,7 +52,7 @@ pub async fn run(project_dir: &Path, logs: LogBuffer) -> anyhow::Result<()> {
     let color = ColorLevel::detect(&env);
     let theme = Theme::new(color);
     let mut app = App::new(project, logs, &theme, SystemTime::now());
-    app.motion = Motion::new(MotionLevel::detect(&env, color));
+    app.motion = Motion::new(MotionLevel::detect(&env, color)).colored(&theme);
     for warning in env.warnings() {
         tracing::warn!("{warning}");
     }

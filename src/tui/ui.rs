@@ -1,6 +1,6 @@
 //! Draws the whole frame from the app's state: the painted background, the
-//! header, the view, the status line and the overlays. Reads nothing but the
-//! app.
+//! header, the view, the footer and the overlays, then the color effects of
+//! motion over them. Reads nothing but the app: never the clock.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Tabs};
 
 use super::app::{App, Overlay, View};
+use super::motion::Areas;
 use super::views;
 use super::widgets::{dialog, help, menu, status, too_small};
 
@@ -17,6 +18,7 @@ const BRAND_WIDTH: u16 = 17;
 /// Draws `app` on `frame`.
 pub(super) fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.observe_motion();
     frame.buffer_mut().set_style(area, app.theme.base);
     if too_small::too_small(area) {
         too_small::render(frame, area);
@@ -29,22 +31,44 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(area);
     render_header(frame, header, app);
-    match app.view {
-        View::Dataset => views::dataset::render(frame, body, app),
-        View::Logs => views::logs::render(frame, body, app),
-        View::Pipeline => views::pipeline::render(frame, body, app),
+    let pulse = match app.view {
+        View::Dataset => {
+            views::dataset::render(frame, body, app);
+            None
+        },
+        View::Logs => {
+            views::logs::render(frame, body, app);
+            None
+        },
+        View::Pipeline => {
+            views::pipeline::render(frame, body, app);
+            None
+        },
         View::Training => views::training::render(frame, body, app),
-    }
-    status::render(frame, footer, app);
-    match &app.overlay {
-        Some(Overlay::Help) => help::render(frame, area, app),
+    };
+    let toast = status::render(frame, footer, app);
+    let overlay = match &app.overlay {
+        Some(Overlay::Help) => Some(help::render(frame, area, app)),
         Some(Overlay::Confirm(confirm)) => {
             let destructive = dialog::destructive(&confirm.action, app.pipeline_task.is_some());
-            dialog::render(frame, area, confirm, &app.theme, destructive);
+            Some(dialog::render(
+                frame,
+                area,
+                confirm,
+                &app.theme,
+                destructive,
+            ))
         },
-        Some(Overlay::Menu(selected)) => menu::render(frame, area, *selected, &app.theme),
-        None => {},
-    }
+        Some(Overlay::Menu(selected)) => Some(menu::render(frame, area, *selected, &app.theme)),
+        None => None,
+    };
+    let areas = Areas {
+        body,
+        overlay,
+        toast,
+        pulse: pulse.filter(|_| app.pulse_shown()),
+    };
+    app.motion.apply(frame.buffer_mut(), &areas);
 }
 
 /// The brand, the tabs and the project name.

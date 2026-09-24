@@ -10,8 +10,8 @@ use super::{centered, overlay};
 use crate::tui::app::App;
 use crate::tui::keys::{self, ACTION_WIDTH, HELP_PADDING, HELP_WIDTH, KEYS_WIDTH, KeyHelp};
 
-/// Draws the help overlay over `area`.
-pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
+/// Draws the help overlay over `area`; returns where.
+pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Rect {
     let theme = &app.theme;
     let row = |KeyHelp { keys, action }: &KeyHelp| {
         Row::new(vec![Span::styled(*keys, theme.key), Span::raw(*action)])
@@ -58,4 +58,5 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, popup);
     frame.render_widget(table, keys_area);
     frame.render_widget(note, note_area);
+    popup
 }

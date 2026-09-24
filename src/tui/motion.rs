@@ -3,15 +3,27 @@
 //! and the views read only that clock, never `Instant::now()`. Motion is `on`
 //! by default, `reduced` over SSH, and `off` under `NO_COLOR`;
 //! `OVERBRAINER_TUI_MOTION` chooses.
+//!
+//! The spinner and the smoothed bars are plain state. The color effects (a
+//! view or an overlay fading in, a new status fading in, the pulse of the
+//! followed run) are tachyonfx effects, applied to the drawn buffer as post
+//! processing, in 24-bit color only. Each is kept with the clock time it
+//! started at, and applied from a fresh copy at its age: drawing twice
+//! between two frames gives the same frame.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use super::app::App;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use tachyonfx::{Effect as Fx, Interpolation, fx};
+
+use super::app::{App, Overlay, View};
 use super::format::WORKING;
 use super::pipeline::{STAGES, StageState};
-use super::theme::{ColorLevel, LookEnv};
+use super::theme::{ColorLevel, LookEnv, Theme};
 
 /// The frames of the spinner of running work.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -25,6 +37,67 @@ pub(super) const FAST: Duration = Duration::from_millis(33);
 const TAU: f64 = 0.25;
 /// How close a bar gets to its target before it lands on it.
 const SETTLED: f64 = 0.001;
+/// How long a view takes to fade in.
+const VIEW_FADE: Duration = Duration::from_millis(160);
+/// How long an overlay takes to fade in.
+const OVERLAY_FADE: Duration = Duration::from_millis(140);
+/// How long a new status message takes to fade in.
+const TOAST_FADE: Duration = Duration::from_millis(200);
+/// Half the pulse of the followed run: from bright to dim crimson.
+const PULSE_HALF: Duration = Duration::from_millis(1200);
+/// The time between frames while only the pulse moves.
+pub(super) const PULSE: Duration = Duration::from_millis(100);
+
+/// What a color effect is for; one of each runs at most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Purpose {
+    /// The view shown fades in.
+    View,
+    /// The overlay opened fades in; it closes at once.
+    Overlay,
+    /// A new status message fades in.
+    Toast,
+}
+
+/// Where the color effects apply on the frame just drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Areas {
+    /// The view, between the header and the footer.
+    pub(super) body: Rect,
+    /// The overlay, if one is open.
+    pub(super) overlay: Option<Rect>,
+    /// The status message on the footer, if one shows.
+    pub(super) toast: Option<Rect>,
+    /// The followed run's `●`, if it shows.
+    pub(super) pulse: Option<Rect>,
+}
+
+/// The colors the effects fade from and to: the painted background, the
+/// overlay surface, and the dim end of the pulse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Colors {
+    bg: Color,
+    surface: Color,
+    dim: Color,
+}
+
+/// A color effect, and the clock time it started at.
+#[derive(Debug, Clone)]
+struct Running {
+    fx: Fx,
+    started: Duration,
+}
+
+/// What the screen showed at the last draw: a change starts an effect.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Seen {
+    /// The view, once one was drawn.
+    view: Option<View>,
+    /// Which overlay was open: its kind, or a dialog's title.
+    overlay: Option<String>,
+    /// The status message and when it was set.
+    status: Option<(String, SystemTime)>,
+}
 
 /// A progress bar smoothed on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,6 +153,15 @@ pub(super) struct Motion {
     clock: Duration,
     /// What each bar on screen shows, easing toward its true value.
     bars: BTreeMap<Bar, f64>,
+    /// The colors of the color effects; `None` when they are off (motion not
+    /// `on`, or no 24-bit color).
+    colors: Option<Colors>,
+    /// The color effects running.
+    effects: BTreeMap<Purpose, Running>,
+    /// The pulse: from bright crimson to dim, played forth and back.
+    pulse: Option<Fx>,
+    /// What the screen showed at the last draw.
+    seen: Seen,
 }
 
 impl Motion {
@@ -89,6 +171,121 @@ impl Motion {
             level,
             clock: Duration::ZERO,
             bars: BTreeMap::new(),
+            colors: None,
+            effects: BTreeMap::new(),
+            pulse: None,
+            seen: Seen::default(),
+        }
+    }
+
+    /// This motion with the color effects of `theme`: only when motion is
+    /// `on` and `theme` is in 24-bit color.
+    pub(super) fn colored(mut self, theme: &Theme) -> Self {
+        let colors = match (theme.base.bg, theme.surface.bg, theme.accent_dim.fg) {
+            (Some(bg), Some(surface), Some(dim)) => Some(Colors { bg, surface, dim }),
+            _ => None,
+        };
+        let on = self.level == MotionLevel::On && theme.level == ColorLevel::TrueColor;
+        self.colors = colors.filter(|_| on);
+        self.pulse = self
+            .colors
+            .map(|colors| fx::fade_to_fg(colors.dim, (PULSE_HALF, Interpolation::SineInOut)));
+        self
+    }
+
+    /// Whether the pulse shows: color effects are on.
+    pub(super) fn pulses(&self) -> bool {
+        self.pulse.is_some()
+    }
+
+    /// Starts the effect of `purpose` now, replacing one running.
+    fn start(&mut self, purpose: Purpose) {
+        let Some(colors) = self.colors else {
+            return;
+        };
+        let fx = match purpose {
+            Purpose::View => {
+                fx::fade_from(colors.bg, colors.bg, (VIEW_FADE, Interpolation::QuadOut))
+            },
+            Purpose::Overlay => fx::fade_from(
+                colors.surface,
+                colors.surface,
+                (OVERLAY_FADE, Interpolation::QuadOut),
+            ),
+            Purpose::Toast => fx::fade_from_fg(colors.bg, (TOAST_FADE, Interpolation::QuadOut)),
+        };
+        self.effects.insert(
+            purpose,
+            Running {
+                fx,
+                started: self.clock,
+            },
+        );
+    }
+
+    /// Starts the effect of each change between the last draw and `now`: a
+    /// new view, an overlay opened (closing one is instant), a new status.
+    fn observe(&mut self, now: Seen) {
+        if self.seen.view.is_some() && self.seen.view != now.view {
+            self.start(Purpose::View);
+        }
+        match &now.overlay {
+            Some(_) if now.overlay != self.seen.overlay => self.start(Purpose::Overlay),
+            Some(_) => {},
+            None => {
+                self.effects.remove(&Purpose::Overlay);
+            },
+        }
+        if now.status.is_some() && now.status != self.seen.status {
+            self.start(Purpose::Toast);
+        }
+        self.seen = now;
+    }
+
+    /// Forgets the effects that ended; returns whether any ran.
+    fn settle_effects(&mut self) -> bool {
+        let ran = !self.effects.is_empty();
+        let clock = self.clock;
+        self.effects.retain(|_, running| {
+            let length = running
+                .fx
+                .timer()
+                .map_or(Duration::ZERO, |timer| timer.duration());
+            clock.saturating_sub(running.started) < length
+        });
+        ran
+    }
+
+    /// The pulse's place in its swing: from 0 (bright) up to [`PULSE_HALF`]
+    /// (dim) and back, every two halves of the clock.
+    fn pulse_age(&self) -> Duration {
+        let period = PULSE_HALF.as_millis() * 2;
+        let phase = u64::try_from(self.clock.as_millis() % period).unwrap_or(0);
+        let half = u64::try_from(PULSE_HALF.as_millis()).unwrap_or(0);
+        Duration::from_millis(if phase <= half {
+            phase
+        } else {
+            2 * half - phase
+        })
+    }
+
+    /// Applies the color effects running, and the pulse, to `buffer`, each on
+    /// its area of `areas`: a fresh copy of each effect played to its age.
+    pub(super) fn apply(&self, buffer: &mut Buffer, areas: &Areas) {
+        for (purpose, running) in &self.effects {
+            let area = match purpose {
+                Purpose::View => Some(areas.body),
+                Purpose::Overlay => areas.overlay,
+                Purpose::Toast => areas.toast,
+            };
+            if let Some(area) = area {
+                let mut fx = running.fx.clone();
+                fx.process(self.clock.saturating_sub(running.started), buffer, area);
+            }
+        }
+        if let (Some(pulse), Some(area)) = (&self.pulse, areas.pulse) {
+            let mut fx = pulse.clone();
+            fx.process(self.pulse_age(), buffer, area);
         }
     }
 
@@ -170,16 +367,45 @@ impl Motion {
 
 impl App {
     /// How long until the loop must draw the next frame, while something moves
-    /// on screen: [`FAST`] while a bar eases, [`SPIN`] while a spinner shows;
-    /// `None` when nothing moves, so an idle TUI never wakes up.
+    /// on screen: [`FAST`] while a fade runs or a bar eases, [`SPIN`] while a
+    /// spinner shows, [`PULSE`] while the pulse does; `None` when nothing
+    /// moves, so an idle TUI never wakes up.
     pub(super) fn frame_period(&self) -> Option<Duration> {
         if self.motion.level() == MotionLevel::Off {
             return None;
         }
-        if self.motion.easing(&self.bar_targets()) {
+        if !self.motion.effects.is_empty() || self.motion.easing(&self.bar_targets()) {
             return Some(FAST);
         }
-        (!self.work().is_empty()).then_some(SPIN)
+        if !self.work().is_empty() {
+            return Some(SPIN);
+        }
+        self.pulse_shown().then_some(PULSE)
+    }
+
+    /// Whether the followed run's `●` pulses on screen: the Training view on a
+    /// run a task follows, with color effects on.
+    pub(super) fn pulse_shown(&self) -> bool {
+        self.motion.pulses() && self.view == View::Training && self.training.selected_followed()
+    }
+
+    /// Starts the color effects of what changed since the last draw: called
+    /// by the render, before it draws.
+    pub(super) fn observe_motion(&mut self) {
+        let overlay = self.overlay.as_ref().map(|overlay| match overlay {
+            Overlay::Help => "help".to_string(),
+            Overlay::Menu(_) => "menu".to_string(),
+            Overlay::Confirm(confirm) => confirm.title.clone(),
+        });
+        let status = self
+            .status
+            .as_ref()
+            .map(|status| (status.text.clone(), status.at));
+        self.motion.observe(Seen {
+            view: Some(self.view),
+            overlay,
+            status,
+        });
     }
 
     /// The true value of every smoothed bar, and whether it lands on it at
@@ -219,6 +445,9 @@ impl App {
         if self.load.is_some() && self.motion.shows_load(self.load_at) != loading {
             self.dirty = true;
         }
+        if self.motion.settle_effects() || self.pulse_shown() {
+            self.dirty = true;
+        }
     }
 }
 
@@ -226,8 +455,16 @@ impl App {
 mod tests {
     use std::ffi::OsString;
 
+    use crossterm::event::KeyCode;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Cell;
+
     use super::*;
-    use crate::tui::snapshots::{app, draw, pipeline_running, text};
+    use crate::tui::app::Severity;
+    use crate::tui::snapshots::{
+        app, dataset_app, draw, key, pipeline_running, text, training_app,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -390,5 +627,173 @@ mod tests {
         still.start();
         assert!(shown(&mut still)?, "at once when motion is off");
         Ok(())
+    }
+
+    /// `app` with motion on, and the color effects of its 24-bit theme.
+    fn moving(mut app: App) -> App {
+        app.motion = Motion::new(MotionLevel::On).colored(&app.theme);
+        app
+    }
+
+    /// The 24-bit background every fade starts from.
+    const BG: Color = Color::Rgb(0x19, 0x11, 0x14);
+
+    /// The cell at `x`, `y` of `terminal`.
+    fn cell(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> Result<Cell, String> {
+        terminal
+            .backend()
+            .buffer()
+            .cell((x, y))
+            .cloned()
+            .ok_or_else(|| format!("no cell at {x}, {y}"))
+    }
+
+    #[test]
+    fn a_view_fades_in_from_the_background() -> TestResult {
+        let mut app = moving(dataset_app());
+        draw(&mut app, 80, 24)?;
+        app.on_input(&key(KeyCode::Char('2')));
+        let terminal = draw(&mut app, 80, 24)?;
+        for y in 1..23 {
+            for x in 0..80 {
+                let cell = cell(&terminal, x, y)?;
+                assert_eq!((cell.fg, cell.bg), (BG, BG), "at {x}, {y}");
+            }
+        }
+        assert_eq!(app.frame_period(), Some(FAST));
+        app.on_frame(VIEW_FADE);
+        let faded = draw(&mut app, 80, 24)?;
+        let mut still = dataset_app();
+        still.on_input(&key(KeyCode::Char('2')));
+        assert_eq!(
+            faded.backend().buffer(),
+            draw(&mut still, 80, 24)?.backend().buffer()
+        );
+        assert_eq!(app.frame_period(), None, "idle once the fade ended");
+        Ok(())
+    }
+
+    #[test]
+    fn an_overlay_fades_in_and_closes_at_once() -> TestResult {
+        let mut app = moving(app());
+        draw(&mut app, 80, 24)?;
+        app.on_input(&key(KeyCode::Char('?')));
+        let surface = Color::Rgb(0x20, 0x13, 0x18);
+        let rows = text(&draw(&mut app, 80, 24)?);
+        let y = rows
+            .iter()
+            .position(|row| row.contains("Everywhere"))
+            .ok_or("no help")?;
+        let x = rows[y].chars().position(|c| c == 'E').ok_or("no E")?;
+        let (x, y) = (u16::try_from(x)?, u16::try_from(y)?);
+        assert_eq!(cell(&draw(&mut app, 80, 24)?, x, y)?.fg, surface);
+        app.on_frame(OVERLAY_FADE);
+        let title = app.theme.title.fg.ok_or("no title color")?;
+        assert_eq!(cell(&draw(&mut app, 80, 24)?, x, y)?.fg, title);
+        app.on_input(&key(KeyCode::Char('?')));
+        app.on_input(&key(KeyCode::Esc));
+        draw(&mut app, 80, 24)?;
+        assert!(
+            !app.motion.effects.contains_key(&Purpose::Overlay),
+            "closed at once"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_status_fades_in() -> TestResult {
+        let mut app = moving(app());
+        draw(&mut app, 80, 24)?;
+        app.say(Severity::Info, "deletion saved");
+        assert_eq!(cell(&draw(&mut app, 80, 24)?, 1, 23)?.fg, BG);
+        app.on_frame(TOAST_FADE);
+        let ok = app.theme.ok.fg.ok_or("no ok color")?;
+        assert_eq!(cell(&draw(&mut app, 80, 24)?, 1, 23)?.fg, ok);
+        Ok(())
+    }
+
+    #[test]
+    fn the_followed_run_pulses_between_two_crimsons() -> TestResult {
+        let mut app = moving(training_app()?);
+        let bright = app.theme.title.fg.ok_or("no bright")?;
+        let dim = app.theme.accent_dim.fg.ok_or("no dim")?;
+        let rows = text(&draw(&mut app, 80, 24)?);
+        let y = rows
+            .iter()
+            .position(|row| row.contains('●'))
+            .ok_or("no marker")?;
+        let y = u16::try_from(y)?;
+        assert_eq!(cell(&draw(&mut app, 80, 24)?, 2, y)?.symbol(), "●");
+        assert_eq!(cell(&draw(&mut app, 80, 24)?, 2, y)?.fg, bright);
+        app.on_frame(PULSE_HALF);
+        assert_eq!(cell(&draw(&mut app, 80, 24)?, 2, y)?.fg, dim);
+        app.on_frame(PULSE_HALF);
+        assert_eq!(cell(&draw(&mut app, 80, 24)?, 2, y)?.fg, bright);
+        assert!(app.pulse_shown());
+        app.training.tasks.clear();
+        assert!(!app.pulse_shown(), "no run followed");
+        Ok(())
+    }
+
+    /// Symbols and styles of `terminal`, a spinner frame and [`WORKING`] read
+    /// alike.
+    fn settled(terminal: &Terminal<TestBackend>) -> Vec<(String, ratatui::style::Style)> {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| {
+                let symbol = if SPINNER.contains(&cell.symbol()) {
+                    WORKING
+                } else {
+                    cell.symbol()
+                };
+                (symbol.to_string(), cell.style())
+            })
+            .collect()
+    }
+
+    /// Long after every change, motion on draws what motion off draws, the
+    /// pulse at its bright end.
+    #[test]
+    fn motion_on_settles_to_what_motion_off_draws() -> TestResult {
+        let changes = |app: &mut App| -> TestResult {
+            app.view = View::Dataset;
+            draw(app, 80, 24)?;
+            app.on_input(&key(KeyCode::Char('3')));
+            app.say(Severity::Warn, "refused: a stage is running");
+            app.overlay = Some(Overlay::Help);
+            draw(app, 80, 24)?;
+            Ok(())
+        };
+        let mut on = moving(training_app()?);
+        changes(&mut on)?;
+        on.on_frame(PULSE_HALF * 20);
+        let mut off = training_app()?;
+        changes(&mut off)?;
+        assert_eq!(
+            settled(&draw(&mut on, 80, 24)?),
+            settled(&draw(&mut off, 80, 24)?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn color_effects_need_motion_on_and_24_bit_color() {
+        let truecolor = Theme::new(ColorLevel::TrueColor);
+        assert!(Motion::new(MotionLevel::On).colored(&truecolor).pulses());
+        assert!(
+            !Motion::new(MotionLevel::Reduced)
+                .colored(&truecolor)
+                .pulses()
+        );
+        let indexed = Theme::new(ColorLevel::Indexed);
+        assert!(!Motion::new(MotionLevel::On).colored(&indexed).pulses());
+        assert!(
+            !Motion::new(MotionLevel::On)
+                .colored(&Theme::mono())
+                .pulses()
+        );
     }
 }
