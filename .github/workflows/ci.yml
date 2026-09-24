@@ -135,6 +135,36 @@ jobs:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
+  crates-metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the categories and keywords crates.io accepts
+        # `cargo publish --dry-run` does not check them; crates.io refuses the
+        # upload itself when a category slug is unknown.
+        run: |
+          curl -fsS -A "overbrainer-ci (https://github.com/nayrosk/overbrainer)" \
+            https://crates.io/api/v1/category_slugs > slugs.json
+          python3 - <<'EOF'
+          import json, re, sys, tomllib
+          package = tomllib.load(open("Cargo.toml", "rb"))["package"]
+          known = {c["slug"] for c in json.load(open("slugs.json"))["category_slugs"]}
+          problems = [f"unknown category: {c}" for c in package.get("categories", []) if c not in known]
+          keywords = package.get("keywords", [])
+          if len(keywords) > 5:
+              problems.append(f"{len(keywords)} keywords, crates.io takes 5 at most")
+          problems += [
+              f"invalid keyword: {k}"
+              for k in keywords
+              if len(k) > 20 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_\-+]*", k)
+          ]
+          for problem in problems:
+              print(f"::error file=Cargo.toml::{problem}")
+          sys.exit(1 if problems else 0)
+          EOF
+
   commits:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
