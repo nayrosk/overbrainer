@@ -2,15 +2,16 @@
 
 Distill a large "parent" LLM into a smaller open-weights "child" model, from the command line.
 
+[![crates.io](https://img.shields.io/crates/v/overbrainer.svg)](https://crates.io/crates/overbrainer)
 [![CI](https://github.com/nayrosk/overbrainer/actions/workflows/ci.yml/badge.svg)](https://github.com/nayrosk/overbrainer/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Latest release](https://img.shields.io/github/v/release/nayrosk/overbrainer?include_prereleases&sort=semver)](https://github.com/nayrosk/overbrainer/releases)
+[![Latest release](https://img.shields.io/github/v/release/nayrosk/overbrainer?sort=semver)](https://github.com/nayrosk/overbrainer/releases)
 
 ![overbrainer tui: the dataset tree with an answer's reasoning, the topic stats, the help, a training run's loss chart and a dialog](docs/assets/tui-tour.gif)
 
 overbrainer asks an LLM for questions on your topics, collects answers and their reasoning from a parent model, then fine-tunes a child model with Axolotl on this machine, over SSH or on Runpod. A terminal UI shows the dataset and the training runs as they progress.
 
-Status: early development, not yet released.
+Status: early development. Expect breaking changes between minor versions until 1.0.
 
 ## How it works
 
@@ -31,10 +32,10 @@ A generator model writes the subtopics and questions, and drops near-duplicates.
 ## Install
 
 ```bash
-cargo install --locked --git https://github.com/nayrosk/overbrainer
+cargo install --locked overbrainer
 ```
 
-There are no prebuilt binaries. You need:
+The latest code from `main` installs with `cargo install --locked --git https://github.com/nayrosk/overbrainer`. There are no prebuilt binaries. You need:
 
 - Rust 1.89 or newer to build it. CI builds and tests on Linux.
 - `ssh` for SSH targets, and `ssh` with `ssh-keygen` for Runpod targets.
