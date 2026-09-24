@@ -1519,11 +1519,12 @@ mod tests {
     /// The Logs view at 80x24 shows 20 lines.
     const ROWS: usize = 20;
 
-    /// The title row and the rows of lines of the Logs view drawn at 80x24.
+    /// The title row and the rows of lines of the Logs view drawn at 80x24:
+    /// the title, a blank row, then the lines.
     fn logs_view(app: &mut App) -> Result<(String, Vec<String>), Infallible> {
         let rows = text(&draw(app, 80, 24)?);
         let title = rows.get(1).cloned().unwrap_or_default();
-        Ok((title, rows.into_iter().skip(2).take(ROWS).collect()))
+        Ok((title, rows.into_iter().skip(3).take(ROWS).collect()))
     }
 
     #[test]

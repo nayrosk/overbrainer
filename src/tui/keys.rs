@@ -2,13 +2,15 @@
 
 use super::app::View;
 
-/// Width of the help overlay, borders included.
-pub(super) const HELP_WIDTH: u16 = 76;
+/// Width of the help overlay, borders included: it fits 80 columns.
+pub(super) const HELP_WIDTH: u16 = 78;
+/// Columns of padding inside the overlay's borders, on each side.
+pub(super) const HELP_PADDING: u16 = 1;
 /// Width of the overlay's key column.
 pub(super) const KEYS_WIDTH: u16 = 26;
-/// Room left for an action: the overlay less its two borders, the key column and
-/// the space between the columns.
-pub(super) const ACTION_WIDTH: u16 = HELP_WIDTH - 2 - KEYS_WIDTH - 1;
+/// Room left for an action: the overlay less its two borders, its padding, the
+/// key column and the space between the columns.
+pub(super) const ACTION_WIDTH: u16 = HELP_WIDTH - 2 - 2 * HELP_PADDING - KEYS_WIDTH - 1;
 
 /// One row of the help overlay.
 pub(super) struct KeyHelp {

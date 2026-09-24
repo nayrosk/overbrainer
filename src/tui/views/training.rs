@@ -4,12 +4,13 @@
 use std::fmt::Write as _;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::Style;
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Chart, Dataset, GraphType, Paragraph, Row, Sparkline, Table, TableState, Wrap,
+    Axis, Block, BorderType, Chart, Dataset, GraphType, Padding, Paragraph, Row, Sparkline, Table,
+    TableState, Wrap,
 };
 
 use crate::runpod::{PodRecord, PodState, PodStatus};
@@ -33,26 +34,17 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     let [list, detail] =
         Layout::vertical([Constraint::Length(shown + 3), Constraint::Fill(1)]).areas(area);
     render_runs(frame, list, app);
+    // The selected run's detail has no frame: a two-column margin.
+    let inner = detail.inner(Margin::new(2, 0));
     let Some(row) = view.selected_run() else {
         let text = view
             .error
             .clone()
             .unwrap_or_else(|| "no run yet".to_string());
-        let block = Block::bordered()
-            .title(Span::styled(" run ", theme.title))
-            .border_style(theme.dim);
-        frame.render_widget(
-            Paragraph::new(Span::styled(text, theme.dim)).block(block),
-            detail,
-        );
+        frame.render_widget(Paragraph::new(Span::styled(text, theme.dim)), inner);
         return;
     };
     let follow = view.task_of(&row.record.id).map(|(_, follow)| follow);
-    let block = Block::bordered()
-        .title(Span::styled(format!(" {} ", row.record.id), theme.title))
-        .border_style(theme.dim);
-    let inner = block.inner(detail);
-    frame.render_widget(block, detail);
     let series = view
         .series
         .get(&row.record.id)
@@ -77,10 +69,10 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(message_rows),
     ])
     .areas(inner);
-    frame.render_widget(
-        Paragraph::new(status_line(&row.record, series, (follow, ended), theme)),
-        status,
-    );
+    let mut line = status_line(&row.record, series, (follow, ended), theme);
+    line.spans
+        .insert(0, Span::styled(format!("{}  ", row.record.id), theme.title));
+    frame.render_widget(Paragraph::new(line), status);
     if let Some(pod) = pod {
         frame.render_widget(pod, pod_area);
     }
@@ -147,6 +139,9 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
     .row_highlight_style(theme.selected)
     .block(
         Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(theme.border_focus)
+            .padding(Padding::horizontal(1))
             .title(Span::styled(
                 if view.error.is_some() && !view.runs.is_empty() {
                     " runs (stale: cannot list the runs) "
@@ -154,8 +149,7 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
                     " runs "
                 },
                 theme.title,
-            ))
-            .border_style(theme.dim),
+            )),
     );
     let mut state =
         TableState::default().with_selected((!view.runs.is_empty()).then_some(view.selected));

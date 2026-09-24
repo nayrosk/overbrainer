@@ -2,44 +2,39 @@
 //! summary lines of the current or last pipeline task.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, LineGauge, Paragraph, Wrap};
+use ratatui::widgets::{LineGauge, Paragraph, Wrap};
 
 use crate::events::Stage;
 use crate::tui::app::App;
 use crate::tui::pipeline::{PipelineView, STAGES, StageState, command_name};
 use crate::tui::theme::Theme;
 
-/// Draws the Pipeline view in `area`.
+/// Draws the Pipeline view in `area`: no frame, a two-column margin, a title
+/// row that also heads the count columns, the stage rows, a blank row, then
+/// the details.
 pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let view = &app.pipeline;
-    let title = match (view.command, view.running) {
-        (Some(command), true) => format!(" pipeline: {} running ", command_name(command)),
-        (Some(command), false) => format!(" pipeline: last run {} ", command_name(command)),
-        (None, _) => " pipeline ".to_string(),
-    };
-    let block = Block::bordered()
-        .title(Span::styled(title, theme.title))
-        .border_style(theme.dim);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let [header, rows, rest] = Layout::vertical([
+    let area = area.inner(Margin::new(2, 0));
+    let [title_row, rows, _, rest] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(4),
+        Constraint::Length(1),
         Constraint::Fill(1),
     ])
-    .areas(inner);
-    let [name, state, progress, counts] = columns(header);
-    for (text, column) in [
-        (" stage", name),
-        ("state", state),
-        ("progress", progress),
-        ("in flight  retries  failed", counts),
-    ] {
-        frame.render_widget(Paragraph::new(Span::styled(text, theme.dim)), column);
-    }
+    .areas(area);
+    let title = match view.command {
+        Some(command) => format!("Pipeline · {}", command_name(command)),
+        None => "Pipeline".to_string(),
+    };
+    frame.render_widget(Paragraph::new(Span::styled(title, theme.title)), title_row);
+    let [.., counts] = columns(title_row);
+    frame.render_widget(
+        Paragraph::new(Span::styled(" in flight  retries  failed", theme.dim)),
+        counts,
+    );
     let row_areas = Layout::vertical([Constraint::Length(1); 4]).split(rows);
     for (stage, row_area) in STAGES.iter().zip(row_areas.iter()) {
         render_row(frame, *row_area, view, *stage, theme);
@@ -71,7 +66,7 @@ fn columns(area: Rect) -> [Rect; 4] {
 fn render_row(frame: &mut Frame, area: Rect, view: &PipelineView, stage: Stage, theme: &Theme) {
     let [name_area, state_area, gauge_area, counts_area] = columns(area);
     let row = view.row(stage);
-    frame.render_widget(Paragraph::new(format!(" {stage}")), name_area);
+    frame.render_widget(Paragraph::new(stage.to_string()), name_area);
     let (label, style) = match row.state {
         StageState::Idle => ("", theme.dim),
         StageState::Pending => ("pending", theme.dim),
@@ -113,7 +108,7 @@ fn details(view: &PipelineView, theme: &Theme, errors: usize) -> Vec<Line<'stati
     let mut lines = Vec::new();
     if view.command.is_none() {
         lines.push(Line::from(Span::styled(
-            " nothing ran yet in this TUI: r runs a stage",
+            "nothing ran yet in this TUI: r runs a stage",
             theme.dim,
         )));
         return lines;
@@ -135,24 +130,25 @@ fn details(view: &PipelineView, theme: &Theme, errors: usize) -> Vec<Line<'stati
             |cost| format!("cost ${cost:.4}"),
         );
     lines.push(Line::from(format!(
-        " tokens  in {}  out {}        {cost}",
+        "tokens  in {}  out {}        {cost}",
         usage.input_tokens, usage.output_tokens
     )));
     if view.skipped > 0 {
         lines.push(Line::from(Span::styled(
             format!(
-                " {} events skipped: counts catch up when each stage finishes",
+                "{} events skipped: counts catch up when each stage finishes",
                 view.skipped
             ),
             theme.warn,
         )));
     }
     if errors > 0 {
-        lines.push(Line::from(Span::styled(" last errors", theme.title)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Last errors", theme.title)));
         let older = view.errors.len().saturating_sub(errors);
         for failure in view.errors.iter().skip(older) {
             lines.push(Line::from(format!(
-                "   {} {}  {}",
+                "  {} {}  {}",
                 failure.stage,
                 short(&failure.id),
                 failure.error
@@ -160,13 +156,14 @@ fn details(view: &PipelineView, theme: &Theme, errors: usize) -> Vec<Line<'stati
         }
     }
     if !view.results.is_empty() || view.outcome.is_some() {
-        lines.push(Line::from(Span::styled(" results", theme.title)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Results", theme.title)));
     }
     for result in &view.results {
-        lines.push(Line::from(format!("   {result}")));
+        lines.push(Line::from(format!("  {result}")));
     }
     if let Some(Err(error)) = &view.outcome {
-        lines.push(Line::from(Span::styled(format!("   {error}"), theme.error)));
+        lines.push(Line::from(Span::styled(format!("  {error}"), theme.error)));
     }
     lines
 }

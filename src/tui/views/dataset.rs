@@ -3,7 +3,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Row, Table, Wrap};
 use tui_tree_widget::Tree;
 
 use crate::dataset::{AnswerText, Example, FinishReason, Id, ReasoningKind};
@@ -11,6 +11,14 @@ use crate::pipeline::SplitClass;
 use crate::tui::app::App;
 use crate::tui::dataset::{Model, Node, Stats, exclusion, sizes};
 use crate::tui::theme::Theme;
+
+/// A rounded pane with a column of padding, its border drawn in `border`.
+fn pane<'a>(border: ratatui::style::Style) -> Block<'a> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border)
+        .padding(Padding::horizontal(1))
+}
 
 /// Draws the Dataset view in `area`.
 pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -23,7 +31,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             || Line::from(Span::styled("loading data/...", theme.dim)),
             |error| Line::from(Span::styled(error, theme.error)),
         );
-        let block = Block::bordered().title(Span::styled(" data ", theme.title));
+        let block = pane(theme.border_focus).title(Span::styled(" data ", theme.title));
         frame.render_widget(
             Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
             area,
@@ -40,10 +48,9 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         (None, true) => " / filter ".to_string(),
         (None, false) => format!(" filter: {} (Esc clears) ", view.filter),
     };
-    let block = Block::bordered()
+    let block = pane(theme.border_focus)
         .title(Span::styled(title, theme.title))
-        .title_bottom(Span::styled(bottom, theme.dim))
-        .border_style(theme.dim);
+        .title_bottom(Span::styled(bottom, theme.dim));
     match &model.items {
         Ok(items) if items.is_empty() => {
             let note = if model.matches.is_some() {
@@ -98,7 +105,7 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
         None => " detail ",
     };
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let inner_width = area.width.saturating_sub(2);
+    let inner_width = area.width.saturating_sub(4);
     let height = usize::from(area.height.saturating_sub(2));
     let total = paragraph.line_count(inner_width);
     let last = u16::try_from(total.saturating_sub(height)).unwrap_or(u16::MAX);
@@ -108,10 +115,9 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
         (usize::from(view.scroll) + height).min(total),
         total
     );
-    let block = Block::bordered()
+    let block = pane(theme.border)
         .title(Span::styled(title, theme.title))
-        .title_bottom(Line::from(Span::styled(position, theme.dim)).right_aligned())
-        .border_style(theme.dim);
+        .title_bottom(Line::from(Span::styled(position, theme.dim)).right_aligned());
     frame.render_widget(paragraph.scroll((view.scroll, 0)).block(block), area);
 }
 
@@ -342,9 +348,7 @@ fn render_stats(frame: &mut Frame, area: Rect, app: &App, topic: Option<&str>) {
         .map(|(label, value)| Row::new(vec![Span::styled(label, theme.dim), Span::raw(value)]))
         .collect();
     let title = format!(" stats: {} ", topic.unwrap_or("all topics"));
-    let block = Block::bordered()
-        .title(Span::styled(title, theme.title))
-        .border_style(theme.dim);
+    let block = pane(theme.border).title(Span::styled(title, theme.title));
     let table = Table::new(rows, [Constraint::Length(16), Constraint::Fill(1)]).block(block);
     frame.render_widget(table, area);
 }

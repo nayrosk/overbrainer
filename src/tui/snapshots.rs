@@ -973,8 +973,8 @@ fn a_tall_dialog_keeps_its_keys_and_its_cost_at_80x24() -> TestResult {
     for shown in [
         "warning     warning number 1 about this run",
         "warning     warning number 4 about this run",
-        "[y] start",
-        "[n] cancel",
+        "y start",
+        "n cancel",
         "max_hours   6",
         "…",
         "target      gpu_cloud",
@@ -990,7 +990,7 @@ fn a_tall_dialog_keeps_its_keys_and_its_cost_at_80x24() -> TestResult {
     }
     app.on_input(&key(KeyCode::Char('q')));
     let rows = text(&draw(&mut app, 80, 24)?).join("\n");
-    for shown in ["[y] quit", "[n] stay", "…"] {
+    for shown in ["y quit", "n stay", "…"] {
         assert!(rows.contains(shown), "{shown}\n{rows}");
     }
     Ok(())
@@ -1049,15 +1049,19 @@ fn training_of_a_run_whose_pod_is_kept() -> TestResult {
     Ok(())
 }
 
-/// The pod line of `app` drawn at 120x40: rows 9 and 10 of the detail pane,
-/// joined as one text.
+/// The pod line of `app` drawn at 120x40: the row that starts with `pod ` and
+/// the row under it, joined as one text.
 fn pod_text(app: &mut App) -> Result<String, Infallible> {
     let rows = text(&draw(app, 120, 40)?);
+    let start = rows
+        .iter()
+        .position(|row| row.trim_start().starts_with("pod "))
+        .unwrap_or(rows.len());
     let words: Vec<&str> = rows
         .iter()
-        .skip(9)
+        .skip(start)
         .take(2)
-        .map(|row| row.trim_matches('│').trim())
+        .map(|row| row.trim())
         .collect();
     Ok(words.join(" "))
 }

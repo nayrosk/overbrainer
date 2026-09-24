@@ -6,7 +6,11 @@ pub(super) mod menu;
 pub(super) mod status;
 pub(super) mod too_small;
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::widgets::{Block, BorderType, Clear};
+
+use crate::tui::theme::Theme;
 
 /// A `width` by `height` rectangle centered in `area`, shrunk to fit it.
 pub(super) fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -17,4 +21,14 @@ pub(super) fn centered(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(row);
     cell
+}
+
+/// Clears `popup` and paints it as an overlay: the surface color, and a
+/// rounded crimson border. Returns the block, to draw its title and content.
+pub(super) fn overlay<'a>(frame: &mut Frame, popup: Rect, theme: &Theme) -> Block<'a> {
+    frame.render_widget(Clear, popup);
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent)
+        .style(theme.surface)
 }
