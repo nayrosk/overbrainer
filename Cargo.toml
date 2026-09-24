@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/nayrosk/overbrainer"
 readme = "README.md"
 keywords = ["llm", "distillation", "fine-tuning", "synthetic-data", "cli"]
-categories = ["command-line-utilities", "science", "science::ml"]
+categories = ["command-line-utilities", "science"]
 include = ["src/**/*", "templates/**/*", "LICENSE-*", "README.md"]
 
 [lints.rust]
