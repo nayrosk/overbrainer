@@ -114,7 +114,7 @@ jobs:
           bin="target/$TARGET/release/overbrainer"
           description="$(file "$bin")"
           echo "$description"
-          if ! printf '%s\n' "$description" | grep -Eq 'static(-pie)? linked'; then
+          if ! printf '%s\n' "$description" | grep -Eq 'static-pie linked|statically linked'; then
             echo "::error::$bin is not statically linked"
             exit 1
           fi
