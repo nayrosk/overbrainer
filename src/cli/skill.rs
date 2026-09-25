@@ -110,22 +110,31 @@ mod tests {
         Ok(())
     }
 
-    /// Every command line in `SKILL.md`: the words after `overbrainer` in a
+    /// Every command line in `text`: the words after `overbrainer` in a
     /// backticked span, or on a line that starts with `overbrainer`.
-    fn command_lines() -> Vec<Vec<&'static str>> {
+    fn command_lines(text: &str) -> Vec<Vec<&str>> {
         let mut lines = Vec::new();
-        for line in SKILL.lines() {
+        for line in text.lines() {
             if let Some(rest) = line.trim_start().strip_prefix("overbrainer ") {
-                lines.push(words(rest));
+                lines.extend(chained(rest));
             }
-            for (_, rest) in line
-                .match_indices("`overbrainer ")
-                .map(|(i, m)| (i, &line[i + m.len()..]))
-            {
-                lines.push(words(rest.split('`').next().unwrap_or_default()));
+            for (i, m) in line.match_indices("`overbrainer ") {
+                let span = line[i + m.len()..].split('`').next().unwrap_or_default();
+                lines.extend(chained(span));
             }
         }
         lines
+    }
+
+    /// The words of `text`, the rest of a command after `overbrainer`, and of every
+    /// `&& overbrainer ...` chained after it.
+    fn chained(text: &str) -> Vec<Vec<&str>> {
+        let mut segments = text.split("&&");
+        let first = segments.next().unwrap_or_default();
+        std::iter::once(first)
+            .chain(segments.filter_map(|segment| segment.trim_start().strip_prefix("overbrainer ")))
+            .map(words)
+            .collect()
     }
 
     fn words(text: &str) -> Vec<&str> {
@@ -136,7 +145,14 @@ mod tests {
             .collect()
     }
 
-    /// Checks that the subcommands and `--flags` in `words` exist.
+    /// A placeholder such as `RUN_ID` or `NAME`.
+    fn is_placeholder(word: &str) -> bool {
+        word.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// Checks that the subcommands and `--flags` in `words` exist, and that the
+    /// command does not stop where a subcommand is required.
     fn check(root: &clap::Command, words: &[&str]) -> Result<(), String> {
         let mut command = root;
         let mut words = words.iter();
@@ -151,25 +167,85 @@ mod tests {
                 }
             } else if word == "-C" {
                 words.next();
-            } else if command.has_subcommands() && word.chars().all(|c| c.is_ascii_lowercase()) {
+            } else if command.has_subcommands() {
+                if is_placeholder(word) {
+                    // Stands for any subcommand: nothing more to check.
+                    return Ok(());
+                }
                 command = command
                     .find_subcommand(word)
                     .ok_or_else(|| format!("{} has no subcommand {word}", command.get_name()))?;
             }
+        }
+        if command.is_subcommand_required_set() {
+            return Err(format!("{} needs a subcommand", command.get_name()));
         }
         Ok(())
     }
 
     #[test]
     fn every_command_in_the_skill_exists() -> Result<(), String> {
-        let mut root = Cli::command();
-        root.build();
-        let lines = command_lines();
+        let root = built_cli();
+        let lines = command_lines(SKILL);
         assert!(lines.len() > 20, "found only {} command lines", lines.len());
         for words in lines {
             check(&root, &words).map_err(|e| format!("`overbrainer {}`: {e}", words.join(" ")))?;
         }
         Ok(())
+    }
+
+    fn built_cli() -> clap::Command {
+        let mut root = Cli::command();
+        root.build();
+        root
+    }
+
+    #[test]
+    fn check_accepts_real_commands() -> Result<(), String> {
+        let root = built_cli();
+        for line in [
+            "train",
+            "train --target NAME",
+            "train attach RUN_ID",
+            "runs ls",
+            "pod rm RUN_ID --force",
+            "config check --resolve",
+            "-C DIR answers --topic NAME",
+        ] {
+            check(&root, &words(line)).map_err(|e| format!("`{line}`: {e}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn check_rejects_wrong_commands() {
+        let root = built_cli();
+        for line in [
+            "runs-ls",
+            "runs",
+            "pod",
+            "config",
+            "skill",
+            "config chek",
+            "pod rm RUN_ID --nope",
+        ] {
+            assert!(check(&root, &words(line)).is_err(), "`{line}` passed");
+        }
+    }
+
+    #[test]
+    fn command_lines_include_every_chained_command() {
+        let text = "overbrainer init x && cd x && overbrainer runs ls\n\
+                    Run `overbrainer pod ls && overbrainer config check`.";
+        assert_eq!(
+            command_lines(text),
+            [
+                vec!["init", "x"],
+                vec!["runs", "ls"],
+                vec!["pod", "ls"],
+                vec!["config", "check"],
+            ]
+        );
     }
 
     #[test]
