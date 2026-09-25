@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/nayrosk/overbrainer/compare/v0.1.1...v0.2.0) - 2026-09-25
+
+### Added
+
+- *(skill)* ship an agent skill and install it with overbrainer skill install ([#14](https://github.com/nayrosk/overbrainer/pull/14))
+- *(cli)* complete run IDs, topics and targets in bash, zsh and fish ([#13](https://github.com/nayrosk/overbrainer/pull/13))
+
 ## [0.1.1](https://github.com/nayrosk/overbrainer/compare/v0.1.0...v0.1.1) - 2026-09-24
 
 ### Documentation
@@ -71,6 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(build)* drop the science::ml category crates.io does not know ([#9](https://github.com/nayrosk/overbrainer/pull/9))
 - *(templates)* pin the example docker image by digest
 - *(config)* keep an out-of-range integer a string, not a float
 - *(exec)* signal a job's process group under every sh
