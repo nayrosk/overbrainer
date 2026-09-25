@@ -70,7 +70,7 @@ The latest code from `main` installs with `cargo install --locked --git https://
 
 ### Shell completions
 
-overbrainer completes its commands and flags in bash, zsh and fish, and, from the project in the current directory or the one given with `-C`, run IDs (with their state and target), topic names and target names. Add the line for your shell to its startup file:
+overbrainer completes its commands and flags in bash, zsh and fish. It also completes run IDs (with their state and target), topic names and target names, read from the project in the current directory or the one given with `-C`. Add the line for your shell to its startup file:
 
 ```bash
 source <(COMPLETE=bash overbrainer)          # ~/.bashrc
