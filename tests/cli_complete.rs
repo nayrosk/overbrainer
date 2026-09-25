@@ -144,6 +144,42 @@ fn completes_run_ids_of_the_project_named_by_dash_c() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn a_dash_c_after_the_cursor_does_not_change_the_project() -> Result<(), Box<dyn std::error::Error>>
+{
+    let cwd = tempfile::tempdir()?;
+    let first = tempfile::tempdir()?;
+    let second = tempfile::tempdir()?;
+    save_run(
+        first.path(),
+        "20260922-143005-a1b2",
+        RunState::Failed,
+        "local",
+    )?;
+    save_run(
+        second.path(),
+        "20260923-090000-ffff",
+        RunState::Running,
+        "local",
+    )?;
+    let first = first.path().to_str().ok_or("temp dir is not UTF-8")?;
+    let second = second.path().to_str().ok_or("temp dir is not UTF-8")?;
+    // bash passes the whole line and the index of the word being completed,
+    // counted from the program name: here the run ID, before `-C second`.
+    let output = overbrainer()?
+        .current_dir(cwd.path())
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "5")
+        .args(["--", "overbrainer", "-C", first, "train", "attach", ""])
+        .args(["-C", second])
+        .output()?;
+    assert!(output.status.success(), "completion failed: {output:?}");
+    let out = String::from_utf8(output.stdout)?;
+    assert!(out.lines().any(|l| l == "20260922-143005-a1b2"), "{out}");
+    assert!(!out.contains("20260923-090000-ffff"), "{out}");
+    Ok(())
+}
+
+#[test]
 fn completes_no_run_id_outside_a_project() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let out = complete(dir.path(), &["train", "attach", ""])?;

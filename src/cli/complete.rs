@@ -20,11 +20,23 @@ use crate::runs::Runs;
 /// The project directory of the command line being completed: the value of the
 /// last `-C` or `--project-dir` after the `--` that follows the completer, or `.`.
 ///
-/// `home` is `HOME`, used to expand a leading `~`; the caller reads it from the
-/// environment so this function stays pure.
-pub(crate) fn project_dir_from(args: &[OsString], home: Option<&OsStr>) -> PathBuf {
+/// `home` is `HOME`, used to expand a leading `~`. `cursor` is the index of the word
+/// being completed, counted from the program name: bash and zsh pass the whole
+/// line, so only the words before it are read; fish cuts the line at the cursor
+/// and passes none. The caller reads both from the environment so this function
+/// stays pure.
+pub(crate) fn project_dir_from(
+    args: &[OsString],
+    home: Option<&OsStr>,
+    cursor: Option<usize>,
+) -> PathBuf {
     // Skip the completer's own arguments, the `--`, then the program name.
-    let mut words = args.iter().skip_while(|word| *word != "--").skip(2);
+    let before = cursor.map_or(usize::MAX, |index| index.saturating_sub(1));
+    let mut words = args
+        .iter()
+        .skip_while(|word| *word != "--")
+        .skip(2)
+        .take(before);
     let mut dir = PathBuf::from(".");
     while let Some(word) = words.next() {
         let Some(text) = word.to_str() else {
@@ -83,7 +95,11 @@ fn expand_tilde(text: &str, home: Option<&OsStr>) -> PathBuf {
 /// The project directory of the command line being completed.
 fn project_dir() -> PathBuf {
     let args: Vec<OsString> = std::env::args_os().collect();
-    project_dir_from(&args, std::env::var_os("HOME").as_deref())
+    // Set by the bash and zsh registration scripts of clap_complete.
+    let cursor = std::env::var("_CLAP_COMPLETE_INDEX")
+        .ok()
+        .and_then(|index| index.parse().ok());
+    project_dir_from(&args, std::env::var_os("HOME").as_deref(), cursor)
 }
 
 /// Run IDs in the project's `runs/`, with their recorded state and target.
@@ -169,7 +185,36 @@ mod tests {
 
     fn dir_of_with_home(line: &[&str], home: Option<&str>) -> PathBuf {
         let args: Vec<OsString> = line.iter().map(OsString::from).collect();
-        project_dir_from(&args, home.map(OsStr::new))
+        project_dir_from(&args, home.map(OsStr::new), None)
+    }
+
+    fn dir_at(line: &[&str], cursor: usize) -> PathBuf {
+        let args: Vec<OsString> = line.iter().map(OsString::from).collect();
+        project_dir_from(&args, None, Some(cursor))
+    }
+
+    #[test]
+    fn ignores_flags_after_the_word_being_completed() {
+        // bash and zsh pass the whole line: completing the run ID (word 5, counted
+        // from the program name) must not read the `-C b` typed after it.
+        let line = [
+            "ob",
+            "--",
+            "overbrainer",
+            "-C",
+            "a",
+            "train",
+            "attach",
+            "",
+            "-C",
+            "b",
+        ];
+        assert_eq!(dir_at(&line, 5), Path::new("a"));
+        assert_eq!(dir_at(&line, 8), Path::new("b"));
+        assert_eq!(
+            dir_at(&["ob", "--", "overbrainer", "-C", "a"], 2),
+            Path::new(".")
+        );
     }
 
     #[test]
