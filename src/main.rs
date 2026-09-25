@@ -3,10 +3,18 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::env::{Bash, CompleteEnv, Fish, Shells, Zsh};
 use overbrainer::cli::{self, Cli};
 
 fn main() -> ExitCode {
+    // Answer a shell's completion request (`COMPLETE=<shell>`) and exit, before
+    // anything else: completion needs neither .env nor logs, and nothing else may
+    // write to stdout. Without `COMPLETE` this returns at once.
+    CompleteEnv::with_factory(Cli::command)
+        .shells(Shells(&[&Bash, &Zsh, &Fish]))
+        .complete();
+
     let cli = Cli::parse();
 
     // Load .env before any thread exists: dotenvy writes to the process environment.

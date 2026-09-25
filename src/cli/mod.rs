@@ -1,5 +1,6 @@
 //! Command line interface.
 
+mod complete;
 mod config_check;
 pub(crate) mod data;
 pub(crate) mod front;
@@ -11,7 +12,8 @@ pub(crate) mod train;
 
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueHint};
+use clap_complete::engine::ArgValueCandidates;
 use secrecy::SecretString;
 use tokio::sync::OnceCell;
 
@@ -24,7 +26,7 @@ use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSetting
 #[command(name = "overbrainer", version, about)]
 pub struct Cli {
     /// Project directory containing overbrainer.toml.
-    #[arg(short = 'C', long, global = true, default_value = ".")]
+    #[arg(short = 'C', long, global = true, default_value = ".", value_hint = ValueHint::DirPath)]
     pub project_dir: PathBuf,
 
     /// The subcommand to run.
@@ -38,6 +40,7 @@ pub enum Command {
     /// Create an example project (overbrainer.toml, .env.example, prompts/, .gitignore).
     Init {
         /// Target directory. Defaults to the project directory (`-C`).
+        #[arg(value_hint = ValueHint::DirPath)]
         dir: Option<PathBuf>,
     },
     /// Inspect the configuration.
@@ -111,6 +114,7 @@ pub enum PodCommand {
     /// Delete every pod of a run, and wait until Runpod no longer shows them.
     Rm {
         /// ID of the run, as shown by `overbrainer runs ls` or `overbrainer pod ls`.
+        #[arg(add = ArgValueCandidates::new(complete::run_ids))]
         run_id: String,
         /// Delete even when the run's job is still running (the run is then failed).
         #[arg(long)]
@@ -123,7 +127,7 @@ pub enum PodCommand {
 #[command(args_conflicts_with_subcommands = true)]
 pub struct TrainArgs {
     /// Train on this target instead of training.target.
-    #[arg(long)]
+    #[arg(long, add = ArgValueCandidates::new(complete::targets))]
     pub target: Option<String>,
     /// Runpod target only: keep the pod once the run ends, with no time limit.
     /// Nothing deletes it then but `overbrainer pod rm <run-id>`.
@@ -140,11 +144,13 @@ pub enum TrainCommand {
     /// Follow a run again after Ctrl-C or a lost connection, then retrieve its results.
     Attach {
         /// ID of the run, as shown by `overbrainer runs ls`.
+        #[arg(add = ArgValueCandidates::new(complete::run_ids))]
         run_id: String,
     },
     /// Stop the job of a run.
     Cancel {
         /// ID of the run, as shown by `overbrainer runs ls`.
+        #[arg(add = ArgValueCandidates::new(complete::run_ids))]
         run_id: String,
     },
 }
@@ -161,7 +167,7 @@ pub enum RunsCommand {
 #[derive(Debug, Default, Args)]
 pub struct StageArgs {
     /// Only process this topic.
-    #[arg(long)]
+    #[arg(long, add = ArgValueCandidates::new(complete::topics))]
     pub topic: Option<String>,
     /// Regenerate this stage's output for the selected topics instead of resuming.
     #[arg(long)]
@@ -172,7 +178,7 @@ pub struct StageArgs {
 #[derive(Debug, Default, Args)]
 pub struct SplitArgs {
     /// Only count this topic in the printed report. Both files still hold every topic.
-    #[arg(long)]
+    #[arg(long, add = ArgValueCandidates::new(complete::topics))]
     pub topic: Option<String>,
 }
 
