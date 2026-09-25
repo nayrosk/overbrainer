@@ -1,5 +1,6 @@
 //! Command line interface.
 
+mod complete;
 mod config_check;
 pub(crate) mod data;
 pub(crate) mod front;
@@ -12,6 +13,7 @@ pub(crate) mod train;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
+use clap_complete::engine::ArgValueCandidates;
 use secrecy::SecretString;
 use tokio::sync::OnceCell;
 
@@ -111,6 +113,7 @@ pub enum PodCommand {
     /// Delete every pod of a run, and wait until Runpod no longer shows them.
     Rm {
         /// ID of the run, as shown by `overbrainer runs ls` or `overbrainer pod ls`.
+        #[arg(add = ArgValueCandidates::new(complete::run_ids))]
         run_id: String,
         /// Delete even when the run's job is still running (the run is then failed).
         #[arg(long)]
@@ -140,11 +143,13 @@ pub enum TrainCommand {
     /// Follow a run again after Ctrl-C or a lost connection, then retrieve its results.
     Attach {
         /// ID of the run, as shown by `overbrainer runs ls`.
+        #[arg(add = ArgValueCandidates::new(complete::run_ids))]
         run_id: String,
     },
     /// Stop the job of a run.
     Cancel {
         /// ID of the run, as shown by `overbrainer runs ls`.
+        #[arg(add = ArgValueCandidates::new(complete::run_ids))]
         run_id: String,
     },
 }
