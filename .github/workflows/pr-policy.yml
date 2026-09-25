@@ -12,6 +12,7 @@ permissions:
 jobs:
   title:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check the title is a Conventional Commit
         # The squash merge uses the title as the commit subject on main.
@@ -26,6 +27,7 @@ jobs:
 
   issue:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       issues: read
