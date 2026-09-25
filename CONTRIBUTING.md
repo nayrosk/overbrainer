@@ -26,7 +26,7 @@ Dependabot pull requests and release pull requests (`chore/release-vX.Y.Z`) do n
 
 - Commits follow [Conventional Commits](https://www.conventionalcommits.org): `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore` or `revert`, with an optional scope, for example `fix(runpod): stop the pod when the watchdog fires`. CI checks every commit subject.
 - Every commit must be signed, on every branch. Set up [GPG, SSH or S/MIME signing](https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification) and turn it on with `git config commit.gpgsign true`. Pushes with unsigned commits are rejected.
-- Rebase on `main` rather than merging it into your branch.
+- `main` moves on while a pull request is open: rebase the branch on it, or use **Update branch** on the pull request. The commit check ignores merge commits, and the squash drops them.
 
 ## Code
 
