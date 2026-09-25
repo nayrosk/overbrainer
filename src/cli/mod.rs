@@ -8,6 +8,7 @@ mod init;
 pub(crate) mod pod;
 mod progress;
 mod runpod_train;
+mod skill;
 pub(crate) mod train;
 
 use std::path::{Path, PathBuf};
@@ -90,6 +91,12 @@ pub enum Command {
         #[command(subcommand)]
         command: PodCommand,
     },
+    /// Install the agent skill that teaches AI coding agents to drive overbrainer.
+    Skill {
+        /// The skill subcommand to run.
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Browse the dataset, run stages and follow training runs in a terminal UI.
     Tui,
 }
@@ -120,6 +127,28 @@ pub enum PodCommand {
         #[arg(long)]
         force: bool,
     },
+}
+
+/// Subcommands of `overbrainer skill`.
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// Write the skill to <project>/.claude/skills/overbrainer/SKILL.md, or with
+    /// --global to ~/.claude/skills, or with --dir to another agent's skills directory.
+    Install(SkillInstallArgs),
+}
+
+/// Options of `overbrainer skill install`.
+#[derive(Debug, Args)]
+pub struct SkillInstallArgs {
+    /// Install for every project, in ~/.claude/skills.
+    #[arg(long, conflicts_with = "dir")]
+    pub global: bool,
+    /// Install into this skills directory instead.
+    #[arg(long, value_hint = ValueHint::DirPath)]
+    pub dir: Option<PathBuf>,
+    /// Replace an installed skill that differs from this version's.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Options and subcommands of `overbrainer train`.
@@ -226,6 +255,7 @@ pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
             command: RunsCommand::Ls,
         } => train::list(dir),
         Command::Pod { command } => pod::run(dir, &command).await,
+        Command::Skill { command } => skill::run(dir, &command),
         Command::Tui => match logs {
             LogMode::Tui(buffer) => crate::tui::run(dir, buffer).await,
             LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),

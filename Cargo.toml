@@ -9,7 +9,7 @@ repository = "https://github.com/nayrosk/overbrainer"
 readme = "README.md"
 keywords = ["llm", "distillation", "fine-tuning", "synthetic-data", "cli"]
 categories = ["command-line-utilities", "science"]
-include = ["src/**/*", "templates/**/*", "LICENSE-*", "README.md"]
+include = ["src/**/*", "templates/**/*", "skills/**/*", "LICENSE-*", "README.md"]
 
 [lints.rust]
 unsafe_code = "forbid"

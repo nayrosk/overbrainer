@@ -1,0 +1,12 @@
+{
+  "name": "overbrainer",
+  "owner": { "name": "nayrosk" },
+  "description": "The overbrainer agent skill for Claude Code.",
+  "plugins": [
+    {
+      "name": "overbrainer",
+      "source": "./",
+      "description": "The overbrainer agent skill."
+    }
+  ]
+}
