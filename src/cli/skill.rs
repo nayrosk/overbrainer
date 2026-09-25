@@ -79,7 +79,8 @@ fn install(base: &Path, force: bool) -> anyhow::Result<(PathBuf, Outcome)> {
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
     };
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    crate::runs::write_atomic(&dir, SKILL_FILE, SKILL.as_bytes())?;
+    crate::runs::write_atomic(&dir, SKILL_FILE, SKILL.as_bytes())
+        .with_context(|| format!("cannot write {}", path.display()))?;
     Ok((path, outcome))
 }
 
@@ -260,6 +261,27 @@ mod tests {
             let link = &link[..link.find(')').unwrap_or(link.len())];
             assert!(link.contains(&tag), "{link}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_names_the_skill_file() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir()?;
+        let dir = base.path().join(SKILL_DIR);
+        std::fs::create_dir(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))?;
+        let result = install(base.path(), false);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+        let Err(error) = result else {
+            anyhow::bail!("writing into a read-only directory succeeded");
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("cannot write {}", dir.join(SKILL_FILE).display())
+        );
+        Ok(())
     }
 
     fn args(global: bool, dir: Option<&str>) -> SkillInstallArgs {
