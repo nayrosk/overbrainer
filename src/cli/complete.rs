@@ -6,7 +6,7 @@
 //! that cannot be read yields no candidates.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use clap_complete::engine::CompletionCandidate;
@@ -19,7 +19,10 @@ use crate::runs::Runs;
 
 /// The project directory of the command line being completed: the value of the
 /// last `-C` or `--project-dir` after the `--` that follows the completer, or `.`.
-pub(crate) fn project_dir_from(args: &[OsString]) -> PathBuf {
+///
+/// `home` is `HOME`, used to expand a leading `~`; the caller reads it from the
+/// environment so this function stays pure.
+pub(crate) fn project_dir_from(args: &[OsString], home: Option<&OsStr>) -> PathBuf {
     // Skip the completer's own arguments, the `--`, then the program name.
     let mut words = args.iter().skip_while(|word| *word != "--").skip(2);
     let mut dir = PathBuf::from(".");
@@ -29,21 +32,58 @@ pub(crate) fn project_dir_from(args: &[OsString]) -> PathBuf {
         };
         if text == "-C" || text == "--project-dir" {
             if let Some(value) = words.next() {
-                dir = PathBuf::from(value);
+                dir = match value.to_str() {
+                    Some(text) => resolve(text, home),
+                    None => PathBuf::from(value),
+                };
             }
         } else if let Some(value) = text.strip_prefix("--project-dir=") {
-            dir = PathBuf::from(value);
+            dir = resolve(value, home);
         } else if let Some(value) = text.strip_prefix("-C") {
-            dir = PathBuf::from(value.strip_prefix('=').unwrap_or(value));
+            dir = resolve(value.strip_prefix('=').unwrap_or(value), home);
         }
     }
     dir
 }
 
+/// A completed `-C` value, unquoted and with a leading `~` expanded: shells pass
+/// the word as typed, so `~/proj` and `'a b'` reach us unexpanded and still quoted.
+fn resolve(text: &str, home: Option<&OsStr>) -> PathBuf {
+    expand_tilde(strip_quotes(text), home)
+}
+
+/// Strips one layer of matching surrounding `'...'` or `"..."`, if present.
+fn strip_quotes(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let quoted = bytes.len() >= 2
+        && ((bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"'));
+    if quoted {
+        &text[1..text.len() - 1]
+    } else {
+        text
+    }
+}
+
+/// Expands a leading `~` or `~/` using `home`. Without a `home`, or for a named
+/// user's home such as `~user/p`, the text is left as is.
+fn expand_tilde(text: &str, home: Option<&OsStr>) -> PathBuf {
+    let Some(home) = home else {
+        return PathBuf::from(text);
+    };
+    if text == "~" {
+        return PathBuf::from(home);
+    }
+    match text.strip_prefix("~/") {
+        Some(rest) => Path::new(home).join(rest),
+        None => PathBuf::from(text),
+    }
+}
+
 /// The project directory of the command line being completed.
 fn project_dir() -> PathBuf {
     let args: Vec<OsString> = std::env::args_os().collect();
-    project_dir_from(&args)
+    project_dir_from(&args, std::env::var_os("HOME").as_deref())
 }
 
 /// Run IDs in the project's `runs/`, with their recorded state and target.
@@ -124,8 +164,12 @@ mod tests {
     use super::*;
 
     fn dir_of(line: &[&str]) -> PathBuf {
+        dir_of_with_home(line, None)
+    }
+
+    fn dir_of_with_home(line: &[&str], home: Option<&str>) -> PathBuf {
         let args: Vec<OsString> = line.iter().map(OsString::from).collect();
-        project_dir_from(&args)
+        project_dir_from(&args, home.map(OsStr::new))
     }
 
     #[test]
@@ -197,5 +241,66 @@ mod tests {
     #[test]
     fn a_flag_being_completed_has_no_value_yet() {
         assert_eq!(dir_of(&["ob", "--", "overbrainer", "-C"]), Path::new("."));
+    }
+
+    #[test]
+    fn ignores_a_separator_inside_the_command_line() {
+        assert_eq!(
+            dir_of(&["ob", "--", "overbrainer", "-C", "p", "train", "--", "x"]),
+            Path::new("p")
+        );
+    }
+
+    #[test]
+    fn expands_a_leading_tilde_from_home() {
+        assert_eq!(
+            dir_of_with_home(
+                &["ob", "--", "overbrainer", "-C", "~", "runs"],
+                Some("/home/nay")
+            ),
+            Path::new("/home/nay")
+        );
+        assert_eq!(
+            dir_of_with_home(
+                &["ob", "--", "overbrainer", "-C", "~/p", "runs"],
+                Some("/home/nay")
+            ),
+            Path::new("/home/nay/p")
+        );
+    }
+
+    #[test]
+    fn leaves_a_named_users_home_alone() {
+        assert_eq!(
+            dir_of_with_home(
+                &["ob", "--", "overbrainer", "-C", "~user/p", "runs"],
+                Some("/home/nay")
+            ),
+            Path::new("~user/p")
+        );
+    }
+
+    #[test]
+    fn leaves_a_tilde_as_is_without_home() {
+        assert_eq!(
+            dir_of(&["ob", "--", "overbrainer", "-C", "~", "runs"]),
+            Path::new("~")
+        );
+        assert_eq!(
+            dir_of(&["ob", "--", "overbrainer", "-C", "~/p", "runs"]),
+            Path::new("~/p")
+        );
+    }
+
+    #[test]
+    fn strips_one_layer_of_matching_quotes() {
+        assert_eq!(
+            dir_of(&["ob", "--", "overbrainer", "-C", "'p q'", "runs"]),
+            Path::new("p q")
+        );
+        assert_eq!(
+            dir_of(&["ob", "--", "overbrainer", "-C", "\"p q\"", "runs"]),
+            Path::new("p q")
+        );
     }
 }
