@@ -19,7 +19,7 @@ Follow these on every task. They protect the user's secrets and money.
 - After any Runpod run, run `overbrainer pod ls` and report any pod left running. Use `overbrainer pod rm RUN_ID --force` or `overbrainer train --keep-pod` only when the user asks.
 - Do not start `overbrainer tui`: it is interactive and needs a terminal you do not have. Suggest it to the user for browsing the dataset.
 - Before training on a parent's outputs, remind the user that several providers (OpenAI and Anthropic among them) forbid using their outputs to train competing models, even through OpenRouter or NanoGPT.
-- Before `overbrainer answers` or `overbrainer run`, read `roles.parent` in `overbrainer.toml`. If it has `reasoning = true` and the parent is on the `anthropic` protocol, or is a Claude, Gemini or OpenAI model other than `gpt-oss` on the `openai` protocol, stop and ask the user: such a parent never returns raw reasoning, so every answer would be paid for and then excluded from training.
+- Before `overbrainer answers` or `overbrainer run`, read `roles.parent` in `overbrainer.toml`, then read the protocol from `[providers.NAME]` where NAME is `roles.parent.provider`. If `roles.parent` has `reasoning = true` and that protocol is `anthropic`, or the parent is a Claude, Gemini or OpenAI model other than `gpt-oss` on the `openai` protocol, stop and ask the user: such a parent never returns raw reasoning, so every answer would be paid for and then excluded from training.
 - Stages and training can run for hours. Run them in the background with the output in a log file, as in "Follow long commands" below.
 
 ## Set up a project

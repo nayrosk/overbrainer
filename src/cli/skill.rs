@@ -268,6 +268,16 @@ mod tests {
     fn a_failed_write_names_the_skill_file() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
+        // Root writes through a read-only directory: nothing to test then.
+        let probe = tempfile::tempdir()?;
+        std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o500))?;
+        let root = std::fs::write(probe.path().join("x"), b"x").is_ok();
+        std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o700))?;
+        if root {
+            eprintln!("skipped: running as root, permissions cannot force a save to fail");
+            return Ok(());
+        }
+
         let base = tempfile::tempdir()?;
         let dir = base.path().join(SKILL_DIR);
         std::fs::create_dir(&dir)?;
