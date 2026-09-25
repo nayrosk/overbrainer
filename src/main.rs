@@ -18,8 +18,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     // Load .env before any thread exists: dotenvy writes to the process environment.
-    // A missing .env is normal; any other error is reported.
-    if let Err(message) = load_dotenv(&cli.project_dir.join(".env")) {
+    // A missing .env is normal; any other error is reported. `skill` needs no
+    // configuration, so a broken .env does not stop it.
+    let needs_env = !matches!(cli.command, cli::Command::Skill { .. });
+    if needs_env && let Err(message) = load_dotenv(&cli.project_dir.join(".env")) {
         eprintln!("error: {message}");
         return ExitCode::FAILURE;
     }
