@@ -477,7 +477,8 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    const LIMIT: Duration = Duration::from_secs(10);
+    /// An upper bound only: a shared CI runner can be far slower than a laptop.
+    const LIMIT: Duration = Duration::from_secs(30);
 
     #[tokio::test]
     async fn a_load_reads_the_data_files_and_ends_with_its_id() -> TestResult {

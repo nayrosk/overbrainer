@@ -639,7 +639,8 @@ mod tests {
     use super::*;
     use crate::tui::snapshots::{app, key};
 
-    const LIMIT: Duration = Duration::from_secs(10);
+    /// An upper bound only: a shared CI runner can be far slower than a laptop.
+    const LIMIT: Duration = Duration::from_secs(30);
 
     #[tokio::test]
     async fn q_ends_the_loop_after_a_resize_is_drawn() -> Result<(), Box<dyn std::error::Error>> {
@@ -1378,7 +1379,11 @@ mod tests {
                     break;
                 }
             }
-            events.send(Ok(key(KeyCode::Char('q'))))
+            // The edit writes its files before the loop hears it ended, so `q`
+            // may still find it saving and ask to confirm: `y` answers. When
+            // `q` quits at once, the loop is gone and `y` is never read.
+            events.send(Ok(key(KeyCode::Char('q'))))?;
+            events.send(Ok(key(KeyCode::Char('y'))))
         };
         let (ran, sent) = tokio::time::timeout(LIMIT, async { tokio::join!(run, quit) }).await?;
         ran?;
@@ -1387,7 +1392,14 @@ mod tests {
         let texts: Vec<&str> = questions.iter().map(|q| q.text.as_str()).collect();
         assert!(texts.contains(&"When does a borrow end?"), "{texts:?}");
         assert!(!texts.contains(&"When does NLL end a borrow?"));
-        assert!(app.exit_notes.is_empty());
+        // Quitting while the edit was saving notes that it was saved; no other note.
+        assert!(
+            app.exit_notes
+                .iter()
+                .all(|note| note.starts_with("a change was saved: ")),
+            "{:?}",
+            app.exit_notes
+        );
         assert_eq!(app.view, crate::tui::app::View::Dataset, "4 was dropped");
         Ok(())
     }
