@@ -12,6 +12,9 @@ reviews:
       - "WIP"
       - "Draft"
       - "DO NOT MERGE"
+    # Release pull requests carry the release label; they only bump versions and the changelog.
+    labels:
+      - "!release"
 
   high_level_summary: true
   review_status: true

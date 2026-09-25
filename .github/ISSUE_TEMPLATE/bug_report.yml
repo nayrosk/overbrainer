@@ -1,0 +1,63 @@
+name: Bug report
+description: Something does not work as documented.
+title: "fix: "
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Remove API keys, tokens and hostnames from anything you paste.
+        Report security issues through the [private advisory form](https://github.com/nayrosk/overbrainer/security/advisories/new) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, including the exact error message.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran and the relevant part of overbrainer.toml.
+      placeholder: |
+        1. overbrainer init
+        2. overbrainer run ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: overbrainer version
+      description: Output of `overbrainer --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installed from
+      options:
+        - crates.io (cargo install)
+        - Release archive
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Arch Linux x86_64, macOS 15 arm64, ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run with `OVERBRAINER_LOG=debug` if possible. Redact secrets.
+      render: text
