@@ -1,0 +1,11 @@
+{
+  "name": "overbrainer",
+  "owner": { "name": "nayrosk" },
+  "plugins": [
+    {
+      "name": "overbrainer",
+      "source": "./",
+      "description": "The overbrainer agent skill."
+    }
+  ]
+}
