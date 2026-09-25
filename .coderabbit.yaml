@@ -12,6 +12,8 @@ reviews:
       - "WIP"
       - "Draft"
       - "DO NOT MERGE"
+      # Release pull requests only bump versions and the changelog.
+      - "chore: release v"
 
   high_level_summary: true
   review_status: true
