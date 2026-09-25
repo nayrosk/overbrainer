@@ -1,9 +1,9 @@
 //! The `overbrainer skill` subcommand: install the agent skill.
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 
 use super::{SkillCommand, SkillInstallArgs};
 
@@ -47,7 +47,8 @@ fn skills_dir(
         return Ok(dir.clone());
     }
     let root = if args.global {
-        home.context("--global needs HOME to find ~/.claude/skills")?
+        home.filter(|home| !home.as_os_str().is_empty())
+            .context("--global needs HOME to find ~/.claude/skills")?
     } else {
         project_dir.to_path_buf()
     };
@@ -79,9 +80,45 @@ fn install(base: &Path, force: bool) -> anyhow::Result<(PathBuf, Outcome)> {
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
     };
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    crate::runs::write_atomic(&dir, SKILL_FILE, SKILL.as_bytes())
-        .with_context(|| format!("cannot write {}", path.display()))?;
+    match outcome {
+        // Found missing: never replace a skill another process wrote meanwhile.
+        Outcome::Installed => create_atomic(&dir, SKILL_FILE, SKILL.as_bytes())?,
+        _ => crate::runs::write_atomic(&dir, SKILL_FILE, SKILL.as_bytes())
+            .with_context(|| format!("cannot write {}", path.display()))?,
+    }
     Ok((path, outcome))
+}
+
+/// Creates `dir/name` with `content`, atomically and only if it does not exist yet:
+/// the content goes to a temporary file first, then a hard link puts it in place,
+/// which fails rather than replace a file created in the meantime.
+fn create_atomic(dir: &Path, name: &str, content: &[u8]) -> anyhow::Result<()> {
+    let tmp = dir.join(format!(".{name}.{:016x}.tmp", fastrand::u64(..)));
+    let path = dir.join(name);
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(content))
+        .with_context(|| format!("cannot write {}", path.display()))
+        .and_then(|()| {
+            std::fs::hard_link(&tmp, &path).map_err(|e| {
+                if e.kind() == ErrorKind::AlreadyExists {
+                    anyhow!(
+                        "{} appeared while installing; run the command again",
+                        path.display()
+                    )
+                } else {
+                    anyhow::Error::new(e).context(format!("cannot write {}", path.display()))
+                }
+            })
+        });
+    if let Err(error) = std::fs::remove_file(&tmp)
+        && error.kind() != ErrorKind::NotFound
+    {
+        tracing::warn!("cannot remove {}: {error}", tmp.display());
+    }
+    created
 }
 
 #[cfg(test)]
@@ -319,6 +356,28 @@ mod tests {
             Path::new("/x")
         );
         assert!(skills_dir(project, &args(true, None), None).is_err());
+        // An empty HOME would put a global install in the current directory.
+        assert!(skills_dir(project, &args(true, None), Some(PathBuf::new())).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_skill_created_meanwhile_is_not_replaced() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join(SKILL_FILE), "written by someone else\n")?;
+        let error = create_atomic(dir.path(), SKILL_FILE, SKILL.as_bytes())
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("an existing file was replaced"))?;
+        assert!(
+            format!("{error:#}").contains("appeared while installing"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SKILL_FILE))?,
+            "written by someone else\n"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())?.collect::<Result<_, _>>()?;
+        assert_eq!(left.len(), 1, "temporary file left behind");
         Ok(())
     }
 }

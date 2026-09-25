@@ -79,12 +79,23 @@ fn installs_globally_under_home() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn global_needs_home() -> Result<(), Box<dyn std::error::Error>> {
+    // Run from a temp dir: a regression would write .claude/skills there.
+    let cwd = tempfile::tempdir()?;
     overbrainer()?
+        .current_dir(cwd.path())
         .env_remove("HOME")
         .args(["skill", "install", "--global"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("HOME"));
+    overbrainer()?
+        .current_dir(cwd.path())
+        .env("HOME", "")
+        .args(["skill", "install", "--global"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("HOME"));
+    assert!(!cwd.path().join(".claude").exists());
     Ok(())
 }
 
