@@ -68,6 +68,18 @@ The latest code from `main` installs with `cargo install --locked --git https://
 - `ssh` for SSH targets, and `ssh` with `ssh-keygen` for Runpod targets.
 - For training on this machine: Axolotl 0.19 in a virtual environment or on `PATH`, or Docker or Podman with NVIDIA GPU access to run the Axolotl image.
 
+### Shell completions
+
+overbrainer completes its commands and flags in bash, zsh and fish, and, from the project in the current directory or the one given with `-C`, run IDs (with their state and target), topic names and target names. Add the line for your shell to its startup file:
+
+```bash
+source <(COMPLETE=bash overbrainer)          # ~/.bashrc
+source <(COMPLETE=zsh overbrainer)           # ~/.zshrc
+COMPLETE=fish overbrainer | source           # ~/.config/fish/completions/overbrainer.fish
+```
+
+The script must match the installed version, so generate it when the shell starts, as above, rather than saving it to a file.
+
 ## Quickstart
 
 ![overbrainer init, config check and runs ls in a terminal](docs/assets/cli.gif)
