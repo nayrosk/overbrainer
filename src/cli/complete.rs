@@ -5,11 +5,16 @@
 //! line. Nothing here prints or logs, since the candidates go to stdout: a project
 //! that cannot be read yields no candidates.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use clap_complete::engine::CompletionCandidate;
+use config::{Config, File, FileFormat};
+use serde::Deserialize;
+use serde_json::Value;
 
+use crate::config::CONFIG_FILE;
 use crate::runs::Runs;
 
 /// The project directory of the command line being completed: the value of the
@@ -58,6 +63,62 @@ fn run_ids_in(dir: &Path) -> Vec<CompletionCandidate> {
         .collect()
 }
 
+/// The names completion needs from `overbrainer.toml`, read without validation:
+/// `config::load` fails when the provider keys are in `.env`, which completion
+/// does not load.
+///
+/// `targets` values are ignored, but `IgnoredAny` is zero-sized and clippy denies a
+/// map with a zero-sized value type; `Value` is the same escape hatch
+/// `config::load` already uses for `training.axolotl_extra`.
+#[derive(Deserialize)]
+struct Names {
+    #[serde(default)]
+    topics: Vec<TopicName>,
+    #[serde(default)]
+    targets: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct TopicName {
+    name: String,
+}
+
+fn names(dir: &Path) -> Option<Names> {
+    let content = std::fs::read_to_string(dir.join(CONFIG_FILE)).ok()?;
+    Config::builder()
+        .add_source(File::from_str(&content, FileFormat::Toml))
+        .build()
+        .ok()?
+        .try_deserialize()
+        .ok()
+}
+
+/// Topic names in the project's `overbrainer.toml`.
+pub(crate) fn topics() -> Vec<CompletionCandidate> {
+    names(&project_dir())
+        .map(|names| {
+            names
+                .topics
+                .into_iter()
+                .map(|t| CompletionCandidate::new(t.name))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Target names in the project's `overbrainer.toml`.
+pub(crate) fn targets() -> Vec<CompletionCandidate> {
+    names(&project_dir())
+        .map(|names| {
+            names
+                .targets
+                .into_keys()
+                .map(CompletionCandidate::new)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +126,33 @@ mod tests {
     fn dir_of(line: &[&str]) -> PathBuf {
         let args: Vec<OsString> = line.iter().map(OsString::from).collect();
         project_dir_from(&args)
+    }
+
+    #[test]
+    fn reads_names_from_an_invalid_but_parsable_config() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[[topics]]\nname = \"ownership\"\n[[topics]]\nname = \"traits\"\nunknown = 1\n\
+             [targets.local]\nkind = \"local\"\n[targets.gpu_cloud]\nkind = \"runpod\"\n",
+        )?;
+        let names = names(dir.path()).ok_or("no names")?;
+        let topics: Vec<&str> = names.topics.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(topics, ["ownership", "traits"]);
+        assert_eq!(
+            names.targets.keys().collect::<Vec<_>>(),
+            ["gpu_cloud", "local"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn has_no_names_without_a_readable_config() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        assert!(names(dir.path()).is_none());
+        std::fs::write(dir.path().join(crate::config::CONFIG_FILE), "[[topics]\n")?;
+        assert!(names(dir.path()).is_none());
+        Ok(())
     }
 
     #[test]
