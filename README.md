@@ -152,6 +152,23 @@ Runpod: [runpod.io](https://runpod.io?ref=ym24z23f) (referral link). A run's LoR
 
 The TUI draws its own crimson theme in 24-bit or 256 colors, and falls back to the terminal's 16 colors. `OVERBRAINER_TUI_COLOR` (`truecolor`, `256` or `16`) and `OVERBRAINER_TUI_MOTION` (`on`, `reduced` or `off`) override the detection, and `NO_COLOR` turns it monochrome. [The TUI page](docs/tui.md) has every key and behavior.
 
+## AI agents
+
+overbrainer ships an [agent skill](https://agentskills.io) that teaches AI coding agents to drive it: set up a project, run the stages and training, read the results, and keep to a few rules (never read `.env`, ask before spending money, clean up Runpod pods). It matches the installed version of overbrainer.
+
+```bash
+overbrainer skill install            # this project: .claude/skills/overbrainer/SKILL.md
+overbrainer skill install --global   # every project: ~/.claude/skills/overbrainer/SKILL.md
+overbrainer skill install --dir DIR  # another agent's skills directory: DIR/overbrainer/SKILL.md
+```
+
+An installed skill that was edited is only replaced with `--force`. In Claude Code, the skill is also a plugin:
+
+```
+/plugin marketplace add nayrosk/overbrainer
+/plugin install overbrainer@overbrainer
+```
+
 ## Documentation
 
 - [The dataset pipeline](docs/pipeline.md): stages, resuming, deduplication, the split, the answer format, reasoning and prompt templates.
@@ -164,7 +181,7 @@ The TUI draws its own crimson theme in 24-bit or 256 colors, and falls back to t
 
 Releases are cut by hand from `main`:
 
-1. Open a release pull request from a `chore/release-vX.Y.Z` branch. It bumps the version in `Cargo.toml` (cargo updates `Cargo.lock` on the next build) and regenerates the changelog with [git-cliff](https://git-cliff.org): `git cliff --tag vX.Y.Z -o CHANGELOG.md`. `cliff.toml` holds the changelog format.
+1. Open a release pull request from a `chore/release-vX.Y.Z` branch. It bumps the version in `Cargo.toml` (cargo updates `Cargo.lock` on the next build) and in `.claude-plugin/plugin.json`, points the docs links of `skills/overbrainer/SKILL.md` at `vX.Y.Z`, and regenerates the changelog with [git-cliff](https://git-cliff.org): `git cliff --tag vX.Y.Z -o CHANGELOG.md`. `cliff.toml` holds the changelog format. Tests fail until the versions and links agree.
 2. Review and merge that pull request.
 3. Tag the merge commit with a signed tag and push it: `git tag -s vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
 4. The tag runs `.github/workflows/release.yml`. It checks that the tag matches `Cargo.toml`, runs the checks and `cargo semver-checks`, builds the binaries, publishes the crate to crates.io and creates the GitHub release from the changelog entry with the binaries attached.
