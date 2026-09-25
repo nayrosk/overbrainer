@@ -14,6 +14,11 @@ on:
 permissions:
   contents: read
 
+# Runs never overlap, so an older catalog cannot overwrite a newer one.
+concurrency:
+  group: labels-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
