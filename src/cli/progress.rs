@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast::Receiver;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio_util::sync::CancellationToken;
 
 use crate::events::{Event, Stage, StageStats};
@@ -41,8 +41,12 @@ pub(crate) async fn render_until(mut receiver: Receiver<Event>, cancel: Cancella
                 Err(RecvError::Closed) => break,
             },
             () = cancel.cancelled() => {
-                while let Ok(event) = receiver.try_recv() {
-                    progress.log(&event);
+                loop {
+                    match receiver.try_recv() {
+                        Ok(event) => progress.log(&event),
+                        Err(TryRecvError::Lagged(skipped)) => lagged(skipped),
+                        Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                    }
                 }
                 break;
             }

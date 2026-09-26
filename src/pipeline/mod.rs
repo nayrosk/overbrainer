@@ -20,6 +20,7 @@ use crate::llm::{
 };
 use crate::pricing::Price;
 use crate::prompts::{PromptError, Prompts};
+use crate::retry::Retryable;
 
 /// Errors that stop a stage.
 #[derive(Debug, thiserror::Error)]
@@ -214,10 +215,15 @@ impl<C: LlmClient> RoleClient<C> {
             .await
             {
                 Ok(completion) => completion,
-                Err(error) if structured && !error.is_fatal_for_stage() => {
-                    // The provider may not support structured output. Drop it and
-                    // retry in plain text at once, without spending an outer parse
-                    // attempt, so a fatal error still stops the stage as itself.
+                Err(error)
+                    if structured && !error.is_fatal_for_stage() && !error.is_retryable() =>
+                {
+                    // A permanent client rejection (such as HTTP 400) may mean the
+                    // provider refuses structured output. Drop it and retry in plain
+                    // text at once, without spending an outer parse attempt. A fatal
+                    // error still stops the stage as itself, and an exhausted retryable
+                    // error (a rate limit) is returned rather than resent, so a format
+                    // change never worsens throttling.
                     structured = false;
                     item.failed(
                         bus,
@@ -460,6 +466,34 @@ mod tests {
         assert!(
             matches!(result, Err(LlmError::Status { status: 401, .. })),
             "the credential error propagates as itself, so the stage stops"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_rate_limit_is_not_resent_without_structured_output() {
+        let bus = EventBus::new();
+        let asking = Asking {
+            policy: RetryPolicy::new(0),
+            bus: &bus,
+        };
+        let client = ScriptedClient::new(vec![Err(LlmError::Status {
+            status: 429,
+            message: "slow down".into(),
+            retry_after: None,
+        })]);
+        let role = role(client, 16_384);
+        let mut stats = StageStats::default();
+        let result = role
+            .ask_list(&asking, "p".into(), &item(), &mut stats)
+            .await;
+        assert!(
+            matches!(result, Err(LlmError::Status { status: 429, .. })),
+            "the rate limit is returned, not retried in plain text"
+        );
+        assert_eq!(
+            lock(&role.client.seen).len(),
+            1,
+            "no second request is made after the rate limit"
         );
     }
 }

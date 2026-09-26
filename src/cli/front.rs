@@ -155,13 +155,21 @@ impl BusGuard {
     /// the queued events and stop, then waits for it, bounded by [`RENDER_GRACE`].
     pub(crate) async fn close(self) {
         drop(self.bus);
-        let Some(renderer) = self.renderer else {
+        let Some(mut renderer) = self.renderer else {
             return;
         };
         match self.cancel {
             Some(cancel) => {
                 cancel.cancel();
-                tokio::time::timeout(RENDER_GRACE, renderer).await.ok();
+                // Await the drain, but do not leave it running on the shared bus past
+                // the grace period: abort it and reap the handle.
+                if tokio::time::timeout(RENDER_GRACE, &mut renderer)
+                    .await
+                    .is_err()
+                {
+                    renderer.abort();
+                    renderer.await.ok();
+                }
             },
             None => {
                 renderer.await.ok();
