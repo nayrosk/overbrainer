@@ -1,6 +1,6 @@
 [package]
 name = "overbrainer"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Distill a large LLM into a smaller open-weights model: generate questions, collect answers, fine-tune, visualize."
