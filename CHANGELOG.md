@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/nayrosk/overbrainer/compare/v0.2.0...v0.2.1) - 2026-09-26
+
+### Documentation
+
+- fix the rustdoc warnings and check the docs in CI ([#30](https://github.com/nayrosk/overbrainer/pull/30))
+
+### Fixed
+
+- *(exec)* clear the cleartext-logging alerts CodeQL raised on tests ([#27](https://github.com/nayrosk/overbrainer/pull/27))
+
 ## [0.2.0](https://github.com/nayrosk/overbrainer/compare/v0.1.1...v0.2.0) - 2026-09-25
 
 ### Added

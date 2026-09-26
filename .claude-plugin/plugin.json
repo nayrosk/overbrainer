@@ -1,6 +1,6 @@
 {
   "name": "overbrainer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Teaches Claude Code to drive the overbrainer CLI: build a distillation dataset, fine-tune with Axolotl, follow runs and clean up Runpod pods.",
   "author": { "name": "nayrosk" },
   "repository": "https://github.com/nayrosk/overbrainer",
