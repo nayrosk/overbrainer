@@ -42,7 +42,7 @@ Each [GitHub release](https://github.com/nayrosk/overbrainer/releases) has a bin
 Each archive holds `overbrainer`, the README and the licenses, next to a `.sha256` file. On Linux:
 
 ```bash
-version=v0.2.1
+version=v0.3.0
 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
 file="overbrainer-$version-$target.tar.gz"
 curl -LO "https://github.com/nayrosk/overbrainer/releases/download/$version/$file"
