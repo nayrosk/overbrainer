@@ -61,10 +61,21 @@ pub async fn answers<C: LlmClient + 'static>(
         skipped: selected.len() - pending.len(),
         ..StageStats::default()
     };
+    // Every selected question is one item; questions answered in an earlier run are
+    // reported done at once, so progress across runs counts what earlier runs finished.
     ctx.bus.publish(Event::StageStarted {
         stage: Stage::Answers,
-        total: pending.len(),
+        total: selected.len(),
     });
+    for question in &selected {
+        if answered.contains(&question.id) {
+            ctx.bus.publish(Event::ItemDone {
+                stage: Stage::Answers,
+                id: question.id.to_string(),
+                usage: None,
+            });
+        }
+    }
     let systems = system_prompts(ctx, &topics)?;
     let mut tasks = spawn_all(ctx, &parent, pending, &systems);
     let mut out = Appender::open(&ctx.files.answers)?;

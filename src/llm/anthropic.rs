@@ -250,6 +250,7 @@ mod tests {
             reasoning: true,
             effort,
             thinking_budget,
+            json_list: false,
         }
     }
 
@@ -300,6 +301,7 @@ mod tests {
             reasoning: false,
             effort: None,
             thinking_budget: None,
+            json_list: false,
         };
         let (thinking, output_config) = thinking_config(&request);
         assert!(thinking.is_none());

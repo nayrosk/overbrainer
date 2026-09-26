@@ -32,9 +32,9 @@ fn lagged(skipped: u64) {
 
 /// Counts finished items to log progress every tenth of the stage.
 ///
-/// `StageStarted.total` counts only the items processed in this run (skipped items
-/// publish nothing), and each processed item ends with one `ItemDone` or one final
-/// `ItemFailed { retryable: false }`. Retryable failures are progress noise: they are
+/// `StageStarted.total` counts every selected item; each ends with one `ItemDone`
+/// (items already complete from an earlier run send it at once, with no usage) or one
+/// final `ItemFailed { retryable: false }`. Retryable failures are progress noise: they are
 /// logged but never counted. A failure that covers several items (for example a
 /// topic whose deduplicator cannot be seeded) counts once, so a stage may finish
 /// below its total.

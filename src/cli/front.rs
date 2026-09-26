@@ -52,11 +52,20 @@ impl Frontend {
                 BusGuard {
                     bus,
                     renderer: Some(renderer),
+                    detached: false,
                 }
             },
-            Self::Tui { bus, .. } => BusGuard {
-                bus: bus.clone(),
-                renderer: None,
+            Self::Tui { bus, .. } => {
+                // The same renderer as the command line turns events into tracing
+                // lines; the TUI's log buffer captures them for its Logs view. The bus
+                // is shared here (the app and the flow hold clones), so it never closes
+                // on this guard alone: the renderer is aborted on close, not awaited.
+                let renderer = tokio::spawn(super::progress::render(bus.subscribe()));
+                BusGuard {
+                    bus: bus.clone(),
+                    renderer: Some(renderer),
+                    detached: true,
+                }
             },
         }
     }
@@ -126,14 +135,23 @@ pub(crate) struct BusGuard {
     /// Where the flow publishes.
     pub(crate) bus: EventBus,
     renderer: Option<JoinHandle<()>>,
+    /// Whether the bus is shared beyond this guard: a shared bus never closes here, so
+    /// the renderer is aborted instead of awaited.
+    detached: bool,
 }
 
 impl BusGuard {
-    /// Drops the bus, then waits for the renderer to show what is left.
+    /// Drops the bus. When the bus is this guard's alone, waits for the renderer to
+    /// show what is left; when it is shared (the TUI), aborts the renderer, whose only
+    /// job was to keep logging.
     pub(crate) async fn close(self) {
         drop(self.bus);
         if let Some(renderer) = self.renderer {
-            renderer.await.ok();
+            if self.detached {
+                renderer.abort();
+            } else {
+                renderer.await.ok();
+            }
         }
     }
 }
