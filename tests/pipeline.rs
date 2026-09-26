@@ -376,6 +376,13 @@ fn count_item_failed(events: &[Event], retryable: bool) -> usize {
         .count()
 }
 
+fn count_item_done(events: &[Event], stage: Stage) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, Event::ItemDone { stage: s, .. } if *s == stage))
+        .count()
+}
+
 #[tokio::test]
 async fn subtopics_resume_a_partial_topic_and_dedup_against_existing_names() -> TestResult {
     let project = Project::new()?;
@@ -533,7 +540,7 @@ async fn questions_stage_stops_on_a_fatal_provider_error() -> TestResult {
 }
 
 #[tokio::test]
-async fn subtopics_started_total_excludes_topics_already_done() -> TestResult {
+async fn subtopics_started_total_counts_every_topic_and_credits_the_done_one() -> TestResult {
     let project = Project::with_toml(TWO_TOPICS)?;
     let mut out = overbrainer::dataset::Appender::open(&project.files.subtopics)?;
     for name in ["Borrowing", "Lifetimes"] {
@@ -551,14 +558,19 @@ async fn subtopics_started_total_excludes_topics_already_done() -> TestResult {
     let events = drain(&mut receiver);
     assert_eq!(
         started_total(&events, Stage::Subtopics),
-        Some(1),
-        "the already-done topic is not counted"
+        Some(2),
+        "every selected topic is counted"
+    );
+    assert_eq!(
+        count_item_done(&events, Stage::Subtopics),
+        2,
+        "the already-done topic is credited as finished"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn questions_started_total_excludes_subtopics_already_filled() -> TestResult {
+async fn questions_started_total_counts_every_subtopic_and_credits_the_filled_one() -> TestResult {
     let project = Project::new()?;
     let mut out = overbrainer::dataset::Appender::open(&project.files.subtopics)?;
     for name in ["Borrowing", "Lifetimes"] {
@@ -588,8 +600,13 @@ async fn questions_started_total_excludes_subtopics_already_filled() -> TestResu
     let events = drain(&mut receiver);
     assert_eq!(
         started_total(&events, Stage::Questions),
-        Some(1),
-        "the already-filled subtopic is not counted"
+        Some(2),
+        "every selected subtopic is counted"
+    );
+    assert_eq!(
+        count_item_done(&events, Stage::Questions),
+        2,
+        "the already-filled subtopic is credited as finished"
     );
     Ok(())
 }
@@ -875,8 +892,13 @@ async fn answers_events_follow_the_stage_conventions() -> TestResult {
     let events = drain(&mut receiver);
     assert_eq!(
         started_total(&events, Stage::Answers),
-        Some(2),
-        "the already-answered question is not counted"
+        Some(3),
+        "every selected question is counted"
+    );
+    assert_eq!(
+        count_item_done(&events, Stage::Answers),
+        3,
+        "the already-answered question is credited alongside the two just answered"
     );
     Ok(())
 }

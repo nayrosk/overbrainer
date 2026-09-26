@@ -313,15 +313,22 @@ mod tests {
     }
 
     impl LlmClient for ScriptedClient {
-        async fn complete(&self, request: CompletionRequest) -> Result<Completion, LlmError> {
+        fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> impl std::future::Future<Output = Result<Completion, LlmError>> + Send {
             lock(&self.seen).push(request);
-            lock(&self.replies)
+            let reply = lock(&self.replies)
                 .pop_front()
-                .unwrap_or_else(|| Err(LlmError::InvalidResponse("no more replies".into())))
+                .unwrap_or_else(|| Err(LlmError::InvalidResponse("no more replies".into())));
+            std::future::ready(reply)
         }
 
-        async fn embed(&self, _inputs: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
-            Err(LlmError::Unsupported("embeddings"))
+        fn embed(
+            &self,
+            _inputs: &[String],
+        ) -> impl std::future::Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send {
+            std::future::ready(Err(LlmError::Unsupported("embeddings")))
         }
     }
 
