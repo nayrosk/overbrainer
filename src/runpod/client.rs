@@ -719,7 +719,11 @@ mod tests {
         assert_eq!(piece.len(), REDACT_WINDOW);
         let text = format!("prefix {piece} suffix");
         let cleaned = redact(&text, secret);
-        assert!(!cleaned.contains(piece), "{cleaned}");
+        // The message never repeats the text: it would hold the piece that got through.
+        assert!(
+            !cleaned.contains(piece),
+            "a piece of the secret survived redaction"
+        );
         assert_eq!(cleaned, "prefix *** suffix");
     }
 

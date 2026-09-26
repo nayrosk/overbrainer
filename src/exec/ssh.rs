@@ -11,7 +11,7 @@ use tokio::process::Child;
 use super::tar;
 use super::{
     CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, FileDigest, JOB_LOG, JobCommand,
-    JobId, JobStatus, PID_FILE, Pid, cancel_script, check_secrets, job_script, manifest_script,
+    JobId, JobStatus, PID_FILE, Pid, cancel_script, check_job_env, job_script, manifest_script,
     parse_manifest, parse_status, quote, shell_path, status_script,
 };
 
@@ -246,9 +246,9 @@ impl Executor for SshExecutor {
 /// # Errors
 ///
 /// Returns [`ExecError::InvalidSecret`] when a secret cannot be passed to a job
-/// (see [`check_secrets`]).
+/// (see [`check_job_env`]).
 fn launcher(job: &JobCommand) -> Result<String, ExecError> {
-    check_secrets(&job.secrets)?;
+    check_job_env(&job.secrets)?;
     let mut parts = Vec::new();
     for (name, _) in &job.secrets {
         parts.push(format!("IFS= read -r {name} && export {name}"));
