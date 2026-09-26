@@ -42,7 +42,7 @@ Each [GitHub release](https://github.com/nayrosk/overbrainer/releases) has a bin
 Each archive holds `overbrainer`, the README and the licenses, next to a `.sha256` file. On Linux:
 
 ```bash
-version=v0.2.0
+version=v0.2.1
 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
 file="overbrainer-$version-$target.tar.gz"
 curl -LO "https://github.com/nayrosk/overbrainer/releases/download/$version/$file"
@@ -181,7 +181,7 @@ An installed skill that was edited is only replaced with `--force`. In Claude Co
 
 Releases are cut by hand from `main`:
 
-1. Open a release pull request from a `chore/release-vX.Y.Z` branch with the `release` label, which makes CodeRabbit skip it. It needs no issue. It bumps the version in `Cargo.toml` (cargo updates `Cargo.lock` on the next build) and in `.claude-plugin/plugin.json`, points the docs links of `skills/overbrainer/SKILL.md` at `vX.Y.Z`, and regenerates the changelog with [git-cliff](https://git-cliff.org): `git cliff --tag vX.Y.Z -o CHANGELOG.md`. `cliff.toml` holds the changelog format. Tests fail until the versions and links agree.
+1. Open a release pull request from a `chore/release-vX.Y.Z` branch with the `release` label, which makes CodeRabbit skip it. It needs no issue. It bumps the version in `Cargo.toml` (cargo updates `Cargo.lock` on the next build) and in `.claude-plugin/plugin.json`, points the docs links of `skills/overbrainer/SKILL.md` and the binary install example above at `vX.Y.Z`, and regenerates the changelog with [git-cliff](https://git-cliff.org): `git cliff --tag vX.Y.Z -o CHANGELOG.md`. `cliff.toml` holds the changelog format. Tests fail until the versions and links agree.
 2. Review and merge that pull request.
 3. Tag the merge commit with a signed tag and push it: `git tag -s vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
 4. The tag runs `.github/workflows/release.yml`. It checks that the tag matches `Cargo.toml`, runs the checks and `cargo semver-checks`, builds the binaries without any cache, publishes the crate to crates.io through [trusted publishing](https://crates.io/docs/trusted-publishing) (no token is stored; the crate trusts `release.yml` in the `production` environment, which only `v*` tags can deploy to) and creates the GitHub release from the changelog entry with the binaries attached.
