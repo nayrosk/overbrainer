@@ -85,7 +85,7 @@ struct GpuPrice {
 /// Errors of the Runpod API. No variant ever holds the API key or a pod's host
 /// key. A create call's error never holds any text from Runpod's answer either,
 /// however that text was shaped: its message is chosen only from the HTTP
-/// status (see [`RunpodClient::status_error`]), because no amount of pattern
+/// status (see `RunpodClient::status_error`), because no amount of pattern
 /// matching against ways a server might chunk, escape or encode an echoed value
 /// can be shown complete; not showing any of it is the only claim this client
 /// can make and keep.
@@ -321,12 +321,12 @@ impl RunpodClient {
         .await
     }
 
-    /// Every pod of the account, following the pagination up to [`MAX_PAGES`].
+    /// Every pod of the account, following the pagination up to a fixed page limit.
     ///
     /// # Errors
     ///
     /// Returns an [`ApiError`] once retries are exhausted, on a fatal answer, when
-    /// a pagination cursor repeats, or when more than [`MAX_PAGES`] are followed.
+    /// a pagination cursor repeats, or when the list does not end within that limit.
     pub async fn list_pods(&self) -> Result<Vec<Pod>, ApiError> {
         let mut pods = Vec::new();
         let mut cursor: Option<String> = None;

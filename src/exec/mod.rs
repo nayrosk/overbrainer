@@ -255,7 +255,7 @@ pub trait Executor: Send + Sync {
     ///
     /// Returns [`ExecError::InvalidSecret`], naming the variable only, when a
     /// secret's name is not an environment variable name or its value holds a line
-    /// break or a NUL byte (see [`check_job_env`]); nothing is started then. Returns
+    /// break or a NUL byte; nothing is started then. Returns
     /// another [`ExecError`] when the job cannot be started.
     fn spawn(&self, job: &JobCommand) -> impl Future<Output = Result<JobId, ExecError>> + Send;
 

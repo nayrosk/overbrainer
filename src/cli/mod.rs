@@ -71,11 +71,11 @@ pub enum Command {
     /// orphaned; they stay in data/answers.jsonl.
     Split(SplitArgs),
     /// Run subtopics, questions, answers and split in order, then train when
-    /// overbrainer.toml has a [training] section.
+    /// overbrainer.toml has a `[training]` section.
     Run,
     /// Fine-tune the child model on data/train.jsonl, evaluating on data/eval.jsonl.
     ///
-    /// The job runs detached on the target and writes to runs/<run-id>/. Ctrl-C stops
+    /// The job runs detached on the target and writes to `runs/<run-id>/`. Ctrl-C stops
     /// following it but leaves it running: `overbrainer train attach <run-id>` follows
     /// it again, `overbrainer train cancel <run-id>` stops it.
     Train(TrainArgs),
@@ -132,7 +132,7 @@ pub enum PodCommand {
 /// Subcommands of `overbrainer skill`.
 #[derive(Debug, Subcommand)]
 pub enum SkillCommand {
-    /// Write the skill to <project>/.claude/skills/overbrainer/SKILL.md, or with
+    /// Write the skill to `<project>/.claude/skills/overbrainer/SKILL.md`, or with
     /// --global to ~/.claude/skills, or with --dir to another agent's skills directory.
     Install(SkillInstallArgs),
 }
