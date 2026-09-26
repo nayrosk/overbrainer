@@ -34,6 +34,7 @@ fn request(effort: Option<Effort>) -> CompletionRequest {
         reasoning: true,
         effort,
         thinking_budget: None,
+        json_list: false,
     }
 }
 

@@ -31,6 +31,7 @@ fn request(reasoning: bool) -> CompletionRequest {
         reasoning,
         effort: None,
         thinking_budget: None,
+        json_list: false,
     }
 }
 
@@ -110,6 +111,50 @@ async fn no_reasoning_parameter_when_not_requested() -> TestResult {
     client(&server)?.complete(&request(false)).await?;
     let body = last_body(&server).await?;
     assert!(body.get("reasoning").is_none(), "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_json_list_request_asks_for_structured_output() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_body(
+            &json!({"content": r#"{"items": ["a"]}"#}),
+            "stop",
+        )))
+        .mount(&server)
+        .await;
+    let list_request = CompletionRequest {
+        json_list: true,
+        ..request(false)
+    };
+    client(&server)?.complete(&list_request).await?;
+    let body = last_body(&server).await?;
+    assert_eq!(
+        body["response_format"]["type"], "json_schema",
+        "structured output is requested: {body}"
+    );
+    assert_eq!(
+        body["response_format"]["json_schema"]["schema"]["properties"]["items"]["type"],
+        "array"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_response_format_without_a_json_list_request() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_body(&json!({"content": "ok"}), "stop")),
+        )
+        .mount(&server)
+        .await;
+    client(&server)?.complete(&request(false)).await?;
+    let body = last_body(&server).await?;
+    assert!(body.get("response_format").is_none(), "{body}");
     Ok(())
 }
 

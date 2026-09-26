@@ -68,6 +68,7 @@ impl OpenAiClient {
             reasoning: request.reasoning.then(|| ReasoningParam {
                 effort: request.effort.unwrap_or(Effort::Medium).as_str(),
             }),
+            response_format: request.json_list.then(string_list_format),
         };
         let response: ChatResponse = self.endpoint.post("chat/completions", &body).await?;
         let choice = response
@@ -149,6 +150,8 @@ struct ChatRequest<'a> {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
 }
 
 #[derive(Serialize)]
@@ -160,6 +163,44 @@ struct WireMessage<'a> {
 #[derive(Serialize)]
 struct ReasoningParam {
     effort: &'static str,
+}
+
+/// A `response_format` asking for a JSON object with a `items` array of strings, the
+/// only array shape the JSON-schema structured output accepts at the top level. The
+/// answer parser reads the array back out of the object.
+#[derive(Serialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    json_schema: JsonSchema,
+}
+
+#[derive(Serialize)]
+struct JsonSchema {
+    name: &'static str,
+    strict: bool,
+    schema: serde_json::Value,
+}
+
+fn string_list_format() -> ResponseFormat {
+    ResponseFormat {
+        kind: "json_schema",
+        json_schema: JsonSchema {
+            name: "string_list",
+            strict: false,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["items"],
+                "additionalProperties": false
+            }),
+        },
+    }
 }
 
 #[derive(Deserialize)]

@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use super::{Ctx, Item, PipelineError, RoleClient, ask_list, item_error, without_topics};
+use super::{Ctx, Item, PipelineError, RoleClient, item_error, without_topics};
 use crate::config::Topic;
 use crate::dataset::{Appender, Id, Question, Rejected, Subtopic, read, rewrite};
 use crate::dedup::Deduplicator;
@@ -55,9 +55,11 @@ where
         existing = without_topics(existing, &topics, |question| &question.topic);
         rewrite(&ctx.files.questions, &existing)?;
     }
+    // Every selected subtopic is one item; a subtopic already at its target is reported
+    // done at once, so progress across runs counts what earlier runs finished.
     ctx.bus.publish(Event::StageStarted {
         stage: Stage::Questions,
-        total: remaining_subtopics(&subtopics, &existing, &topics),
+        total: selected_subtopics(&subtopics, &topics),
     });
     let mut filler = Filler {
         ctx,
@@ -128,11 +130,11 @@ async fn seed<D: Deduplicator>(
     Ok(false)
 }
 
-/// Subtopics of `topics` not yet filled to their `questions_per_subtopic` target.
-fn remaining_subtopics(subtopics: &[Subtopic], existing: &[Question], topics: &[&Topic]) -> usize {
+/// Subtopics belonging to one of `topics`.
+fn selected_subtopics(subtopics: &[Subtopic], topics: &[&Topic]) -> usize {
     subtopics
         .iter()
-        .filter(|subtopic| needs_filling(subtopic, existing, topics))
+        .filter(|subtopic| topics.iter().any(|topic| topic.name == subtopic.topic))
         .count()
 }
 
@@ -187,6 +189,11 @@ impl<C: LlmClient> Filler<'_, C> {
     ) -> Result<(), PipelineError> {
         if slot.accepted.len() >= slot.target {
             self.stats.skipped += 1;
+            self.ctx.bus.publish(Event::ItemDone {
+                stage: Stage::Questions,
+                id: slot.item.id,
+                usage: None,
+            });
             return Ok(());
         }
         let patience = self.ctx.settings.pipeline.max_retries.max(1);
@@ -232,14 +239,10 @@ impl<C: LlmClient> Filler<'_, C> {
                 accepted: &slot.accepted,
             },
         )?;
-        let asked = ask_list(
-            self.ctx,
-            self.generator,
-            prompt,
-            &slot.item,
-            &mut self.stats,
-        )
-        .await;
+        let asked = self
+            .generator
+            .ask_list(&self.ctx.asking(), prompt, &slot.item, &mut self.stats)
+            .await;
         let (candidates, usage) = match asked {
             Ok(asked) => asked,
             Err(error) => {

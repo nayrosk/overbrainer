@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 
-use super::{Ctx, Item, PipelineError, RoleClient, ask_list, item_error, without_topics};
+use super::{Ctx, Item, PipelineError, RoleClient, item_error, without_topics};
 use crate::config::Topic;
 use crate::dataset::{Appender, Id, Rejected, Subtopic, read, rewrite};
 use crate::events::{Event, Stage, StageStats};
@@ -50,13 +50,11 @@ pub async fn subtopics<C: LlmClient>(
         rewrite(&ctx.files.subtopics, &existing)?;
     }
     let mut out = Appender::open(&ctx.files.subtopics)?;
-    let total = topics
-        .iter()
-        .filter(|topic| stored_count(&existing, &topic.name) < target_count(topic))
-        .count();
+    // Every selected topic is one item; a topic already at its target is reported done
+    // at once, so progress across runs counts what earlier runs finished.
     ctx.bus.publish(Event::StageStarted {
         stage: Stage::Subtopics,
-        total,
+        total: topics.len(),
     });
     let mut stats = StageStats::default();
     for topic in topics {
@@ -64,6 +62,11 @@ pub async fn subtopics<C: LlmClient>(
         let target = target_count(topic);
         if have >= target {
             stats.skipped += 1;
+            ctx.bus.publish(Event::ItemDone {
+                stage: Stage::Subtopics,
+                id: topic.name.clone(),
+                usage: None,
+            });
             continue;
         }
         let plan = Plan {
@@ -146,7 +149,8 @@ async fn generate<C: LlmClient>(
             count: u32::try_from(plan.missing).unwrap_or(u32::MAX),
         },
     )?;
-    let (names, usage) = ask_list(ctx, generator, prompt, &plan.item, stats)
+    let (names, usage) = generator
+        .ask_list(&ctx.asking(), prompt, &plan.item, stats)
         .await
         .map_err(|source| PipelineError::Llm {
             stage: Stage::Subtopics,

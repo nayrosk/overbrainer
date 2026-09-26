@@ -23,6 +23,10 @@ pub struct CompletionRequest {
     /// `effort` for that client: the request asks for a fixed thinking budget instead
     /// of adaptive thinking, and omits `output_config.effort`.
     pub thinking_budget: Option<u32>,
+    /// Whether the answer must be a list of strings. The `openai` protocol client then
+    /// asks for structured output (a JSON schema); other clients ignore it. The list
+    /// stages set it so compliant models return parseable JSON.
+    pub json_list: bool,
 }
 
 impl CompletionRequest {
@@ -37,6 +41,7 @@ impl CompletionRequest {
             reasoning: role.reasoning,
             effort: role.reasoning_effort,
             thinking_budget: role.thinking_budget,
+            json_list: false,
         }
     }
 }

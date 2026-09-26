@@ -7,6 +7,7 @@ use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll, Waker};
+use std::time::Duration;
 
 use anyhow::Context;
 use tokio::signal::unix::{SignalKind, signal};
@@ -52,11 +53,25 @@ impl Frontend {
                 BusGuard {
                     bus,
                     renderer: Some(renderer),
+                    cancel: None,
                 }
             },
-            Self::Tui { bus, .. } => BusGuard {
-                bus: bus.clone(),
-                renderer: None,
+            Self::Tui { bus, .. } => {
+                // The same renderer as the command line turns events into tracing
+                // lines; the TUI's log buffer captures them for its Logs view. The bus
+                // is shared here (the app and the flow hold clones), so it never closes
+                // on this guard alone: `close` cancels the renderer, which first drains
+                // the queued events so the last progress lines still reach the buffer.
+                let cancel = CancellationToken::new();
+                let renderer = tokio::spawn(super::progress::render_until(
+                    bus.subscribe(),
+                    cancel.clone(),
+                ));
+                BusGuard {
+                    bus: bus.clone(),
+                    renderer: Some(renderer),
+                    cancel: Some(cancel),
+                }
             },
         }
     }
@@ -121,19 +136,44 @@ impl Frontend {
     }
 }
 
+/// How long `close` waits for a cancelled renderer to drain its queued events.
+const RENDER_GRACE: Duration = Duration::from_secs(2);
+
 /// The bus of a flow, and the task rendering it if any.
 pub(crate) struct BusGuard {
     /// Where the flow publishes.
     pub(crate) bus: EventBus,
     renderer: Option<JoinHandle<()>>,
+    /// Set when the bus is shared beyond this guard (the TUI): the renderer only stops
+    /// on this signal, since the bus never closes here.
+    cancel: Option<CancellationToken>,
 }
 
 impl BusGuard {
-    /// Drops the bus, then waits for the renderer to show what is left.
+    /// Drops the bus. When the bus is this guard's alone, waits for the renderer to
+    /// show what is left; when it is shared (the TUI), signals the renderer to drain
+    /// the queued events and stop, then waits for it, bounded by [`RENDER_GRACE`].
     pub(crate) async fn close(self) {
         drop(self.bus);
-        if let Some(renderer) = self.renderer {
-            renderer.await.ok();
+        let Some(mut renderer) = self.renderer else {
+            return;
+        };
+        match self.cancel {
+            Some(cancel) => {
+                cancel.cancel();
+                // Await the drain, but do not leave it running on the shared bus past
+                // the grace period: abort it and reap the handle.
+                if tokio::time::timeout(RENDER_GRACE, &mut renderer)
+                    .await
+                    .is_err()
+                {
+                    renderer.abort();
+                    renderer.await.ok();
+                }
+            },
+            None => {
+                renderer.await.ok();
+            },
         }
     }
 }

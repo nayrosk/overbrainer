@@ -133,6 +133,17 @@ fn index(stage: Stage) -> usize {
     }
 }
 
+/// The single stage a stage command runs, or `None` for `run`, which runs them all.
+fn command_stage(command: Command) -> Option<Stage> {
+    match command {
+        Command::Subtopics => Some(Stage::Subtopics),
+        Command::Questions => Some(Stage::Questions),
+        Command::Answers => Some(Stage::Answers),
+        Command::Split => Some(Stage::Split),
+        Command::Run => None,
+    }
+}
+
 /// The name `command` has in the `r` menu.
 pub(super) fn command_name(command: Command) -> &'static str {
     match command {
@@ -145,18 +156,21 @@ pub(super) fn command_name(command: Command) -> &'static str {
 }
 
 impl PipelineView {
-    /// A new task running `command` with `concurrency` requests at a time.
+    /// A new task running `command` with `concurrency` requests at a time. A stage
+    /// command keeps the rows of the finished stages it does not run, so their tokens
+    /// and cost stay on screen when stages are run one at a time; `run` starts every
+    /// stage afresh.
     pub(super) fn started(&mut self, command: Command, concurrency: usize) {
-        let pending = if command == Command::Run {
-            StageState::Pending
-        } else {
-            StageState::Idle
-        };
+        let rows = std::array::from_fn(|i| match command_stage(command) {
+            None => Row::new(StageState::Pending),
+            Some(stage) if stage == STAGES[i] => Row::new(StageState::Idle),
+            Some(_) => self.rows[i].clone(),
+        });
         *self = Self {
             command: Some(command),
             running: true,
             concurrency: concurrency.max(1),
-            rows: std::array::from_fn(|_| Row::new(pending)),
+            rows,
             ..Self::default()
         };
     }
@@ -384,6 +398,67 @@ mod tests {
         assert_eq!(
             (row.state, row.finished, row.total, row.failed),
             (StageState::Done, 12, 12, 1)
+        );
+    }
+
+    #[test]
+    fn running_a_later_stage_keeps_the_finished_stage_tokens_and_cost() {
+        let mut view = PipelineView::default();
+        view.started(Command::Subtopics, 1);
+        view.event(&Event::StageStarted {
+            stage: Stage::Subtopics,
+            total: 1,
+        });
+        view.event(&Event::StageFinished {
+            stage: Stage::Subtopics,
+            stats: StageStats {
+                done: 1,
+                usage: Usage {
+                    input_tokens: 40,
+                    output_tokens: 60,
+                },
+                cost: Some(0.25),
+                ..StageStats::default()
+            },
+        });
+        view.stopped();
+        // Running questions on its own must not wipe the subtopics totals.
+        view.started(Command::Questions, 1);
+        let subtopics = view.row(Stage::Subtopics);
+        assert_eq!(subtopics.state, StageState::Done);
+        assert_eq!(subtopics.usage.output_tokens, 60);
+        assert_eq!(
+            subtopics.stats.as_ref().and_then(|stats| stats.cost),
+            Some(0.25)
+        );
+        assert_eq!(view.usage().output_tokens, 60);
+        assert_eq!(
+            view.row(Stage::Questions).state,
+            StageState::Idle,
+            "the stage being run starts fresh"
+        );
+    }
+
+    #[test]
+    fn a_full_run_starts_every_stage_afresh() {
+        let mut view = PipelineView::default();
+        view.started(Command::Subtopics, 1);
+        view.event(&Event::StageFinished {
+            stage: Stage::Subtopics,
+            stats: StageStats {
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                },
+                ..StageStats::default()
+            },
+        });
+        view.started(Command::Run, 4);
+        assert_eq!(view.row(Stage::Subtopics).state, StageState::Pending);
+        assert_eq!(
+            view.usage().output_tokens,
+            0,
+            "run clears the earlier totals"
         );
     }
 
