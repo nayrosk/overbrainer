@@ -1344,9 +1344,11 @@ mod tests {
     async fn the_editor_round_trip_saves_the_edit() -> Result<(), Box<dyn std::error::Error>> {
         let dir = crate::tui::snapshots::project()?;
         let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
-        let mut app = app();
+        // The app already holds the data of the files, so the keys never depend
+        // on when the load the loop starts ends: that load finds the same data
+        // and keeps the selection.
+        let mut app = crate::tui::snapshots::dataset_app();
         app.project.dir = dir.path().to_path_buf();
-        app.project.topics = crate::tui::snapshots::topics();
         app.editor = vec![
             "sh".into(),
             "-c".into(),
@@ -1368,8 +1370,6 @@ mod tests {
             KeyCode::Char('4'),
         ];
         let quit = async {
-            // The data is loaded by then.
-            tokio::time::sleep(Duration::from_millis(300)).await;
             for code in keys {
                 events.send(Ok(key(code)))?;
             }
