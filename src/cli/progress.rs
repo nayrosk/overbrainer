@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
+use tokio_util::sync::CancellationToken;
 
 use crate::events::{Event, Stage, StageStats};
 use crate::exec::JobStatus;
@@ -22,6 +23,29 @@ pub(crate) async fn render(mut receiver: Receiver<Event>) {
             Ok(event) => progress.log(&event),
             Err(RecvError::Lagged(skipped)) => lagged(skipped),
             Err(RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Logs events until `cancel` is triggered, then logs whatever is already queued and
+/// returns. The terminal UI uses this because it keeps its bus alive past the flow, so
+/// the buffer would otherwise never close; draining first keeps the last progress lines.
+pub(crate) async fn render_until(mut receiver: Receiver<Event>, cancel: CancellationToken) {
+    let mut progress = Progress::default();
+    loop {
+        tokio::select! {
+            biased;
+            incoming = receiver.recv() => match incoming {
+                Ok(event) => progress.log(&event),
+                Err(RecvError::Lagged(skipped)) => lagged(skipped),
+                Err(RecvError::Closed) => break,
+            },
+            () = cancel.cancelled() => {
+                while let Ok(event) = receiver.try_recv() {
+                    progress.log(&event);
+                }
+                break;
+            }
         }
     }
 }

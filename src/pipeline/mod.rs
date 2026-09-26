@@ -214,16 +214,18 @@ impl<C: LlmClient> RoleClient<C> {
             .await
             {
                 Ok(completion) => completion,
-                Err(error) if structured => {
-                    // The provider may not support structured output; drop it and
-                    // try again in plain text before giving up on the error.
+                Err(error) if structured && !error.is_fatal_for_stage() => {
+                    // The provider may not support structured output. Drop it and
+                    // retry in plain text at once, without spending an outer parse
+                    // attempt, so a fatal error still stops the stage as itself.
                     structured = false;
                     item.failed(
                         bus,
                         format!("{error}; retrying without structured output"),
                         true,
                     );
-                    continue;
+                    request.json_list = false;
+                    complete_with_retry(&self.client, &asking.policy, &request, item, bus).await?
                 },
                 Err(error) => return Err(error),
             };
@@ -436,5 +438,28 @@ mod tests {
             .await?;
         assert_eq!(items, vec!["foo".to_string(), "bar".to_string()]);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_fatal_error_on_the_first_structured_attempt_stops_the_stage() {
+        let bus = EventBus::new();
+        let asking = Asking {
+            policy: RetryPolicy::new(0),
+            bus: &bus,
+        };
+        let client = ScriptedClient::new(vec![Err(LlmError::Status {
+            status: 401,
+            message: "bad key".into(),
+            retry_after: None,
+        })]);
+        let role = role(client, 16_384);
+        let mut stats = StageStats::default();
+        let result = role
+            .ask_list(&asking, "p".into(), &item(), &mut stats)
+            .await;
+        assert!(
+            matches!(result, Err(LlmError::Status { status: 401, .. })),
+            "the credential error propagates as itself, so the stage stops"
+        );
     }
 }
