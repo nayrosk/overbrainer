@@ -104,7 +104,7 @@ Topic names must be unique. `subtopics` and `questions_per_subtopic` must be at 
 
 | Key | Default | Meaning |
 |---|---|---|
-| `concurrency` | `8` | Parallel requests in `answers`, 1 to 1024. |
+| `concurrency` | `8` | Parallel requests in `questions` (one subtopic each) and `answers`, 1 to 1024. Lower it for a rate-limited provider. |
 | `max_retries` | `5` | Retries per request (rate limits, server errors, timeouts), and batches without progress before a subtopic stops. |
 | `dedup_threshold` | `0.8` | Word-overlap similarity above which two questions are duplicates. |
 | `embedding_threshold` | `0.9` | Embedding similarity above which two questions are duplicates. |

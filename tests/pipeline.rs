@@ -105,6 +105,12 @@ question_batch_size = 2
 eval_ratio = 0.5
 "#;
 
+/// [`PROJECT`] filling one subtopic at a time, for tests that follow the order
+/// of requests across subtopics.
+fn sequential() -> String {
+    PROJECT.replace("concurrency = 2", "concurrency = 1")
+}
+
 /// Two topics, so `--topic` and `--force` selection has something to leave alone.
 const TWO_TOPICS: &str = r#"
 [project]
@@ -234,7 +240,7 @@ async fn subtopics_are_generated_once_and_capped() -> TestResult {
 
 #[tokio::test]
 async fn questions_fill_each_subtopic_in_batches() -> TestResult {
-    let project = Project::new()?;
+    let project = Project::with_toml(&sequential())?;
     let mut out = overbrainer::dataset::Appender::open(&project.files.subtopics)?;
     for name in ["Borrowing", "Lifetimes"] {
         out.append(&Subtopic {
@@ -688,7 +694,7 @@ async fn only_one_final_itemfailed_event_is_published_per_item() -> TestResult {
 #[tokio::test]
 async fn questions_stage_fails_only_the_subtopic_when_dedup_admit_fails_non_fatally() -> TestResult
 {
-    let project = Project::new()?;
+    let project = Project::with_toml(&sequential())?;
     let mut out = overbrainer::dataset::Appender::open(&project.files.subtopics)?;
     for name in ["Borrowing", "Lifetimes"] {
         out.append(&Subtopic {
@@ -743,6 +749,170 @@ async fn questions_stage_stops_when_dedup_admit_fails_fatally() -> TestResult {
             ..
         })
     ));
+    Ok(())
+}
+
+/// Two topics of `per_topic` subtopics each, filling `concurrency` at a time.
+fn wide(per_topic: usize, concurrency: usize) -> Result<Project, Box<dyn std::error::Error>> {
+    let toml = TWO_TOPICS
+        .replace("subtopics = 2", &format!("subtopics = {per_topic}"))
+        .replace("concurrency = 2", &format!("concurrency = {concurrency}"));
+    let project = Project::with_toml(&toml)?;
+    let mut out = Appender::open(&project.files.subtopics)?;
+    for topic in ["ownership", "control_flow"] {
+        for n in 0..per_topic {
+            let name = format!("Area {n}");
+            out.append(&Subtopic {
+                id: Id::subtopic(topic, &name),
+                topic: topic.into(),
+                name,
+            })?;
+        }
+    }
+    Ok(project)
+}
+
+/// Two distinct questions per call, unique across the whole run.
+fn unique_pairs() -> Reply {
+    Box::new(|_, call| {
+        Ok(text(&format!(
+            r#"["Distinct question number {call} alpha?", "Another angle number {call} beta?"]"#
+        )))
+    })
+}
+
+#[tokio::test]
+async fn questions_fill_at_most_concurrency_subtopics_at_a_time() -> TestResult {
+    let project = wide(6, 3)?;
+    let mut fake = FakeLlm::new(unique_pairs());
+    fake.delay = Duration::from_millis(20);
+    let generator = project.role(fake, false);
+    let stats = pipeline::questions(&project.ctx(false), &generator, || Lexical::new(0.8)).await?;
+    assert_eq!((stats.done, stats.failed), (12, 0));
+    assert_eq!(generator.client.peak.load(Ordering::SeqCst), 3);
+    let questions: Vec<Question> = read(&project.files.questions)?;
+    assert_eq!(questions.len(), 24, "2 questions in each of 12 subtopics");
+    Ok(())
+}
+
+#[tokio::test]
+async fn questions_with_concurrency_one_run_one_subtopic_at_a_time() -> TestResult {
+    let project = wide(3, 1)?;
+    let mut fake = FakeLlm::new(unique_pairs());
+    fake.delay = Duration::from_millis(5);
+    let generator = project.role(fake, false);
+    let stats = pipeline::questions(&project.ctx(false), &generator, || Lexical::new(0.8)).await?;
+    assert_eq!(stats.done, 6);
+    assert_eq!(generator.client.peak.load(Ordering::SeqCst), 1);
+    let questions: Vec<Question> = read(&project.files.questions)?;
+    assert_eq!(questions.len(), 12, "2 questions in each of 6 subtopics");
+    Ok(())
+}
+
+#[tokio::test]
+async fn questions_in_parallel_subtopics_of_a_topic_are_deduplicated() -> TestResult {
+    let project = wide(2, 2)?;
+    let fake = FakeLlm::new(Box::new(|request, _| {
+        Ok(text(if request.prompt.contains("ownership") {
+            r#"["What is a borrow?"]"#
+        } else {
+            r#"["What is a loop?"]"#
+        }))
+    }));
+    let generator = project.role(fake, false);
+    pipeline::questions(&project.ctx(false), &generator, || Lexical::new(0.8)).await?;
+    let questions: Vec<Question> = read(&project.files.questions)?;
+    let borrows = questions
+        .iter()
+        .filter(|q| q.text == "What is a borrow?")
+        .count();
+    assert_eq!(borrows, 1, "one topic, one deduplicator: kept once");
+    Ok(())
+}
+
+#[tokio::test]
+async fn questions_keep_the_same_text_under_two_topics() -> TestResult {
+    let project = wide(1, 2)?;
+    let fake = FakeLlm::new(Box::new(|_, _| Ok(text(r#"["What is ownership for?"]"#))));
+    let generator = project.role(fake, false);
+    pipeline::questions(&project.ctx(false), &generator, || Lexical::new(0.8)).await?;
+    let questions: Vec<Question> = read(&project.files.questions)?;
+    let topics: Vec<&str> = questions.iter().map(|q| q.topic.as_str()).collect();
+    assert_eq!(topics.len(), 2, "{topics:?}");
+    assert!(topics.contains(&"ownership") && topics.contains(&"control_flow"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn questions_fatal_error_stops_the_pool_and_keeps_accepted_batches() -> TestResult {
+    let project = wide(2, 2)?;
+    let fake = FakeLlm::new(Box::new(|request, call| {
+        if request.prompt.contains("control_flow") {
+            return Err(unauthorized());
+        }
+        Ok(text(&format!(
+            r#"["Kept question {call}?", "Kept angle {call}?"]"#
+        )))
+    }));
+    let generator = project.role(fake, false);
+    let result = pipeline::questions(&project.ctx(false), &generator, || Lexical::new(0.8)).await;
+    assert!(matches!(
+        result,
+        Err(PipelineError::Llm {
+            stage: Stage::Questions,
+            source: LlmError::Status { status: 401, .. },
+            ..
+        })
+    ));
+    let questions: Vec<Question> = read(&project.files.questions)?;
+    assert!(questions.iter().all(|q| q.topic == "ownership"));
+    assert_eq!(
+        questions.len(),
+        4,
+        "both ownership subtopics were filled before the stop"
+    );
+    Ok(())
+}
+
+/// Passes candidates through; fails `record` (seeding), non-fatally, for a topic
+/// whose stored texts include `Poison?`.
+struct SeedFails;
+
+impl Deduplicator for SeedFails {
+    fn admit(
+        &mut self,
+        candidates: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<String>, LlmError>> + Send {
+        std::future::ready(Ok(candidates))
+    }
+
+    fn record(&mut self, accepted: &[String]) -> impl Future<Output = Result<(), LlmError>> + Send {
+        let poisoned = accepted.iter().any(|text| text == "Poison?");
+        std::future::ready(if poisoned { Err(non_fatal()) } else { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn questions_skip_a_topic_whose_seeding_fails_and_fill_the_other() -> TestResult {
+    let project = wide(2, 2)?;
+    let area = Id::subtopic("control_flow", "Area 0");
+    Appender::open(&project.files.questions)?.append(&Question {
+        id: Id::question(&area, "Poison?"),
+        topic: "control_flow".into(),
+        subtopic_id: area.clone(),
+        subtopic: "Area 0".into(),
+        text: "Poison?".into(),
+    })?;
+    let fake = FakeLlm::new(unique_pairs());
+    let generator = project.role(fake, false);
+    let stats = pipeline::questions(&project.ctx(false), &generator, || SeedFails).await?;
+    assert_eq!(
+        (stats.done, stats.failed),
+        (2, 1),
+        "two ownership subtopics, one topic"
+    );
+    let requests = generator.client.requests();
+    assert!(requests.iter().all(|r| !r.prompt.contains("control_flow")));
     Ok(())
 }
 
