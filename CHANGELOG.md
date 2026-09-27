@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/nayrosk/overbrainer/compare/v0.3.0...v0.3.1) - 2026-09-27
+
+### Changed
+
+- *(pipeline)* generate questions for several subtopics concurrently ([#41](https://github.com/nayrosk/overbrainer/pull/41))
+
+### Fixed
+
+- *(tui)* reload the dataset while a pipeline runs ([#38](https://github.com/nayrosk/overbrainer/pull/38))
+- *(tui)* toggle the selected node on Enter in the Dataset view ([#37](https://github.com/nayrosk/overbrainer/pull/37))
+
 ## [0.3.0](https://github.com/nayrosk/overbrainer/compare/v0.2.1...v0.3.0) - 2026-09-26
 
 ### Fixed
