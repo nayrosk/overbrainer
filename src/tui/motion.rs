@@ -628,6 +628,7 @@ mod tests {
                 stage: crate::events::Stage::Answers,
                 id: format!("item{n}"),
                 usage: None,
+                cost: None,
             });
         }
     }

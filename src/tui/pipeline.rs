@@ -305,6 +305,7 @@ mod tests {
                 input_tokens: 1,
                 output_tokens,
             }),
+            cost: None,
         }
     }
 

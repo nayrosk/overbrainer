@@ -108,6 +108,7 @@ where
                     stage: Stage::Questions,
                     id: slot.item.id,
                     usage: None,
+                    cost: None,
                 });
             } else {
                 slots.push(slot);
@@ -256,6 +257,7 @@ impl<C: LlmClient> Filler<'_, C> {
             stage: Stage::Questions,
             id: slot.item.id,
             usage: Some(usage),
+            cost: self.generator.price.as_ref().map(|price| price.cost(usage)),
         });
         Ok(())
     }

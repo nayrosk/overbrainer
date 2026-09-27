@@ -73,6 +73,7 @@ pub async fn answers<C: LlmClient + 'static>(
                 stage: Stage::Answers,
                 id: question.id.to_string(),
                 usage: None,
+                cost: None,
             });
         }
     }
@@ -313,6 +314,7 @@ fn record<C: LlmClient>(
         stage: Stage::Answers,
         id: example.id.to_string(),
         usage: Some(usage),
+        cost: parent.price.as_ref().map(|price| price.cost(usage)),
     });
 }
 

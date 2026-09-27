@@ -286,6 +286,7 @@ fn stage_events(stage: Stage, total: usize, retries: usize) -> Vec<Event> {
             stage,
             id: format!("item{n}"),
             usage: Some(usage(1000, 250)),
+            cost: None,
         });
     }
     events
