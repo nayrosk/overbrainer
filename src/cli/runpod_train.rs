@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{Context, bail};
 
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
-use super::train::{POLL, finish, reattach, secrets, started, training, warn};
+use super::train::{POLL, finish, prepare, reattach, secrets, started, training, warn};
 use crate::config::Settings;
 use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
@@ -108,9 +108,14 @@ pub(super) async fn train(
     if let Some(warning) = reasoning_template_warning(training) {
         warn(&warning);
     }
-    let secrets = secrets(settings).await?;
-    let session = Session::open(project_dir, settings, front).await?;
+    // Caught from before the preparation: Ctrl-C stops it without a run.
     let mut interrupt = front.interrupt();
+    let (secrets, session) = prepare(&mut interrupt, async {
+        let secrets = secrets(settings).await?;
+        let session = Session::open(project_dir, settings, front).await?;
+        Ok((secrets, session))
+    })
+    .await?;
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let job = Job {
         session: &session,
