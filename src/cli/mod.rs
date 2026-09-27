@@ -4,6 +4,7 @@ mod complete;
 mod config_check;
 pub(crate) mod data;
 pub(crate) mod front;
+mod history;
 mod init;
 pub(crate) mod pod;
 mod progress;
@@ -86,6 +87,8 @@ pub enum Command {
         #[command(subcommand)]
         command: RunsCommand,
     },
+    /// Show what the pipeline stages did and spent, from .overbrainer/history.jsonl.
+    History(HistoryArgs),
     /// Find and remove the Runpod pods overbrainer created.
     Pod {
         /// The pod subcommand to run.
@@ -126,9 +129,11 @@ impl Command {
             | Self::Run
             | Self::Train(_) => true,
             Self::Pod { command } => matches!(command, PodCommand::Rm { .. }),
-            Self::Init { .. } | Self::Config { .. } | Self::Runs { .. } | Self::Skill { .. } => {
-                false
-            },
+            Self::Init { .. }
+            | Self::Config { .. }
+            | Self::Runs { .. }
+            | Self::History(_)
+            | Self::Skill { .. } => false,
         }
     }
 }
@@ -212,6 +217,14 @@ pub enum RunsCommand {
     Ls,
 }
 
+/// Options of `overbrainer history`.
+#[derive(Debug, Default, Args)]
+pub struct HistoryArgs {
+    /// List every execution, oldest first, instead of the totals per stage.
+    #[arg(long)]
+    pub all: bool,
+}
+
 /// Options shared by the pipeline stage commands.
 #[derive(Debug, Default, Args)]
 pub struct StageArgs {
@@ -279,6 +292,7 @@ pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
+        Command::History(args) => history::run(dir, &args),
         Command::Pod { command } => pod::run(dir, &command).await,
         Command::Skill { command } => skill::run(dir, &command),
         Command::Tui => match logs {
@@ -359,6 +373,7 @@ mod tests {
             &["init"][..],
             &["config", "check"],
             &["runs", "ls"],
+            &["history"],
             &["pod", "ls"],
             &["skill", "install"],
         ] {

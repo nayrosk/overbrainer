@@ -34,6 +34,18 @@ pub enum Status {
     Interrupted,
 }
 
+impl Status {
+    /// Lowercase name, as used by `overbrainer history`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 /// What `split` wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitCounts {

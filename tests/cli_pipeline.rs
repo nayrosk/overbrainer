@@ -585,3 +585,30 @@ async fn run_trains_after_split_when_training_is_configured() -> TestResult {
         ));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_sums_the_stages() -> TestResult {
+    let server = provider().await;
+    let dir = project()?;
+    overbrainer(dir.path(), &server)?
+        .arg("history")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no stage has run yet"));
+    overbrainer(dir.path(), &server)?
+        .arg("run")
+        .assert()
+        .success();
+    overbrainer(dir.path(), &server)?
+        .arg("history")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("answers"))
+        .stdout(predicate::str::contains("total"));
+    overbrainer(dir.path(), &server)?
+        .args(["history", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("subtopics  ok"));
+    Ok(())
+}
