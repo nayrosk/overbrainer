@@ -168,6 +168,12 @@ impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.sender.subscribe()
     }
+
+    /// How many subscribers are listening.
+    #[cfg(test)]
+    pub(crate) fn receiver_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
 }
 
 impl Default for EventBus {

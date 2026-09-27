@@ -153,12 +153,15 @@ impl BusGuard {
     /// Drops the bus. When the bus is this guard's alone, waits for the renderer to
     /// show what is left; when it is shared (the TUI), signals the renderer to drain
     /// the queued events and stop, then waits for it, bounded by [`RENDER_GRACE`].
-    pub(crate) async fn close(self) {
-        drop(self.bus);
-        let Some(mut renderer) = self.renderer else {
+    pub(crate) async fn close(mut self) {
+        let renderer = self.renderer.take();
+        let cancel = self.cancel.take();
+        // Drops the bus; with the renderer taken, the drop leaves it running.
+        drop(self);
+        let Some(mut renderer) = renderer else {
             return;
         };
-        match self.cancel {
+        match cancel {
             Some(cancel) => {
                 cancel.cancel();
                 // Await the drain, but do not leave it running on the shared bus past
@@ -178,6 +181,21 @@ impl BusGuard {
     }
 }
 
+impl Drop for BusGuard {
+    /// Stops the renderer of a guard dropped without [`BusGuard::close`] (a flow
+    /// interrupted before it closed its bus): a shared bus's renderer drains what is
+    /// queued and ends, any other is aborted, so no renderer outlives its flow.
+    fn drop(&mut self) {
+        let Some(renderer) = self.renderer.take() else {
+            return;
+        };
+        match self.cancel.take() {
+            Some(cancel) => cancel.cancel(),
+            None => renderer.abort(),
+        }
+    }
+}
+
 /// The interrupted flag of Runpod provisioning, and the task that sets it if any.
 pub(crate) struct Flag {
     /// Set once the flow must stop provisioning.
@@ -188,7 +206,15 @@ pub(crate) struct Flag {
 impl Flag {
     /// Stops watching for the interruption.
     pub(crate) fn close(self) {
-        if let Some(watcher) = self.watcher {
+        drop(self);
+    }
+}
+
+impl Drop for Flag {
+    /// Stops the watcher, so a flag dropped without [`Flag::close`] never leaves
+    /// it running.
+    fn drop(&mut self) {
+        if let Some(watcher) = self.watcher.take() {
             watcher.abort();
         }
     }
@@ -424,6 +450,54 @@ mod tests {
         });
         assert!(extra.try_recv().is_ok());
         tokio::time::timeout(Duration::from_secs(10), guard.close()).await
+    }
+
+    /// Waits until `done` holds, yielding to the runtime, for at most ten seconds.
+    async fn eventually(done: impl Fn() -> bool) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_cli_flag_dropped_without_close_stops_its_watcher() -> anyhow::Result<()> {
+        // No other test may send Ctrl-C meanwhile: it would end the watcher too.
+        let _signals = crate::test_support::SIGNALS.lock().await;
+        let flag = Frontend::Cli.provisioning_flag()?;
+        let interrupted = Arc::clone(&flag.interrupted);
+        assert_eq!(
+            Arc::strong_count(&interrupted),
+            3,
+            "the flag and its watcher"
+        );
+        drop(flag);
+        // The watcher holds the other clone until it ends.
+        eventually(|| Arc::strong_count(&interrupted) == 1).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bus_guard_dropped_without_close_stops_its_renderer() -> anyhow::Result<()> {
+        // The command line: a clone keeps the bus open, so only the guard ends it.
+        let guard = Frontend::Cli.open_bus();
+        let bus = guard.bus.clone();
+        assert_eq!(bus.receiver_count(), 1, "the renderer");
+        drop(guard);
+        eventually(|| bus.receiver_count() == 0).await?;
+
+        // The TUI: the task's bus outlives the guard.
+        let front = tui(&CancellationToken::new());
+        let Frontend::Tui { bus, .. } = &front else {
+            anyhow::bail!("not a TUI front end");
+        };
+        let guard = front.open_bus();
+        assert_eq!(bus.receiver_count(), 1, "the renderer");
+        drop(guard);
+        eventually(|| bus.receiver_count() == 0).await?;
+        Ok(())
     }
 
     #[tokio::test]
