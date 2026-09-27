@@ -10,6 +10,7 @@ pub mod llm;
 pub mod logging;
 pub mod pipeline;
 pub mod pricing;
+pub mod project_lock;
 pub mod prompts;
 pub mod retry;
 pub mod runpod;
