@@ -214,7 +214,7 @@ async fn execute(
                 .await
         },
         Command::Answers => steps.stage(Stage::Answers, answers(session, &ctx)).await,
-        Command::Split => steps.split(&ctx),
+        Command::Split => steps.split(&ctx).await,
         Command::Run => {
             steps
                 .stage(Stage::Subtopics, subtopics(session, &ctx))
@@ -223,7 +223,7 @@ async fn execute(
                 .stage(Stage::Questions, questions(session, &ctx))
                 .await?;
             steps.stage(Stage::Answers, answers(session, &ctx)).await?;
-            steps.split(&ctx)
+            steps.split(&ctx).await
         },
     }
 }
@@ -243,10 +243,10 @@ impl Steps<'_> {
         work: impl Future<Output = anyhow::Result<StageStats>>,
     ) -> anyhow::Result<()> {
         self.recorder.begin(stage, self.session.role_of(stage));
-        report(stage, work.await, self.front, self.recorder)
+        report(stage, work.await, self.front, self.recorder).await
     }
 
-    fn split(&mut self, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    async fn split(&mut self, ctx: &Ctx<'_>) -> anyhow::Result<()> {
         self.recorder.begin(Stage::Split, None);
         match pipeline::split(ctx) {
             Ok(report) => {
@@ -255,7 +255,7 @@ impl Steps<'_> {
                 Ok(())
             },
             Err(error) => {
-                self.recorder.fail();
+                self.recorder.fail().await;
                 Err(error.into())
             },
         }
@@ -300,7 +300,7 @@ async fn answers(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<StageStats>
 /// when items failed. A stage stopped by a fatal provider error still emits and
 /// records what it produced and spent before stopping; a stage stopped by another
 /// error records what its events counted.
-fn report(
+async fn report(
     stage: Stage,
     result: anyhow::Result<StageStats>,
     front: &Frontend,
@@ -313,7 +313,7 @@ fn report(
                 front.line(&summary(*stage, spent));
                 recorder.end(Status::Failed, spent);
             } else {
-                recorder.fail();
+                recorder.fail().await;
             }
             return Err(error);
         },

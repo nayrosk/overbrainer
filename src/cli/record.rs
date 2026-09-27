@@ -55,11 +55,13 @@ impl Recorder {
         self.write(outcome, stats, None);
     }
 
-    /// Records the stage that began as failed, with what the events counted.
-    pub(super) fn fail(&mut self) {
+    /// Records the stage that began as failed, with what the events published
+    /// before the failure counted. Counting stops: the command ends with the stage.
+    pub(super) async fn fail(&mut self) {
         let Some(stage) = self.begun.as_ref().map(|begun| begun.stage) else {
             return;
         };
+        self.tally.settle().await;
         let stats = self.tally.of(stage);
         self.write(Status::Failed, &stats, None);
     }
@@ -280,12 +282,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_stage_is_recorded_with_its_tally() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let bus = EventBus::new();
+        let mut recorder = Recorder::new(dir.path(), &bus);
+        recorder.begin(Stage::Questions, None);
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+        };
+        bus.publish(done(Stage::Questions, Some(usage), None));
+        bus.publish(done(Stage::Questions, None, None));
+        bus.publish(failed(Stage::Questions, false));
+        recorder.fail().await;
+        let entries = history::read(dir.path())?;
+        let [entry] = entries.as_slice() else {
+            return Err(format!("expected one entry, got {entries:?}").into());
+        };
+        assert_eq!(entry.stage, Stage::Questions);
+        assert_eq!(entry.status, Status::Failed);
+        assert_eq!((entry.done, entry.skipped, entry.failed), (1, 1, 1));
+        assert_eq!((entry.input_tokens, entry.output_tokens), (10, 5));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn nothing_is_recorded_without_a_begun_stage() -> TestResult {
         let dir = tempfile::tempdir()?;
         let bus = EventBus::new();
         let mut recorder = Recorder::new(dir.path(), &bus);
         recorder.interrupted().await;
-        recorder.fail();
+        recorder.fail().await;
         recorder.begin(Stage::Split, None);
         recorder.split(&SplitReport {
             train: 3,
@@ -322,6 +349,8 @@ mod tests {
         let mut recorder = Recorder::new(dir.path(), &bus);
         recorder.begin(Stage::Subtopics, None);
         recorder.end(Status::Ok, &StageStats::default());
+        assert!(!history::path(dir.path()).exists());
+        assert!(history::read(dir.path()).is_err());
         Ok(())
     }
 }
