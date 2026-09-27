@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
 fn overbrainer() -> Result<Command, Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("overbrainer")?;
     // Isolate from the developer's environment.
@@ -256,7 +258,7 @@ fn init_appends_missing_gitignore_entries_once() -> Result<(), Box<dyn std::erro
         .assert()
         .success();
     let content = std::fs::read_to_string(&gitignore)?;
-    assert_eq!(content, "target/\n.env\n/data/\n/runs/\n");
+    assert_eq!(content, "target/\n.env\n/data/\n/runs/\n/.overbrainer/\n");
 
     // A second init (after removing the non-appendable files) adds nothing.
     std::fs::remove_file(dir.path().join("overbrainer.toml"))?;
@@ -319,5 +321,25 @@ fn help_lists_the_tui_command() -> Result<(), Box<dyn std::error::Error>> {
         .stdout(predicate::str::contains(
             "tui        Browse the dataset, run stages and follow training runs in a terminal UI",
         ));
+    Ok(())
+}
+
+#[test]
+fn a_second_writing_command_is_refused_while_the_project_is_locked() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let _held = overbrainer::project_lock::ProjectLock::acquire(dir.path())?;
+    Command::cargo_bin("overbrainer")?
+        .arg("-C")
+        .arg(dir.path())
+        .arg("split")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("another overbrainer (pid"));
+    Command::cargo_bin("overbrainer")?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["runs", "ls"])
+        .assert()
+        .success();
     Ok(())
 }

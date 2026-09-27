@@ -111,6 +111,25 @@ impl Command {
             _ => LogMode::Stderr,
         }
     }
+
+    /// Whether this command writes to the project, and so must hold the project
+    /// lock: at most one such overbrainer process per project.
+    #[must_use]
+    pub fn writes_project(&self) -> bool {
+        match self {
+            Self::Tui
+            | Self::Subtopics(_)
+            | Self::Questions(_)
+            | Self::Answers(_)
+            | Self::Split(_)
+            | Self::Run
+            | Self::Train(_) => true,
+            Self::Pod { command } => matches!(command, PodCommand::Rm { .. }),
+            Self::Init { .. } | Self::Config { .. } | Self::Runs { .. } | Self::Skill { .. } => {
+                false
+            },
+        }
+    }
 }
 
 /// Subcommands of `overbrainer pod`.
@@ -231,6 +250,11 @@ pub enum ConfigCommand {
 /// [`LogMode::Tui`] its logs need.
 pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
     let dir = &cli.project_dir;
+    let _lock = if cli.command.writes_project() {
+        Some(crate::project_lock::ProjectLock::acquire(dir)?)
+    } else {
+        None
+    };
     match cli.command {
         Command::Init { dir: target } => init::run(target.as_deref().unwrap_or(dir)),
         Command::Config {
@@ -303,4 +327,42 @@ fn vault() -> Result<Option<VaultSource>, SecretError> {
     VaultSettings::from_env(|key| std::env::var(key).ok(), home.as_deref())?
         .map(|settings| VaultSource::new(&settings))
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_commands_that_write_take_the_lock() -> Result<(), clap::Error> {
+        let writes = |args: &[&str]| -> Result<bool, clap::Error> {
+            let cli =
+                Cli::try_parse_from(std::iter::once("overbrainer").chain(args.iter().copied()))?;
+            Ok(cli.command.writes_project())
+        };
+        for args in [
+            &["tui"][..],
+            &["subtopics"],
+            &["questions"],
+            &["answers"],
+            &["split"],
+            &["run"],
+            &["train"],
+            &["train", "attach", "x"],
+            &["train", "cancel", "x"],
+            &["pod", "rm", "x"],
+        ] {
+            assert!(writes(args)?, "{args:?} should lock");
+        }
+        for args in [
+            &["init"][..],
+            &["config", "check"],
+            &["runs", "ls"],
+            &["pod", "ls"],
+            &["skill", "install"],
+        ] {
+            assert!(!writes(args)?, "{args:?} should not lock");
+        }
+        Ok(())
+    }
 }
