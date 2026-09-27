@@ -412,10 +412,12 @@ impl App {
         TaskId(self.next_task)
     }
 
-    /// Reloads the data files; while a load runs, one more starts when it ends.
+    /// Reloads the data files; while a load runs, one more starts when it ends,
+    /// and the footer shows the running load even when it started quietly.
     fn reload(&mut self) -> Vec<Effect> {
         if self.load.is_some() {
             self.reload_pending = true;
+            self.quiet_load = false;
             return Vec::new();
         }
         let id = self.task_id();
@@ -569,6 +571,7 @@ impl App {
         }
         if self.load == Some(id) {
             self.load = None;
+            self.reloaded = self.now;
             self.load_failed(error);
             return self.pending_reload();
         }
@@ -918,14 +921,16 @@ impl App {
         Vec::new()
     }
 
-    /// Shows `view`; the Training view reads `runs/` again, the Dataset view
-    /// reads the data files again while a stage runs. Leaving a view never
-    /// touches a task.
+    /// Shows `view`; the Training view reads `runs/` again, and switching to the
+    /// Dataset view reads the data files again while a stage runs. Leaving a
+    /// view never touches a task.
     fn show(&mut self, view: View) -> Vec<Effect> {
+        let entered = self.view != view;
         self.view = view;
         match view {
             View::Training => self.refresh_runs(),
-            View::Dataset => self.reload_while_running(true),
+            View::Dataset if entered => self.reload_while_running(true),
+            View::Dataset => Vec::new(),
             View::Pipeline | View::Logs => Vec::new(),
         }
     }
@@ -2388,7 +2393,63 @@ mod tests {
         assert!(matches!(effects.as_slice(), [Effect::Spawn(_, Task::Load)]));
         let effects = app.on_done(pipeline, Ok(Done::Pipeline(Ok(()))));
         assert_eq!(effects, [], "the end's reload waits for the running load");
+        assert!(
+            app.work().contains(&"loading".to_string()),
+            "a reload asked for shows, even behind a quiet one"
+        );
         assert_eq!(app.on_tick(at(NOW + 30)), [], "no stage runs");
+    }
+
+    #[test]
+    fn the_dataset_view_reloads_at_once_only_when_it_is_entered() {
+        let mut app = dataset_app();
+        let effects = press(
+            &mut app,
+            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Spawn(_, Task::Pipeline(_))]
+        ));
+        let effects = press(&mut app, &[KeyCode::Char('1')]);
+        let [Effect::Spawn(load, Task::Load)] = effects.as_slice() else {
+            return assert_eq!(effects, []);
+        };
+        let load = *load;
+        app.on_tick(at(NOW + 1));
+        app.on_done(load, Ok(Done::Loaded(Ok(dataset()))));
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('1')]),
+            [],
+            "already shown: the tick paces the reloads"
+        );
+    }
+
+    #[test]
+    fn a_failed_quiet_load_waits_before_the_next_one() {
+        let mut app = dataset_app();
+        let effects = press(
+            &mut app,
+            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Spawn(_, Task::Pipeline(_))]
+        ));
+        let effects = press(&mut app, &[KeyCode::Char('1')]);
+        let [Effect::Spawn(load, Task::Load)] = effects.as_slice() else {
+            return assert_eq!(effects, []);
+        };
+        let load = *load;
+        assert_eq!(app.on_tick(at(NOW + 10)), [], "the load still runs");
+        app.on_done(load, Err("boom".into()));
+        assert_eq!(
+            app.on_tick(at(NOW + 11)),
+            [],
+            "failed less than 2 s ago, though it started long before"
+        );
+        let effects = app.on_tick(at(NOW + 12));
+        assert!(matches!(effects.as_slice(), [Effect::Spawn(_, Task::Load)]));
     }
 
     #[test]
