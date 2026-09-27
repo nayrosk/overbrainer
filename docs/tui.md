@@ -22,7 +22,8 @@ Dataset:
 | Keys | Action |
 |---|---|
 | `k` `j`, Up, Down | Move. |
-| `l` `h`, Right, Left, Enter | Expand, collapse. |
+| `l` `h`, Right, Left | Expand, collapse. |
+| Enter | Expand or collapse. |
 | PgUp, PgDn | Scroll the detail pane. |
 | `/` | Filter the tree. Enter keeps the filter, Esc clears it. |
 | `s` | Stats pane. |
