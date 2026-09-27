@@ -68,6 +68,18 @@ impl StageStats {
             *self.cost.get_or_insert(0.0) += price.cost(usage);
         }
     }
+
+    /// Adds the counts, tokens and cost of `other`.
+    pub(crate) fn merge(&mut self, other: &Self) {
+        self.done += other.done;
+        self.skipped += other.skipped;
+        self.failed += other.failed;
+        self.excluded += other.excluded;
+        self.usage += other.usage;
+        if let Some(cost) = other.cost {
+            *self.cost.get_or_insert(0.0) += cost;
+        }
+    }
 }
 
 /// Something that happened in a stage, a training run or its Runpod pod.
@@ -201,6 +213,40 @@ mod tests {
         stats.add_usage(usage, Some(&price));
         assert_eq!(stats.usage.input_tokens, 2_000_000);
         assert!(stats.cost.is_some_and(|cost| (cost - 3.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn merge_adds_counts_tokens_and_cost() {
+        let mut total = StageStats {
+            done: 1,
+            cost: None,
+            ..StageStats::default()
+        };
+        let other = StageStats {
+            done: 2,
+            skipped: 1,
+            failed: 1,
+            excluded: 1,
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 4,
+            },
+            cost: Some(0.5),
+        };
+        total.merge(&other);
+        total.merge(&other);
+        assert_eq!(
+            (total.done, total.skipped, total.failed, total.excluded),
+            (5, 2, 2, 2)
+        );
+        assert_eq!(
+            total.usage,
+            Usage {
+                input_tokens: 6,
+                output_tokens: 8
+            }
+        );
+        assert_eq!(total.cost, Some(1.0));
     }
 
     #[tokio::test]
