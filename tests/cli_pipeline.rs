@@ -609,6 +609,9 @@ async fn history_sums_the_stages() -> TestResult {
         .args(["history", "--all"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("subtopics  ok"));
+        .stdout(predicate::str::contains("subtopics  ok"))
+        .stdout(predicate::str::is_match(
+            r"split      ok           train 3, eval 1, excluded 0, orphaned 0\n",
+        )?);
     Ok(())
 }

@@ -41,6 +41,18 @@ fn total_line(name: &str, total: &Total) -> String {
 }
 
 fn entry_line(entry: &Entry) -> String {
+    if let Some(split) = &entry.split {
+        return format!(
+            "{}  {:<9}  {:<11}  train {}, eval {}, excluded {}, orphaned {}",
+            entry.started_at,
+            entry.stage.name(),
+            entry.status.name(),
+            split.train,
+            split.eval,
+            entry.excluded,
+            split.orphaned,
+        );
+    }
     let model = entry.model.as_deref().unwrap_or("-");
     let cost = entry.cost.map_or(Cost::Unknown, Cost::Known);
     format!(

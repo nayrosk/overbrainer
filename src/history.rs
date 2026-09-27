@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead as _, BufReader, ErrorKind, Write as _};
+use std::io::{
+    self, BufRead as _, BufReader, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _,
+};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -134,11 +136,32 @@ pub fn append(project_dir: &Path, entry: &Entry) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut line = serde_json::to_string(entry).map_err(io::Error::other)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    let mut line = String::new();
+    // A crash can leave a last line without its newline: end it first, so that
+    // line alone is lost.
+    if !ends_a_line(&mut file)? {
+        line.push('\n');
+    }
+    line.push_str(&serde_json::to_string(entry).map_err(io::Error::other)?);
     line.push('\n');
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     // One write per line, so a crash leaves at most a truncated last line.
     file.write_all(line.as_bytes())
+}
+
+/// Whether `file` is empty or ends with a newline.
+fn ends_a_line(file: &mut std::fs::File) -> io::Result<bool> {
+    if file.metadata()?.len() == 0 {
+        return Ok(true);
+    }
+    let mut last = [0; 1];
+    file.seek(SeekFrom::End(-1))?;
+    file.read_exact(&mut last)?;
+    Ok(last == *b"\n")
 }
 
 /// Every entry of the history of `project_dir`, oldest first. A missing file is an
@@ -276,6 +299,18 @@ pub fn totals(entries: &[Entry]) -> (BTreeMap<Stage, Total>, Total) {
     (per_stage, all)
 }
 
+/// Totals per model, entries without a model (`split`) left out.
+#[must_use]
+pub fn per_model(entries: &[Entry]) -> BTreeMap<String, Total> {
+    let mut models: BTreeMap<String, Total> = BTreeMap::new();
+    for entry in entries {
+        if let Some(model) = &entry.model {
+            models.entry(model.clone()).or_default().add(entry);
+        }
+    }
+    models
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +378,37 @@ mod tests {
         assert_eq!(per_stage[&Stage::Subtopics].cost, Cost::Unknown);
         assert_eq!(all.cost, Cost::Partial(1.25));
         assert_eq!(all.runs, 4);
+    }
+
+    #[test]
+    fn a_truncated_last_line_never_swallows_the_next_entry() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(dir.path().join(STATE_DIR))?;
+        std::fs::write(path(dir.path()), "{\"stage\": \"answ")?;
+        let good = entry(Stage::Answers, Some(1.0));
+        append(dir.path(), &good)?;
+        assert_eq!(read(dir.path())?, vec![good]);
+        Ok(())
+    }
+
+    #[test]
+    fn per_model_sums_the_entries_of_each_model() {
+        let with_model = |model: &str, cost| Entry {
+            model: Some(model.to_string()),
+            ..entry(Stage::Answers, cost)
+        };
+        let entries = [
+            with_model("parent", Some(1.0)),
+            with_model("gen", Some(0.5)),
+            with_model("parent", Some(0.25)),
+            entry(Stage::Split, None),
+        ];
+        let models = per_model(&entries);
+        assert_eq!(models.keys().collect::<Vec<_>>(), ["gen", "parent"]);
+        assert_eq!(models["parent"].runs, 2);
+        assert_eq!(models["parent"].input_tokens, 20);
+        assert_eq!(models["parent"].cost, Cost::Known(1.25));
+        assert_eq!(models["gen"].runs, 1);
     }
 
     #[test]
