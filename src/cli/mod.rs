@@ -7,6 +7,7 @@ pub(crate) mod front;
 mod init;
 pub(crate) mod pod;
 mod progress;
+mod record;
 mod runpod_train;
 mod skill;
 pub(crate) mod train;

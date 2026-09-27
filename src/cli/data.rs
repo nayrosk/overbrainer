@@ -4,16 +4,18 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use serde_json::Value;
 use tokio::sync::{Mutex, OnceCell};
 
 use super::front::Frontend;
+use super::record::Recorder;
 use super::{LazyVault, StageArgs};
 use crate::config::{EnvSource, RoleModel, Settings};
 use crate::dataset::{DataFiles, Subtopic, read};
 use crate::dedup::{Embedding, Layered, Lexical};
 use crate::events::{EventBus, Stage, StageStats};
+use crate::history::Status;
 use crate::llm::{ProtocolClient, connect};
 use crate::pipeline::{self, Ctx, PipelineError, RoleClient, SplitReport};
 use crate::pricing::{LISTING_TIMEOUT, Price, fetch_listing, listed_price};
@@ -62,6 +64,16 @@ impl Session {
             embedder: OnceCell::new(),
             listings: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// The role `stage` uses; none for `split`.
+    fn role_of(&self, stage: Stage) -> Option<&RoleModel> {
+        let roles = &self.settings.roles;
+        match stage {
+            Stage::Subtopics | Stage::Questions => Some(&roles.generator),
+            Stage::Answers => Some(&roles.parent),
+            Stage::Split => None,
+        }
     }
 
     fn ctx<'a>(&'a self, bus: &'a EventBus, args: &'a StageArgs, prompts: &'a Prompts) -> Ctx<'a> {
@@ -130,14 +142,16 @@ impl Session {
     }
 }
 
-/// Runs `command` in `project_dir`, publishing progress on `front`'s bus and
-/// emitting a usage summary per stage through `front` (stdout on the command line).
+/// Runs `command` in `project_dir`, publishing progress on `front`'s bus, emitting a
+/// usage summary per stage through `front` (stdout on the command line) and
+/// recording each stage it starts in the project's history. The command stops at
+/// `front`'s interruption (Ctrl-C on the command line).
 ///
 /// # Errors
 ///
 /// Returns an error if the configuration, a template or a data file cannot be loaded,
-/// if `--topic` names no configured topic, if a provider cannot be reached, or if
-/// items failed (they are retried on the next run).
+/// if `--topic` names no configured topic, if a provider cannot be reached, if items
+/// failed (they are retried on the next run), or if the command was interrupted.
 pub async fn run(
     project_dir: &Path,
     command: Command,
@@ -146,18 +160,31 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let session = Session::open(project_dir)?;
     let guard = front.open_bus();
-    let result = execute(&session, &guard.bus, command, args, front).await;
+    let mut recorder = Recorder::new(project_dir, &guard.bus);
+    let steps = Steps {
+        session: &session,
+        front,
+        recorder: &mut recorder,
+    };
+    let flow = execute(&guard.bus, command, args, steps);
+    let result = if let Some(result) = front.interrupt().race(flow).await {
+        result
+    } else {
+        recorder.interrupted().await;
+        Err(anyhow!("interrupted: the stage resumes on its next run"))
+    };
+    drop(recorder);
     guard.close().await;
     result
 }
 
 async fn execute(
-    session: &Session,
     bus: &EventBus,
     command: Command,
     args: &StageArgs,
-    front: &Frontend,
+    mut steps: Steps<'_>,
 ) -> anyhow::Result<()> {
+    let session = steps.session;
     let empty = Prompts::empty();
     session.ctx(bus, args, &empty).topics()?;
     let prompts = if command == Command::Split {
@@ -167,32 +194,72 @@ async fn execute(
     };
     let ctx = session.ctx(bus, args, &prompts);
     match command {
-        Command::Subtopics => report(Stage::Subtopics, subtopics(session, &ctx).await, front),
+        Command::Subtopics => {
+            steps
+                .stage(Stage::Subtopics, subtopics(session, &ctx))
+                .await
+        },
         Command::Questions => {
             if missing_subtopics(&ctx)? {
                 let first = Ctx {
                     force: false,
                     ..ctx
                 };
-                report(Stage::Subtopics, subtopics(session, &first).await, front)?;
+                steps
+                    .stage(Stage::Subtopics, subtopics(session, &first))
+                    .await?;
             }
-            report(Stage::Questions, questions(session, &ctx).await, front)
+            steps
+                .stage(Stage::Questions, questions(session, &ctx))
+                .await
         },
-        Command::Answers => report(Stage::Answers, answers(session, &ctx).await, front),
-        Command::Split => {
-            print_split(&pipeline::split(&ctx)?, front);
-            Ok(())
+        Command::Answers => steps.stage(Stage::Answers, answers(session, &ctx)).await,
+        Command::Split => steps.split(&ctx),
+        Command::Run => {
+            steps
+                .stage(Stage::Subtopics, subtopics(session, &ctx))
+                .await?;
+            steps
+                .stage(Stage::Questions, questions(session, &ctx))
+                .await?;
+            steps.stage(Stage::Answers, answers(session, &ctx)).await?;
+            steps.split(&ctx)
         },
-        Command::Run => run_all(session, &ctx, front).await,
     }
 }
 
-async fn run_all(session: &Session, ctx: &Ctx<'_>, front: &Frontend) -> anyhow::Result<()> {
-    report(Stage::Subtopics, subtopics(session, ctx).await, front)?;
-    report(Stage::Questions, questions(session, ctx).await, front)?;
-    report(Stage::Answers, answers(session, ctx).await, front)?;
-    print_split(&pipeline::split(ctx)?, front);
-    Ok(())
+/// Runs stages one at a time, reporting and recording each.
+struct Steps<'a> {
+    session: &'a Session,
+    front: &'a Frontend,
+    recorder: &'a mut Recorder,
+}
+
+impl Steps<'_> {
+    /// Runs `stage` through `work`, then reports and records how it ended.
+    async fn stage(
+        &mut self,
+        stage: Stage,
+        work: impl Future<Output = anyhow::Result<StageStats>>,
+    ) -> anyhow::Result<()> {
+        self.recorder.begin(stage, self.session.role_of(stage));
+        report(stage, work.await, self.front, self.recorder)
+    }
+
+    fn split(&mut self, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+        self.recorder.begin(Stage::Split, None);
+        match pipeline::split(ctx) {
+            Ok(report) => {
+                self.recorder.split(&report);
+                print_split(&report, self.front);
+                Ok(())
+            },
+            Err(error) => {
+                self.recorder.fail();
+                Err(error.into())
+            },
+        }
+    }
 }
 
 /// Whether a selected topic has no subtopic yet (`questions` then generates them).
@@ -229,24 +296,35 @@ async fn answers(session: &Session, ctx: &Ctx<'_>) -> anyhow::Result<StageStats>
     Ok(pipeline::answers(ctx, session.parent().await?).await?)
 }
 
-/// Emits the stage summary through `front` and fails when items failed. A stage
-/// stopped by a fatal provider error still emits what it produced and spent before
-/// stopping.
+/// Emits the stage summary through `front`, records how the stage ended, and fails
+/// when items failed. A stage stopped by a fatal provider error still emits and
+/// records what it produced and spent before stopping; a stage stopped by another
+/// error records what its events counted.
 fn report(
     stage: Stage,
     result: anyhow::Result<StageStats>,
     front: &Frontend,
+    recorder: &mut Recorder,
 ) -> anyhow::Result<()> {
     let stats = match result {
         Ok(stats) => stats,
         Err(error) => {
             if let Some(PipelineError::Llm { stage, spent, .. }) = error.downcast_ref() {
                 front.line(&summary(*stage, spent));
+                recorder.end(Status::Failed, spent);
+            } else {
+                recorder.fail();
             }
             return Err(error);
         },
     };
     front.line(&summary(stage, &stats));
+    let outcome = if stats.failed == 0 {
+        Status::Ok
+    } else {
+        Status::Failed
+    };
+    recorder.end(outcome, &stats);
     if stats.failed > 0 {
         bail!(
             "{} {stage} item(s) failed; run the command again to retry them",

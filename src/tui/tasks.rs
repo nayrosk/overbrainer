@@ -383,7 +383,7 @@ impl Tasks {
         self.ids.insert(handle.id(), id);
     }
 
-    /// Starts the pipeline `command` as `id`: its token drops the stage.
+    /// Starts the pipeline `command` as `id`: its token interrupts the stage.
     fn spawn_pipeline(&mut self, id: TaskId, command: Command) -> AbortHandle {
         let dir = self.project_dir.clone();
         let token = CancellationToken::new();
@@ -392,15 +392,10 @@ impl Tasks {
         self.tokens.insert(id, token.clone());
         self.set.spawn(async move {
             let args = StageArgs::default();
-            let outcome = {
-                let run = crate::cli::data::run(&dir, command, &args, &front);
-                tokio::select! {
-                    result = run => result.map_err(|error| format!("{error:#}")),
-                    () = token.cancelled() => {
-                        Err("interrupted: the stage resumes on its next run".to_string())
-                    },
-                }
-            };
+            // The flow ends itself when the token is cancelled, recording the stage.
+            let outcome = crate::cli::data::run(&dir, command, &args, &front)
+                .await
+                .map_err(|error| format!("{error:#}"));
             forwarded(front, forwarder, "stage").await;
             Done::Pipeline(outcome)
         })
