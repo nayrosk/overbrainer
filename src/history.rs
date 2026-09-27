@@ -4,9 +4,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{
-    self, BufRead as _, BufReader, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _,
-};
+use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -177,18 +175,19 @@ fn ends_a_line(file: &mut std::fs::File) -> io::Result<bool> {
 /// Returns an error when the file exists but cannot be read.
 pub fn read(project_dir: &Path) -> io::Result<Vec<Entry>> {
     let path = path(project_dir);
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     let mut entries = Vec::new();
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
+    // Split the bytes, not text: a line of invalid UTF-8 is skipped like any other
+    // malformed line instead of failing the whole read.
+    for (index, line) in bytes.split(|&byte| byte == b'\n').enumerate() {
+        if line.trim_ascii().is_empty() {
             continue;
         }
-        match serde_json::from_str(&line) {
+        match serde_json::from_slice(line) {
             Ok(entry) => entries.push(entry),
             Err(error) => {
                 tracing::warn!("skipping line {} of {}: {error}", index + 1, path.display());
@@ -366,6 +365,18 @@ mod tests {
         writeln!(file, "not json")?;
         append(dir.path(), &good)?;
         assert_eq!(read(dir.path())?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_line_of_invalid_utf8_is_skipped() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let good = entry(Stage::Questions, Some(1.0));
+        append(dir.path(), &good)?;
+        let mut file = OpenOptions::new().append(true).open(path(dir.path()))?;
+        file.write_all(b"\xff\xfe\n")?;
+        append(dir.path(), &good)?;
+        assert_eq!(read(dir.path())?, vec![good.clone(), good]);
         Ok(())
     }
 
