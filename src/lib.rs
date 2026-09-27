@@ -6,6 +6,7 @@ pub mod dataset;
 pub mod dedup;
 pub mod events;
 pub mod exec;
+pub mod history;
 pub mod llm;
 pub mod logging;
 pub mod pipeline;
