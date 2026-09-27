@@ -804,6 +804,8 @@ async fn questions_with_concurrency_one_run_one_subtopic_at_a_time() -> TestResu
     let stats = pipeline::questions(&project.ctx(false), &generator, || Lexical::new(0.8)).await?;
     assert_eq!(stats.done, 6);
     assert_eq!(generator.client.peak.load(Ordering::SeqCst), 1);
+    let questions: Vec<Question> = read(&project.files.questions)?;
+    assert_eq!(questions.len(), 12, "2 questions in each of 6 subtopics");
     Ok(())
 }
 
@@ -864,6 +866,11 @@ async fn questions_fatal_error_stops_the_pool_and_keeps_accepted_batches() -> Te
     ));
     let questions: Vec<Question> = read(&project.files.questions)?;
     assert!(questions.iter().all(|q| q.topic == "ownership"));
+    assert_eq!(
+        questions.len(),
+        4,
+        "both ownership subtopics were filled before the stop"
+    );
     Ok(())
 }
 

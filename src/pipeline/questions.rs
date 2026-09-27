@@ -15,7 +15,7 @@ use crate::prompts;
 
 /// One subtopic's fill, boxed so the pool holds a concrete future type (see
 /// [`questions`]).
-type Batch<'a> = Pin<Box<dyn Future<Output = Result<(), PipelineError>> + Send + 'a>>;
+type Fill<'a> = Pin<Box<dyn Future<Output = Result<(), PipelineError>> + Send + 'a>>;
 
 #[derive(Serialize)]
 struct Context<'a> {
@@ -43,6 +43,10 @@ struct Context<'a> {
 /// the whole stage when it is fatal; otherwise it fails only the subtopic being
 /// filled, or, when it happens while seeding a topic's deduplicator from the
 /// questions already on disk, the whole topic.
+///
+/// When a fatal error stops the stage, the requests still in flight for other
+/// subtopics are cancelled, and the tokens their earlier attempts already spent are
+/// not counted in what the returned error reports as spent.
 ///
 /// # Errors
 ///
@@ -120,11 +124,11 @@ where
     // returning `impl Future` here made the pipeline stage's own future lose its
     // `Send` bound (needed to spawn it, in the TUI) for reasons `rustc` reports as a
     // higher-ranked lifetime it cannot solve, not as an actual `Send` violation.
-    let batches: Vec<Batch<'_>> = slots
+    let fills: Vec<Fill<'_>> = slots
         .into_iter()
-        .map(|slot| Box::pin(filler.fill(slot)) as Batch<'_>)
+        .map(|slot| Box::pin(filler.fill(slot)) as Fill<'_>)
         .collect();
-    stream::iter(batches)
+    stream::iter(fills)
         .buffer_unordered(ctx.settings.pipeline.concurrency.max(1))
         .try_for_each(|()| std::future::ready(Ok(())))
         .await?;
