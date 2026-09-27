@@ -90,7 +90,7 @@ A deleted subtopic or question is recorded in `data/rejected.jsonl`, so the stag
 
 ## The data lock
 
-While a stage, an edit or a training start runs in the TUI, and once it is quitting, `e`, `d`, `r` and `t` are refused. An `overbrainer` command run in another terminal at the same time is not locked out. Avoid editing in the TUI while a stage runs elsewhere: a stage appending to a file the TUI rewrites loses those lines. An edit checks that what it changes is still on disk as shown, and refuses otherwise.
+While a stage, an edit or a training start runs in the TUI, and once it is quitting, `e`, `d`, `r` and `t` are refused. `overbrainer tui` also holds the project's [lock](pipeline.md#project-state) for as long as it runs, so no other overbrainer command can write to the same project at the same time. An edit checks that what it changes is still on disk as shown, and refuses otherwise.
 
 ## Quitting
 
