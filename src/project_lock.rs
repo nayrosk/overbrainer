@@ -3,6 +3,7 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 /// Directory of the project's own state, next to `overbrainer.toml`.
@@ -19,10 +20,11 @@ pub enum LockError {
         /// The PID the holder wrote, when readable.
         pid: Option<u32>,
     },
-    /// The state directory or the lock file is a symbolic link, never followed.
+    /// The state directory or the lock file is a symbolic link, a hard link to
+    /// another file, or was swapped for one of those between the check and the open.
     #[error("refusing to use {}: it is a symbolic link", path.display())]
     Symlink {
-        /// The symbolic link.
+        /// The link, or the path replaced by one.
         path: PathBuf,
     },
     /// The lock file cannot be created, read or locked.
@@ -44,6 +46,52 @@ fn is_symlink(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Verifies that `file`, already opened from `path`, is truly the file at `path`:
+/// not a symbolic link, not a hard link to another file, and not swapped for either
+/// between the earlier symlink check and the `open` call that produced `file`.
+///
+/// `open` follows symbolic links, so a check made before opening cannot by itself
+/// rule out a link swapped in during that window. This closes the window by
+/// comparing what was actually opened (`fstat`, via [`File::metadata`]) against what
+/// is on disk right now (`lstat`, via [`std::fs::symlink_metadata`]).
+fn verify_opened_file(dir: &Path, path: &Path, file: &File) -> Result<(), LockError> {
+    let io = |source| LockError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let symlink = |bad: &Path| LockError::Symlink {
+        path: bad.to_path_buf(),
+    };
+
+    // The state directory could have been swapped for a symlink after the earlier
+    // check and before the lock file was opened.
+    if is_symlink(dir).map_err(io)? {
+        return Err(symlink(dir));
+    }
+
+    let opened = file.metadata().map_err(io)?;
+    // A file with more than one hard link is also reachable through another path;
+    // refusing it rules out the lock file being a second name for a file we do not
+    // own, even though a hard link is not a symbolic link.
+    if !opened.is_file() || opened.nlink() != 1 {
+        return Err(symlink(path));
+    }
+
+    // `lstat` the path itself: it must still be a plain file, never a symlink, and
+    // it must be the very inode `file` was opened from. A mismatch means `path` was
+    // replaced after the open, and `file` is not the file the caller expects to
+    // manage.
+    let on_disk = std::fs::symlink_metadata(path).map_err(io)?;
+    if on_disk.file_type().is_symlink() {
+        return Err(symlink(path));
+    }
+    if on_disk.dev() != opened.dev() || on_disk.ino() != opened.ino() {
+        return Err(symlink(path));
+    }
+
+    Ok(())
+}
+
 fn holder(pid: Option<u32>) -> String {
     pid.map_or_else(|| "unknown pid".to_string(), |pid| format!("pid {pid}"))
 }
@@ -61,8 +109,9 @@ impl ProjectLock {
     /// # Errors
     ///
     /// [`LockError::Held`] when another process holds it, [`LockError::Symlink`] when
-    /// `.overbrainer/` or its lock file is a symbolic link, [`LockError::Io`] when the
-    /// file cannot be created, locked or written.
+    /// `.overbrainer/` or its lock file is a symbolic link, is a hard link to another
+    /// file, or was swapped for one of those after the initial check, [`LockError::Io`]
+    /// when the file cannot be created, locked or written.
     pub fn acquire(project_dir: &Path) -> Result<Self, LockError> {
         let dir = project_dir.join(STATE_DIR);
         let path = dir.join(LOCK_FILE);
@@ -76,7 +125,9 @@ impl ProjectLock {
             _ => {},
         }
         // Never follow a symbolic link: it could point the lock, and the PID written
-        // into it, at any file.
+        // into it, at any file. This first check narrows the window but does not
+        // close it; `open` below follows symlinks, so the path could still be
+        // swapped for one between this check and the open.
         for link in [&dir, &path] {
             if is_symlink(link).map_err(io)? {
                 return Err(LockError::Symlink { path: link.clone() });
@@ -89,6 +140,11 @@ impl ProjectLock {
             .truncate(false)
             .open(&path)
             .map_err(io)?;
+        // Close the race: verify the file just opened is really the one at `path`,
+        // and only that one, before locking or writing anything into it. Without
+        // this, a symlink or hard link swapped in after the check above would let
+        // `set_len(0)` and the PID write land on an unrelated file.
+        verify_opened_file(&dir, &path, &file)?;
         match file.try_lock() {
             Ok(()) => {},
             Err(TryLockError::WouldBlock) => {
@@ -174,6 +230,22 @@ mod tests {
         std::fs::create_dir(dir.path().join(STATE_DIR))?;
         let lock = dir.path().join(STATE_DIR).join(LOCK_FILE);
         std::os::unix::fs::symlink(&target, &lock)?;
+        match ProjectLock::acquire(dir.path()) {
+            Err(LockError::Symlink { path }) => assert_eq!(path, lock),
+            other => return Err(format!("expected Symlink, got {other:?}").into()),
+        }
+        assert_eq!(std::fs::read_to_string(&target)?, "keep me");
+        Ok(())
+    }
+
+    #[test]
+    fn a_hard_linked_lock_file_is_refused_and_its_target_kept() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("precious");
+        std::fs::write(&target, "keep me")?;
+        std::fs::create_dir(dir.path().join(STATE_DIR))?;
+        let lock = dir.path().join(STATE_DIR).join(LOCK_FILE);
+        std::fs::hard_link(&target, &lock)?;
         match ProjectLock::acquire(dir.path()) {
             Err(LockError::Symlink { path }) => assert_eq!(path, lock),
             other => return Err(format!("expected Symlink, got {other:?}").into()),
