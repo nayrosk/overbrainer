@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::RoleModel;
 use crate::events::{Event, EventBus, Stage, StageStats};
-use crate::history::{self, Entry, SplitCounts, Status};
+use crate::history::{self, Entry, Span, SplitCounts, Status};
 use crate::pipeline::SplitReport;
 use crate::runs::rfc3339;
 
@@ -99,8 +99,10 @@ impl Recorder {
         };
         let mut entry = Entry::from_stats(
             begun.stage,
-            begun.started_at,
-            rfc3339(SystemTime::now()),
+            Span {
+                started_at: begun.started_at,
+                ended_at: rfc3339(SystemTime::now()),
+            },
             outcome,
             begun.role.as_ref(),
             stats,

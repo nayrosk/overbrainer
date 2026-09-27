@@ -93,25 +93,30 @@ pub struct Entry {
     pub split: Option<SplitCounts>,
 }
 
+/// When a stage execution ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    /// When it started, RFC 3339 UTC.
+    pub started_at: String,
+    /// When it ended, RFC 3339 UTC.
+    pub ended_at: String,
+}
+
 impl Entry {
     /// An entry from a stage's counters.
     #[must_use]
-    // The fixed history-entry shape needs all six inputs; `status` and `stats` are
-    // both part of the interface and not worth renaming to please the lint.
-    #[allow(clippy::too_many_arguments, clippy::similar_names)]
     pub fn from_stats(
         stage: Stage,
-        started_at: String,
-        ended_at: String,
-        status: Status,
+        span: Span,
+        outcome: Status,
         role: Option<&RoleModel>,
         stats: &StageStats,
     ) -> Self {
         Self {
             stage,
-            started_at,
-            ended_at,
-            status,
+            started_at: span.started_at,
+            ended_at: span.ended_at,
+            status: outcome,
             provider: role.map(|role| role.provider.clone()),
             model: role.map(|role| role.model.clone()),
             done: stats.done,
@@ -330,8 +335,10 @@ mod tests {
         };
         Entry::from_stats(
             stage,
-            "2026-09-27T10:00:00Z".into(),
-            "2026-09-27T10:01:00Z".into(),
+            Span {
+                started_at: "2026-09-27T10:00:00Z".into(),
+                ended_at: "2026-09-27T10:01:00Z".into(),
+            },
             Status::Ok,
             None,
             &stats,
