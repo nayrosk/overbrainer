@@ -50,7 +50,7 @@ Logs:
 
 ### Dataset (`1`)
 
-The topics, their subtopics, questions and answers as a tree, with a detail pane: an answer's reasoning and content, which PgUp and PgDn scroll. With `s`, the pane shows the stats of the selected topic and the train and eval sizes. `/` filters the tree by a case-insensitive substring of question texts and subtopic names. Enter keeps the typed filter applied; Esc clears the filter, whether it is being typed or already applied. Questions show `[a]` when answered and used for training, `[x]` when the answer is excluded, `[o]` when orphaned (its topic is no longer configured), and `[ ]` when unanswered. Topics no longer in `overbrainer.toml` and questions whose subtopic is gone are shown too, so they can be deleted.
+The topics, their subtopics, questions and answers as a tree, with a detail pane: an answer's reasoning and content, which PgUp and PgDn scroll. With `s`, the pane shows the stats of the selected topic and the train and eval sizes. `/` filters the tree by a case-insensitive substring of question texts and subtopic names. Enter keeps the typed filter applied; Esc clears the filter, whether it is being typed or already applied. Questions show `[a]` when answered and used for training, `[x]` when the answer is excluded, `[o]` when orphaned (its topic is no longer configured), and `[ ]` when unanswered. Topics no longer in `overbrainer.toml` and questions whose subtopic is gone are shown too, so they can be deleted. While a stage started from the TUI runs, the view reads the data files again every 2 seconds and whenever it is shown, so its counts follow what the stage writes; the selection and open nodes stay.
 
 ### Pipeline (`2`)
 

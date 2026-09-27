@@ -12,6 +12,7 @@ use tracing::Level;
 
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
 use super::editor::{self, Session, Target};
+use super::follow::REFRESH;
 use super::motion::{Motion, MotionLevel};
 use super::pipeline::{PipelineView, STAGES, command_name};
 use super::start::StartPlan;
@@ -299,6 +300,11 @@ pub(super) struct App {
     /// Whether a reload was asked for while a load ran: it starts once that load
     /// ends, so it reads what changed meanwhile.
     reload_pending: bool,
+    /// Whether the load running was started in the background, while a stage
+    /// runs: the footer does not show it.
+    quiet_load: bool,
+    /// When the last load started or ended.
+    reloaded: SystemTime,
     /// The edit being saved, if any.
     pub(super) edit: Option<TaskId>,
     /// The edit open in the editor or being saved.
@@ -359,6 +365,8 @@ impl App {
             load_at: None,
             motion: Motion::new(MotionLevel::Off),
             reload_pending: false,
+            quiet_load: false,
+            reloaded: Self::never(),
             edit: None,
             editing: None,
             editor: vec!["vi".to_string()],
@@ -413,7 +421,29 @@ impl App {
         let id = self.task_id();
         self.load = Some(id);
         self.load_at = Some(self.motion.clock());
+        self.quiet_load = false;
+        self.reloaded = self.now;
         vec![Effect::Spawn(id, Task::Load)]
+    }
+
+    /// Reloads the data files in the background while a stage runs and the
+    /// Dataset view is shown, so its counts follow what the stage writes: at
+    /// once when `now` is set, else once the last load ended long enough ago (or
+    /// the clock went back), so a slow load is not followed by another at once. A load already running is left alone.
+    fn reload_while_running(&mut self, now: bool) -> Vec<Effect> {
+        if self.view != View::Dataset || self.pipeline_task.is_none() || self.load.is_some() {
+            return Vec::new();
+        }
+        let recent = matches!(
+            self.now.duration_since(self.reloaded),
+            Ok(since) if since < REFRESH
+        );
+        if recent && !now {
+            return Vec::new();
+        }
+        let effects = self.reload();
+        self.quiet_load = true;
+        effects
     }
 
     /// The work running, as the footer shows it, each with a spinner.
@@ -422,7 +452,7 @@ impl App {
         if self.leaving.is_some() {
             work.push("quitting: waiting".to_string());
         }
-        if self.load.is_some() {
+        if self.load.is_some() && !self.quiet_load {
             work.push("loading".to_string());
         }
         if let Some(progress) = self.pipeline.progress() {
@@ -505,6 +535,7 @@ impl App {
             return Vec::new();
         }
         self.load = None;
+        self.reloaded = self.now;
         match loaded {
             Ok(data) => self.dataset.loaded(data, &self.project.topics),
             Err(error) => self.load_failed(error),
@@ -887,14 +918,16 @@ impl App {
         Vec::new()
     }
 
-    /// Shows `view`; the Training view reads `runs/` again. Leaving a view never
+    /// Shows `view`; the Training view reads `runs/` again, the Dataset view
+    /// reads the data files again while a stage runs. Leaving a view never
     /// touches a task.
     fn show(&mut self, view: View) -> Vec<Effect> {
         self.view = view;
-        if view == View::Training {
-            return self.refresh_runs();
+        match view {
+            View::Training => self.refresh_runs(),
+            View::Dataset => self.reload_while_running(true),
+            View::Pipeline | View::Logs => Vec::new(),
         }
-        Vec::new()
     }
 
     /// Closes the overlay and returns it. Closing the start dialog forgets its
@@ -1292,10 +1325,12 @@ impl App {
 
     /// Moves the clock to `now`: expires the status message and shows new log
     /// lines, and the newest warning or error on the status line; reads `runs/`
-    /// again when the Training view is shown and it is time.
+    /// again when the Training view is shown and it is time, and the data files
+    /// when the Dataset view is shown while a stage runs.
     pub(super) fn on_tick(&mut self, now: SystemTime) -> Vec<Effect> {
         self.now = now;
-        let effects = self.refresh_when_due();
+        let mut effects = self.refresh_when_due();
+        effects.extend(self.reload_while_running(false));
         if self.status.as_ref().is_some_and(|status| {
             now.duration_since(status.at)
                 .is_ok_and(|shown| shown >= STATUS_FOR)
@@ -2308,6 +2343,48 @@ mod tests {
         assert!(matches!(reload.as_slice(), [Effect::Spawn(_, Task::Load)]));
         assert_eq!(status(&app), Some("answers finished"));
         assert_eq!(app.lock(), None);
+    }
+
+    #[test]
+    fn the_dataset_view_reloads_quietly_while_a_stage_runs() {
+        let mut app = dataset_app();
+        let effects = press(
+            &mut app,
+            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
+        );
+        let [Effect::Spawn(id, Task::Pipeline(_))] = effects.as_slice() else {
+            return assert_eq!(effects, []);
+        };
+        let pipeline = *id;
+        assert_eq!(
+            app.on_tick(at(NOW + 10)),
+            [],
+            "not shown on the Pipeline view"
+        );
+        let effects = press(&mut app, &[KeyCode::Char('1')]);
+        let [Effect::Spawn(load, Task::Load)] = effects.as_slice() else {
+            return assert_eq!(effects, []);
+        };
+        let load = *load;
+        assert!(!app.work().contains(&"loading".to_string()), "quiet");
+        assert_eq!(app.on_tick(at(NOW + 11)), [], "one load at a time");
+        app.on_done(load, Ok(Done::Loaded(Ok(dataset()))));
+        assert_eq!(app.on_tick(at(NOW + 12)), [], "ended less than 2 s ago");
+        let effects = app.on_tick(at(NOW + 13));
+        assert!(matches!(effects.as_slice(), [Effect::Spawn(_, Task::Load)]));
+        let effects = app.on_done(pipeline, Ok(Done::Pipeline(Ok(()))));
+        assert_eq!(effects, [], "the end's reload waits for the running load");
+        assert_eq!(app.on_tick(at(NOW + 30)), [], "no stage runs");
+    }
+
+    #[test]
+    fn the_dataset_view_does_not_reload_on_its_own_when_no_stage_runs() {
+        let mut app = dataset_app();
+        assert_eq!(app.on_tick(at(NOW + 10)), []);
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('2'), KeyCode::Char('1')]),
+            []
+        );
     }
 
     #[test]
