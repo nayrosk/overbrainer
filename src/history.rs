@@ -4,14 +4,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{self, BufRead as _, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::RoleModel;
 use crate::events::{Stage, StageStats};
-use crate::project_lock::STATE_DIR;
+use crate::project_lock::{STATE_DIR, check_path, verify_opened};
 
 /// File name of the history in the state directory.
 pub const HISTORY_FILE: &str = "history.jsonl";
@@ -133,17 +133,24 @@ impl Entry {
 ///
 /// # Errors
 ///
-/// Returns an error when the file cannot be created or written.
+/// Returns an error when the file cannot be created or written, or when
+/// `.overbrainer` or the history file is not a safe path to write to (a symbolic
+/// link, a hard link to another file, or swapped for one of those).
 pub fn append(project_dir: &Path, entry: &Entry) -> io::Result<()> {
+    let dir = project_dir.join(STATE_DIR);
     let path = path(project_dir);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(&dir)?;
+    // Never follow a symbolic link into an unrelated file. This narrows the
+    // window but does not close it; `verify_opened` below closes it.
+    for link in [&dir, &path] {
+        check_path(link)?;
     }
     let mut file = OpenOptions::new()
         .read(true)
         .create(true)
         .append(true)
         .open(&path)?;
+    verify_opened(&dir, &path, &file)?;
     let mut line = String::new();
     // A crash can leave a last line without its newline: end it first, so that
     // line alone is lost.
@@ -172,25 +179,42 @@ fn ends_a_line(file: &mut std::fs::File) -> io::Result<bool> {
 ///
 /// # Errors
 ///
-/// Returns an error when the file exists but cannot be read.
+/// Returns an error when the file exists but cannot be read, or when
+/// `.overbrainer` or the history file is a symbolic link.
 pub fn read(project_dir: &Path) -> io::Result<Vec<Entry>> {
+    let dir = project_dir.join(STATE_DIR);
     let path = path(project_dir);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    // Never follow a symbolic link into an unrelated file.
+    for link in [&dir, &path] {
+        check_path(link)?;
+    }
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
+    let mut reader = io::BufReader::new(file);
     let mut entries = Vec::new();
-    // Split the bytes, not text: a line of invalid UTF-8 is skipped like any other
-    // malformed line instead of failing the whole read.
-    for (index, line) in bytes.split(|&byte| byte == b'\n').enumerate() {
+    let mut buf = Vec::new();
+    let mut number = 0_usize;
+    // Stream line by line instead of loading the whole file: a history can grow
+    // large over the life of a project.
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        number += 1;
+        let line = buf.strip_suffix(b"\n").unwrap_or(&buf);
         if line.trim_ascii().is_empty() {
             continue;
         }
+        // A line of invalid UTF-8, like any other malformed line, is skipped
+        // instead of failing the whole read.
         match serde_json::from_slice(line) {
             Ok(entry) => entries.push(entry),
             Err(error) => {
-                tracing::warn!("skipping line {} of {}: {error}", index + 1, path.display());
+                tracing::warn!("skipping line {number} of {}: {error}", path.display());
             },
         }
     }
@@ -406,6 +430,35 @@ mod tests {
         let good = entry(Stage::Answers, Some(1.0));
         append(dir.path(), &good)?;
         assert_eq!(read(dir.path())?, vec![good]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlinked_history_file_is_refused_and_its_target_kept() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        let target = elsewhere.path().join("precious");
+        std::fs::write(&target, "keep me")?;
+        std::fs::create_dir(dir.path().join(STATE_DIR))?;
+        let file = dir.path().join(STATE_DIR).join(HISTORY_FILE);
+        std::os::unix::fs::symlink(&target, &file)?;
+        let good = entry(Stage::Answers, Some(1.0));
+        assert!(append(dir.path(), &good).is_err());
+        assert_eq!(std::fs::read_to_string(&target)?, "keep me");
+        Ok(())
+    }
+
+    #[test]
+    fn a_hard_linked_history_file_is_refused_and_its_target_kept() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("precious");
+        std::fs::write(&target, "keep me")?;
+        std::fs::create_dir(dir.path().join(STATE_DIR))?;
+        let file = dir.path().join(STATE_DIR).join(HISTORY_FILE);
+        std::fs::hard_link(&target, &file)?;
+        let good = entry(Stage::Answers, Some(1.0));
+        assert!(append(dir.path(), &good).is_err());
+        assert_eq!(std::fs::read_to_string(&target)?, "keep me");
         Ok(())
     }
 
