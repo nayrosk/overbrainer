@@ -930,8 +930,7 @@ impl App {
         match view {
             View::Training => self.refresh_runs(),
             View::Dataset if entered => self.reload_while_running(true),
-            View::Dataset => Vec::new(),
-            View::Pipeline | View::Logs => Vec::new(),
+            View::Dataset | View::Pipeline | View::Logs => Vec::new(),
         }
     }
 
