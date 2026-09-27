@@ -45,7 +45,8 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
 
 const DATASET: &[KeyHelp] = &[
     row("k j, Up Down", "move"),
-    row("l h, Right Left, Enter", "expand, collapse"),
+    row("l h, Right Left", "expand, collapse"),
+    row("Enter", "expand or collapse"),
     row("PgUp PgDn", "scroll the detail pane"),
     row("/", "filter the tree (Enter keeps, Esc clears)"),
     row("s", "stats pane"),

@@ -966,8 +966,11 @@ impl App {
         match code {
             KeyCode::Up | KeyCode::Char('k') => view.step(false),
             KeyCode::Down | KeyCode::Char('j') => view.step(true),
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+            KeyCode::Right | KeyCode::Char('l') => {
                 view.tree.key_right();
+            },
+            KeyCode::Enter => {
+                view.tree.toggle_selected();
             },
             KeyCode::Left | KeyCode::Char('h') => {
                 view.tree.key_left();
@@ -1722,6 +1725,17 @@ mod tests {
             1,
             "closed, then its topic"
         );
+    }
+
+    #[test]
+    fn enter_opens_then_closes_the_selected_node() {
+        let mut app = dataset_app();
+        let topic = vec![Node::Topic("ownership".into())];
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.dataset.tree.opened().contains(&topic));
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(!app.dataset.tree.opened().contains(&topic));
+        assert_eq!(app.dataset.tree.selected(), topic, "the selection stays");
     }
 
     #[test]
