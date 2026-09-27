@@ -26,8 +26,9 @@ use crate::cli::front::Report;
 use crate::events::Event;
 use crate::train::TrainMetric;
 
-/// Time between two reads of `runs/` while the Training view is shown.
-const REFRESH: Duration = Duration::from_secs(2);
+/// Time between two reads of `runs/` while the Training view is shown, and of
+/// the data files while the Dataset view is shown during a stage.
+pub(super) const REFRESH: Duration = Duration::from_secs(2);
 
 /// What abandoning a Runpod start does, for the dialogs that offer it.
 const ABANDONED: &str = "If its pod is still being prepared, it is deleted and the run fails, \
