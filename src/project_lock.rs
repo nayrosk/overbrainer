@@ -19,6 +19,12 @@ pub enum LockError {
         /// The PID the holder wrote, when readable.
         pid: Option<u32>,
     },
+    /// The state directory or the lock file is a symbolic link, never followed.
+    #[error("refusing to use {}: it is a symbolic link", path.display())]
+    Symlink {
+        /// The symbolic link.
+        path: PathBuf,
+    },
     /// The lock file cannot be created, read or locked.
     #[error("cannot lock {}", path.display())]
     Io {
@@ -27,6 +33,15 @@ pub enum LockError {
         /// The I/O error.
         source: io::Error,
     },
+}
+
+/// Whether `path` is a symbolic link; a missing path is not.
+fn is_symlink(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 fn holder(pid: Option<u32>) -> String {
@@ -45,7 +60,8 @@ impl ProjectLock {
     ///
     /// # Errors
     ///
-    /// [`LockError::Held`] when another process holds it, [`LockError::Io`] when the
+    /// [`LockError::Held`] when another process holds it, [`LockError::Symlink`] when
+    /// `.overbrainer/` or its lock file is a symbolic link, [`LockError::Io`] when the
     /// file cannot be created, locked or written.
     pub fn acquire(project_dir: &Path) -> Result<Self, LockError> {
         let dir = project_dir.join(STATE_DIR);
@@ -58,6 +74,13 @@ impl ProjectLock {
         match std::fs::create_dir(&dir) {
             Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(io(e)),
             _ => {},
+        }
+        // Never follow a symbolic link: it could point the lock, and the PID written
+        // into it, at any file.
+        for link in [&dir, &path] {
+            if is_symlink(link).map_err(io)? {
+                return Err(LockError::Symlink { path: link.clone() });
+            }
         }
         let mut file = OpenOptions::new()
             .read(true)
@@ -122,6 +145,40 @@ mod tests {
             other => return Err(format!("expected Io, got {other:?}").into()),
         }
         assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlinked_state_directory_is_refused() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        let state = dir.path().join(STATE_DIR);
+        std::os::unix::fs::symlink(elsewhere.path(), &state)?;
+        match ProjectLock::acquire(dir.path()) {
+            Err(error @ LockError::Symlink { .. }) => assert_eq!(
+                error.to_string(),
+                format!("refusing to use {}: it is a symbolic link", state.display())
+            ),
+            other => return Err(format!("expected Symlink, got {other:?}").into()),
+        }
+        assert!(!elsewhere.path().join(LOCK_FILE).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlinked_lock_file_is_refused_and_its_target_kept() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        let target = elsewhere.path().join("precious");
+        std::fs::write(&target, "keep me")?;
+        std::fs::create_dir(dir.path().join(STATE_DIR))?;
+        let lock = dir.path().join(STATE_DIR).join(LOCK_FILE);
+        std::os::unix::fs::symlink(&target, &lock)?;
+        match ProjectLock::acquire(dir.path()) {
+            Err(LockError::Symlink { path }) => assert_eq!(path, lock),
+            other => return Err(format!("expected Symlink, got {other:?}").into()),
+        }
+        assert_eq!(std::fs::read_to_string(&target)?, "keep me");
         Ok(())
     }
 
