@@ -142,7 +142,7 @@ Runpod: [runpod.io](https://runpod.io?ref=ym24z23f) (referral link). A run's LoR
 |---|---|
 | `1` to `4`, Tab, Shift-Tab | Switch view. |
 | `?` | The keys of the current view. |
-| `j` `k`, `l` `h` | Move, expand and collapse. |
+| `j` `k`, `l` `h`, Enter | Move, expand and collapse (Enter toggles). |
 | `/`, `s` | Filter the tree, show the stats. |
 | `e`, `d` | Edit in `$EDITOR`, delete (asks first). |
 | `r` | Run a pipeline stage. |
