@@ -264,7 +264,9 @@ pub enum ConfigCommand {
 /// [`LogMode::Tui`] its logs need.
 pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
     let dir = &cli.project_dir;
-    let _lock = if cli.command.writes_project() {
+    // Only a project takes the lock: without `overbrainer.toml` the command fails
+    // with its usual error and leaves nothing behind.
+    let _lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
         Some(crate::project_lock::ProjectLock::acquire(dir)?)
     } else {
         None

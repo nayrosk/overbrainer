@@ -2,7 +2,7 @@
 //! held until the process exits. The OS releases it when the process dies.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
 /// Directory of the project's own state, next to `overbrainer.toml`.
@@ -20,7 +20,7 @@ pub enum LockError {
         pid: Option<u32>,
     },
     /// The lock file cannot be created, read or locked.
-    #[error("cannot lock {}: {source}", path.display())]
+    #[error("cannot lock {}", path.display())]
     Io {
         /// The lock file.
         path: PathBuf,
@@ -54,7 +54,11 @@ impl ProjectLock {
             path: path.clone(),
             source,
         };
-        std::fs::create_dir_all(&dir).map_err(io)?;
+        // Never the project directory itself: only its state directory.
+        match std::fs::create_dir(&dir) {
+            Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(io(e)),
+            _ => {},
+        }
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -104,6 +108,20 @@ mod tests {
         let dir = tempfile::tempdir()?;
         drop(ProjectLock::acquire(dir.path())?);
         ProjectLock::acquire(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_project_directory_is_never_created() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let missing = dir.path().join("missing");
+        match ProjectLock::acquire(&missing) {
+            Err(error @ LockError::Io { .. }) => {
+                assert!(error.to_string().starts_with("cannot lock "), "{error}");
+            },
+            other => return Err(format!("expected Io, got {other:?}").into()),
+        }
+        assert!(!missing.exists());
         Ok(())
     }
 

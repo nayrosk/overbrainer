@@ -1,8 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
-
 fn overbrainer() -> Result<Command, Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("overbrainer")?;
     // Isolate from the developer's environment.
@@ -325,8 +323,10 @@ fn help_lists_the_tui_command() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn a_second_writing_command_is_refused_while_the_project_is_locked() -> TestResult {
+fn a_second_writing_command_is_refused_while_the_project_is_locked()
+-> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("overbrainer.toml"), "")?;
     let _held = overbrainer::project_lock::ProjectLock::acquire(dir.path())?;
     Command::cargo_bin("overbrainer")?
         .arg("-C")
@@ -341,5 +341,27 @@ fn a_second_writing_command_is_refused_while_the_project_is_locked() -> TestResu
         .args(["runs", "ls"])
         .assert()
         .success();
+    Ok(())
+}
+
+#[test]
+fn a_writing_command_outside_a_project_creates_nothing() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .arg("split")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("overbrainer.toml"));
+    assert!(!dir.path().join(".overbrainer").exists());
+    let missing = dir.path().join("missing/dir");
+    overbrainer()?
+        .arg("-C")
+        .arg(&missing)
+        .arg("split")
+        .assert()
+        .failure();
+    assert!(!dir.path().join("missing").exists());
     Ok(())
 }
