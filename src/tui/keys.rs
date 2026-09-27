@@ -24,11 +24,12 @@ const fn row(keys: &'static str, action: &'static str) -> KeyHelp {
     KeyHelp { keys, action }
 }
 
-/// The note under the keys: what the data lock refuses, and what it does not
-/// cover.
+/// The note under the keys: what the data lock refuses, and the project lock the
+/// TUI holds.
 pub(super) const NOTE: &str = "e, d, r and t are refused while a stage, an edit or a training \
-                               start runs in this TUI; an overbrainer command in another \
-                               terminal is not locked out.";
+                               start runs in this TUI; the TUI also holds the project lock, \
+                               so no other overbrainer command writes to the project \
+                               meanwhile.";
 
 /// Keys that work in every view.
 pub(super) const GLOBAL: &[KeyHelp] = &[
