@@ -231,7 +231,7 @@ impl PipelineView {
         });
     }
 
-    /// Requests in flight in `stage`: the answers stage holds up to
+    /// Requests in flight in `stage`: the questions and answers stages hold up to
     /// `pipeline.concurrency` requests, retries included; the others one.
     pub(super) fn in_flight(&self, stage: Stage) -> usize {
         if !self.running {
@@ -239,10 +239,10 @@ impl PipelineView {
         }
         let row = &self.rows[index(stage)];
         match (row.state, stage) {
-            (StageState::Running, Stage::Answers) => self.concurrency.min(row.total - row.finished),
-            (StageState::Running, Stage::Subtopics | Stage::Questions) => {
-                usize::from(row.finished < row.total)
+            (StageState::Running, Stage::Questions | Stage::Answers) => {
+                self.concurrency.min(row.total - row.finished)
             },
+            (StageState::Running, Stage::Subtopics) => usize::from(row.finished < row.total),
             _ => 0,
         }
     }
@@ -360,6 +360,21 @@ mod tests {
             "final stats replace live ones"
         );
         assert_eq!(view.in_flight(Stage::Answers), 0);
+    }
+
+    #[test]
+    fn questions_hold_up_to_concurrency_requests_in_flight() {
+        let mut view = PipelineView::default();
+        view.started(Command::Questions, 8);
+        view.event(&Event::StageStarted {
+            stage: Stage::Questions,
+            total: 10,
+        });
+        assert_eq!(view.in_flight(Stage::Questions), 8);
+        for _ in 0..7 {
+            view.event(&done(Stage::Questions, 1));
+        }
+        assert_eq!(view.in_flight(Stage::Questions), 3, "only 3 subtopics left");
     }
 
     #[test]

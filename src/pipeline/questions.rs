@@ -1,12 +1,21 @@
+use std::future::Future;
+use std::pin::Pin;
+
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::Serialize;
+use tokio::sync::Mutex;
 
 use super::{Ctx, Item, PipelineError, RoleClient, item_error, without_topics};
 use crate::config::Topic;
 use crate::dataset::{Appender, Id, Question, Rejected, Subtopic, read, rewrite};
 use crate::dedup::Deduplicator;
 use crate::events::{Event, Stage, StageStats};
-use crate::llm::{LlmClient, Usage};
+use crate::llm::{LlmClient, LlmError, Usage};
 use crate::prompts;
+
+/// One subtopic's fill, boxed so the pool holds a concrete future type (see
+/// [`questions`]).
+type Fill<'a> = Pin<Box<dyn Future<Output = Result<(), PipelineError>> + Send + 'a>>;
 
 #[derive(Serialize)]
 struct Context<'a> {
@@ -20,18 +29,24 @@ struct Context<'a> {
 /// Generates questions for every subtopic of the selected topics into
 /// `data/questions.jsonl`.
 ///
-/// Subtopics are filled one batch at a time (`pipeline.question_batch_size`), each
-/// prompt listing the questions already accepted for the subtopic. Every batch goes
-/// through a deduplicator shared by the whole topic, created by `new_dedup` and seeded
-/// with the questions already on disk and the topic's questions recorded in
-/// `data/rejected.jsonl` (deleted questions), so neither comes back; a topic with
-/// nothing left to fill is not seeded, so its stored questions are not embedded
-/// again. A subtopic stops at `questions_per_subtopic` or after
-/// `pipeline.max_retries` batches without a new question (at least one).
-/// Batches run one after the other because each depends on the previous ones. A
-/// deduplicator error that survives its own retries stops the whole stage when it is
-/// fatal; otherwise it fails only the subtopic being filled, or, when it happens while
-/// seeding a topic's deduplicator from the questions already on disk, the whole topic.
+/// Up to `pipeline.concurrency` subtopics are filled at a time, across every
+/// selected topic. A subtopic is filled one batch at a time
+/// (`pipeline.question_batch_size`), each prompt listing the questions already
+/// accepted for the subtopic, so its batches run one after the other. Every batch
+/// goes through a deduplicator shared by the whole topic, which admits one batch at
+/// a time, created by `new_dedup` and seeded with the questions already on disk and
+/// the topic's questions recorded in `data/rejected.jsonl` (deleted questions), so
+/// neither comes back; a topic with nothing left to fill is not seeded, so its
+/// stored questions are not embedded again. A subtopic stops at
+/// `questions_per_subtopic` or after `pipeline.max_retries` batches without a new
+/// question (at least one). A deduplicator error that survives its own retries stops
+/// the whole stage when it is fatal; otherwise it fails only the subtopic being
+/// filled, or, when it happens while seeding a topic's deduplicator from the
+/// questions already on disk, the whole topic.
+///
+/// When a fatal error stops the stage, the requests still in flight for other
+/// subtopics are cancelled, and the tokens their earlier attempts already spent are
+/// not counted in what the returned error reports as spent.
 ///
 /// # Errors
 ///
@@ -61,12 +76,10 @@ where
         stage: Stage::Questions,
         total: selected_subtopics(&subtopics, &topics),
     });
-    let mut filler = Filler {
-        ctx,
-        generator,
-        out: Appender::open(&ctx.files.questions)?,
-        stats: StageStats::default(),
-    };
+    // Seed every topic with something to fill, one after the other; a topic whose
+    // seeding failed is left out with its subtopics.
+    let mut stats = StageStats::default();
+    let mut ready: Vec<(&Topic, Mutex<D>)> = Vec::new();
     for topic in topics {
         let mut dedup = new_dedup();
         let pending = subtopics.iter().any(|subtopic| {
@@ -74,26 +87,57 @@ where
         });
         if pending {
             let known = seed_texts(&topic.name, &existing, &rejected);
-            if !seed(ctx, topic, &known, &mut dedup, &mut filler.stats).await? {
+            if !seed(ctx, topic, &known, &mut dedup, &mut stats).await? {
                 continue;
             }
         }
+        ready.push((topic, Mutex::new(dedup)));
+    }
+    let mut slots = Vec::new();
+    for (topic, dedup) in &ready {
         for subtopic in subtopics.iter().filter(|s| s.topic == topic.name) {
             let accepted: Vec<String> = existing
                 .iter()
                 .filter(|question| question.subtopic_id == subtopic.id)
                 .map(|question| question.text.clone())
                 .collect();
-            filler
-                .fill(Slot::new(topic, subtopic, accepted), &mut dedup)
-                .await?;
+            let slot = Slot::new(topic, subtopic, accepted, dedup);
+            if slot.accepted.len() >= slot.target {
+                stats.skipped += 1;
+                ctx.bus.publish(Event::ItemDone {
+                    stage: Stage::Questions,
+                    id: slot.item.id,
+                    usage: None,
+                });
+            } else {
+                slots.push(slot);
+            }
         }
     }
+    let filler = Filler {
+        ctx,
+        generator,
+        out: Mutex::new(Appender::open(&ctx.files.questions)?),
+        stats: Mutex::new(stats),
+    };
+    // Boxed so the pool holds a concrete, non-opaque future type: an inline closure
+    // returning `impl Future` here made the pipeline stage's own future lose its
+    // `Send` bound (needed to spawn it, in the TUI) for reasons `rustc` reports as a
+    // higher-ranked lifetime it cannot solve, not as an actual `Send` violation.
+    let fills: Vec<Fill<'_>> = slots
+        .into_iter()
+        .map(|slot| Box::pin(filler.fill(slot)) as Fill<'_>)
+        .collect();
+    stream::iter(fills)
+        .buffer_unordered(ctx.settings.pipeline.concurrency.max(1))
+        .try_for_each(|()| std::future::ready(Ok(())))
+        .await?;
+    let stats = filler.stats.into_inner();
     ctx.bus.publish(Event::StageFinished {
         stage: Stage::Questions,
-        stats: filler.stats.clone(),
+        stats: stats.clone(),
     });
-    Ok(filler.stats)
+    Ok(stats)
 }
 
 /// The texts of `topic_name`'s questions already on disk, then of its rejected ones.
@@ -150,17 +194,23 @@ fn needs_filling(subtopic: &Subtopic, existing: &[Question], topics: &[&Topic]) 
     accepted < usize::try_from(topic.questions_per_subtopic).unwrap_or(usize::MAX)
 }
 
-/// One subtopic being filled.
-struct Slot<'a> {
+/// One subtopic being filled, with its topic's deduplicator.
+struct Slot<'a, D> {
     topic: &'a Topic,
     subtopic: &'a Subtopic,
     item: Item,
     target: usize,
     accepted: Vec<String>,
+    dedup: &'a Mutex<D>,
 }
 
-impl<'a> Slot<'a> {
-    fn new(topic: &'a Topic, subtopic: &'a Subtopic, accepted: Vec<String>) -> Self {
+impl<'a, D> Slot<'a, D> {
+    fn new(
+        topic: &'a Topic,
+        subtopic: &'a Subtopic,
+        accepted: Vec<String>,
+        dedup: &'a Mutex<D>,
+    ) -> Self {
         Self {
             topic,
             subtopic,
@@ -170,37 +220,28 @@ impl<'a> Slot<'a> {
             },
             target: usize::try_from(topic.questions_per_subtopic).unwrap_or(usize::MAX),
             accepted,
+            dedup,
         }
     }
 }
 
+/// What every subtopic being filled shares.
 struct Filler<'a, C> {
     ctx: &'a Ctx<'a>,
     generator: &'a RoleClient<C>,
-    out: Appender,
-    stats: StageStats,
+    out: Mutex<Appender>,
+    stats: Mutex<StageStats>,
 }
 
 impl<C: LlmClient> Filler<'_, C> {
-    async fn fill<D: Deduplicator>(
-        &mut self,
-        mut slot: Slot<'_>,
-        dedup: &mut D,
-    ) -> Result<(), PipelineError> {
-        if slot.accepted.len() >= slot.target {
-            self.stats.skipped += 1;
-            self.ctx.bus.publish(Event::ItemDone {
-                stage: Stage::Questions,
-                id: slot.item.id,
-                usage: None,
-            });
-            return Ok(());
-        }
+    /// Fills `slot` batch after batch until its target, or until
+    /// `pipeline.max_retries` batches (at least one) bring nothing new.
+    async fn fill<D: Deduplicator>(&self, mut slot: Slot<'_, D>) -> Result<(), PipelineError> {
         let patience = self.ctx.settings.pipeline.max_retries.max(1);
         let mut stalls = 0;
         let mut usage = Usage::default();
         while slot.accepted.len() < slot.target && stalls < patience {
-            let Some((added, batch_usage)) = self.batch(&slot, dedup).await? else {
+            let Some((added, batch_usage)) = self.batch(&slot).await? else {
                 return Ok(());
             };
             usage += batch_usage;
@@ -210,7 +251,7 @@ impl<C: LlmClient> Filler<'_, C> {
         if slot.accepted.len() < slot.target {
             short(&slot);
         }
-        self.stats.done += 1;
+        self.stats.lock().await.done += 1;
         self.ctx.bus.publish(Event::ItemDone {
             stage: Stage::Questions,
             id: slot.item.id,
@@ -222,9 +263,8 @@ impl<C: LlmClient> Filler<'_, C> {
     /// Generates, deduplicates and writes one batch. Returns the accepted texts with
     /// their token usage, or `None` when the subtopic failed and was reported.
     async fn batch<D: Deduplicator>(
-        &mut self,
-        slot: &Slot<'_>,
-        dedup: &mut D,
+        &self,
+        slot: &Slot<'_, D>,
     ) -> Result<Option<(Vec<String>, Usage)>, PipelineError> {
         let batch_size =
             usize::try_from(self.ctx.settings.pipeline.question_batch_size).unwrap_or(usize::MAX);
@@ -239,27 +279,27 @@ impl<C: LlmClient> Filler<'_, C> {
                 accepted: &slot.accepted,
             },
         )?;
+        let mut spent = StageStats::default();
         let asked = self
             .generator
-            .ask_list(&self.ctx.asking(), prompt, &slot.item, &mut self.stats)
+            .ask_list(&self.ctx.asking(), prompt, &slot.item, &mut spent)
             .await;
+        self.stats.lock().await.merge(&spent);
         let (candidates, usage) = match asked {
             Ok(asked) => asked,
-            Err(error) => {
-                item_error(self.ctx, &slot.item, error, &mut self.stats)?;
-                return Ok(None);
-            },
+            Err(error) => return self.failed(&slot.item, error).await,
         };
         let candidates = candidates.into_iter().take(count).collect();
-        let added = match dedup.admit(candidates).await {
+        // Held across the embedding request: admission stays one batch at a time
+        // per topic, so parallel subtopics never keep the same question twice.
+        let admitted = slot.dedup.lock().await.admit(candidates).await;
+        let added = match admitted {
             Ok(added) => added,
-            Err(error) => {
-                item_error(self.ctx, &slot.item, error, &mut self.stats)?;
-                return Ok(None);
-            },
+            Err(error) => return self.failed(&slot.item, error).await,
         };
+        let mut out = self.out.lock().await;
         for text in &added {
-            self.out.append(&Question {
+            out.append(&Question {
                 id: Id::question(&slot.subtopic.id, text),
                 topic: slot.topic.name.clone(),
                 subtopic_id: slot.subtopic.id.clone(),
@@ -269,9 +309,16 @@ impl<C: LlmClient> Filler<'_, C> {
         }
         Ok(Some((added, usage)))
     }
+
+    /// Reports `error` for `item`: a fatal one stops the stage with what it spent.
+    async fn failed<T>(&self, item: &Item, error: LlmError) -> Result<Option<T>, PipelineError> {
+        let mut stats = self.stats.lock().await;
+        item_error(self.ctx, item, error, &mut stats)?;
+        Ok(None)
+    }
 }
 
-fn short(slot: &Slot<'_>) {
+fn short<D>(slot: &Slot<'_, D>) {
     tracing::warn!(
         "subtopic `{}`: stopped at {} of {} questions, the generator kept repeating itself",
         slot.subtopic.name,
