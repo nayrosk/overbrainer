@@ -153,6 +153,8 @@ struct Loop<'t, B: Backend> {
     frame_at: Option<Instant>,
     /// Effects the loop could not run before it ended, for [`Loop::settle`].
     pending: Vec<Effect>,
+    /// The logs exports still writing, which [`Loop::settle`] waits for.
+    exports: Vec<JoinHandle<()>>,
 }
 
 impl<'t, B> Loop<'t, B>
@@ -186,6 +188,7 @@ where
             last_draw: None,
             frame_at: None,
             pending: Vec::new(),
+            exports: Vec::new(),
         }
     }
 
@@ -278,13 +281,18 @@ where
     /// pod that nothing finds again, and a start is never abandoned without a
     /// signal. With the real terminal, the screen is given back first and
     /// stderr says what is waited for; a signal meanwhile acts as a first one
-    /// would. The ends still reach the app, for its exit notes.
+    /// would. The ends still reach the app, for its exit notes. A logs export
+    /// still writing is waited for first.
     async fn settle(&mut self, app: &mut App) {
         self.logged = app.logs.seq();
         // List prices are only read: nothing waits for them.
         self.tasks.abort_lookups();
         for effect in std::mem::take(&mut self.pending) {
             self.apply_late(app, effect);
+        }
+        // A file write: the exit's grace must not cut a `logs-*.log` short.
+        for export in std::mem::take(&mut self.exports) {
+            export.await.ok();
         }
         if !self.tasks.is_empty() {
             // Why the loop ended stays what it was.
@@ -533,14 +541,15 @@ where
     /// Writes `lines` to `.overbrainer/<name>`, off the UI thread and off the
     /// event loop: the write runs in its own spawned task, so `Loop::run` keeps
     /// handling events while it happens, never overwriting an existing file.
-    /// Reports the outcome as [`Msg::LogsExported`], dropped once the loop has
-    /// ended.
-    fn export_logs(&self, name: String, lines: Vec<String>) {
+    /// Reports the outcome as [`Msg::LogsExported`]. [`Loop::settle`] waits for
+    /// the write, so quitting never truncates it.
+    fn export_logs(&mut self, name: String, lines: Vec<String>) {
         let dir = self.tasks.project_dir().to_path_buf();
         let count = lines.len();
         let file_name = name.clone();
         let messages = self.messages.clone();
-        tokio::spawn(async move {
+        self.exports.retain(|export| !export.is_finished());
+        self.exports.push(tokio::spawn(async move {
             let written =
                 tokio::task::spawn_blocking(move || write_log_export(&dir, &name, &lines)).await;
             let message = match written {
@@ -548,7 +557,7 @@ where
                 Err(error) => Msg::LogsExported(Err(format!("export task panicked: {error}"))),
             };
             messages.send(message).ok();
-        });
+        }));
     }
 
     /// Hands the terminal to the editor: stops reading input, drops the keys
@@ -850,6 +859,53 @@ mod tests {
         let result = write_log_export(project.path(), "logs-x.log", &lines);
         let error = result.err().ok_or("expected an error")?;
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_logs_export_ends_before_the_loop_returns() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let project = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut app = app();
+        app.project.dir = project.path().to_path_buf();
+        app.logs.push(crate::logging::LogLine {
+            seq: 0,
+            level: Level::WARN,
+            target: "overbrainer".into(),
+            time: SystemTime::UNIX_EPOCH,
+            message: "kept".into(),
+        });
+        let (events, input) = mpsc::unbounded_channel();
+        for code in ['4', 'x', 'q'] {
+            events.send(Ok(key(KeyCode::Char(code))))?;
+        }
+        tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await??;
+        let exports: Vec<_> = std::fs::read_dir(project.path().join(".overbrainer"))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("logs-"))
+            .map(|entry| std::fs::read_to_string(entry.path()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert!(exports[0].contains("kept"), "{exports:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settling_waits_for_a_running_export() -> Result<(), Box<dyn std::error::Error>> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut app = app();
+        let (_events, input) = mpsc::unbounded_channel();
+        let mut looping = Loop::new(&mut terminal, input, &app.project.dir);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        looping.exports.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        tokio::time::timeout(LIMIT, looping.settle(&mut app)).await?;
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(looping.exports.is_empty());
         Ok(())
     }
 
