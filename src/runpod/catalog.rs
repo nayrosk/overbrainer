@@ -142,14 +142,27 @@ pub fn data_center_stock<S: AsRef<str>>(
 }
 
 /// The data centers with at least one `chosen` GPU type in stock, ordered by
-/// the cheapest such GPU type they have (see [`by_price`], `gpus` giving the
-/// prices), ties by ID.
+/// the cheapest such GPU type they have (see [`by_price`]), ties by ID.
+///
+/// Built only from each chosen GPU's own `data_centers` (as
+/// [`RunpodClient::list_gpu_types`](super::RunpodClient::list_gpu_types)
+/// scopes it to a GPU count), never from the unscoped `catalog/datacenters`
+/// stock: a data center is picked only when the GPU itself reports stock
+/// there for that count.
 #[must_use]
-pub fn stocked_data_centers<S: AsRef<str>>(
-    data_centers: &[DataCenter],
-    gpus: &[GpuType],
-    chosen: &[S],
-) -> Vec<DataCenterStock> {
+pub fn stocked_data_centers<S: AsRef<str>>(gpus: &[GpuType], chosen: &[S]) -> Vec<DataCenterStock> {
+    let chosen_gpus: Vec<&GpuType> = chosen
+        .iter()
+        .filter_map(|id| gpus.iter().find(|gpu| gpu.id == id.as_ref()))
+        .collect();
+    let mut ids: Vec<(String, String)> = Vec::new();
+    for gpu in &chosen_gpus {
+        for entry in &gpu.data_centers {
+            if entry.availability.is_in_stock() && !ids.iter().any(|(id, _)| *id == entry.id) {
+                ids.push((entry.id.clone(), entry.name.clone()));
+            }
+        }
+    }
     let cheapest = |row: &DataCenterStock| -> Option<&GpuType> {
         row.stock
             .iter()
@@ -157,9 +170,17 @@ pub fn stocked_data_centers<S: AsRef<str>>(
             .filter_map(|entry| gpus.iter().find(|gpu| gpu.id == entry.id))
             .min_by(|a, b| by_price(a, b))
     };
-    let mut rows: Vec<DataCenterStock> = data_center_stock(data_centers, chosen)
+    let mut rows: Vec<DataCenterStock> = ids
         .into_iter()
-        .filter(DataCenterStock::in_stock)
+        .map(|(id, name)| DataCenterStock {
+            stock: chosen
+                .iter()
+                .map(|gpu_id| gpu_stock_at(&chosen_gpus, gpu_id.as_ref(), &id))
+                .collect(),
+            id,
+            name,
+            region: String::new(),
+        })
         .collect();
     rows.sort_by(|a, b| {
         let order = match (cheapest(a), cheapest(b)) {
@@ -173,24 +194,37 @@ pub fn stocked_data_centers<S: AsRef<str>>(
     rows
 }
 
+/// `gpu_id`'s own stock at the data center `center_id`, `NONE` when that GPU
+/// (among `chosen_gpus`) does not report it. `id` names the GPU, not the data
+/// center, to match [`DataCenterStock::stock`]'s "one entry per chosen GPU".
+fn gpu_stock_at(chosen_gpus: &[&GpuType], gpu_id: &str, center_id: &str) -> Stock {
+    let availability = chosen_gpus
+        .iter()
+        .find(|gpu| gpu.id == gpu_id)
+        .and_then(|gpu| gpu.data_centers.iter().find(|entry| entry.id == center_id))
+        .map_or(Availability::None, |entry| entry.availability);
+    Stock {
+        id: gpu_id.to_string(),
+        name: String::new(),
+        availability,
+    }
+}
+
 /// `target` with its `auto` choices replaced by lists, from the catalog's
-/// `gpus` (listed for the target's `gpu_count`) and `data_centers`; listed
-/// choices are kept as they are.
+/// `gpus`, listed for the target's `gpu_count`; listed choices are kept as
+/// they are.
 ///
 /// `auto` GPU types are those in stock whose Secure Cloud pod maximum covers
 /// `gpu_count`, within `min_vram_gb` and `max_price_per_hour`, in stock in one
 /// of the listed data centers when there are any, cheapest first (see
-/// [`by_price`]). `auto` data centers are those with a chosen GPU type in stock,
-/// ordered by the cheapest one they have (see [`stocked_data_centers`]).
+/// [`by_price`]). `auto` data centers are those with a chosen GPU type in
+/// stock for that count, ordered by the cheapest one they have (see
+/// [`stocked_data_centers`]).
 ///
 /// # Errors
 ///
 /// Returns a message saying what was asked when nothing in stock matches.
-pub fn resolve(
-    target: &RunpodTarget,
-    gpus: &[GpuType],
-    data_centers: &[DataCenter],
-) -> Result<RunpodTarget, String> {
+pub fn resolve(target: &RunpodTarget, gpus: &[GpuType]) -> Result<RunpodTarget, String> {
     let mut resolved = target.clone();
     if target.gpu_types.is_auto() {
         let filter = GpuFilter {
@@ -221,7 +255,7 @@ pub fn resolve(
     }
     if target.data_center_ids.is_auto() {
         let chosen = resolved.gpu_types.list();
-        let centers: Vec<String> = stocked_data_centers(data_centers, gpus, chosen)
+        let centers: Vec<String> = stocked_data_centers(gpus, chosen)
             .into_iter()
             .map(|row| row.id)
             .collect();
@@ -451,27 +485,22 @@ mod tests {
 
     #[test]
     fn stocked_data_centers_are_ordered_by_their_cheapest_chosen_gpu() {
-        let gpus = [gpu("cheap", 24, Some(0.2)), gpu("dear", 80, Some(1.5))];
-        let centers = [
-            center("A-DEAR", vec![stock("dear", Availability::High)]),
-            center(
-                "B-EMPTY",
-                vec![
-                    stock("cheap", Availability::None),
-                    stock("dear", Availability::None),
-                ],
-            ),
-            center(
-                "C-CHEAP",
-                vec![
-                    stock("cheap", Availability::Low),
-                    stock("dear", Availability::High),
-                ],
-            ),
-            center("D-CHEAP", vec![stock("cheap", Availability::High)]),
-            center("E-OTHER", vec![stock("other", Availability::High)]),
+        let mut cheap = gpu("cheap", 24, Some(0.2));
+        cheap.data_centers = vec![
+            stock("B-EMPTY", Availability::None),
+            stock("C-CHEAP", Availability::Low),
+            stock("D-CHEAP", Availability::High),
         ];
-        let rows = stocked_data_centers(&centers, &gpus, &["dear", "cheap"]);
+        let mut dear = gpu("dear", 80, Some(1.5));
+        dear.data_centers = vec![
+            stock("A-DEAR", Availability::High),
+            stock("B-EMPTY", Availability::None),
+            stock("C-CHEAP", Availability::High),
+        ];
+        // "E-OTHER" is not in either chosen GPU's own list, unlike an unscoped
+        // catalog/datacenters listing might show: it must never appear.
+        let gpus = [cheap, dear];
+        let rows = stocked_data_centers(&gpus, &["dear", "cheap"]);
         let row_ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
         assert_eq!(row_ids, vec!["C-CHEAP", "D-CHEAP", "A-DEAR"]);
     }
@@ -479,9 +508,9 @@ mod tests {
     #[test]
     fn listed_choices_are_kept_as_they_are() {
         let listed = target(list(&["B", "A"]), list(&["EU-RO-1"]));
-        assert_eq!(resolve(&listed, &[], &[]), Ok(listed.clone()));
+        assert_eq!(resolve(&listed, &[]), Ok(listed.clone()));
         let any = target(list(&["A"]), ListOrAuto::default());
-        assert_eq!(resolve(&any, &[], &[]), Ok(any.clone()));
+        assert_eq!(resolve(&any, &[]), Ok(any.clone()));
     }
 
     #[test]
@@ -502,7 +531,7 @@ mod tests {
         ];
         let mut auto = target(ListOrAuto::Auto, ListOrAuto::default());
         auto.gpu_count = 2;
-        let resolved = resolve(&auto, &gpus, &[]);
+        let resolved = resolve(&auto, &gpus);
         assert_eq!(
             resolved.map(|target| target.gpu_types),
             Ok(list(&["big", "a", "dear"]))
@@ -520,12 +549,12 @@ mod tests {
         let mut auto = target(ListOrAuto::Auto, ListOrAuto::default());
         auto.min_vram_gb = Some(40);
         assert_eq!(
-            resolve(&auto, &gpus, &[]).map(|target| target.gpu_types),
+            resolve(&auto, &gpus).map(|target| target.gpu_types),
             Ok(list(&["mid", "dear", "unpriced"]))
         );
         auto.max_price_per_hour = Some(1.0);
         assert_eq!(
-            resolve(&auto, &gpus, &[]).map(|target| target.gpu_types),
+            resolve(&auto, &gpus).map(|target| target.gpu_types),
             Ok(list(&["mid"]))
         );
     }
@@ -540,7 +569,7 @@ mod tests {
         elsewhere.data_centers = vec![stock("US-KS-2", Availability::High)];
         let gpus = [here, empty_here, elsewhere];
         let auto = target(ListOrAuto::Auto, list(&["EU-RO-1"]));
-        let resolved = resolve(&auto, &gpus, &[]);
+        let resolved = resolve(&auto, &gpus);
         assert_eq!(
             resolved.clone().map(|target| target.gpu_types),
             Ok(list(&["here"]))
@@ -553,14 +582,16 @@ mod tests {
 
     #[test]
     fn auto_data_centers_have_a_chosen_gpu_in_stock_cheapest_first() {
-        let gpus = [gpu("cheap", 24, Some(0.2)), gpu("dear", 80, Some(1.5))];
-        let centers = [
-            center("A-DEAR", vec![stock("dear", Availability::High)]),
-            center("B-EMPTY", vec![stock("cheap", Availability::None)]),
-            center("C-CHEAP", vec![stock("cheap", Availability::Low)]),
+        let mut cheap = gpu("cheap", 24, Some(0.2));
+        cheap.data_centers = vec![
+            stock("B-EMPTY", Availability::None),
+            stock("C-CHEAP", Availability::Low),
         ];
+        let mut dear = gpu("dear", 80, Some(1.5));
+        dear.data_centers = vec![stock("A-DEAR", Availability::High)];
+        let gpus = [cheap, dear];
         let listed = target(list(&["dear", "cheap"]), ListOrAuto::Auto);
-        let resolved = resolve(&listed, &gpus, &centers);
+        let resolved = resolve(&listed, &gpus);
         assert_eq!(
             resolved.clone().map(|target| target.data_center_ids),
             Ok(list(&["C-CHEAP", "A-DEAR"]))
@@ -570,7 +601,7 @@ mod tests {
             Ok(list(&["dear", "cheap"]))
         );
         let both = target(ListOrAuto::Auto, ListOrAuto::Auto);
-        let resolved = resolve(&both, &gpus, &centers);
+        let resolved = resolve(&both, &gpus);
         assert_eq!(
             resolved.clone().map(|target| target.gpu_types),
             Ok(list(&["cheap", "dear"]))
@@ -591,7 +622,7 @@ mod tests {
         auto.min_vram_gb = Some(48);
         auto.max_price_per_hour = Some(0.5);
         assert_eq!(
-            resolve(&auto, &gpus, &[]),
+            resolve(&auto, &gpus),
             Err(
                 "no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" \
                  (gpu_count = 2, min_vram_gb = 48, max_price_per_hour = 0.5, \
@@ -601,17 +632,18 @@ mod tests {
         );
         let plain = target(ListOrAuto::Auto, ListOrAuto::default());
         assert_eq!(
-            resolve(&plain, &[], &[]),
+            resolve(&plain, &[]),
             Err(
                 "no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" \
                  (gpu_count = 1)"
                     .to_string()
             )
         );
-        let centers = [center("EU-RO-1", vec![stock("A", Availability::None)])];
+        let mut a = gpu("A", 24, Some(0.3));
+        a.data_centers = vec![stock("EU-RO-1", Availability::None)];
         let listed = target(list(&["A", "B"]), ListOrAuto::Auto);
         assert_eq!(
-            resolve(&listed, &[gpu("A", 24, Some(0.3))], &centers),
+            resolve(&listed, &[a]),
             Err(
                 "no data center has A or B in stock for data_center_ids = \"auto\" \
                  (gpu_count = 1)"

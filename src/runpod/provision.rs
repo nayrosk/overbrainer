@@ -185,7 +185,9 @@ pub async fn provision(
 
 /// `target` with its `auto` choices resolved from the Runpod catalog (see
 /// [`resolve`](super::resolve)), logged at info level; a target without any
-/// is returned as it is, without an API call.
+/// is returned as it is, without an API call. Both choices are resolved from
+/// the same GPU listing, scoped to `target.gpu_count`: `catalog/datacenters`
+/// is never read for this.
 ///
 /// # Errors
 ///
@@ -195,18 +197,11 @@ pub async fn resolve_target(
     client: &RunpodClient,
     target: &RunpodTarget,
 ) -> Result<RunpodTarget, PodError> {
-    let gpus_auto = target.gpu_types.is_auto();
-    let centers_auto = target.data_center_ids.is_auto();
-    if !gpus_auto && !centers_auto {
+    if !target.gpu_types.is_auto() && !target.data_center_ids.is_auto() {
         return Ok(target.clone());
     }
     let gpus = client.list_gpu_types(target.gpu_count).await?;
-    let centers = if centers_auto {
-        client.list_data_centers().await?
-    } else {
-        Vec::new()
-    };
-    let resolved = super::resolve(target, &gpus, &centers).map_err(PodError::NotInStock)?;
+    let resolved = super::resolve(target, &gpus).map_err(PodError::NotInStock)?;
     log_picks(target, &resolved);
     Ok(resolved)
 }

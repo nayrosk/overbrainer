@@ -1107,32 +1107,33 @@ async fn catalog_gpus(server: &MockServer, count: &str, gpus: &[(&str, u32, f64,
 #[tokio::test]
 async fn auto_choices_are_resolved_from_the_catalog_before_the_create_calls() -> TestResult {
     let harness = Harness::new().await?;
-    catalog_gpus(
-        &harness.server,
-        "2",
-        &[
-            ("NVIDIA A40", 48, 0.4, "HIGH"),
-            ("NVIDIA RTX A6000", 48, 0.4, "LOW"),
-            ("NVIDIA L4", 24, 0.2, "NONE"),
-            ("NVIDIA RTX 4000 Ada", 20, 0.3, "MEDIUM"),
-        ],
-    )
-    .await;
+    // Each GPU's own count-scoped `dataCenters` decides which data centers are
+    // candidates for `auto`; `/v2/catalog/datacenters` is not read at all.
+    let gpus = json!([
+        {
+            "id": "NVIDIA A40", "memory": 48, "secure": true,
+            "price": {"secure": 0.4}, "maxCount": {"secure": 8}, "availability": "HIGH",
+            "dataCenters": [{"id": "US-KS-2", "availability": "HIGH"}]
+        },
+        {
+            "id": "NVIDIA RTX A6000", "memory": 48, "secure": true,
+            "price": {"secure": 0.4}, "maxCount": {"secure": 8}, "availability": "LOW",
+            "dataCenters": [{"id": "US-KS-2", "availability": "LOW"}]
+        },
+        {
+            "id": "NVIDIA L4", "memory": 24, "secure": true,
+            "price": {"secure": 0.2}, "maxCount": {"secure": 8}, "availability": "NONE"
+        },
+        {
+            "id": "NVIDIA RTX 4000 Ada", "memory": 20, "secure": true,
+            "price": {"secure": 0.3}, "maxCount": {"secure": 8}, "availability": "MEDIUM",
+            "dataCenters": [{"id": "EU-RO-1", "availability": "MEDIUM"}]
+        }
+    ]);
     Mock::given(method("GET"))
-        .and(path("/v2/catalog/datacenters"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"dataCenters": [
-                {"id": "US-KS-2", "gpuAvailability": [
-                    {"id": "NVIDIA A40", "availability": "HIGH"}
-                ]},
-                {"id": "EU-RO-1", "gpuAvailability": [
-                    {"id": "NVIDIA RTX 4000 Ada", "availability": "LOW"}
-                ]},
-                {"id": "EU-SE-1", "gpuAvailability": [
-                    {"id": "NVIDIA L4", "availability": "HIGH"}
-                ]}
-            ]})),
-        )
+        .and(path("/v2/catalog/gpus"))
+        .and(query_param("count", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "gpus": gpus })))
         .expect(1)
         .mount(&harness.server)
         .await;
