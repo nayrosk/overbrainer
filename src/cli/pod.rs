@@ -27,32 +27,50 @@ pub async fn run(project_dir: &Path, command: &PodCommand) -> anyhow::Result<()>
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
     let client = client(&settings).await?;
     match command {
-        PodCommand::Gpus(args) => return gpus(&client, args).await,
-        PodCommand::Datacenters => return datacenters(&client).await,
-        PodCommand::Volumes => return volumes(&client).await,
-        PodCommand::Templates => return templates(&client).await,
-        PodCommand::Ls | PodCommand::Rm { .. } => {},
+        PodCommand::Gpus(args) => gpus(&client, args).await,
+        PodCommand::Datacenters => datacenters(&client).await,
+        PodCommand::Volumes => volumes(&client).await,
+        PodCommand::Templates => templates(&client).await,
+        PodCommand::Ls => with_pods(project_dir, &client, Pods::Ls).await,
+        PodCommand::Rm { run_id, force } => {
+            let rm = Pods::Rm {
+                run_id,
+                force: *force,
+            };
+            with_pods(project_dir, &client, rm).await
+        },
     }
+}
+
+/// The pod commands that need `runs/` and the progress renderer.
+enum Pods<'a> {
+    /// `pod ls`.
+    Ls,
+    /// `pod rm <run-id>`.
+    Rm { run_id: &'a str, force: bool },
+}
+
+/// Runs `command` with the runs of `project_dir` and a progress renderer.
+async fn with_pods(
+    project_dir: &Path,
+    client: &RunpodClient,
+    command: Pods<'_>,
+) -> anyhow::Result<()> {
     let runs = Runs::new(project_dir);
     let bus = EventBus::new();
     let renderer = tokio::spawn(super::progress::render(bus.subscribe()));
     let timing = Timing::standard();
     let interrupted = AtomicBool::new(false);
     let ctx = PodCtx {
-        client: &client,
+        client,
         runs: &runs,
         bus: &bus,
         timing: &timing,
         interrupted: &interrupted,
     };
     let result = match command {
-        PodCommand::Ls => ls(&ctx).await,
-        PodCommand::Rm { run_id, force } => rm(&ctx, run_id, *force).await,
-        // The catalog commands returned above; never reached.
-        PodCommand::Gpus(_)
-        | PodCommand::Datacenters
-        | PodCommand::Volumes
-        | PodCommand::Templates => Ok(()),
+        Pods::Ls => ls(&ctx).await,
+        Pods::Rm { run_id, force } => rm(&ctx, run_id, force).await,
     };
     drop(bus);
     renderer.await.ok();
