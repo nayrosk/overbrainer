@@ -139,8 +139,8 @@ async fn latest(env: &CheckEnv, url: &str, now: SystemTime, timeout: Duration) -
     Some(latest)
 }
 
-/// The cached version when the cache is readable and younger than a day. A
-/// symlink or a file past [`MAX_CACHE`] is ignored.
+/// The cached version when the cache is readable and younger than a day.
+/// Anything but a regular file, or a file past [`MAX_CACHE`], is ignored.
 fn read_cache(dir: &Path, now: SystemTime) -> Option<String> {
     let path = dir.join(CACHE_FILE);
     let text = read_small(&path)
@@ -156,14 +156,16 @@ fn read_cache(dir: &Path, now: SystemTime) -> Option<String> {
 }
 
 fn read_small(path: &Path) -> std::io::Result<String> {
+    use rustix::fs::{Mode, OFlags};
     use std::io::{Error, Read as _};
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(Error::other("a symlink"));
+    // NOFOLLOW refuses a symlink; NONBLOCK keeps a FIFO from hanging the open.
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = std::fs::File::from(rustix::fs::open(path, flags, Mode::empty())?);
+    if !file.metadata()?.is_file() {
+        return Err(Error::other("not a regular file"));
     }
     let mut text = String::new();
-    std::fs::File::open(path)?
-        .take(MAX_CACHE as u64 + 1)
-        .read_to_string(&mut text)?;
+    file.take(MAX_CACHE as u64 + 1).read_to_string(&mut text)?;
     if text.len() > MAX_CACHE {
         return Err(Error::other(format!("larger than {MAX_CACHE} bytes")));
     }
@@ -446,6 +448,21 @@ mod tests {
         );
         let written = std::fs::symlink_metadata(dir.path().join(CACHE_FILE))?;
         assert!(written.is_file(), "the symlink was replaced by a file");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_fifo_cache_is_fetched_without_blocking() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            dir.path().join(CACHE_FILE),
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )?;
+        let server = serve(ResponseTemplate::new(200).set_body_string(BODY), 1).await;
+        let found = latest(&env(dir.path()), &url(&server), now(), TIMEOUT).await;
+        assert_eq!(found.as_deref(), Some("0.4.2"));
         Ok(())
     }
 
