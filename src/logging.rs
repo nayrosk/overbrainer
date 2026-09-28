@@ -218,6 +218,49 @@ impl<S: Subscriber> Layer<S> for BufferLayer {
     }
 }
 
+/// Runs `f` and returns what it logged on this thread, in a fresh buffer.
+///
+/// Tests share one global subscriber sending each event to the buffer of the
+/// thread that logged it. A per-test scoped subscriber would not do: `tracing`
+/// caches whether a call site is enabled when a thread first reaches it, and a
+/// thread without a subscriber caches it as disabled for every thread while that
+/// scoped subscriber is the only one alive.
+#[cfg(test)]
+pub(crate) fn capture<R>(f: impl FnOnce() -> R) -> (R, LogBuffer) {
+    use std::cell::RefCell;
+    use std::sync::Once;
+
+    thread_local! {
+        static SINK: RefCell<Option<LogBuffer>> = const { RefCell::new(None) };
+    }
+
+    /// Hands each event to the buffer of the thread logging it, if any.
+    struct Route;
+
+    impl<S: Subscriber> Layer<S> for Route {
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            SINK.with_borrow(|sink| {
+                if let Some(buffer) = sink {
+                    buffer.layer().on_event(event, ctx);
+                }
+            });
+        }
+    }
+
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Route)).ok();
+    });
+    // Call sites reached while the global subscriber was being installed may
+    // have cached a stale interest.
+    tracing::callsite::rebuild_interest_cache();
+    let buffer = LogBuffer::new(LOG_LINES);
+    SINK.set(Some(buffer.clone()));
+    let returned = f();
+    SINK.set(None);
+    (returned, buffer)
+}
+
 /// An event's fields: the message, then the others as ` key=value`.
 #[derive(Default)]
 struct Fields {
@@ -245,8 +288,6 @@ impl Visit for Fields {
 
 #[cfg(test)]
 mod tests {
-    use tracing_subscriber::layer::SubscriberExt;
-
     use super::*;
 
     fn line(level: Level, message: &str) -> LogLine {
@@ -336,9 +377,7 @@ mod tests {
 
     #[test]
     fn the_layer_records_level_target_message_and_fields() {
-        let buffer = LogBuffer::new(10);
-        let subscriber = tracing_subscriber::registry().with(buffer.layer());
-        tracing::subscriber::with_default(subscriber, || {
+        let ((), buffer) = capture(|| {
             tracing::warn!(attempt = 2, "retrying {}", "answers");
             tracing::info!(target: "elsewhere", "plain");
         });
