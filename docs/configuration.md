@@ -133,3 +133,9 @@ Secrets are never printed or logged. When a configuration value has the wrong ty
 ## Logs
 
 Logs go to stderr, or to the Logs view of `overbrainer tui`. Set the filter with `OVERBRAINER_LOG` (for example `debug`). By default overbrainer logs at `info` and its dependencies at `warn`. `NO_COLOR` disables colors.
+
+## Update check
+
+At the start of a command, overbrainer looks up the latest release on crates.io, with a 3 second timeout, and never holds up the command while waiting for it. The result is cached for 24 hours in `$XDG_CACHE_HOME/overbrainer/latest-version.json`, or `~/.cache/overbrainer/latest-version.json` when `XDG_CACHE_HOME` is unset. When a newer release exists, the command line prints a note on stderr once the command ends, and `overbrainer tui` shows it in the footer. The check is skipped for `overbrainer skill`, for shell completions, and whenever stderr (or, for `tui`, stdout) is not a terminal. Any failure (network, parsing, the cache file) is ignored and logged at `debug`.
+
+Set `OVERBRAINER_NO_UPDATE_CHECK` to any non-empty value to turn the check off.

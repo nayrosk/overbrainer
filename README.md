@@ -80,6 +80,8 @@ COMPLETE=fish overbrainer | source           # ~/.config/fish/completions/overbr
 
 The script must match the installed version, so generate it when the shell starts, as above, rather than saving it to a file.
 
+overbrainer also checks crates.io once a day for a newer release, never blocking the command, and prints a note on stderr (or in the TUI footer) when one exists. Set `OVERBRAINER_NO_UPDATE_CHECK` to skip it; see [Configuration](docs/configuration.md#update-check).
+
 ## Quickstart
 
 ![overbrainer init, config check and runs ls in a terminal](docs/assets/cli.gif)

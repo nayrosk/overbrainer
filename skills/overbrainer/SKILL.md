@@ -46,6 +46,8 @@ overbrainer config check
 
 It fails with the key and the reason when a value is invalid. A missing URL, key or host does not make it fail: look for `unset` in its output, such as `providers.openrouter.base_url = (unset)`. The commands that need the value fail and name the variable to set.
 
+Every command also checks crates.io once a day for a newer overbrainer release and prints a note on stderr, but only when stderr is a terminal, so it never runs when you drive overbrainer as a subprocess.
+
 Details: [configuration](https://github.com/nayrosk/overbrainer/blob/v0.3.1/docs/configuration.md).
 
 ## Build the dataset
