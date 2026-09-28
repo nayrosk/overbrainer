@@ -276,6 +276,7 @@ async fn the_list_follows_every_page() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v2/pods"))
+        .and(query_param("limit", "1000"))
         .and(query_param("cursor", "c2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "pods": [pod("p2", "r2")],

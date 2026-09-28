@@ -27,8 +27,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout of `POST /pods`, which answers once the pod is placed.
 const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Items asked for per page of `GET /pods` and `GET /templates` (the v2 maximum).
-const PAGE_SIZE: &str = "1000";
+/// Items asked for per page of `GET /pods` (the v2 maximum).
+const PODS_PAGE_SIZE: &str = "1000";
+/// Items asked for per page of `GET /templates` (the v2 maximum).
+const TEMPLATES_PAGE_SIZE: &str = "100";
 /// The GPU types of the catalog (v2 reference: `GET /v2/catalog/gpus`).
 const GPUS_PATH: &str = "catalog/gpus";
 /// The data centers of the catalog (v2 reference: `GET /v2/catalog/datacenters`).
@@ -322,8 +324,10 @@ impl RunpodClient {
     /// Returns an [`ApiError`] once retries are exhausted, on a fatal answer, when
     /// a pagination cursor repeats, or when the list does not end within that limit.
     pub async fn list_pods(&self) -> Result<Vec<Pod>, ApiError> {
-        self.paginate("pods", |page: PodPage| (page.pods, page.pagination))
-            .await
+        self.paginate("pods", PODS_PAGE_SIZE, |page: PodPage| {
+            (page.pods, page.pagination)
+        })
+        .await
     }
 
     /// The Secure Cloud GPU types of the catalog with their pod stock for
@@ -378,7 +382,7 @@ impl RunpodClient {
     /// a pagination cursor repeats, or when the list does not end within that limit.
     pub async fn list_templates(&self) -> Result<Vec<Template>, ApiError> {
         let templates = self
-            .paginate(TEMPLATES_PATH, |page: TemplatePage| {
+            .paginate(TEMPLATES_PATH, TEMPLATES_PAGE_SIZE, |page: TemplatePage| {
                 (page.templates, page.pagination)
             })
             .await?;
@@ -388,11 +392,13 @@ impl RunpodClient {
             .collect())
     }
 
-    /// Every item of the cursor-paginated list at `path`, `split` taking a
-    /// page apart into its items and its pagination.
+    /// Every item of the cursor-paginated list at `path`, `page_size` items
+    /// asked for per page, `split` taking a page apart into its items and its
+    /// pagination.
     async fn paginate<P, T>(
         &self,
         path: &str,
+        page_size: &str,
         split: impl Fn(P) -> (Vec<T>, Option<Pagination>),
     ) -> Result<Vec<T>, ApiError>
     where
@@ -402,7 +408,7 @@ impl RunpodClient {
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
         for _ in 0..MAX_PAGES {
-            let mut query = vec![("limit", PAGE_SIZE)];
+            let mut query = vec![("limit", page_size)];
             if let Some(cursor) = cursor.as_deref() {
                 query.push(("cursor", cursor));
             }

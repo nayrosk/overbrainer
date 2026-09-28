@@ -199,6 +199,7 @@ async fn templates_follow_every_page_and_keep_pod_templates_only() -> TestResult
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v2/templates"))
+        .and(query_param("limit", "100"))
         .and(query_param("cursor", "c2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "templates": [template("t3", false)],
@@ -209,7 +210,7 @@ async fn templates_follow_every_page_and_keep_pod_templates_only() -> TestResult
         .await;
     Mock::given(method("GET"))
         .and(path("/v2/templates"))
-        .and(query_param("limit", "1000"))
+        .and(query_param("limit", "100"))
         .and(query_param_is_missing("cursor"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "templates": [template("t1", false), template("t2", true)],
