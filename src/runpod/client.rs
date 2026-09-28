@@ -26,6 +26,9 @@ const MAX_MESSAGE_CHARS: usize = 300;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout of a request, answer included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest answer read, in bytes: a listing is far below it, so anything past
+/// it is refused instead of filling memory.
+const MAX_BODY: usize = 8 * 1024 * 1024;
 /// Timeout of `POST /pods`, which answers once the pod is placed.
 const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Items asked for per page of `GET /pods` (the v2 maximum).
@@ -490,16 +493,39 @@ impl RunpodClient {
     /// a non-success HTTP status is returned as data, unredacted, so `get_pod`
     /// and `delete_pod` can recognize Runpod's own "not found" shape, and
     /// `status_error` can classify a create failure, before anyone builds the
-    /// client-facing error from it.
+    /// client-facing error from it. A body past [`MAX_BODY`] is an
+    /// [`ApiError::InvalidResponse`].
     async fn fetch(
         &self,
         builder: reqwest::RequestBuilder,
     ) -> Result<(StatusCode, String, Option<Duration>), ApiError> {
-        let response = builder.send().await.map_err(ApiError::Transport)?;
+        let mut response = builder.send().await.map_err(ApiError::Transport)?;
         let status = response.status();
         let retry_after = retry_after(response.headers());
-        let body = response.text().await.map_err(ApiError::Transport)?;
-        Ok((status, body, retry_after))
+        let too_large = || {
+            ApiError::InvalidResponse(format!(
+                "the answer is larger than {} MiB",
+                MAX_BODY / (1024 * 1024)
+            ))
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_BODY as u64)
+        {
+            return Err(too_large());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(ApiError::Transport)? {
+            if body.len() + chunk.len() > MAX_BODY {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok((
+            status,
+            String::from_utf8_lossy(&body).into_owned(),
+            retry_after,
+        ))
     }
 
     /// Sends `builder` and returns the body of a success answer, or the client's

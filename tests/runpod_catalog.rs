@@ -346,3 +346,50 @@ async fn a_listing_decode_error_never_quotes_the_body() -> TestResult {
     );
     Ok(())
 }
+
+/// Bytes past which `RunpodClient` refuses an answer (its private `MAX_BODY`).
+const MAX_BODY: usize = 8 * 1024 * 1024;
+
+#[tokio::test]
+async fn an_oversized_listing_is_refused_without_a_retry() -> TestResult {
+    let server = MockServer::start().await;
+    let big = format!(r#"{{"gpus": []{}}}"#, " ".repeat(MAX_BODY));
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(big))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server)?
+        .list_gpu_types(1)
+        .await
+        .err()
+        .ok_or("no error")?;
+    assert!(matches!(error, ApiError::InvalidResponse(_)), "{error:?}");
+    assert!(error.to_string().contains("larger than"), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_oversized_listing_without_a_length_is_refused() -> TestResult {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let body = format!(r#"{{"gpus": []{}}}"#, " ".repeat(MAX_BODY));
+    let serving = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut stream, _) = listener.accept().await?;
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).await?;
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+        stream.write_all(head.as_bytes()).await?;
+        // No length: the body ends when the connection closes.
+        let _ = stream.write_all(body.as_bytes()).await;
+        std::io::Result::Ok(())
+    });
+    let client = RunpodClient::new(&format!("http://{address}/v2"), &SecretString::from(KEY))?;
+    let error = client.list_gpu_types(1).await.err().ok_or("no error")?;
+    serving.abort();
+    assert!(matches!(error, ApiError::InvalidResponse(_)), "{error:?}");
+    assert!(error.to_string().contains("larger than"), "{error}");
+    Ok(())
+}
