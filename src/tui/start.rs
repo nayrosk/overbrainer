@@ -45,6 +45,10 @@ pub(super) struct RunpodPlan {
     pub(super) file_gpu_types: ListOrAuto,
     /// `data_center_ids` as the settings have it.
     pub(super) file_data_center_ids: ListOrAuto,
+    /// `min_vram_gb` as the settings have it.
+    pub(super) file_min_vram_gb: Option<u32>,
+    /// `max_price_per_hour` as the settings have it.
+    pub(super) file_max_price_per_hour: Option<f64>,
 }
 
 impl RunpodPlan {
@@ -53,12 +57,15 @@ impl RunpodPlan {
         Self {
             file_gpu_types: spec.gpu_types.clone(),
             file_data_center_ids: spec.data_center_ids.clone(),
+            file_min_vram_gb: spec.min_vram_gb,
+            file_max_price_per_hour: spec.max_price_per_hour,
             spec,
         }
     }
 
     /// The fields chosen in the dialog that differ from the settings, which
-    /// `y` saves before the run starts.
+    /// `y` saves before the run starts: the `auto` limits among them are
+    /// unset.
     pub(super) fn changed(&self) -> Vec<&'static str> {
         let mut changed = Vec::new();
         if self.spec.gpu_types != self.file_gpu_types {
@@ -67,7 +74,53 @@ impl RunpodPlan {
         if self.spec.data_center_ids != self.file_data_center_ids {
             changed.push(DATA_CENTER_IDS);
         }
+        changed.extend(self.removed());
         changed
+    }
+
+    /// The `auto` limits the settings have and the plan dropped.
+    fn removed(&self) -> Vec<&'static str> {
+        let [vram, price] = AUTO_LIMITS;
+        let mut removed = Vec::new();
+        if self.file_min_vram_gb.is_some() && self.spec.min_vram_gb.is_none() {
+            removed.push(vram);
+        }
+        if self.file_max_price_per_hour.is_some() && self.spec.max_price_per_hour.is_none() {
+            removed.push(price);
+        }
+        removed
+    }
+
+    /// The GPU types chosen: listed ones drop the `auto` limits, `auto` gets
+    /// those of the settings back.
+    pub(super) fn choose_gpus(&mut self, gpu_types: ListOrAuto) {
+        if gpu_types.is_auto() {
+            self.spec.min_vram_gb = self.file_min_vram_gb;
+            self.spec.max_price_per_hour = self.file_max_price_per_hour;
+        } else {
+            self.spec.min_vram_gb = None;
+            self.spec.max_price_per_hour = None;
+        }
+        self.spec.gpu_types = gpu_types;
+    }
+
+    /// What the dialog's `changed` line lists: `gpu_types (min_vram_gb and
+    /// max_price_per_hour removed), data_center_ids`; none when nothing
+    /// changed.
+    fn changed_text(&self) -> Option<String> {
+        let mut shown = Vec::new();
+        if self.spec.gpu_types != self.file_gpu_types {
+            let removed = self.removed();
+            shown.push(if removed.is_empty() {
+                GPU_TYPES.to_string()
+            } else {
+                format!("{GPU_TYPES} ({} removed)", removed.join(" and "))
+            });
+        }
+        if self.spec.data_center_ids != self.file_data_center_ids {
+            shown.push(DATA_CENTER_IDS.to_string());
+        }
+        (!shown.is_empty()).then(|| shown.join(", "))
     }
 }
 
@@ -75,6 +128,9 @@ impl RunpodPlan {
 pub(super) const GPU_TYPES: &str = "gpu_types";
 /// The data centers field of a Runpod target.
 pub(super) const DATA_CENTER_IDS: &str = "data_center_ids";
+/// The limits of a Runpod target's `auto` GPU types: unset when the types are
+/// listed.
+pub(super) const AUTO_LIMITS: [&str; 2] = ["min_vram_gb", "max_price_per_hour"];
 
 /// The Secure Cloud GPU types listed for the run's GPU count, or why they
 /// cannot be.
@@ -85,6 +141,9 @@ const AUTO_SHOWN: usize = 4;
 
 /// The start of the line saying what the run costs at most.
 const COST_LABEL: &str = "max_hours   ";
+
+/// The start of the line saying what `y` saves first.
+const CHANGED_LABEL: &str = "changed     ";
 
 /// What a run started now in the project in `dir` would use, from its settings
 /// (read with `env`) and data files only.
@@ -216,11 +275,9 @@ pub(super) fn text(plan: &StartPlan, gpus: Option<&Gpus>) -> Vec<String> {
         text.push(format!("warning     {warning}"));
     }
     if let Some(runpod) = &plan.runpod {
-        let changed = runpod.changed();
-        if !changed.is_empty() {
+        if let Some(changed) = runpod.changed_text() {
             text.push(format!(
-                "changed     {}: saved to {CONFIG_FILE} on y, then the run starts",
-                changed.join(", ")
+                "{CHANGED_LABEL}{changed}: saved to {CONFIG_FILE} on y, then the run starts"
             ));
         }
         text.extend(runpod_lines(&runpod.spec, gpus));

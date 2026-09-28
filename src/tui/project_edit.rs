@@ -16,6 +16,7 @@ use super::catalog::{
     volume_data_center,
 };
 use super::project::{Addable, Form, Listing, Locks, Pending, ProjectConfig, Shown};
+use super::start::{AUTO_LIMITS, GPU_TYPES};
 use super::tasks::Task;
 use super::widgets::form::{Input, InputOutcome};
 use super::widgets::picker::Choice;
@@ -293,6 +294,38 @@ impl App {
         };
         pending.mark(&path, &config.doc);
         self.settle_pending();
+        if let (FieldPath::Target { name, field }, Some(FieldValue::List(_))) = (&path, value)
+            && *field == GPU_TYPES
+        {
+            self.drop_auto_limits(name)?;
+        }
+        Ok(())
+    }
+
+    /// GPU types listed for the target `name`: its `min_vram_gb` and
+    /// `max_price_per_hour`, which go with `auto` only, are unset too, and the
+    /// status line says so.
+    fn drop_auto_limits(&mut self, name: &str) -> Result<(), String> {
+        let mut removed = Vec::new();
+        for field in AUTO_LIMITS {
+            let path = FieldPath::Target {
+                name: name.to_string(),
+                field,
+            };
+            if self.shown_doc().and_then(|doc| doc.get(&path)).is_some() {
+                self.apply(&path, None)?;
+                removed.push(path.to_string());
+            }
+        }
+        if !removed.is_empty() {
+            self.say(
+                Severity::Info,
+                format!(
+                    "{} removed: only with gpu_types = \"auto\"",
+                    removed.join(" and ")
+                ),
+            );
+        }
         Ok(())
     }
 
@@ -2348,6 +2381,76 @@ mod tests {
             Shown::Unset
         );
         Ok(())
+    }
+
+    /// [`editing_app`] on `gpu_types = "auto"` with both limits.
+    fn auto_limits_app() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
+        let (dir, mut app) = editing_app()?;
+        let config = PROJECT_CONFIG.replace(
+            "gpu_types = [\"NVIDIA A40\"]",
+            "gpu_types = \"auto\"\nmin_vram_gb = 24\nmax_price_per_hour = 1.5",
+        );
+        std::fs::write(dir.path().join(CONFIG_FILE), &config)?;
+        app.set_config(ProjectConfig::new(&config, &app.env)?);
+        Ok((dir, app))
+    }
+
+    /// Both `auto` limits are unset and marked changed, the status says so,
+    /// and `s` writes a file without them.
+    fn limits_dropped(app: &mut App, dir: &Path) -> TestResult {
+        for key in [
+            "targets.gpu_cloud.min_vram_gb",
+            "targets.gpu_cloud.max_price_per_hour",
+        ] {
+            let limit = field(app, key)?;
+            assert!(limit.changed, "{key} marked");
+            assert_eq!(limit.shown, Shown::Unset, "{key}");
+        }
+        assert_eq!(
+            status(app),
+            "targets.gpu_cloud.min_vram_gb and targets.gpu_cloud.max_price_per_hour removed: \
+             only with gpu_types = \"auto\""
+        );
+        save(app, dir)?;
+        let text = written(dir)?;
+        assert!(text.contains(r#"gpu_types = ["NVIDIA A40"]"#), "{text}");
+        assert!(!text.contains("min_vram_gb") && !text.contains("max_price_per_hour"));
+        assert_eq!(status(app), "✓ saved overbrainer.toml");
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_types_picked_as_a_list_drop_the_auto_limits() -> TestResult {
+        let (dir, mut app) = auto_limits_app()?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
+        // The A40, second cheapest, alone.
+        press(
+            &mut app,
+            &[
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Char(' '),
+                KeyCode::Enter,
+            ],
+        );
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.gpu_types")?,
+            "NVIDIA A40"
+        );
+        limits_dropped(&mut app, dir.path())
+    }
+
+    #[test]
+    fn gpu_types_typed_as_a_list_drop_the_auto_limits() -> TestResult {
+        let (dir, mut app) = auto_limits_app()?;
+        select(&mut app, "targets.gpu_cloud.gpu_types")?;
+        press(&mut app, &[KeyCode::Enter, KeyCode::Char('t')]);
+        press(&mut app, &[KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 10]);
+        chars(&mut app, "NVIDIA A40");
+        press(&mut app, &[KeyCode::Enter]);
+        limits_dropped(&mut app, dir.path())
     }
 
     #[test]

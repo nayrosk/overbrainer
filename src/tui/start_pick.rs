@@ -30,10 +30,11 @@ fn saved_text(base: &str, target: &str, runpod: &RunpodPlan) -> Result<String, S
             name: target.to_string(),
             field,
         };
-        let value = if field == GPU_TYPES {
-            &runpod.spec.gpu_types
-        } else {
-            &runpod.spec.data_center_ids
+        let value = match field {
+            GPU_TYPES => &runpod.spec.gpu_types,
+            DATA_CENTER_IDS => &runpod.spec.data_center_ids,
+            // An `auto` limit dropped with listed GPU types.
+            _ => &ListOrAuto::default(),
         };
         let edited = match value {
             ListOrAuto::Auto => doc.set(&path, FieldValue::Text(ListOrAuto::AUTO.to_string())),
@@ -143,18 +144,19 @@ impl App {
             .filter(|plan| plan.target == target)
             .and_then(|plan| plan.runpod.as_mut())
         {
-            let spec = &mut runpod.spec;
             match (picked.kind, picked.choice) {
                 (CatalogKind::Gpus, Choice::List(ids)) if ids.is_empty() => {
                     self.say(Severity::Warn, "choose a GPU type or auto; nothing changed");
                 },
-                (CatalogKind::Gpus, Choice::Auto) => spec.gpu_types = ListOrAuto::Auto,
-                (CatalogKind::Gpus, Choice::List(ids)) => spec.gpu_types = ListOrAuto::List(ids),
+                (CatalogKind::Gpus, Choice::Auto) => runpod.choose_gpus(ListOrAuto::Auto),
+                (CatalogKind::Gpus, Choice::List(ids)) => {
+                    runpod.choose_gpus(ListOrAuto::List(ids));
+                },
                 (CatalogKind::DataCenters, Choice::Auto) => {
-                    spec.data_center_ids = ListOrAuto::Auto;
+                    runpod.spec.data_center_ids = ListOrAuto::Auto;
                 },
                 (CatalogKind::DataCenters, Choice::List(ids)) => {
-                    spec.data_center_ids = ListOrAuto::List(ids);
+                    runpod.spec.data_center_ids = ListOrAuto::List(ids);
                 },
                 (CatalogKind::Volumes | CatalogKind::Templates, _) => {},
             }
@@ -255,7 +257,6 @@ mod tests {
         PROJECT_CONFIG, draw, gpu_catalog, gpu_types, key, project_app, project_env, runpod_plan,
         text as screen,
     };
-    use crate::tui::start::runpod_spec;
     use crate::tui::tasks::{Done, TaskId, TrainJob};
     use crate::tui::widgets::picker::Entry;
 
@@ -270,8 +271,14 @@ mod tests {
         let mut app = project_app()?;
         app.project.dir = dir.path().to_path_buf();
         app.env = project_env();
-        app.config = Some(crate::tui::project::ProjectConfig::new(config, &app.env)?);
-        let spec = runpod_spec(ListOrAuto::List(vec!["NVIDIA A40".into()]), 1);
+        let read = crate::tui::project::ProjectConfig::new(config, &app.env)?;
+        let spec = read
+            .settings
+            .targets
+            .get("gpu_cloud")
+            .and_then(crate::runpod::RunpodTarget::from_target)
+            .ok_or("no Runpod target gpu_cloud")?;
+        app.config = Some(read);
         let plan = StartPlan {
             runpod: Some(Box::new(RunpodPlan::new(spec))),
             ..runpod_plan()
@@ -486,22 +493,59 @@ mod tests {
             status(&app)
         );
         assert_eq!(app.lock(), None);
-        // Validation: min_vram_gb goes with auto only.
-        let auto = PROJECT_CONFIG.replace(
-            "gpu_types = [\"NVIDIA A40\"]",
-            "gpu_types = \"auto\"\nmin_vram_gb = 24",
-        );
-        let (dir, mut app) = starting(&auto)?;
-        pick_gpus(&mut app)?;
-        let effects = confirm_and_save(&mut app, dir.path())?;
-        assert!(!starts(&effects), "{effects:?}");
-        assert_eq!(written(dir.path())?, auto);
-        assert_eq!(
-            status(&app),
-            "run not started: overbrainer.toml not saved: targets.gpu_cloud.min_vram_gb: only \
-             with gpu_types = \"auto\""
-        );
         assert!(app.project_view.errors.is_empty(), "the file is fine");
+        Ok(())
+    }
+
+    /// `gpu_types = "auto"` with both limits.
+    fn auto_config() -> String {
+        PROJECT_CONFIG.replace(
+            "gpu_types = [\"NVIDIA A40\"]",
+            "gpu_types = \"auto\"\nmin_vram_gb = 24\nmax_price_per_hour = 1.5",
+        )
+    }
+
+    /// `g`, then the RTX 2000 alone instead of `auto`.
+    fn pick_a_list(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+        let (id, _) = open(app, 'g')?;
+        listed(app, id, gpu_catalog(1)?);
+        press(app, &[KeyCode::Down, KeyCode::Char(' '), KeyCode::Enter]);
+        Ok(())
+    }
+
+    #[test]
+    fn listed_gpu_types_drop_the_auto_limits_and_the_save_succeeds() -> TestResult {
+        let auto = auto_config();
+        let (dir, mut app) = starting(&auto)?;
+        pick_a_list(&mut app)?;
+        assert!(
+            dialog(&app).contains(
+                "changed     gpu_types (min_vram_gb and max_price_per_hour removed): saved to \
+                 overbrainer.toml on y, then the run starts"
+            ),
+            "{}",
+            dialog(&app)
+        );
+        // Back to auto: the limits come back, nothing is changed.
+        let (id, _) = open(&mut app, 'g')?;
+        listed(&mut app, id, gpu_catalog(1)?);
+        press(
+            &mut app,
+            &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        assert!(!dialog(&app).contains("changed"), "{}", dialog(&app));
+        pick_a_list(&mut app)?;
+        let effects = confirm_and_save(&mut app, dir.path())?;
+        assert!(starts(&effects), "{effects:?} ({})", status(&app));
+        let text = written(dir.path())?;
+        assert!(
+            text.contains(r#"gpu_types = ["NVIDIA RTX 2000 Ada Generation"]"#),
+            "{text}"
+        );
+        assert!(
+            !text.contains("min_vram_gb") && !text.contains("max_price_per_hour"),
+            "{text}"
+        );
         Ok(())
     }
 
