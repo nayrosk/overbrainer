@@ -1,7 +1,8 @@
-//! Looks up the latest overbrainer release on crates.io, at most once a day.
+//! Looks up the latest overbrainer release on crates.io, at most once a day,
+//! and at most once an hour after an attempt that gave no answer.
 //!
-//! Every failure (network, parse, cache) is logged at debug and gives no answer:
-//! the check must never get in the way of the command it runs beside.
+//! Every failure (network, parse, cache) is logged at debug and gives no new
+//! answer: the check must never get in the way of the command it runs beside.
 
 use std::cmp::Ordering;
 use std::error::Error;
@@ -22,8 +23,10 @@ const USER_AGENT: &str = concat!(
     " (https://github.com/nayrosk/overbrainer)"
 );
 const TIMEOUT: Duration = Duration::from_secs(3);
-/// A cache younger than this skips the request.
+/// A cached answer younger than this skips the request.
 const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+/// An attempt that gave no answer (yet) skips the request this long.
+const RETRY_AFTER: Duration = Duration::from_secs(3600);
 const CACHE_FILE: &str = "latest-version.json";
 /// The most the check reads from crates.io (its answer is a few KiB).
 const MAX_BODY: usize = 64 * 1024;
@@ -118,7 +121,9 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 }
 
 /// The latest release when it is newer than this binary, from a cache younger
-/// than a day or else from `url`, a crates.io crate endpoint.
+/// than a day or else from `url`, a crates.io crate endpoint. An attempt is
+/// cached before the request: for an hour after one that gave no answer, only
+/// the version known before it, if any, is told.
 pub async fn check(env: &CheckEnv, url: &str, now: SystemTime) -> Option<Newer> {
     let current = env!("CARGO_PKG_VERSION");
     let latest = latest(env, url, now, TIMEOUT).await?;
@@ -127,32 +132,76 @@ pub async fn check(env: &CheckEnv, url: &str, now: SystemTime) -> Option<Newer> 
 
 #[derive(Serialize, Deserialize)]
 struct Cache {
-    /// Unix seconds.
+    /// Unix seconds of the last answer, or of the last attempt.
     checked_at: u64,
-    latest: String,
+    /// The answer; `None` marks an attempt that failed or was cut short.
+    latest: Option<String>,
+    /// On an attempt, the answer known before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<String>,
+}
+
+impl Cache {
+    /// The version this cache knows, fresh or not.
+    fn known(self) -> Option<String> {
+        self.latest.or(self.previous)
+    }
+
+    /// Whether the cache still stands: an answer for a day, an attempt for an
+    /// hour. Otherwise crates.io is asked again.
+    fn fresh(&self, now: SystemTime) -> bool {
+        let Some(checked_at) =
+            SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(self.checked_at))
+        else {
+            return false;
+        };
+        // A cache from the future (a clock set back) fails here and is refreshed.
+        let Ok(age) = now.duration_since(checked_at) else {
+            return false;
+        };
+        let limit = if self.latest.is_some() {
+            MAX_AGE
+        } else {
+            RETRY_AFTER
+        };
+        age < limit
+    }
 }
 
 async fn latest(env: &CheckEnv, url: &str, now: SystemTime, timeout: Duration) -> Option<String> {
     if env.disabled {
         return None;
     }
+    // Blocking cache I/O, inline on purpose: at most MAX_CACHE (4 KiB) read, a
+    // few dozen bytes written, not worth a blocking task.
     let dir = env.cache_dir.as_deref();
-    if let Some(latest) = dir.and_then(|dir| read_cache(dir, now)) {
-        return Some(latest);
+    let cache = dir.and_then(read_cache);
+    let fresh = cache.as_ref().is_some_and(|cache| cache.fresh(now));
+    let known = cache.and_then(Cache::known);
+    if fresh {
+        return known;
     }
-    let latest = fetch(url, timeout)
-        .await
-        .map_err(|error| tracing::debug!("update check: {error}"))
-        .ok()?;
+    // Written first, so a fetch that fails or is dropped still waits an hour.
     if let Some(dir) = dir {
-        write_cache(dir, now, &latest);
+        write_cache(dir, now, None, known.clone());
     }
-    Some(latest)
+    match fetch(url, timeout).await {
+        Ok(latest) => {
+            if let Some(dir) = dir {
+                write_cache(dir, now, Some(latest.clone()), None);
+            }
+            Some(latest)
+        },
+        Err(error) => {
+            tracing::debug!("update check: {error}");
+            known
+        },
+    }
 }
 
-/// The cached version when the cache is readable and younger than a day.
-/// Anything but a regular file, or a file past [`MAX_CACHE`], is ignored.
-fn read_cache(dir: &Path, now: SystemTime) -> Option<String> {
+/// The cache when it is readable and every version in it is plain. Anything
+/// but a regular file, or a file past [`MAX_CACHE`], is ignored.
+fn read_cache(dir: &Path) -> Option<Cache> {
     let path = dir.join(CACHE_FILE);
     let text = read_small(&path)
         .map_err(|error| tracing::debug!("update check: cannot read {}: {error}", path.display()))
@@ -160,10 +209,10 @@ fn read_cache(dir: &Path, now: SystemTime) -> Option<String> {
     let cache: Cache = serde_json::from_str(&text)
         .map_err(|error| tracing::debug!("update check: cannot parse {}: {error}", path.display()))
         .ok()?;
-    let checked_at = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(cache.checked_at))?;
-    // A cache from the future (a clock set back) fails here and is refreshed.
-    let age = now.duration_since(checked_at).ok()?;
-    (age < MAX_AGE && plain_version(&cache.latest)).then_some(cache.latest)
+    let mut versions = cache.latest.iter().chain(&cache.previous);
+    versions
+        .all(|version| plain_version(version))
+        .then_some(cache)
 }
 
 fn read_small(path: &Path) -> std::io::Result<String> {
@@ -183,13 +232,14 @@ fn read_small(path: &Path) -> std::io::Result<String> {
     Ok(text)
 }
 
-fn write_cache(dir: &Path, now: SystemTime, latest: &str) {
+fn write_cache(dir: &Path, now: SystemTime, latest: Option<String>, previous: Option<String>) {
     let checked_at = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
     let cache = Cache {
         checked_at,
-        latest: latest.to_owned(),
+        latest,
+        previous,
     };
     let written = serde_json::to_vec(&cache)
         .map_err(|error| error.to_string())
@@ -520,7 +570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failures_give_nothing_and_leave_no_cache() -> TestResult {
+    async fn failures_give_nothing_and_leave_a_marker() -> TestResult {
         let cases = [
             ResponseTemplate::new(500),
             ResponseTemplate::new(200).set_body_string("{\"crate\":"),
@@ -535,8 +585,59 @@ mod tests {
             let timeout = Duration::from_millis(100);
             let found = latest(&env(dir.path()), &url(&server), now(), timeout).await;
             assert_eq!(found, None);
-            assert!(!dir.path().join(CACHE_FILE).exists());
+            let cache = read_cache(dir.path())?;
+            assert_eq!(cache["latest"], serde_json::Value::Null);
+            assert_eq!(cache["checked_at"], unix(now()));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_waits_an_hour_before_the_next() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let failing = serve(ResponseTemplate::new(500), 1).await;
+        assert_eq!(
+            latest(&env(dir.path()), &url(&failing), now(), TIMEOUT).await,
+            None
+        );
+        let within = serve(ResponseTemplate::new(200).set_body_string(BODY), 0).await;
+        let found = latest(&env(dir.path()), &url(&within), now() + HOUR / 2, TIMEOUT).await;
+        assert_eq!(found, None);
+        let after = serve(ResponseTemplate::new(200).set_body_string(BODY), 1).await;
+        let later = now() + HOUR + Duration::from_secs(60);
+        let found = latest(&env(dir.path()), &url(&after), later, TIMEOUT).await;
+        assert_eq!(found.as_deref(), Some("0.4.2"));
+        assert_eq!(read_cache(dir.path())?["latest"], "0.4.2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_aborted_fetch_leaves_the_marker() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let slow = ResponseTemplate::new(200)
+            .set_body_string(BODY)
+            .set_delay(Duration::from_secs(10));
+        let server = serve(slow, 1).await;
+        let cut = Duration::from_millis(200);
+        let (env, url) = (env(dir.path()), url(&server));
+        let found = tokio::time::timeout(cut, latest(&env, &url, now(), TIMEOUT)).await;
+        assert!(found.is_err(), "the fetch ended before it was dropped");
+        let cache = read_cache(dir.path())?;
+        assert_eq!(cache["latest"], serde_json::Value::Null);
+        assert_eq!(cache["checked_at"], unix(now()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_known_version_survives_a_failed_attempt() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        write_cache(dir.path(), now() - 25 * HOUR, "999.0.0")?;
+        let failing = serve(ResponseTemplate::new(500), 1).await;
+        let found = latest(&env(dir.path()), &url(&failing), now(), TIMEOUT).await;
+        assert_eq!(found.as_deref(), Some("999.0.0"));
+        let server = serve(ResponseTemplate::new(200).set_body_string(BODY), 0).await;
+        let newer = check(&env(dir.path()), &url(&server), now() + HOUR / 2).await;
+        assert_eq!(newer.map(|newer| newer.latest).as_deref(), Some("999.0.0"));
         Ok(())
     }
 
