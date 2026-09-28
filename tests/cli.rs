@@ -216,7 +216,9 @@ fn malformed_dotenv_does_not_leak_its_content() -> Result<(), Box<dyn std::error
         .args(["config", "check"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("cannot parse .env"))
+        .stderr(predicate::str::contains(
+            "cannot parse .env (syntax error at line 1)",
+        ))
         .stderr(predicate::str::contains("hf_marker").not())
         .stdout(predicate::str::contains("hf_marker").not());
     Ok(())

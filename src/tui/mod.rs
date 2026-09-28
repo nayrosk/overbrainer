@@ -41,13 +41,13 @@ use self::motion::{Motion, MotionLevel};
 use self::project::ProjectConfig;
 use self::terminal::TerminalGuard;
 use self::theme::{ColorLevel, LookEnv, Theme};
-use crate::config::{CONFIG_FILE, ConfigError, EnvSource};
+use crate::config::{CONFIG_FILE, ConfigError, DotenvKeys, EnvSource};
 use crate::logging::LogBuffer;
 use crate::update::Newer;
 
 /// Runs the terminal UI on the project in `project_dir`; `logs` holds the log
 /// lines the Logs view shows; the answer of `check`, when newer, shows in the
-/// footer.
+/// footer; `dotenv` are the keys `.env` set at start.
 ///
 /// # Errors
 ///
@@ -57,6 +57,7 @@ pub async fn run(
     project_dir: &Path,
     logs: LogBuffer,
     check: Option<JoinHandle<Option<Newer>>>,
+    _dotenv: DotenvKeys,
 ) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() {
         bail!("overbrainer tui needs a terminal: stdout is not a TTY");
