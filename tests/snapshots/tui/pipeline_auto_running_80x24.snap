@@ -7,7 +7,7 @@ source: src/tui/snapshots.rs
 "  ✓ questions   █████████████████████████     36/36         0        0       0  "
 "  … answers     ███████▌                    120/400         8       14       1  "
 "  · split       pending                                                         "
-"  auto  subtopics ✓ → questions ● → answers → split → train                     "
+"  auto  subtopics ✓ → questions ✓ → answers ● → split → train                   "
 "  tokens  in 162210  out 39620        cost $0.0135+                             "
 "                                                                                "
 "  Last errors                                                                   "

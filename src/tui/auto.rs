@@ -23,6 +23,9 @@ pub(super) const STAGES: [Command; 4] = [
 /// The name of the chain's last link.
 const TRAIN: &str = "train";
 
+/// What `c` in the Pipeline view says once the chain trains.
+const TRAINING_CANCEL: &str = "auto mode is training: c in the Training view cancels the run";
+
 /// Where a link of the chain is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mark {
@@ -346,10 +349,7 @@ impl App {
             return;
         };
         if !chain.in_stages() {
-            self.say(
-                Severity::Info,
-                "auto mode is training: c in the Training view cancels the run",
-            );
+            self.say(Severity::Info, TRAINING_CANCEL);
             return;
         }
         let stage = command_name(STAGES[chain.at]);
@@ -368,6 +368,10 @@ impl App {
     /// `y` on the cancel dialog: the chain stops, and its stage with it.
     pub(super) fn cancel_auto(&mut self) -> Vec<Effect> {
         let Some(chain) = self.auto.chain.as_mut().filter(|chain| chain.in_stages()) else {
+            // The chain reached training while the dialog was open.
+            if self.auto.running() {
+                self.say(Severity::Info, TRAINING_CANCEL);
+            }
             return Vec::new();
         };
         chain.state = ChainState::Stopped;
@@ -564,6 +568,20 @@ mod tests {
     }
 
     #[test]
+    fn a_cancel_confirmed_once_training_started_says_where_to_cancel() -> TestResult {
+        let mut app = app();
+        confirmed(&mut app, plan(true))?;
+        press(&mut app, &[KeyCode::Char('c')]);
+        let chain = app.auto.chain.as_mut().ok_or("no chain")?;
+        chain.at = STAGES.len();
+        chain.train_task = Some(TaskId(99));
+        assert_eq!(press(&mut app, &[KeyCode::Char('y')]), []);
+        assert_eq!(status(&app), TRAINING_CANCEL);
+        assert!(app.auto.running());
+        Ok(())
+    }
+
+    #[test]
     fn a_is_refused_while_a_stage_runs_and_its_failure_is_said() -> TestResult {
         let mut app = app();
         confirmed(&mut app, plan(true))?;
@@ -589,17 +607,19 @@ mod tests {
     fn the_pipeline_view_draws_the_chain() -> TestResult {
         let mut app = app();
         app.view = View::Pipeline;
+        // The fixture runs answers, after subtopics and questions.
         crate::tui::snapshots::pipeline_running(&mut app);
         app.auto.chain = Some(Chain {
-            at: 1,
+            at: 2,
             ..Chain::new(plan(true))
         });
         crate::tui::snapshots::snapshot("pipeline_auto_running", &mut app)?;
-        app.auto.chain = Some(Chain {
-            at: 2,
-            state: ChainState::Stopped,
-            ..Chain::new(plan(false))
-        });
+        let task = app.pipeline_task.ok_or("no stage runs")?;
+        end(&mut app, task, Err("1 item failed".into()));
+        assert_eq!(
+            status(&app),
+            "auto stopped at answers: 1 item failed; A resumes it"
+        );
         crate::tui::snapshots::snapshot("pipeline_auto_stopped", &mut app)?;
         Ok(())
     }
