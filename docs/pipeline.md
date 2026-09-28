@@ -30,11 +30,25 @@ A stage that could not process some items exits with an error after writing ever
 
 overbrainer keeps its own state in `.overbrainer/`, next to `overbrainer.toml` (`init` adds it to `.gitignore`).
 
-- `history.jsonl`: one line per stage execution, appended when the stage ends, whether it succeeded (`ok`), had failed items or was stopped by a provider error (`failed`), or was stopped by Ctrl-C or the TUI (`interrupted`). Each line holds the stage, start and end times (UTC), provider and model, the counts, tokens and cost (`null` when the price is unknown). `split` lines hold the train, eval and orphaned counts instead of a model. The file is never rewritten; deleting it resets the totals. The counts of an interrupted line come from progress events: they can miss the last items, and for `answers` its `done` also counts answers excluded from training.
-- `logs-<YYYYMMDDTHHMMSSZ>.log`: written by the [TUI](tui.md)'s `x` key in the Logs view, one such file per export; nothing else creates or reads these.
-- the lock is held on the project directory itself: the commands that write to the project (`tui`, the stages, `run`, `train`, `pod rm`) hold it while they run, so a second one stops at once with `another overbrainer (pid N) is using this project`. Reading commands (`history`, `runs ls`, `pod ls`, `config check`) never take it. `.overbrainer/lock` only holds the holding process's PID, for that message; removing it, or renaming `.overbrainer/`, changes nothing. The lock goes away with the process, even after a crash. It guards against a second overbrainer process, not against other programs changing the project. A project whose directory cannot be locked or whose `.overbrainer/` cannot be created (a read-only copy, a filesystem without file locks) refuses every command that writes, the TUI included.
+- `version`: the project format, one integer line (`1` since 0.4.0), written by `init` and `migrate`. A project without it predates 0.4.0: see [migrating a project](#migrating-a-project).
 
-`overbrainer history` prints the totals per stage and overall; `overbrainer history --all` prints every execution.
+- `history.jsonl`: one line per stage execution, appended when the stage ends, whether it succeeded (`ok`), had failed items or was stopped by a provider error (`failed`), or was stopped by Ctrl-C or the TUI (`interrupted`). Each line holds the stage, start and end times (UTC), provider and model, the counts, tokens and cost (`null` when the price is unknown). `split` lines hold the train, eval and orphaned counts instead of a model. The file is never rewritten; deleting it resets the totals. The counts of an interrupted line come from progress events: they can miss the last items, and for `answers` its `done` also counts answers excluded from training. Lines rebuilt by `migrate` carry `"backfilled": true`.
+- `logs-<YYYYMMDDTHHMMSSZ>.log`: written by the [TUI](tui.md)'s `x` key in the Logs view, one such file per export; nothing else creates or reads these.
+- the lock is held on the project directory itself: the commands that write to the project (`tui`, the stages, `run`, `train`, `pod rm`, `migrate`) hold it while they run, so a second one stops at once with `another overbrainer (pid N) is using this project`. Reading commands (`history`, `runs ls`, `pod ls`, `config check`) never take it. `.overbrainer/lock` only holds the holding process's PID, for that message; removing it, or renaming `.overbrainer/`, changes nothing. The lock goes away with the process, even after a crash. It guards against a second overbrainer process, not against other programs changing the project. A project whose directory cannot be locked or whose `.overbrainer/` cannot be created (a read-only copy, a filesystem without file locks) refuses every command that writes, the TUI included.
+
+`overbrainer history` prints the totals per stage and overall; `overbrainer history --all` prints every execution, a backfilled one ending with `(backfilled)`.
+
+### Migrating a project
+
+Every command on a project without `.overbrainer/version` (one made before 0.4.0) ends with one line on stderr, `this project predates overbrainer 0.4.0: run overbrainer migrate`; the TUI shows it on its status line on start. It never stops the command. `init`, `migrate` and `skill` never say it.
+
+`overbrainer migrate` takes the project lock and:
+
+- adds `/.overbrainer/` to `.gitignore` when it lacks it, appending, never rewriting the file;
+- rebuilds the `answers` history from `data/answers.jsonl`: one `ok` line per model, whose `done` counts its answers, `excluded` those excluded from training, and the tokens are summed; the cost and provider are unknown, and both times are the file's modification time. It is skipped, saying why, when `history.jsonl` already has an `answers` line, so nothing is counted twice. Subtopics and questions keep no tokens, so they are not rebuilt;
+- writes `.overbrainer/version`, last.
+
+It prints one line per change, or `nothing to migrate`: running it again changes nothing. `--dry-run` prints the same lines starting with `would`, and changes nothing. A project whose format is newer than the one the running overbrainer knows is refused: upgrade overbrainer.
 
 ## What each stage does
 
