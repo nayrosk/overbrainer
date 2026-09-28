@@ -494,14 +494,16 @@ where
     /// Opens `url` in a browser, detached: no terminal I/O, never waited for.
     /// The child is dropped at once and tokio reaps it in the background, so no
     /// zombie is left and quitting never waits for it (`xdg-open` can run as
-    /// long as the browser it started). A failed start comes back as
-    /// [`Msg::BrowserFailed`].
+    /// long as the browser it started). Its own process group keeps a Ctrl-C or
+    /// a job-control signal to the TUI from reaching it. A failed start comes
+    /// back as [`Msg::BrowserFailed`].
     fn open_url(&self, url: String) {
         let started = tokio::process::Command::new(opener(cfg!(target_os = "macos")))
             .arg(&url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn();
         match started {
             Ok(child) => drop(child),
