@@ -3,8 +3,7 @@
 //! Env-only keys (provider `base_url` and `api_key`, target `host`, `runpod.*`,
 //! `hf_token`, `log`), the target `kind` tag and the free-form
 //! `training.axolotl_extra` are not listed: a form never writes them. Bounds mirror
-//! `validate.rs`; `Float` bounds are inclusive, and the help text states when
-//! `validate` excludes an end.
+//! `validate.rs`, open or closed ends included; [`FieldKind::describe`] words them.
 
 /// A part of the configuration whose fields share one schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,12 +68,12 @@ pub enum FieldKind {
         /// Largest accepted value.
         max: i64,
     },
-    /// A finite float in `[min, max]`.
+    /// A finite float between `min` and `max`.
     Float {
-        /// Smallest accepted value.
-        min: f64,
-        /// Largest accepted value.
-        max: f64,
+        /// Lower end.
+        min: Bound,
+        /// Upper end.
+        max: Bound,
     },
     /// `true` or `false`.
     Bool,
@@ -82,6 +81,35 @@ pub enum FieldKind {
     Choice(&'static [&'static str]),
     /// A list of strings, typed as comma-separated text.
     List,
+}
+
+/// One end of a float range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Bound {
+    /// The end is accepted.
+    Incl(f64),
+    /// The end is refused.
+    Excl(f64),
+    /// No end.
+    Unbounded,
+}
+
+impl Bound {
+    fn below(self, number: f64) -> bool {
+        match self {
+            Self::Incl(end) => end <= number,
+            Self::Excl(end) => end < number,
+            Self::Unbounded => true,
+        }
+    }
+
+    fn above(self, number: f64) -> bool {
+        match self {
+            Self::Incl(end) => number <= end,
+            Self::Excl(end) => number < end,
+            Self::Unbounded => true,
+        }
+    }
 }
 
 /// A typed value for a field. Text is always a string, never parsed as TOML.
@@ -146,37 +174,62 @@ impl FieldKind {
             (Self::Text, FieldValue::Text(_))
             | (Self::Bool, FieldValue::Bool(_))
             | (Self::List, FieldValue::List(_)) => Ok(()),
-            (Self::Int { min, max }, FieldValue::Int(number)) => {
-                if (min..=max).contains(number) {
-                    Ok(())
-                } else {
-                    Err(int_range(min, max))
-                }
+            (Self::Int { min, max }, FieldValue::Int(number)) if (min..=max).contains(number) => {
+                Ok(())
             },
-            (Self::Float { min, max }, FieldValue::Float(number)) => {
-                if number.is_finite() && (min..=max).contains(number) {
-                    Ok(())
-                } else {
-                    Err(format!("must be a number in [{min}, {max}]"))
-                }
+            (Self::Float { min, max }, FieldValue::Float(number))
+                if number.is_finite() && min.below(*number) && max.above(*number) =>
+            {
+                Ok(())
             },
-            (Self::Choice(choices), FieldValue::Text(text)) => {
-                if choices.contains(&text.as_str()) {
-                    Ok(())
-                } else {
-                    Err(format!("must be one of {}", choices.join(", ")))
-                }
+            (Self::Choice(choices), FieldValue::Text(text)) if choices.contains(&text.as_str()) => {
+                Ok(())
             },
+            (Self::Int { .. }, FieldValue::Int(_))
+            | (Self::Float { .. }, FieldValue::Float(_))
+            | (Self::Choice(_), FieldValue::Text(_)) => Err(format!("must be {}", self.describe())),
             _ => Err("has the wrong type".to_string()),
+        }
+    }
+
+    /// The accepted values in words, for a form's hint and error messages:
+    /// `at least 1`, `in (0, 1]`, `one of lora, qlora, full`.
+    #[must_use]
+    pub fn describe(self) -> String {
+        match self {
+            Self::Text => "any text".to_string(),
+            Self::Int {
+                min,
+                max: i64::MAX | U32_MAX,
+            } => format!("at least {min}"),
+            Self::Int { min, max } => format!("between {min} and {max}"),
+            Self::Float { min, max } => describe_floats(min, max),
+            Self::Bool => "true or false".to_string(),
+            Self::Choice(choices) => format!("one of {}", choices.join(", ")),
+            Self::List => "a comma-separated list".to_string(),
         }
     }
 }
 
-/// The range message of an integer field, without an unbounded end.
-fn int_range(min: i64, max: i64) -> String {
-    match (min, max) {
-        (min, i64::MAX | U32_MAX) => format!("must be at least {min}"),
-        (min, max) => format!("must be between {min} and {max}"),
+/// A float range in words: `in [0, 2]`, `in (0, 1)`, `greater than 0`.
+fn describe_floats(min: Bound, max: Bound) -> String {
+    let lower = match min {
+        Bound::Incl(end) => Some(("[", end)),
+        Bound::Excl(end) => Some(("(", end)),
+        Bound::Unbounded => None,
+    };
+    let upper = match max {
+        Bound::Incl(end) => Some((end, "]")),
+        Bound::Excl(end) => Some((end, ")")),
+        Bound::Unbounded => None,
+    };
+    match (lower, upper) {
+        (Some((open, low)), Some((high, close))) => format!("in {open}{low}, {high}{close}"),
+        (Some(("(", low)), None) => format!("greater than {low}"),
+        (Some((_, low)), None) => format!("at least {low}"),
+        (None, Some((high, "]"))) => format!("at most {high}"),
+        (None, Some((high, _))) => format!("less than {high}"),
+        (None, None) => "a number".to_string(),
     }
 }
 
@@ -228,6 +281,11 @@ const fn at_least(min: i64) -> FieldKind {
     FieldKind::Int { min, max: U32_MAX }
 }
 const COUNT: FieldKind = at_least(1);
+const fn floats(min: Bound, max: Bound) -> FieldKind {
+    FieldKind::Float { min, max }
+}
+/// `(0, 1]`: a similarity threshold.
+const THRESHOLD: FieldKind = floats(Bound::Excl(0.0), Bound::Incl(1.0));
 const RUNTIMES: FieldKind = FieldKind::Choice(&["docker", "native"]);
 const ENGINES: FieldKind = FieldKind::Choice(&["docker", "podman"]);
 
@@ -236,17 +294,12 @@ const PROJECT: &[FieldSpec] = &[spec("name", TEXT, false, "Name of the project")
 const TOPIC: &[FieldSpec] = &[
     spec("name", TEXT, false, "Unique name of the topic"),
     spec("description", TEXT, true, "What the topic covers"),
-    spec(
-        "subtopics",
-        COUNT,
-        false,
-        "Subtopics to generate, at least 1",
-    ),
+    spec("subtopics", COUNT, false, "Subtopics to generate"),
     spec(
         "questions_per_subtopic",
         COUNT,
         false,
-        "Questions per subtopic, at least 1",
+        "Questions per subtopic",
     ),
 ];
 
@@ -274,9 +327,9 @@ const ROLE: &[FieldSpec] = &[
     ),
     spec(
         "temperature",
-        FieldKind::Float { min: 0.0, max: 2.0 },
+        floats(Bound::Incl(0.0), Bound::Incl(2.0)),
         true,
-        "Sampling temperature in [0, 2] (provider default)",
+        "Sampling temperature (provider default)",
     ),
     spec(
         "reasoning_effort",
@@ -288,7 +341,7 @@ const ROLE: &[FieldSpec] = &[
         "thinking_budget",
         at_least(MIN_THINKING_BUDGET),
         true,
-        "Anthropic thinking budget in [1024, max_tokens), with reasoning = true",
+        "Anthropic thinking budget, below max_tokens, with reasoning = true",
     ),
 ];
 
@@ -300,7 +353,7 @@ const PIPELINE: &[FieldSpec] = &[
             max: MAX_CONCURRENCY,
         },
         true,
-        "Parallel requests, 1 to 1024 (default 8)",
+        "Parallel requests (default 8)",
     ),
     spec(
         "max_retries",
@@ -310,15 +363,15 @@ const PIPELINE: &[FieldSpec] = &[
     ),
     spec(
         "dedup_threshold",
-        FieldKind::Float { min: 0.0, max: 1.0 },
+        THRESHOLD,
         true,
-        "Word-overlap duplicate threshold in (0, 1] (default 0.8)",
+        "Word-overlap duplicate threshold (default 0.8)",
     ),
     spec(
         "eval_ratio",
-        FieldKind::Float { min: 0.0, max: 1.0 },
+        floats(Bound::Excl(0.0), Bound::Excl(1.0)),
         true,
-        "Share kept for evaluation, in (0, 1) (default 0.1)",
+        "Share kept for evaluation (default 0.1)",
     ),
     spec(
         "seed",
@@ -337,9 +390,9 @@ const PIPELINE: &[FieldSpec] = &[
     ),
     spec(
         "embedding_threshold",
-        FieldKind::Float { min: 0.0, max: 1.0 },
+        THRESHOLD,
         true,
-        "Embedding duplicate threshold in (0, 1] (default 0.9)",
+        "Embedding duplicate threshold (default 0.9)",
     ),
     spec(
         "question_batch_size",
@@ -375,12 +428,9 @@ const TRAINING: &[FieldSpec] = &[
     spec("epochs", COUNT, true, "Training epochs (default 3)"),
     spec(
         "learning_rate",
-        FieldKind::Float {
-            min: 0.0,
-            max: f64::MAX,
-        },
+        floats(Bound::Excl(0.0), Bound::Unbounded),
         true,
-        "Learning rate, greater than 0 (default 0.0002)",
+        "Learning rate (default 0.0002)",
     ),
     spec("lora_r", COUNT, true, "LoRA rank (default 16)"),
     spec(
@@ -391,9 +441,9 @@ const TRAINING: &[FieldSpec] = &[
     ),
     spec(
         "lora_dropout",
-        FieldKind::Float { min: 0.0, max: 1.0 },
+        floats(Bound::Incl(0.0), Bound::Excl(1.0)),
         true,
-        "LoRA dropout in [0, 1) (default 0.05)",
+        "LoRA dropout (default 0.05)",
     ),
     spec(
         "sequence_len",
@@ -531,22 +581,19 @@ const RUNPOD: &[FieldSpec] = &[
         "container_disk_gb",
         at_least(MIN_CONTAINER_DISK_GB),
         true,
-        "Container disk, in GB, at least 20 (default 50)",
+        "Container disk, in GB (default 50)",
     ),
     spec(
         "max_hours",
-        FieldKind::Float {
-            min: 0.0,
-            max: MAX_RUNPOD_HOURS,
-        },
+        floats(Bound::Excl(0.0), Bound::Incl(MAX_RUNPOD_HOURS)),
         false,
-        "Hours before the watchdog deletes the pod, in (0, 720]",
+        "Hours before the watchdog deletes the pod",
     ),
     spec(
         "boot_grace_minutes",
         at_least(MIN_BOOT_GRACE_MINUTES),
         true,
-        "Minutes to wait for the job to start, at least 5 (default 30)",
+        "Minutes to wait for the job to start (default 30)",
     ),
     spec(
         "retrieve_grace_minutes",
@@ -598,7 +645,7 @@ mod tests {
     use crate::config::{ConfigError, EnvSource, load_str};
 
     /// A valid configuration with a `#ZZ <section>` marker in each table.
-    const FIXTURE: &str = r#"
+    const FIXTURE: &str = r#"#ZZ settings
 [project]
 name = "demo"
 #ZZ project
@@ -610,6 +657,8 @@ questions_per_subtopic = 5
 [providers.nanogpt]
 protocol = "openai"
 #ZZ provider
+[roles]
+#ZZ roles
 [roles.generator]
 provider = "nanogpt"
 model = "m1"
@@ -640,7 +689,10 @@ max_hours = 6
 "#;
 
     /// Keys a form never writes: env-only secrets and hosts, and free-form tables.
-    const NOT_IN_FORM: [(&str, &str); 4] = [
+    const NOT_IN_FORM: [(&str, &str); 7] = [
+        ("settings", "runpod"),
+        ("settings", "hf_token"),
+        ("settings", "log"),
         ("provider", "base_url"),
         ("provider", "api_key"),
         ("ssh", "host"),
@@ -705,36 +757,116 @@ max_hours = 6
         Ok(())
     }
 
+    /// The fields listed outside `for_section`: the form's sections and the roles.
+    const LISTED_ELSEWHERE: [(&str, &[&str]); 2] = [
+        (
+            "settings",
+            &[
+                "project",
+                "topics",
+                "providers",
+                "roles",
+                "pipeline",
+                "training",
+                "targets",
+            ],
+        ),
+        ("roles", &["generator", "parent", "embedder"]),
+    ];
+
     #[test]
-    fn required_fields_match_the_fixture() {
+    fn every_settings_and_roles_key_is_covered() -> Result<(), String> {
+        for (marker, listed) in LISTED_ELSEWHERE {
+            let mut covered: BTreeSet<String> =
+                listed.iter().map(|key| (*key).to_string()).collect();
+            covered.extend(
+                NOT_IN_FORM
+                    .iter()
+                    .filter(|(owner, _)| *owner == marker)
+                    .map(|(_, field)| (*field).to_string()),
+            );
+            assert_eq!(covered, struct_fields(marker)?, "{marker}");
+        }
+        let roles: Vec<&str> = crate::config::edit::Role::ALL
+            .iter()
+            .map(|role| role.as_str())
+            .collect();
+        assert_eq!(roles, LISTED_ELSEWHERE[1].1);
+        Ok(())
+    }
+
+    /// `FIXTURE` without the `field` line of the table marked `#ZZ <marker>`.
+    fn without(marker: &str, field: &str) -> String {
+        let prefix = format!("{field} =");
+        let mut result = Vec::new();
+        let mut table = Vec::new();
+        for line in FIXTURE.lines() {
+            if line.starts_with('[') {
+                result.append(&mut strip(&mut table, marker, &prefix));
+            }
+            table.push(line);
+        }
+        result.append(&mut strip(&mut table, marker, &prefix));
+        result.join("\n")
+    }
+
+    /// Drains `table`, leaving out the `prefix` line when it is the marked table.
+    fn strip<'a>(table: &mut Vec<&'a str>, marker: &str, prefix: &str) -> Vec<&'a str> {
+        let in_marked_table = table.contains(&format!("#ZZ {marker}").as_str());
+        table
+            .drain(..)
+            .filter(|line| !(in_marked_table && line.starts_with(prefix)))
+            .collect()
+    }
+
+    #[test]
+    fn each_required_field_alone_is_required_and_optional_ones_are_not() {
         for (marker, section) in SECTIONS {
-            for spec in for_section(section).iter().filter(|spec| !spec.optional) {
-                let removed = FIXTURE
-                    .lines()
-                    .filter(|line| !line.starts_with(&format!("{} =", spec.name)))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                assert!(
-                    load_str(&removed, EnvSource::Vars(Vec::new())).is_err(),
-                    "{marker}.{} is required",
-                    spec.name
-                );
+            for spec in for_section(section) {
+                let text = without(marker, spec.name);
+                let result = load_str(&text, EnvSource::Vars(Vec::new()));
+                if spec.optional {
+                    assert!(
+                        result.is_ok(),
+                        "{marker}.{} is optional: {result:?}",
+                        spec.name
+                    );
+                } else {
+                    assert!(
+                        text.len() < FIXTURE.len(),
+                        "{marker}.{} not in the fixture",
+                        spec.name
+                    );
+                    assert!(result.is_err(), "{marker}.{} is required", spec.name);
+                }
             }
         }
     }
 
     #[test]
-    fn text_is_parsed_by_kind() {
+    fn numbers_are_parsed_with_their_bounds() {
         let int = FieldKind::Int { min: 1, max: 10 };
         assert_eq!(int.parse(" 7 "), Ok(FieldValue::Int(7)));
         assert_eq!(int.parse("0"), Err("must be between 1 and 10".to_string()));
         assert_eq!(COUNT.parse("0"), Err("must be at least 1".to_string()));
         assert!(int.parse("7.5").is_err());
-        let float = FieldKind::Float { min: 0.0, max: 1.0 };
+        let float = floats(Bound::Excl(0.0), Bound::Incl(1.0));
         assert_eq!(float.parse("0.5"), Ok(FieldValue::Float(0.5)));
+        assert_eq!(float.parse("1"), Ok(FieldValue::Float(1.0)));
+        assert_eq!(float.parse("0"), Err("must be in (0, 1]".to_string()));
         for text in ["NaN", "inf", "1.5", "x"] {
             assert!(float.parse(text).is_err(), "{text}");
         }
+        let rate = floats(Bound::Excl(0.0), Bound::Unbounded);
+        assert_eq!(rate.parse("1e9"), Ok(FieldValue::Float(1e9)));
+        assert_eq!(rate.parse("0"), Err("must be greater than 0".to_string()));
+        let dropout = floats(Bound::Incl(0.0), Bound::Excl(1.0));
+        assert_eq!(dropout.parse("0"), Ok(FieldValue::Float(0.0)));
+        assert_eq!(dropout.parse("1"), Err("must be in [0, 1)".to_string()));
+    }
+
+    #[test]
+    fn other_text_is_parsed_by_kind() {
         assert_eq!(BOOL.parse("true"), Ok(FieldValue::Bool(true)));
         assert!(BOOL.parse("yes").is_err());
         assert_eq!(
@@ -762,12 +894,7 @@ max_hours = 6
     #[test]
     fn errors_never_quote_the_value() {
         let secret = "sk-secret-value";
-        for kind in [
-            COUNT,
-            BOOL,
-            RUNTIMES,
-            FieldKind::Float { min: 0.0, max: 1.0 },
-        ] {
+        for kind in [COUNT, BOOL, RUNTIMES, THRESHOLD] {
             let message = kind.parse(secret).err().unwrap_or_default();
             assert!(
                 !message.is_empty() && !message.contains(secret),

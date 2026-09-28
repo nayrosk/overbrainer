@@ -8,7 +8,8 @@
 use std::fmt;
 
 use toml_edit::{
-    Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value, value,
+    Array, ArrayOfTables, Decor, DocumentMut, InlineTable, Item, RawString, Table, TableLike,
+    Value, value,
 };
 
 use super::fields::{self, FieldSpec, FieldValue, Section, TargetKind};
@@ -237,13 +238,21 @@ impl ConfigDoc {
         self.raw_set(path, value)
     }
 
-    /// Removes a field. Returns whether it was present.
+    /// Removes an optional field. Returns whether it was present. Comment lines
+    /// above the key move to the next key, or the next table, or the end.
     ///
     /// # Errors
     ///
-    /// Returns [`EditError::NotEditable`] for a field outside [`fields`].
+    /// Returns [`EditError::NotEditable`] for a field outside [`fields`] and
+    /// [`EditError::Invalid`] for a required field.
     pub fn unset(&mut self, path: &FieldPath) -> Result<bool, EditError> {
         match self.spec_of(path) {
+            Ok(spec) if !spec.optional => {
+                return Err(EditError::Invalid {
+                    path: path.to_string(),
+                    reason: "is required and cannot be removed".to_string(),
+                });
+            },
             Ok(_) => {},
             Err(EditError::Missing(_)) => return Ok(false),
             Err(error) => return Err(error),
@@ -266,9 +275,32 @@ impl ConfigDoc {
             }
             return Ok(true);
         }
-        Ok(entry
-            .as_table_like_mut()
-            .is_some_and(|table| table.remove(field).is_some()))
+        let Item::Table(table) = entry else {
+            return Ok(entry
+                .as_table_like_mut()
+                .is_some_and(|table| table.remove(field).is_some()));
+        };
+        let position = table.position();
+        let moved = table
+            .key(field)
+            .map(|key| comment_lines(key.leaf_decor()))
+            .unwrap_or_default();
+        let next = table
+            .iter()
+            .skip_while(|(key, _)| *key != field)
+            .skip(1)
+            .find(|(_, item)| item.is_value())
+            .map(|(key, _)| key.to_string());
+        if table.remove(field).is_none() {
+            return Ok(false);
+        }
+        if let Some(mut key) = next.as_deref().and_then(|next| table.key_mut(next)) {
+            let prefix = raw(key.leaf_decor().prefix());
+            key.leaf_decor_mut().set_prefix(format!("{moved}{prefix}"));
+        } else {
+            self.rehome(position, &moved);
+        }
+        Ok(true)
     }
 
     /// Names of the `[[topics]]` entries, in order (empty for an entry without one).
@@ -317,11 +349,14 @@ impl ConfigDoc {
                 let mut array = ArrayOfTables::new();
                 array.push(table);
                 root.insert("topics", Item::ArrayOfTables(array));
+                self.renumber();
                 Ok(0)
             },
             Some(Item::ArrayOfTables(array)) => {
                 array.push(table);
-                Ok(array.len() - 1)
+                let index = array.len() - 1;
+                self.renumber();
+                Ok(index)
             },
             Some(Item::Value(Value::Array(array))) => {
                 array.push(table.into_inline_table());
@@ -334,19 +369,27 @@ impl ConfigDoc {
     /// Removes the `index`-th topic. Returns whether it existed.
     pub fn remove_topic(&mut self, index: usize) -> bool {
         let root = self.doc.as_table_mut();
-        let remaining = match root.get_mut("topics") {
+        let (remaining, removed) = match root.get_mut("topics") {
             Some(Item::ArrayOfTables(array)) if index < array.len() => {
-                array.remove(index);
-                array.len()
+                let removed = array.remove(index);
+                let comments = comment_lines(removed.decor());
+                if let Some(next) = array.get_mut(index) {
+                    prepend_comments(next, &comments);
+                    return true;
+                }
+                (array.len(), Some(removed))
             },
             Some(Item::Value(Value::Array(array))) if index < array.len() => {
                 array.remove(index);
-                array.len()
+                (array.len(), None)
             },
             _ => return false,
         };
         if remaining == 0 {
             root.remove("topics");
+        }
+        if let Some(removed) = removed {
+            self.rehome(removed.position(), &comment_lines(removed.decor()));
         }
         true
     }
@@ -417,11 +460,86 @@ impl ConfigDoc {
         else {
             return false;
         };
-        let removed = tables.remove(name).is_some();
+        let next = tables
+            .iter()
+            .skip_while(|(key, _)| *key != name)
+            .skip(1)
+            .find(|(_, item)| item.is_table())
+            .map(|(key, _)| key.to_string());
+        let Some(removed) = tables.remove(name) else {
+            return false;
+        };
+        let Item::Table(removed) = removed else {
+            if tables.is_empty() {
+                root.remove(collection.key());
+            }
+            return true;
+        };
+        let comments = comment_lines(removed.decor());
+        if let Some(next) = next
+            .as_deref()
+            .and_then(|next| tables.get_mut(next))
+            .and_then(Item::as_table_mut)
+        {
+            prepend_comments(next, &comments);
+            return true;
+        }
         if tables.is_empty() {
             root.remove(collection.key());
         }
-        removed
+        self.rehome(removed.position(), &comments);
+        true
+    }
+
+    /// Puts the comment lines of a removed item before the first table after
+    /// document position `after`, or at the end of the document.
+    fn rehome(&mut self, after: Option<isize>, comments: &str) {
+        if comments.is_empty() {
+            return;
+        }
+        let next = after.and_then(|after| {
+            self.tables()
+                .into_iter()
+                .filter(|table| table.headed && table.position > after)
+                .min_by_key(|table| table.position)
+        });
+        if let Some(table) = next.and_then(|table| self.table_at(&table.steps)) {
+            prepend_comments(table, comments);
+        } else {
+            let trailing = raw(Some(self.doc.trailing()));
+            self.doc.set_trailing(format!("{trailing}\n{comments}"));
+        }
+    }
+
+    /// Every table below the root, in the order `toml_edit` visits them.
+    fn tables(&self) -> Vec<Located> {
+        let mut found = Vec::new();
+        tables_under(self.doc.as_table(), &mut Vec::new(), &mut 0, &mut found);
+        found
+    }
+
+    /// Gives every table its printed rank as position, so a table added here gets
+    /// one too and the tables are printed in the same order.
+    fn renumber(&mut self) {
+        let mut tables = self.tables();
+        tables.sort_by_key(|table| table.position);
+        for (rank, located) in (1..).zip(tables) {
+            if let Some(table) = self.table_at(&located.steps) {
+                table.set_position(Some(rank));
+            }
+        }
+    }
+
+    /// The table at `steps` from the root.
+    fn table_at(&mut self, steps: &[Step]) -> Option<&mut Table> {
+        let mut item = self.doc.as_item_mut();
+        for step in steps {
+            item = match step {
+                Step::Key(key) => item.get_mut(key.as_str())?,
+                Step::Index(index) => item.get_mut(*index)?,
+            };
+        }
+        item.as_table_mut()
     }
 
     fn add_named(
@@ -448,6 +566,7 @@ impl ConfigDoc {
             return Err(EditError::Exists(format!("{key}.{name}")));
         }
         tables.insert(name, Item::Table(table));
+        self.renumber();
         Ok(())
     }
 
@@ -474,6 +593,7 @@ impl ConfigDoc {
     /// Sets a field without checking it against its spec.
     fn raw_set(&mut self, path: &FieldPath, value: FieldValue) -> Result<(), EditError> {
         let missing = || EditError::Missing(path.table());
+        let created = self.entry(path).is_none();
         let entry = self.entry_or_create(path).ok_or_else(missing)?;
         let mut new = toml_value(value);
         if let Item::Value(Value::InlineTable(table)) = entry
@@ -502,6 +622,9 @@ impl ConfigDoc {
                 table.insert(path.field(), Item::Value(new));
             },
         }
+        if created {
+            self.renumber();
+        }
         Ok(())
     }
 
@@ -510,7 +633,10 @@ impl ConfigDoc {
         let root = self.doc.as_item();
         match path {
             FieldPath::Project(_) => root.get("project"),
-            FieldPath::Topic { index, .. } => root.get("topics")?.get(*index),
+            FieldPath::Topic { index, name, .. } => root
+                .get("topics")?
+                .get(*index)
+                .filter(|topic| topic.get("name").and_then(Item::as_str) == Some(name)),
             FieldPath::Provider { name, .. } => root.get("providers")?.get(name.as_str()),
             FieldPath::Role { role, .. } => root.get("roles")?.get(role.as_str()),
             FieldPath::Pipeline(_) => root.get("pipeline"),
@@ -524,7 +650,10 @@ impl ConfigDoc {
         let root = self.doc.as_item_mut();
         match path {
             FieldPath::Project(_) => root.get_mut("project"),
-            FieldPath::Topic { index, .. } => root.get_mut("topics")?.get_mut(*index),
+            FieldPath::Topic { index, name, .. } => root
+                .get_mut("topics")?
+                .get_mut(*index)
+                .filter(|topic| topic.get("name").and_then(Item::as_str) == Some(name)),
             FieldPath::Provider { name, .. } => root.get_mut("providers")?.get_mut(name.as_str()),
             FieldPath::Role { role, .. } => root.get_mut("roles")?.get_mut(role.as_str()),
             FieldPath::Pipeline(_) => root.get_mut("pipeline"),
@@ -577,12 +706,98 @@ fn ensure_table<'a>(root: &'a mut Table, key: &str) -> Option<&'a mut Item> {
 
 /// A syntax error at byte `offset` of `text`, as a 1-based line and column.
 fn syntax(text: &str, offset: usize) -> EditError {
-    let before = text.get(..offset).unwrap_or(text);
+    let mut end = offset.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let before = text.get(..end).unwrap_or_default();
     let line_start = before.rfind('\n').map_or(0, |index| index + 1);
     EditError::Syntax {
         line: before.matches('\n').count() + 1,
         column: before[line_start..].chars().count() + 1,
     }
+}
+
+/// One step from the root to a table: a key, or an index in an array of tables.
+#[derive(Debug, Clone)]
+enum Step {
+    Key(String),
+    Index(usize),
+}
+
+/// A table of the document: its steps from the root, its position as printed
+/// (a table without one follows the table before it), and whether it has a header.
+struct Located {
+    steps: Vec<Step>,
+    position: isize,
+    headed: bool,
+}
+
+/// Collects the tables under `table` in the order `toml_edit` visits them.
+fn tables_under(table: &Table, steps: &mut Vec<Step>, last: &mut isize, found: &mut Vec<Located>) {
+    for (key, item) in table {
+        let children: Vec<(Option<usize>, &Table)> = match item {
+            Item::Table(child) => vec![(None, child)],
+            Item::ArrayOfTables(array) => array
+                .iter()
+                .enumerate()
+                .map(|(index, child)| (Some(index), child))
+                .collect(),
+            _ => continue,
+        };
+        for (index, child) in children {
+            steps.push(Step::Key(key.to_string()));
+            if let Some(index) = index {
+                steps.push(Step::Index(index));
+            }
+            if !child.is_dotted() {
+                *last = child.position().unwrap_or(*last);
+                found.push(Located {
+                    steps: steps.clone(),
+                    position: *last,
+                    headed: !child.is_implicit(),
+                });
+            }
+            tables_under(child, steps, last, found);
+            steps.truncate(steps.len() - 1 - usize::from(index.is_some()));
+        }
+    }
+}
+
+/// Puts `comments` before `table`'s header, after its leading blank line.
+fn prepend_comments(table: &mut Table, comments: &str) {
+    if comments.is_empty() {
+        return;
+    }
+    // An unset prefix prints as the default blank line.
+    let prefix = table
+        .decor()
+        .prefix()
+        .map_or_else(|| "\n".to_string(), |prefix| raw(Some(prefix)));
+    let prefix = match prefix.strip_prefix('\n') {
+        Some(rest) => format!("\n{comments}{rest}"),
+        None => format!("{comments}{prefix}"),
+    };
+    table.decor_mut().set_prefix(prefix);
+}
+
+/// The comment lines of a decor's prefix, each ending with a newline.
+fn comment_lines(decor: &Decor) -> String {
+    let mut comments = String::new();
+    for line in raw(decor.prefix()).lines() {
+        if line.trim_start().starts_with('#') {
+            comments.push_str(line);
+            comments.push('\n');
+        }
+    }
+    comments
+}
+
+/// The text of a raw string, empty when absent or still a span.
+fn raw(text: Option<&RawString>) -> String {
+    text.and_then(RawString::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn protocol_name(protocol: Protocol) -> &'static str {
@@ -617,7 +832,7 @@ fn display(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::fields::FieldKind;
+    use crate::config::fields::{Bound, FieldKind};
     use crate::config::{ConfigError, EnvSource, load_str};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -781,14 +996,31 @@ runtime = "native"
                 "providers.nanogpt.api_key".to_string()
             ))
         );
-        let host = FieldPath::Target {
+        let other_kind = FieldPath::Target {
             name: "local".to_string(),
             field: "gpu_types",
         };
         assert!(matches!(
-            doc.set(&host, FieldValue::List(Vec::new())),
+            doc.set(&other_kind, FieldValue::List(Vec::new())),
             Err(EditError::NotEditable(_))
         ));
+        doc.add_target("box", TargetKind::Ssh)?;
+        let host = FieldPath::Target {
+            name: "box".to_string(),
+            field: "host",
+        };
+        assert_eq!(
+            doc.set(&host, FieldValue::Text("me@gpu".to_string())),
+            Err(EditError::NotEditable("targets.box.host".to_string()))
+        );
+        assert_eq!(
+            doc.unset(&FieldPath::Training("target")),
+            Err(EditError::Invalid {
+                path: "training.target".to_string(),
+                reason: "is required and cannot be removed".to_string(),
+            })
+        );
+        assert!(doc.remove_table(Collection::Targets, "box"));
         let refused = [
             (FieldPath::Pipeline("concurrency"), FieldValue::Int(0)),
             (
@@ -853,6 +1085,96 @@ runtime = "native"
         assert_eq!(
             format!("{:?}", written.targets.get("cloud")),
             format!("{:?}", defaults.targets.get("cloud"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stray_secret_in_the_file_is_never_returned() -> TestResult {
+        let text = COMMENTED.replace(
+            "protocol = \"openai\"\n",
+            "protocol = \"openai\"\napi_key = \"sk-secret\"\n",
+        );
+        let doc = ConfigDoc::parse(&text)?;
+        let key = FieldPath::Provider {
+            name: "nanogpt".to_string(),
+            field: "api_key",
+        };
+        assert_eq!(doc.get(&key), None);
+        assert_eq!(doc.spec(&key), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_topic_path_must_match_the_name_at_its_index() -> TestResult {
+        let mut doc = ConfigDoc::parse(COMMENTED)?;
+        let stale = FieldPath::Topic {
+            index: 0,
+            name: "traits".to_string(),
+            field: "subtopics",
+        };
+        assert_eq!(doc.get(&stale), None);
+        assert_eq!(
+            doc.set(&stale, FieldValue::Int(4)),
+            Err(EditError::Missing("topics.traits".to_string()))
+        );
+        let description = FieldPath::Topic {
+            index: 0,
+            name: "traits".to_string(),
+            field: "description",
+        };
+        assert!(!doc.unset(&description)?);
+        assert_eq!(doc.text(), COMMENTED);
+        Ok(())
+    }
+
+    #[test]
+    fn removals_keep_the_comments_above_them() -> TestResult {
+        // A key's comment moves to the next key, or to the next table when last.
+        let text = COMMENTED.replace("seed = 42\n", "# the split\nseed = 42\n");
+        let mut doc = ConfigDoc::parse(&text)?;
+        assert!(doc.unset(&FieldPath::Pipeline("seed"))?);
+        assert!(
+            doc.text()
+                .contains("concurrency = 8 # parallel requests\n\n# the split\n[training]")
+        );
+        let text = text.replace("adapter = \"qlora\"\n", "adapter = \"qlora\"\n# rounds\n");
+        let mut doc = ConfigDoc::parse(&text)?;
+        assert!(doc.unset(&FieldPath::Training("epochs"))?);
+        assert!(doc.text().contains("[training]\ntarget"));
+
+        // A table's comment moves to its next sibling, else to the next table.
+        let mut doc = ConfigDoc::parse(COMMENTED)?;
+        doc.add_topic("traits")?;
+        assert!(doc.remove_topic(0));
+        assert!(
+            doc.text()
+                .contains("# the project\n\n# What to ask about\n[[topics]]\nname = \"traits\"")
+        );
+        assert!(doc.remove_topic(0));
+        assert!(
+            doc.text().contains(
+                "# What to ask about\n# Providers: keys come from env\n[providers.nanogpt]"
+            )
+        );
+        assert!(doc.remove_table(Collection::Providers, "nanogpt"));
+        assert!(
+            doc.text()
+                .contains("# What to ask about\n# Providers: keys come from env\n[roles]")
+        );
+        assert!(doc.remove_table(Collection::Targets, "local"));
+        assert!(
+            doc.text()
+                .ends_with("epochs = 3 # one pass is too few\n\n# Where training runs\n")
+        );
+        validate(&ConfigDoc::parse(&doc.text())?).err();
+
+        let mut doc = ConfigDoc::parse(COMMENTED)?;
+        doc.add_provider("claude", Protocol::Anthropic)?;
+        assert!(doc.remove_table(Collection::Providers, "nanogpt"));
+        assert!(
+            doc.text()
+                .contains("# Providers: keys come from env\n[providers.claude]")
         );
         Ok(())
     }
@@ -1027,6 +1349,8 @@ runtime = "native"
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(!message.contains("sk-secret"));
+        assert_eq!(syntax("é\nx", 1), EditError::Syntax { line: 1, column: 1 });
+        assert_eq!(syntax("a\né", 9), EditError::Syntax { line: 2, column: 2 });
     }
 
     #[test]
@@ -1106,6 +1430,33 @@ runtime = "native"
         })
     }
 
+    /// Values at, just inside and just outside each end of a numeric kind.
+    fn probes(kind: FieldKind) -> Vec<FieldValue> {
+        match kind {
+            FieldKind::Int { min, max } => [
+                Some(min - 1),
+                Some(min),
+                Some(min + 1),
+                Some(max),
+                max.checked_add(1),
+            ]
+            .into_iter()
+            .flatten()
+            .map(FieldValue::Int)
+            .collect(),
+            FieldKind::Float { min, max } => [min, max]
+                .into_iter()
+                .filter_map(|bound| match bound {
+                    Bound::Incl(end) | Bound::Excl(end) => Some(end),
+                    Bound::Unbounded => None,
+                })
+                .flat_map(|end| [end - 0.5, end, end + 0.5])
+                .map(FieldValue::Float)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     #[test]
     fn numeric_bounds_match_validate() -> TestResult {
         let mut doc = ConfigDoc::parse(COMMENTED)?;
@@ -1123,48 +1474,43 @@ runtime = "native"
             Section::Training,
             Section::Target(TargetKind::Runpod),
         ];
+        let mut probed = 0;
         for section in sections {
             for spec in fields::for_section(section) {
                 let Some(path) = path_in(section, spec.name) else {
                     continue;
                 };
-                let outside = match spec.kind {
-                    FieldKind::Int { min, max } => {
-                        let mut values = vec![FieldValue::Int(min - 1)];
-                        if max < i64::from(u32::MAX) {
-                            values.push(FieldValue::Int(max + 1));
-                        }
-                        values
-                    },
-                    FieldKind::Float { min, max } => {
-                        let mut values = vec![FieldValue::Float(min - 0.5)];
-                        if max < f64::MAX {
-                            values.push(FieldValue::Float(max + 0.5));
-                        }
-                        values
-                    },
-                    _ => continue,
-                };
-                for value in outside {
+                for value in probes(spec.kind) {
+                    let accepted = spec.kind.check(&value).is_ok();
                     let mut edited = doc.clone();
                     edited.raw_set(&path, value.clone())?;
                     let found = problems(&edited);
+                    // The fixture is valid, so any problem comes from this value. Type
+                    // errors name a topic `topics[0]subtopics` and a target number only
+                    // by its table.
+                    let refused = !found.is_empty();
+                    let key = match &path {
+                        FieldPath::Topic { index, field, .. } => format!("topics[{index}]{field}"),
+                        _ => path.table(),
+                    };
                     assert!(
                         found
                             .iter()
-                            .any(|problem| problem.contains(&path.to_string())),
-                        "{path} = {value:?} accepted: {found:?}"
+                            .all(|problem| problem.contains(&path.to_string())
+                                || problem.contains(&key)),
+                        "{path} = {value:?}: {found:?}"
                     );
-                }
-                if let FieldKind::Int { min, .. } = spec.kind
-                    && spec.name != "thinking_budget"
-                {
-                    let mut edited = doc.clone();
-                    edited.set(&path, FieldValue::Int(min))?;
-                    validate(&edited)?;
+                    // thinking_budget also needs an anthropic provider: only refusals agree.
+                    if spec.name == "thinking_budget" && !accepted {
+                        assert!(refused, "{path} = {value:?} accepted: {found:?}");
+                    } else if spec.name != "thinking_budget" {
+                        assert_eq!(accepted, !refused, "{path} = {value:?}: {found:?}");
+                    }
+                    probed += 1;
                 }
             }
         }
+        assert!(probed > 100, "{probed}");
         Ok(())
     }
 }
