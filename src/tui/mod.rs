@@ -29,6 +29,7 @@ mod training;
 mod ui;
 mod views;
 mod widgets;
+mod wizard;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;

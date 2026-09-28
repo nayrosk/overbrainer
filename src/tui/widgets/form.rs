@@ -42,6 +42,15 @@ impl Input {
         &self.text
     }
 
+    /// The same input with every char drawn as `•`, the cursor kept: what a
+    /// secret shows.
+    pub(in crate::tui) fn masked(&self) -> Self {
+        Self {
+            text: "•".repeat(self.len()),
+            cursor: self.cursor,
+        }
+    }
+
     /// Edits the text or moves the cursor; Enter and Esc end the edit.
     pub(in crate::tui) fn on_key(&mut self, code: KeyCode) -> InputOutcome {
         match code {
