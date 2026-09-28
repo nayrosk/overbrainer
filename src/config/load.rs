@@ -174,7 +174,7 @@ pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> 
 /// variables, with the same prefix and separators [`load`] and [`load_str`] use.
 ///
 /// `OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY` gives `providers.openrouter.api_key`;
-/// `OVERBRAINER_LOG` gives `log`. Variables under [`TUI_ENV_PREFIX`] are not
+/// `OVERBRAINER_LOG` gives `log`. Variables under `OVERBRAINER_TUI_` are not
 /// configuration keys ([`load_str`] skips them too) and are left out.
 ///
 /// The prefix and `TUI_ENV_PREFIX` are matched case-insensitively, on a lower-cased
