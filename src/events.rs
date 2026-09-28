@@ -12,7 +12,10 @@ use crate::runpod::PodStatus;
 use crate::train::TrainMetric;
 
 /// A pipeline stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Stage {
     /// Subtopics of each topic.
     Subtopics,
@@ -101,6 +104,8 @@ pub enum Event {
         id: String,
         /// Tokens used for this item, when known.
         usage: Option<Usage>,
+        /// Cost of this item in USD, when the model price is known.
+        cost: Option<f64>,
     },
     /// One attempt or one item failed.
     ItemFailed {
@@ -163,6 +168,12 @@ impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.sender.subscribe()
     }
+
+    /// How many subscribers are listening.
+    #[cfg(test)]
+    pub(crate) fn receiver_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
 }
 
 impl Default for EventBus {
@@ -194,6 +205,26 @@ mod tests {
                 total: 3
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stage_serializes_as_its_name() -> Result<(), serde_json::Error> {
+        for stage in [
+            Stage::Subtopics,
+            Stage::Questions,
+            Stage::Answers,
+            Stage::Split,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&stage)?,
+                format!("\"{}\"", stage.name())
+            );
+            assert_eq!(
+                serde_json::from_str::<Stage>(&format!("\"{}\"", stage.name()))?,
+                stage
+            );
+        }
         Ok(())
     }
 

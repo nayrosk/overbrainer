@@ -286,6 +286,7 @@ fn stage_events(stage: Stage, total: usize, retries: usize) -> Vec<Event> {
             stage,
             id: format!("item{n}"),
             usage: Some(usage(1000, 250)),
+            cost: None,
         });
     }
     events
@@ -1133,7 +1134,10 @@ fn the_help_note_fits_every_view_at_80x24() -> TestResult {
             rows.contains("e, d, r and t are refused"),
             "{view:?}\n{rows}"
         );
-        assert!(rows.contains("is not locked out."), "{view:?}\n{rows}");
+        assert!(
+            rows.contains("writes to the project meanwhile."),
+            "{view:?}\n{rows}"
+        );
     }
     Ok(())
 }

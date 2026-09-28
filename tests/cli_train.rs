@@ -389,6 +389,60 @@ fn ctrl_c_while_the_job_starts_still_leaves_it_attachable() -> TestResult {
 }
 
 #[test]
+fn ctrl_c_while_preparing_creates_no_run() -> TestResult {
+    let dir = project("ok")?;
+    // A Vault that accepts the connection and never answers: resolving the token
+    // hangs until the interruption.
+    let vault = std::net::TcpListener::bind("127.0.0.1:0")?;
+    vault.set_nonblocking(true)?;
+    let port = vault.local_addr()?.port();
+    let binary = assert_cmd::cargo::cargo_bin("overbrainer");
+    let mut train = std::process::Command::new(binary)
+        .env_clear()
+        .env("NO_COLOR", "1")
+        .env("HOME", "/nonexistent")
+        .env("PATH", PATH)
+        .env("OVERBRAINER_HF_TOKEN", "vault:secret/overbrainer/hf#token")
+        .env("VAULT_ADDR", format!("http://127.0.0.1:{port}"))
+        .env("VAULT_TOKEN", "test-token")
+        .arg("-C")
+        .arg(dir.path())
+        .arg("train")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut request = None;
+    for _ in 0..600 {
+        match vault.accept() {
+            Ok((stream, _)) => {
+                request = Some(stream);
+                break;
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+            Err(e) => return Err(e.into()),
+        }
+        if train.try_wait()?.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let killed = std::process::Command::new("kill")
+        .args(["-INT", &train.id().to_string()])
+        .status()?;
+    let output = train.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(request.is_some(), "the token was never requested: {stderr}");
+    assert!(killed.success(), "kill failed");
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("interrupted before the run started"),
+        "{stderr}"
+    );
+    assert!(only_run(dir.path()).is_err(), "a run was created");
+    Ok(())
+}
+
+#[test]
 fn cancel_refuses_a_run_that_has_not_started() -> TestResult {
     let dir = project("ok")?;
     let id = "20260101-000000-abcd";

@@ -89,10 +89,11 @@ overbrainer init my-project && cd my-project
 cp .env.example .env        # fill in the provider URL and key
 overbrainer config check    # prints the resolved configuration, secrets masked
 overbrainer run             # subtopics, questions, answers, split, then train
+overbrainer history         # what each stage did and spent
 overbrainer tui             # browse the dataset and follow the runs
 ```
 
-`init` writes `overbrainer.toml`, `.env.example`, the prompt templates in `prompts/` and a `.gitignore`. Edit the topics in `overbrainer.toml` before `run`. `run` trains only when `overbrainer.toml` has a `[training]` section; otherwise it stops after `split`. Each stage also runs on its own (`subtopics`, `questions`, `answers`, `split`, `train`) and resumes where it stopped: see [the dataset pipeline](docs/pipeline.md).
+`init` writes `overbrainer.toml`, `.env.example`, the prompt templates in `prompts/` and a `.gitignore`. Edit the topics in `overbrainer.toml` before `run`. `run` trains only when `overbrainer.toml` has a `[training]` section; otherwise it stops after `split`. Each stage also runs on its own (`subtopics`, `questions`, `answers`, `split`, `train`) and resumes where it stopped: see [the dataset pipeline](docs/pipeline.md). Only one overbrainer process writes to a project at a time; a second one fails at once, naming the first one's PID.
 
 ## Providers
 
@@ -171,7 +172,7 @@ An installed skill that was edited is only replaced with `--force`. In Claude Co
 
 ## Documentation
 
-- [The dataset pipeline](docs/pipeline.md): stages, resuming, deduplication, the split, the answer format, reasoning and prompt templates.
+- [The dataset pipeline](docs/pipeline.md): stages, resuming, deduplication, the split, the answer format, reasoning, prompt templates, and the project state (`history.jsonl` and the lock).
 - [Configuration](docs/configuration.md): `overbrainer.toml`, environment variables, providers, roles, pipeline settings, Vault and logs.
 - [Training](docs/training.md): runs, local and SSH targets, the Hugging Face token, chat templates and training settings.
 - [Runpod](docs/runpod.md): pods, the watchdog, `--keep-pod`, stray pods and custom images.

@@ -256,7 +256,7 @@ fn init_appends_missing_gitignore_entries_once() -> Result<(), Box<dyn std::erro
         .assert()
         .success();
     let content = std::fs::read_to_string(&gitignore)?;
-    assert_eq!(content, "target/\n.env\n/data/\n/runs/\n");
+    assert_eq!(content, "target/\n.env\n/data/\n/runs/\n/.overbrainer/\n");
 
     // A second init (after removing the non-appendable files) adds nothing.
     std::fs::remove_file(dir.path().join("overbrainer.toml"))?;
@@ -319,5 +319,49 @@ fn help_lists_the_tui_command() -> Result<(), Box<dyn std::error::Error>> {
         .stdout(predicate::str::contains(
             "tui        Browse the dataset, run stages and follow training runs in a terminal UI",
         ));
+    Ok(())
+}
+
+#[test]
+fn a_second_writing_command_is_refused_while_the_project_is_locked()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("overbrainer.toml"), "")?;
+    let _held = overbrainer::project_lock::ProjectLock::acquire(dir.path())?;
+    Command::cargo_bin("overbrainer")?
+        .arg("-C")
+        .arg(dir.path())
+        .arg("split")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("another overbrainer (pid"));
+    Command::cargo_bin("overbrainer")?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["runs", "ls"])
+        .assert()
+        .success();
+    Ok(())
+}
+
+#[test]
+fn a_writing_command_outside_a_project_creates_nothing() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .arg("split")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("overbrainer.toml"));
+    assert!(!dir.path().join(".overbrainer").exists());
+    let missing = dir.path().join("missing/dir");
+    overbrainer()?
+        .arg("-C")
+        .arg(&missing)
+        .arg("split")
+        .assert()
+        .failure();
+    assert!(!dir.path().join("missing").exists());
     Ok(())
 }

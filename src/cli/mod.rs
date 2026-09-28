@@ -4,9 +4,11 @@ mod complete;
 mod config_check;
 pub(crate) mod data;
 pub(crate) mod front;
+mod history;
 mod init;
 pub(crate) mod pod;
 mod progress;
+mod record;
 mod runpod_train;
 mod skill;
 pub(crate) mod train;
@@ -85,6 +87,8 @@ pub enum Command {
         #[command(subcommand)]
         command: RunsCommand,
     },
+    /// Show what the pipeline stages did and spent, from .overbrainer/history.jsonl.
+    History(HistoryArgs),
     /// Find and remove the Runpod pods overbrainer created.
     Pod {
         /// The pod subcommand to run.
@@ -109,6 +113,27 @@ impl Command {
         match self {
             Self::Tui => LogMode::Tui(LogBuffer::new(LOG_LINES)),
             _ => LogMode::Stderr,
+        }
+    }
+
+    /// Whether this command writes to the project, and so must hold the project
+    /// lock: at most one such overbrainer process per project.
+    #[must_use]
+    pub fn writes_project(&self) -> bool {
+        match self {
+            Self::Tui
+            | Self::Subtopics(_)
+            | Self::Questions(_)
+            | Self::Answers(_)
+            | Self::Split(_)
+            | Self::Run
+            | Self::Train(_) => true,
+            Self::Pod { command } => matches!(command, PodCommand::Rm { .. }),
+            Self::Init { .. }
+            | Self::Config { .. }
+            | Self::Runs { .. }
+            | Self::History(_)
+            | Self::Skill { .. } => false,
         }
     }
 }
@@ -192,6 +217,14 @@ pub enum RunsCommand {
     Ls,
 }
 
+/// Options of `overbrainer history`.
+#[derive(Debug, Default, Args)]
+pub struct HistoryArgs {
+    /// List every execution, oldest first, instead of the totals per stage.
+    #[arg(long)]
+    pub all: bool,
+}
+
 /// Options shared by the pipeline stage commands.
 #[derive(Debug, Default, Args)]
 pub struct StageArgs {
@@ -231,6 +264,13 @@ pub enum ConfigCommand {
 /// [`LogMode::Tui`] its logs need.
 pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
     let dir = &cli.project_dir;
+    // Only a project takes the lock: without `overbrainer.toml` the command fails
+    // with its usual error and leaves nothing behind.
+    let _lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
+        Some(crate::project_lock::ProjectLock::acquire(dir)?)
+    } else {
+        None
+    };
     match cli.command {
         Command::Init { dir: target } => init::run(target.as_deref().unwrap_or(dir)),
         Command::Config {
@@ -254,6 +294,7 @@ pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
+        Command::History(args) => history::run(dir, &args),
         Command::Pod { command } => pod::run(dir, &command).await,
         Command::Skill { command } => skill::run(dir, &command),
         Command::Tui => match logs {
@@ -303,4 +344,43 @@ fn vault() -> Result<Option<VaultSource>, SecretError> {
     VaultSettings::from_env(|key| std::env::var(key).ok(), home.as_deref())?
         .map(|settings| VaultSource::new(&settings))
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_commands_that_write_take_the_lock() -> Result<(), clap::Error> {
+        let writes = |args: &[&str]| -> Result<bool, clap::Error> {
+            let cli =
+                Cli::try_parse_from(std::iter::once("overbrainer").chain(args.iter().copied()))?;
+            Ok(cli.command.writes_project())
+        };
+        for args in [
+            &["tui"][..],
+            &["subtopics"],
+            &["questions"],
+            &["answers"],
+            &["split"],
+            &["run"],
+            &["train"],
+            &["train", "attach", "x"],
+            &["train", "cancel", "x"],
+            &["pod", "rm", "x"],
+        ] {
+            assert!(writes(args)?, "{args:?} should lock");
+        }
+        for args in [
+            &["init"][..],
+            &["config", "check"],
+            &["runs", "ls"],
+            &["history"],
+            &["pod", "ls"],
+            &["skill", "install"],
+        ] {
+            assert!(!writes(args)?, "{args:?} should not lock");
+        }
+        Ok(())
+    }
 }

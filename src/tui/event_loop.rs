@@ -1512,6 +1512,7 @@ mod tests {
                         stage: Stage::Answers,
                         id: format!("{burst}-{n}"),
                         usage: None,
+                        cost: None,
                     });
                 }
                 while received.get() < 1 + (burst + 1) * 20_000 {

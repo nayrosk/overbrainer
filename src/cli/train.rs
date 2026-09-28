@@ -3,9 +3,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 
-use super::front::Frontend;
+use super::front::{Frontend, Interrupt};
 use super::progress::status_name;
 use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
@@ -91,12 +91,17 @@ async fn train(
     if let Some(warning) = reasoning_template_warning(training) {
         warn(&warning);
     }
-    let secrets = secrets(settings).await?;
-    let executor = executor(project_dir, name, target).await?;
-    let runs = Runs::new(project_dir);
-    // Caught from before the run exists, so Ctrl-C never kills the process while
-    // its job is being started and not yet recorded.
+    // Caught from before the preparation, so Ctrl-C stops it without a run (the
+    // command line's handler may already be installed by `overbrainer run`), and
+    // never kills the process while the job is being started and not yet recorded.
     let mut interrupt = front.interrupt();
+    let (secrets, executor) = prepare(&mut interrupt, async {
+        let secrets = secrets(settings).await?;
+        let executor = executor(project_dir, name, target).await?;
+        Ok((secrets, executor))
+    })
+    .await?;
+    let runs = Runs::new(project_dir);
     let record = create(&runs, executor.workdir(), name)?;
     started(&record);
     front.run_created(&record.id);
@@ -234,6 +239,22 @@ pub fn list(project_dir: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Runs `steps`, the preparation of a run that does not exist yet, unless the
+/// interruption comes first.
+///
+/// # Errors
+///
+/// Returns the error of `steps`, or an error when the interruption came first.
+pub(super) async fn prepare<T>(
+    interrupt: &mut Interrupt,
+    steps: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    interrupt
+        .race(steps)
+        .await
+        .unwrap_or_else(|| Err(anyhow!("interrupted before the run started")))
 }
 
 pub(super) fn training(settings: &Settings) -> anyhow::Result<&Training> {
@@ -375,4 +396,40 @@ pub(super) fn started(record: &RunRecord) {
 
 pub(super) fn warn(message: &str) {
     tracing::warn!("{message}");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::events::EventBus;
+
+    #[tokio::test]
+    async fn an_interruption_stops_the_preparation() -> anyhow::Result<()> {
+        let detach = CancellationToken::new();
+        let front = Frontend::Tui {
+            bus: EventBus::with_capacity(8),
+            detach: detach.clone(),
+            abandon: Arc::new(AtomicBool::new(false)),
+            report: Arc::new(|_| {}),
+        };
+        let mut interrupt = front.interrupt();
+        let steps = async {
+            detach.cancel();
+            std::future::pending::<anyhow::Result<()>>().await
+        };
+        let prepared =
+            tokio::time::timeout(Duration::from_secs(10), prepare(&mut interrupt, steps)).await?;
+        let Err(error) = prepared else {
+            anyhow::bail!("the preparation was not interrupted");
+        };
+        assert_eq!(error.to_string(), "interrupted before the run started");
+        assert!(interrupt.caught());
+        Ok(())
+    }
 }

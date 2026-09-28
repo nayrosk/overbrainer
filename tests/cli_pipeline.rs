@@ -139,6 +139,163 @@ async fn run_chains_the_data_stages_and_prints_costs() -> TestResult {
     Ok(())
 }
 
+/// Every line of the project's stage history.
+fn history(dir: &std::path::Path) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(dir.join(".overbrainer/history.jsonl"))?;
+    assert!(!text.contains(KEY));
+    Ok(text
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_records_each_stage_in_the_history() -> TestResult {
+    let server = provider().await;
+    let dir = project()?;
+    overbrainer(dir.path(), &server)?
+        .arg("run")
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(dir.path().join(".overbrainer/history.jsonl"))?;
+    let lines: Vec<Value> = text
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    let stages: Vec<&str> = lines
+        .iter()
+        .filter_map(|line| line["stage"].as_str())
+        .collect();
+    assert_eq!(stages, ["subtopics", "questions", "answers", "split"]);
+    assert!(lines.iter().all(|line| line["status"] == "ok"));
+    assert_eq!(lines[0]["model"], "gen");
+    assert_eq!(lines[2]["model"], "parent");
+    assert_eq!(lines[2]["done"], 4);
+    assert!(lines[2]["cost"].is_number() || lines[2]["cost"].is_null());
+    assert_eq!(lines[3]["split"]["train"], 3);
+    assert!(!text.contains(KEY));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_key_is_recorded_as_a_failed_stage() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(
+            json!({"error": {"message": format!("Incorrect API key provided: {KEY}")}}),
+        ))
+        .mount(&server)
+        .await;
+    let dir = project()?;
+    overbrainer(dir.path(), &server)?
+        .arg("subtopics")
+        .assert()
+        .failure();
+    let lines = history(dir.path())?;
+    let last = lines.last().ok_or("empty history")?;
+    assert_eq!(last["stage"], "subtopics");
+    assert_eq!(last["status"], "failed");
+    assert_eq!(last["model"], "gen");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_items_are_recorded_as_a_failed_stage() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"index": 0, "message": {"content": "no list here"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+    let dir = project()?;
+    overbrainer(dir.path(), &server)?
+        .arg("subtopics")
+        .assert()
+        .failure();
+    let lines = history(dir.path())?;
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["status"], "failed");
+    assert_eq!(lines[0]["failed"], 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_c_records_the_stage_as_interrupted() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    let dir = project()?;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_overbrainer"))
+        .env_clear()
+        .env("NO_COLOR", "1")
+        .env("HOME", "/nonexistent")
+        .env(
+            "OVERBRAINER_PROVIDERS__MOCK__BASE_URL",
+            format!("{}/v1", server.uri()),
+        )
+        .env("OVERBRAINER_PROVIDERS__MOCK__API_KEY", KEY)
+        .arg("-C")
+        .arg(dir.path())
+        .arg("subtopics")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    // Wait for the stage to send its request, then press Ctrl-C.
+    let limit = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .is_empty()
+    {
+        if std::time::Instant::now() > limit {
+            child.kill()?;
+            return Err("the stage never sent its request".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let status = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()?;
+    assert!(status.success());
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || child.wait_with_output()),
+    )
+    .await???;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("interrupted: the stage resumes on its next run"),
+        "{stderr}"
+    );
+    let lines = history(dir.path())?;
+    let [line] = lines.as_slice() else {
+        return Err(format!("expected one history line, got {lines:?}").into());
+    };
+    assert_eq!(line["stage"], "subtopics");
+    assert_eq!(line["status"], "interrupted");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_starts_no_stage_records_nothing() -> TestResult {
+    let server = provider().await;
+    let dir = project()?;
+    overbrainer(dir.path(), &server)?
+        .args(["subtopics", "--topic", "nope"])
+        .assert()
+        .failure();
+    assert!(!dir.path().join(".overbrainer/history.jsonl").exists());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn questions_generates_missing_subtopics_first() -> TestResult {
     let server = provider().await;
@@ -426,5 +583,35 @@ async fn run_trains_after_split_when_training_is_configured() -> TestResult {
         .stdout(predicate::str::contains(
             "succeeded; step 1/1, epoch 1.00, loss 0.7500; output in runs/",
         ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_sums_the_stages() -> TestResult {
+    let server = provider().await;
+    let dir = project()?;
+    overbrainer(dir.path(), &server)?
+        .arg("history")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no stage has run yet"));
+    overbrainer(dir.path(), &server)?
+        .arg("run")
+        .assert()
+        .success();
+    overbrainer(dir.path(), &server)?
+        .arg("history")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("answers"))
+        .stdout(predicate::str::contains("total"));
+    overbrainer(dir.path(), &server)?
+        .args(["history", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("subtopics  ok"))
+        .stdout(predicate::str::is_match(
+            r"split      ok           train 3, eval 1, excluded 0, orphaned 0\n",
+        )?);
     Ok(())
 }
