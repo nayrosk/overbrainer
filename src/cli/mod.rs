@@ -271,15 +271,17 @@ pub enum ConfigCommand {
 /// Returns an error if the selected subcommand fails, or if `tui` is not given the
 /// [`LogMode::Tui`] its logs need.
 pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
-    let env = CheckEnv::from_process();
-    // `tui` refuses a stdout that is not a terminal at once: no check then.
-    let wanted = should_check(&cli.command, std::io::stderr().is_terminal(), &env)
-        && (!matches!(cli.command, Command::Tui) || std::io::stdout().is_terminal());
-    let mut check = wanted.then(|| {
-        tokio::spawn(
-            async move { update::check(&env, update::CRATES_IO_URL, SystemTime::now()).await },
-        )
-    });
+    let stderr = std::io::stderr().is_terminal();
+    let stdout = std::io::stdout().is_terminal();
+    // `skill` never checks: it does not even read the environment.
+    let env = (!matches!(cli.command, Command::Skill { .. })).then(CheckEnv::from_process);
+    let mut check = env
+        .filter(|env| should_check(&cli.command, stderr, stdout, env))
+        .map(|env| {
+            tokio::spawn(async move {
+                update::check(&env, update::CRATES_IO_URL, SystemTime::now()).await
+            })
+        });
     let result = dispatch(cli, logs, &mut check).await;
     // `tui` took the check, and shows its answer itself.
     if let Some(check) = check
@@ -292,12 +294,18 @@ pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
 
 /// Whether to look for a newer release beside `command`: not when turned off,
 /// not for `skill`, and not when stderr, where the notice goes, is not a
-/// terminal, except for `tui`, which shows it on its own screen.
-fn should_check(command: &Command, stderr_is_terminal: bool, env: &CheckEnv) -> bool {
+/// terminal, except for `tui`, which shows it on its own screen, and so needs
+/// stdout a terminal instead (it refuses to start otherwise).
+fn should_check(
+    command: &Command,
+    stderr_is_terminal: bool,
+    stdout_is_terminal: bool,
+    env: &CheckEnv,
+) -> bool {
     !env.disabled
         && match command {
             Command::Skill { .. } => false,
-            Command::Tui => true,
+            Command::Tui => stdout_is_terminal,
             _ => stderr_is_terminal,
         }
 }
@@ -415,20 +423,22 @@ mod tests {
             disabled: true,
             cache_dir: None,
         };
-        for (args, terminal, env, expected) in [
-            (&["run"][..], true, &on, true),
-            (&["history"], true, &on, true),
-            (&["run"], false, &on, false),
-            (&["run"], true, &off, false),
-            (&["skill", "install"], true, &on, false),
-            (&["tui"], true, &on, true),
-            (&["tui"], false, &on, true),
-            (&["tui"], true, &off, false),
+        // (args, stderr a terminal, stdout a terminal, env, expected)
+        for (args, stderr, stdout, env, expected) in [
+            (&["run"][..], true, true, &on, true),
+            (&["history"], true, false, &on, true),
+            (&["run"], false, true, &on, false),
+            (&["run"], true, true, &off, false),
+            (&["skill", "install"], true, true, &on, false),
+            (&["tui"], true, true, &on, true),
+            (&["tui"], false, true, &on, true),
+            (&["tui"], true, false, &on, false),
+            (&["tui"], true, true, &off, false),
         ] {
             assert_eq!(
-                should_check(&command(args)?, terminal, env),
+                should_check(&command(args)?, stderr, stdout, env),
                 expected,
-                "{args:?}, stderr a terminal: {terminal}, disabled: {}",
+                "{args:?}, stderr a terminal: {stderr}, stdout: {stdout}, disabled: {}",
                 env.disabled
             );
         }

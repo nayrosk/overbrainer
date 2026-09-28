@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::env::{Bash, CompleteEnv, Fish, Shells, Zsh};
@@ -40,13 +41,26 @@ fn main() -> ExitCode {
         },
     };
 
-    match runtime.block_on(cli::run(cli, logs)) {
+    let result = runtime.block_on(cli::run(cli, logs));
+    shut_down(runtime);
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         },
     }
+}
+
+/// How long the exit waits for blocking work still running.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
+/// Drops `runtime`, waiting at most [`SHUTDOWN_GRACE`] for its blocking tasks.
+/// A plain drop waits for them without limit, and the update check's DNS lookup
+/// runs in one that aborting its task does not stop: a slow resolver would hold
+/// every exit. The grace still lets short work, such as a history write, end.
+fn shut_down(runtime: tokio::runtime::Runtime) {
+    runtime.shutdown_timeout(SHUTDOWN_GRACE);
 }
 
 /// Loads `path` into the process environment. A missing file is not an error.
@@ -63,5 +77,33 @@ fn load_dotenv(path: &Path) -> Result<(), String> {
         },
         Err(dotenvy::Error::Io(e)) => Err(format!("cannot load .env: {e}")),
         Err(_) => Err("cannot load .env".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn a_stuck_blocking_task_holds_the_exit_at_most_the_grace() -> std::io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread().build()?;
+        let (started, running) = std::sync::mpsc::channel();
+        runtime.spawn_blocking(move || {
+            started.send(()).ok();
+            std::thread::sleep(Duration::from_secs(10));
+        });
+        running
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(std::io::Error::other)?;
+        let start = Instant::now();
+        shut_down(runtime);
+        let took = start.elapsed();
+        assert!(
+            took >= SHUTDOWN_GRACE && took < SHUTDOWN_GRACE + Duration::from_millis(500),
+            "{took:?}"
+        );
+        Ok(())
     }
 }
