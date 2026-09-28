@@ -33,8 +33,7 @@ pub(in crate::tui) fn destructive(action: &Action, stage_running: bool) -> bool 
         | Action::Abandon(_)
         | Action::AbandonStart(_)
         | Action::Remove(_)
-        | Action::DropChanges
-        | Action::Leave(_) => true,
+        | Action::DropChanges => true,
         Action::Quit => stage_running,
         Action::Start(_) => false,
     }

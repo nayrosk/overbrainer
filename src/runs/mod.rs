@@ -251,13 +251,49 @@ impl Runs {
 /// Returns [`RunsError::Io`] when the temporary file cannot be created or
 /// written, or cannot be renamed over `dir/name`.
 pub(crate) fn write_atomic(dir: &Path, name: &str, content: &[u8]) -> Result<(), RunsError> {
+    replace(dir, name, content, |_| Ok(()))
+}
+
+/// [`write_atomic`] for a file a user owns: the temporary file takes
+/// `permissions` (the mode of the file it replaces) and is synced to disk
+/// before the rename.
+///
+/// # Errors
+///
+/// Returns [`RunsError::Io`] as [`write_atomic`] does, and when the
+/// permissions cannot be set or the file cannot be synced.
+pub(crate) fn write_atomic_synced(
+    dir: &Path,
+    name: &str,
+    content: &[u8],
+    permissions: Option<fs::Permissions>,
+) -> Result<(), RunsError> {
+    replace(dir, name, content, |file| {
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.sync_all()
+    })
+}
+
+/// Writes `content` to a temporary file, runs `finish` on it, then renames it
+/// over `dir/name`; the temporary file goes when a step fails.
+fn replace(
+    dir: &Path,
+    name: &str,
+    content: &[u8],
+    finish: impl FnOnce(&fs::File) -> io::Result<()>,
+) -> Result<(), RunsError> {
     let tmp = dir.join(format!(".{name}.{:016x}.tmp", fastrand::u64(..)));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
         .map_err(io_error(&tmp))?;
-    let written = file.write_all(content).map_err(io_error(&tmp));
+    let written = file
+        .write_all(content)
+        .and_then(|()| finish(&file))
+        .map_err(io_error(&tmp));
     drop(file);
     let path = dir.join(name);
     let renamed = written.and_then(|()| fs::rename(&tmp, &path).map_err(io_error(&path)));

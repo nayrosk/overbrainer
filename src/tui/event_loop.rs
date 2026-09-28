@@ -23,11 +23,9 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tracing::Level;
 
 use super::app::{App, Effect, Exit};
-use super::project_edit::{SaveRefusal, save_config};
 use super::tasks::{Done, Msg, Task, TaskId, Tasks, TrainJob};
 use super::terminal::Screen;
 use super::ui;
-use crate::config::EnvSource;
 use crate::update::Newer;
 
 /// Time between two ticks of the app's clock.
@@ -390,19 +388,14 @@ where
     fn apply_late(&mut self, app: &mut App, effect: Effect) {
         match effect {
             Effect::Spawn(id, Task::Train(TrainJob::Start)) => app.start_dropped(id),
-            Effect::Spawn(id, task @ (Task::Train(_) | Task::Edit(_))) => {
+            Effect::Spawn(
+                id,
+                task @ (Task::Train(_) | Task::Edit(_) | Task::SaveConfig { .. }),
+            ) => {
                 self.tasks.spawn(id, task);
             },
             Effect::Cancel(id) => self.tasks.cancel(id),
             Effect::Abandon(id) => self.tasks.abandon(id),
-            // Never lost: written at once, the file being small.
-            Effect::SaveConfig { text, base } => {
-                let dir = self.tasks.project_dir().to_path_buf();
-                let saved = save_config(&dir, &text, &base, &EnvSource::Process).map(Box::new);
-                for effect in app.on_message(Msg::ConfigSaved(saved)) {
-                    self.apply_late(app, effect);
-                }
-            },
             Effect::Spawn(..)
             | Effect::OpenEditor { .. }
             | Effect::OpenUrl(_)
@@ -519,7 +512,6 @@ where
             Effect::OpenEditor { command, path } => self.open_editor(&command, path).await?,
             Effect::OpenUrl(url) => self.open_url(url),
             Effect::ExportLogs { name, lines } => self.export_logs(name, lines),
-            Effect::SaveConfig { text, base } => self.save_config(text, base),
         }
         Ok(())
     }
@@ -571,26 +563,6 @@ where
             };
             messages.send(message).ok();
         }));
-    }
-
-    /// Validates `text` and writes it to `overbrainer.toml` unless the file no
-    /// longer holds `base`, in a blocking task of its own so `Loop::run` keeps
-    /// handling events; the outcome comes back as [`Msg::ConfigSaved`].
-    fn save_config(&self, text: String, base: String) {
-        let dir = self.tasks.project_dir().to_path_buf();
-        let messages = self.messages.clone();
-        tokio::spawn(async move {
-            let saved = tokio::task::spawn_blocking(move || {
-                save_config(&dir, &text, &base, &EnvSource::Process).map(Box::new)
-            })
-            .await;
-            let saved = saved.unwrap_or_else(|error| {
-                Err(SaveRefusal::Failed(format!(
-                    "the save task failed: {error}"
-                )))
-            });
-            messages.send(Msg::ConfigSaved(saved)).ok();
-        });
     }
 
     /// Hands the terminal to the editor: stops reading input, drops the keys
@@ -1297,6 +1269,72 @@ mod tests {
         assert_eq!(error.as_deref(), Some("the terminal is gone"));
         let ended = app.training.ended.get(RUN).and_then(|e| e.error.clone());
         assert_eq!(ended, Some(format!("run {RUN} has not started")));
+        Ok(())
+    }
+
+    /// [`crate::tui::snapshots::project_app`] on a project directory holding
+    /// its configuration, with `project.name` changed and not saved.
+    fn saving_app() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
+        use crate::tui::snapshots::{PROJECT_CONFIG, project_app, project_env};
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("overbrainer.toml"), PROJECT_CONFIG)?;
+        let mut app = project_app()?;
+        app.project.dir = dir.path().to_path_buf();
+        app.env = project_env();
+        for code in [KeyCode::Enter, KeyCode::End]
+            .into_iter()
+            .chain([KeyCode::Backspace; 20])
+            .chain("rust_pro".chars().map(KeyCode::Char))
+            .chain([KeyCode::Enter])
+        {
+            app.on_input(&key(code));
+        }
+        assert!(app.project_view.pending.is_some());
+        Ok((dir, app))
+    }
+
+    /// A save started, then the terminal fails (its input, or the draw after
+    /// `s`, whose effects are then applied late): the save is still waited
+    /// for, and the app hears how it ended.
+    #[tokio::test]
+    async fn a_save_is_waited_for_when_the_terminal_fails() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for draw_fails in [false, true] {
+            let (dir, mut app) = saving_app()?;
+            let backend = Shared::new();
+            let (frame, fail) = (Arc::clone(&backend.frame), Arc::clone(&backend.fail));
+            let mut terminal = Terminal::new(backend)?;
+            let (events, input) = mpsc::unbounded_channel();
+            let run_loop = drive(&mut terminal, &mut app, input, None);
+            let keys = async {
+                drawn(&frame, "configuration").await?;
+                tokio::time::sleep(FRAME * 2).await;
+                if draw_fails {
+                    fail.store(true, Ordering::SeqCst);
+                }
+                events.send(Ok(key(KeyCode::Char('s'))))?;
+                if !draw_fails {
+                    events.send(Err(io::Error::other("the terminal is gone")))?;
+                }
+                Ok::<_, Box<dyn std::error::Error>>(())
+            };
+            let joined = tokio::time::timeout(LIMIT, async { tokio::join!(run_loop, keys) }).await;
+            let Ok((result, sent)) = joined else {
+                return Err(stalled("waiting for the loop", &app, &frame).into());
+            };
+            sent?;
+            assert!(result.is_err(), "{draw_fails}");
+            let text = std::fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+            assert!(text.contains("name = \"rust_pro\""), "{draw_fails}: {text}");
+            assert!(app.project_view.pending.is_none(), "{draw_fails}");
+            assert_eq!(app.project_view.save, None);
+            assert!(
+                app.exit_notes
+                    .contains(&"overbrainer.toml was saved".to_string()),
+                "{draw_fails}: {:?}",
+                app.exit_notes
+            );
+        }
         Ok(())
     }
 

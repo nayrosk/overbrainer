@@ -16,7 +16,7 @@ use super::follow::REFRESH;
 use super::motion::{Motion, MotionLevel};
 use super::pipeline::{PipelineView, STAGES, command_name};
 use super::project::{ProjectConfig, ProjectView};
-use super::project_edit::Removal;
+use super::project_edit::{Removal, SaveRefusal, editor_failure};
 use super::start::StartPlan;
 use super::tasks::{Done, Edit, History, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
@@ -98,14 +98,6 @@ pub(super) enum Effect {
     },
     /// Open this URL in a browser, detached.
     OpenUrl(String),
-    /// Validates `text` and writes it to `overbrainer.toml`, off the UI
-    /// thread, unless the file no longer holds `base`.
-    SaveConfig {
-        /// The new text.
-        text: String,
-        /// The text the file held when it was read.
-        base: String,
-    },
     /// Writes `lines` to `.overbrainer/<name>`, off the UI thread, never
     /// overwriting an existing file.
     ExportLogs {
@@ -249,8 +241,6 @@ pub(super) enum Action {
     Remove(Removal),
     /// Dropping the pending changes to `overbrainer.toml`.
     DropChanges,
-    /// Leaving the Project view for `0`, dropping its pending changes.
-    Leave(View),
 }
 
 /// What an exit note added while leaving is about.
@@ -537,7 +527,7 @@ impl App {
         if let Some(progress) = self.pipeline.progress() {
             work.push(progress);
         }
-        if self.edit.is_some() {
+        if self.edit.is_some() || self.project_view.save.is_some() {
             work.push("saving".to_string());
         }
         if self.prepare.is_some() || self.prices.is_some() {
@@ -603,7 +593,10 @@ impl App {
                 self.priced(&prices);
                 Vec::new()
             },
-            Ok(Done::Prepared(_) | Done::Prices(_)) => Vec::new(),
+            Ok(Done::ConfigSaved(saved)) if self.project_view.save == Some(id) => {
+                self.config_saved(saved)
+            },
+            Ok(Done::Prepared(_) | Done::Prices(_) | Done::ConfigSaved(_)) => Vec::new(),
             Err(error) => self.failed(id, error),
         }
     }
@@ -659,6 +652,9 @@ impl App {
         tracing::error!("{error}");
         if self.edit == Some(id) {
             return self.saved(Err(error));
+        }
+        if self.project_view.save == Some(id) {
+            return self.config_saved(Err(SaveRefusal::Failed(error)));
         }
         if self.pipeline_task == Some(id) {
             return self.pipeline_ended(id, Err(error));
@@ -745,13 +741,10 @@ impl App {
     /// end); those of any other task are dropped.
     pub(super) fn on_message(&mut self, message: Msg) -> Vec<Effect> {
         self.dirty = true;
-        let message = match message {
-            Msg::ConfigSaved(saved) => return self.config_saved(saved),
-            message => message,
-        };
+
         let id = match &message {
             Msg::Event(id, _) | Msg::Lagged(id, _) | Msg::Report(id, _) => *id,
-            Msg::EditorExited(_) | Msg::ConfigSaved(_) => return Vec::new(),
+            Msg::EditorExited(_) => return Vec::new(),
             Msg::BrowserFailed(url) => {
                 self.say(Severity::Warn, format!("cannot open a browser: {url}"));
                 return Vec::new();
@@ -785,7 +778,6 @@ impl App {
             Msg::Report(_, Report::Line(line)) => self.pipeline.results.push(line),
             Msg::Report(_, Report::RunCreated(_))
             | Msg::EditorExited(_)
-            | Msg::ConfigSaved(_)
             | Msg::BrowserFailed(_)
             | Msg::LogsExported(_)
             | Msg::NewerRelease(_) => {},
@@ -882,7 +874,7 @@ impl App {
     /// Ends the TUI once nothing it waits for runs.
     pub(super) fn leave_when_idle(&mut self) {
         let idle = self.edit.is_none()
-            && !self.project_view.saving
+            && self.project_view.save.is_none()
             && self.pipeline_task.is_none()
             && self.training.tasks.is_empty();
         if self.leaving.is_some() && idle {
@@ -945,14 +937,7 @@ impl App {
         let Some(session) = self.editing.clone() else {
             return Vec::new();
         };
-        let failed = match status {
-            Ok(status) if status.success() => None,
-            Ok(status) => Some(status.code().map_or_else(
-                || "the editor was killed; nothing changed".to_string(),
-                |code| format!("the editor exited with status {code}; nothing changed"),
-            )),
-            Err(error) => Some(format!("cannot run the editor: {error}; nothing changed")),
-        };
+        let failed = editor_failure(status).map(|failed| format!("{failed}; nothing changed"));
         if let Some(message) = failed {
             return self.drop_edit(&session, Severity::Warn, message);
         }
@@ -1087,14 +1072,6 @@ impl App {
     /// Dataset view reads the data files again while a stage runs. Leaving a
     /// view never touches a task.
     fn show(&mut self, view: View) -> Vec<Effect> {
-        if self.ask_leave(view) {
-            return Vec::new();
-        }
-        self.show_now(view)
-    }
-
-    /// Shows `view` without asking.
-    fn show_now(&mut self, view: View) -> Vec<Effect> {
         let entered = self.view != view;
         self.view = view;
         match view {
@@ -1141,13 +1118,11 @@ impl App {
                 Vec::new()
             },
             Action::DropChanges => {
-                self.drop_changes();
-                self.say(Severity::Info, "pending changes dropped");
+                if !self.refuse_change() {
+                    self.drop_changes();
+                    self.say(Severity::Info, "pending changes dropped");
+                }
                 Vec::new()
-            },
-            Action::Leave(view) => {
-                self.drop_changes();
-                self.show_now(view)
             },
             Action::Delete { deletion, counts } => {
                 if self.locked() {
@@ -1429,7 +1404,7 @@ impl App {
         if self.edit.is_some() {
             text.push("An edit is being saved: quitting waits for it.".to_string());
         }
-        if self.project_view.saving {
+        if self.project_view.save.is_some() {
             text.push("overbrainer.toml is being saved: quitting waits for it.".to_string());
         }
         if self.project_view.pending.is_some() {
@@ -1553,7 +1528,7 @@ impl App {
             if self.edit.is_some() {
                 waited.push("the edit is saved".to_string());
             }
-            if self.project_view.saving {
+            if self.project_view.save.is_some() {
                 waited.push("overbrainer.toml is saved".to_string());
             }
             if self.pipeline_task.is_some() {

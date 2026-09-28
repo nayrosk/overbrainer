@@ -15,7 +15,7 @@ pub const ENV_PREFIX: &str = "OVERBRAINER";
 pub const TUI_ENV_PREFIX: &str = "OVERBRAINER_TUI_";
 
 /// Where [`load`] reads `OVERBRAINER_*` environment variable overrides from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvSource {
     /// Read from the current process environment. This is what a running binary uses.
     Process,

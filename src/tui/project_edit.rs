@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use crossterm::event::KeyCode;
 
-use super::app::{Action, App, Confirm, Effect, Overlay, PAGE, Project, Severity, View};
-use super::project::{Addable, Form, Listing, Locks, Pending, ProjectConfig, Shown, env_var};
+use super::app::{Action, App, Confirm, Effect, Overlay, PAGE, Project, Severity};
+use super::project::{Addable, Form, Listing, Locks, Pending, ProjectConfig, Shown};
+use super::tasks::Task;
 use super::widgets::form::{Input, InputOutcome};
 use crate::config::edit::{Collection, ConfigDoc, FieldPath};
 use crate::config::fields::{FieldKind, FieldValue, TargetKind};
@@ -67,15 +68,28 @@ pub(super) fn save_config(
         ConfigError::Read { .. } => SaveRefusal::Failed(error.to_string()),
     })?;
     let path = dir.join(CONFIG_FILE);
-    let on_disk = std::fs::read_to_string(&path)
-        .map_err(|error| SaveRefusal::Failed(format!("cannot read {}: {error}", path.display())))?;
+    let cannot_read =
+        |error: io::Error| SaveRefusal::Failed(format!("cannot read {}: {error}", path.display()));
+    let metadata = std::fs::symlink_metadata(&path).map_err(cannot_read)?;
+    if metadata.file_type().is_symlink() {
+        // A rename would replace the link, not the file it points to.
+        return Err(SaveRefusal::Failed(format!(
+            "{CONFIG_FILE} is a symlink; nothing written, edit it with E"
+        )));
+    }
+    let on_disk = std::fs::read_to_string(&path).map_err(cannot_read)?;
     if on_disk != base {
         return Err(SaveRefusal::Failed(format!(
             "{CONFIG_FILE} changed on disk since it was read; drop the changes (u), then E"
         )));
     }
-    crate::runs::write_atomic(dir, CONFIG_FILE, text.as_bytes())
-        .map_err(|error| SaveRefusal::Failed(error.to_string()))?;
+    crate::runs::write_atomic_synced(
+        dir,
+        CONFIG_FILE,
+        text.as_bytes(),
+        Some(metadata.permissions()),
+    )
+    .map_err(|error| SaveRefusal::Failed(error.to_string()))?;
     Ok(config)
 }
 
@@ -168,11 +182,11 @@ impl App {
     }
 
     /// Refuses a change while a save runs, or with no configuration read.
-    fn refuse_change(&mut self) -> bool {
+    pub(super) fn refuse_change(&mut self) -> bool {
         if self.config.is_none() {
             return true;
         }
-        if self.project_view.saving {
+        if self.project_view.save.is_some() {
             self.say(
                 Severity::Warn,
                 format!("refused: {CONFIG_FILE} is being saved"),
@@ -215,28 +229,40 @@ impl App {
     }
 
     /// Sets the field `path` to `value` in the pending document, or unsets it
-    /// for `None`, and marks it changed.
+    /// for `None`, and marks it changed unless it is back to the file's value.
     fn apply(&mut self, path: &FieldPath, value: Option<&FieldValue>) -> Result<(), String> {
-        let key = path.to_string();
-        let pending = self
-            .pending_mut()
+        let config = self
+            .config
+            .as_ref()
             .ok_or_else(|| "no configuration read".to_string())?;
-        let applied = match &value {
-            Some(value) => pending.doc.set(path, (*value).clone()),
+        let pending = self
+            .project_view
+            .pending
+            .get_or_insert_with(|| Pending::new(&config.doc));
+        let applied = match value {
+            Some(value) => pending.doc.set(path, value.clone()),
             None => pending.doc.unset(path).map(drop),
         };
         if let Err(error) = applied {
             self.settle_pending();
             return Err(error.to_string());
         }
-        pending.changed.insert(key.clone());
-        // A renamed topic is a table of its own for the marks.
-        if let (FieldPath::Topic { field: "name", .. }, Some(FieldValue::Text(name))) =
-            (path, value)
-        {
-            pending.changed.insert(format!("topics.{name}"));
-        }
-        self.project_view.errors.remove(&key);
+        self.project_view.errors.remove(&path.to_string());
+        // A renamed topic keeps its marks, under its new name.
+        let path = match (path, value) {
+            (FieldPath::Topic { index, name, field }, Some(FieldValue::Text(new)))
+                if *field == "name" =>
+            {
+                pending.rename(name, new);
+                FieldPath::Topic {
+                    index: *index,
+                    name: new.clone(),
+                    field,
+                }
+            },
+            _ => path.clone(),
+        };
+        pending.mark(&path, &config.doc);
         self.settle_pending();
         Ok(())
     }
@@ -258,16 +284,13 @@ impl App {
             self.say(Severity::Warn, said);
             return;
         }
-        let Some(path) = field.path.clone() else {
-            let said = format!("{key}: env only, set {} in .env", env_var(key));
-            self.say(Severity::Warn, said);
-            return;
-        };
-        if field.env {
-            let said = format!("{key} is set by {}; change it in .env", env_var(key));
-            self.say(Severity::Warn, said);
+        if let Some(note) = field.env_note() {
+            self.say(Severity::Warn, note);
             return;
         }
+        let Some(path) = field.path.clone() else {
+            return;
+        };
         let Some(spec) = self.shown_doc().and_then(|doc| doc.spec(&path)) else {
             let said = format!("{key}: not edited here; E opens {CONFIG_FILE}");
             self.say(Severity::Warn, said);
@@ -437,33 +460,22 @@ impl App {
         self.project_view.form = Some(Form::Adding(at));
     }
 
-    /// Enter on the name of what is added: a topic is added at once, a
-    /// provider or a target asks its protocol or kind next.
+    /// Enter on the name of what is added, which must match `^[a-z0-9_]+$`
+    /// and be new: a topic is added at once, a provider or a target asks its
+    /// protocol or kind next.
     fn named(&mut self, what: Addable, name: &str) -> Result<Option<Form>, String> {
         let Some(doc) = self.shown_doc() else {
             return Ok(None);
         };
-        if name.is_empty() {
-            return Err("a name is needed".to_string());
+        if !is_valid_name(name) {
+            return Err("the name must match ^[a-z0-9_]+$".to_string());
         }
-        let (exists, key) = match what {
-            Addable::Topic => (
-                doc.topic_names().iter().any(|topic| topic == name),
-                format!("topics.{name}"),
-            ),
-            Addable::Provider | Addable::Target => {
-                if !is_valid_name(name) {
-                    return Err("the name must match ^[a-z0-9_]+$".to_string());
-                }
-                let collection = collection(what);
-                (
-                    doc.names(collection).iter().any(|table| table == name),
-                    format!("{}.{name}", collection.key()),
-                )
-            },
+        let exists = match collection(what) {
+            None => doc.topic_names().iter().any(|topic| topic == name),
+            Some(collection) => doc.names(collection).iter().any(|table| table == name),
         };
         if exists {
-            return Err(format!("{key} already exists"));
+            return Err(format!("{} already exists", table_key(what, name)));
         }
         if what == Addable::Topic {
             self.add(what, name, 0);
@@ -480,11 +492,12 @@ impl App {
     /// of its kinds, and selects its first field.
     fn add(&mut self, what: Addable, name: &str, choice: usize) {
         let kind = what.kinds().get(choice).copied().unwrap_or_default();
+        let key = table_key(what, name);
         let Some(pending) = self.pending_mut() else {
             return;
         };
         let added = match what {
-            Addable::Topic => pending.doc.add_topic(name).map(drop),
+            Addable::Topic => pending.add_topic(name),
             Addable::Provider => {
                 let protocol = if kind == "anthropic" {
                     Protocol::Anthropic
@@ -498,13 +511,9 @@ impl App {
                 TargetKind::from_name(kind).unwrap_or(TargetKind::Local),
             ),
         };
-        let key = match what {
-            Addable::Topic => format!("topics.{name}"),
-            Addable::Provider | Addable::Target => format!("{}.{name}", collection(what).key()),
-        };
         match added {
             Ok(()) => {
-                pending.changed.insert(key.clone());
+                pending.note_table(&key, true);
                 self.settle_pending();
                 if let Some(index) = self.project_listing().find(&key) {
                     self.project_view.selected = index;
@@ -593,11 +602,11 @@ impl App {
                 .topic_names()
                 .iter()
                 .position(|topic| topic == name)
-                .is_some_and(|index| pending.doc.remove_topic(index)),
+                .is_some_and(|index| pending.remove_topic(index)),
             Removal::Table(collection, name) => pending.doc.remove_table(*collection, name),
         };
         if removed {
-            pending.changed.insert(key.clone());
+            pending.note_table(&key, false);
         }
         self.settle_pending();
         let count = self.project_listing().fields.len();
@@ -628,10 +637,6 @@ impl App {
                 .user_of(&config.settings, key)
                 .map(|user| (key.clone(), user))
         });
-        let effect = Effect::SaveConfig {
-            text: pending.doc.text(),
-            base: config.text.clone(),
-        };
         if let Some((key, user)) = conflict {
             self.say(
                 Severity::Warn,
@@ -643,8 +648,17 @@ impl App {
             self.say(Severity::Warn, "refused: quitting; no save starts");
             return Vec::new();
         }
-        self.project_view.saving = true;
-        vec![effect]
+        let (Some(config), Some(pending)) = (&self.config, &self.project_view.pending) else {
+            return Vec::new();
+        };
+        let task = Task::SaveConfig {
+            text: pending.doc.text(),
+            base: config.text.clone(),
+            env: self.env.clone(),
+        };
+        let id = self.task_id();
+        self.project_view.save = Some(id);
+        vec![Effect::Spawn(id, task)]
     }
 
     /// The save ended: the app reads the configuration written, or each
@@ -653,7 +667,7 @@ impl App {
         &mut self,
         saved: Result<Box<ProjectConfig>, SaveRefusal>,
     ) -> Vec<Effect> {
-        self.project_view.saving = false;
+        self.project_view.save = None;
         let mut effects = Vec::new();
         match saved {
             Ok(config) => {
@@ -755,30 +769,6 @@ impl App {
         self.project_view.touch();
     }
 
-    /// Whether leaving the Project view for `view` must ask first, because of
-    /// pending changes: then it asks.
-    pub(super) fn ask_leave(&mut self, view: View) -> bool {
-        if self.view != View::Project || view == View::Project {
-            return false;
-        }
-        let count = self.project_view.changes();
-        if self.project_view.pending.is_none() {
-            return false;
-        }
-        self.overlay = Some(Overlay::Confirm(Confirm {
-            title: " Leave the Project view? ".to_string(),
-            text: vec![format!(
-                "{} to {CONFIG_FILE} not saved: leaving drops {}. s saves them first.",
-                changes(count),
-                if count == 1 { "it" } else { "them" },
-            )],
-            yes: "leave",
-            no: "stay",
-            action: Action::Leave(view),
-        }));
-        true
-    }
-
     /// `E`: opens `overbrainer.toml` in the editor; refused with pending
     /// changes, while a save runs, or while a stage, an edit or a training
     /// uses the configuration.
@@ -813,14 +803,7 @@ impl App {
     /// The editor on `overbrainer.toml` ended with `status`: the file is read
     /// again; one that does not load leaves the view as it was.
     pub(super) fn config_edited(&mut self, status: io::Result<ExitStatus>) -> Vec<Effect> {
-        let failed = match status {
-            Ok(status) if status.success() => None,
-            Ok(status) => Some(status.code().map_or_else(
-                || "the editor was killed".to_string(),
-                |code| format!("the editor exited with status {code}"),
-            )),
-            Err(error) => Some(format!("cannot run the editor: {error}")),
-        };
+        let failed = editor_failure(status);
         let path = self.project.dir.join(CONFIG_FILE);
         let read = std::fs::read_to_string(&path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))
@@ -859,12 +842,31 @@ impl App {
     }
 }
 
-/// The collection a provider or a target is added to.
-fn collection(what: Addable) -> Collection {
-    match what {
-        Addable::Target => Collection::Targets,
-        Addable::Topic | Addable::Provider => Collection::Providers,
+/// How the editor failed, when it did: killed, a non-zero status, or not run.
+pub(super) fn editor_failure(status: io::Result<ExitStatus>) -> Option<String> {
+    match status {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(status.code().map_or_else(
+            || "the editor was killed".to_string(),
+            |code| format!("the editor exited with status {code}"),
+        )),
+        Err(error) => Some(format!("cannot run the editor: {error}")),
     }
+}
+
+/// The collection a provider or a target is added to; `None` for a topic.
+fn collection(what: Addable) -> Option<Collection> {
+    match what {
+        Addable::Topic => None,
+        Addable::Provider => Some(Collection::Providers),
+        Addable::Target => Some(Collection::Targets),
+    }
+}
+
+/// The dotted key of the table `what` named `name`: `topics.traits`.
+fn table_key(what: Addable, name: &str) -> String {
+    let parent = collection(what).map_or("topics", Collection::key);
+    format!("{parent}.{name}")
 }
 
 #[cfg(test)]
@@ -873,10 +875,11 @@ mod tests {
 
     use super::*;
     use crate::cli::data::Command;
+    use crate::tui::app::View;
     use crate::tui::snapshots::{
         PROJECT_CONFIG, draw, key, project_app, project_env, text as screen,
     };
-    use crate::tui::tasks::{Msg, Task, TaskId};
+    use crate::tui::tasks::{Done, TaskId};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -937,15 +940,16 @@ mod tests {
             .ok_or_else(|| format!("no field {key}"))
     }
 
-    /// `s`, then the save the loop would run, in `dir`, handed back to `app`.
+    /// `s`, then the save task run in `dir`, its end handed back to `app`.
     fn save(app: &mut App, dir: &Path) -> Result<Vec<Effect>, String> {
         let effects = press(app, &[KeyCode::Char('s')]);
-        let [Effect::SaveConfig { text, base }] = effects.as_slice() else {
+        let [Effect::Spawn(id, Task::SaveConfig { text, base, env })] = effects.as_slice() else {
             return Err(format!("no save: {effects:?} ({})", status(app)));
         };
-        assert!(app.project_view.saving);
-        let saved = save_config(dir, text, base, &project_env()).map(Box::new);
-        Ok(app.on_message(Msg::ConfigSaved(saved)))
+        assert_eq!(app.project_view.save, Some(*id));
+        assert_eq!(env, &project_env(), "the app's environment");
+        let saved = save_config(dir, text, base, env).map(Box::new);
+        Ok(app.on_done(*id, Ok(Done::ConfigSaved(saved))))
     }
 
     fn written(dir: &Path) -> std::io::Result<String> {
@@ -993,7 +997,7 @@ mod tests {
         assert_eq!(status(&app), "✓ saved overbrainer.toml");
         assert_eq!(app.project.name, "rust_pro", "the settings are read again");
         assert!(app.project_view.pending.is_none());
-        assert!(!app.project_view.saving);
+        assert_eq!(app.project_view.save, None);
         assert!(
             effects
                 .iter()
@@ -1049,6 +1053,13 @@ mod tests {
         press(&mut app, &[KeyCode::Char('a')]);
         assert_eq!(app.project_view.form, Some(Form::Adding(0)));
         press(&mut app, &[KeyCode::Enter]);
+        chars(&mut app, "rust.traits");
+        press(&mut app, &[KeyCode::Enter]);
+        let Some(Form::Name { error, .. }) = &app.project_view.form else {
+            return Err("the form closed".into());
+        };
+        assert_eq!(error.as_deref(), Some("the name must match ^[a-z0-9_]+$"));
+        press(&mut app, &[KeyCode::Backspace; 11]);
         chars(&mut app, "ownership");
         press(&mut app, &[KeyCode::Enter]);
         let Some(Form::Name { error, .. }) = &app.project_view.form else {
@@ -1177,7 +1188,7 @@ mod tests {
         press(&mut app, &[KeyCode::Enter]);
         assert_eq!(
             status(&app),
-            "pipeline.concurrency is set by OVERBRAINER_PIPELINE__CONCURRENCY; \
+            "pipeline.concurrency: set by OVERBRAINER_PIPELINE__CONCURRENCY, \
              change it in .env"
         );
         assert_eq!(app.project_view.form, None);
@@ -1219,21 +1230,22 @@ mod tests {
     }
 
     #[test]
-    fn leaving_the_view_with_pending_changes_asks_and_u_drops_them() -> TestResult {
+    fn switching_views_keeps_the_pending_changes_and_u_drops_them() -> TestResult {
         let (_dir, mut app) = editing_app()?;
         set(&mut app, "project.name", "rust_pro")?;
         press(&mut app, &[KeyCode::Char('2')]);
-        assert_eq!(app.view, View::Project);
-        assert!(matches!(
-            &app.overlay,
-            Some(Overlay::Confirm(Confirm {
-                action: Action::Leave(View::Dataset),
-                ..
-            }))
-        ));
-        press(&mut app, &[KeyCode::Char('n')]);
-        assert_eq!(app.view, View::Project);
-        assert!(app.project_view.pending.is_some());
+        assert_eq!((app.view, &app.overlay), (View::Dataset, &None));
+        press(
+            &mut app,
+            &[KeyCode::Tab, KeyCode::BackTab, KeyCode::Char('1')],
+        );
+        assert_eq!(field(&mut app, "project.name")?.shown.text(), "rust_pro");
+        let effects = press(&mut app, &[KeyCode::Char('r'), KeyCode::Enter]);
+        assert!(!effects.is_empty(), "a stage starts");
+        assert_eq!(app.view, View::Pipeline);
+        assert!(app.project_view.pending.is_some(), "kept");
+        app.view = View::Project;
+        app.pipeline_task = None;
         press(&mut app, &[KeyCode::Char('u')]);
         assert!(matches!(
             &app.overlay,
@@ -1246,10 +1258,44 @@ mod tests {
         assert!(app.project_view.pending.is_none());
         assert_eq!(status(&app), "pending changes dropped");
         assert_eq!(field(&mut app, "project.name")?.shown.text(), "rust_expert");
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_changes_while_a_save_runs() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
         set(&mut app, "project.name", "rust_pro")?;
-        press(&mut app, &[KeyCode::Tab, KeyCode::Char('y')]);
-        assert_eq!(app.view, View::Dataset);
-        assert!(app.project_view.pending.is_none(), "leaving dropped them");
+        let effects = press(&mut app, &[KeyCode::Char('s')]);
+        assert_eq!(effects.len(), 1);
+        for code in ['u', 'a', 'd', 's', 'E'] {
+            assert!(press(&mut app, &[KeyCode::Char(code)]).is_empty(), "{code}");
+            assert_eq!(app.overlay, None, "{code}");
+            assert_eq!(app.project_view.form, None, "{code}");
+            assert_eq!(status(&app), "refused: overbrainer.toml is being saved");
+        }
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.project_view.form, None);
+        assert_eq!(field(&mut app, "project.name")?.shown.text(), "rust_pro");
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_set_back_loses_its_mark_and_a_rename_is_one_change() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        set(&mut app, "topics.ownership.subtopics", "5")?;
+        set(&mut app, "topics.ownership.name", "owning")?;
+        assert_eq!(app.project_view.changes(), 2);
+        assert!(field(&mut app, "topics.owning.subtopics")?.changed);
+        assert!(field(&mut app, "topics.owning.name")?.changed);
+        set(&mut app, "topics.owning.subtopics", "2")?;
+        assert_eq!(app.project_view.changes(), 1, "the rename alone");
+        assert!(!field(&mut app, "topics.owning.subtopics")?.changed);
+        set(&mut app, "project.name", "rust_pro")?;
+        set(&mut app, "project.name", "rust_expert")?;
+        assert!(!field(&mut app, "project.name")?.changed);
+        assert_eq!(app.project_view.changes(), 1);
+        set(&mut app, "topics.owning.name", "ownership")?;
+        assert!(app.project_view.pending.is_none(), "back to the file");
         Ok(())
     }
 
@@ -1390,6 +1436,133 @@ mod tests {
         assert_eq!(Addable::Target.kinds(), targets.as_slice());
         assert_eq!(Addable::Provider.kinds(), ["openai", "anthropic"]);
         assert!(Addable::Topic.kinds().is_empty());
+    }
+
+    #[test]
+    fn a_save_reloads_the_settings_the_app_uses() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        assert_eq!(app.project.concurrency, 8, "the fixture's");
+        set(&mut app, "pipeline.eval_ratio", "0.2")?;
+        press(
+            &mut app,
+            &[KeyCode::Char('a'), KeyCode::Right, KeyCode::Right],
+        );
+        press(&mut app, &[KeyCode::Enter]);
+        chars(&mut app, "box");
+        press(&mut app, &[KeyCode::Enter, KeyCode::Enter]);
+        set(&mut app, "training.target", "box")?;
+        save(&mut app, dir.path())?;
+        assert_eq!(status(&app), "✓ saved overbrainer.toml");
+        assert!((app.project.eval_ratio - 0.2).abs() < f64::EPSILON);
+        assert_eq!(app.project.concurrency, 4, "from the environment");
+        assert_eq!(app.project.target.as_deref(), Some("box"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_save_keeps_the_file_mode_and_refuses_a_symlink() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, mut app) = editing_app()?;
+        let path = dir.path().join(CONFIG_FILE);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+        set(&mut app, "project.name", "rust_pro")?;
+        save(&mut app, dir.path())?;
+        assert_eq!(status(&app), "✓ saved overbrainer.toml");
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o640
+        );
+        let real = dir.path().join("real.toml");
+        std::fs::rename(&path, &real)?;
+        std::os::unix::fs::symlink(&real, &path)?;
+        set(&mut app, "project.name", "rust_max")?;
+        save(&mut app, dir.path())?;
+        assert_eq!(
+            status(&app),
+            "not saved: overbrainer.toml is a symlink; nothing written, edit it with E"
+        );
+        assert!(std::fs::symlink_metadata(&path)?.file_type().is_symlink());
+        assert!(std::fs::read_to_string(&real)?.contains("rust_pro"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_type_error_in_a_topic_is_shown_on_its_field() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        let text = PROJECT_CONFIG.replace("subtopics = 2", "subtopics = \"many\"");
+        let refusal = save_config(dir.path(), &text, PROJECT_CONFIG, &project_env());
+        let Err(SaveRefusal::Invalid(problems)) = refusal else {
+            return Err(format!("{refusal:?}").into());
+        };
+        assert!(
+            problems.iter().any(|problem| problem.contains("topics[0]")),
+            "{problems:?}"
+        );
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG);
+        app.project_view.save = Some(TaskId(40));
+        app.on_done(
+            TaskId(40),
+            Ok(Done::ConfigSaved(Err(SaveRefusal::Invalid(problems)))),
+        );
+        assert!(
+            field(&mut app, "topics.ownership.subtopics")?
+                .error
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quitting_or_a_signal_waits_for_a_save_then_notes_it() -> TestResult {
+        for signal in [false, true] {
+            let (dir, mut app) = editing_app()?;
+            set(&mut app, "project.name", "rust_pro")?;
+            let effects = press(&mut app, &[KeyCode::Char('s')]);
+            let [Effect::Spawn(id, Task::SaveConfig { text, base, env })] = effects.as_slice()
+            else {
+                return Err(format!("{effects:?}").into());
+            };
+            if signal {
+                app.on_signal();
+            } else {
+                press(&mut app, &[KeyCode::Char('q')]);
+                let Some(Overlay::Confirm(confirm)) = &app.overlay else {
+                    return Err("no dialog".into());
+                };
+                assert!(
+                    confirm.text.iter().any(|line| line.contains("being saved")),
+                    "{confirm:?}"
+                );
+                press(&mut app, &[KeyCode::Char('y')]);
+            }
+            assert_eq!(app.exit, None, "waits for the save");
+            let saved = save_config(dir.path(), text, base, env).map(Box::new);
+            app.on_done(*id, Ok(Done::ConfigSaved(saved)));
+            assert!(app.exit.is_some());
+            assert!(app.project_view.pending.is_none());
+            assert!(
+                app.exit_notes
+                    .contains(&"overbrainer.toml was saved".to_string()),
+                "{:?}",
+                app.exit_notes
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn e_is_refused_while_a_training_run_is_followed() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let mut follow =
+            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, "20260921-a1");
+        follow.watching = true;
+        app.training.tasks.insert(TaskId(9), follow);
+        assert!(press(&mut app, &[KeyCode::Char('E')]).is_empty());
+        assert_eq!(
+            status(&app),
+            "refused: run 20260921-a1 uses the training table; E edits the whole file"
+        );
+        Ok(())
     }
 
     #[test]

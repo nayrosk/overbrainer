@@ -424,7 +424,6 @@ impl App {
                 return self.refresh_runs();
             },
             Msg::EditorExited(_)
-            | Msg::ConfigSaved(_)
             | Msg::BrowserFailed(_)
             | Msg::LogsExported(_)
             | Msg::NewerRelease(_) => {},

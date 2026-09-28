@@ -11,9 +11,10 @@ use super::app::App;
 use super::cost::pods_cost;
 use super::dataset::sizes;
 use super::pipeline::command_name;
+use super::tasks::TaskId;
 use super::widgets::form::Input;
 use crate::cli::data::Command;
-use crate::config::edit::{Collection, ConfigDoc, FieldPath, Role};
+use crate::config::edit::{Collection, ConfigDoc, EditError, FieldPath, Role};
 use crate::config::fields::{self, FieldKind, FieldSpec, Section, TargetKind};
 use crate::config::{
     Adapter, ConfigError, ENV_PREFIX, Engine, EnvSource, Pipeline, Protocol, RoleModel, Runtime,
@@ -155,13 +156,18 @@ impl Field {
         if let Some(user) = &self.lock {
             return format!("{key}: used by {user}, read-only until it ends");
         }
+        self.env_note()
+            .unwrap_or_else(|| format!("{key}: {}", self.help))
+    }
+
+    /// Where to change the field when only the environment may: `.env`.
+    pub(super) fn env_note(&self) -> Option<String> {
+        let key = &self.key;
         if self.path.is_none() {
-            return format!("{key}: env only, set {} in .env", env_var(key));
+            return Some(format!("{key}: env only, set {} in .env", env_var(key)));
         }
-        if self.env {
-            return format!("{key}: set by {}, change it in .env", env_var(key));
-        }
-        format!("{key}: {}", self.help)
+        self.env
+            .then(|| format!("{key}: set by {}, change it in .env", env_var(key)))
     }
 }
 
@@ -252,13 +258,16 @@ fn roles_of(command: Command) -> Vec<Role> {
 }
 
 /// The changes not saved yet: the edited document, and the dotted keys of the
-/// fields they set and of the tables they add or remove.
+/// fields they set to another value and of the tables they add or remove.
 #[derive(Debug, Clone)]
 pub(super) struct Pending {
     /// `overbrainer.toml` as edited.
     pub(super) doc: ConfigDoc,
     /// What changed: `pipeline.seed`, `providers.local`.
     pub(super) changed: BTreeSet<String>,
+    /// For each topic of `doc`, its position in the file's document; `None`
+    /// for a topic added.
+    origins: Vec<Option<usize>>,
 }
 
 impl Pending {
@@ -267,7 +276,81 @@ impl Pending {
         Self {
             doc: doc.clone(),
             changed: BTreeSet::new(),
+            origins: (0..doc.topic_names().len()).map(Some).collect(),
         }
+    }
+
+    /// Where the field `path` of the edited document was in `original`, the
+    /// file's document: `None` for a field of a topic added.
+    fn original_path(&self, path: &FieldPath, original: &ConfigDoc) -> Option<FieldPath> {
+        let FieldPath::Topic { index, field, .. } = path else {
+            return Some(path.clone());
+        };
+        let at = self.origins.get(*index).copied().flatten()?;
+        let name = original.topic_names().get(at)?.clone();
+        Some(FieldPath::Topic {
+            index: at,
+            name,
+            field,
+        })
+    }
+
+    /// Marks the field `path` changed when its value differs from the one it
+    /// has in `original`, the file's document, and unmarks it otherwise.
+    pub(super) fn mark(&mut self, path: &FieldPath, original: &ConfigDoc) {
+        let before = self
+            .original_path(path, original)
+            .map(|at| original.get(&at));
+        let key = path.to_string();
+        if before == Some(self.doc.get(path)) {
+            self.changed.remove(&key);
+        } else {
+            self.changed.insert(key);
+        }
+    }
+
+    /// The topic `old` is now named `new`: what was noted of it follows.
+    pub(super) fn rename(&mut self, old: &str, new: &str) {
+        let (old, new) = (format!("topics.{old}"), format!("topics.{new}"));
+        self.changed = std::mem::take(&mut self.changed)
+            .into_iter()
+            .map(|key| match key.strip_prefix(old.as_str()) {
+                Some(rest) if rest.is_empty() || rest.starts_with('.') => format!("{new}{rest}"),
+                _ => key,
+            })
+            .collect();
+    }
+
+    /// Appends a topic named `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`ConfigDoc::add_topic`] returns.
+    pub(super) fn add_topic(&mut self, name: &str) -> Result<(), EditError> {
+        let index = self.doc.add_topic(name)?;
+        self.origins.truncate(index);
+        self.origins.push(None);
+        Ok(())
+    }
+
+    /// Removes the `index`-th topic; returns whether it existed.
+    pub(super) fn remove_topic(&mut self, index: usize) -> bool {
+        let removed = self.doc.remove_topic(index);
+        if removed && index < self.origins.len() {
+            self.origins.remove(index);
+        }
+        removed
+    }
+
+    /// Notes that the table `key` was added or removed: a table added then
+    /// removed leaves no mark, and nothing noted inside it stays.
+    pub(super) fn note_table(&mut self, key: &str, added: bool) {
+        let inside = format!("{key}.");
+        self.changed.retain(|noted| !noted.starts_with(&inside));
+        if !added && self.changed.remove(key) {
+            return;
+        }
+        self.changed.insert(key.to_string());
     }
 
     /// Whether a change sets `key` or adds its table.
@@ -872,8 +955,8 @@ pub(super) struct ProjectView {
     pub(super) errors: BTreeMap<String, String>,
     /// The form open, if any.
     pub(super) form: Option<Form>,
-    /// Whether a save runs.
-    pub(super) saving: bool,
+    /// The save running, if any.
+    pub(super) save: Option<TaskId>,
     /// Whether the editor open is on `overbrainer.toml`.
     pub(super) editing: bool,
     /// Bumped by every change of what the rows show but the locks.

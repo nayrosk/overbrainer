@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::cost::history_cost;
 use super::editor::Edited;
 use super::project::ProjectConfig;
-use super::project_edit::SaveRefusal;
+use super::project_edit::{SaveRefusal, save_config};
 use super::start::{Prices, StartPlan, list_prices, prepare};
 use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::Command;
@@ -66,6 +66,16 @@ pub(super) enum Task {
     Prepare,
     /// The list prices of these Runpod GPU types.
     Prices(Vec<String>),
+    /// Validates `text` with `env` and writes it to `overbrainer.toml`,
+    /// unless the file no longer holds `base`.
+    SaveConfig {
+        /// The new text.
+        text: String,
+        /// The text the file held when it was read.
+        base: String,
+        /// The environment it is validated with.
+        env: EnvSource,
+    },
 }
 
 /// A training flow, run exactly as `overbrainer train` runs it.
@@ -172,6 +182,8 @@ pub(super) enum Done {
     Prepared(Result<StartPlan, String>),
     /// List prices of GPU types.
     Prices(Prices),
+    /// The configuration written to `overbrainer.toml`, or why nothing was.
+    ConfigSaved(Result<Box<ProjectConfig>, SaveRefusal>),
 }
 
 /// A saved edit.
@@ -188,9 +200,6 @@ pub(super) struct Saved {
 pub(super) enum Msg {
     /// The editor ended, or could not be started.
     EditorExited(io::Result<ExitStatus>),
-    /// The save of `overbrainer.toml` ended: the configuration written, or
-    /// why nothing was.
-    ConfigSaved(Result<Box<ProjectConfig>, SaveRefusal>),
     /// No browser could be started on this URL.
     BrowserFailed(String),
     /// The Logs export ended: the file name and how many lines were written, or
@@ -407,6 +416,18 @@ impl Tasks {
                     })
                 })
             },
+            Task::SaveConfig { text, base, env } => {
+                let dir = self.project_dir.clone();
+                self.set.spawn(async move {
+                    let saved = tokio::task::spawn_blocking(move || {
+                        save_config(&dir, &text, &base, &env).map(Box::new)
+                    })
+                    .await;
+                    Done::ConfigSaved(saved.unwrap_or_else(|error| {
+                        Err(SaveRefusal::Failed(format!("the save failed: {error}")))
+                    }))
+                })
+            },
             Task::Pipeline(command) => self.spawn_pipeline(id, command),
             Task::Train(job) => self.spawn_train(id, job),
             Task::Runs => {
@@ -545,6 +566,34 @@ mod tests {
 
     /// An upper bound only: a shared CI runner can be far slower than a laptop.
     const LIMIT: Duration = Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn a_save_task_writes_the_configuration_and_ends_with_it() -> TestResult {
+        use crate::tui::snapshots::{PROJECT_CONFIG, project_env};
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("overbrainer.toml"), PROJECT_CONFIG)?;
+        let text = PROJECT_CONFIG.replace("rust_expert", "rust_pro");
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
+        tasks.spawn(
+            TaskId(5),
+            Task::SaveConfig {
+                text: text.clone(),
+                base: PROJECT_CONFIG.to_string(),
+                env: project_env(),
+            },
+        );
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        let Some((TaskId(5), Ok(Done::ConfigSaved(Ok(config))))) = next else {
+            return Err(format!("unexpected end: {next:?}").into());
+        };
+        assert_eq!(config.settings.project.name, "rust_pro");
+        assert_eq!(config.text, text);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("overbrainer.toml"))?,
+            text
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn a_load_reads_the_data_files_and_the_history_cost_and_ends_with_its_id() -> TestResult {
@@ -734,7 +783,6 @@ mod tests {
             Msg::Lagged(id, skipped) => Some(Msg::Lagged(*id, *skipped)),
             Msg::Report(id, report) => Some(Msg::Report(*id, report.clone())),
             Msg::EditorExited(_)
-            | Msg::ConfigSaved(_)
             | Msg::BrowserFailed(_)
             | Msg::LogsExported(_)
             | Msg::NewerRelease(_) => None,
