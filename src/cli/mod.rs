@@ -16,6 +16,7 @@ pub(crate) mod train;
 
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use clap::{Args, Parser, Subcommand, ValueHint};
@@ -28,6 +29,7 @@ use self::front::Frontend;
 use self::reload::Reloader;
 use crate::config::{DotenvKeys, EnvSource, Source};
 use crate::logging::{LOG_LINES, LogBuffer, LogMode};
+use crate::metrics::{Metrics, MetricsServer};
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
 use crate::update::{self, CheckEnv, Newer};
 
@@ -358,10 +360,15 @@ async fn dispatch(
     let dir = &cli.project_dir;
     // Only a project takes the lock: without `overbrainer.toml` the command fails
     // with its usual error and leaves nothing behind.
-    let _lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
+    let lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
         Some(crate::project_lock::ProjectLock::acquire(dir)?)
     } else {
         None
+    };
+    // Served while the lock is held: dropped before it.
+    let _metrics = match &lock {
+        Some(_) => serve_metrics(dir).await,
+        None => None,
     };
     match cli.command {
         Command::Init { dir: target } => init::run(target.as_deref().unwrap_or(dir)),
@@ -400,6 +407,32 @@ async fn dispatch(
             LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),
         },
     }
+}
+
+/// Serves the Prometheus metrics of the project in `dir` when `metrics.listen` is
+/// set. Nothing here fails the command: a configuration error is the command's
+/// to report, and an address that cannot be bound only warns.
+async fn serve_metrics(dir: &Path) -> Option<MetricsServer> {
+    let settings = crate::config::load(dir, EnvSource::Process).ok()?;
+    let address = settings.metrics.listen?;
+    if !address.ip().is_loopback() {
+        tracing::warn!("metrics on {address} have no authentication");
+    }
+    let metrics = Arc::new(project_metrics(dir));
+    crate::metrics::serve(address, metrics, crate::events::tap())
+        .await
+        .inspect(|server| tracing::info!("metrics at http://{}/metrics", server.address()))
+        .inspect_err(|error| tracing::warn!("cannot serve the metrics on {address}: {error}"))
+        .ok()
+}
+
+/// The metrics of the project in `dir`, from its stage history and its runs.
+fn project_metrics(dir: &Path) -> Metrics {
+    let history = crate::history::read(dir).unwrap_or_else(|error| {
+        tracing::warn!("cannot read the stage history, the metrics start from zero: {error}");
+        Vec::new()
+    });
+    Metrics::new(&history).with_runs(crate::runs::Runs::new(dir))
 }
 
 /// Runs a pipeline command on the command line.
