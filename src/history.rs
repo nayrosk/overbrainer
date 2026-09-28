@@ -90,6 +90,10 @@ pub struct Entry {
     /// What `split` wrote; only on `split` lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split: Option<SplitCounts>,
+    /// Rebuilt by `overbrainer migrate` from the data files instead of recorded
+    /// when the stage ran; only on those lines.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backfilled: bool,
 }
 
 /// When a stage execution ran.
@@ -126,6 +130,7 @@ impl Entry {
             output_tokens: stats.usage.output_tokens,
             cost: stats.cost,
             split: None,
+            backfilled: false,
         }
     }
 }
@@ -522,6 +527,23 @@ mod tests {
         assert_eq!(models["parent"].input_tokens, 20);
         assert_eq!(models["parent"].cost, Cost::Known(1.25));
         assert_eq!(models["gen"].runs, 1);
+    }
+
+    #[test]
+    fn only_backfilled_entries_carry_the_mark() -> Result<(), serde_json::Error> {
+        let normal = entry(Stage::Answers, Some(1.0));
+        let line = serde_json::to_string(&normal)?;
+        assert!(!line.contains("backfilled"), "{line}");
+        let back: Entry = serde_json::from_str(&line)?;
+        assert!(!back.backfilled);
+        let backfilled = Entry {
+            backfilled: true,
+            ..normal
+        };
+        let line = serde_json::to_string(&backfilled)?;
+        assert!(line.contains("\"backfilled\":true"), "{line}");
+        assert_eq!(serde_json::from_str::<Entry>(&line)?, backfilled);
+        Ok(())
     }
 
     #[test]

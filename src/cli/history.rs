@@ -55,8 +55,13 @@ fn entry_line(entry: &Entry) -> String {
     }
     let model = entry.model.as_deref().unwrap_or("-");
     let cost = entry.cost.map_or(Cost::Unknown, Cost::Known);
+    let note = if entry.backfilled {
+        " (backfilled)"
+    } else {
+        ""
+    };
     format!(
-        "{}  {:<9}  {:<11}  {model}  {} done, {} skipped, {} failed, {} excluded; tokens {} in, {} out; {cost}",
+        "{}  {:<9}  {:<11}  {model}  {} done, {} skipped, {} failed, {} excluded; tokens {} in, {} out; {cost}{note}",
         entry.started_at,
         entry.stage.name(),
         entry.status.name(),
@@ -67,4 +72,39 @@ fn entry_line(entry: &Entry) -> String {
         entry.input_tokens,
         entry.output_tokens,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::Stage;
+    use crate::history::Status;
+
+    #[test]
+    fn a_backfilled_entry_says_so() {
+        let mut entry = Entry {
+            stage: Stage::Answers,
+            started_at: "2026-09-27T10:00:00Z".into(),
+            ended_at: "2026-09-27T10:00:00Z".into(),
+            status: Status::Ok,
+            provider: None,
+            model: Some("parent".into()),
+            done: 3,
+            skipped: 0,
+            failed: 0,
+            excluded: 1,
+            input_tokens: 30,
+            output_tokens: 15,
+            cost: None,
+            split: None,
+            backfilled: false,
+        };
+        assert!(!entry_line(&entry).contains("backfilled"));
+        entry.backfilled = true;
+        assert!(
+            entry_line(&entry).ends_with("cost unknown (backfilled)"),
+            "{}",
+            entry_line(&entry)
+        );
+    }
 }
