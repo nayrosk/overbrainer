@@ -176,15 +176,23 @@ pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> 
 /// `OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY` gives `providers.openrouter.api_key`;
 /// `OVERBRAINER_LOG` gives `log`. Variables under [`TUI_ENV_PREFIX`] are not
 /// configuration keys ([`load_str`] skips them too) and are left out.
+///
+/// The prefix and `TUI_ENV_PREFIX` are matched case-insensitively, on a lower-cased
+/// copy of each key: this mirrors what `config::Environment` itself does inside
+/// [`load_str`] (it lower-cases every key before comparing it to its own lower-cased
+/// prefix pattern), so a variable such as `overbrainer_log` or `Overbrainer_Log`,
+/// which `load_str` accepts, is reported here too.
 #[must_use]
 pub fn env_keys(env: &EnvSource) -> BTreeSet<String> {
-    let prefix = format!("{ENV_PREFIX}_");
+    let prefix = format!("{ENV_PREFIX}_").to_lowercase();
+    let tui_prefix = TUI_ENV_PREFIX.to_lowercase();
     env_pairs(env.clone())
         .into_iter()
-        .filter(|(key, _)| !key.starts_with(TUI_ENV_PREFIX))
-        .filter_map(|(key, _)| {
+        .map(|(key, _)| key.to_lowercase())
+        .filter(|key| !key.starts_with(&tui_prefix))
+        .filter_map(|key| {
             let rest = key.strip_prefix(&prefix)?;
-            (!rest.is_empty()).then(|| rest.to_lowercase().replace("__", "."))
+            (!rest.is_empty()).then(|| rest.replace("__", "."))
         })
         .collect()
 }
@@ -391,6 +399,29 @@ mod tests {
     #[test]
     fn env_keys_skips_the_bare_prefix_with_nothing_after_it() {
         let env = vars(&[("OVERBRAINER_", "")]);
+        assert!(env_keys(&env).is_empty());
+    }
+
+    #[test]
+    fn env_keys_matches_a_lower_case_variable_name() {
+        // `config::Environment` lower-cases every key before matching its prefix, so
+        // `load_str` accepts `overbrainer_log` exactly as it accepts `OVERBRAINER_LOG`.
+        let env = vars(&[("overbrainer_log", "debug")]);
+        assert_eq!(env_keys(&env), BTreeSet::from(["log".to_string()]));
+    }
+
+    #[test]
+    fn env_keys_matches_a_mixed_case_variable_name() {
+        let env = vars(&[("Overbrainer_Providers__Openrouter__Api_Key", "sk-something")]);
+        assert_eq!(
+            env_keys(&env),
+            BTreeSet::from(["providers.openrouter.api_key".to_string()])
+        );
+    }
+
+    #[test]
+    fn env_keys_skips_a_lower_case_tui_variable_case_insensitively() {
+        let env = vars(&[("overbrainer_tui_color", "256")]);
         assert!(env_keys(&env).is_empty());
     }
 }

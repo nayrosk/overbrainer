@@ -648,3 +648,36 @@ fn env_keys_from_vars_maps_dotted_lower_case_keys() {
         ])
     );
 }
+
+#[test]
+fn env_keys_agrees_with_load_str_on_a_lower_case_variable_name()
+-> Result<(), Box<dyn std::error::Error>> {
+    // `overbrainer_log` (lower case): `load_str` applies it because `config::Environment`
+    // lower-cases every key before matching its prefix. `env_keys` must report it too.
+    let pairs = env(&[("overbrainer_log", "debug")]);
+    let settings = load_str(BASE, pairs.clone())?;
+    assert_eq!(settings.log.as_deref(), Some("debug"));
+    assert_eq!(
+        env_keys(&pairs),
+        std::collections::BTreeSet::from(["log".to_string()])
+    );
+    Ok(())
+}
+
+#[test]
+fn env_keys_agrees_with_load_str_on_a_mixed_case_nested_key()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pairs = env(&[("Overbrainer_Providers__Nanogpt__Api_Key", "sk-mixed-case")]);
+    let settings = load_str(BASE, pairs.clone())?;
+    let provider = settings
+        .providers
+        .get("nanogpt")
+        .ok_or("provider missing")?;
+    let key = provider.api_key.as_ref().ok_or("api_key missing")?;
+    assert_eq!(key.expose_secret(), "sk-mixed-case");
+    assert_eq!(
+        env_keys(&pairs),
+        std::collections::BTreeSet::from(["providers.nanogpt.api_key".to_string()])
+    );
+    Ok(())
+}
