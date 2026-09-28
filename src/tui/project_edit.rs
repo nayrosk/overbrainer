@@ -448,6 +448,17 @@ impl App {
         if self.refuse_change() || self.refuse_locked(path) {
             return;
         }
+        if picked.kind == CatalogKind::DataCenters {
+            let value = match &picked.choice {
+                Choice::Auto => Some(FieldValue::Text(ListOrAuto::AUTO.to_string())),
+                Choice::List(ids) if ids.is_empty() => None,
+                Choice::List(ids) => Some(FieldValue::List(ids.clone())),
+            };
+            if let Some(refusal) = self.volume_centers_refusal(path, value.as_ref()) {
+                self.say(Severity::Warn, refusal);
+                return;
+            }
+        }
         let ids = match picked.choice {
             Choice::Auto => {
                 let auto = FieldValue::Text(ListOrAuto::AUTO.to_string());
@@ -479,6 +490,39 @@ impl App {
         if let Err(error) = applied {
             self.say(Severity::Warn, error);
         }
+    }
+
+    /// Why `value` cannot be set on the field `path`, when it is the
+    /// `data_center_ids` of a Runpod target with a network volume: its one
+    /// data center is the volume's, so it only changes with the volume.
+    fn volume_centers_refusal(
+        &mut self,
+        path: &FieldPath,
+        value: Option<&FieldValue>,
+    ) -> Option<String> {
+        let FieldPath::Target { name, field } = path else {
+            return None;
+        };
+        if *field != "data_center_ids" {
+            return None;
+        }
+        let listing = self.project_listing();
+        shown_value(&listing, &format!("targets.{name}.network_volume_id"))
+            .filter(|volume| !volume.is_empty())?;
+        let now =
+            shown_value(&listing, &path.to_string()).map(|text| ListOrAuto::from_form_text(&text));
+        let new = match value {
+            Some(FieldValue::List(ids)) => Some(ListOrAuto::List(ids.clone())),
+            Some(FieldValue::Text(text)) => Some(ListOrAuto::from_form_text(text)),
+            _ => None,
+        };
+        let kept = matches!(&now, Some(ListOrAuto::List(ids)) if ids.len() == 1) && new == now;
+        (!kept).then(|| {
+            format!(
+                "refused: {path} is the network volume's data center; pick another \
+                 network_volume_id to change it"
+            )
+        })
     }
 
     /// Refuses a change of the field `path` while something uses it, as the
@@ -678,6 +722,9 @@ impl App {
             (true, false) => return Err("is required".to_string()),
             (false, _) => Some(kind.parse(text).map_err(|error| error.to_string())?),
         };
+        if let Some(refusal) = self.volume_centers_refusal(path, value.as_ref()) {
+            return Err(refusal);
+        }
         if let (FieldPath::Topic { index, field, .. }, Some(FieldValue::Text(new))) = (path, &value)
             && *field == "name"
         {
@@ -2151,6 +2198,72 @@ mod tests {
             shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
             "EU-RO-1"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn with_a_volume_the_data_centers_change_only_with_the_volume() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
+        let key = "targets.gpu_cloud.data_center_ids";
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1");
+        let centers = || {
+            ["EU-RO-1", "US-KS-2"]
+                .map(|id| Entry {
+                    id: id.into(),
+                    columns: vec![id.into(), String::new(), String::new(), "HIGH".into()],
+                    selectable: true,
+                    ranks: Vec::new(),
+                })
+                .to_vec()
+        };
+        let refused = "refused: targets.gpu_cloud.data_center_ids is the network volume's data \
+                       center; pick another network_volume_id to change it";
+        // Another data center, none, then auto: each refused.
+        for codes in [
+            &[KeyCode::End, KeyCode::Char(' '), KeyCode::Enter][..],
+            &[KeyCode::Char(' '), KeyCode::Enter],
+            &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
+        ] {
+            app.status = None;
+            let (id, _) = open_picker_on(&mut app, key)?;
+            listed(&mut app, id, centers(), Vec::new());
+            press(&mut app, codes);
+            assert!(!picker_open(&app), "{codes:?}");
+            assert_eq!(shown(&mut app, key)?, "EU-RO-1", "{codes:?}");
+            assert_eq!(status(&app), refused, "{codes:?}");
+        }
+        // Keeping the volume's own data center is no change.
+        app.status = None;
+        let (id, _) = open_picker_on(&mut app, key)?;
+        listed(&mut app, id, centers(), Vec::new());
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(status(&app), "");
+        // Typed instead: refused in the form.
+        open_picker_on(&mut app, key)?;
+        press(&mut app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        chars(&mut app, "US-KS-2");
+        press(&mut app, &[KeyCode::Enter]);
+        let Some(Form::Value { error, .. }) = &app.project_view.form else {
+            return Err("the form closed".into());
+        };
+        assert_eq!(error.as_deref(), Some(refused));
+        press(&mut app, &[KeyCode::Esc]);
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1");
+        // Without a volume, the data centers change again.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        press(&mut app, &[KeyCode::Home, KeyCode::Enter]);
+        let (id, _) = open_picker_on(&mut app, key)?;
+        listed(&mut app, id, centers(), Vec::new());
+        press(
+            &mut app,
+            &[KeyCode::End, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1, US-KS-2");
         Ok(())
     }
 
