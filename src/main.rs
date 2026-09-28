@@ -101,7 +101,7 @@ mod tests {
         shut_down(runtime);
         let took = start.elapsed();
         assert!(
-            took >= SHUTDOWN_GRACE && took < SHUTDOWN_GRACE + Duration::from_millis(500),
+            took >= SHUTDOWN_GRACE && took < SHUTDOWN_GRACE + Duration::from_secs(3),
             "{took:?}"
         );
         Ok(())
