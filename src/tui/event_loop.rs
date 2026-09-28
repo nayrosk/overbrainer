@@ -18,6 +18,7 @@ use rustix::fs::OFlags;
 use tokio::process::Child;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tracing::Level;
 
@@ -25,6 +26,7 @@ use super::app::{App, Effect, Exit};
 use super::tasks::{Done, Msg, Task, TaskId, Tasks, TrainJob};
 use super::terminal::Screen;
 use super::ui;
+use crate::update::Newer;
 
 /// Time between two ticks of the app's clock.
 const TICK: Duration = Duration::from_millis(250);
@@ -33,11 +35,12 @@ const FRAME: Duration = Duration::from_millis(33);
 /// How long an editor asked to end with SIGTERM gets before SIGKILL.
 const EDITOR_GRACE: Duration = Duration::from_secs(2);
 
-/// What the real terminal adds to the loop: process signals, and the screen the
-/// editor borrows.
+/// What the real terminal adds to the loop: process signals, the screen the
+/// editor borrows, and the update check running.
 pub(super) struct Real {
     signals: Signals,
     screen: Screen,
+    check: Option<JoinHandle<Option<Newer>>>,
 }
 
 /// Runs the TUI on the real terminal until the app is done.
@@ -47,12 +50,17 @@ pub(super) struct Real {
 /// Returns an error when drawing fails, the terminal cannot be read, the signals
 /// cannot be caught, the terminal cannot be handed to the editor and back, or a
 /// process signal ended the TUI.
-pub(super) async fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+pub(super) async fn run(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    check: Option<JoinHandle<Option<Newer>>>,
+) -> anyhow::Result<()> {
     let signals = Signals::new().context("cannot catch the process signals")?;
     let (events, input) = mpsc::unbounded_channel();
     let real = Real {
         signals,
         screen: Screen::start(events),
+        check,
     };
     drive(terminal, app, input, Some(real)).await
 }
@@ -81,6 +89,9 @@ where
     if let Some(real) = real {
         looping.signals = Some(real.signals);
         looping.screen = Some(real.screen);
+        if let Some(check) = real.check {
+            tokio::spawn(forward_check(check, looping.messages.clone()));
+        }
     }
     let result = looping.run(app).await;
     if let Some(mut editor) = looping.editor.take() {
@@ -142,6 +153,8 @@ struct Loop<'t, B: Backend> {
     frame_at: Option<Instant>,
     /// Effects the loop could not run before it ended, for [`Loop::settle`].
     pending: Vec<Effect>,
+    /// The logs exports still writing, which [`Loop::settle`] waits for.
+    exports: Vec<JoinHandle<()>>,
 }
 
 impl<'t, B> Loop<'t, B>
@@ -175,6 +188,7 @@ where
             last_draw: None,
             frame_at: None,
             pending: Vec::new(),
+            exports: Vec::new(),
         }
     }
 
@@ -267,13 +281,18 @@ where
     /// pod that nothing finds again, and a start is never abandoned without a
     /// signal. With the real terminal, the screen is given back first and
     /// stderr says what is waited for; a signal meanwhile acts as a first one
-    /// would. The ends still reach the app, for its exit notes.
+    /// would. The ends still reach the app, for its exit notes. A logs export
+    /// still writing is waited for first.
     async fn settle(&mut self, app: &mut App) {
         self.logged = app.logs.seq();
         // List prices are only read: nothing waits for them.
         self.tasks.abort_lookups();
         for effect in std::mem::take(&mut self.pending) {
             self.apply_late(app, effect);
+        }
+        // A file write: the exit's grace must not cut a `logs-*.log` short.
+        for export in std::mem::take(&mut self.exports) {
+            export.await.ok();
         }
         if !self.tasks.is_empty() {
             // Why the loop ended stays what it was.
@@ -522,14 +541,15 @@ where
     /// Writes `lines` to `.overbrainer/<name>`, off the UI thread and off the
     /// event loop: the write runs in its own spawned task, so `Loop::run` keeps
     /// handling events while it happens, never overwriting an existing file.
-    /// Reports the outcome as [`Msg::LogsExported`], dropped once the loop has
-    /// ended.
-    fn export_logs(&self, name: String, lines: Vec<String>) {
+    /// Reports the outcome as [`Msg::LogsExported`]. [`Loop::settle`] waits for
+    /// the write, so quitting never truncates it.
+    fn export_logs(&mut self, name: String, lines: Vec<String>) {
         let dir = self.tasks.project_dir().to_path_buf();
         let count = lines.len();
         let file_name = name.clone();
         let messages = self.messages.clone();
-        tokio::spawn(async move {
+        self.exports.retain(|export| !export.is_finished());
+        self.exports.push(tokio::spawn(async move {
             let written =
                 tokio::task::spawn_blocking(move || write_log_export(&dir, &name, &lines)).await;
             let message = match written {
@@ -537,7 +557,7 @@ where
                 Err(error) => Msg::LogsExported(Err(format!("export task panicked: {error}"))),
             };
             messages.send(message).ok();
-        });
+        }));
     }
 
     /// Hands the terminal to the editor: stops reading input, drops the keys
@@ -609,6 +629,18 @@ async fn watch_browser(mut child: Child, url: String, messages: UnboundedSender<
     };
     tracing::debug!("the browser opener on {url} failed: {why}");
     messages.send(Msg::BrowserFailed(url)).ok();
+}
+
+/// Sends the answer of the update `check` to `messages` as
+/// [`Msg::NewerRelease`], when there is a newer release.
+async fn forward_check(check: JoinHandle<Option<Newer>>, messages: UnboundedSender<Msg>) {
+    match check.await {
+        Ok(Some(newer)) => {
+            messages.send(Msg::NewerRelease(newer.latest)).ok();
+        },
+        Ok(None) => {},
+        Err(error) => tracing::debug!("update check: {error}"),
+    }
 }
 
 /// The program that opens a URL in the user's browser: `open` on macOS,
@@ -779,6 +811,26 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn only_a_newer_release_reaches_the_app() {
+        let (messages, mut received) = mpsc::unbounded_channel();
+        let newer = crate::update::Newer {
+            latest: "0.9.0".into(),
+            current: "0.4.0",
+        };
+        let found = tokio::spawn(async move { Some(newer) });
+        forward_check(found, messages.clone()).await;
+        let nothing = tokio::spawn(async { None });
+        forward_check(nothing, messages).await;
+        let mut versions = Vec::new();
+        while let Some(message) = received.recv().await {
+            if let Msg::NewerRelease(version) = message {
+                versions.push(version);
+            }
+        }
+        assert_eq!(versions, ["0.9.0"]);
+    }
+
     #[test]
     fn an_export_to_a_file_that_exists_says_which() -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
@@ -807,6 +859,53 @@ mod tests {
         let result = write_log_export(project.path(), "logs-x.log", &lines);
         let error = result.err().ok_or("expected an error")?;
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_logs_export_ends_before_the_loop_returns() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let project = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut app = app();
+        app.project.dir = project.path().to_path_buf();
+        app.logs.push(crate::logging::LogLine {
+            seq: 0,
+            level: Level::WARN,
+            target: "overbrainer".into(),
+            time: SystemTime::UNIX_EPOCH,
+            message: "kept".into(),
+        });
+        let (events, input) = mpsc::unbounded_channel();
+        for code in ['4', 'x', 'q'] {
+            events.send(Ok(key(KeyCode::Char(code))))?;
+        }
+        tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await??;
+        let exports: Vec<_> = std::fs::read_dir(project.path().join(".overbrainer"))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("logs-"))
+            .map(|entry| std::fs::read_to_string(entry.path()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert!(exports[0].contains("kept"), "{exports:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settling_waits_for_a_running_export() -> Result<(), Box<dyn std::error::Error>> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut app = app();
+        let (_events, input) = mpsc::unbounded_channel();
+        let mut looping = Loop::new(&mut terminal, input, &app.project.dir);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        looping.exports.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        tokio::time::timeout(LIMIT, looping.settle(&mut app)).await?;
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(looping.exports.is_empty());
         Ok(())
     }
 

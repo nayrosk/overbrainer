@@ -423,7 +423,10 @@ impl App {
                 self.training.wanted = Some(run_id);
                 return self.refresh_runs();
             },
-            Msg::EditorExited(_) | Msg::BrowserFailed(_) | Msg::LogsExported(_) => {},
+            Msg::EditorExited(_)
+            | Msg::BrowserFailed(_)
+            | Msg::LogsExported(_)
+            | Msg::NewerRelease(_) => {},
         }
         Vec::new()
     }

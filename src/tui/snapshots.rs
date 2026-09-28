@@ -627,6 +627,15 @@ fn dataset_stats_pane() -> TestResult {
     Ok(())
 }
 
+/// A newer release: its marker follows the version in the footer.
+#[test]
+fn dataset_with_a_newer_release() -> TestResult {
+    let mut app = dataset_app();
+    app.newer = Some("0.9.0".into());
+    snapshot_at("dataset_newer_120x40", &mut app, 120, 40)?;
+    Ok(())
+}
+
 #[test]
 fn dataset_with_a_filter() -> TestResult {
     let mut app = dataset_app();

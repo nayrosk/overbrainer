@@ -13,16 +13,23 @@ mod runpod_train;
 mod skill;
 pub(crate) mod train;
 
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use clap::{Args, Parser, Subcommand, ValueHint};
 use clap_complete::engine::ArgValueCandidates;
 use secrecy::SecretString;
 use tokio::sync::OnceCell;
+use tokio::task::JoinHandle;
 
 use self::front::Frontend;
 use crate::logging::{LOG_LINES, LogBuffer, LogMode};
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
+use crate::update::{self, CheckEnv, Newer};
+
+/// How long a command that ended waits for the update check still running.
+const CHECK_GRACE: Duration = Duration::from_millis(500);
 
 /// The `overbrainer` command line interface.
 #[derive(Debug, Parser)]
@@ -256,13 +263,67 @@ pub enum ConfigCommand {
 }
 
 /// Runs the parsed command line, whose logs were set up with `logs` (see
-/// [`Command::log_mode`]).
+/// [`Command::log_mode`]). Meanwhile it looks for a newer release, told on
+/// stderr once the command ended, even with an error (`tui` shows it itself).
 ///
 /// # Errors
 ///
 /// Returns an error if the selected subcommand fails, or if `tui` is not given the
 /// [`LogMode::Tui`] its logs need.
 pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
+    let stderr = std::io::stderr().is_terminal();
+    let stdout = std::io::stdout().is_terminal();
+    // `skill` never checks: it does not even read the environment.
+    let env = (!matches!(cli.command, Command::Skill { .. })).then(CheckEnv::from_process);
+    let mut check = env
+        .filter(|env| should_check(&cli.command, stderr, stdout, env))
+        .map(|env| {
+            tokio::spawn(async move {
+                update::check(&env, update::CRATES_IO_URL, SystemTime::now()).await
+            })
+        });
+    let result = dispatch(cli, logs, &mut check).await;
+    // `tui` took the check, and shows its answer itself.
+    if let Some(check) = check
+        && let Some(newer) = settle(check).await
+    {
+        eprintln!("{newer}");
+    }
+    result
+}
+
+/// Whether to look for a newer release beside `command`: not when turned off,
+/// not for `skill`, and not when stderr, where the notice goes, is not a
+/// terminal, except for `tui`, which shows it on its own screen, and so needs
+/// stdout a terminal instead (it refuses to start otherwise).
+fn should_check(
+    command: &Command,
+    stderr_is_terminal: bool,
+    stdout_is_terminal: bool,
+    env: &CheckEnv,
+) -> bool {
+    !env.disabled
+        && match command {
+            Command::Skill { .. } => false,
+            Command::Tui => stdout_is_terminal,
+            _ => stderr_is_terminal,
+        }
+}
+
+/// The answer of `check`, waiting for it at most [`CHECK_GRACE`]; a check
+/// still running then is dropped.
+async fn settle(mut check: JoinHandle<Option<Newer>>) -> Option<Newer> {
+    let answer = tokio::time::timeout(CHECK_GRACE, &mut check).await;
+    check.abort();
+    answer.ok()?.ok()?
+}
+
+/// Runs `cli`'s command; `tui` takes `check` to show its answer.
+async fn dispatch(
+    cli: Cli,
+    logs: LogMode,
+    check: &mut Option<JoinHandle<Option<Newer>>>,
+) -> anyhow::Result<()> {
     let dir = &cli.project_dir;
     // Only a project takes the lock: without `overbrainer.toml` the command fails
     // with its usual error and leaves nothing behind.
@@ -298,7 +359,7 @@ pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
         Command::Pod { command } => pod::run(dir, &command).await,
         Command::Skill { command } => skill::run(dir, &command),
         Command::Tui => match logs {
-            LogMode::Tui(buffer) => crate::tui::run(dir, buffer).await,
+            LogMode::Tui(buffer) => crate::tui::run(dir, buffer, check.take()).await,
             LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),
         },
     }
@@ -349,6 +410,59 @@ fn vault() -> Result<Option<VaultSource>, SecretError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command(args: &[&str]) -> Result<Command, clap::Error> {
+        let cli = Cli::try_parse_from(std::iter::once("overbrainer").chain(args.iter().copied()))?;
+        Ok(cli.command)
+    }
+
+    #[test]
+    fn the_update_check_runs_on_a_terminal_unless_turned_off() -> Result<(), clap::Error> {
+        let on = CheckEnv::default();
+        let off = CheckEnv {
+            disabled: true,
+            cache_dir: None,
+        };
+        // (args, stderr a terminal, stdout a terminal, env, expected)
+        for (args, stderr, stdout, env, expected) in [
+            (&["run"][..], true, true, &on, true),
+            (&["history"], true, false, &on, true),
+            (&["run"], false, true, &on, false),
+            (&["run"], true, true, &off, false),
+            (&["skill", "install"], true, true, &on, false),
+            (&["tui"], true, true, &on, true),
+            (&["tui"], false, true, &on, true),
+            (&["tui"], true, false, &on, false),
+            (&["tui"], true, true, &off, false),
+        ] {
+            assert_eq!(
+                should_check(&command(args)?, stderr, stdout, env),
+                expected,
+                "{args:?}, stderr a terminal: {stderr}, stdout: {stdout}, disabled: {}",
+                env.disabled
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_notice_waits_at_most_the_grace_period() {
+        let check = tokio::spawn(std::future::pending::<Option<Newer>>());
+        let start = tokio::time::Instant::now();
+        assert_eq!(settle(check).await, None);
+        assert_eq!(start.elapsed(), CHECK_GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_check_gives_its_answer() {
+        let newer = Newer {
+            latest: "9.0.0".into(),
+            current: "0.4.0",
+        };
+        let answer = newer.clone();
+        let check = tokio::spawn(async move { Some(answer) });
+        assert_eq!(settle(check).await, Some(newer));
+    }
 
     #[test]
     fn only_commands_that_write_take_the_lock() -> Result<(), clap::Error> {

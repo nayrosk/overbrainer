@@ -156,6 +156,8 @@ pub(super) enum Msg {
     /// The Logs export ended: the file name and how many lines were written, or
     /// why it could not be written.
     LogsExported(Result<(String, usize), String>),
+    /// crates.io has this release, newer than the one running.
+    NewerRelease(String),
     /// An event of a task's bus.
     Event(TaskId, Event),
     /// A task's forwarder fell behind and skipped this many events.
@@ -685,7 +687,10 @@ mod tests {
             Msg::Event(id, event) => Some(Msg::Event(*id, event.clone())),
             Msg::Lagged(id, skipped) => Some(Msg::Lagged(*id, *skipped)),
             Msg::Report(id, report) => Some(Msg::Report(*id, report.clone())),
-            Msg::EditorExited(_) | Msg::BrowserFailed(_) | Msg::LogsExported(_) => None,
+            Msg::EditorExited(_)
+            | Msg::BrowserFailed(_)
+            | Msg::LogsExported(_)
+            | Msg::NewerRelease(_) => None,
         }
     }
 
