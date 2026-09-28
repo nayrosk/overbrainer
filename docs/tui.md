@@ -2,7 +2,7 @@
 
 ![A tour of overbrainer tui: the dataset tree and an answer's reasoning, the topic stats, a filter, the help, a training run's loss chart, the logs and a dialog](assets/tui-tour.gif)
 
-`overbrainer tui` shows the project in five views, switched with `1` to `5` (or Tab, Shift-Tab): the project's configuration and stats, the dataset, the pipeline stages, the training runs, and the logs. It opens on the Project view. It runs the same stages and training flows as the commands. It needs a terminal (it refuses to start when stdout is not one) and is laid out for at least 80x24 characters. While the TUI runs, logs go to its Logs view instead of stderr; `OVERBRAINER_LOG` still sets what is captured.
+`overbrainer tui` shows the project in five views, switched with `1` to `5` (or Tab, Shift-Tab): the project's configuration and stats, the dataset, the pipeline stages, the training runs, and the logs. It opens on the Project view; in a directory without `overbrainer.toml`, it opens the [init wizard](#the-init-wizard) first. It runs the same stages and training flows as the commands, and [auto mode](#auto-mode) runs them all in a row. It needs a terminal (it refuses to start when stdout is not one) and is laid out for at least 80x24 characters. While the TUI runs, logs go to its Logs view instead of stderr; `OVERBRAINER_LOG` still sets what is captured.
 
 ## Keys
 
@@ -15,7 +15,8 @@ Everywhere:
 | `q`, Ctrl-C | Quit. |
 | `R` | Reload the data files and the runs list from disk. |
 | `g` | Open the overbrainer repository in a browser. |
-| `r` | Run a pipeline stage, or `run` (asks which). |
+| `r` | Run auto mode, a pipeline stage, or `run` (asks which). |
+| `A`, in Project and Pipeline | Auto mode: every stage, then training (asks first). |
 | `y`, then `n`, Esc or Enter | In a dialog: confirm, or cancel (the default, `n`). |
 
 Project:
@@ -43,6 +44,12 @@ Runpod catalog picker (opened from the Project view, or with `g`/`c` before a ru
 | Enter | Keep what is toggled (GPU types, data centers), or pick the entry under the cursor (network volume, image). |
 | `t` | Type the value instead of picking it. Not offered from the start confirmation's `g`/`c` pickers. |
 | Esc | Cancel: nothing changes. |
+
+Pipeline:
+
+| Keys | Action |
+|---|---|
+| `c`, while auto mode runs a stage | Cancel that stage and the rest of the chain (asks first). |
 
 Dataset:
 
@@ -103,7 +110,7 @@ The topics, their subtopics and questions as a tree, with a detail pane for the 
 
 ### Pipeline (`3`)
 
-`r` opens a menu of the stages and `run`, always on every topic and without `--force` (both stay command-line options). The view shows each stage's progress, requests in flight, items being retried, failures, tokens and cost, and the summary lines the command would print. The cost updates live as the running stage's items finish, before the stage itself reports its total. `run` stops after `split` here: training starts only with `t`.
+`r` opens a menu of `auto`, the stages and `run`, always on every topic and without `--force` (both stay command-line options). The view shows each stage's progress, requests in flight, items being retried, failures, tokens and cost, and the summary lines the command would print. The cost updates live as the running stage's items finish, before the stage itself reports its total. `run` stops after `split` here: training starts only with `t`, or with auto mode, whose chain shows under the stages (see [auto mode](#auto-mode)).
 
 ### Training (`4`)
 
@@ -121,9 +128,33 @@ The captured log lines, newest at the bottom. Scrolling back with `k`/`j`, the a
 
 ## The footer and dialogs
 
-The footer lists the keys of what the keys act on (the view, the filter or a form being typed, a dialog or the help), dropping the last ones when the row is full. A new message replaces them for ten seconds, marked `✓` or `✗`: `✓ config reloaded` when `overbrainer.toml` or `.env` changed on disk and was applied, `✗ overbrainer.toml: <problem>` or `✗ cannot parse .env (syntax error at line N)` when the change is invalid and the previous settings stay (see [reloading](configuration.md#reloading-while-overbrainer-runs)). On the right, the footer shows the work running, each with a spinner, `locked` while the data lock holds (see below), the project's cost so far, the version, then `? help`. The cost is `$` with two decimals, a trailing `+` when part of it is unknown, and it is left out while nothing has been spent. It includes the estimated spend of the Runpod pods, so it can differ from `overbrainer history`, which counts the stages only. When a newer overbrainer release is available, `↑ X.Y.Z` follows the version, naming that release. The cost, the version and that marker are left out while a dialog, the help overlay or the `r` menu is open, so the hints have the room. While `e`, `d`, `r` and `t` are refused (see below), they are drawn crossed out and `locked` joins the work.
+The footer lists the keys of what the keys act on (the view, the filter or a form being typed, a dialog or the help), dropping the last ones when the row is full. A new message replaces them for ten seconds, marked `✓` or `✗`: `✓ config reloaded` when `overbrainer.toml` or `.env` changed on disk and was applied, `✗ overbrainer.toml: <problem>` or `✗ cannot parse .env (syntax error at line N)` when the change is invalid and the previous settings stay (see [reloading](configuration.md#reloading-while-overbrainer-runs)). On the right, the footer shows the work running, each with a spinner, `locked` while the data lock holds (see below), the project's cost so far, the version, then `? help`. The cost is `$` with two decimals, a trailing `+` when part of it is unknown, and it is left out while nothing has been spent. It includes the estimated spend of the Runpod pods, so it can differ from `overbrainer history`, which counts the stages only. When a newer overbrainer release is available, `↑ X.Y.Z` follows the version, naming that release. The cost, the version and that marker are left out while a dialog, the help overlay or the `r` menu is open, so the hints have the room. While `e`, `d`, `r`, `A` and `t` are refused (see below), they are drawn crossed out and `locked` joins the work.
 
 A dialog highlights its default answer, `n`. `y` confirms; `n`, Esc and Enter cancel. A `y` that deletes, cancels or abandons something, drops the pending changes, or quits while a stage runs (its requests in flight are lost), is drawn as an error. The view under a dialog, the help or a menu goes dim.
+
+## The init wizard
+
+`overbrainer tui` in a directory without `overbrainer.toml` asks what the project needs, one screen at a time, then writes it:
+
+1. The project name (the directory's name until changed).
+2. The provider: OpenRouter, NanoGPT, OpenAI or Anthropic fill in the protocol and the base URL; `custom` asks for a name (`^[a-z0-9_]+$`), the protocol and the base URL.
+3. Its API key: typed (shown as `•`, never shown again), a `vault:<mount>/<path>#<field>` reference, or empty to fill `.env` later.
+4. The models: the generator, the parent (with reasoning on or off) and an optional embedder, as the provider names them.
+5. The topics: `a` adds one (name, description, subtopics, questions per subtopic), `e` edits the selected one, `d` deletes it. At least one is needed.
+6. Training: `skip` (auto mode then stops after split), `local` (native or docker), `ssh` (the host, native or docker) or `runpod` (its API key, and `auto` or a list of GPU types); then the base model and the adapter.
+7. A summary, then Enter writes the files.
+
+Enter or Tab goes to the next screen, Shift-Tab or Esc to the one before, every value kept; ↑ and ↓ move between the fields of a screen, ← and → change a choice, and a paste goes to the field being typed. A screen refuses Next while a required field is empty or invalid, and says why under the field. Ctrl-C asks, then quits without writing anything.
+
+The wizard writes `overbrainer.toml` (the template `overbrainer init` writes, with the answers set and its comments kept, validated before anything is written), `.env` with the `OVERBRAINER_*` variables the choices need (the base URL, the keys, the SSH host; a key left empty is an empty line to fill), created readable by you only (mode 600), `.env.example` with the same variables and no secret, the prompt templates in `prompts/`, and the entries `.gitignore` lacks. Like `init`, it never overwrites a file: when one of them exists, the summary names it and nothing is written. The last screen asks "Start auto now?": yes opens the TUI on auto mode's confirmation, no on the Project view. `overbrainer init` stays non-interactive.
+
+## Auto mode
+
+`A` in the Project or Pipeline view, or `auto` at the top of the `r` menu, runs every stage, then training. One confirmation comes first: the stages that will run, then what `t` would show (the target, the model and, for Runpod, each GPU type's list price and the most `max_hours` can cost). Without `[training]`, it says the chain stops after split.
+
+The chain runs subtopics, questions, answers and split, each once the one before ended without failed items, then starts a run on `training.target` as `t` does, switches to the Training view and follows it. The Pipeline view shows the chain under the stages, for example `auto  subtopics ✓ → questions ● → answers → split → train`. At the end, the status line says where the model is: `✓ auto done: runs/<run-id>/output`, and the merged model in `runs/<run-id>/output/merged` with `merge = true`.
+
+A failure stops the chain at its stage, with the error; running auto mode again resumes it, since the stages skip what is done. `c` in the Pipeline view, while the chain runs a stage, cancels that stage and the rest of the chain after a confirmation. Once training has started, the run is a run like any other: `c` in the Training view cancels it as it does today.
 
 ## Editing and deleting
 
@@ -139,7 +170,7 @@ A deleted subtopic or question is recorded in `data/rejected.jsonl`, so the stag
 
 ## The data lock
 
-While a stage, an edit or a training start runs in the TUI, and once it is quitting, `e`, `d`, `r` and `t` are refused. `overbrainer tui` also holds the project's [lock](pipeline.md#project-state) for as long as it runs, so no other overbrainer command can write to the same project at the same time. An edit checks that what it changes is still on disk as shown, and refuses otherwise.
+While a stage, an edit or a training start runs in the TUI, and once it is quitting, `e`, `d`, `r`, `A` and `t` are refused. `overbrainer tui` also holds the project's [lock](pipeline.md#project-state) for as long as it runs, so no other overbrainer command can write to the same project at the same time. An edit checks that what it changes is still on disk as shown, and refuses otherwise.
 
 ## Quitting
 

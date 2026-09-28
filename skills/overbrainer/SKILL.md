@@ -17,7 +17,7 @@ Follow these on every task. They protect the user's secrets and money.
 - Ask before any command that calls a paid API: `overbrainer subtopics`, `overbrainer questions`, `overbrainer answers`, `overbrainer run`, and `overbrainer train` on a Runpod target, which is billed per second. Say roughly how much work it is first: `answers` sends one request per question, and a topic yields up to `subtopics` times `questions_per_subtopic` questions.
 - Never pass `--force` without the user's explicit consent. It throws away a stage's output and pays for it again.
 - After any Runpod run, run `overbrainer pod ls` and report any pod left running. Use `overbrainer pod rm RUN_ID --force` or `overbrainer train --keep-pod` only when the user asks.
-- Do not start `overbrainer tui`: it is interactive and needs a terminal you do not have. Suggest it to the user for browsing the dataset.
+- Do not start `overbrainer tui`: it is interactive and needs a terminal you do not have. Suggest it to the user for browsing the dataset, or, in a directory without `overbrainer.toml`, for its init wizard, which asks for everything a project needs and writes `.env` itself.
 - Before training on a parent's outputs, remind the user that several providers (OpenAI and Anthropic among them) forbid using their outputs to train competing models, even through OpenRouter or NanoGPT.
 - Before `overbrainer answers` or `overbrainer run`, read `roles.parent` in `overbrainer.toml`, then read the protocol from `[providers.NAME]` where NAME is `roles.parent.provider`. If `roles.parent` has `reasoning = true` and that protocol is `anthropic`, or the parent is a Claude, Gemini or OpenAI model other than `gpt-oss` on the `openai` protocol, stop and ask the user: such a parent never returns raw reasoning, so every answer would be paid for and then excluded from training.
 - Stages and training can run for hours. Run them in the background with the output in a log file, as in "Follow long commands" below.
@@ -28,7 +28,7 @@ Follow these on every task. They protect the user's secrets and money.
 overbrainer init my-project && cd my-project
 ```
 
-`init` writes `overbrainer.toml`, `.env.example`, the prompt templates in `prompts/` and a `.gitignore`. It refuses to overwrite existing files.
+`init` writes `overbrainer.toml`, `.env.example`, the prompt templates in `prompts/` and a `.gitignore`. It refuses to overwrite existing files. It never asks anything: use it, not `overbrainer tui`, whose wizard is interactive.
 
 The user copies `.env.example` to `.env` and fills in the provider URLs and keys. Do not do it for them, and do not read the result. `overbrainer.toml` never holds URLs, hosts or secrets, so you may read and edit it:
 
@@ -101,7 +101,7 @@ Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.3
 | `overbrainer pod volumes` | List the account's network volumes. |
 | `overbrainer pod templates` | List the account's pod templates. |
 
-The job runs detached. Ctrl-C, a closed terminal or a lost connection only stop following it; the training goes on. `train` then exits non-zero and prints the `overbrainer train attach RUN_ID` command to use. That does not mean the run failed. A run ends as `succeeded`, `failed` or `cancelled`. Its files are in `runs/RUN_ID/`: `job.log` (the job's output, read it when a run fails), `metrics.jsonl`, and `output/` with the LoRA adapter (or the full model, and `output/merged/` with `merge = true`).
+The job runs detached. Ctrl-C, a closed terminal or a lost connection only stop following it; the training goes on. `train` then exits non-zero and prints the `overbrainer train attach RUN_ID` command to use. That does not mean the run failed. A run ends as `succeeded`, `failed` or `cancelled`. Its files are in `runs/RUN_ID/`: `job.log` (the job's output, read it when a run fails), `metrics.jsonl`, and `output/` with the LoRA adapter (or the full model, and `output/merged/` with `merge = true`). After a run that succeeded, `train` and `run` print these paths on lines such as `train: adapter in runs/RUN_ID/output`.
 
 Once `train` has stopped following a run, only `overbrainer train attach RUN_ID` retrieves its results. On Runpod, the watchdog deletes the pod `retrieve_grace_minutes` (60 by default) after the job ends if its results were not retrieved, and the results are lost with it. Attach well before that.
 
