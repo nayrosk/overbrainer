@@ -17,7 +17,7 @@ Every change goes issue, branch, pull request. Nobody pushes to `main` directly,
 
    Branch names follow [Conventional Branch](https://conventional-branch.github.io): `feature/`, `bugfix/`, `hotfix/` or `chore/`, then lowercase words joined by hyphens. Starting with the issue number is recommended. CI rejects other names.
 3. **Pull request.** Open it against `main` with the template. The description must close the issue (`Closes #42`), and the title must be a Conventional Commit because it becomes the commit subject on `main`.
-4. **Review.** CI, CodeQL and CodeRabbit run on the pull request. Every check must pass and every review conversation must be resolved before merging.
+4. **Review.** CI, CodeQL and CodeRabbit run on the pull request; CodeRabbit skips a documentation pull request (title starting with `docs:` or `docs(`). Every check must pass and every review conversation must be resolved before merging.
 5. **Merge.** Pull requests are squash merged, which closes the issue and deletes the branch.
 
 Dependabot pull requests and release pull requests (`chore/release-vX.Y.Z`) do not need an issue.
