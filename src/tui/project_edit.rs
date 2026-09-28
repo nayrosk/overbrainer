@@ -3,16 +3,12 @@
 //! stay in a pending document until `s` validates and writes it.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{self, Read as _};
-use std::os::unix::fs::PermissionsExt as _;
+use std::io;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
 use crossterm::event::KeyCode;
-use rustix::fs::{Mode, OFlags};
-use rustix::io::Errno;
 
 use super::app::{Action, App, Confirm, Effect, Overlay, PAGE, Project, Severity};
 use super::project::{Addable, Form, Listing, Locks, Pending, ProjectConfig, Shown};
@@ -53,7 +49,8 @@ pub(super) enum SaveRefusal {
 
 /// Validates `text` with the variables of `env`, then writes it to
 /// `overbrainer.toml` in `dir` atomically, unless the file no longer holds
-/// `base`, the text it was read from. Returns the configuration written.
+/// `base`, the text it was read from, up to the rename
+/// ([`super::project_save`]). Returns the configuration written.
 ///
 /// # Errors
 ///
@@ -71,36 +68,7 @@ pub(super) fn save_config(
         ConfigError::Parse(problem) => SaveRefusal::Invalid(vec![problem]),
         ConfigError::Read { .. } => SaveRefusal::Failed(error.to_string()),
     })?;
-    let path = dir.join(CONFIG_FILE);
-    let cannot_read =
-        |error: io::Error| SaveRefusal::Failed(format!("cannot read {}: {error}", path.display()));
-    // One handle, never through a link: a rename would replace the link, not
-    // the file it points to. NONBLOCK keeps a FIFO from hanging the open.
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let mut file = match rustix::fs::open(&path, flags, Mode::empty()) {
-        Ok(fd) => File::from(fd),
-        Err(Errno::LOOP) => {
-            return Err(SaveRefusal::Failed(format!(
-                "{CONFIG_FILE} is a symlink; nothing written, edit it with E"
-            )));
-        },
-        Err(errno) => return Err(cannot_read(errno.into())),
-    };
-    let metadata = file.metadata().map_err(cannot_read)?;
-    if !metadata.is_file() {
-        return Err(cannot_read(io::Error::other("not a regular file")));
-    }
-    let mode = metadata.permissions().mode();
-    let mut on_disk = String::new();
-    file.read_to_string(&mut on_disk).map_err(cannot_read)?;
-    drop(file);
-    if on_disk != base {
-        return Err(SaveRefusal::Failed(format!(
-            "{CONFIG_FILE} changed on disk since it was read; drop the changes (u), then E"
-        )));
-    }
-    crate::runs::write_atomic_synced(dir, CONFIG_FILE, text.as_bytes(), mode)
-        .map_err(|error| SaveRefusal::Failed(error.to_string()))?;
+    super::project_save::stage(dir, text, base)?.commit()?;
     Ok(config)
 }
 
@@ -1571,7 +1539,7 @@ mod tests {
         rustix::fs::mkfifoat(
             rustix::fs::CWD,
             dir.path().join(CONFIG_FILE),
-            Mode::from_raw_mode(0o600),
+            rustix::fs::Mode::from_raw_mode(0o600),
         )?;
         let (sender, receiver) = std::sync::mpsc::channel();
         let path = dir.path().to_path_buf();

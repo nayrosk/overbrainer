@@ -15,6 +15,7 @@ mod motion;
 mod pipeline;
 mod project;
 mod project_edit;
+mod project_save;
 #[cfg(test)]
 mod snapshots;
 mod start;
