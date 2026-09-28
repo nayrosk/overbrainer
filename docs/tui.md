@@ -103,7 +103,7 @@ The captured log lines, newest at the bottom. Scrolling back with `k`/`j`, the a
 
 The footer lists the keys of what the keys act on (the view, the filter or a form being typed, a dialog or the help), dropping the last ones when the row is full. A new message replaces them for ten seconds, marked `✓` or `✗`. On the right, the footer shows the work running, each with a spinner, `locked` while the data lock holds (see below), the project's cost so far, the version, then `? help`. The cost is `$` with two decimals, a trailing `+` when part of it is unknown, and it is left out while nothing has been spent. It includes the estimated spend of the Runpod pods, so it can differ from `overbrainer history`, which counts the stages only. When a newer overbrainer release is available, `↑ X.Y.Z` follows the version, naming that release. The cost, the version and that marker are left out while a dialog, the help overlay or the `r` menu is open, so the hints have the room. While `e`, `d`, `r` and `t` are refused (see below), they are drawn crossed out and `locked` joins the work.
 
-A dialog highlights its default answer, `n`. `y` confirms; `n`, Esc and Enter cancel. A `y` that deletes, cancels or abandons something, or quits while a stage runs (its requests in flight are lost), is drawn as an error. The view under a dialog, the help or a menu goes dim.
+A dialog highlights its default answer, `n`. `y` confirms; `n`, Esc and Enter cancel. A `y` that deletes, cancels or abandons something, drops the pending changes, or quits while a stage runs (its requests in flight are lost), is drawn as an error. The view under a dialog, the help or a menu goes dim.
 
 ## Editing and deleting
 
@@ -132,7 +132,7 @@ While a stage, an edit or a training start runs in the TUI, and once it is quitt
 - a save of `overbrainer.toml` in progress is waited for;
 - pending changes to `overbrainer.toml` not yet saved are dropped; the file stays as it is.
 
-While the help overlay is open, `q` (like Esc or `?`) closes it instead of quitting, and a filter being typed takes `q` as a character. Ctrl-C quits the same way `q` does, but from any of those contexts too, closing or leaving them first. After the TUI exits, it prints what it left running, with the commands to follow it again.
+While the help overlay is open, `q` (like Esc or `?`) closes it instead of quitting, and a filter or a Project form being typed takes `q` as a character. Ctrl-C quits the same way `q` does, but from any of those contexts too, closing or leaving them first. After the TUI exits, it prints what it left running, with the commands to follow it again.
 
 A SIGTERM or SIGHUP from outside ends the TUI without asking, as Ctrl-C does on the command line. So does SIGINT, except while `$EDITOR` holds the terminal: then it is ignored until the TUI takes the terminal back, since it would come from a Ctrl-C typed in the editor. An editor still running when the TUI ends is sent SIGTERM, then SIGKILL two seconds later if it has not exited.
 
