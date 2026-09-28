@@ -2,10 +2,11 @@
 
 Distill a large "parent" LLM into a smaller open-weights "child" model, from the command line.
 
+[![Latest release](https://img.shields.io/github/v/release/nayrosk/overbrainer?sort=semver)](https://github.com/nayrosk/overbrainer/releases)
 [![crates.io](https://img.shields.io/crates/v/overbrainer.svg)](https://crates.io/crates/overbrainer)
 [![CI](https://github.com/nayrosk/overbrainer/actions/workflows/ci.yml/badge.svg)](https://github.com/nayrosk/overbrainer/actions/workflows/ci.yml)
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/nayrosk/overbrainer?utm_source=oss&utm_medium=github&utm_campaign=nayrosk%2Foverbrainer&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Latest release](https://img.shields.io/github/v/release/nayrosk/overbrainer?sort=semver)](https://github.com/nayrosk/overbrainer/releases)
 
 ![overbrainer tui: the dataset tree with an answer's reasoning, the topic stats, the help, a training run's loss chart and a dialog](docs/assets/tui-tour.gif)
 
