@@ -12,6 +12,7 @@ use ratatui::widgets::{Cell, Padding, Paragraph, Row as TableRow, Table, TableSt
 use super::form::{Input, InputOutcome};
 use super::{centered, overlay};
 use crate::config::ListOrAuto;
+use crate::runpod::printable;
 use crate::tui::app::PAGE;
 use crate::tui::theme::Theme;
 
@@ -171,12 +172,18 @@ impl Picker {
         self.typed
     }
 
-    /// Shows the entries read, or why they cannot be. A chosen ID no entry
-    /// has gets an entry of its own, so it stays in view and can be taken out.
-    /// The cursor goes to the first chosen row.
+    /// Shows the entries read, or why they cannot be; their cells, from the
+    /// Runpod API, are made [`printable`]. A chosen ID no entry has gets an
+    /// entry of its own, so it stays in view and can be taken out. The cursor
+    /// goes to the first chosen row.
     pub(in crate::tui) fn loaded(&mut self, entries: Result<Vec<Entry>, String>) {
         let mut entries = match entries {
-            Ok(entries) => entries,
+            Ok(mut entries) => {
+                for cell in entries.iter_mut().flat_map(|entry| &mut entry.columns) {
+                    *cell = printable(cell);
+                }
+                entries
+            },
             Err(error) => {
                 self.load = Load::Failed(error);
                 return;
@@ -890,5 +897,27 @@ mod tests {
         );
         keys(&mut picker, &[KeyCode::Char(' ')]);
         assert_eq!(picker.choice(), list(&["a"]));
+    }
+
+    #[test]
+    fn entries_are_drawn_without_control_characters() -> Result<(), Box<dyn std::error::Error>> {
+        let mut picker = Picker::new(spec(Mode::Single, false), list(&[]));
+        picker.loaded(Ok(vec![Entry {
+            id: "odd".into(),
+            columns: vec!["odd\u{1b}[2J\nname".into(), "48".into()],
+            selectable: true,
+        }]));
+        assert_eq!(
+            picker.entry("odd").map(|entry| entry.columns.clone()),
+            Some(vec!["oddname".to_string(), "48".to_string()])
+        );
+        let theme = Theme::mono();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))?;
+        terminal.draw(|frame| {
+            render(frame, frame.area(), &picker, &theme, "*");
+        })?;
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("oddname"), "{screen}");
+        Ok(())
     }
 }

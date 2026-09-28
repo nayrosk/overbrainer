@@ -121,6 +121,49 @@ pub fn gpu_table(gpus: &[GpuType], data_center: Option<&str>) -> Vec<String> {
     )
 }
 
+/// `text`, from the Runpod API, without what could move the cursor or change
+/// the terminal's state: ANSI escape sequences (CSI, OSC and two-character
+/// ones) and every other control character (C0, DEL, C1) are dropped.
+#[must_use]
+pub fn printable(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => skip_csi(&mut chars),
+                Some(']') => skip_osc(&mut chars),
+                _ => {},
+            },
+            '\u{9b}' => skip_csi(&mut chars),
+            '\u{9d}' => skip_osc(&mut chars),
+            c if c.is_control() => {},
+            c => kept.push(c),
+        }
+    }
+    kept
+}
+
+/// Skips a CSI sequence's parameters and intermediates, then its final byte.
+fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars.next_if(|c| matches!(c, ' '..='?')).is_some() {}
+    chars.next_if(|c| matches!(c, '@'..='~'));
+}
+
+/// Skips an OSC sequence up to its terminator: BEL, ST or `ESC \`.
+fn skip_osc(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{7}' | '\u{9c}' => return,
+            '\u{1b}' => {
+                chars.next_if_eq(&'\\');
+                return;
+            },
+            _ => {},
+        }
+    }
+}
+
 /// Whether a [`columns`] column is aligned to the left or the right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Align {
@@ -130,10 +173,14 @@ enum Align {
 
 /// `header` and `rows` laid out in columns two spaces apart, each as wide as
 /// its longest value, `align` giving each column's side; the last column is
-/// never padded.
+/// never padded. Each cell is [`printable`].
 fn columns(header: &[&str], align: &[Align], rows: &[Vec<String>]) -> Vec<String> {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| printable(cell)).collect())
+        .collect();
     let mut widths: Vec<usize> = header.iter().map(|title| title.chars().count()).collect();
-    for row in rows {
+    for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
         }
@@ -1050,6 +1097,55 @@ mod tests {
         let lines = template_table(&[template("t1", LONG), template("t2", "z")]);
         for line in &lines[1..] {
             assert_eq!(at(line, "img/"), at(&lines[0], "IMAGE"), "{lines:#?}");
+        }
+    }
+
+    #[test]
+    fn printable_strips_control_characters_and_escape_sequences() {
+        assert_eq!(printable("A40\u{1b}[2J\nname"), "A40name");
+        assert_eq!(
+            printable("a\u{1b}]0;title\u{7}b\u{1b}]8;;x\u{1b}\\c"),
+            "abc"
+        );
+        assert_eq!(printable("a\u{1b}Mb\u{7f}c\u{9b}31md\te"), "abcde");
+        assert_eq!(
+            printable("RTX 4090 é"),
+            "RTX 4090 é",
+            "printable text stays"
+        );
+    }
+
+    #[test]
+    fn every_table_prints_api_strings_without_control_characters() {
+        let odd = "odd\u{1b}[2J\nname";
+        let mut named = center("EU-RO-1", Vec::new());
+        named.name = odd.to_string();
+        let volume = NetworkVolume {
+            id: "v1".to_string(),
+            name: odd.to_string(),
+            size: 50,
+            data_center: "EU-RO-1".to_string(),
+        };
+        let template = Template {
+            id: "t1".to_string(),
+            name: odd.to_string(),
+            image: "img\u{1b}[31m:1".to_string(),
+            serverless: false,
+        };
+        let tables = [
+            gpu_table(&[gpu(odd, 48, Some(0.4))], None),
+            data_center_table(&[named]),
+            volume_table(&[volume]),
+            template_table(&[template]),
+        ];
+        for lines in tables {
+            let text = lines.join("\n");
+            assert!(text.contains("oddname"), "{text:?}");
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(
+                !text.chars().any(|c| c.is_control() && c != '\n'),
+                "{text:?}"
+            );
         }
     }
 }
