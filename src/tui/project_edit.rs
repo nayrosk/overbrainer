@@ -2018,6 +2018,7 @@ mod tests {
             id: id.into(),
             columns: vec![id.into(), String::new(), String::new(), "1 GPU type".into()],
             selectable: true,
+            ranks: Vec::new(),
         };
         listed(
             &mut app,

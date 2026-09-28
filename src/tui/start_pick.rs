@@ -336,6 +336,7 @@ mod tests {
             id: id.into(),
             columns: vec![id.into(), String::new(), String::new(), "HIGH".into()],
             selectable: true,
+            ranks: Vec::new(),
         }
     }
 
