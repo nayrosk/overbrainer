@@ -1,6 +1,8 @@
+use std::io::{BufRead as _, BufReader};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use wiremock::matchers::{method, path};
@@ -59,17 +61,35 @@ fn overbrainer(dir: &Path, base_url: &str) -> Command {
     cmd
 }
 
-/// A port free a moment ago.
-fn free_port() -> std::io::Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+/// Reads the lines of `stderr` as they come, on a thread of their own.
+fn lines(stderr: impl std::io::Read + Send + 'static) -> mpsc::Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
 }
 
-async fn wait(child: std::process::Child) -> Result<Output, Box<dyn std::error::Error>> {
-    Ok(tokio::time::timeout(
-        Duration::from_secs(20),
-        tokio::task::spawn_blocking(move || child.wait_with_output()),
-    )
-    .await???)
+/// The address of the `metrics at http://ADDRESS/metrics` line.
+fn served_at(lines: &mpsc::Receiver<String>) -> Result<String, String> {
+    let mut seen = Vec::new();
+    loop {
+        let line = lines
+            .recv_timeout(Duration::from_secs(20))
+            .map_err(|_| format!("no metrics address in {seen:?}"))?;
+        let address = line
+            .split_once("metrics at http://")
+            .and_then(|(_, rest)| rest.split_once("/metrics"))
+            .map(|(address, _)| address.to_string());
+        seen.push(line);
+        if let Some(address) = address {
+            return Ok(address);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -80,11 +100,14 @@ async fn a_locked_command_serves_its_metrics_while_it_runs() -> TestResult {
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
         .mount(&server)
         .await;
-    let port = free_port()?;
-    let dir = project(Some(&format!("127.0.0.1:{port}")))?;
+    // Port 0: the system picks a free one, which the log names.
+    let dir = project(Some("127.0.0.1:0"))?;
     let mut child = overbrainer(dir.path(), &format!("{}/v1", server.uri()))
         .arg("subtopics")
         .spawn()?;
+    let stderr = child.stderr.take().ok_or("no stderr")?;
+    let lines = lines(stderr);
+    let logged = served_at(&lines);
     // Wait for the stage to send its request: it runs now.
     let limit = Instant::now() + Duration::from_secs(20);
     while server
@@ -99,15 +122,22 @@ async fn a_locked_command_serves_its_metrics_while_it_runs() -> TestResult {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let url = format!("http://127.0.0.1:{port}/metrics");
-    let scraped = reqwest::get(&url).await;
+    let scraped = match &logged {
+        Ok(address) => Some(reqwest::get(format!("http://{address}/metrics")).await),
+        Err(_) => None,
+    };
     let status = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
         .status()?;
     assert!(status.success());
-    let output = wait(child).await?;
-    let stderr = String::from_utf8(output.stderr)?;
-    let text = scraped?.text().await?;
+    let status = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || child.wait()),
+    )
+    .await???;
+    assert!(!status.success(), "an interrupted stage fails");
+    let address = logged?;
+    let text = scraped.ok_or("never scraped")??.text().await?;
     for sample in [
         r#"overbrainer_stage_running{stage="subtopics"} 1"#,
         r#"overbrainer_tokens_total{stage="answers",model="parent",direction="in"} 400"#,
@@ -117,12 +147,12 @@ async fn a_locked_command_serves_its_metrics_while_it_runs() -> TestResult {
         assert!(text.lines().any(|line| line == sample), "{sample}:\n{text}");
     }
     assert!(!text.contains("sk-metrics-test"), "{text}");
-    assert!(
-        stderr.contains(&format!("metrics at http://127.0.0.1:{port}/metrics")),
-        "{stderr}"
-    );
     // The command ended: nothing serves anymore.
-    assert!(reqwest::get(&url).await.is_err());
+    assert!(
+        reqwest::get(format!("http://{address}/metrics"))
+            .await
+            .is_err()
+    );
     Ok(())
 }
 
