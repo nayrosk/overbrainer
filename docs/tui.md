@@ -23,12 +23,25 @@ Project:
 | Keys | Action |
 |---|---|
 | `k` `j`, PgUp, PgDn, Home, End | Select a field, by page, the first or the last. |
-| Enter | Edit the field; toggles a bool, cycles a choice. |
+| Enter | Edit the field; toggles a bool, cycles a choice, opens the catalog picker on a Runpod target's `gpu_types`, `data_center_ids`, `network_volume_id` or `image`. |
+| `t`, in a Runpod picker | Type the value instead of picking it. |
 | `a` | Add a topic, a provider or a target. |
 | `d` | Delete the selected topic, provider or target (asks first). |
 | `s` | Save to `overbrainer.toml`, validated first. |
 | `u` | Drop the pending changes (asks first). |
 | `E` | Open `overbrainer.toml` in `$EDITOR`. |
+
+Runpod catalog picker (opened from the Project view, or with `g`/`c` before a run starts, see below):
+
+| Keys | Action |
+|---|---|
+| `k` `j`, Up, Down, PgUp, PgDn, Home, End | Move. |
+| Space | Toggle the entry under the cursor (GPU types, data centers: several may be chosen, in the order toggled). |
+| `J` `K` | Move the toggled entry under the cursor later or earlier in that order. |
+| `/` | Filter the entries. Enter keeps the filter, Esc clears it. |
+| Enter | Keep what is toggled (GPU types, data centers), or pick the entry under the cursor (network volume, image). |
+| `t` | Type the value instead of picking it. Not offered from the start confirmation's `g`/`c` pickers. |
+| Esc | Cancel: nothing changes. |
 
 Dataset:
 
@@ -54,6 +67,7 @@ Training:
 | `a` | Attach: follow the selected run again. |
 | `c` | Cancel the selected run's job (asks first). On a Runpod run still starting, abandon it instead (asks first). |
 | `t` | Start a training run (asks first). |
+| `g` `c`, in the start confirmation for a Runpod target | Choose the GPU types or the data centers from the catalog instead of what `overbrainer.toml` has; the choice is saved to `overbrainer.toml` when the run starts. |
 
 Logs:
 
@@ -71,6 +85,8 @@ Logs:
 The left pane lists the effective configuration section by section: `project`, each topic, each provider, the roles, `pipeline`, `training`, each target, then the env-only `runpod` and `other` tables. A value comes from `overbrainer.toml`, else from the environment, else from its default, shown dim; a field with no value shows `unset`. A value the environment sets is marked `(env)` and is read-only here: change it in `.env` instead (a field only the environment can ever set, such as a provider's `base_url`, is read-only the same way). A secret never shows its value, only `set`, `unset` or `vault ref` for a `vault:` reference.
 
 `k`/`j`, PgUp/PgDn, Home/End move the selection. Enter opens the field for editing: a bool toggles at once, a choice cycles through its values (and to unset, when the field may be left out), and anything else opens a one-line form under the list, shown with what it accepts and any error from the last Enter. A number is checked when the form is submitted with Enter, not as it is typed. `a` asks what to add, a topic, a provider or a target, then its name (must match `^[a-z0-9_]+$` and be new) and, for a provider or a target, its protocol or kind. `d` deletes the selected topic, provider or target after a confirmation; it is refused while something uses it. Changes are kept in memory as pending changes, marked `*` on their field, and are kept when switching views.
+
+On a Runpod target, Enter on `gpu_types` or `data_center_ids` instead opens a picker reading the Runpod catalog live, its top row `auto` (cheapest GPU types in stock, or the data centers with a chosen GPU type in stock); Space toggles an entry, `J`/`K` move it in the chosen order, and Enter keeps the choice, `auto` included. Enter on `network_volume_id` opens a picker of the account's network volumes, its top row `none` (unsets it); picking a volume also sets `data_center_ids` to the volume's own data center. Enter on `image` opens a picker of the account's pod templates, its top row `default` (unsets `image`, so the pinned Axolotl image applies); a template with no image cannot be picked. In any of these pickers, `t` types the value instead, and Esc cancels without changing anything. Selecting `gpu_count` or `max_hours` reads the GPU catalog in the background and adds a hint: the most GPUs a pod can have with the chosen types (or on Runpod's Secure Cloud with `auto`), and the most a run can cost at `max_hours`. Picking or typing a list of GPU types for `gpu_types` (instead of `auto`) also unsets `min_vram_gb` and `max_price_per_hour`, since those narrow `gpu_types = "auto"` only, and the status line says so.
 
 `s` validates the pending changes against the whole configuration before writing anything: on error, nothing is written, and each problem is shown on the field it names (the first one is selected). On success, the file is written atomically, keeping its permissions and its comments; the save is refused if the file changed on disk since it was read (drop the changes with `u`, then use `E`) or if it is a symlink. `u` drops the pending changes after a confirmation; the file is left as it is. `E` opens `overbrainer.toml` whole in `$EDITOR`, for what the form does not cover, such as `training.axolotl_extra`: it is refused with pending changes not yet saved or dropped, while a stage or an edit runs, or while a training run is starting or being followed (since it would change the training table).
 
@@ -90,7 +106,8 @@ The topics, their subtopics and questions as a tree, with a detail pane for the 
 
 The runs of `runs/`, and for the selected one its progress, ETA, pod and estimated spend, a loss chart and sparklines of the learning rate and gradient norm.
 
-- `t` starts a run on `training.target` after a confirmation that shows the target, the model and the data. For Runpod it also shows each GPU type with its catalog list price times `gpu_count`, and the most `max_hours` can cost at the highest listed rate, marked "(some prices unknown)" when a price could not be read. `--target` and `--keep-pod` stay command-line options.
+- `t` starts a run on `training.target` after a confirmation that shows the target, the model and the data. For Runpod it also shows each GPU type with its catalog list price times `gpu_count`, VRAM and stock, and the most `max_hours` can cost at the highest listed rate, marked "(some prices unknown)" when a price could not be read; with `gpu_types = "auto"` or `data_center_ids = "auto"`, the catalog read shows what `auto` would pick right now instead. `--target` and `--keep-pod` stay command-line options.
+- `g` and `c` in that confirmation open the catalog picker (no `t`: only picking, never typing) to choose the GPU types or the data centers the run will use instead of what `overbrainer.toml` has; the dialog shows again once the picker closes, with what changed on a line of its own. `y` then saves that choice to `overbrainer.toml` first (validated and written atomically, like `s` in the Project view) and only starts the run once the save succeeds; a refused save (validation, the file changed on disk, a lock) starts nothing, and the confirmation stays. `g` and `c` are themselves refused while there are pending Project view changes not yet saved or dropped (they are never saved along), while `overbrainer.toml` is being saved, or on a field the environment sets or a running task locks.
 - A start holds the data lock until its job begins and is never interrupted before then. Quitting while a Runpod run is still provisioning offers to abandon it instead of waiting.
 - `a` follows a run again, and `c` cancels its job after a confirmation. A Runpod run still starting has no job to cancel yet, so `c` offers to abandon that run instead, and the TUI stays open. If its pod is still being prepared, the pod is deleted and the run fails. Once its job is being sent, the run is detached, and `c` then cancels it.
 - Leaving the view does not stop following a run: while the TUI is open, its results are still retrieved and its pod deleted on time.
