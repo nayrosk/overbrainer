@@ -474,6 +474,18 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_price_is_unknown_neither_first_nor_under_a_limit() {
+        let gpus = [gpu("free", 24, Some(0.0)), gpu("paid", 24, Some(0.5))];
+        let sorted = select_gpus(&gpus, &GpuFilter::default());
+        assert_eq!(ids(&sorted), vec!["paid", "free"]);
+        let capped = GpuFilter {
+            max_price: Some(1.0),
+            ..GpuFilter::default()
+        };
+        assert_eq!(ids(&select_gpus(&gpus, &capped)), vec!["paid"]);
+    }
+
+    #[test]
     fn vram_and_price_limits_filter() {
         let gpus = [
             gpu("small", 16, Some(0.2)),

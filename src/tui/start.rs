@@ -233,13 +233,6 @@ async fn lookup_gpus(dir: &Path, env: EnvSource, gpu_count: u32, limit: Duration
     }
 }
 
-/// The usable Secure Cloud list price of one `gpu`: none when it is not a
-/// positive number.
-fn list_price(gpu: &GpuType) -> Option<f64> {
-    gpu.secure_price()
-        .filter(|price| price.is_finite() && *price > 0.0)
-}
-
 /// Stock of `gpu` for the run: its best in `centers`, or overall when they
 /// are any.
 fn stock(gpu: &GpuType, centers: &[String]) -> Availability {
@@ -371,7 +364,7 @@ fn gpu_line(id: &str, count: u32, centers: &[String], gpus: Option<&Gpus>) -> St
         Some(Ok(listed)) => match listed.iter().find(|gpu| gpu.id == id) {
             None => "not in the catalog".to_string(),
             Some(gpu) => {
-                let price = list_price(gpu).map_or_else(
+                let price = gpu.secure_price().map_or_else(
                     || "price unknown".to_string(),
                     |rate| format!("${:.2}/h", rate * f64::from(count)),
                 );
@@ -424,7 +417,7 @@ fn max_hours_line(spec: &RunpodTarget, gpus: Option<&[GpuType]>, ids: &[String])
         .iter()
         .map(|id| {
             gpus.and_then(|listed| listed.iter().find(|gpu| gpu.id == *id))
-                .and_then(list_price)
+                .and_then(GpuType::secure_price)
         })
         .collect();
     let highest = rates.iter().flatten().copied().reduce(f64::max);

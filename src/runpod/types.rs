@@ -306,10 +306,13 @@ pub struct GpuType {
 }
 
 impl GpuType {
-    /// The Secure Cloud list price of one GPU, in USD per hour.
+    /// The Secure Cloud list price of one GPU, in USD per hour; none when it
+    /// is not a positive number, which Runpod sends for a type it does not price.
     #[must_use]
     pub fn secure_price(&self) -> Option<f64> {
-        self.price.secure
+        self.price
+            .secure
+            .filter(|price| price.is_finite() && *price > 0.0)
     }
 
     /// Whether Secure Cloud offers it (true unless Runpod says otherwise).
