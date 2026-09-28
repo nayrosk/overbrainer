@@ -23,7 +23,7 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::registry::Registry;
+use prometheus_client::registry::{Metric, Registry};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -121,83 +121,81 @@ impl Metrics {
     /// The metrics, with the items, tokens and cost of `history` already counted.
     #[must_use]
     pub fn new(history: &[Entry]) -> Self {
-        let metrics = Self {
-            registry: Registry::default(),
-            items: Family::default(),
-            tokens: Family::default(),
-            cost: Family::default(),
-            running: Family::default(),
-            retries: Family::default(),
-            train_step: Family::default(),
-            train_loss: Family::default(),
-            eval_loss: Family::default(),
-            learning_rate: Family::default(),
-            spend: Family::default(),
-            runs: None,
-            buses: Mutex::default(),
-        };
         let mut registry = Registry::default();
-        registry.register(
+        let items = register(
+            &mut registry,
             "overbrainer_stage_items",
             "Items of the pipeline stages, by result",
-            metrics.items.clone(),
         );
-        registry.register(
+        let tokens = register(
+            &mut registry,
             "overbrainer_tokens",
             "Tokens sent (in) and received (out) by the pipeline stages",
-            metrics.tokens.clone(),
         );
-        registry.register(
+        let cost = register(
+            &mut registry,
             "overbrainer_cost_usd",
             "Cost of the pipeline stages in USD, when the model price is known",
-            metrics.cost.clone(),
         );
-        registry.register(
+        let running = register(
+            &mut registry,
             "overbrainer_stage_running",
             "Pipeline stages running now",
-            metrics.running.clone(),
         );
-        registry.register(
+        let retries = register(
+            &mut registry,
             "overbrainer_item_retries",
             "Failed attempts retried, since this process started",
-            metrics.retries.clone(),
         );
-        registry.register(
+        let train_step = register(
+            &mut registry,
             "overbrainer_train_step",
             "Last optimizer step of a training run",
-            metrics.train_step.clone(),
         );
-        registry.register(
+        let train_loss = register(
+            &mut registry,
             "overbrainer_train_loss",
             "Last training loss of a run",
-            metrics.train_loss.clone(),
         );
-        registry.register(
+        let eval_loss = register(
+            &mut registry,
             "overbrainer_eval_loss",
             "Last evaluation loss of a run",
-            metrics.eval_loss.clone(),
         );
-        registry.register(
+        let learning_rate = register(
+            &mut registry,
             "overbrainer_learning_rate",
             "Last learning rate of a run",
-            metrics.learning_rate.clone(),
         );
-        registry.register(
+        let spend = register(
+            &mut registry,
             "overbrainer_runpod_spend_usd",
             "Estimated Runpod spend of a run in USD: rate times uptime",
-            metrics.spend.clone(),
         );
-        let build = Family::<VersionLabels, Gauge>::default();
+        let build: Family<VersionLabels, Gauge> = register(
+            &mut registry,
+            "overbrainer_build_info",
+            "Version of overbrainer",
+        );
         build
             .get_or_create(&VersionLabels {
                 version: env!("CARGO_PKG_VERSION"),
             })
             .set(1);
-        registry.register("overbrainer_build_info", "Version of overbrainer", build);
-        // The families are shared: the registry holds clones of the same series.
         let metrics = Self {
             registry,
-            ..metrics
+            items,
+            tokens,
+            cost,
+            running,
+            retries,
+            train_step,
+            train_loss,
+            eval_loss,
+            learning_rate,
+            spend,
+            runs: None,
+            buses: Mutex::default(),
         };
         // Every stage shows, running or not.
         for stage in [
@@ -385,6 +383,14 @@ impl Observer for Metrics {
             self.stage_running(stage).dec();
         }
     }
+}
+
+/// A new metric, registered in `registry` as `name`: the registry keeps a clone,
+/// which shares its series.
+fn register<M: Metric + Clone + Default>(registry: &mut Registry, name: &str, help: &str) -> M {
+    let metric = M::default();
+    registry.register(name, help, metric.clone());
+    metric
 }
 
 /// The Runpod spend at `now` of each run of `runs` with a pod record. A record
