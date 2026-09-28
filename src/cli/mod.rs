@@ -6,6 +6,7 @@ pub(crate) mod data;
 pub(crate) mod front;
 mod history;
 pub(crate) mod init;
+pub(crate) mod migrate;
 pub(crate) mod pod;
 mod progress;
 mod record;
@@ -107,6 +108,13 @@ pub enum Command {
     },
     /// Show what the pipeline stages did and spent, from .overbrainer/history.jsonl.
     History(HistoryArgs),
+    /// Bring a project from an older overbrainer up to this one's format.
+    ///
+    /// Adds /.overbrainer/ to .gitignore, rebuilds the answers history from
+    /// data/answers.jsonl (tokens per model, cost unknown) unless the history
+    /// already has answers, and writes .overbrainer/version. Running it again
+    /// changes nothing.
+    Migrate(MigrateArgs),
     /// Find and remove the Runpod pods overbrainer created.
     Pod {
         /// The pod subcommand to run.
@@ -145,6 +153,7 @@ impl Command {
             | Self::Answers(_)
             | Self::Split(_)
             | Self::Run
+            | Self::Migrate(_)
             | Self::Train(_) => true,
             Self::Pod { command } => matches!(command, PodCommand::Rm { .. }),
             Self::Init { .. }
@@ -267,6 +276,14 @@ pub struct HistoryArgs {
     /// List every execution, oldest first, instead of the totals per stage.
     #[arg(long)]
     pub all: bool,
+}
+
+/// Options of `overbrainer migrate`.
+#[derive(Debug, Default, Args)]
+pub struct MigrateArgs {
+    /// Print what would change, and change nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Options shared by the pipeline stage commands.
@@ -458,6 +475,7 @@ async fn dispatch(
             command: RunsCommand::Ls,
         } => train::list(dir),
         Command::History(args) => history::run(dir, &args),
+        Command::Migrate(args) => migrate::run(dir, args.dry_run),
         Command::Pod { command } => pod::run(dir, &command).await,
         Command::Skill { command } => skill::run(dir, &command),
         Command::Tui => match logs {
@@ -653,6 +671,8 @@ mod tests {
             &["train", "attach", "x"],
             &["train", "cancel", "x"],
             &["pod", "rm", "x"],
+            &["migrate"],
+            &["migrate", "--dry-run"],
         ] {
             assert!(writes(args)?, "{args:?} should lock");
         }

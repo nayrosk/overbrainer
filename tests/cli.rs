@@ -25,6 +25,7 @@ fn init_creates_project_files_and_refuses_to_overwrite() -> Result<(), Box<dyn s
         "prompts/subtopics.txt",
         "prompts/questions.txt",
         "prompts/answer_system.txt",
+        ".overbrainer/version",
     ] {
         assert!(dir.path().join(file).is_file(), "{file} missing");
     }

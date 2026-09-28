@@ -162,6 +162,36 @@ pub(crate) fn remove_state_file(project_dir: &Path, name: &str) -> io::Result<()
         .map_err(|e| unsafe_or_io_error(&dir_path.join(name), e))
 }
 
+/// Replaces `name` in `project_dir`'s state directory (`.overbrainer`, created
+/// when needed) with `content`, atomically: written to `<name>.tmp` first, then
+/// renamed over `name`. Never through a symbolic link.
+///
+/// # Errors
+///
+/// An [`io::Error`] when the state directory or the temporary file is not a
+/// safe path (see [`open_state_file`]), or when writing or renaming fails.
+pub(crate) fn replace_state_file(project_dir: &Path, name: &str, content: &[u8]) -> io::Result<()> {
+    let tmp = format!("{name}.tmp");
+    let mut file = open_state_file(
+        project_dir,
+        &tmp,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+        true,
+    )?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    let project = rustix::fs::open(
+        project_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let dir_path = project_dir.join(STATE_DIR);
+    let state = open_state_dir(&project).map_err(|e| unsafe_or_io_error(&dir_path, e))?;
+    // A rename replaces a symbolic link at `name` itself, never its target.
+    rustix::fs::renameat(&state, tmp.as_str(), &state, name)?;
+    Ok(())
+}
+
 /// Converts an [`io::Error`] from [`open_state_file`] into a [`LockError`] for
 /// the project lock: the exact unsafe path when the error names one,
 /// `fallback` otherwise.
@@ -425,6 +455,32 @@ mod tests {
             error.to_string(),
             "another overbrainer (pid 42) is using this project"
         );
+    }
+
+    #[test]
+    fn replace_state_file_replaces_the_file_and_leaves_no_temporary() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        replace_state_file(dir.path(), "version", b"1\n")?;
+        replace_state_file(dir.path(), "version", b"2\n")?;
+        let state = dir.path().join(STATE_DIR);
+        assert_eq!(std::fs::read_to_string(state.join("version"))?, "2\n");
+        assert!(!state.join("version.tmp").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn replace_state_file_replaces_a_symlink_without_writing_its_target() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        let target = elsewhere.path().join("precious");
+        std::fs::write(&target, "keep me")?;
+        std::fs::create_dir(dir.path().join(STATE_DIR))?;
+        let file = dir.path().join(STATE_DIR).join("version");
+        std::os::unix::fs::symlink(&target, &file)?;
+        replace_state_file(dir.path(), "version", b"1\n")?;
+        assert_eq!(std::fs::read_to_string(&target)?, "keep me");
+        assert!(!std::fs::symlink_metadata(&file)?.file_type().is_symlink());
+        Ok(())
     }
 
     #[test]

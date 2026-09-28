@@ -41,7 +41,8 @@ pub(crate) const GITIGNORE: &str = ".gitignore";
 const GITIGNORE_TEMPLATE: &str = include_str!("../../templates/gitignore");
 
 /// Writes the example project files into `dir`: `overbrainer.toml`, `.env.example`,
-/// the default prompt templates in `prompts/`, and `.gitignore`.
+/// the default prompt templates in `prompts/`, `.gitignore`, and
+/// `.overbrainer/version`, so the new project is never taken for an old one.
 ///
 /// None of these files is ever overwritten: if one exists, nothing is written. An
 /// existing `.gitignore` gets only the entries it lacks.
@@ -64,7 +65,13 @@ pub fn run(dir: &Path) -> anyhow::Result<()> {
     for (name, content) in &files {
         create_new(&dir.join(name), content)?;
     }
-    update_gitignore(&dir.join(GITIGNORE))
+    update_gitignore(&dir.join(GITIGNORE))?;
+    crate::project_format::write(dir).with_context(|| {
+        format!(
+            "cannot write the project format into {}",
+            dir.join(crate::project_lock::STATE_DIR).display()
+        )
+    })
 }
 
 /// Creates `path` with `content`, failing if it exists, even if it appeared after
@@ -127,14 +134,24 @@ fn kept_or_removed(path: &Path, written: std::io::Result<()>) -> anyhow::Result<
 ///
 /// Returns an error when the file cannot be read, created or written.
 pub(crate) fn update_gitignore(path: &Path) -> anyhow::Result<()> {
+    add_gitignore_entries(path, GITIGNORE_TEMPLATE)
+}
+
+/// Creates `.gitignore` at `path` with `entries`, or appends the entries
+/// (non-empty lines) that an existing file lacks. Never rewrites the file.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read, created or appended to.
+pub(crate) fn add_gitignore_entries(path: &Path, entries: &str) -> anyhow::Result<()> {
     let existing = match std::fs::read_to_string(path) {
         Ok(existing) => existing,
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            return create_new(path, GITIGNORE_TEMPLATE);
+            return create_new(path, entries);
         },
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
     };
-    let missing = missing_entries(&existing, GITIGNORE_TEMPLATE);
+    let missing = missing_entries(&existing, entries);
     if missing.is_empty() {
         return Ok(());
     }
@@ -154,6 +171,20 @@ pub(crate) fn update_gitignore(path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("cannot write {}", path.display()))?;
     tracing::info!("added {} to {}", missing.join(", "), path.display());
     Ok(())
+}
+
+/// The entries (non-empty lines) of `entries` that `.gitignore` at `path`
+/// lacks: all of them when it does not exist.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read.
+pub(super) fn gitignore_lacks<'a>(path: &Path, entries: &'a str) -> anyhow::Result<Vec<&'a str>> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) => Ok(missing_entries(&existing, entries)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(missing_entries("", entries)),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
 }
 
 /// Template entries (non-empty lines) not already present as a line of `existing`.

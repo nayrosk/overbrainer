@@ -577,6 +577,7 @@ mod tests {
             output_tokens: 40,
             cost,
             split: None,
+            backfilled: false,
         }
     }
 
