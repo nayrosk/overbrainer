@@ -181,10 +181,10 @@ impl FieldKind {
                 _ => return Err(FieldError::NotBool),
             },
             Self::Choice(_) => FieldValue::Text(text.trim().to_string()),
-            Self::ListOrAuto if text.trim() == ListOrAuto::AUTO => {
-                FieldValue::Text(ListOrAuto::AUTO.to_string())
+            Self::ListOrAuto => match ListOrAuto::from_form_text(text) {
+                ListOrAuto::Auto => FieldValue::Text(ListOrAuto::AUTO.to_string()),
+                ListOrAuto::List(items) => FieldValue::List(items),
             },
-            Self::ListOrAuto => list(text),
         };
         self.check(&value)?;
         Ok(value)
@@ -239,17 +239,6 @@ impl FieldKind {
             Self::ListOrAuto => "auto or a comma-separated list".to_string(),
         }
     }
-}
-
-/// Comma-separated `text` as a list, without empty items.
-fn list(text: &str) -> FieldValue {
-    FieldValue::List(
-        text.split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect(),
-    )
 }
 
 /// A float range in words: `in [0, 2]`, `in (0, 1)`, `greater than 0`.
@@ -966,6 +955,12 @@ max_hours = 6
             ]))
         );
         assert_eq!(kind.parse(""), Ok(FieldValue::List(Vec::new())));
+        // The TUI hints read the same text through the same parser.
+        assert_eq!(
+            ListOrAuto::from_form_text("A40,, H100 ,"),
+            ListOrAuto::List(vec!["A40".to_string(), "H100".to_string()])
+        );
+        assert_eq!(ListOrAuto::from_form_text(" auto "), ListOrAuto::Auto);
         assert_eq!(
             kind.check(&FieldValue::Text("A40".to_string()))
                 .map_err(|error| error.to_string()),

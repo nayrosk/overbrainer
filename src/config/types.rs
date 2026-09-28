@@ -492,6 +492,22 @@ impl ListOrAuto {
     pub fn is_any(&self) -> bool {
         *self == Self::default()
     }
+
+    /// `text` as a form holds it: `auto`, or items comma-separated. Unlike
+    /// deserialization, empty items are dropped.
+    #[must_use]
+    pub fn from_form_text(text: &str) -> Self {
+        if text.trim() == Self::AUTO {
+            return Self::Auto;
+        }
+        Self::List(
+            text.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
+    }
 }
 
 impl Default for ListOrAuto {

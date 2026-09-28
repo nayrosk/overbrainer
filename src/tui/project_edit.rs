@@ -12,7 +12,7 @@ use crossterm::event::KeyCode;
 
 use super::app::{Action, App, Confirm, Effect, Origin, Overlay, PAGE, Picked, Project, Severity};
 use super::catalog::{
-    CatalogKind, DEFAULT_IMAGE, NO_VOLUME, Query, Sizing, cost_hint, gpu_count_hint, parse_list,
+    CatalogKind, DEFAULT_IMAGE, NO_VOLUME, Query, Sizing, cost_hint, gpu_count_hint,
     volume_data_center,
 };
 use super::follow::NOT_STARTED;
@@ -424,14 +424,18 @@ impl App {
         sizing: &Sizing,
     ) -> Vec<Effect> {
         let preselected = match kind {
-            CatalogKind::Gpus | CatalogKind::DataCenters => Choice::from(&parse_list(shown)),
+            CatalogKind::Gpus | CatalogKind::DataCenters => {
+                Choice::from(&ListOrAuto::from_form_text(shown))
+            },
             // Unset: the `none` or `default` entry is the one chosen.
             CatalogKind::Volumes | CatalogKind::Templates => Choice::List(vec![shown.to_string()]),
         };
         let query = Query {
             kind,
             gpu_count: sizing.gpu_count,
-            gpu_types: parse_list(&sizing.gpu_types).list().to_vec(),
+            gpu_types: ListOrAuto::from_form_text(&sizing.gpu_types)
+                .list()
+                .to_vec(),
         };
         self.open_picker(query, preselected, Origin::Field(path))
     }

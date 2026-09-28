@@ -310,23 +310,8 @@ pub(super) struct Sizing {
 impl Sizing {
     /// `gpu_types` as a list, or `auto`.
     fn gpu_types(&self) -> ListOrAuto {
-        parse_list(&self.gpu_types)
+        ListOrAuto::from_form_text(&self.gpu_types)
     }
-}
-
-/// `text` as the Project view shows a list-or-auto field: `auto`, or items
-/// comma-separated.
-pub(super) fn parse_list(text: &str) -> ListOrAuto {
-    if text.trim() == ListOrAuto::AUTO {
-        return ListOrAuto::Auto;
-    }
-    ListOrAuto::List(
-        text.split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect(),
-    )
 }
 
 /// The chosen GPU types `gpus` lists; none when one is not listed, since the
