@@ -5,7 +5,7 @@ A project has two sources of configuration:
 - `overbrainer.toml` describes the project: topics, providers (by protocol), model roles, pipeline and training settings, training targets. It never contains URLs, hosts or secrets, so it is safe to commit.
 - Environment variables carry everything else. `overbrainer init` writes a commented `.env.example` to start from.
 
-`overbrainer config check` prints the resolved configuration with secrets masked. `overbrainer config check --resolve` also resolves every secret, which tests Vault access. Every command takes `-C DIR` to run on the project in `DIR` instead of the current directory.
+`overbrainer config check` prints the resolved configuration with secrets masked. `overbrainer config check --resolve` also resolves every secret, which tests Vault access. Every command takes `-C DIR` to run on the project in `DIR` instead of the current directory. The [TUI](tui.md)'s Project view edits `overbrainer.toml` field by field and keeps its comments when it saves.
 
 ## Environment variables
 

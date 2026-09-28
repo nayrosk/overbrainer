@@ -15,14 +15,17 @@ use super::editor::{self, Session, Target};
 use super::follow::REFRESH;
 use super::motion::{Motion, MotionLevel};
 use super::pipeline::{PipelineView, STAGES, command_name};
+use super::project::{ProjectConfig, ProjectView};
+use super::project_edit::{Removal, SaveRefusal, editor_failure};
 use super::start::StartPlan;
-use super::tasks::{Done, Edit, Msg, Saved, Task, TaskId};
+use super::tasks::{Done, Edit, History, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
 use super::training::TrainingView;
 use super::views::logs::{export_line, level_name};
+use super::widgets::form::{Input, InputOutcome};
 use crate::cli::data::Command;
 use crate::cli::front::Report;
-use crate::config::Settings;
+use crate::config::{EnvSource, Settings};
 use crate::dataset::{AnswerText, Counts, Dataset, Deletion, Id};
 use crate::logging::LogBuffer;
 
@@ -105,9 +108,11 @@ pub(super) enum Effect {
     },
 }
 
-/// The four views, switched with `1` to `4`.
+/// The five views, switched with `1` to `5`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum View {
+    /// The configuration and the project's stats.
+    Project,
     /// The dataset tree, its details and stats.
     Dataset,
     /// The pipeline stages.
@@ -120,11 +125,18 @@ pub(super) enum View {
 
 impl View {
     /// Every view, in tab order.
-    pub(super) const ALL: [Self; 4] = [Self::Dataset, Self::Pipeline, Self::Training, Self::Logs];
+    pub(super) const ALL: [Self; 5] = [
+        Self::Project,
+        Self::Dataset,
+        Self::Pipeline,
+        Self::Training,
+        Self::Logs,
+    ];
 
     /// The tab title.
     pub(super) fn title(self) -> &'static str {
         match self {
+            Self::Project => "Project",
             Self::Dataset => "Dataset",
             Self::Pipeline => "Pipeline",
             Self::Training => "Training",
@@ -135,10 +147,11 @@ impl View {
     /// Position in [`View::ALL`].
     pub(super) fn index(self) -> usize {
         match self {
-            Self::Dataset => 0,
-            Self::Pipeline => 1,
-            Self::Training => 2,
-            Self::Logs => 3,
+            Self::Project => 0,
+            Self::Dataset => 1,
+            Self::Pipeline => 2,
+            Self::Training => 3,
+            Self::Logs => 4,
         }
     }
 
@@ -224,6 +237,10 @@ pub(super) enum Action {
     Abandon(Vec<TaskId>),
     /// Abandoning the Runpod start `0` still provisioning, asked for with `c`.
     AbandonStart(TaskId),
+    /// Taking a topic, a provider or a target out of the pending changes.
+    Remove(Removal),
+    /// Dropping the pending changes to `overbrainer.toml`.
+    DropChanges,
 }
 
 /// What an exit note added while leaving is about.
@@ -328,6 +345,14 @@ pub(super) struct App {
     /// The cost of the stages the history recorded at the last load, `None`
     /// while none spent anything.
     pub(super) history_cost: Option<crate::history::Cost>,
+    /// What the history recorded at the last load that read it.
+    pub(super) history: History,
+    /// The configuration the Project view shows, read when the TUI starts.
+    pub(super) config: Option<ProjectConfig>,
+    /// The Project view's state.
+    pub(super) project_view: ProjectView,
+    /// The environment the configuration is read with.
+    pub(super) env: EnvSource,
     /// The last error reading the history, warned once, until a read works.
     history_error: Option<String>,
     /// While a pipeline task runs, and until the reload after its end read the
@@ -382,7 +407,7 @@ impl App {
             theme: *theme,
             seen_log: logs.seq(),
             logs,
-            view: View::Dataset,
+            view: View::Project,
             overlay: None,
             status: None,
             now,
@@ -400,6 +425,10 @@ impl App {
             editing: None,
             editor: vec!["vi".to_string()],
             history_cost: None,
+            history: History::default(),
+            config: None,
+            project_view: ProjectView::default(),
+            env: EnvSource::Process,
             history_error: None,
             cost_base: None,
             base_load: None,
@@ -449,7 +478,7 @@ impl App {
 
     /// Reloads the data files; while a load runs, one more starts when it ends,
     /// and the footer shows the running load even when it started quietly.
-    fn reload(&mut self) -> Vec<Effect> {
+    pub(super) fn reload(&mut self) -> Vec<Effect> {
         if self.load.is_some() {
             self.reload_pending = true;
             self.quiet_load = false;
@@ -498,7 +527,7 @@ impl App {
         if let Some(progress) = self.pipeline.progress() {
             work.push(progress);
         }
-        if self.edit.is_some() {
+        if self.edit.is_some() || self.project_view.save.is_some() {
             work.push("saving".to_string());
         }
         if self.prepare.is_some() || self.prices.is_some() {
@@ -564,7 +593,10 @@ impl App {
                 self.priced(&prices);
                 Vec::new()
             },
-            Ok(Done::Prepared(_) | Done::Prices(_)) => Vec::new(),
+            Ok(Done::ConfigSaved(saved)) if self.project_view.save == Some(id) => {
+                self.config_saved(saved)
+            },
+            Ok(Done::Prepared(_) | Done::Prices(_) | Done::ConfigSaved(_)) => Vec::new(),
             Err(error) => self.failed(id, error),
         }
     }
@@ -576,7 +608,7 @@ impl App {
         &mut self,
         id: TaskId,
         loaded: Result<Dataset, String>,
-        history: Result<Option<crate::history::Cost>, String>,
+        history: Result<History, String>,
     ) -> Vec<Effect> {
         if self.load != Some(id) {
             return Vec::new();
@@ -584,8 +616,10 @@ impl App {
         self.load = None;
         self.reloaded = self.now;
         match history {
-            Ok(cost) => {
+            Ok(history) => {
+                let cost = history.cost;
                 self.history_cost = cost;
+                self.history = history;
                 self.history_error = None;
                 if self.base_load == Some(id) {
                     self.base_load = None;
@@ -618,6 +652,9 @@ impl App {
         tracing::error!("{error}");
         if self.edit == Some(id) {
             return self.saved(Err(error));
+        }
+        if self.project_view.save == Some(id) {
+            return self.config_saved(Err(SaveRefusal::Failed(error)));
         }
         if self.pipeline_task == Some(id) {
             return self.pipeline_ended(id, Err(error));
@@ -835,8 +872,10 @@ impl App {
 
     /// Ends the TUI once nothing it waits for runs.
     pub(super) fn leave_when_idle(&mut self) {
-        let idle =
-            self.edit.is_none() && self.pipeline_task.is_none() && self.training.tasks.is_empty();
+        let idle = self.edit.is_none()
+            && self.project_view.save.is_none()
+            && self.pipeline_task.is_none()
+            && self.training.tasks.is_empty();
         if self.leaving.is_some() && idle {
             self.exit = self.leaving;
         }
@@ -891,17 +930,13 @@ impl App {
 
     /// The editor ended with `status`: checks the edited file and saves it.
     pub(super) fn on_editor_exit(&mut self, status: io::Result<ExitStatus>) -> Vec<Effect> {
+        if std::mem::take(&mut self.project_view.editing) {
+            return self.config_edited(status);
+        }
         let Some(session) = self.editing.clone() else {
             return Vec::new();
         };
-        let failed = match status {
-            Ok(status) if status.success() => None,
-            Ok(status) => Some(status.code().map_or_else(
-                || "the editor was killed; nothing changed".to_string(),
-                |code| format!("the editor exited with status {code}; nothing changed"),
-            )),
-            Err(error) => Some(format!("cannot run the editor: {error}; nothing changed")),
-        };
+        let failed = editor_failure(status).map(|failed| format!("{failed}; nothing changed"));
         if let Some(message) = failed {
             return self.drop_edit(&session, Severity::Warn, message);
         }
@@ -958,6 +993,10 @@ impl App {
     pub(super) fn on_input(&mut self, event: &Event) -> Vec<Effect> {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(*key),
+            Event::Paste(text) => {
+                self.on_paste(text);
+                Vec::new()
+            },
             Event::Resize(..) => {
                 self.dirty = true;
                 Vec::new()
@@ -973,7 +1012,14 @@ impl App {
         if ctrl_c {
             self.close_overlay();
             self.dataset.input = None;
+            self.project_view.form = None;
             return self.quit();
+        }
+        if self.view == View::Project && self.project_view.form.is_some() {
+            if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+                self.on_form_key(key.code);
+            }
+            return Vec::new();
         }
         if self.view == View::Dataset && self.dataset.input.is_some() {
             if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
@@ -1009,10 +1055,11 @@ impl App {
             KeyCode::Char('r') => self.run_menu(),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Char('g') => return vec![Effect::OpenUrl(REPOSITORY.to_string())],
-            KeyCode::Char('1') => return self.show(View::Dataset),
-            KeyCode::Char('2') => return self.show(View::Pipeline),
-            KeyCode::Char('3') => return self.show(View::Training),
-            KeyCode::Char('4') => return self.show(View::Logs),
+            KeyCode::Char('1') => return self.show(View::Project),
+            KeyCode::Char('2') => return self.show(View::Dataset),
+            KeyCode::Char('3') => return self.show(View::Pipeline),
+            KeyCode::Char('4') => return self.show(View::Training),
+            KeyCode::Char('5') => return self.show(View::Logs),
             KeyCode::Tab => return self.show(self.view.shifted(1)),
             KeyCode::BackTab => return self.show(self.view.shifted(View::ALL.len() - 1)),
             code => return self.on_view_key(code),
@@ -1029,7 +1076,7 @@ impl App {
         match view {
             View::Training => self.refresh_runs(),
             View::Dataset if entered => self.reload_while_running(true),
-            View::Dataset | View::Pipeline | View::Logs => Vec::new(),
+            View::Project | View::Dataset | View::Pipeline | View::Logs => Vec::new(),
         }
     }
 
@@ -1065,6 +1112,17 @@ impl App {
             Action::Start(plan) => self.start_run(&plan),
             Action::Abandon(tasks) => self.abandon(&tasks),
             Action::AbandonStart(task) => self.abandon_start(task),
+            Action::Remove(removal) => {
+                self.remove(&removal);
+                Vec::new()
+            },
+            Action::DropChanges => {
+                if !self.refuse_change() {
+                    self.drop_changes();
+                    self.say(Severity::Info, "pending changes dropped");
+                }
+                Vec::new()
+            },
             Action::Delete { deletion, counts } => {
                 if self.locked() {
                     return Vec::new();
@@ -1081,6 +1139,7 @@ impl App {
 
     fn on_view_key(&mut self, code: KeyCode) -> Vec<Effect> {
         match self.view {
+            View::Project => return self.on_project_key(code),
             View::Dataset => return self.on_dataset_key(code),
             View::Training => return self.on_training_key(code),
             View::Logs => return self.on_logs_key(code),
@@ -1126,7 +1185,7 @@ impl App {
                 }
             },
             KeyCode::Char('s') => view.stats = !view.stats,
-            KeyCode::Char('/') => view.input = Some(view.filter.clone()),
+            KeyCode::Char('/') => view.input = Some(Input::new(view.filter.clone())),
             KeyCode::Esc if !view.filter.is_empty() => view.apply_filter(String::new()),
             _ => {},
         }
@@ -1233,26 +1292,32 @@ impl App {
     /// A key while the filter is typed: Enter applies it, Esc clears it.
     fn on_filter_key(&mut self, code: KeyCode) {
         let view = &mut self.dataset;
-        match code {
-            KeyCode::Char(c) => {
-                if let Some(input) = &mut view.input {
-                    input.push(c);
-                }
-            },
-            KeyCode::Backspace => {
-                if let Some(input) = &mut view.input {
-                    input.pop();
-                }
-            },
-            KeyCode::Enter => {
-                let filter = view.input.take().unwrap_or_default();
+        let Some(input) = &mut view.input else {
+            return;
+        };
+        match input.on_key(code) {
+            InputOutcome::Editing => {},
+            InputOutcome::Done(filter) => {
+                view.input = None;
                 view.apply_filter(filter);
             },
-            KeyCode::Esc => {
+            InputOutcome::Cancelled => {
                 view.input = None;
                 view.apply_filter(String::new());
             },
-            _ => {},
+        }
+    }
+
+    /// A bracketed paste goes to the input being typed; with none, it is dropped.
+    fn on_paste(&mut self, text: &str) {
+        if self.view == View::Project {
+            self.on_project_paste(text);
+        }
+        if self.view == View::Dataset
+            && let Some(input) = &mut self.dataset.input
+        {
+            input.paste(text);
+            self.dirty = true;
         }
     }
 
@@ -1338,6 +1403,15 @@ impl App {
         if self.edit.is_some() {
             text.push("An edit is being saved: quitting waits for it.".to_string());
         }
+        if self.project_view.save.is_some() {
+            text.push("overbrainer.toml is being saved: quitting waits for it.".to_string());
+        }
+        if self.project_view.pending.is_some() {
+            text.push(
+                "The pending changes to overbrainer.toml are not saved: quitting drops them."
+                    .to_string(),
+            );
+        }
         text.extend(self.training_quit_text());
         if text.is_empty() {
             self.exit = Some(Exit::Quit);
@@ -1370,12 +1444,19 @@ impl App {
         effects
     }
 
-    /// What the TUI waits for once its loop ended, one line each: an edit being
-    /// saved, the stage stopping, and each training task.
+    /// What the TUI waits for once its loop ended, one line each: an edit or
+    /// `overbrainer.toml` being saved, the stage stopping, and each training
+    /// task.
     pub(super) fn waiting_for(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if self.edit.is_some() {
             lines.push("waiting for an edit to be saved...".to_string());
+        }
+        if self.project_view.save.is_some() {
+            lines.push(format!(
+                "waiting for {} to be saved...",
+                crate::config::CONFIG_FILE
+            ));
         }
         if self.pipeline_task.is_some() {
             let name = self.pipeline.command.map_or("stage", command_name);
@@ -1437,6 +1518,7 @@ impl App {
     pub(super) fn on_loop_end(&mut self) -> Vec<Effect> {
         self.close_overlay();
         self.dataset.input = None;
+        self.project_view.form = None;
         self.leave(Exit::Quit)
     }
 
@@ -1451,6 +1533,9 @@ impl App {
             let mut waited = Vec::new();
             if self.edit.is_some() {
                 waited.push("the edit is saved".to_string());
+            }
+            if self.project_view.save.is_some() {
+                waited.push("overbrainer.toml is saved".to_string());
             }
             if self.pipeline_task.is_some() {
                 let name = self.pipeline.command.map_or("stage", command_name);
@@ -1662,17 +1747,57 @@ mod tests {
     }
 
     #[test]
-    fn digits_and_tabs_switch_views() {
+    fn the_tui_opens_on_the_project_view() {
+        let project = app().project;
+        let theme = Theme::new(crate::tui::theme::ColorLevel::TrueColor);
+        let app = App::new(project, LogBuffer::new(1), &theme, at(NOW));
+        assert_eq!(app.view, View::Project);
+    }
+
+    #[test]
+    fn digits_and_tabs_switch_the_five_views() {
         let mut app = app();
-        assert_eq!(app.view, View::Dataset);
-        press(&mut app, &[KeyCode::Char('3')]);
-        assert_eq!(app.view, View::Training);
-        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
-        assert_eq!(app.view, View::Dataset);
+        for (digit, view) in ['1', '2', '3', '4', '5'].into_iter().zip(View::ALL) {
+            press(&mut app, &[KeyCode::Char(digit)]);
+            assert_eq!(app.view, view, "{digit}");
+        }
+        press(&mut app, &[KeyCode::Char('1')]);
+        for view in View::ALL.into_iter().cycle().skip(1).take(5) {
+            press(&mut app, &[KeyCode::Tab]);
+            assert_eq!(app.view, view);
+        }
         press(&mut app, &[KeyCode::BackTab]);
         assert_eq!(app.view, View::Logs);
-        press(&mut app, &[KeyCode::Char('2')]);
-        assert_eq!(app.view, View::Pipeline);
+        press(&mut app, &[KeyCode::Char('4')]);
+        assert_eq!(app.view, View::Training);
+    }
+
+    #[test]
+    fn the_project_view_moves_by_field_and_by_page() -> TestResult {
+        let mut app = app();
+        let config = crate::tui::snapshots::project_config()?;
+        let count =
+            crate::tui::project::rows(&config, None, &crate::tui::project::Locks::default())
+                .iter()
+                .filter(|row| matches!(row, crate::tui::project::Row::Field(_)))
+                .count();
+        app.config = Some(config);
+        press(
+            &mut app,
+            &[KeyCode::Char('1'), KeyCode::Char('j'), KeyCode::Down],
+        );
+        assert_eq!(app.project_view.selected, 2);
+        press(&mut app, &[KeyCode::PageDown]);
+        assert_eq!(app.project_view.selected, 12);
+        press(&mut app, &[KeyCode::End]);
+        assert_eq!(app.project_view.selected, count - 1);
+        press(&mut app, &[KeyCode::Char('j')]);
+        assert_eq!(app.project_view.selected, count - 1, "stays on the last");
+        press(&mut app, &[KeyCode::PageUp, KeyCode::Char('k')]);
+        assert_eq!(app.project_view.selected, count - 12);
+        press(&mut app, &[KeyCode::Home, KeyCode::Up]);
+        assert_eq!(app.project_view.selected, 0);
+        Ok(())
     }
 
     #[test]
@@ -1680,7 +1805,7 @@ mod tests {
         let mut app = app();
         press(&mut app, &[KeyCode::Char('?')]);
         assert_eq!(app.overlay, Some(Overlay::Help));
-        press(&mut app, &[KeyCode::Char('3')]);
+        press(&mut app, &[KeyCode::Char('4')]);
         assert_eq!(app.view, View::Dataset);
         press(&mut app, &[KeyCode::Esc]);
         assert_eq!(app.overlay, None);
@@ -1719,7 +1844,11 @@ mod tests {
         assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
         assert_eq!(app.overlay, None, "as any other key, g closes the menu");
         press(&mut app, &[KeyCode::Char('/'), KeyCode::Char('g')]);
-        assert_eq!(app.dataset.input.as_deref(), Some("g"), "g is typed");
+        assert_eq!(
+            app.dataset.input.as_ref().map(Input::text),
+            Some("g"),
+            "g is typed"
+        );
     }
 
     #[test]
@@ -1782,7 +1911,7 @@ mod tests {
         for n in 0..30 {
             log(&app, Level::INFO, &format!("line {n}"));
         }
-        press(&mut app, &[KeyCode::Char('4')]);
+        press(&mut app, &[KeyCode::Char('5')]);
         logs_view(&mut app)?;
         press(&mut app, &[KeyCode::Char('k'), KeyCode::Up]);
         assert_eq!(app.log_view.offset(&app.logs), 2);
@@ -1817,7 +1946,7 @@ mod tests {
         for n in 0..30 {
             log(&app, Level::INFO, &format!("line {n}"));
         }
-        press(&mut app, &[KeyCode::Char('4')]);
+        press(&mut app, &[KeyCode::Char('5')]);
         logs_view(&mut app)?;
         press(&mut app, &[KeyCode::Char('k'), KeyCode::Char('k')]);
         let (title, before) = logs_view(&mut app)?;
@@ -1861,7 +1990,7 @@ mod tests {
         for n in 0..25 {
             log(&app, Level::INFO, &format!("line {n}"));
         }
-        press(&mut app, &[KeyCode::Char('4')]);
+        press(&mut app, &[KeyCode::Char('5')]);
         logs_view(&mut app)?;
         press(&mut app, &[KeyCode::PageUp]);
         assert_eq!(app.log_view.anchor, Some(20), "line 19 at the bottom");
@@ -1883,7 +2012,7 @@ mod tests {
         for n in 0..30 {
             log(&app, Level::INFO, &format!("line {n}"));
         }
-        press(&mut app, &[KeyCode::Char('4'), KeyCode::Char('k')]);
+        press(&mut app, &[KeyCode::Char('5'), KeyCode::Char('k')]);
         assert!(app.log_view.anchor.is_some());
         let levels: Vec<Level> = (0..5)
             .map(|_| {
@@ -1911,7 +2040,7 @@ mod tests {
         log(&app, Level::WARN, "first");
         log(&app, Level::INFO, "second");
         log(&app, Level::ERROR, "third");
-        press(&mut app, &[KeyCode::Char('4')]);
+        press(&mut app, &[KeyCode::Char('5')]);
         let effects = press(&mut app, &[KeyCode::Char('x')]);
         let [Effect::ExportLogs { name, lines }] = effects.as_slice() else {
             return Err(format!("expected an export effect: {effects:?}").into());
@@ -1944,7 +2073,7 @@ mod tests {
     fn x_with_no_line_at_the_shown_level_exports_nothing() {
         let mut app = app();
         log(&app, Level::DEBUG, "too quiet");
-        press(&mut app, &[KeyCode::Char('4')]);
+        press(&mut app, &[KeyCode::Char('5')]);
         assert_eq!(press(&mut app, &[KeyCode::Char('x')]), []);
         let status = app.status.as_ref().map(|s| (s.severity, s.text.as_str()));
         assert_eq!(status, Some((Severity::Warn, "nothing to export at INFO")));
@@ -2067,6 +2196,30 @@ mod tests {
         assert_eq!(app.exit, Some(Exit::Quit));
     }
 
+    #[test]
+    fn the_filter_edits_at_its_cursor_and_takes_a_paste() {
+        let mut app = dataset_app();
+        press(
+            &mut app,
+            &[KeyCode::Char('/'), KeyCode::Char('b'), KeyCode::Home],
+        );
+        assert_eq!(app.on_input(&Event::Paste("bor\nde".into())), []);
+        press(
+            &mut app,
+            &[KeyCode::Char('a'), KeyCode::End, KeyCode::Enter],
+        );
+        assert_eq!(app.dataset.filter, "bor deab");
+    }
+
+    #[test]
+    fn a_paste_without_an_input_is_ignored() {
+        let mut app = dataset_app();
+        assert_eq!(app.on_input(&Event::Paste("q".into())), []);
+        assert_eq!(app.exit, None);
+        assert_eq!(app.dataset.filter, "");
+        assert_eq!(app.dataset.input, None);
+    }
+
     /// The one load in `effects`.
     fn only_load(effects: &[Effect]) -> Result<TaskId, String> {
         match effects {
@@ -2108,12 +2261,18 @@ mod tests {
             but_runs(press(&mut app, &[KeyCode::Char('R'), KeyCode::Char('R')])),
             []
         );
-        let second = only_load(&app.on_done(first, Ok(Done::Loaded(Ok(dataset()), Ok(None)))))?;
+        let second = only_load(&app.on_done(
+            first,
+            Ok(Done::Loaded(Ok(dataset()), Ok(History::default()))),
+        ))?;
         assert_ne!(second, first);
         assert_eq!(app.load, Some(second));
         assert!(app.dataset.model.is_some(), "the first load is shown");
         assert_eq!(
-            app.on_done(second, Ok(Done::Loaded(Ok(dataset()), Ok(None)))),
+            app.on_done(
+                second,
+                Ok(Done::Loaded(Ok(dataset()), Ok(History::default())))
+            ),
             []
         );
         assert_eq!(app.load, None);
@@ -2123,7 +2282,7 @@ mod tests {
     #[test]
     fn a_load_sets_the_history_cost_and_keeps_it_when_the_history_cannot_be_read() -> TestResult {
         let mut app = app();
-        let known = Ok(Some(crate::history::Cost::Known(1.5)));
+        let known = Ok(History::costing(crate::history::Cost::Known(1.5)));
         let id = only_load(&app.start())?;
         app.on_done(id, Ok(Done::Loaded(Ok(dataset()), known)));
         assert_eq!(app.history_cost, Some(crate::history::Cost::Known(1.5)));
@@ -2149,7 +2308,7 @@ mod tests {
             for history in ["denied", "denied", "gone", "gone"]
                 .map(|error| Err(error.to_string()))
                 .into_iter()
-                .chain([Ok(None), Err("gone".to_string())])
+                .chain([Ok(History::default()), Err("gone".to_string())])
             {
                 app.on_done(id, Ok(Done::Loaded(Ok(dataset()), history)));
                 id = only_load(&but_runs(press(&mut app, &[KeyCode::Char('R')])))?;
@@ -2171,7 +2330,10 @@ mod tests {
         let id = only_load(&app.start())?;
         let stale = TaskId(id.0 + 100);
         assert_eq!(
-            app.on_done(stale, Ok(Done::Loaded(Ok(dataset()), Ok(None)))),
+            app.on_done(
+                stale,
+                Ok(Done::Loaded(Ok(dataset()), Ok(History::default())))
+            ),
             []
         );
         assert!(app.dataset.model.is_none());
@@ -2180,7 +2342,7 @@ mod tests {
             id,
             Ok(Done::Loaded(
                 Err("data/answers.jsonl:1: bad".into()),
-                Ok(None),
+                Ok(History::default()),
             )),
         );
         assert_eq!(
@@ -2839,7 +3001,10 @@ mod tests {
         let load = only_load(&app.start())?;
         app.on_done(
             load,
-            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+            Ok(Done::Loaded(
+                Ok(dataset()),
+                Ok(History::costing(Cost::Known(1.0))),
+            )),
         );
         let mut keys = vec![KeyCode::Char('r')];
         keys.extend([KeyCode::Down; 4]);
@@ -2879,10 +3044,13 @@ mod tests {
         );
         // A quiet reload lands with the finished stages in the history: the sum
         // still counts each once.
-        let quiet = only_load(&press(&mut app, &[KeyCode::Char('1')]))?;
+        let quiet = only_load(&press(&mut app, &[KeyCode::Char('2')]))?;
         app.on_done(
             quiet,
-            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.75))))),
+            Ok(Done::Loaded(
+                Ok(dataset()),
+                Ok(History::costing(Cost::Known(1.75))),
+            )),
         );
         assert_eq!(
             project_cost(&app),
@@ -2898,7 +3066,10 @@ mod tests {
         assert_eq!(project_cost(&app), pipeline, "a stopped stage stays");
         app.on_done(
             reload,
-            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.875))))),
+            Ok(Done::Loaded(
+                Ok(dataset()),
+                Ok(History::costing(Cost::Known(1.875))),
+            )),
         );
         assert_eq!(
             project_cost(&app),
@@ -2927,7 +3098,10 @@ mod tests {
         spend(&mut app, id, Stage::Questions, 0.5, true);
         app.on_done(
             load,
-            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+            Ok(Done::Loaded(
+                Ok(dataset()),
+                Ok(History::costing(Cost::Known(1.0))),
+            )),
         );
         assert_eq!(project_cost(&app), Cost::Known(1.5));
         Ok(())
@@ -2943,7 +3117,10 @@ mod tests {
         let load = only_load(&app.start())?;
         app.on_done(
             load,
-            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+            Ok(Done::Loaded(
+                Ok(dataset()),
+                Ok(History::costing(Cost::Known(1.0))),
+            )),
         );
         let questions = [KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter];
         let [Effect::Spawn(first, Task::Pipeline(_))] = press(&mut app, &questions)[..] else {
@@ -2951,7 +3128,7 @@ mod tests {
         };
         spend(&mut app, first, Stage::Questions, 0.5, true);
         // A quiet load starts during the task, which ends before it lands.
-        let quiet = only_load(&press(&mut app, &[KeyCode::Char('1')]))?;
+        let quiet = only_load(&press(&mut app, &[KeyCode::Char('2')]))?;
         assert_eq!(app.on_done(first, Ok(Done::Pipeline(Ok(())))), []);
         let [Effect::Spawn(_, Task::Pipeline(_))] = press(&mut app, &questions)[..] else {
             return Err("expected a second stage".into());
@@ -2960,7 +3137,10 @@ mod tests {
         // Its history predates the first task's entry: the base keeps that task.
         app.on_done(
             quiet,
-            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+            Ok(Done::Loaded(
+                Ok(dataset()),
+                Ok(History::costing(Cost::Known(1.0))),
+            )),
         );
         assert_eq!(project_cost(&app), Cost::Known(1.5));
         Ok(())
@@ -2982,14 +3162,17 @@ mod tests {
             [],
             "not shown on the Pipeline view"
         );
-        let effects = press(&mut app, &[KeyCode::Char('1')]);
+        let effects = press(&mut app, &[KeyCode::Char('2')]);
         let [Effect::Spawn(load, Task::Load)] = effects.as_slice() else {
             return assert_eq!(effects, []);
         };
         let load = *load;
         assert!(!app.work().contains(&"loading".to_string()), "quiet");
         assert_eq!(app.on_tick(at(NOW + 11)), [], "one load at a time");
-        app.on_done(load, Ok(Done::Loaded(Ok(dataset()), Ok(None))));
+        app.on_done(
+            load,
+            Ok(Done::Loaded(Ok(dataset()), Ok(History::default()))),
+        );
         assert_eq!(app.on_tick(at(NOW + 12)), [], "ended less than 2 s ago");
         let effects = app.on_tick(at(NOW + 13));
         assert!(matches!(effects.as_slice(), [Effect::Spawn(_, Task::Load)]));
@@ -3013,15 +3196,18 @@ mod tests {
             effects.as_slice(),
             [Effect::Spawn(_, Task::Pipeline(_))]
         ));
-        let effects = press(&mut app, &[KeyCode::Char('1')]);
+        let effects = press(&mut app, &[KeyCode::Char('2')]);
         let [Effect::Spawn(load, Task::Load)] = effects.as_slice() else {
             return assert_eq!(effects, []);
         };
         let load = *load;
         app.on_tick(at(NOW + 1));
-        app.on_done(load, Ok(Done::Loaded(Ok(dataset()), Ok(None))));
+        app.on_done(
+            load,
+            Ok(Done::Loaded(Ok(dataset()), Ok(History::default()))),
+        );
         assert_eq!(
-            press(&mut app, &[KeyCode::Char('1')]),
+            press(&mut app, &[KeyCode::Char('2')]),
             [],
             "already shown: the tick paces the reloads"
         );
@@ -3038,7 +3224,7 @@ mod tests {
             effects.as_slice(),
             [Effect::Spawn(_, Task::Pipeline(_))]
         ));
-        let effects = press(&mut app, &[KeyCode::Char('1')]);
+        let effects = press(&mut app, &[KeyCode::Char('2')]);
         let [Effect::Spawn(load, Task::Load)] = effects.as_slice() else {
             return assert_eq!(effects, []);
         };
@@ -3059,7 +3245,7 @@ mod tests {
         let mut app = dataset_app();
         assert_eq!(app.on_tick(at(NOW + 10)), []);
         assert_eq!(
-            press(&mut app, &[KeyCode::Char('2'), KeyCode::Char('1')]),
+            press(&mut app, &[KeyCode::Char('3'), KeyCode::Char('2')]),
             []
         );
     }
@@ -3133,6 +3319,16 @@ mod tests {
         app.on_done(TaskId(7), Ok(Done::Pipeline(Err("interrupted".into()))));
         assert_eq!(app.exit, Some(Exit::Quit));
         assert_eq!(app.exit_notes, ["run: interrupted"]);
+    }
+
+    #[test]
+    fn a_save_in_flight_is_waited_for() {
+        let mut app = app();
+        app.project_view.save = Some(TaskId(12));
+        assert_eq!(
+            app.waiting_for(),
+            ["waiting for overbrainer.toml to be saved..."]
+        );
     }
 
     /// The loop ended with a Runpod run still provisioning: it is never
@@ -3237,7 +3433,7 @@ mod tests {
             runs.run_dir(SECOND)?.join(crate::train::METRICS_FILE),
             "{\"event\": \"log\", \"time\": 2, \"step\": 1, \"loss\": 1.5}\n",
         )?;
-        keys(&mut app, &[KeyCode::Char('3')]);
+        keys(&mut app, &[KeyCode::Char('4')]);
         Ok((dir, app))
     }
 
@@ -3324,7 +3520,7 @@ mod tests {
         assert_eq!(app.training.runs.len(), 3);
         assert_eq!(app.training.runs[0].record.id, "20260922-080000-beef");
         runs.save(&record("20260923-080000-cafe"))?;
-        keys(&mut app, &[KeyCode::Char('1')]);
+        keys(&mut app, &[KeyCode::Char('2')]);
         assert_eq!(app.on_tick(at(NOW + 10)), [], "not read while hidden");
         Ok(())
     }
@@ -3905,7 +4101,7 @@ mod tests {
     #[test]
     fn t_prepares_asks_with_list_prices_then_starts_one_run() -> Result<(), String> {
         let mut app = app();
-        press(&mut app, &[KeyCode::Char('3')]);
+        press(&mut app, &[KeyCode::Char('4')]);
         let effects = press(&mut app, &[KeyCode::Char('t')]);
         let [Effect::Spawn(prepare, Task::Prepare)] = effects.as_slice() else {
             return Err(format!("{effects:?}"));
@@ -3951,7 +4147,7 @@ mod tests {
     #[test]
     fn t_is_refused_without_training_or_while_the_data_is_locked() {
         let mut app = app();
-        press(&mut app, &[KeyCode::Char('3')]);
+        press(&mut app, &[KeyCode::Char('4')]);
         let effects = press(&mut app, &[KeyCode::Char('t')]);
         let [Effect::Spawn(prepare, _)] = effects.as_slice() else {
             return assert_eq!(effects, []);
@@ -4144,7 +4340,7 @@ mod tests {
             TaskId(9),
             crate::tui::training::Follow::new(crate::tui::training::Job::Attach, FIRST),
         );
-        let effects = press(&mut app, &[KeyCode::Char('3'), KeyCode::Char('t')]);
+        let effects = press(&mut app, &[KeyCode::Char('4'), KeyCode::Char('t')]);
         let Some(Effect::Spawn(prepare, Task::Prepare)) = effects.last() else {
             return Err(format!("{effects:?}"));
         };
@@ -4188,7 +4384,7 @@ mod tests {
                 app.overlay = Some(Overlay::Help);
             } else {
                 app.overlay = None;
-                app.dataset.input = Some("bor".into());
+                app.dataset.input = Some(Input::new("bor"));
             }
             app.prepare = Some(TaskId(3));
             let effects = app.on_done(
@@ -4203,7 +4399,7 @@ mod tests {
     #[test]
     fn t_while_a_run_is_prepared_says_so() {
         let mut app = app();
-        press(&mut app, &[KeyCode::Char('3'), KeyCode::Char('t')]);
+        press(&mut app, &[KeyCode::Char('4'), KeyCode::Char('t')]);
         assert_eq!(press(&mut app, &[KeyCode::Char('t')]), []);
         assert_eq!(status(&app), Some("already preparing a run"));
     }
@@ -4363,7 +4559,7 @@ mod tests {
     #[test]
     fn a_plan_that_arrives_while_quitting_is_dropped() {
         let mut app = app();
-        let effects = press(&mut app, &[KeyCode::Char('3'), KeyCode::Char('t')]);
+        let effects = press(&mut app, &[KeyCode::Char('4'), KeyCode::Char('t')]);
         let Some(Effect::Spawn(prepare, Task::Prepare)) = effects.last() else {
             return assert_eq!(effects, []);
         };

@@ -106,8 +106,9 @@ where
 
 /// What woke the loop while it settles.
 enum Settling {
-    /// A task ended, or none is left.
-    Ended(Option<(TaskId, Result<Done, String>)>),
+    /// A task ended, or none is left. Boxed: a result is far larger than the
+    /// other variants.
+    Ended(Option<Box<(TaskId, Result<Done, String>)>>),
     /// A process signal.
     Signal,
     /// Time to write the new log lines.
@@ -325,12 +326,13 @@ where
         let mut tick = tokio::time::interval(TICK);
         loop {
             let woke = tokio::select! {
-                next = self.tasks.next() => Settling::Ended(next),
+                next = self.tasks.next() => Settling::Ended(next.map(Box::new)),
                 () = Signals::recv(self.signals.as_mut(), true) => Settling::Signal,
                 _ = tick.tick() => Settling::Tick,
             };
             let effects = match woke {
-                Settling::Ended(Some((id, result))) => {
+                Settling::Ended(Some(ended)) => {
+                    let (id, result) = *ended;
                     self.drain_late(app);
                     app.on_done(id, result)
                 },
@@ -386,7 +388,10 @@ where
     fn apply_late(&mut self, app: &mut App, effect: Effect) {
         match effect {
             Effect::Spawn(id, Task::Train(TrainJob::Start)) => app.start_dropped(id),
-            Effect::Spawn(id, task @ (Task::Train(_) | Task::Edit(_))) => {
+            Effect::Spawn(
+                id,
+                task @ (Task::Train(_) | Task::Edit(_) | Task::SaveConfig { .. }),
+            ) => {
                 self.tasks.spawn(id, task);
             },
             Effect::Cancel(id) => self.tasks.cancel(id),
@@ -877,7 +882,7 @@ mod tests {
             message: "kept".into(),
         });
         let (events, input) = mpsc::unbounded_channel();
-        for code in ['4', 'x', 'q'] {
+        for code in ['5', 'x', 'q'] {
             events.send(Ok(key(KeyCode::Char(code))))?;
         }
         tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await??;
@@ -916,7 +921,7 @@ mod tests {
         let (events, input) = mpsc::unbounded_channel();
         terminal.backend_mut().resize(100, 30);
         events.send(Ok(TermEvent::Resize(100, 30)))?;
-        events.send(Ok(key(KeyCode::Char('4'))))?;
+        events.send(Ok(key(KeyCode::Char('5'))))?;
         events.send(Ok(key(KeyCode::Char('q'))))?;
         tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await??;
         let area = terminal.backend().buffer().area;
@@ -1002,7 +1007,7 @@ mod tests {
         let (events, input) = mpsc::unbounded_channel();
         let run_loop = drive(&mut terminal, &mut app, input, None);
         let keys = async {
-            events.send(Ok(key(KeyCode::Char('3'))))?;
+            events.send(Ok(key(KeyCode::Char('4'))))?;
             drawn(&frame, run).await?;
             events.send(Ok(key(KeyCode::Char('a'))))?;
             events.send(Err(io::Error::other("the terminal is gone")))?;
@@ -1245,7 +1250,7 @@ mod tests {
         let (events, input) = mpsc::unbounded_channel();
         let run_loop = drive(&mut terminal, &mut app, input, None);
         let keys = async {
-            events.send(Ok(key(KeyCode::Char('3'))))?;
+            events.send(Ok(key(KeyCode::Char('4'))))?;
             drawn(&frame, RUN).await?;
             events.send(Ok(key(KeyCode::Char('c'))))?;
             drawn(&frame, "Cancel a run?").await?;
@@ -1264,6 +1269,72 @@ mod tests {
         assert_eq!(error.as_deref(), Some("the terminal is gone"));
         let ended = app.training.ended.get(RUN).and_then(|e| e.error.clone());
         assert_eq!(ended, Some(format!("run {RUN} has not started")));
+        Ok(())
+    }
+
+    /// [`crate::tui::snapshots::project_app`] on a project directory holding
+    /// its configuration, with `project.name` changed and not saved.
+    fn saving_app() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
+        use crate::tui::snapshots::{PROJECT_CONFIG, project_app, project_env};
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("overbrainer.toml"), PROJECT_CONFIG)?;
+        let mut app = project_app()?;
+        app.project.dir = dir.path().to_path_buf();
+        app.env = project_env();
+        for code in [KeyCode::Enter, KeyCode::End]
+            .into_iter()
+            .chain([KeyCode::Backspace; 20])
+            .chain("rust_pro".chars().map(KeyCode::Char))
+            .chain([KeyCode::Enter])
+        {
+            app.on_input(&key(code));
+        }
+        assert!(app.project_view.pending.is_some());
+        Ok((dir, app))
+    }
+
+    /// A save started, then the terminal fails (its input, or the draw after
+    /// `s`, whose effects are then applied late): the save is still waited
+    /// for, and the app hears how it ended.
+    #[tokio::test]
+    async fn a_save_is_waited_for_when_the_terminal_fails() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for draw_fails in [false, true] {
+            let (dir, mut app) = saving_app()?;
+            let backend = Shared::new();
+            let (frame, fail) = (Arc::clone(&backend.frame), Arc::clone(&backend.fail));
+            let mut terminal = Terminal::new(backend)?;
+            let (events, input) = mpsc::unbounded_channel();
+            let run_loop = drive(&mut terminal, &mut app, input, None);
+            let keys = async {
+                drawn(&frame, "configuration").await?;
+                tokio::time::sleep(FRAME * 2).await;
+                if draw_fails {
+                    fail.store(true, Ordering::SeqCst);
+                }
+                events.send(Ok(key(KeyCode::Char('s'))))?;
+                if !draw_fails {
+                    events.send(Err(io::Error::other("the terminal is gone")))?;
+                }
+                Ok::<_, Box<dyn std::error::Error>>(())
+            };
+            let joined = tokio::time::timeout(LIMIT, async { tokio::join!(run_loop, keys) }).await;
+            let Ok((result, sent)) = joined else {
+                return Err(stalled("waiting for the loop", &app, &frame).into());
+            };
+            sent?;
+            assert!(result.is_err(), "{draw_fails}");
+            let text = std::fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+            assert!(text.contains("name = \"rust_pro\""), "{draw_fails}: {text}");
+            assert!(app.project_view.pending.is_none(), "{draw_fails}");
+            assert_eq!(app.project_view.save, None);
+            assert!(
+                app.exit_notes
+                    .contains(&"overbrainer.toml was saved".to_string()),
+                "{draw_fails}: {:?}",
+                app.exit_notes
+            );
+        }
         Ok(())
     }
 
@@ -1634,7 +1705,7 @@ mod tests {
             KeyCode::Char('j'),
             KeyCode::Char('e'),
             // Typed before the editor took the terminal: dropped, not replayed.
-            KeyCode::Char('4'),
+            KeyCode::Char('5'),
         ];
         let quit = async {
             for code in keys {

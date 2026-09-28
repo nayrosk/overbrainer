@@ -33,7 +33,7 @@ pub(super) const NOTE: &str = "e, d, r and t are refused while a stage, an edit 
 
 /// Keys that work in every view.
 pub(super) const GLOBAL: &[KeyHelp] = &[
-    row("1 2 3 4, Tab, Shift-Tab", "switch view"),
+    row("1 2 3 4 5, Tab, Shift-Tab", "switch view"),
     row("?", "this help (Esc, ? or q closes it)"),
     row("q, Ctrl-C", "quit"),
     row("R", "reload the data files and runs"),
@@ -43,6 +43,19 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
         "y, n Esc Enter",
         "in a dialog: confirm, cancel (the default, n)",
     ),
+];
+
+const PROJECT: &[KeyHelp] = &[
+    row(
+        "k j, PgUp PgDn, Home End",
+        "select a field, by page, the first or last",
+    ),
+    row("Enter", "edit the field; toggles a bool, cycles a choice"),
+    row("a", "add a topic, a provider or a target"),
+    row("d", "delete the selected topic, provider or target"),
+    row("s", "save to overbrainer.toml, validated first"),
+    row("u", "drop the pending changes (asks first)"),
+    row("E", "open overbrainer.toml in $EDITOR"),
 ];
 
 const DATASET: &[KeyHelp] = &[
@@ -115,6 +128,10 @@ pub(super) enum Context {
     Abandon,
     /// The filter being typed.
     Filter,
+    /// A value or a name being typed in the Project view's form.
+    Form,
+    /// A choice being made in the Project view's form.
+    Pick,
     /// A dialog answered with `y`, labelled `yes` and `no`.
     Dialog {
         /// What `y` does.
@@ -128,6 +145,14 @@ pub(super) enum Context {
     Menu,
 }
 
+const FOOTER_PROJECT: &[Hint] = &[
+    hint("j/k", "move"),
+    hint("Enter", "edit"),
+    hint("a", "add"),
+    hint("d", "delete"),
+    hint("s", "save"),
+    hint("E", "$EDITOR"),
+];
 const FOOTER_DATASET: &[Hint] = &[
     hint("j/k", "move"),
     hint("l", "open"),
@@ -139,7 +164,7 @@ const FOOTER_DATASET: &[Hint] = &[
 ];
 const FOOTER_PIPELINE: &[Hint] = &[
     locking("r", "run a stage"),
-    hint("1-4", "views"),
+    hint("1-5", "views"),
     hint("q", "quit"),
 ];
 const FOOTER_TRAINING: &[Hint] = &[
@@ -161,6 +186,12 @@ const FOOTER_LOGS: &[Hint] = &[
     hint("x", "export"),
 ];
 const FOOTER_FILTER: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "clear")];
+const FOOTER_FORM: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "cancel")];
+const FOOTER_PICK: &[Hint] = &[
+    hint("←/→", "choose"),
+    hint("Enter", "pick"),
+    hint("Esc", "cancel"),
+];
 const FOOTER_HELP: &[Hint] = &[hint("Esc", "close")];
 const FOOTER_MENU: &[Hint] = &[
     hint("j/k", "move"),
@@ -172,12 +203,15 @@ const FOOTER_MENU: &[Hint] = &[
 /// from the end when it runs out of room.
 pub(super) fn footer(context: Context) -> Vec<Hint> {
     match context {
+        Context::View(View::Project) => FOOTER_PROJECT.to_vec(),
         Context::View(View::Dataset) => FOOTER_DATASET.to_vec(),
         Context::View(View::Pipeline) => FOOTER_PIPELINE.to_vec(),
         Context::View(View::Training) => FOOTER_TRAINING.to_vec(),
         Context::View(View::Logs) => FOOTER_LOGS.to_vec(),
         Context::Abandon => FOOTER_ABANDON.to_vec(),
         Context::Filter => FOOTER_FILTER.to_vec(),
+        Context::Form => FOOTER_FORM.to_vec(),
+        Context::Pick => FOOTER_PICK.to_vec(),
         Context::Dialog { yes, no } => vec![hint("y", yes), hint("n, Esc or Enter", no)],
         Context::Help => FOOTER_HELP.to_vec(),
         Context::Menu => FOOTER_MENU.to_vec(),
@@ -187,6 +221,7 @@ pub(super) fn footer(context: Context) -> Vec<Hint> {
 /// Keys of `view`.
 pub(super) fn of(view: View) -> &'static [KeyHelp] {
     match view {
+        View::Project => PROJECT,
         View::Dataset => DATASET,
         View::Training => TRAINING,
         View::Logs => LOGS,
@@ -223,6 +258,8 @@ mod tests {
         let others = [
             Context::Abandon,
             Context::Filter,
+            Context::Form,
+            Context::Pick,
             dialog,
             Context::Help,
             Context::Menu,

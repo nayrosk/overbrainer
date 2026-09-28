@@ -60,13 +60,16 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         None => " data ".to_string(),
     };
     let bottom = match (&view.input, view.filter.is_empty()) {
-        (Some(input), _) => format!(" /{input}_ "),
-        (None, true) => " / filter ".to_string(),
-        (None, false) => format!(" filter: {} (Esc clears) ", view.filter),
+        (Some(_), _) => Line::from(Span::styled(" /", theme.dim)),
+        (None, true) => Line::from(Span::styled(" / filter ", theme.dim)),
+        (None, false) => Line::from(Span::styled(
+            format!(" filter: {} (Esc clears) ", view.filter),
+            theme.dim,
+        )),
     };
     let block = pane(theme.border_focus)
         .title(Span::styled(title, theme.title))
-        .title_bottom(Span::styled(bottom, theme.dim));
+        .title_bottom(bottom);
     let inner = block.inner(left);
     model.fit(usize::from(inner.width.saturating_sub(TOGGLE)));
     let data = &model.data;
@@ -103,6 +106,16 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             Err(error) => error_pane(frame, left, block, &error.to_string(), &theme),
         },
         Err(error) => error_pane(frame, left, block, error, &theme),
+    }
+    if let Some(input) = &view.input {
+        // On the bottom border, after the corner and the " /" title.
+        let row = Rect {
+            x: left.x.saturating_add(3),
+            y: left.bottom().saturating_sub(1),
+            width: left.width.saturating_sub(4),
+            height: left.height.min(1),
+        };
+        input.render(frame, row, theme.dim);
     }
     if view.stats {
         let topic = match view.tree.selected().first() {

@@ -13,6 +13,7 @@ use crate::history::Cost;
 use crate::tui::app::{App, Overlay, Severity, Status, View};
 use crate::tui::cost::project_cost;
 use crate::tui::keys::{self, Context, HELP_HINT, Hint, SEPARATOR};
+use crate::tui::project::Form;
 use crate::tui::theme::Theme;
 use crate::tui::training::RunActivity;
 
@@ -77,6 +78,11 @@ pub(in crate::tui) fn context(app: &App) -> Context {
         Some(Overlay::Help) => Context::Help,
         Some(Overlay::Menu(_)) => Context::Menu,
         None if app.view == View::Dataset && app.dataset.input.is_some() => Context::Filter,
+        None if app.view == View::Project => match &app.project_view.form {
+            Some(Form::Value { .. } | Form::Name { .. }) => Context::Form,
+            Some(Form::Adding(_) | Form::Kind { .. }) => Context::Pick,
+            None => Context::View(View::Project),
+        },
         None if app.view == View::Training
             && app.training.selected_activity() == RunActivity::Starting { runpod: true } =>
         {
@@ -151,7 +157,7 @@ mod tests {
         let shown = text(&terminal).last().cloned().unwrap_or_default();
         let right = format!("… answers 120/400 · locked · {VERSION}  ? help ");
         assert!(
-            shown.starts_with(" r run a stage · 1-4 views · q quit "),
+            shown.starts_with(" r run a stage · 1-5 views · q quit "),
             "{shown}"
         );
         assert!(shown.ends_with(&right), "{shown}");
@@ -162,7 +168,7 @@ mod tests {
         );
         assert!(
             !buffer[(17, 23)].modifier.contains(Modifier::CROSSED_OUT),
-            "1-4 is not"
+            "1-5 is not"
         );
         Ok(())
     }

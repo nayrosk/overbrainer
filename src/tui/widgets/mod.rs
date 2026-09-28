@@ -2,6 +2,7 @@
 
 pub(super) mod bar;
 pub(super) mod dialog;
+pub(super) mod form;
 pub(super) mod help;
 pub(super) mod menu;
 pub(super) mod status;

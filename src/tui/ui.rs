@@ -36,6 +36,10 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
     .areas(area);
     render_header(frame, header, app);
     let pulse = match app.view {
+        View::Project => {
+            views::project::render(frame, body, app);
+            None
+        },
         View::Dataset => {
             views::dataset::render(frame, body, app);
             None
@@ -164,7 +168,7 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    const TABS: &str = "1 Dataset  2 Pipeline  3 Training  4 Logs";
+    const TABS: &str = "1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs";
 
     /// The header of `app` alone, drawn `width` columns wide.
     fn header(app: &App, width: u16) -> Result<String, Box<dyn std::error::Error>> {
@@ -182,7 +186,8 @@ mod tests {
         let row = rows.first().ok_or("no header")?;
         assert_eq!(
             row,
-            &format!(" ⠿ overbrainer   {TABS}  a_project_name_for… ")
+            &format!(" ⠿ overbrainer   {TABS}  a_proje… "),
+            "the brand and the five tabs fit 80 columns"
         );
         Ok(())
     }
@@ -190,14 +195,15 @@ mod tests {
     #[test]
     fn the_brand_goes_before_the_tabs_when_the_width_runs_out() -> TestResult {
         let app = app();
-        let row = header(&app, 45)?;
+        let tabs = u16::try_from(TABS.chars().count())?;
+        let row = header(&app, tabs + 4)?;
         assert!(row.starts_with(TABS), "{row}");
         assert!(!row.contains("overbrainer"), "{row}");
         assert_eq!(row, format!("{TABS}    "), "no lone ellipsis");
-        assert_eq!(header(&app, 47)?, format!("{TABS}  ru… "));
-        assert_eq!(header(&app, 41)?, TABS);
-        let row = header(&app, 38)?;
-        let kept: String = TABS.chars().take(38).collect();
+        assert_eq!(header(&app, tabs + 6)?, format!("{TABS}  ru… "));
+        assert_eq!(header(&app, tabs)?, TABS);
+        let row = header(&app, tabs - 3)?;
+        let kept: String = TABS.chars().take(usize::from(tabs - 3)).collect();
         assert_eq!(row, kept, "the tabs keep the columns there are");
         Ok(())
     }

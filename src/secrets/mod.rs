@@ -5,7 +5,7 @@ mod vault;
 
 use secrecy::{ExposeSecret, SecretString};
 
-pub use reference::{VaultRef, parse_reference};
+pub use reference::{VaultRef, is_reference, parse_reference};
 pub use vault::{SecretSource, VaultSettings, VaultSource};
 
 /// Errors from parsing secret references or fetching secrets from Vault.

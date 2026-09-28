@@ -452,7 +452,7 @@ impl App {
                 }
                 return targets;
             },
-            View::Dataset | View::Logs => return targets,
+            View::Project | View::Dataset | View::Logs => return targets,
         }
         for (index, stage) in STAGES.iter().enumerate() {
             let row = self.pipeline.row(*stage);
@@ -736,7 +736,7 @@ mod tests {
     fn a_view_fades_in_from_the_background() -> TestResult {
         let mut app = moving(dataset_app());
         draw(&mut app, 80, 24)?;
-        app.on_input(&key(KeyCode::Char('2')));
+        app.on_input(&key(KeyCode::Char('3')));
         let terminal = draw(&mut app, 80, 24)?;
         for y in 1..23 {
             for x in 0..80 {
@@ -748,7 +748,7 @@ mod tests {
         app.on_frame(VIEW_FADE);
         let faded = draw(&mut app, 80, 24)?;
         let mut still = dataset_app();
-        still.on_input(&key(KeyCode::Char('2')));
+        still.on_input(&key(KeyCode::Char('3')));
         assert_eq!(
             faded.backend().buffer(),
             draw(&mut still, 80, 24)?.backend().buffer()
@@ -862,7 +862,7 @@ mod tests {
         let changes = |app: &mut App| -> TestResult {
             app.view = View::Dataset;
             draw(app, 80, 24)?;
-            app.on_input(&key(KeyCode::Char('3')));
+            app.on_input(&key(KeyCode::Char('4')));
             app.say(Severity::Warn, "refused: a stage is running");
             app.overlay = Some(Overlay::Help);
             draw(app, 80, 24)?;
@@ -886,7 +886,7 @@ mod tests {
     fn a_fade_never_changes_a_symbol() -> TestResult {
         let changes = |app: &mut App| -> TestResult {
             draw(app, 80, 24)?;
-            app.on_input(&key(KeyCode::Char('2')));
+            app.on_input(&key(KeyCode::Char('3')));
             app.say(Severity::Info, "deletion saved");
             app.overlay = Some(Overlay::Help);
             Ok(())

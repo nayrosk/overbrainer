@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use config::{Config, Environment, File, FileFormat};
@@ -15,7 +15,7 @@ pub const ENV_PREFIX: &str = "OVERBRAINER";
 pub const TUI_ENV_PREFIX: &str = "OVERBRAINER_TUI_";
 
 /// Where [`load`] reads `OVERBRAINER_*` environment variable overrides from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvSource {
     /// Read from the current process environment. This is what a running binary uses.
     Process,
@@ -119,24 +119,33 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
         path: path.clone(),
         error,
     })?;
-    let pairs: Vec<(String, String)> = match env {
-        EnvSource::Process => std::env::vars_os()
-            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-            .collect(),
-        EnvSource::Vars(pairs) => pairs,
-    };
-    let env: config::Map<String, String> = pairs
+    load_str(&content, env)
+}
+
+/// Validates a configuration text (the would-be contents of `overbrainer.toml`) layered
+/// with `OVERBRAINER_*` variables from `env`, without reading any file.
+///
+/// This is what [`load`] does after reading the file; a caller that already has the
+/// text (an editor buffer, a value about to be written) can validate it directly.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Parse`] when `content` or the environment cannot be parsed
+/// into [`Settings`], and [`ConfigError::Invalid`] when the parsed settings fail
+/// semantic validation or when an env-only key is set in `content`.
+pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> {
+    let env: config::Map<String, String> = env_pairs(env)
         .into_iter()
-        .filter(|(key, _)| !key.starts_with(TUI_ENV_PREFIX))
+        .filter(|(key, _)| !is_tui_variable(key))
         .collect();
 
     let file_only = Config::builder()
-        .add_source(File::from_str(&content, FileFormat::Toml))
+        .add_source(File::from_str(content, FileFormat::Toml))
         .build()?;
     let mut problems = validate::env_only_in_file(&file_only);
 
     let mut settings: Settings = Config::builder()
-        .add_source(File::from_str(&content, FileFormat::Toml))
+        .add_source(File::from_str(content, FileFormat::Toml))
         .add_source(
             Environment::with_prefix(ENV_PREFIX)
                 .prefix_separator("_")
@@ -158,6 +167,49 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
         Ok(settings)
     } else {
         Err(ConfigError::Invalid(problems))
+    }
+}
+
+/// The dotted, lower-case configuration keys `env` sets through `OVERBRAINER_*`
+/// variables, with the same prefix and separators [`load`] and [`load_str`] use.
+///
+/// `OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY` gives `providers.openrouter.api_key`;
+/// `OVERBRAINER_LOG` gives `log`. Variables under `OVERBRAINER_TUI_` are not
+/// configuration keys ([`load_str`] skips them too) and are left out.
+///
+/// The prefix and `TUI_ENV_PREFIX` are matched case-insensitively, on a lower-cased
+/// copy of each key: this mirrors what `config::Environment` itself does inside
+/// [`load_str`] (it lower-cases every key before comparing it to its own lower-cased
+/// prefix pattern), so a variable such as `overbrainer_log` or `Overbrainer_Log`,
+/// which `load_str` accepts, is reported here too.
+#[must_use]
+pub fn env_keys(env: &EnvSource) -> BTreeSet<String> {
+    let prefix = format!("{ENV_PREFIX}_").to_lowercase();
+    env_pairs(env.clone())
+        .into_iter()
+        .filter(|(key, _)| !is_tui_variable(key))
+        .map(|(key, _)| key.to_lowercase())
+        .filter_map(|key| {
+            let rest = key.strip_prefix(&prefix)?;
+            (!rest.is_empty()).then(|| rest.replace("__", "."))
+        })
+        .collect()
+}
+
+/// Whether `key` is under [`TUI_ENV_PREFIX`] once lower-cased, as `config::Environment`
+/// lower-cases keys before matching.
+fn is_tui_variable(key: &str) -> bool {
+    key.to_lowercase()
+        .starts_with(&TUI_ENV_PREFIX.to_lowercase())
+}
+
+/// The key-value pairs `env` provides: the process environment, or an explicit list.
+fn env_pairs(env: EnvSource) -> Vec<(String, String)> {
+    match env {
+        EnvSource::Process => std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect(),
+        EnvSource::Vars(pairs) => pairs,
     }
 }
 
@@ -313,5 +365,69 @@ mod tests {
             None,
             "a negative integer past i64::MIN must stay a string, not become an imprecise float"
         );
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> EnvSource {
+        EnvSource::Vars(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn env_keys_maps_double_underscores_to_dots_and_lower_cases() {
+        let env = vars(&[("OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY", "sk-something")]);
+        assert_eq!(
+            env_keys(&env),
+            BTreeSet::from(["providers.openrouter.api_key".to_string()])
+        );
+    }
+
+    #[test]
+    fn env_keys_maps_log_to_a_bare_key() {
+        let env = vars(&[("OVERBRAINER_LOG", "debug")]);
+        assert_eq!(env_keys(&env), BTreeSet::from(["log".to_string()]));
+    }
+
+    #[test]
+    fn env_keys_skips_tui_variables_and_unrelated_prefixes() {
+        let env = vars(&[
+            ("OVERBRAINER_TUI_COLOR", "256"),
+            ("OVERBRAINER_TUI_MOTION", "off"),
+            ("PATH", "/usr/bin"),
+            ("OVERBRAINERX", "not us"),
+        ]);
+        assert!(env_keys(&env).is_empty());
+    }
+
+    #[test]
+    fn env_keys_skips_the_bare_prefix_with_nothing_after_it() {
+        let env = vars(&[("OVERBRAINER_", "")]);
+        assert!(env_keys(&env).is_empty());
+    }
+
+    #[test]
+    fn env_keys_matches_a_lower_case_variable_name() {
+        // `config::Environment` lower-cases every key before matching its prefix, so
+        // `load_str` accepts `overbrainer_log` exactly as it accepts `OVERBRAINER_LOG`.
+        let env = vars(&[("overbrainer_log", "debug")]);
+        assert_eq!(env_keys(&env), BTreeSet::from(["log".to_string()]));
+    }
+
+    #[test]
+    fn env_keys_matches_a_mixed_case_variable_name() {
+        let env = vars(&[("Overbrainer_Providers__Openrouter__Api_Key", "sk-something")]);
+        assert_eq!(
+            env_keys(&env),
+            BTreeSet::from(["providers.openrouter.api_key".to_string()])
+        );
+    }
+
+    #[test]
+    fn env_keys_skips_a_lower_case_tui_variable_case_insensitively() {
+        let env = vars(&[("overbrainer_tui_color", "256")]);
+        assert!(env_keys(&env).is_empty());
     }
 }
