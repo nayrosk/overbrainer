@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
+use overbrainer::config::ListOrAuto;
 use overbrainer::events::{Event, EventBus};
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
@@ -19,7 +20,7 @@ use overbrainer::runs::Runs;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::Receiver;
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -122,7 +123,9 @@ async fn create_for(server: &MockServer, gpu: &str, response: ResponseTemplate) 
 
 fn target(gpu_types: &[&str]) -> RunpodTarget {
     RunpodTarget {
-        gpu_types: gpu_types.iter().map(|gpu| (*gpu).to_string()).collect(),
+        gpu_types: ListOrAuto::List(gpu_types.iter().map(|gpu| (*gpu).to_string()).collect()),
+        min_vram_gb: None,
+        max_price_per_hour: None,
         gpu_count: 1,
         image: "img@sha256:abc".into(),
         venv: "/workspace/axolotl-venv".into(),
@@ -130,7 +133,7 @@ fn target(gpu_types: &[&str]) -> RunpodTarget {
         max_hours: 6.0,
         boot_grace: Duration::from_secs(1800),
         retrieve_grace: Duration::from_secs(3600),
-        data_center_ids: Vec::new(),
+        data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
     }
 }
@@ -665,7 +668,7 @@ async fn the_create_carries_the_target_and_the_watchdog_settings() -> TestResult
         .mount(&harness.server)
         .await;
     let mut target = target(&["NVIDIA A40"]);
-    target.data_center_ids = vec!["EU-RO-1".into()];
+    target.data_center_ids = ListOrAuto::List(vec!["EU-RO-1".into()]);
     target.network_volume_id = Some("vol1".into());
     let before = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
@@ -1075,5 +1078,131 @@ async fn a_pod_is_still_deleted_when_pod_json_cannot_be_saved() -> TestResult {
         vec!["/v2/pods/p1"]
     );
     assert_eq!(record.state, PodState::Deleted);
+    Ok(())
+}
+
+/// `GET /catalog/gpus` for `count` GPUs: `gpus` as `(id, VRAM, price, band)`,
+/// each in stock where its band says, in `EU-RO-1`.
+async fn catalog_gpus(server: &MockServer, count: &str, gpus: &[(&str, u32, f64, &str)]) {
+    let gpus: Vec<Value> = gpus
+        .iter()
+        .map(|(id, memory, price, band)| {
+            json!({
+                "id": id, "memory": memory, "secure": true,
+                "price": {"secure": price}, "maxCount": {"secure": 8},
+                "availability": band,
+                "dataCenters": [{"id": "EU-RO-1", "availability": band}]
+            })
+        })
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus"))
+        .and(query_param("count", count))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "gpus": gpus })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn auto_choices_are_resolved_from_the_catalog_before_the_create_calls() -> TestResult {
+    let harness = Harness::new().await?;
+    catalog_gpus(
+        &harness.server,
+        "2",
+        &[
+            ("NVIDIA A40", 48, 0.4, "HIGH"),
+            ("NVIDIA RTX A6000", 48, 0.4, "LOW"),
+            ("NVIDIA L4", 24, 0.2, "NONE"),
+            ("NVIDIA RTX 4000 Ada", 20, 0.3, "MEDIUM"),
+        ],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/datacenters"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"dataCenters": [
+                {"id": "US-KS-2", "gpuAvailability": [
+                    {"id": "NVIDIA A40", "availability": "HIGH"}
+                ]},
+                {"id": "EU-RO-1", "gpuAvailability": [
+                    {"id": "NVIDIA RTX 4000 Ada", "availability": "LOW"}
+                ]},
+                {"id": "EU-SE-1", "gpuAvailability": [
+                    {"id": "NVIDIA L4", "availability": "HIGH"}
+                ]}
+            ]})),
+        )
+        .expect(1)
+        .mount(&harness.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(no_capacity())
+        .mount(&harness.server)
+        .await;
+    let mut auto = target(&[]);
+    auto.gpu_types = ListOrAuto::Auto;
+    auto.data_center_ids = ListOrAuto::Auto;
+    auto.gpu_count = 2;
+    auto.min_vram_gb = Some(20);
+    let (result, record) = harness.provision(&auto).await?;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    let sent: Vec<Value> = harness
+        .calls("POST")
+        .await
+        .iter()
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap_or_default())
+        .collect();
+    let gpus: Vec<&Value> = sent.iter().map(|body| &body["gpu"]["id"]).collect();
+    // Cheapest first, ties by more VRAM then ID; out of stock left out.
+    assert_eq!(
+        gpus,
+        vec!["NVIDIA RTX 4000 Ada", "NVIDIA A40", "NVIDIA RTX A6000"]
+    );
+    // Data centers with a chosen GPU in stock, cheapest first.
+    for body in &sent {
+        assert_eq!(body["dataCenterIds"], json!(["EU-RO-1", "US-KS-2"]));
+        assert_eq!(body["gpu"]["count"], 2);
+    }
+    assert_eq!(record.attempts.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn nothing_in_stock_fails_before_any_create_call() -> TestResult {
+    let harness = Harness::new().await?;
+    catalog_gpus(
+        &harness.server,
+        "1",
+        &[
+            ("NVIDIA A40", 48, 0.4, "NONE"),
+            ("NVIDIA L4", 24, 0.2, "HIGH"),
+        ],
+    )
+    .await;
+    let mut auto = target(&[]);
+    auto.gpu_types = ListOrAuto::Auto;
+    auto.min_vram_gb = Some(40);
+    let (result, record) = harness.provision(&auto).await?;
+    let Err(PodError::NotInStock(message)) = &result else {
+        return Err(format!("expected NotInStock, got {result:?}").into());
+    };
+    assert_eq!(
+        message,
+        "no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" (gpu_count = 1, min_vram_gb = 40)"
+    );
+    assert!(harness.calls("POST").await.is_empty());
+    assert!(record.attempts.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn listed_choices_never_read_the_catalog() -> TestResult {
+    let harness = Harness::new().await?;
+    create_for(&harness.server, "NVIDIA A40", no_capacity()).await;
+    let (result, _) = harness.provision(&target(&["NVIDIA A40"])).await?;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    assert!(harness.calls("GET").await.is_empty());
     Ok(())
 }

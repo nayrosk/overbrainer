@@ -623,11 +623,14 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
+    use crate::config::ListOrAuto;
     use crate::runpod::{AttemptResult, Pod};
 
     fn target() -> RunpodTarget {
         RunpodTarget {
-            gpu_types: vec!["NVIDIA A40".into()],
+            gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
+            min_vram_gb: None,
+            max_price_per_hour: None,
             gpu_count: 1,
             image: "img".into(),
             venv: "/venv".into(),
@@ -635,7 +638,7 @@ mod tests {
             max_hours: 6.0,
             boot_grace: Duration::from_secs(1800),
             retrieve_grace: Duration::from_secs(3600),
-            data_center_ids: Vec::new(),
+            data_center_ids: ListOrAuto::default(),
             network_volume_id: None,
         }
     }

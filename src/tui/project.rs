@@ -17,8 +17,8 @@ use crate::cli::data::Command;
 use crate::config::edit::{Collection, ConfigDoc, EditError, FieldPath, Role};
 use crate::config::fields::{self, FieldKind, FieldSpec, Section, TargetKind};
 use crate::config::{
-    Adapter, ConfigError, ENV_PREFIX, Engine, EnvSource, Pipeline, Protocol, RoleModel, Runtime,
-    Settings, Target, Topic, Training, env_keys, load_str,
+    Adapter, ConfigError, ENV_PREFIX, Engine, EnvSource, ListOrAuto, Pipeline, Protocol, RoleModel,
+    Runtime, Settings, Target, Topic, Training, env_keys, load_str,
 };
 use crate::history::{Cost, Total};
 use crate::runs::RunState;
@@ -801,6 +801,8 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
         },
         Target::Runpod {
             gpu_types,
+            min_vram_gb,
+            max_price_per_hour,
             gpu_count,
             image,
             venv,
@@ -811,7 +813,9 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             data_center_ids,
             network_volume_id,
         } => match field {
-            "gpu_types" => Some(gpu_types.join(", ")),
+            "gpu_types" => Some(gpu_types.to_string()),
+            "min_vram_gb" => min_vram_gb.map(|gb| gb.to_string()),
+            "max_price_per_hour" => max_price_per_hour.map(float),
             "gpu_count" => Some(gpu_count.to_string()),
             "image" => image.clone(),
             "venv" => venv.clone(),
@@ -819,7 +823,9 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             "max_hours" => Some(float(*max_hours)),
             "boot_grace_minutes" => Some(boot_grace_minutes.to_string()),
             "retrieve_grace_minutes" => Some(retrieve_grace_minutes.to_string()),
-            "data_center_ids" => (!data_center_ids.is_empty()).then(|| data_center_ids.join(", ")),
+            "data_center_ids" => {
+                (*data_center_ids != ListOrAuto::default()).then(|| data_center_ids.to_string())
+            },
             "network_volume_id" => network_volume_id.clone(),
             _ => None,
         },

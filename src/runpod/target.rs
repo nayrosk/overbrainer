@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::config::{DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV, Target};
+use crate::config::{DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV, ListOrAuto, Target};
 use crate::exec::JobRuntime;
 
 use super::JOB_ENV;
@@ -20,8 +20,13 @@ pub const MIN_CUDA_VERSION: &str = "13.0";
 /// A `runpod` target of `overbrainer.toml`, defaults applied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunpodTarget {
-    /// GPU types, tried in order.
-    pub gpu_types: Vec<String>,
+    /// GPU types, tried in order; `Auto` until resolved at the run's start
+    /// (see [`resolve`](super::resolve)).
+    pub gpu_types: ListOrAuto,
+    /// Least VRAM per GPU, in GB, for `Auto` GPU types.
+    pub min_vram_gb: Option<u32>,
+    /// Highest list price of one GPU, in USD per hour, for `Auto` GPU types.
+    pub max_price_per_hour: Option<f64>,
     /// GPUs per pod.
     pub gpu_count: u32,
     /// Container image.
@@ -36,8 +41,9 @@ pub struct RunpodTarget {
     pub boot_grace: Duration,
     /// How long the watchdog keeps a pod whose ended job was not retrieved.
     pub retrieve_grace: Duration,
-    /// Allowed data centers; any when empty.
-    pub data_center_ids: Vec<String>,
+    /// Allowed data centers, any when empty; `Auto` until resolved at the run's
+    /// start.
+    pub data_center_ids: ListOrAuto,
     /// Network volume, if any.
     pub network_volume_id: Option<String>,
 }
@@ -48,6 +54,8 @@ impl RunpodTarget {
     pub fn from_target(target: &Target) -> Option<Self> {
         let Target::Runpod {
             gpu_types,
+            min_vram_gb,
+            max_price_per_hour,
             gpu_count,
             image,
             venv,
@@ -63,6 +71,8 @@ impl RunpodTarget {
         };
         Some(Self {
             gpu_types: gpu_types.clone(),
+            min_vram_gb: *min_vram_gb,
+            max_price_per_hour: *max_price_per_hour,
             gpu_count: *gpu_count,
             image: image
                 .clone()
@@ -106,7 +116,9 @@ mod tests {
 
     fn config_target(volume: Option<&str>) -> Target {
         Target::Runpod {
-            gpu_types: vec!["NVIDIA A40".into()],
+            gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
+            min_vram_gb: None,
+            max_price_per_hour: None,
             gpu_count: 1,
             image: None,
             venv: None,
@@ -114,7 +126,7 @@ mod tests {
             max_hours: 6.0,
             boot_grace_minutes: 30,
             retrieve_grace_minutes: 60,
-            data_center_ids: vec!["EU-RO-1".into()],
+            data_center_ids: ListOrAuto::List(vec!["EU-RO-1".into()]),
             network_volume_id: volume.map(str::to_string),
         }
     }

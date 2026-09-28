@@ -36,8 +36,10 @@ pub(super) struct StartPlan {
 /// The pod a Runpod run would ask for.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct RunpodPlan {
-    /// GPU types, tried in order.
+    /// GPU types, tried in order; none when `auto` chooses them at the start.
     pub(super) gpu_types: Vec<String>,
+    /// Whether the GPU types are `auto`.
+    pub(super) auto: bool,
     /// GPUs per pod.
     pub(super) gpu_count: u32,
     /// When the watchdog deletes the pod.
@@ -92,7 +94,8 @@ pub(super) fn prepare(dir: &Path, env: EnvSource) -> Result<StartPlan, String> {
         train: count(&files.train)?,
         eval: count(&files.eval)?,
         runpod: crate::runpod::RunpodTarget::from_target(target).map(|spec| RunpodPlan {
-            gpu_types: spec.gpu_types,
+            gpu_types: spec.gpu_types.list().to_vec(),
+            auto: spec.gpu_types.is_auto(),
             gpu_count: spec.gpu_count,
             max_hours: spec.max_hours,
         }),
@@ -232,10 +235,17 @@ pub(super) fn cost_line(plan: &StartPlan) -> Option<usize> {
 /// highest listed rate.
 fn gpu_lines(runpod: &RunpodPlan, prices: Option<&Prices>) -> Vec<String> {
     let count = f64::from(runpod.gpu_count);
-    let mut lines = vec![format!(
-        "GPU types   tried in order, list price x {} GPU:",
-        runpod.gpu_count
-    )];
+    let mut lines = vec![if runpod.auto {
+        format!(
+            "GPU types   auto: those in stock for {} GPU, cheapest first, chosen at the start",
+            runpod.gpu_count
+        )
+    } else {
+        format!(
+            "GPU types   tried in order, list price x {} GPU:",
+            runpod.gpu_count
+        )
+    }];
     let rates: Vec<Option<f64>> = runpod
         .gpu_types
         .iter()
@@ -284,11 +294,33 @@ mod tests {
             eval: 137,
             runpod: runpod.then(|| RunpodPlan {
                 gpu_types: vec!["NVIDIA GeForce RTX 4090".into(), "NVIDIA A40".into()],
+                auto: false,
                 gpu_count: 2,
                 max_hours: 6.0,
             }),
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn auto_gpu_types_say_they_are_chosen_at_the_start() {
+        let mut auto = plan(true);
+        if let Some(runpod) = &mut auto.runpod {
+            runpod.gpu_types.clear();
+            runpod.auto = true;
+        }
+        let lines = text(&auto, Some(&Vec::new()));
+        assert!(
+            lines.iter().any(|line| line
+                == "GPU types   auto: those in stock for 2 GPU, cheapest first, chosen at the start"),
+            "{lines:?}"
+        );
+        let line = cost_line(&auto).and_then(|at| lines.get(at).cloned());
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.starts_with("max_hours   6: ")),
+            "{line:?}"
+        );
     }
 
     #[test]

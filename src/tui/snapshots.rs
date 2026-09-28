@@ -1098,6 +1098,7 @@ pub(super) fn runpod_plan() -> StartPlan {
                 "NVIDIA RTX A6000".into(),
                 "NVIDIA A40".into(),
             ],
+            auto: false,
             gpu_count: 1,
             max_hours: 6.0,
         }),

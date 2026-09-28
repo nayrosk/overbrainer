@@ -5,6 +5,8 @@
 //! `training.axolotl_extra` are not listed: a form never writes them. Bounds mirror
 //! `validate.rs`, open or closed ends included; [`FieldKind::describe`] words them.
 
+use crate::config::ListOrAuto;
+
 /// A part of the configuration whose fields share one schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -81,6 +83,9 @@ pub enum FieldKind {
     Choice(&'static [&'static str]),
     /// A list of strings, typed as comma-separated text.
     List,
+    /// `auto` (a [`FieldValue::Text`]) or a list of strings typed as
+    /// comma-separated text; see [`ListOrAuto`].
+    ListOrAuto,
 }
 
 /// One end of a float range.
@@ -178,13 +183,10 @@ impl FieldKind {
                 _ => return Err(FieldError::NotBool),
             },
             Self::Choice(_) => FieldValue::Text(text.trim().to_string()),
-            Self::List => FieldValue::List(
-                text.split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-            ),
+            Self::ListOrAuto if text.trim() == ListOrAuto::AUTO => {
+                FieldValue::Text(ListOrAuto::AUTO.to_string())
+            },
+            Self::List | Self::ListOrAuto => list(text),
         };
         self.check(&value)?;
         Ok(value)
@@ -199,7 +201,8 @@ impl FieldKind {
         match (self, value) {
             (Self::Text, FieldValue::Text(_))
             | (Self::Bool, FieldValue::Bool(_))
-            | (Self::List, FieldValue::List(_)) => Ok(()),
+            | (Self::List | Self::ListOrAuto, FieldValue::List(_)) => Ok(()),
+            (Self::ListOrAuto, FieldValue::Text(text)) if text == ListOrAuto::AUTO => Ok(()),
             (Self::Int { min, max }, FieldValue::Int(number)) if (min..=max).contains(number) => {
                 Ok(())
             },
@@ -214,7 +217,9 @@ impl FieldKind {
             (Self::Int { .. }, FieldValue::Int(_)) | (Self::Float { .. }, FieldValue::Float(_)) => {
                 Err(FieldError::OutOfRange(self.describe()))
             },
-            (Self::Choice(_), FieldValue::Text(_)) => Err(FieldError::NotAChoice(self.describe())),
+            (Self::Choice(_) | Self::ListOrAuto, FieldValue::Text(_)) => {
+                Err(FieldError::NotAChoice(self.describe()))
+            },
             _ => Err(FieldError::WrongType),
         }
     }
@@ -234,8 +239,20 @@ impl FieldKind {
             Self::Bool => "true or false".to_string(),
             Self::Choice(choices) => format!("one of {}", choices.join(", ")),
             Self::List => "a comma-separated list".to_string(),
+            Self::ListOrAuto => "auto or a comma-separated list".to_string(),
         }
     }
+}
+
+/// Comma-separated `text` as a list, without empty items.
+fn list(text: &str) -> FieldValue {
+    FieldValue::List(
+        text.split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// A float range in words: `in [0, 2]`, `in (0, 1)`, `greater than 0`.
@@ -303,7 +320,7 @@ const fn spec(
 
 const TEXT: FieldKind = FieldKind::Text;
 const BOOL: FieldKind = FieldKind::Bool;
-const LIST: FieldKind = FieldKind::List;
+const LIST_OR_AUTO: FieldKind = FieldKind::ListOrAuto;
 const fn at_least(min: i64) -> FieldKind {
     FieldKind::Int { min, max: U32_MAX }
 }
@@ -587,9 +604,21 @@ const SSH: &[FieldSpec] = &[
 const RUNPOD: &[FieldSpec] = &[
     spec(
         "gpu_types",
-        LIST,
+        LIST_OR_AUTO,
         false,
-        "Runpod GPU type IDs, tried in order, comma-separated",
+        "Runpod GPU type IDs, tried in order, comma-separated; auto: cheapest in stock",
+    ),
+    spec(
+        "min_vram_gb",
+        COUNT,
+        true,
+        "Least VRAM per GPU in GB, with gpu_types = auto only",
+    ),
+    spec(
+        "max_price_per_hour",
+        floats(Bound::Excl(0.0), Bound::Unbounded),
+        true,
+        "Highest list price of one GPU in USD/h, with gpu_types = auto only",
     ),
     spec("gpu_count", COUNT, true, "GPUs per pod (default 1)"),
     spec(
@@ -630,9 +659,9 @@ const RUNPOD: &[FieldSpec] = &[
     ),
     spec(
         "data_center_ids",
-        LIST,
+        LIST_OR_AUTO,
         true,
-        "Allowed data centers, comma-separated (any when empty)",
+        "Allowed data centers, comma-separated (any when empty); auto: those in stock",
     ),
     spec(
         "network_volume_id",
@@ -920,17 +949,44 @@ max_hours = 6
             Err("must be one of docker, native".to_string())
         );
         assert_eq!(
-            LIST.parse(" A40 , ,L40S"),
+            FieldKind::List.parse(" A40 , ,L40S"),
             Ok(FieldValue::List(vec![
                 "A40".to_string(),
                 "L40S".to_string()
             ]))
         );
-        assert_eq!(LIST.parse(""), Ok(FieldValue::List(Vec::new())));
+        assert_eq!(FieldKind::List.parse(""), Ok(FieldValue::List(Vec::new())));
         assert_eq!(
             TEXT.parse(" a = \"b\" "),
             Ok(FieldValue::Text(" a = \"b\" ".to_string()))
         );
+    }
+
+    #[test]
+    fn a_list_or_auto_field_takes_auto_or_a_list() {
+        let kind = FieldKind::ListOrAuto;
+        assert_eq!(
+            kind.parse(" auto "),
+            Ok(FieldValue::Text("auto".to_string()))
+        );
+        assert_eq!(
+            kind.parse("A40, auto"),
+            Ok(FieldValue::List(vec![
+                "A40".to_string(),
+                "auto".to_string()
+            ]))
+        );
+        assert_eq!(kind.parse(""), Ok(FieldValue::List(Vec::new())));
+        assert_eq!(
+            kind.check(&FieldValue::Text("A40".to_string()))
+                .map_err(|error| error.to_string()),
+            Err("must be auto or a comma-separated list".to_string())
+        );
+        assert_eq!(kind.check(&FieldValue::Int(1)), Err(FieldError::WrongType));
+        for field in ["gpu_types", "data_center_ids"] {
+            let spec = find(Section::Target(TargetKind::Runpod), field);
+            assert_eq!(spec.map(|spec| spec.kind), Some(kind), "{field}");
+        }
     }
 
     #[test]

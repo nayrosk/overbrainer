@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
+use overbrainer::config::ListOrAuto;
 use overbrainer::events::EventBus;
 use overbrainer::exec::{Executor, JobCommand, LocalExecutor};
 use overbrainer::retry::RetryPolicy;
@@ -132,7 +133,9 @@ impl Harness {
 
 fn target() -> RunpodTarget {
     RunpodTarget {
-        gpu_types: vec!["NVIDIA A40".into()],
+        gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
+        min_vram_gb: None,
+        max_price_per_hour: None,
         gpu_count: 1,
         image: "img".into(),
         venv: "/venv".into(),
@@ -140,7 +143,7 @@ fn target() -> RunpodTarget {
         max_hours: 1.0,
         boot_grace: Duration::from_secs(1800),
         retrieve_grace: Duration::from_secs(3600),
-        data_center_ids: Vec::new(),
+        data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
     }
 }
@@ -188,6 +191,50 @@ async fn a_run_whose_pod_cannot_be_placed_is_failed() -> TestResult {
     let ssh = harness.runs.run_dir(&run.id)?.join("ssh");
     assert!(!ssh.join("id_ed25519").exists());
     assert!(!ssh.join("host_ed25519").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_run_with_nothing_in_stock_fails_without_a_pod() -> TestResult {
+    if !keygen_available() {
+        return Ok(());
+    }
+    let harness = Harness::new().await?;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"gpus": [
+            {"id": "NVIDIA A40", "memory": 48, "secure": true, "price": {"secure": 0.4},
+             "maxCount": {"secure": 8}, "availability": "NONE"}
+        ]})))
+        .mount(&harness.server)
+        .await;
+    let mut auto = target();
+    auto.gpu_types = ListOrAuto::Auto;
+    auto.max_price_per_hour = Some(0.5);
+    let run = create(&harness.runs, "/workspace/overbrainer", "gpu_cloud")?;
+    let result = start_pod(&harness.ctx(), &auto, run.clone(), false).await;
+    assert!(matches!(result, Err(PodError::NotInStock(_))), "{result:?}");
+    let saved = harness.runs.load(&run.id)?;
+    assert_eq!(saved.state, RunState::Failed);
+    assert_eq!(
+        saved.message.as_deref(),
+        Some(
+            "no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" (gpu_count = 1, max_price_per_hour = 0.5)"
+        )
+    );
+    let posts = harness
+        .server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .count();
+    assert_eq!(posts, 0);
+    let pod = PodRecord::load(&harness.runs, &run.id)?.ok_or("no pod.json")?;
+    assert!(pod.attempts.is_empty() && pod.pod_id.is_none());
+    let ssh = harness.runs.run_dir(&run.id)?.join("ssh");
+    assert!(!ssh.join("id_ed25519").exists());
     Ok(())
 }
 

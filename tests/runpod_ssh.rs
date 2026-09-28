@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use std::sync::Mutex;
 
+use overbrainer::config::ListOrAuto;
 use overbrainer::events::EventBus;
 use overbrainer::exec::{Executor, JobCommand, JobRuntime, JobStatus, SshExecutor};
 use overbrainer::retry::RetryPolicy;
@@ -309,7 +310,9 @@ async fn provision_against(
         interrupted: &interrupted,
     };
     let target = RunpodTarget {
-        gpu_types: vec!["NVIDIA A40".into()],
+        gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
+        min_vram_gb: None,
+        max_price_per_hour: None,
         gpu_count: 1,
         image: "img".into(),
         venv: "/venv".into(),
@@ -317,7 +320,7 @@ async fn provision_against(
         max_hours: 1.0,
         boot_grace: Duration::from_secs(1800),
         retrieve_grace: Duration::from_secs(3600),
-        data_center_ids: Vec::new(),
+        data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
     };
     let keys = keys(sshd, &sshd.host_public);
@@ -864,7 +867,9 @@ async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestRes
         interrupted: &interrupted,
     };
     let target = RunpodTarget {
-        gpu_types: vec!["NVIDIA A40".into()],
+        gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
+        min_vram_gb: None,
+        max_price_per_hour: None,
         gpu_count: 1,
         image: "img".into(),
         venv: "/venv".into(),
@@ -872,7 +877,7 @@ async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestRes
         max_hours: 1.0,
         boot_grace: Duration::from_secs(1800),
         retrieve_grace: Duration::from_secs(3600),
-        data_center_ids: Vec::new(),
+        data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
     };
     let keys = keys(&sshd, &sshd.host_public);
