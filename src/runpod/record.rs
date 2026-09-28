@@ -349,17 +349,28 @@ impl PodRecord {
         Some(Duration::from_secs(unix(now).saturating_sub(created)))
     }
 
+    /// What the pod has cost at `now`, in USD: its estimate once deleted, else
+    /// its rate times its uptime so far.
+    #[must_use]
+    pub fn spend_at(&self, now: SystemTime) -> Option<f64> {
+        if self.state == PodState::Deleted {
+            return self.estimated_spend;
+        }
+        self.rate_times_uptime(now)
+    }
+
+    fn rate_times_uptime(&self, now: SystemTime) -> Option<f64> {
+        Some(self.cost_per_hour? * self.uptime(now)?.as_secs_f64() / 3600.0)
+    }
+
     /// The pod was found gone at `now`, removed by `by`: the spend is estimated
     /// from its rate and uptime, to a hundredth of a cent.
     pub fn deleted(&mut self, by: DeletedBy, now: SystemTime) {
-        self.estimated_spend = match (self.cost_per_hour, self.uptime(now)) {
-            // Rounded to a hundredth of a cent, which also keeps the number short
-            // enough to read back from `pod.json` exactly.
-            (Some(rate), Some(uptime)) => {
-                Some((rate * uptime.as_secs_f64() / 3600.0 * 10_000.0).round() / 10_000.0)
-            },
-            _ => None,
-        };
+        // Rounded to a hundredth of a cent, which also keeps the number short
+        // enough to read back from `pod.json` exactly.
+        self.estimated_spend = self
+            .rate_times_uptime(now)
+            .map(|spend| (spend * 10_000.0).round() / 10_000.0);
         self.state = PodState::Deleted;
         self.deleted_at = Some(rfc3339(now));
         self.deleted_by = Some(by);
@@ -461,6 +472,21 @@ mod tests {
         record.deleted(DeletedBy::Client, at(1_790_004_323));
         assert_eq!(record.summary(), "pod deleted about $0.64");
         assert_eq!(record.deleted_by, Some(DeletedBy::Client));
+        Ok(())
+    }
+
+    #[test]
+    fn the_spend_is_rate_times_uptime_until_the_estimate_of_the_deletion() -> TestResult {
+        let mut record = PodRecord::new(RUN, false, 1, "ssh-ed25519 AAAAhost");
+        record.begin_attempt("NVIDIA RTX A6000", at(1_790_000_000), 6.0);
+        assert_eq!(record.spend_at(at(1_790_003_600)), None, "no pod yet");
+        record.created(&pod()?, AttemptResult::Created, at(1_790_000_000));
+        // An hour at its rate.
+        assert_eq!(record.spend_at(at(1_790_003_600)), Some(0.53));
+        record.deleted(DeletedBy::Client, at(1_790_007_200));
+        assert_eq!(record.estimated_spend, Some(1.06));
+        // Once deleted, the estimate stays whatever the time.
+        assert_eq!(record.spend_at(at(1_800_000_000)), Some(1.06));
         Ok(())
     }
 

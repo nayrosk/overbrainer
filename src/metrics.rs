@@ -30,7 +30,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::events::{Event, Observer, Stage};
 use crate::history::Entry;
 use crate::llm::Usage;
-use crate::runpod::{PodRecord, PodState};
+use crate::runpod::PodRecord;
 use crate::runs::Runs;
 use crate::train::TrainMetric;
 
@@ -352,6 +352,8 @@ impl Metrics {
         let Some(runs) = &self.runs else {
             return;
         };
+        // A run removed since the last scrape leaves no series behind.
+        self.spend.clear();
         for (run_id, spend) in pod_spends(runs, now) {
             self.spend.get_or_create(&RunLabels { run_id }).set(spend);
         }
@@ -401,18 +403,9 @@ fn pod_spends(runs: &Runs, now: SystemTime) -> Vec<(String, f64)> {
             let pod = PodRecord::load(runs, &record.id)
                 .map_err(|error| skipped(&record.id, &error))
                 .ok()??;
-            Some((record.id, spend(&pod, now)?))
+            Some((record.id, pod.spend_at(now)?))
         })
         .collect()
-}
-
-/// The spend of `pod` at `now`: its estimate once deleted, else its rate times
-/// its uptime so far.
-fn spend(pod: &PodRecord, now: SystemTime) -> Option<f64> {
-    if pod.state == PodState::Deleted {
-        return pod.estimated_spend;
-    }
-    Some(pod.cost_per_hour? * pod.uptime(now)?.as_secs_f64() / 3600.0)
 }
 
 /// The running endpoint. Dropping it stops the server and closes its connections.
@@ -532,6 +525,7 @@ mod tests {
     use super::*;
     use crate::events::{EventBus, StageStats};
     use crate::history::Status;
+    use crate::runpod::PodState;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -837,6 +831,13 @@ mod tests {
         assert_value(&text, &series(&gone.id), 0.64);
         assert_value(&text, &series(&live.id), 1.0);
         assert_eq!(value(&text, &series(&local.id)), None);
+        // A run removed meanwhile leaves no series behind.
+        std::fs::remove_dir_all(runs.run_dir(&gone.id)?)?;
+        metrics.read_spend(now);
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &metrics.registry)?;
+        assert_eq!(value(&text, &series(&gone.id)), None, "{text}");
+        assert_value(&text, &series(&live.id), 1.0);
         Ok(())
     }
 
