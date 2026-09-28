@@ -9,6 +9,7 @@ pub mod exec;
 pub mod history;
 pub mod llm;
 pub mod logging;
+pub mod metrics;
 pub mod pipeline;
 pub mod pricing;
 pub mod project_lock;

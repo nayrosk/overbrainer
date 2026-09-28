@@ -174,6 +174,13 @@ async fn a_run_trains_merges_and_records_its_outcome() -> TestResult {
     }
 
     let events = events(&mut receiver);
+    assert_eq!(
+        events.iter().position(
+            |event| matches!(event, Event::RunWatched { run_id } if *run_id == outcome.record.id)
+        ),
+        Some(0),
+        "the watch names its run before its metrics: {events:?}"
+    );
     let running = events
         .iter()
         .filter(|event| **event == Event::JobStatus(JobStatus::Running))

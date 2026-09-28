@@ -67,6 +67,10 @@ pub async fn answers<C: LlmClient + 'static>(
         stage: Stage::Answers,
         total: selected.len(),
     });
+    ctx.bus.publish(Event::StageModel {
+        stage: Stage::Answers,
+        model: parent.model.model.clone(),
+    });
     for question in &selected {
         if answered.contains(&question.id) {
             ctx.bus.publish(Event::ItemDone {

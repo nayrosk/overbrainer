@@ -568,6 +568,14 @@ async fn subtopics_started_total_counts_every_topic_and_credits_the_done_one() -
         "every selected topic is counted"
     );
     assert_eq!(
+        events.get(1),
+        Some(&Event::StageModel {
+            stage: Stage::Subtopics,
+            model: generator.model.model.clone(),
+        }),
+        "the model follows the start: {events:?}"
+    );
+    assert_eq!(
         count_item_done(&events, Stage::Subtopics),
         2,
         "the already-done topic is credited as finished"

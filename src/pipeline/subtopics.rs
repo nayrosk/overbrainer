@@ -56,6 +56,10 @@ pub async fn subtopics<C: LlmClient>(
         stage: Stage::Subtopics,
         total: topics.len(),
     });
+    ctx.bus.publish(Event::StageModel {
+        stage: Stage::Subtopics,
+        model: generator.model.model.clone(),
+    });
     let mut stats = StageStats::default();
     for topic in topics {
         let have = stored_count(&existing, &topic.name);
