@@ -228,7 +228,9 @@ pub enum Cost {
 }
 
 impl Cost {
-    fn add(self, cost: Option<f64>) -> Self {
+    /// Adds one more cost to the sum, `None` when that one is unknown.
+    #[must_use]
+    pub fn plus(self, cost: Option<f64>) -> Self {
         match (self, cost) {
             (Self::Unknown, None) => Self::Unknown,
             (Self::Unknown, Some(c)) => Self::Partial(c),
@@ -288,7 +290,7 @@ impl Total {
         self.cost = if self.runs == 0 {
             Cost::first(entry.cost)
         } else {
-            self.cost.add(entry.cost)
+            self.cost.plus(entry.cost)
         };
         self.runs += 1;
         self.done += entry.done;

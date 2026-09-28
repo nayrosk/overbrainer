@@ -3,6 +3,7 @@
 //! writes nothing to stdout or stderr while the terminal shows it.
 
 mod app;
+mod cost;
 mod dataset;
 mod editor;
 mod event_loop;

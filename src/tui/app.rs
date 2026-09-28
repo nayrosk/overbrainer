@@ -311,6 +311,9 @@ pub(super) struct App {
     pub(super) editing: Option<Session>,
     /// The editor command.
     pub(super) editor: Vec<String>,
+    /// The cost of the stages the history recorded at the last load, `None`
+    /// while none spent anything.
+    pub(super) history_cost: Option<crate::history::Cost>,
     /// The Pipeline view's state.
     pub(super) pipeline: PipelineView,
     /// The pipeline task running, if any.
@@ -370,6 +373,7 @@ impl App {
             edit: None,
             editing: None,
             editor: vec!["vi".to_string()],
+            history_cost: None,
             pipeline: PipelineView::default(),
             pipeline_task: None,
             pipeline_last: None,
@@ -515,7 +519,7 @@ impl App {
     pub(super) fn on_done(&mut self, id: TaskId, result: Result<Done, String>) -> Vec<Effect> {
         self.dirty = true;
         match result {
-            Ok(Done::Loaded(loaded)) => self.on_loaded(id, loaded),
+            Ok(Done::Loaded(loaded, history)) => self.on_loaded(id, loaded, history),
             Ok(Done::Saved(saved)) => self.saved(saved),
             Ok(Done::Pipeline(outcome)) => self.pipeline_ended(id, outcome),
             Ok(Done::Trained(result)) => self.trained(id, result),
@@ -531,13 +535,24 @@ impl App {
         }
     }
 
-    /// Load `id` read `loaded`: shown when it is the load running, else ignored.
-    fn on_loaded(&mut self, id: TaskId, loaded: Result<Dataset, String>) -> Vec<Effect> {
+    /// Load `id` read `loaded` and the cost in the history: shown when it is the
+    /// load running, else ignored. A history that cannot be read keeps the cost
+    /// known so far.
+    fn on_loaded(
+        &mut self,
+        id: TaskId,
+        loaded: Result<Dataset, String>,
+        history: Result<Option<crate::history::Cost>, String>,
+    ) -> Vec<Effect> {
         if self.load != Some(id) {
             return Vec::new();
         }
         self.load = None;
         self.reloaded = self.now;
+        match history {
+            Ok(cost) => self.history_cost = cost,
+            Err(error) => tracing::warn!("{error}"),
+        }
         match loaded {
             Ok(data) => self.dataset.loaded(data, &self.project.topics),
             Err(error) => self.load_failed(error),
@@ -1838,12 +1853,31 @@ mod tests {
             but_runs(press(&mut app, &[KeyCode::Char('R'), KeyCode::Char('R')])),
             []
         );
-        let second = only_load(&app.on_done(first, Ok(Done::Loaded(Ok(dataset())))))?;
+        let second = only_load(&app.on_done(first, Ok(Done::Loaded(Ok(dataset()), Ok(None)))))?;
         assert_ne!(second, first);
         assert_eq!(app.load, Some(second));
         assert!(app.dataset.model.is_some(), "the first load is shown");
-        assert_eq!(app.on_done(second, Ok(Done::Loaded(Ok(dataset())))), []);
+        assert_eq!(
+            app.on_done(second, Ok(Done::Loaded(Ok(dataset()), Ok(None)))),
+            []
+        );
         assert_eq!(app.load, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_sets_the_history_cost_and_keeps_it_when_the_history_cannot_be_read() -> TestResult {
+        let mut app = app();
+        let known = Ok(Some(crate::history::Cost::Known(1.5)));
+        let id = only_load(&app.start())?;
+        app.on_done(id, Ok(Done::Loaded(Ok(dataset()), known)));
+        assert_eq!(app.history_cost, Some(crate::history::Cost::Known(1.5)));
+        let id = only_load(&but_runs(press(&mut app, &[KeyCode::Char('R')])))?;
+        app.on_done(
+            id,
+            Ok(Done::Loaded(Ok(dataset()), Err("permission denied".into()))),
+        );
+        assert_eq!(app.history_cost, Some(crate::history::Cost::Known(1.5)));
         Ok(())
     }
 
@@ -1852,12 +1886,18 @@ mod tests {
         let mut app = app();
         let id = only_load(&app.start())?;
         let stale = TaskId(id.0 + 100);
-        assert_eq!(app.on_done(stale, Ok(Done::Loaded(Ok(dataset())))), []);
+        assert_eq!(
+            app.on_done(stale, Ok(Done::Loaded(Ok(dataset()), Ok(None)))),
+            []
+        );
         assert!(app.dataset.model.is_none());
         assert_eq!(app.load, Some(id));
         app.on_done(
             id,
-            Ok(Done::Loaded(Err("data/answers.jsonl:1: bad".into()))),
+            Ok(Done::Loaded(
+                Err("data/answers.jsonl:1: bad".into()),
+                Ok(None),
+            )),
         );
         assert_eq!(
             app.dataset.error.as_deref(),
@@ -2386,7 +2426,7 @@ mod tests {
         let load = *load;
         assert!(!app.work().contains(&"loading".to_string()), "quiet");
         assert_eq!(app.on_tick(at(NOW + 11)), [], "one load at a time");
-        app.on_done(load, Ok(Done::Loaded(Ok(dataset()))));
+        app.on_done(load, Ok(Done::Loaded(Ok(dataset()), Ok(None))));
         assert_eq!(app.on_tick(at(NOW + 12)), [], "ended less than 2 s ago");
         let effects = app.on_tick(at(NOW + 13));
         assert!(matches!(effects.as_slice(), [Effect::Spawn(_, Task::Load)]));
@@ -2416,7 +2456,7 @@ mod tests {
         };
         let load = *load;
         app.on_tick(at(NOW + 1));
-        app.on_done(load, Ok(Done::Loaded(Ok(dataset()))));
+        app.on_done(load, Ok(Done::Loaded(Ok(dataset()), Ok(None))));
         assert_eq!(
             press(&mut app, &[KeyCode::Char('1')]),
             [],

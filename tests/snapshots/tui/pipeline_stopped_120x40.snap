@@ -8,7 +8,7 @@ source: src/tui/snapshots.rs
 "  ✗ answers     ███████████████████▌ stopped                                        120/400         0       14       1  "
 "    split                                                                                                               "
 "                                                                                                                        "
-"  tokens  in 162210  out 39620        cost $0.0135                                                                      "
+"  tokens  in 162210  out 39620        cost $0.0135+                                                                     "
 "                                                                                                                        "
 "  Last errors                                                                                                           "
 "    answers 3f1c…000a  429 Too Many Requests; retrying in 4.0s                                                          "

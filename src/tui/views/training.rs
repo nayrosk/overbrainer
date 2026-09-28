@@ -20,7 +20,7 @@ use crate::tui::app::App;
 use crate::tui::format::duration;
 use crate::tui::motion::Bar;
 use crate::tui::theme::Theme;
-use crate::tui::training::{Ended, Follow, RunActivity, RunRow, float, progress};
+use crate::tui::training::{Ended, Follow, RunActivity, RunRow, float, live_spend, progress};
 use crate::tui::views::dataset::failed;
 use crate::tui::widgets::bar::bar;
 
@@ -356,9 +356,8 @@ fn live_line(id: &str, record: &PodRecord, latest: Option<&PodStatus>, app: &App
         write!(text, " ${rate:.2}/h").ok();
     }
     if let Some(up) = record.uptime(app.now) {
-        let spend = rate.map_or_else(String::new, |rate| {
-            format!(" (about ${:.2})", rate * up.as_secs_f64() / 3600.0)
-        });
+        let spend = live_spend(record, rate, app.now)
+            .map_or_else(String::new, |spend| format!(" (about ${spend:.2})"));
         write!(text, "  up {}{spend}", duration(up)).ok();
     }
     // `--keep-pod` holds only once the job started: until then a failed start

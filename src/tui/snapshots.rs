@@ -720,7 +720,7 @@ fn dataset_load_error() -> TestResult {
     let Some(Effect::Spawn(id, _)) = app.start().first().cloned() else {
         return Err("no load started".into());
     };
-    app.on_done(id, Ok(Done::Loaded(Err(error.into()))));
+    app.on_done(id, Ok(Done::Loaded(Err(error.into()), Ok(None))));
     app.status = None;
     snapshot("dataset_error", &mut app)?;
     Ok(())

@@ -15,6 +15,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use super::cost::history_cost;
 use super::editor::Edited;
 use super::start::{Prices, StartPlan, list_prices, prepare};
 use super::training::{Listing, list_runs, read_series};
@@ -24,6 +25,7 @@ use crate::cli::{StageArgs, TrainArgs, TrainCommand};
 use crate::config::EnvSource;
 use crate::dataset::{Counts, DataFiles, Dataset, Deletion};
 use crate::events::{Event, EventBus};
+use crate::history::{self, Cost};
 use crate::pipeline::{Ctx, SplitReport};
 use crate::prompts::Prompts;
 use crate::train::TrainMetric;
@@ -111,8 +113,9 @@ pub(super) enum Edit {
 /// What a task gives back.
 #[derive(Debug)]
 pub(super) enum Done {
-    /// The dataset files, or why they cannot be read.
-    Loaded(Result<Dataset, String>),
+    /// The dataset files, or why they cannot be read; then the cost the history
+    /// records, `None` when no stage spent anything, or why it cannot be read.
+    Loaded(Result<Dataset, String>, Result<Option<Cost>, String>),
     /// What an edit did, or why nothing changed.
     Saved(Result<Saved, String>),
     /// How a pipeline command ended.
@@ -316,14 +319,30 @@ impl Tasks {
     pub(super) fn spawn(&mut self, id: TaskId, task: Task) {
         let files = DataFiles::new(&self.project_dir);
         let handle = match task {
-            Task::Load => self.set.spawn(async move {
-                let read = tokio::task::spawn_blocking(move || Dataset::read(&files)).await;
-                Done::Loaded(match read {
-                    Ok(Ok(data)) => Ok(data),
-                    Ok(Err(error)) => Err(format!("{:#}", anyhow::Error::from(error))),
-                    Err(error) => Err(format!("cannot read the data files: {error}")),
+            Task::Load => {
+                let dir = self.project_dir.clone();
+                self.set.spawn(async move {
+                    let read = tokio::task::spawn_blocking(move || {
+                        let history = history::read(&dir)
+                            .map(|entries| history_cost(&entries))
+                            .map_err(|error| {
+                                format!("cannot read {}: {error}", history::path(&dir).display())
+                            });
+                        (Dataset::read(&files), history)
+                    })
+                    .await;
+                    match read {
+                        Ok((Ok(data), history)) => Done::Loaded(Ok(data), history),
+                        Ok((Err(error), history)) => {
+                            Done::Loaded(Err(format!("{:#}", anyhow::Error::from(error))), history)
+                        },
+                        Err(error) => Done::Loaded(
+                            Err(format!("cannot read the data files: {error}")),
+                            Err(format!("cannot read the history: {error}")),
+                        ),
+                    }
                 })
-            }),
+            },
             Task::Edit(edit) => {
                 let dir = self.project_dir.clone();
                 self.set.spawn(async move {
@@ -476,19 +495,37 @@ mod tests {
     const LIMIT: Duration = Duration::from_secs(30);
 
     #[tokio::test]
-    async fn a_load_reads_the_data_files_and_ends_with_its_id() -> TestResult {
+    async fn a_load_reads_the_data_files_and_the_history_cost_and_ends_with_its_id() -> TestResult {
         let dir = tempfile::tempdir()?;
         let files = DataFiles::new(dir.path());
         rewrite(&files.subtopics, &dataset().subtopics)?;
+        let stats = crate::events::StageStats {
+            cost: Some(0.5),
+            ..crate::events::StageStats::default()
+        };
+        let span = history::Span {
+            started_at: "2026-09-27T10:00:00Z".into(),
+            ended_at: "2026-09-27T10:01:00Z".into(),
+        };
+        let entry = history::Entry::from_stats(
+            crate::events::Stage::Answers,
+            span,
+            history::Status::Ok,
+            None,
+            &stats,
+        );
+        history::append(dir.path(), &entry)?;
         let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
         assert!(tasks.is_empty());
         tasks.spawn(TaskId(7), Task::Load);
         assert!(!tasks.is_empty());
         let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
-        let Some((TaskId(7), Ok(Done::Loaded(Ok(data))))) = next else {
+        let Some((TaskId(7), Ok(Done::Loaded(Ok(data), Ok(Some(Cost::Known(cost))))))) = next
+        else {
             return Err(format!("unexpected end: {next:?}").into());
         };
         assert_eq!(data.subtopics.len(), 3);
+        assert!((cost - 0.5).abs() < f64::EPSILON, "{cost}");
         assert!(tasks.is_empty());
         assert!(tasks.next().await.is_none());
         Ok(())
@@ -505,7 +542,7 @@ mod tests {
         let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
         tasks.spawn(TaskId(1), Task::Load);
         let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
-        let Some((TaskId(1), Ok(Done::Loaded(Err(error))))) = next else {
+        let Some((TaskId(1), Ok(Done::Loaded(Err(error), Ok(None))))) = next else {
             return Err(format!("unexpected end: {next:?}").into());
         };
         assert!(error.contains("answers.jsonl"), "{error}");

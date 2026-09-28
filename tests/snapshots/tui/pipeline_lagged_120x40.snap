@@ -8,7 +8,7 @@ source: src/tui/snapshots.rs
 "  … answers     ███████████████████▌                                                120/400         8       14       1  "
 "  · split       pending                                                                                                 "
 "                                                                                                                        "
-"  tokens  in 162210  out 39620        cost $0.0135                                                                      "
+"  tokens  in 162210  out 39620        cost $0.0135+                                                                     "
 "  312 events skipped: counts catch up when each stage finishes                                                          "
 "                                                                                                                        "
 "  Last errors                                                                                                           "

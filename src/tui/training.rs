@@ -3,11 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use super::tasks::TaskId;
 use crate::events::Event;
-use crate::runpod::{PodRecord, PodStatus};
+use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, Runs};
 use crate::train::{METRICS_FILE, MetricLine, TrainMetric, parse_line};
 
@@ -18,6 +18,23 @@ pub(super) struct RunRow {
     pub(super) record: RunRecord,
     /// `pod.json`, for a Runpod run.
     pub(super) pod: Option<PodRecord>,
+}
+
+/// What the pod of `record` spent by `now` at `rate` USD per hour, while it
+/// exists; `None` when the rate or its creation time is unknown.
+pub(super) fn live_spend(record: &PodRecord, rate: Option<f64>, now: SystemTime) -> Option<f64> {
+    Some(rate? * record.uptime(now)?.as_secs_f64() / 3600.0)
+}
+
+/// What the pod of `row` spent by `now`: as recorded once deleted, else its rate
+/// times its uptime. `None` for a run without a pod, or when unknown.
+pub(super) fn estimated_spend(row: &RunRow, now: SystemTime) -> Option<f64> {
+    let pod = row.pod.as_ref()?;
+    if pod.state == PodState::Deleted {
+        pod.estimated_spend
+    } else {
+        live_spend(pod, pod.cost_per_hour, now)
+    }
 }
 
 /// What a training task does.
