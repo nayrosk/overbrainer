@@ -19,6 +19,7 @@ use super::motion::MotionLevel;
 use super::tasks::{Done, TaskId};
 use super::theme::{ColorLevel, LookEnv, Theme};
 use super::ui;
+use super::widgets::status::VERSION;
 use crate::cli::data::Command;
 use crate::dataset::{
     Dataset, Example, Exclusion, FinishReason, Id, Message, Meta, Question, ReasoningKind,
@@ -446,7 +447,13 @@ fn snapshot_at(name: &str, app: &mut App, width: u16, height: u16) -> Result<(),
     settings.set_snapshot_path(SNAPSHOTS);
     settings.set_prepend_module_to_snapshot(false);
     settings.set_omit_expression(true);
-    settings.bind(|| insta::assert_snapshot!(name.to_string(), terminal.backend()));
+    // The version changes at every release: its digits are masked, its width kept.
+    let masked: String = VERSION
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect();
+    let screen = terminal.backend().to_string().replace(VERSION, &masked);
+    settings.bind(|| insta::assert_snapshot!(name.to_string(), screen));
     Ok(())
 }
 

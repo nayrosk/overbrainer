@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "│                                                    ││                                                                │"
 "│                                                    ││                                                                │"
 "╰ / filter ──────────────────────────────────────────╯╰─────────────────────────────────────────────────────────── 3/3 ╯"
-" y delete · n, Esc or Enter cancel                                                                               ? help "
+" y delete · n, Esc or Enter cancel                                                                       v#.#.#  ? help "

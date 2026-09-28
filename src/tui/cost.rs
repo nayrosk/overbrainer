@@ -39,10 +39,6 @@ pub(super) fn history_cost(entries: &[Entry]) -> Option<Cost> {
 
 /// The project's cost so far: the history, the stage running (a finished one is
 /// in the history once reloaded), and every Runpod pod, live or deleted.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the footer shows it from the next commit")
-)]
 pub(super) fn project_cost(app: &App) -> Cost {
     let mut total = app.history_cost;
     for row in &app.pipeline.rows {
@@ -53,7 +49,11 @@ pub(super) fn project_cost(app: &App) -> Cost {
     for run in &app.training.runs {
         // A pod never created spent nothing.
         if run.pod.as_ref().is_some_and(|pod| pod.pod_id.is_some()) {
-            total = Some(add(total, estimated_spend(run, app.now)));
+            let latest = app
+                .training
+                .task_of(&run.record.id)
+                .and_then(|(_, follow)| follow.pod.as_ref());
+            total = Some(add(total, estimated_spend(run, latest, app.now)));
         }
     }
     total.unwrap_or_default()
@@ -65,10 +65,11 @@ mod tests {
     use crate::events::{Event, Stage, StageStats};
     use crate::history::{Cost, Entry, Span, Status};
     use crate::llm::Usage;
-    use crate::runpod::PodState;
+    use crate::runpod::{PodId, PodState, PodStatus};
     use crate::runs::RunState;
     use crate::tui::snapshots::{app, pod, run};
-    use crate::tui::training::RunRow;
+    use crate::tui::tasks::TaskId;
+    use crate::tui::training::{Follow, Job, RunRow};
 
     use super::*;
 
@@ -223,6 +224,31 @@ mod tests {
         assert_eq!(project_cost(&app), Cost::Partial(1.5));
         app.training.runs.remove(0);
         assert_eq!(project_cost(&app), Cost::Known(1.5));
+        Ok(())
+    }
+
+    #[test]
+    fn a_pod_rate_known_only_from_its_live_status_is_counted() -> TestResult {
+        let mut app = app();
+        let mut record = pod("r1")?;
+        record.cost_per_hour = None;
+        app.training.runs = vec![RunRow {
+            record: run("r1", "gpu_cloud", RunState::Running),
+            pod: Some(record),
+        }];
+        let mut follow = Follow::new(Job::Attach, "r1");
+        follow.pod = Some(PodStatus::Created {
+            pod_id: PodId::new("k3x9abc")?,
+            gpu_type: "NVIDIA GeForce RTX 4090".into(),
+            data_center: None,
+            cost_per_hour: Some(0.53),
+        });
+        app.training.tasks.insert(TaskId(4), follow);
+        // $0.53/h for 41 minutes, as the pod line shows it.
+        let Cost::Known(spend) = project_cost(&app) else {
+            return Err("the spend is not known".into());
+        };
+        assert!((spend - 0.53 * 41.0 / 60.0).abs() < 1e-9, "{spend}");
         Ok(())
     }
 

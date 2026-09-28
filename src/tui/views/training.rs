@@ -20,7 +20,9 @@ use crate::tui::app::App;
 use crate::tui::format::duration;
 use crate::tui::motion::Bar;
 use crate::tui::theme::Theme;
-use crate::tui::training::{Ended, Follow, RunActivity, RunRow, float, live_spend, progress};
+use crate::tui::training::{
+    Ended, Follow, RunActivity, RunRow, float, live_spend, pod_rate, progress,
+};
 use crate::tui::views::dataset::failed;
 use crate::tui::widgets::bar::bar;
 
@@ -347,10 +349,7 @@ fn deleted_line(
 /// and the watchdog's deadline, or no time limit for a kept pod.
 fn live_line(id: &str, record: &PodRecord, latest: Option<&PodStatus>, app: &App) -> String {
     let state = latest.map_or_else(|| record.state.name(), status_name);
-    let rate = record.cost_per_hour.or(match latest {
-        Some(PodStatus::Created { cost_per_hour, .. }) => *cost_per_hour,
-        _ => None,
-    });
+    let rate = pod_rate(record, latest);
     let mut text = format!("pod {id} {state}");
     if let Some(rate) = rate {
         write!(text, " ${rate:.2}/h").ok();

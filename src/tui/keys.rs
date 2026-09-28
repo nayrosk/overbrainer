@@ -37,6 +37,7 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
     row("?", "this help (Esc, ? or q closes it)"),
     row("q, Ctrl-C", "quit"),
     row("R", "reload the data files and runs"),
+    row("g", "open the overbrainer repository in a browser"),
     row("r", "run a pipeline stage, or run (asks which)"),
     row(
         "y, n Esc Enter",

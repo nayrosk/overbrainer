@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
-" y quit · n, Esc or Enter stay                                           … answers 120/400 · … saving · locked · ? help "
+" y quit · n, Esc or Enter stay                                   … answers 120/400 · … saving · locked · v#.#.#  ? help "

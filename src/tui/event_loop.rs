@@ -370,7 +370,7 @@ where
             },
             Effect::Cancel(id) => self.tasks.cancel(id),
             Effect::Abandon(id) => self.tasks.abandon(id),
-            Effect::Spawn(..) | Effect::OpenEditor { .. } => {},
+            Effect::Spawn(..) | Effect::OpenEditor { .. } | Effect::OpenUrl(_) => {},
         }
     }
 
@@ -481,8 +481,30 @@ where
             Effect::Cancel(id) => self.tasks.cancel(id),
             Effect::Abandon(id) => self.tasks.abandon(id),
             Effect::OpenEditor { command, path } => self.open_editor(&command, path).await?,
+            Effect::OpenUrl(url) => self.open_url(url),
         }
         Ok(())
+    }
+
+    /// Opens `url` in a browser, detached: no terminal I/O, never waited for.
+    /// The child is dropped at once and tokio reaps it in the background, so no
+    /// zombie is left and quitting never waits for it (`xdg-open` can run as
+    /// long as the browser it started). A failed start comes back as
+    /// [`Msg::BrowserFailed`].
+    fn open_url(&self, url: String) {
+        let started = tokio::process::Command::new(opener(cfg!(target_os = "macos")))
+            .arg(&url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match started {
+            Ok(child) => drop(child),
+            Err(error) => {
+                tracing::warn!("cannot open a browser on {url}: {error}");
+                self.messages.send(Msg::BrowserFailed(url)).ok();
+            },
+        }
     }
 
     /// Hands the terminal to the editor: stops reading input, drops the keys
@@ -542,6 +564,12 @@ where
             message => Ok(app.on_message(message)),
         }
     }
+}
+
+/// The program that opens a URL in the user's browser: `open` on macOS,
+/// `xdg-open` elsewhere.
+fn opener(macos: bool) -> &'static str {
+    if macos { "open" } else { "xdg-open" }
 }
 
 /// SIGINT, SIGTERM and SIGHUP: in raw mode they only come from outside (`kill`, a
@@ -641,6 +669,12 @@ mod tests {
 
     /// An upper bound only: a shared CI runner can be far slower than a laptop.
     const LIMIT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn the_browser_opener_is_open_on_macos_and_xdg_open_elsewhere() {
+        assert_eq!(opener(true), "open");
+        assert_eq!(opener(false), "xdg-open");
+    }
 
     #[tokio::test]
     async fn q_ends_the_loop_after_a_resize_is_drawn() -> Result<(), Box<dyn std::error::Error>> {

@@ -73,6 +73,9 @@ impl Project {
     }
 }
 
+/// The repository `g` opens.
+pub(super) const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+
 /// What the app asks the loop to do.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Effect {
@@ -89,6 +92,8 @@ pub(super) enum Effect {
         /// The file to edit.
         path: PathBuf,
     },
+    /// Open this URL in a browser, detached.
+    OpenUrl(String),
 }
 
 /// The four views, switched with `1` to `4`.
@@ -655,6 +660,10 @@ impl App {
         let id = match &message {
             Msg::Event(id, _) | Msg::Lagged(id, _) | Msg::Report(id, _) => *id,
             Msg::EditorExited(_) => return Vec::new(),
+            Msg::BrowserFailed(url) => {
+                self.say(Severity::Warn, format!("cannot open a browser: {url}"));
+                return Vec::new();
+            },
         };
         if self.training.is_training(id) {
             return self.on_training_message(id, message);
@@ -666,7 +675,9 @@ impl App {
             Msg::Event(_, event) => self.pipeline.event(&event),
             Msg::Lagged(_, skipped) => self.pipeline.skipped += skipped,
             Msg::Report(_, Report::Line(line)) => self.pipeline.results.push(line),
-            Msg::Report(_, Report::RunCreated(_)) | Msg::EditorExited(_) => {},
+            Msg::Report(_, Report::RunCreated(_))
+            | Msg::EditorExited(_)
+            | Msg::BrowserFailed(_) => {},
         }
         Vec::new()
     }
@@ -925,6 +936,7 @@ impl App {
             },
             KeyCode::Char('r') => self.run_menu(),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
+            KeyCode::Char('g') => return vec![Effect::OpenUrl(REPOSITORY.to_string())],
             KeyCode::Char('1') => return self.show(View::Dataset),
             KeyCode::Char('2') => return self.show(View::Pipeline),
             KeyCode::Char('3') => return self.show(View::Training),
@@ -1558,6 +1570,47 @@ mod tests {
         press(&mut app, &[KeyCode::Char('?'), KeyCode::Char('q')]);
         assert_eq!(app.overlay, None);
         assert_eq!(app.exit, None, "q closes the help, it does not quit");
+    }
+
+    #[test]
+    fn g_opens_the_repository_in_every_view() {
+        let mut app = app();
+        for view in View::ALL {
+            app.view = view;
+            assert_eq!(
+                press(&mut app, &[KeyCode::Char('g')]),
+                [Effect::OpenUrl(REPOSITORY.to_string())],
+                "{view:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn g_is_ignored_in_a_dialog_the_help_the_menu_and_the_filter() {
+        let mut app = dataset_app();
+        open_to(&mut app, &path_to(MOVED, true));
+        press(&mut app, &[KeyCode::Char('d')]);
+        assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
+        assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
+        assert_eq!(app.overlay, None, "as any key but y, g answers no");
+        app.overlay = Some(Overlay::Help);
+        assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
+        assert_eq!(app.overlay, Some(Overlay::Help), "the help stays");
+        app.overlay = Some(Overlay::Menu(0));
+        assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
+        assert_eq!(app.overlay, None, "as any other key, g closes the menu");
+        press(&mut app, &[KeyCode::Char('/'), KeyCode::Char('g')]);
+        assert_eq!(app.dataset.input.as_deref(), Some("g"), "g is typed");
+    }
+
+    #[test]
+    fn a_browser_that_cannot_start_is_said() {
+        let mut app = app();
+        let url = REPOSITORY.to_string();
+        assert_eq!(app.on_message(Msg::BrowserFailed(url.clone())), []);
+        let status = app.status.as_ref().map(|s| (s.severity, s.text.as_str()));
+        let said = format!("cannot open a browser: {url}");
+        assert_eq!(status, Some((Severity::Warn, said.as_str())));
     }
 
     #[test]

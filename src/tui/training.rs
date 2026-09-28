@@ -26,14 +26,28 @@ pub(super) fn live_spend(record: &PodRecord, rate: Option<f64>, now: SystemTime)
     Some(rate? * record.uptime(now)?.as_secs_f64() / 3600.0)
 }
 
+/// The rate of the pod of `record`, USD per hour: as recorded, else as its
+/// `latest` status gave it.
+pub(super) fn pod_rate(record: &PodRecord, latest: Option<&PodStatus>) -> Option<f64> {
+    record.cost_per_hour.or(match latest {
+        Some(PodStatus::Created { cost_per_hour, .. }) => *cost_per_hour,
+        _ => None,
+    })
+}
+
 /// What the pod of `row` spent by `now`: as recorded once deleted, else its rate
-/// times its uptime. `None` for a run without a pod, or when unknown.
-pub(super) fn estimated_spend(row: &RunRow, now: SystemTime) -> Option<f64> {
+/// (see [`pod_rate`]) times its uptime. `None` for a run without a pod, or when
+/// unknown.
+pub(super) fn estimated_spend(
+    row: &RunRow,
+    latest: Option<&PodStatus>,
+    now: SystemTime,
+) -> Option<f64> {
     let pod = row.pod.as_ref()?;
     if pod.state == PodState::Deleted {
         pod.estimated_spend
     } else {
-        live_spend(pod, pod.cost_per_hour, now)
+        live_spend(pod, pod_rate(pod, latest), now)
     }
 }
 

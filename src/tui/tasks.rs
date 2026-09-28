@@ -151,6 +151,8 @@ pub(super) struct Saved {
 pub(super) enum Msg {
     /// The editor ended, or could not be started.
     EditorExited(io::Result<ExitStatus>),
+    /// No browser could be started on this URL.
+    BrowserFailed(String),
     /// An event of a task's bus.
     Event(TaskId, Event),
     /// A task's forwarder fell behind and skipped this many events.
@@ -675,7 +677,7 @@ mod tests {
             Msg::Event(id, event) => Some(Msg::Event(*id, event.clone())),
             Msg::Lagged(id, skipped) => Some(Msg::Lagged(*id, *skipped)),
             Msg::Report(id, report) => Some(Msg::Report(*id, report.clone())),
-            Msg::EditorExited(_) => None,
+            Msg::EditorExited(_) | Msg::BrowserFailed(_) => None,
         }
     }
 
