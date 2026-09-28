@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
-" r run a stage · 1-5 views · q quit                                                          … loading · v#.#.#  ? help "
+" r run a stage · A auto · q quit · 1-5 views                                                 … loading · v#.#.#  ? help "

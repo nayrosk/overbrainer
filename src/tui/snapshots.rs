@@ -1084,8 +1084,9 @@ fn a_picker_whose_catalog_cannot_be_read() -> TestResult {
 fn the_run_menu() -> TestResult {
     let mut app = app();
     app.on_input(&key(KeyCode::Char('r')));
-    app.on_input(&key(KeyCode::Down));
-    app.on_input(&key(KeyCode::Down));
+    for _ in 0..3 {
+        app.on_input(&key(KeyCode::Down));
+    }
     snapshot("run_menu", &mut app)?;
     Ok(())
 }
@@ -1383,7 +1384,7 @@ fn the_help_note_fits_every_view_at_80x24() -> TestResult {
         app.view = view;
         let rows = text(&draw(&mut app, 80, 24)?).join("\n");
         assert!(
-            rows.contains("e, d, r and t are refused"),
+            rows.contains("e, d, r, A and t are refused"),
             "{view:?}\n{rows}"
         );
         assert!(

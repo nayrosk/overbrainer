@@ -17,6 +17,8 @@ pub const METRICS_FILE: &str = "metrics.jsonl";
 /// Axolotl's `output_dir`, relative to the run directory. The merged model, when
 /// `merge = true`, goes to its `merged/` subdirectory.
 pub const OUTPUT_DIR: &str = "output";
+/// Where Axolotl's `merge-lora` writes the merged model, relative to [`OUTPUT_DIR`].
+pub const MERGED_DIR: &str = "merged";
 /// Copies of `data/train.jsonl` and `data/eval.jsonl`, relative to the run directory.
 const TRAIN_FILE: &str = "data/train.jsonl";
 const EVAL_FILE: &str = "data/eval.jsonl";
@@ -30,6 +32,45 @@ const PREPARED_DIR: &str = "prepared";
 const REASONING_TEMPLATES: [&str; 5] = ["qwen3", "qwen3_5", "exaone4", "gemma4", "gemma4_unified"];
 /// Base model family whose own chat template is known to render `reasoning_content`.
 const REASONING_MODEL: &str = "qwen3";
+
+/// What a succeeded run leaves in its directory, from the `[training]` it ran
+/// with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outputs {
+    /// `training.adapter`: `full` leaves a whole model, not an adapter.
+    pub adapter: Adapter,
+    /// `training.merge`: a merged model too.
+    pub merge: bool,
+}
+
+impl Outputs {
+    /// The outputs of a run of `training`.
+    #[must_use]
+    pub fn of(training: &Training) -> Self {
+        Self {
+            adapter: training.adapter,
+            merge: training.merge,
+        }
+    }
+
+    /// Where the model of succeeded run `run_id` is, relative to the project
+    /// directory, each with what it is: the adapter (the model for `full`),
+    /// then the merged model with `merge = true`.
+    #[must_use]
+    pub fn paths(self, run_id: &str) -> Vec<(&'static str, String)> {
+        let output = format!("{}/{run_id}/{OUTPUT_DIR}", crate::runs::RUNS_DIR);
+        let what = if self.adapter == Adapter::Full {
+            "model"
+        } else {
+            "adapter"
+        };
+        let mut paths = vec![(what, output.clone())];
+        if self.merge && self.adapter != Adapter::Full {
+            paths.push(("merged model", format!("{output}/{MERGED_DIR}")));
+        }
+        paths
+    }
+}
 
 /// Fine-tunes with Axolotl from `data/train.jsonl`, evaluating on `data/eval.jsonl`.
 #[derive(Debug)]
@@ -324,5 +365,30 @@ pub fn reasoning_template_warning(training: &Training) -> Option<String> {
                 ))
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outputs_name_the_adapter_then_the_merged_model() {
+        let paths = |adapter, merge| Outputs { adapter, merge }.paths("r1");
+        assert_eq!(
+            paths(Adapter::Qlora, true),
+            [
+                ("adapter", "runs/r1/output".to_string()),
+                ("merged model", "runs/r1/output/merged".to_string()),
+            ]
+        );
+        assert_eq!(
+            paths(Adapter::Lora, false),
+            [("adapter", "runs/r1/output".to_string())]
+        );
+        assert_eq!(
+            paths(Adapter::Full, true),
+            [("model", "runs/r1/output".to_string())]
+        );
     }
 }

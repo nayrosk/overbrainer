@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 use crossterm::event::KeyCode;
 
 use super::app::{Action, App, Confirm, Effect, Exit, NoteOf, Overlay, Severity, View};
+use super::auto;
 use super::start::{self, Gpus, StartPlan};
 use super::tasks::{Msg, Task, TaskId, TrainJob};
 use super::training::{Detach, Ended, Follow, Job, Listing, RunActivity};
@@ -239,10 +240,12 @@ impl App {
     pub(super) fn start_catalog_read(&mut self, gpus: Gpus) {
         self.start_catalog = None;
         self.start_gpus = Some(gpus);
-        if let Some(Overlay::Confirm(confirm)) = &mut self.overlay
-            && let Action::Start(plan) = &confirm.action
-        {
-            confirm.text = start::text(plan, self.start_gpus.as_ref());
+        if let Some(Overlay::Confirm(confirm)) = &mut self.overlay {
+            match &confirm.action {
+                Action::Start(plan) => confirm.text = start::text(plan, self.start_gpus.as_ref()),
+                Action::Auto(plan) => confirm.text = auto::text(plan, self.start_gpus.as_ref()),
+                _ => {},
+            }
         }
     }
 
@@ -453,11 +456,27 @@ impl App {
         }
     }
 
+    /// Training task `id` ended with `result` (see [`App::run_ended`]); auto
+    /// mode ends when it was its run.
+    pub(super) fn trained(&mut self, id: TaskId, result: Result<(), String>) -> Vec<Effect> {
+        let run = self
+            .training
+            .tasks
+            .get(&id)
+            .map(|follow| follow.run_id.clone());
+        let error = result.as_ref().err().cloned();
+        let effects = self.run_ended(id, result);
+        if let Some(run) = run {
+            self.auto_trained(id, &run, error.as_deref());
+        }
+        effects
+    }
+
     /// Training task `id` ended with `result`. A cancel waiting for it starts,
     /// unless a signal came (an exit note then says how to cancel). While the
     /// TUI is leaving, what it reported and its error (a detached run's "keeps
     /// running ... attach") are kept for the exit.
-    pub(super) fn trained(&mut self, id: TaskId, result: Result<(), String>) -> Vec<Effect> {
+    fn run_ended(&mut self, id: TaskId, result: Result<(), String>) -> Vec<Effect> {
         let Some(follow) = self.training.tasks.remove(&id) else {
             return Vec::new();
         };

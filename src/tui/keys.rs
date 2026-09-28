@@ -27,7 +27,7 @@ const fn row(keys: &'static str, action: &'static str) -> KeyHelp {
 
 /// The note under the keys: what the data lock refuses, and the project lock the
 /// TUI holds.
-pub(super) const NOTE: &str = "e, d, r and t are refused while a stage, an edit or a training \
+pub(super) const NOTE: &str = "e, d, r, A and t are refused while a stage, an edit or a training \
                                start runs in this TUI; the TUI also holds the project lock, \
                                so no other overbrainer command writes to the project \
                                meanwhile.";
@@ -39,7 +39,7 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
     row("q, Ctrl-C", "quit"),
     row("R", "reload the data files and runs"),
     row("g", "open the overbrainer repository in a browser"),
-    row("r", "run a pipeline stage, or run (asks which)"),
+    row("r, A", "run auto or a stage (asks which); A: auto"),
     row(
         "y, n Esc Enter",
         "in a dialog: confirm, cancel (the default, n)",
@@ -88,6 +88,11 @@ const TRAINING: &[KeyHelp] = &[
         "choose GPU types, data centers (saved on y)",
     ),
 ];
+
+const PIPELINE: &[KeyHelp] = &[row(
+    "c, auto mode running",
+    "cancel its stage and the rest (asks first)",
+)];
 
 const LOGS: &[KeyHelp] = &[
     row("k j, Up Down, PgUp PgDn", "scroll"),
@@ -188,8 +193,9 @@ const FOOTER_DATASET: &[Hint] = &[
 ];
 const FOOTER_PIPELINE: &[Hint] = &[
     locking("r", "run a stage"),
-    hint("1-5", "views"),
+    locking("A", "auto"),
     hint("q", "quit"),
+    hint("1-5", "views"),
 ];
 const FOOTER_TRAINING: &[Hint] = &[
     hint("j/k", "select"),
@@ -290,7 +296,7 @@ pub(super) fn of(view: View) -> &'static [KeyHelp] {
         View::Dataset => DATASET,
         View::Training => TRAINING,
         View::Logs => LOGS,
-        View::Pipeline => &[],
+        View::Pipeline => PIPELINE,
     }
 }
 

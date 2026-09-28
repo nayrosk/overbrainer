@@ -20,7 +20,7 @@ use super::cost::history_cost;
 use super::editor::Edited;
 use super::project::ProjectConfig;
 use super::project_edit::{SaveRefusal, save_config};
-use super::start::{Gpus, StartPlan, list_gpus, prepare};
+use super::start::{AutoPlan, Gpus, StartPlan, list_gpus, prepare, prepare_auto};
 use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::{Command, Load};
 use crate::cli::front::{Frontend, Report};
@@ -65,6 +65,8 @@ pub(super) enum Task {
     Series(String),
     /// What a training run started now would use.
     Prepare,
+    /// What auto mode run now would do after split.
+    PrepareAuto,
     /// The Runpod GPU catalog for this many GPUs per pod, for the start
     /// dialog: list prices, VRAM and stock.
     StartCatalog(u32),
@@ -193,6 +195,8 @@ pub(super) enum Done {
     },
     /// What a training run started now would use, or why none can start.
     Prepared(Result<StartPlan, String>),
+    /// What auto mode would do after split, or why it cannot run.
+    PreparedAuto(Result<AutoPlan, String>),
     /// The GPU catalog of the start dialog, or why it cannot be read.
     StartCatalog(Gpus),
     /// A picker's entries, or why they cannot be read.
@@ -456,6 +460,27 @@ impl Tasks {
         self.set.is_empty()
     }
 
+    /// Prepares a training start, or auto mode when `auto`, off the UI
+    /// thread, on the configuration kept.
+    fn spawn_prepare(&mut self, auto: bool) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        let source = self.source.clone();
+        self.set.spawn(async move {
+            if auto {
+                let plan = tokio::task::spawn_blocking(move || prepare_auto(&dir, &source)).await;
+                return Done::PreparedAuto(match plan {
+                    Ok(plan) => plan,
+                    Err(error) => Err(format!("cannot prepare auto mode: {error}")),
+                });
+            }
+            let plan = tokio::task::spawn_blocking(move || prepare(&dir, &source)).await;
+            Done::Prepared(match plan {
+                Ok(plan) => plan,
+                Err(error) => Err(format!("cannot prepare the run: {error}")),
+            })
+        })
+    }
+
     /// Starts `task` as `id`.
     pub(super) fn spawn(&mut self, id: TaskId, task: Task) {
         let files = DataFiles::new(&self.project_dir);
@@ -521,17 +546,8 @@ impl Tasks {
                     }
                 })
             },
-            Task::Prepare => {
-                let dir = self.project_dir.clone();
-                let source = self.source.clone();
-                self.set.spawn(async move {
-                    let plan = tokio::task::spawn_blocking(move || prepare(&dir, &source)).await;
-                    Done::Prepared(match plan {
-                        Ok(plan) => plan,
-                        Err(error) => Err(format!("cannot prepare the run: {error}")),
-                    })
-                })
-            },
+            Task::Prepare => self.spawn_prepare(false),
+            Task::PrepareAuto => self.spawn_prepare(true),
             Task::StartCatalog(gpu_count) => {
                 let dir = self.project_dir.clone();
                 let source = self.source.clone();
@@ -1084,6 +1100,7 @@ mod tests {
             let mut effects = Vec::new();
             for code in [
                 KeyCode::Char('r'),
+                KeyCode::Down,
                 KeyCode::Down,
                 KeyCode::Down,
                 KeyCode::Down,

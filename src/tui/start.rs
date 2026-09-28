@@ -11,7 +11,7 @@ use serde::de::IgnoredAny;
 use crate::config::{Adapter, CONFIG_FILE, ListOrAuto, Runtime, Source, Target};
 use crate::dataset::{DataFiles, read};
 use crate::runpod::{Availability, GpuType, RunpodTarget, resolve};
-use crate::train::reasoning_template_warning;
+use crate::train::{Outputs, reasoning_template_warning};
 
 /// Total time the GPU catalog may take; the dialog never waits for it.
 pub(super) const START_CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
@@ -194,6 +194,33 @@ pub(super) fn prepare(dir: &Path, source: &Source) -> Result<StartPlan, String> 
     })
 }
 
+/// What auto mode would run after split.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct AutoPlan {
+    /// The run it starts, and what that run leaves; `None` without
+    /// `[training]`: auto mode stops after split.
+    pub(super) run: Option<(Box<StartPlan>, Outputs)>,
+}
+
+/// What auto mode run now in the project in `dir` would do after split, from
+/// its settings (read from `source`).
+///
+/// # Errors
+///
+/// Returns why it cannot run: the settings cannot be loaded, the training
+/// target is unknown, or the data cannot be read.
+pub(super) fn prepare_auto(dir: &Path, source: &Source) -> Result<AutoPlan, String> {
+    let settings = source.load(dir).map_err(|error| format!("{error:#}"))?;
+    let Some(training) = &settings.training else {
+        return Ok(AutoPlan { run: None });
+    };
+    let outputs = Outputs::of(training);
+    let plan = prepare(dir, source)?;
+    Ok(AutoPlan {
+        run: Some((Box::new(plan), outputs)),
+    })
+}
+
 /// The kind of `target`, never its host nor any key.
 fn kind(target: &Target) -> String {
     let runtime = |runtime: &Runtime| match runtime {
@@ -255,13 +282,25 @@ fn stock(gpu: &GpuType, centers: &[String]) -> Availability {
 /// The confirmation text of `plan`, with the GPU types of the catalog once
 /// looked up.
 pub(super) fn text(plan: &StartPlan, gpus: Option<&Gpus>) -> Vec<String> {
+    let data = format!(
+        "data        data/train.jsonl {} examples, data/eval.jsonl {}",
+        plan.train, plan.eval
+    );
+    lines(plan, gpus, data)
+}
+
+/// [`text`] for a run started once split has rebuilt the data, which it
+/// cannot count yet.
+pub(super) fn text_after_split(plan: &StartPlan, gpus: Option<&Gpus>) -> Vec<String> {
+    let data = "data        rebuilt by split just before the run".to_string();
+    lines(plan, gpus, data)
+}
+
+fn lines(plan: &StartPlan, gpus: Option<&Gpus>, data: String) -> Vec<String> {
     let mut text = vec![
         format!("target      {} ({})", plan.target, plan.kind),
         format!("model       {}", plan.model),
-        format!(
-            "data        data/train.jsonl {} examples, data/eval.jsonl {}",
-            plan.train, plan.eval
-        ),
+        data,
     ];
     // Before the GPU list: a dialog too tall for the terminal cuts after them.
     for warning in &plan.warnings {

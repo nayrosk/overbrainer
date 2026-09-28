@@ -175,7 +175,7 @@ mod tests {
         let shown = text(&terminal).last().cloned().unwrap_or_default();
         let right = format!("… answers 120/400 · locked · {VERSION}  ? help ");
         assert!(
-            shown.starts_with(" r run a stage · 1-5 views · q quit "),
+            shown.starts_with(" r run a stage · A auto · q quit "),
             "{shown}"
         );
         assert!(shown.ends_with(&right), "{shown}");
@@ -185,8 +185,12 @@ mod tests {
             "r is locked"
         );
         assert!(
-            !buffer[(17, 23)].modifier.contains(Modifier::CROSSED_OUT),
-            "1-5 is not"
+            buffer[(17, 23)].modifier.contains(Modifier::CROSSED_OUT),
+            "A is locked"
+        );
+        assert!(
+            !buffer[(26, 23)].modifier.contains(Modifier::CROSSED_OUT),
+            "q is not"
         );
         Ok(())
     }

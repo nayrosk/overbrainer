@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tracing::Level;
 
+use super::auto::Auto;
 use super::catalog::{CatalogKind, Listed, Query};
 use super::config_watch::ConfigWatch;
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
@@ -19,7 +20,7 @@ use super::motion::{Motion, MotionLevel};
 use super::pipeline::{PipelineView, STAGES, command_name};
 use super::project::{ProjectConfig, ProjectView};
 use super::project_edit::{Removal, SaveRefusal, editor_failure};
-use super::start::{Gpus, StartPlan};
+use super::start::{AutoPlan, Gpus, StartPlan};
 use super::tasks::{Done, Edit, History, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
 use super::training::TrainingView;
@@ -237,13 +238,46 @@ pub(super) struct Picked {
     pub(super) entries: Vec<Entry>,
 }
 
-/// The entries of the `r` menu: every pipeline command, all topics, no `--force`.
-pub(super) const MENU: [(Command, &str); 5] = [
-    (Command::Subtopics, "generate the missing subtopics"),
-    (Command::Questions, "fill the subtopics with questions"),
-    (Command::Answers, "ask the parent to answer (paid requests)"),
-    (Command::Split, "rebuild train and eval"),
-    (Command::Run, "all four stages; training starts only with t"),
+/// An entry of the `r` menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MenuEntry {
+    /// Auto mode: every stage, then training.
+    Auto,
+    /// A pipeline command.
+    Stage(Command),
+}
+
+impl MenuEntry {
+    /// Its name in the menu.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Stage(command) => command_name(command),
+        }
+    }
+}
+
+/// The entries of the `r` menu: auto mode, then every pipeline command, all
+/// topics, no `--force`.
+pub(super) const MENU: [(MenuEntry, &str); 6] = [
+    (MenuEntry::Auto, "every stage, then training (asks first)"),
+    (
+        MenuEntry::Stage(Command::Subtopics),
+        "generate the missing subtopics",
+    ),
+    (
+        MenuEntry::Stage(Command::Questions),
+        "fill the subtopics with questions",
+    ),
+    (
+        MenuEntry::Stage(Command::Answers),
+        "ask the parent to answer (paid requests)",
+    ),
+    (MenuEntry::Stage(Command::Split), "rebuild train and eval"),
+    (
+        MenuEntry::Stage(Command::Run),
+        "all four stages; training starts only with t",
+    ),
 ];
 
 /// A confirmation dialog: `y` runs its action, anything else closes it.
@@ -277,6 +311,10 @@ pub(super) enum Action {
     Cancel(String),
     /// Starting a training run as planned.
     Start(Box<StartPlan>),
+    /// Running auto mode as planned.
+    Auto(Box<AutoPlan>),
+    /// Cancelling auto mode: its stage and the rest of its chain.
+    CancelAuto,
     /// Abandoning Runpod runs still provisioning, when quitting.
     Abandon(Vec<TaskId>),
     /// Abandoning the Runpod start `0` still provisioning, asked for with `c`.
@@ -464,6 +502,8 @@ pub(super) struct App {
     seen_log: u64,
     /// What the TUI opens with.
     pub(super) opening: Opening,
+    /// Auto mode.
+    pub(super) auto: Auto,
 }
 
 /// What the TUI opens with.
@@ -538,6 +578,7 @@ impl App {
             dirty: true,
             exit: None,
             opening: Opening::Project,
+            auto: Auto::default(),
         }
     }
 
@@ -552,7 +593,8 @@ impl App {
     }
 
     /// What to do when the loop starts: have the tasks read the configuration
-    /// kept, if any, and load the data.
+    /// kept, if any, load the data, and prepare auto mode's confirmation when
+    /// the TUI opens with it.
     pub(super) fn start(&mut self) -> Vec<Effect> {
         let mut effects: Vec<Effect> = self
             .config
@@ -561,6 +603,9 @@ impl App {
             .into_iter()
             .collect();
         effects.extend(self.reload());
+        if self.opening == Opening::Auto {
+            effects.extend(self.ask_auto());
+        }
         effects
     }
 
@@ -636,6 +681,9 @@ impl App {
         if self.prepare.is_some() || self.start_catalog.is_some() {
             work.push("preparing a run".to_string());
         }
+        if self.auto.prepare.is_some() {
+            work.push("preparing auto mode".to_string());
+        }
         if let Some(Overlay::Picker(picking)) = &self.overlay
             && picking.picker.loading()
         {
@@ -700,6 +748,9 @@ impl App {
             Ok(Done::Runs(listing)) => self.listed(id, listing),
             Ok(Done::Series { run, series }) => self.series_read(id, run, series),
             Ok(Done::Prepared(plan)) if self.prepare == Some(id) => self.prepared(plan),
+            Ok(Done::PreparedAuto(plan)) if self.auto.prepare == Some(id) => {
+                self.auto_prepared(plan)
+            },
             Ok(Done::StartCatalog(gpus)) if self.start_catalog == Some(id) => {
                 self.start_catalog_read(gpus);
                 Vec::new()
@@ -712,7 +763,12 @@ impl App {
                 Vec::new()
             },
             Ok(Done::ConfigChecked(checked)) => self.config_checked(id, *checked),
-            Ok(Done::Prepared(_) | Done::StartCatalog(_) | Done::ConfigSaved(_)) => Vec::new(),
+            Ok(
+                Done::Prepared(_)
+                | Done::PreparedAuto(_)
+                | Done::StartCatalog(_)
+                | Done::ConfigSaved(_),
+            ) => Vec::new(),
             Err(error) => self.failed(id, error),
         }
     }
@@ -784,6 +840,9 @@ impl App {
         if self.prepare == Some(id) {
             return self.prepared(Err(error));
         }
+        if self.auto.prepare == Some(id) {
+            return self.auto_prepared(Err(error));
+        }
         if self.start_catalog == Some(id) {
             // The dialog never keeps waiting.
             self.start_catalog_read(Err(error));
@@ -854,9 +913,12 @@ impl App {
         self.pipeline.outcome = Some(outcome);
         self.leave_when_idle();
         if self.exit.is_some() {
+            self.auto_stage_ended();
             return Vec::new();
         }
-        self.reload()
+        let mut effects = self.reload();
+        effects.extend(self.auto_stage_ended());
+        effects
     }
 
     /// A message of a task: the events, lag and lines of a training task, or of
@@ -1021,8 +1083,10 @@ impl App {
             },
             KeyCode::Enter => {
                 self.overlay = None;
-                let (command, _) = MENU[selected.min(MENU.len() - 1)];
-                return self.run_pipeline(command);
+                return match MENU[selected.min(MENU.len() - 1)].0 {
+                    MenuEntry::Auto => self.ask_auto(),
+                    MenuEntry::Stage(command) => self.run_pipeline(command),
+                };
             },
             _ => self.overlay = None,
         }
@@ -1031,7 +1095,7 @@ impl App {
 
     /// Starts the pipeline `command` and shows the Pipeline view, unless the
     /// data is locked or the TUI is leaving.
-    fn run_pipeline(&mut self, command: Command) -> Vec<Effect> {
+    pub(super) fn run_pipeline(&mut self, command: Command) -> Vec<Effect> {
         if self.refuse_new("one task at a time", "stage") {
             return Vec::new();
         }
@@ -1271,6 +1335,9 @@ impl App {
                 return effects;
             },
             KeyCode::Char('r') => self.run_menu(),
+            KeyCode::Char('A') if matches!(self.view, View::Project | View::Pipeline) => {
+                return self.ask_auto();
+            },
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Char('g') => return vec![Effect::OpenUrl(REPOSITORY.to_string())],
             KeyCode::Char('1') => return self.show(View::Project),
@@ -1334,7 +1401,7 @@ impl App {
     /// Shows `view`; the Training view reads `runs/` again, and switching to the
     /// Dataset view reads the data files again while a stage runs. Leaving a
     /// view never touches a task.
-    fn show(&mut self, view: View) -> Vec<Effect> {
+    pub(super) fn show(&mut self, view: View) -> Vec<Effect> {
         let entered = self.view != view;
         self.view = view;
         match view {
@@ -1350,7 +1417,9 @@ impl App {
     fn close_overlay(&mut self) -> Option<Overlay> {
         let overlay = self.overlay.take();
         let start = match &overlay {
-            Some(Overlay::Confirm(confirm)) => matches!(confirm.action, Action::Start(_)),
+            Some(Overlay::Confirm(confirm)) => {
+                matches!(confirm.action, Action::Start(_) | Action::Auto(_))
+            },
             Some(Overlay::Picker(picking)) => matches!(picking.origin, Origin::Start(_)),
             _ => false,
         };
@@ -1389,6 +1458,8 @@ impl App {
             },
             Action::Cancel(run_id) => self.cancel_run(&run_id),
             Action::Start(plan) => self.confirm_start(plan),
+            Action::Auto(plan) => self.confirm_auto(*plan),
+            Action::CancelAuto => self.cancel_auto(),
             Action::Abandon(tasks) => self.abandon(&tasks),
             Action::AbandonStart(task) => self.abandon_start(task),
             Action::Remove(removal) => {
@@ -1422,7 +1493,7 @@ impl App {
             View::Dataset => return self.on_dataset_key(code),
             View::Training => return self.on_training_key(code),
             View::Logs => return self.on_logs_key(code),
-            View::Pipeline => {},
+            View::Pipeline => self.on_pipeline_key(code),
         }
         Vec::new()
     }
@@ -3199,9 +3270,14 @@ mod tests {
         let mut app = dataset_app();
         press(
             &mut app,
-            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Down],
+            &[
+                KeyCode::Char('r'),
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+            ],
         );
-        assert_eq!(app.overlay, Some(Overlay::Menu(2)));
+        assert_eq!(app.overlay, Some(Overlay::Menu(3)));
         let effects = press(&mut app, &[KeyCode::Enter]);
         let [Effect::Spawn(id, Task::Pipeline(Command::Answers))] = effects.as_slice() else {
             return assert_eq!(effects, []);
@@ -3290,7 +3366,7 @@ mod tests {
             )),
         );
         let mut keys = vec![KeyCode::Char('r')];
-        keys.extend([KeyCode::Down; 4]);
+        keys.extend([KeyCode::Down; 5]);
         keys.push(KeyCode::Enter);
         let effects = press(&mut app, &keys);
         let [Effect::Spawn(id, Task::Pipeline(Command::Run))] = effects.as_slice() else {
@@ -3372,7 +3448,12 @@ mod tests {
         let load = only_load(&app.start())?;
         let effects = press(
             &mut app,
-            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
+            &[
+                KeyCode::Char('r'),
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+            ],
         );
         let [Effect::Spawn(id, Task::Pipeline(_))] = effects.as_slice() else {
             return Err(format!("expected a stage: {effects:?}").into());
@@ -3405,7 +3486,12 @@ mod tests {
                 Ok(History::costing(Cost::Known(1.0))),
             )),
         );
-        let questions = [KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter];
+        let questions = [
+            KeyCode::Char('r'),
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Enter,
+        ];
         let [Effect::Spawn(first, Task::Pipeline(_))] = press(&mut app, &questions)[..] else {
             return Err("expected a stage".into());
         };
@@ -3434,7 +3520,12 @@ mod tests {
         let mut app = dataset_app();
         let effects = press(
             &mut app,
-            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
+            &[
+                KeyCode::Char('r'),
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+            ],
         );
         let [Effect::Spawn(id, Task::Pipeline(_))] = effects.as_slice() else {
             return assert_eq!(effects, []);
@@ -3473,7 +3564,12 @@ mod tests {
         let mut app = dataset_app();
         let effects = press(
             &mut app,
-            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
+            &[
+                KeyCode::Char('r'),
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+            ],
         );
         assert!(matches!(
             effects.as_slice(),
@@ -3501,7 +3597,12 @@ mod tests {
         let mut app = dataset_app();
         let effects = press(
             &mut app,
-            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
+            &[
+                KeyCode::Char('r'),
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+            ],
         );
         assert!(matches!(
             effects.as_slice(),
@@ -4826,7 +4927,7 @@ mod tests {
         ended(&mut app, TaskId(40), Err("a background task failed".into()));
         attach(&mut app)?;
         assert_eq!(app.exit_notes, [warning, "run: interrupted"]);
-        app.overlay = Some(Overlay::Menu(0));
+        app.overlay = Some(Overlay::Menu(1));
         keys(&mut app, &[KeyCode::Enter]);
         assert!(app.pipeline_task.is_some(), "the stage runs again");
         assert_eq!(app.exit_notes, [warning]);

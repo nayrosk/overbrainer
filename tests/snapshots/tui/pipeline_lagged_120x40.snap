@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
-" r run a stage · 1-5 views · q quit                                         … answers 120/400 · locked · v#.#.#  ? help "
+" r run a stage · A auto · q quit · 1-5 views                                … answers 120/400 · locked · v#.#.#  ? help "

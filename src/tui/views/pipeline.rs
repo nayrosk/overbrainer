@@ -10,6 +10,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::events::Stage;
 use crate::history::Cost;
 use crate::tui::app::App;
+use crate::tui::auto::{Chain, Mark};
 use crate::tui::cost::rows_cost;
 use crate::tui::format::hang;
 use crate::tui::motion::Bar;
@@ -24,7 +25,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let view = &app.pipeline;
     let area = area.inner(Margin::new(2, 0));
-    let [title_row, rows, _, rest] = Layout::vertical([
+    let [title_row, rows, chain_row, rest] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(4),
         Constraint::Length(1),
@@ -51,6 +52,9 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         let glyph = app.motion.spinner();
         render_row(frame, *row_area, (view, *stage), (glyph, shown), theme);
     }
+    if let Some(chain) = &app.auto.chain {
+        frame.render_widget(Paragraph::new(chain_line(chain, theme)), chain_row);
+    }
     // The oldest item failures give way first, so the summary lines and the
     // final error stay in view on a small terminal.
     let mut errors = view.errors.len();
@@ -63,6 +67,31 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         errors -= 1;
     };
     frame.render_widget(paragraph, rest);
+}
+
+/// Auto mode's chain: `auto  subtopics ✓ → questions ● → answers → split →
+/// train`, a stopped link marked `✗`.
+fn chain_line(chain: &Chain, theme: &Theme) -> Line<'static> {
+    let mut spans = vec![Span::styled("auto  ", theme.title)];
+    for (at, (name, mark)) in chain.links().into_iter().enumerate() {
+        if at > 0 {
+            spans.push(Span::styled(" → ", theme.dim));
+        }
+        let (glyph, style) = match mark {
+            Mark::Pending => ("", theme.dim),
+            Mark::Running => (" ●", theme.accent),
+            Mark::Done => (" ✓", theme.ok),
+            Mark::Stopped => (" ✗", theme.error),
+        };
+        let name_style = if mark == Mark::Pending {
+            theme.dim
+        } else {
+            Style::new()
+        };
+        spans.push(Span::styled(name, name_style));
+        spans.push(Span::styled(glyph, style));
+    }
+    Line::from(spans)
 }
 
 /// The glyph, name, bar, count and counts columns of a row.
