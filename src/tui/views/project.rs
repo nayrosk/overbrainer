@@ -47,7 +47,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = pane(theme.border).title(Span::styled(" stats ", theme.title));
     let inner = block.inner(right);
     frame.render_widget(block, right);
-    let lines = stat_lines(&project::stats(app), inner.width, &theme);
+    let lines = stat_lines(&project::stats(app), (inner.width, inner.height), &theme);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -158,45 +158,124 @@ fn field_line(
     }
 }
 
-/// The stats as lines `width` columns wide, a blank line before each group
-/// but the first.
-fn stat_lines(stats: &[Stat], width: u16, theme: &Theme) -> Vec<Line<'static>> {
+/// The lines of one stat, `width` columns wide: a pair whose label or value
+/// does not fit beside the other takes two.
+fn stat_line(stat: &Stat, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    match stat {
+        Stat::Heading(text) => vec![Line::from(Span::styled(cut(text, width), theme.title))],
+        Stat::Note(text) => vec![Line::from(Span::styled(
+            cut(&format!("  {text}"), width),
+            theme.dim,
+        ))],
+        Stat::Pair(label, value)
+            if label.chars().count() > LABEL_WIDTH
+                || LABEL_WIDTH + 3 + value.chars().count() > width =>
+        {
+            let indent = " ".repeat((LABEL_WIDTH + 3).min(width / 3));
+            vec![
+                Line::from(Span::styled(cut(&format!("  {label}"), width), theme.dim)),
+                Line::from(cut(&format!("{indent}{value}"), width)),
+            ]
+        },
+        Stat::Pair(label, value) => {
+            let label = format!("  {label:<LABEL_WIDTH$} ");
+            let value = cut(value, width.saturating_sub(label.chars().count()));
+            vec![Line::from(vec![
+                Span::styled(label, theme.dim),
+                Span::raw(value),
+            ])]
+        },
+    }
+}
+
+/// The stats in `width` columns and `height` rows, a blank line between two
+/// groups when all fit with them. A group shows only with its heading and at
+/// least its first stat, and a stat never loses its second line: what does
+/// not fit is left out, never a lone heading.
+fn stat_lines(stats: &[Stat], (width, height): (u16, u16), theme: &Theme) -> Vec<Line<'static>> {
     let width = usize::from(width);
-    let mut lines = Vec::new();
+    let height = usize::from(height);
+    let mut groups: Vec<Vec<Vec<Line<'static>>>> = Vec::new();
     for stat in stats {
-        match stat {
-            Stat::Heading(text) => {
-                if !lines.is_empty() {
-                    lines.push(Line::from(""));
-                }
-                lines.push(Line::from(Span::styled(cut(text, width), theme.title)));
-            },
-            Stat::Note(text) => {
-                lines.push(Line::from(Span::styled(
-                    cut(&format!("  {text}"), width),
-                    theme.dim,
-                )));
-            },
-            Stat::Pair(label, value)
-                if label.chars().count() > LABEL_WIDTH
-                    || LABEL_WIDTH + 3 + value.chars().count() > width =>
-            {
-                lines.push(Line::from(Span::styled(
-                    cut(&format!("  {label}"), width),
-                    theme.dim,
-                )));
-                let indent = " ".repeat((LABEL_WIDTH + 3).min(width / 3));
-                lines.push(Line::from(cut(&format!("{indent}{value}"), width)));
-            },
-            Stat::Pair(label, value) => {
-                let label = format!("  {label:<LABEL_WIDTH$} ");
-                let value = cut(value, width.saturating_sub(label.chars().count()));
-                lines.push(Line::from(vec![
-                    Span::styled(label, theme.dim),
-                    Span::raw(value),
-                ]));
-            },
+        let lines = stat_line(stat, width, theme);
+        match (stat, groups.last_mut()) {
+            (Stat::Heading(_), _) | (_, None) => groups.push(vec![lines]),
+            (_, Some(group)) => group.push(lines),
+        }
+    }
+    let count = |group: &Vec<Vec<Line>>| group.iter().map(Vec::len).sum::<usize>();
+    let blanks = groups.iter().map(count).sum::<usize>() + groups.len().saturating_sub(1) <= height;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for group in groups {
+        let blank = usize::from(blanks && !lines.is_empty());
+        let mut room = height.saturating_sub(lines.len() + blank);
+        let first = group.iter().take(2).map(Vec::len).sum::<usize>();
+        if first > room {
+            continue;
+        }
+        if blank == 1 {
+            lines.push(Line::from(""));
+        }
+        for stat in group {
+            if stat.len() > room {
+                break;
+            }
+            room -= stat.len();
+            lines.extend(stat);
         }
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::theme::ColorLevel;
+
+    fn texts(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(ToString::to_string).collect()
+    }
+
+    fn stats() -> Vec<Stat> {
+        let pair = |label: &str, value: &str| Stat::Pair(label.into(), value.into());
+        vec![
+            Stat::Heading("cost"),
+            pair("all", "$1"),
+            Stat::Heading("dataset"),
+            pair("topics", "2"),
+            pair("questions", "6"),
+            Stat::Heading("models"),
+            pair("a-model-with-a-long-name", "$1"),
+            pair("gen", "$0"),
+        ]
+    }
+
+    #[test]
+    fn groups_are_parted_by_a_blank_line_when_all_fit() {
+        let theme = Theme::new(ColorLevel::TrueColor);
+        let lines = texts(&stat_lines(&stats(), (30, 11), &theme));
+        assert_eq!(lines.len(), 11, "{lines:?}");
+        assert_eq!((lines[2].as_str(), lines[6].as_str()), ("", ""));
+    }
+
+    #[test]
+    fn short_on_rows_the_blanks_go_then_whole_stats() {
+        let theme = Theme::new(ColorLevel::TrueColor);
+        let lines = texts(&stat_lines(&stats(), (30, 10), &theme));
+        assert_eq!(lines.len(), 9, "{lines:?}");
+        assert!(!lines.contains(&String::new()), "{lines:?}");
+        let lines = texts(&stat_lines(&stats(), (30, 8), &theme));
+        assert_eq!(lines.len(), 8, "{lines:?}");
+        assert_eq!(
+            lines.last().map(|line| line.trim()),
+            Some("$1"),
+            "the long model name and its value go together: {lines:?}"
+        );
+        let lines = texts(&stat_lines(&stats(), (30, 7), &theme));
+        assert!(
+            !lines.iter().any(|line| line == "models"),
+            "no heading without a stat under it: {lines:?}"
+        );
+        assert_eq!(lines.len(), 5);
+    }
 }
