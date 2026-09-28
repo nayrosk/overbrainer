@@ -381,7 +381,7 @@ where
     }
 
     /// Runs `effect` once the loop ended: a training task or an edit starts
-    /// (never lost, never cut, with the environment of the last reload), a
+    /// (never lost, never cut, with the configuration the app keeps), a
     /// token is cancelled, a task abandoned; a
     /// reading, a stage or the editor does not start any more, nor a new run
     /// (the app notes it was not started), and a browser to open or a logs
@@ -397,7 +397,7 @@ where
             },
             Effect::Cancel(id) => self.tasks.cancel(id),
             Effect::Abandon(id) => self.tasks.abandon(id),
-            Effect::UseEnv(env) => self.tasks.use_env(env),
+            Effect::UseConfig(source) => self.tasks.use_config(source),
             Effect::Spawn(..)
             | Effect::OpenEditor { .. }
             | Effect::OpenUrl(_)
@@ -511,7 +511,7 @@ where
             Effect::Spawn(id, task) => self.tasks.spawn(id, task),
             Effect::Cancel(id) => self.tasks.cancel(id),
             Effect::Abandon(id) => self.tasks.abandon(id),
-            Effect::UseEnv(env) => self.tasks.use_env(env),
+            Effect::UseConfig(source) => self.tasks.use_config(source),
             Effect::OpenEditor { command, path } => self.open_editor(&command, path).await?,
             Effect::OpenUrl(url) => self.open_url(url),
             Effect::ExportLogs { name, lines } => self.export_logs(name, lines),

@@ -25,7 +25,7 @@ use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::{Command, Load};
 use crate::cli::front::{Frontend, Report};
 use crate::cli::{StageArgs, TrainArgs, TrainCommand};
-use crate::config::{DotenvKeys, EnvSource, ReloadError, Stamp, reload, stamp};
+use crate::config::{DotenvKeys, EnvSource, ReloadError, Source, Stamp, reload, stamp};
 use crate::dataset::{Counts, DataFiles, Dataset, Deletion};
 use crate::events::{Event, EventBus, Stage};
 use crate::history::{self, Cost, Entry, Total};
@@ -335,16 +335,16 @@ fn front_end(
 }
 
 /// Applies `edit` to the files of the project in `project_dir`, freshly read,
-/// then rewrites train and eval with `split`, with the settings of `env` (a
+/// then rewrites train and eval with `split`, with the settings of `source` (a
 /// configuration error refuses the edit before anything is written).
 ///
 /// # Errors
 ///
 /// Returns why nothing changed: the settings cannot be loaded, the files cannot
 /// be read or written, or the edit is refused.
-pub(super) fn save(project_dir: &Path, edit: &Edit, env: EnvSource) -> Result<Saved, String> {
+pub(super) fn save(project_dir: &Path, edit: &Edit, source: &Source) -> Result<Saved, String> {
     let error = |error: anyhow::Error| format!("{error:#}");
-    let settings = crate::config::load(project_dir, env).map_err(|e| error(e.into()))?;
+    let settings = source.load(project_dir).map_err(|e| error(e.into()))?;
     let files = DataFiles::new(project_dir);
     let mut data = Dataset::read(&files).map_err(|e| error(e.into()))?;
     let change = match edit {
@@ -385,8 +385,9 @@ pub(super) struct Tasks {
     /// The catalog lookups running: only reads, aborted when
     /// the TUI ends.
     lookups: HashMap<TaskId, AbortHandle>,
-    /// The environment the tasks started from now read the settings with.
-    env: EnvSource,
+    /// Where the tasks started from now read the settings: the configuration
+    /// the app keeps, never a file it has not validated.
+    source: Source,
 }
 
 impl Tasks {
@@ -401,14 +402,14 @@ impl Tasks {
             tokens: HashMap::new(),
             abandons: HashMap::new(),
             lookups: HashMap::new(),
-            env: EnvSource::Process,
+            source: Source::from(EnvSource::Process),
         }
     }
 
-    /// Has the tasks started from now read the settings with `env`; those
+    /// Has the tasks started from now read the settings from `source`; those
     /// running keep the settings they read.
-    pub(super) fn use_env(&mut self, env: EnvSource) {
-        self.env = env;
+    pub(super) fn use_config(&mut self, source: Source) {
+        self.source = source;
     }
 
     /// The project directory tasks are spawned for.
@@ -476,9 +477,10 @@ impl Tasks {
             },
             Task::Edit(edit) => {
                 let dir = self.project_dir.clone();
-                let env = self.env.clone();
+                let source = self.source.clone();
                 self.set.spawn(async move {
-                    let saved = tokio::task::spawn_blocking(move || save(&dir, &edit, env)).await;
+                    let saved =
+                        tokio::task::spawn_blocking(move || save(&dir, &edit, &source)).await;
                     Done::Saved(match saved {
                         Ok(saved) => saved,
                         Err(error) => Err(format!("the edit failed: {error}")),
@@ -512,9 +514,9 @@ impl Tasks {
             },
             Task::Prepare => {
                 let dir = self.project_dir.clone();
-                let env = self.env.clone();
+                let source = self.source.clone();
                 self.set.spawn(async move {
-                    let plan = tokio::task::spawn_blocking(move || prepare(&dir, env)).await;
+                    let plan = tokio::task::spawn_blocking(move || prepare(&dir, &source)).await;
                     Done::Prepared(match plan {
                         Ok(plan) => plan,
                         Err(error) => Err(format!("cannot prepare the run: {error}")),
@@ -523,18 +525,17 @@ impl Tasks {
             },
             Task::StartCatalog(gpu_count) => {
                 let dir = self.project_dir.clone();
-                let env = self.env.clone();
+                let source = self.source.clone();
                 self.spawn_lookup(id, async move {
-                    Done::StartCatalog(list_gpus(&dir, env, gpu_count).await)
+                    Done::StartCatalog(list_gpus(&dir, source, gpu_count).await)
                 })
             },
             Task::Catalog(query) => {
                 let dir = self.project_dir.clone();
-                let env = self.env.clone();
-                self.spawn_lookup(
-                    id,
-                    async move { Done::Catalog(fetch(&dir, env, query).await) },
-                )
+                let source = self.source.clone();
+                self.spawn_lookup(id, async move {
+                    Done::Catalog(fetch(&dir, source, query).await)
+                })
             },
         };
         self.ids.insert(handle.id(), id);
@@ -587,7 +588,7 @@ impl Tasks {
     /// Starts the pipeline `command` as `id`: its token interrupts the stage.
     fn spawn_pipeline(&mut self, id: TaskId, command: Command) -> AbortHandle {
         let dir = self.project_dir.clone();
-        let env = self.env.clone();
+        let source = self.source.clone();
         let token = CancellationToken::new();
         let abandon = Arc::new(AtomicBool::new(false));
         let (front, forwarder) = front_end(id, &self.messages, &token, &abandon);
@@ -595,9 +596,10 @@ impl Tasks {
         self.set.spawn(async move {
             let args = StageArgs::default();
             // The flow ends itself when the token is cancelled, recording the stage.
-            let outcome = crate::cli::data::run(&dir, command, &args, &front, Load::Env(&env))
-                .await
-                .map_err(|error| format!("{error:#}"));
+            let outcome =
+                crate::cli::data::run(&dir, command, &args, &front, Load::Source(&source))
+                    .await
+                    .map_err(|error| format!("{error:#}"));
             forwarded(front, forwarder, "stage").await;
             Done::Pipeline(outcome)
         })
@@ -607,7 +609,7 @@ impl Tasks {
     /// its abandon flag makes a Runpod provisioning delete its pod.
     fn spawn_train(&mut self, id: TaskId, job: TrainJob) -> AbortHandle {
         let dir = self.project_dir.clone();
-        let env = self.env.clone();
+        let source = self.source.clone();
         let token = CancellationToken::new();
         let abandon = Arc::new(AtomicBool::new(false));
         let (front, forwarder) = front_end(id, &self.messages, &token, &abandon);
@@ -616,7 +618,7 @@ impl Tasks {
         self.set.spawn(async move {
             // Never aborted: the flow shields its starts and cancels, and only
             // its token detaches it.
-            let result = crate::cli::train::run(&dir, &job.args(), &front, &env).await;
+            let result = crate::cli::train::run(&dir, &job.args(), &front, &source).await;
             forwarded(front, forwarder, "training").await;
             Done::Trained(result.map_err(|error| format!("{error:#}")))
         })
@@ -725,7 +727,7 @@ mod tests {
                 vec![("OVERBRAINER_HF_TOKEN".to_string(), "hf_x".to_string())],
             ),
         ] {
-            tasks.use_env(EnvSource::Vars(env));
+            tasks.use_config(Source::from(EnvSource::Vars(env)));
             tasks.spawn(id, Task::Prepare);
             let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
             let Some((ended, Ok(Done::Prepared(Ok(plan))))) = next else {
@@ -835,7 +837,11 @@ mod tests {
             before: MOVED.into(),
             text: "What happens to a borrow after a move?".into(),
         });
-        let saved = save(dir.path(), &edit, EnvSource::Vars(Vec::new()))?;
+        let saved = save(
+            dir.path(),
+            &edit,
+            &Source::from(EnvSource::Vars(Vec::new())),
+        )?;
         assert_eq!(
             saved.message,
             "question saved; its old answer was deleted: 1 question unanswered, run answers to answer it"
@@ -869,7 +875,14 @@ mod tests {
                 answers: 1,
             },
         };
-        assert!(save(dir.path(), &edit, EnvSource::Vars(Vec::new())).is_err());
+        assert!(
+            save(
+                dir.path(),
+                &edit,
+                &Source::from(EnvSource::Vars(Vec::new()))
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(&files.answers)?, before);
         assert!(!files.train.exists());
         Ok(())

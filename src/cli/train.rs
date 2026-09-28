@@ -10,7 +10,7 @@ use super::progress::status_name;
 use super::reload::Reloader;
 use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
-use crate::config::{DEFAULT_WORKDIR, EnvSource, Settings, Target, Training};
+use crate::config::{DEFAULT_WORKDIR, Settings, Source, Target, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{PodRecord, RunpodTarget};
@@ -23,7 +23,7 @@ use crate::train::{Axolotl, OUTPUT_DIR, reasoning_template_warning};
 pub(super) const POLL: Duration = Duration::from_secs(2);
 
 /// Runs `overbrainer train` or one of its subcommands, for `front`, with the
-/// settings read with `env`.
+/// settings of `source`.
 ///
 /// # Errors
 ///
@@ -33,11 +33,11 @@ pub async fn run(
     project_dir: &Path,
     args: &TrainArgs,
     front: &Frontend,
-    env: &EnvSource,
+    source: &Source,
 ) -> anyhow::Result<()> {
     match &args.command {
         None => {
-            let settings = crate::config::load(project_dir, env.clone())?;
+            let settings = source.load(project_dir)?;
             train(
                 project_dir,
                 &settings,
@@ -47,8 +47,10 @@ pub async fn run(
             )
             .await
         },
-        Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id, front, env).await,
-        Some(TrainCommand::Cancel { run_id }) => cancel_run(project_dir, run_id, front, env).await,
+        Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id, front, source).await,
+        Some(TrainCommand::Cancel { run_id }) => {
+            cancel_run(project_dir, run_id, front, source).await
+        },
     }
 }
 
@@ -159,9 +161,9 @@ async fn attach(
     project_dir: &Path,
     run_id: &str,
     front: &Frontend,
-    env: &EnvSource,
+    source: &Source,
 ) -> anyhow::Result<()> {
-    let settings = crate::config::load(project_dir, env.clone())?;
+    let settings = source.load(project_dir)?;
     let training = training(&settings)?;
     let runs = Runs::new(project_dir);
     let record = runs.load(run_id)?;
@@ -191,9 +193,9 @@ async fn cancel_run(
     project_dir: &Path,
     run_id: &str,
     front: &Frontend,
-    env: &EnvSource,
+    source: &Source,
 ) -> anyhow::Result<()> {
-    let settings = crate::config::load(project_dir, env.clone())?;
+    let settings = source.load(project_dir)?;
     let runs = Runs::new(project_dir);
     let record = runs.load(run_id)?;
     match (record.state, record.job.is_some()) {

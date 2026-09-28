@@ -12,7 +12,7 @@ use super::front::Frontend;
 use super::record::Recorder;
 use super::reload::Reloader;
 use super::{LazyVault, StageArgs};
-use crate::config::{EnvSource, RoleModel, Settings};
+use crate::config::{RoleModel, Settings, Source};
 use crate::dataset::{DataFiles, Subtopic, read};
 use crate::dedup::{Embedding, Layered, Lexical};
 use crate::events::{EventBus, Stage, StageStats};
@@ -42,8 +42,8 @@ type Client = RoleClient<ProtocolClient>;
 
 /// How a pipeline command reads its settings.
 pub(crate) enum Load<'a> {
-    /// Once, with this environment.
-    Env(&'a EnvSource),
+    /// Once, from this source.
+    Source(&'a Source),
     /// With the environment of this reloader, and, for `run`, again before
     /// each stage after the first when the files changed (on the command line).
     Reload(&'a mut Reloader),
@@ -63,8 +63,8 @@ struct Session {
 }
 
 impl Session {
-    fn open(project_dir: &Path, env: &EnvSource) -> anyhow::Result<Self> {
-        let settings = crate::config::load(project_dir, env.clone())?;
+    fn open(project_dir: &Path, source: &Source) -> anyhow::Result<Self> {
+        let settings = source.load(project_dir)?;
         Ok(Self::new(project_dir, settings))
     }
 
@@ -176,11 +176,11 @@ pub async fn run(
     front: &Frontend,
     load: Load<'_>,
 ) -> anyhow::Result<()> {
-    let (env, reloader) = match load {
-        Load::Env(env) => (env.clone(), None),
-        Load::Reload(reloader) => (reloader.env().clone(), Some(reloader)),
+    let (source, reloader) = match load {
+        Load::Source(source) => (source.clone(), None),
+        Load::Reload(reloader) => (Source::from(reloader.env().clone()), Some(reloader)),
     };
-    let session = Session::open(project_dir, &env)?;
+    let session = Session::open(project_dir, &source)?;
     let guard = front.open_bus();
     let mut recorder = Recorder::new(project_dir, &guard.bus);
     let steps = Steps {

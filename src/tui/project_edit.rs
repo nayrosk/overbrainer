@@ -1112,12 +1112,13 @@ impl App {
         match saved {
             Ok(config) => {
                 self.project_view.pending = None;
-                self.adopt(*config);
+                let used = self.adopt(*config);
                 if self.leaving.is_some() {
                     self.exit_notes.push(format!("{CONFIG_FILE} was saved"));
                 }
                 self.say(Severity::Info, format!("✓ saved {CONFIG_FILE}"));
-                effects = self.reload();
+                effects = vec![used];
+                effects.extend(self.reload());
                 match start {
                     Some(_) if self.leaving.is_some() => {
                         self.exit_notes.push(NOT_STARTED.to_string());
@@ -1162,16 +1163,19 @@ impl App {
 
     /// Makes `config`, just read from `overbrainer.toml`, the configuration:
     /// the project follows it, the errors shown go, and the look at the files
-    /// takes its stamp, so it reads them again only once they change. A save
-    /// and a reload both end here.
-    pub(super) fn adopt(&mut self, config: ProjectConfig) {
+    /// takes its stamp, so it reads them again only once they change; the
+    /// returned effect has the next tasks read their settings from it, with
+    /// the environment of the app. A save, a reload and `E` all end here.
+    pub(super) fn adopt(&mut self, config: ProjectConfig) -> Effect {
         let dir = self.project.dir.clone();
         self.project = Project::new(&dir, &config.settings);
         self.project_view.errors.clear();
         if let (Some(watch), Some(stamp)) = (self.watch.as_mut(), config.stamp) {
             watch.seen(stamp);
         }
+        let used = self.use_config(&config);
         self.set_config(config);
+        used
     }
 
     /// Shows each of `problems` on the field it names, and selects the first.
@@ -1305,7 +1309,7 @@ impl App {
             .as_ref()
             .is_some_and(|shown| shown.text == config.text);
         config.stamp = Some(read_at);
-        self.adopt(config);
+        let used = self.adopt(config);
         let what = if unchanged {
             format!("{CONFIG_FILE} unchanged")
         } else {
@@ -1323,7 +1327,9 @@ impl App {
             said = format!("{said}; {text}");
         }
         self.say(severity, said);
-        self.reload()
+        let mut effects = vec![used];
+        effects.extend(self.reload());
+        effects
     }
 }
 

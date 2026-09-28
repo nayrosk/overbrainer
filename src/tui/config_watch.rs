@@ -113,8 +113,8 @@ impl App {
     /// stay, made on the old file.
     fn reloaded(&mut self, reread: Reread) -> Vec<Effect> {
         let Reread { config, env } = reread;
-        self.adopt(config);
-        self.env = env.clone();
+        self.env = env;
+        let used = self.adopt(config);
         let said = if self.project_view.pending.is_some() {
             "✓ config reloaded; the pending changes are on the old file: drop them (u), then \
              make them again"
@@ -122,7 +122,7 @@ impl App {
             "✓ config reloaded"
         };
         self.say(Severity::Info, said);
-        let mut effects = vec![Effect::UseEnv(env)];
+        let mut effects = vec![used];
         effects.extend(self.reload());
         effects
     }
@@ -153,14 +153,14 @@ mod tests {
     use crossterm::event::KeyCode;
 
     use super::*;
-    use crate::config::{DOTENV_FILE, stamp};
+    use crate::config::{DOTENV_FILE, EnvSource, Source, stamp};
     use crate::tui::app::View;
     use crate::tui::project::{Pending, ProjectConfig};
     use crate::tui::project_edit::save_config;
     use crate::tui::snapshots::{
         NOW, PROJECT_CONFIG, SECRET, at, draw, key, project_app, project_env, text,
     };
-    use crate::tui::tasks::{Done, check_config};
+    use crate::tui::tasks::{Done, Tasks, check_config};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -189,14 +189,23 @@ mod tests {
     /// What a look finds in `dir` once `text` replaced `overbrainer.toml`,
     /// read with the environment of the fixtures.
     fn rewritten(dir: &Path, text: &str) -> Result<Checked, Box<dyn std::error::Error>> {
+        rewritten_with(dir, text, &project_env())
+    }
+
+    /// [`rewritten`], read with `env`.
+    fn rewritten_with(
+        dir: &Path,
+        text: &str,
+        env: &EnvSource,
+    ) -> Result<Checked, Box<dyn std::error::Error>> {
         fs::write(dir.join(CONFIG_FILE), text)?;
         let now = stamp(dir);
-        let read = ProjectConfig::new(text, &project_env())
+        let read = ProjectConfig::new(text, env)
             .map(|mut config| {
                 config.stamp = Some(now);
                 Reread {
                     config,
-                    env: project_env(),
+                    env: env.clone(),
                 }
             })
             .map_err(ReloadError::from);
@@ -226,7 +235,11 @@ mod tests {
             )?))),
         );
         assert!(
-            matches!(effects.as_slice(), [Effect::UseEnv(env), Effect::Spawn(_, Task::Load)] if *env == project_env()),
+            matches!(
+                effects.as_slice(),
+                [Effect::UseConfig(Source { text: Some(text), env }), Effect::Spawn(_, Task::Load)]
+                    if *text == renamed && *env == project_env()
+            ),
             "{effects:?}"
         );
         assert_eq!(status(&app), "✓ config reloaded");
@@ -291,6 +304,32 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn after_a_refused_reload_the_next_task_runs_on_the_kept_configuration() -> TestResult {
+        let (dir, mut app) = watched()?;
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
+        let mut apply = |effects: Vec<Effect>| {
+            for effect in effects {
+                if let Effect::UseConfig(source) = effect {
+                    tasks.use_config(source);
+                }
+            }
+        };
+        apply(app.start());
+        let (id, _) = tick(&mut app, NOW)?;
+        let invalid = PROJECT_CONFIG.replace("subtopics = 2", "subtopics = 0");
+        let checked = rewritten(dir.path(), &invalid)?;
+        apply(app.on_done(id, Ok(Done::ConfigChecked(Box::new(checked)))));
+        assert!(status(&app).starts_with('✗'), "{}", status(&app));
+        tasks.spawn(TaskId(500), Task::Prepare);
+        let next = tokio::time::timeout(std::time::Duration::from_secs(30), tasks.next()).await?;
+        let Some((TaskId(500), Ok(Done::Prepared(Ok(plan))))) = next else {
+            return Err(format!("not run on the kept configuration: {next:?}").into());
+        };
+        assert_eq!(plan.target, "gpu_cloud");
+        Ok(())
+    }
+
     #[test]
     fn a_broken_env_file_is_said_by_its_line_only() -> TestResult {
         let (dir, mut app) = watched()?;
@@ -314,11 +353,17 @@ mod tests {
         app.pipeline_task = Some(TaskId(90));
         let (id, _) = tick(&mut app, NOW)?;
         let changed = PROJECT_CONFIG.replace("concurrency = 16", "concurrency = 12");
+        let EnvSource::Vars(mut vars) = project_env() else {
+            return Err("the fixtures' env is a list".into());
+        };
+        vars.push(("OVERBRAINER_PIPELINE__SEED".into(), "99".into()));
+        let env = EnvSource::Vars(vars);
         let effects = app.on_done(
             id,
-            Ok(Done::ConfigChecked(Box::new(rewritten(
+            Ok(Done::ConfigChecked(Box::new(rewritten_with(
                 dir.path(),
                 &changed,
+                &env,
             )?))),
         );
         assert!(
@@ -326,7 +371,12 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::Cancel(_) | Effect::Abandon(_)))
         );
-        assert!(effects.contains(&Effect::UseEnv(project_env())));
+        let used = Source {
+            text: Some(changed),
+            env: env.clone(),
+        };
+        assert!(effects.contains(&Effect::UseConfig(used)), "{effects:?}");
+        assert_eq!(app.env, env);
         assert_eq!(app.pipeline_task, Some(TaskId(90)));
         Ok(())
     }

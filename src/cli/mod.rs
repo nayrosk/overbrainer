@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use self::front::Frontend;
 use self::reload::Reloader;
-use crate::config::{DotenvKeys, EnvSource};
+use crate::config::{DotenvKeys, EnvSource, Source};
 use crate::logging::{LOG_LINES, LogBuffer, LogMode};
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
 use crate::update::{self, CheckEnv, Newer};
@@ -385,7 +385,10 @@ async fn dispatch(
             data::run(dir, data::Command::Run, &args, &Frontend::Cli, load).await?;
             train::after_run(dir, &Frontend::Cli, &mut reloader).await
         },
-        Command::Train(args) => train::run(dir, &args, &Frontend::Cli, &EnvSource::Process).await,
+        Command::Train(args) => {
+            let source = Source::from(EnvSource::Process);
+            train::run(dir, &args, &Frontend::Cli, &source).await
+        },
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
@@ -401,7 +404,7 @@ async fn dispatch(
 
 /// Runs a pipeline command on the command line.
 async fn stage(dir: &Path, command: data::Command, args: &StageArgs) -> anyhow::Result<()> {
-    let load = data::Load::Env(&EnvSource::Process);
+    let load = data::Load::Source(&Source::from(EnvSource::Process));
     data::run(dir, command, args, &Frontend::Cli, load).await
 }
 

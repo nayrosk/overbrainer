@@ -29,7 +29,7 @@ use super::widgets::picker::{Choice, Entry, Picker, PickerOutcome};
 use crate::cli::data::Command;
 use crate::cli::front::Report;
 use crate::config::edit::FieldPath;
-use crate::config::{EnvSource, Settings};
+use crate::config::{EnvSource, Settings, Source};
 use crate::dataset::{AnswerText, Counts, Dataset, Deletion, Id};
 use crate::logging::LogBuffer;
 
@@ -102,9 +102,9 @@ pub(super) enum Effect {
     },
     /// Open this URL in a browser, detached.
     OpenUrl(String),
-    /// Has the tasks started from now read the settings with this
-    /// environment: the configuration was read again.
-    UseEnv(EnvSource),
+    /// Has the tasks started from now read the settings from this source:
+    /// the configuration the app keeps, read at start, saved or read again.
+    UseConfig(Source),
     /// Writes `lines` to `.overbrainer/<name>`, off the UI thread, never
     /// overwriting an existing file.
     ExportLogs {
@@ -538,9 +538,26 @@ impl App {
         self.dirty = true;
     }
 
-    /// What to do when the loop starts: load the data.
+    /// What to do when the loop starts: have the tasks read the configuration
+    /// kept, if any, and load the data.
     pub(super) fn start(&mut self) -> Vec<Effect> {
-        self.reload()
+        let mut effects: Vec<Effect> = self
+            .config
+            .as_ref()
+            .map(|config| self.use_config(config))
+            .into_iter()
+            .collect();
+        effects.extend(self.reload());
+        effects
+    }
+
+    /// Has the tasks read their settings from `config`, with the environment
+    /// the app reads the configuration with.
+    pub(super) fn use_config(&self, config: &ProjectConfig) -> Effect {
+        Effect::UseConfig(Source {
+            text: Some(config.text.clone()),
+            env: self.env.clone(),
+        })
     }
 
     /// A new task ID.
