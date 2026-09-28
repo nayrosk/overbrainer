@@ -5,7 +5,7 @@ source: src/tui/snapshots.rs
 "  Pipeline · answers                                in flight  retries  failed  "
 "    subtopics                                                                   "
 "    questions                                                                   "
-"  ✓ answers     █████████████████████████       4/4         0        1       0  "
+"  ✓ answers     █████████████████████████       4/4         0        0       0  "
 "    split                                                                       "
 "                                                                                "
 "  tokens  in 4000  out 7360        cost $0.0431                                 "

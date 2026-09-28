@@ -1,7 +1,7 @@
 //! The Pipeline view's model: what the events of the current pipeline task say
 //! of each stage, counted like the command line's progress lines.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::cli::data::Command;
 use crate::events::{Event, Stage, StageStats};
@@ -42,7 +42,10 @@ pub(super) struct Row {
     pub(super) total: usize,
     /// Items done or failed for good, at most `total`.
     pub(super) finished: usize,
-    /// Failed attempts that are tried again.
+    /// Items whose retryable failure has not yet resolved: on their first
+    /// retryable failure, off once they succeed or fail for good.
+    in_retry: BTreeSet<String>,
+    /// Items currently being retried, `in_retry.len()`.
     pub(super) retries: usize,
     /// Items that failed for good.
     pub(super) failed: usize,
@@ -64,6 +67,7 @@ impl Row {
             state,
             total: 0,
             finished: 0,
+            in_retry: BTreeSet::new(),
             retries: 0,
             failed: 0,
             usage: Usage::default(),
@@ -201,10 +205,16 @@ impl PipelineView {
                 row.this_task = true;
             },
             Event::ItemDone {
-                stage, usage, cost, ..
+                stage,
+                id,
+                usage,
+                cost,
             } => {
                 let row = &mut self.rows[index(*stage)];
                 row.finished = (row.finished + 1).min(row.total);
+                if row.in_retry.remove(id) {
+                    row.retries = row.in_retry.len();
+                }
                 if let Some(usage) = usage {
                     row.usage += *usage;
                 }
@@ -234,11 +244,13 @@ impl PipelineView {
     fn failed(&mut self, stage: Stage, id: &str, error: &str, retryable: bool) {
         let row = &mut self.rows[index(stage)];
         if retryable {
-            row.retries += 1;
+            row.in_retry.insert(id.to_string());
         } else {
+            row.in_retry.remove(id);
             row.failed += 1;
             row.finished = (row.finished + 1).min(row.total);
         }
+        row.retries = row.in_retry.len();
         if self.errors.len() == ERRORS {
             self.errors.pop_front();
         }
@@ -328,11 +340,24 @@ mod tests {
     }
 
     fn failed(stage: Stage, retryable: bool) -> Event {
+        failed_id(stage, "3f1c", retryable)
+    }
+
+    fn failed_id(stage: Stage, id: &str, retryable: bool) -> Event {
         Event::ItemFailed {
             stage,
-            id: "3f1c".into(),
+            id: id.into(),
             error: "429 Too Many Requests".into(),
             retryable,
+        }
+    }
+
+    fn done_id(stage: Stage, id: &str) -> Event {
+        Event::ItemDone {
+            stage,
+            id: id.into(),
+            usage: None,
+            cost: None,
         }
     }
 
@@ -355,7 +380,11 @@ mod tests {
             view.event(&event);
         }
         let row = view.row(Stage::Answers);
-        assert_eq!((row.finished, row.retries, row.failed), (3, 2, 1));
+        assert_eq!(
+            (row.finished, row.retries, row.failed),
+            (3, 0, 1),
+            "the same item retried twice counts once, and leaves the count once it fails for good"
+        );
         assert_eq!(view.in_flight(Stage::Answers), 7);
         assert_eq!(view.usage().output_tokens, 12);
         assert_eq!(view.errors.len(), 3);
@@ -379,6 +408,54 @@ mod tests {
             "final stats replace live ones"
         );
         assert_eq!(view.in_flight(Stage::Answers), 0);
+    }
+
+    #[test]
+    fn an_item_retried_twice_then_done_counts_one_then_zero() {
+        let mut view = PipelineView::default();
+        view.started(Command::Answers, 1);
+        view.event(&Event::StageStarted {
+            stage: Stage::Answers,
+            total: 3,
+        });
+        view.event(&failed_id(Stage::Answers, "a", true));
+        assert_eq!(view.row(Stage::Answers).retries, 1);
+        view.event(&failed_id(Stage::Answers, "a", true));
+        assert_eq!(
+            view.row(Stage::Answers).retries,
+            1,
+            "the same item failing again does not count twice"
+        );
+        view.event(&done_id(Stage::Answers, "a"));
+        assert_eq!(view.row(Stage::Answers).retries, 0);
+    }
+
+    #[test]
+    fn two_items_in_retry_count_two() {
+        let mut view = PipelineView::default();
+        view.started(Command::Answers, 1);
+        view.event(&Event::StageStarted {
+            stage: Stage::Answers,
+            total: 3,
+        });
+        view.event(&failed_id(Stage::Answers, "a", true));
+        view.event(&failed_id(Stage::Answers, "b", true));
+        assert_eq!(view.row(Stage::Answers).retries, 2);
+    }
+
+    #[test]
+    fn a_final_failure_after_a_retry_leaves_the_count_and_adds_to_failed() {
+        let mut view = PipelineView::default();
+        view.started(Command::Answers, 1);
+        view.event(&Event::StageStarted {
+            stage: Stage::Answers,
+            total: 3,
+        });
+        view.event(&failed_id(Stage::Answers, "a", true));
+        assert_eq!(view.row(Stage::Answers).retries, 1);
+        view.event(&failed_id(Stage::Answers, "a", false));
+        let row = view.row(Stage::Answers);
+        assert_eq!((row.retries, row.failed), (0, 1));
     }
 
     #[test]
