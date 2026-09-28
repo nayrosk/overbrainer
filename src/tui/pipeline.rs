@@ -232,6 +232,8 @@ impl PipelineView {
                 let row = &mut self.rows[index(*stage)];
                 row.state = StageState::Done;
                 row.finished = row.total;
+                // Lagged events can leave ids whose ItemDone never arrived.
+                row.in_retry.clear();
                 row.failed = stats.failed;
                 row.usage = stats.usage;
                 row.cost = stats.cost;
@@ -444,6 +446,26 @@ mod tests {
         view.event(&failed_id(Stage::Answers, "a", true));
         view.event(&failed_id(Stage::Answers, "b", true));
         assert_eq!(view.row(Stage::Answers).retries(), 2);
+    }
+
+    #[test]
+    fn a_finished_stage_has_no_item_in_retry() {
+        let mut view = PipelineView::default();
+        view.started(Command::Answers, 1);
+        view.event(&Event::StageStarted {
+            stage: Stage::Answers,
+            total: 3,
+        });
+        view.event(&failed_id(Stage::Answers, "a", true));
+        view.event(&Event::StageFinished {
+            stage: Stage::Answers,
+            stats: StageStats::default(),
+        });
+        assert_eq!(
+            view.row(Stage::Answers).retries(),
+            0,
+            "a lagged bus can drop the ItemDone of a retried item"
+        );
     }
 
     #[test]
