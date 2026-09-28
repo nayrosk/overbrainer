@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 " │ command writes to the project meanwhile.                                   │ "
 " ╰────────────────────────────────────────────────────────────────────────────╯ "
 "                                                                                "
-" Esc close                                                       v#.#.#  ? help "
+" Esc close                                                               ? help "

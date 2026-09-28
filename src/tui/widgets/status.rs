@@ -1,7 +1,8 @@
 //! The footer, on the last row: the key hints of what the keys act on, or the
 //! latest status message while it lasts, on the left; the work running, each
-//! with its spinner, `locked` while the data lock holds, the project cost, the
-//! version and `? help` on the right.
+//! with its spinner, `locked` while the data lock holds, the project cost and
+//! the version (not under a dialog, the help or the menu) and `? help` on the
+//! right.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -34,13 +35,16 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option
         right.push(Span::styled("locked", theme.dim));
         right.push(Span::styled(SEPARATOR, theme.dim));
     }
-    let cost = match project_cost(app) {
-        Cost::Known(usd) => Some(format!("${usd:.2}")),
-        Cost::Partial(usd) => Some(format!("${usd:.2}+")),
-        Cost::Unknown => None,
-    };
-    for fact in cost.into_iter().chain([VERSION.to_string()]) {
-        right.push(Span::styled(format!("{fact}  "), theme.dim));
+    // An overlay's hints need the room: no cost and no version under it.
+    if app.overlay.is_none() {
+        let cost = match project_cost(app) {
+            Cost::Known(usd) => Some(format!("${usd:.2}")),
+            Cost::Partial(usd) => Some(format!("${usd:.2}+")),
+            Cost::Unknown => None,
+        };
+        for fact in cost.into_iter().chain([VERSION.to_string()]) {
+            right.push(Span::styled(format!("{fact}  "), theme.dim));
+        }
     }
     let (key, label) = HELP_HINT.split_at(1);
     right.push(Span::styled(key, theme.key));
@@ -120,7 +124,7 @@ mod tests {
     use super::VERSION;
     use crate::history::Cost;
     use crate::runs::RunState;
-    use crate::tui::app::{Severity, View};
+    use crate::tui::app::{Action, Confirm, Overlay, Severity, View};
     use crate::tui::snapshots::{NOW, app, at, draw, pipeline_running, run, text};
     use crate::tui::tasks::TaskId;
     use crate::tui::training::{Detach, Follow, Job, RunRow};
@@ -197,6 +201,25 @@ mod tests {
         assert_eq!(style(dollar), dim, "the cost is dim");
         assert_eq!(style(help - 3), dim, "the version is dim");
         assert_ne!(style(help), dim, "? stands out");
+        Ok(())
+    }
+
+    #[test]
+    fn a_dialog_keeps_its_hints_over_the_cost_and_the_version() -> TestResult {
+        let mut app = app();
+        pipeline_running(&mut app);
+        app.history_cost = Some(Cost::Known(1.5));
+        app.overlay = Some(Overlay::Confirm(Confirm {
+            title: " Quit overbrainer? ".to_string(),
+            text: vec!["A pipeline is running.".to_string()],
+            yes: "quit",
+            no: "stay",
+            action: Action::Quit,
+        }));
+        let shown = footer(&mut app)?;
+        assert!(shown.contains("n, Esc or Enter stay"), "{shown}");
+        assert!(!shown.contains('$'), "{shown}");
+        assert!(!shown.contains(VERSION), "{shown}");
         Ok(())
     }
 
