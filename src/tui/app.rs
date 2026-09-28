@@ -780,9 +780,12 @@ impl App {
         }
         self.forget_notes(&NoteOf::Stage);
         let id = self.task_id();
-        // What the history holds so far, the last task's stages included.
+        // What the history holds so far, the last task's stages included. The
+        // load in flight may set it only when no task's stages are missing from
+        // it: no window was open, or it is the last task's settling reload.
+        let fresh = self.cost_base.is_none() || (self.load.is_some() && self.settle == self.load);
         self.cost_base = Some(super::cost::Base(super::cost::history_so_far(self)));
-        self.base_load = self.load;
+        self.base_load = if fresh { self.load } else { None };
         self.settle = None;
         self.pipeline_task = Some(id);
         self.pipeline_last = None;
@@ -2906,6 +2909,39 @@ mod tests {
         spend(&mut app, id, Stage::Questions, 0.5, true);
         app.on_done(
             load,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+        );
+        assert_eq!(project_cost(&app), Cost::Known(1.5));
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_older_than_the_last_task_leaves_the_next_base_alone() -> TestResult {
+        use crate::events::Stage;
+        use crate::history::Cost;
+        use crate::tui::cost::project_cost;
+
+        let mut app = dataset_app();
+        let load = only_load(&app.start())?;
+        app.on_done(
+            load,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+        );
+        let questions = [KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter];
+        let [Effect::Spawn(first, Task::Pipeline(_))] = press(&mut app, &questions)[..] else {
+            return Err("expected a stage".into());
+        };
+        spend(&mut app, first, Stage::Questions, 0.5, true);
+        // A quiet load starts during the task, which ends before it lands.
+        let quiet = only_load(&press(&mut app, &[KeyCode::Char('1')]))?;
+        assert_eq!(app.on_done(first, Ok(Done::Pipeline(Ok(())))), []);
+        let [Effect::Spawn(_, Task::Pipeline(_))] = press(&mut app, &questions)[..] else {
+            return Err("expected a second stage".into());
+        };
+        assert_eq!(project_cost(&app), Cost::Known(1.5));
+        // Its history predates the first task's entry: the base keeps that task.
+        app.on_done(
+            quiet,
             Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
         );
         assert_eq!(project_cost(&app), Cost::Known(1.5));
