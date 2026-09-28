@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use crate::config::ListOrAuto;
 
 use super::RunpodTarget;
-use super::types::{Availability, DataCenter, GpuType, Stock};
+use super::types::{Availability, DataCenter, GpuType, NetworkVolume, Stock, Template};
 
 /// What [`select_gpus`] keeps. The default keeps every Secure Cloud GPU type.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -83,6 +83,35 @@ pub fn select_gpus(gpus: &[GpuType], filter: &GpuFilter) -> Vec<GpuType> {
     kept
 }
 
+/// The rows of `overbrainer pod gpus`, header first, for `gpus` already
+/// filtered and sorted (see [`select_gpus`]); nothing when `gpus` is empty.
+/// `data_center`, when given, is shown as the stock column instead of the
+/// overall band (see [`GpuType::stock_in`]).
+#[must_use]
+pub fn gpu_table(gpus: &[GpuType], data_center: Option<&str>) -> Vec<String> {
+    if gpus.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "{:<28}  {:>7}  {:>6}  {:>9}  STOCK",
+        "ID", "VRAM GB", "$/H", "MAX COUNT"
+    )];
+    for gpu in gpus {
+        let price = gpu
+            .secure_price()
+            .map_or_else(|| "-".to_string(), |price| format!("{price:.2}"));
+        let stock = data_center.map_or(gpu.availability, |center| gpu.stock_in(center));
+        lines.push(format!(
+            "{:<28}  {:>7}  {price:>6}  {:>9}  {}",
+            gpu.id,
+            gpu.memory,
+            gpu.max_count.secure,
+            stock.name()
+        ));
+    }
+    lines
+}
+
 /// A data center with the stock of chosen GPU types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataCenterStock {
@@ -139,6 +168,34 @@ pub fn data_center_stock<S: AsRef<str>>(
         .collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     rows
+}
+
+/// The rows of `overbrainer pod datacenters`, header first, sorted by ID;
+/// nothing when `data_centers` is empty. The stock column counts the GPU
+/// types `data_centers` reports in stock there, not a chosen set.
+#[must_use]
+pub fn data_center_table(data_centers: &[DataCenter]) -> Vec<String> {
+    if data_centers.is_empty() {
+        return Vec::new();
+    }
+    let mut rows: Vec<&DataCenter> = data_centers.iter().collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut lines = vec![format!(
+        "{:<12}  {:<24}  {:<16}  GPU TYPES IN STOCK",
+        "ID", "NAME", "REGION"
+    )];
+    for center in rows {
+        let in_stock = center
+            .gpu_availability
+            .iter()
+            .filter(|entry| entry.availability.is_in_stock())
+            .count();
+        lines.push(format!(
+            "{:<12}  {:<24}  {:<16}  {in_stock}",
+            center.id, center.name, center.region
+        ));
+    }
+    lines
 }
 
 /// The data centers with at least one `chosen` GPU type in stock, ordered by
@@ -295,6 +352,47 @@ fn or_list(items: &[String]) -> String {
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
     }
+}
+
+/// The rows of `overbrainer pod volumes`, header first, sorted by name;
+/// nothing when `volumes` is empty.
+#[must_use]
+pub fn volume_table(volumes: &[NetworkVolume]) -> Vec<String> {
+    if volumes.is_empty() {
+        return Vec::new();
+    }
+    let mut rows: Vec<&NetworkVolume> = volumes.iter().collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut lines = vec![format!(
+        "{:<12}  {:<24}  {:>7}  DATA CENTER",
+        "ID", "NAME", "SIZE GB"
+    )];
+    for volume in rows {
+        lines.push(format!(
+            "{:<12}  {:<24}  {:>7}  {}",
+            volume.id, volume.name, volume.size, volume.data_center
+        ));
+    }
+    lines
+}
+
+/// The rows of `overbrainer pod templates`, header first, sorted by name;
+/// nothing when `templates` is empty.
+#[must_use]
+pub fn template_table(templates: &[Template]) -> Vec<String> {
+    if templates.is_empty() {
+        return Vec::new();
+    }
+    let mut rows: Vec<&Template> = templates.iter().collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut lines = vec![format!("{:<12}  {:<24}  IMAGE", "ID", "NAME")];
+    for template in rows {
+        lines.push(format!(
+            "{:<12}  {:<24}  {}",
+            template.id, template.name, template.image
+        ));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -649,6 +747,165 @@ mod tests {
                  (gpu_count = 1)"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn gpu_table_is_empty_without_rows() {
+        assert!(gpu_table(&[], None).is_empty());
+    }
+
+    #[test]
+    fn gpu_table_lists_price_vram_count_and_overall_stock() {
+        let mut a40 = gpu("NVIDIA A40", 48, Some(0.4));
+        a40.availability = Availability::High;
+        let mut cheap = gpu("cheap", 16, None);
+        cheap.availability = Availability::Low;
+        let lines = gpu_table(&[a40, cheap], None);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].starts_with("ID") && lines[0].ends_with("STOCK"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("NVIDIA A40")
+                && lines[1].contains("48")
+                && lines[1].contains("0.40")
+                && lines[1].ends_with("HIGH"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with("cheap") && lines[2].ends_with("LOW"),
+            "{}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn gpu_table_shows_stock_at_a_data_center_when_given() {
+        let mut a40 = gpu("NVIDIA A40", 48, Some(0.4));
+        a40.availability = Availability::High;
+        a40.data_centers = vec![stock("EU-RO-1", Availability::Low)];
+        let lines = gpu_table(&[a40], Some("EU-RO-1"));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].ends_with("LOW"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn data_center_table_is_empty_without_rows() {
+        assert!(data_center_table(&[]).is_empty());
+    }
+
+    #[test]
+    fn data_center_table_counts_gpu_types_in_stock_sorted_by_id() {
+        let centers = [
+            center(
+                "B-ID",
+                vec![
+                    stock("x", Availability::High),
+                    stock("y", Availability::None),
+                ],
+            ),
+            center("A-ID", vec![stock("x", Availability::Low)]),
+        ];
+        let lines = data_center_table(&centers);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].starts_with("ID") && lines[0].ends_with("GPU TYPES IN STOCK"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("A-ID") && lines[1].ends_with('1'),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with("B-ID") && lines[2].ends_with('1'),
+            "{}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn volume_table_is_empty_without_rows() {
+        assert!(volume_table(&[]).is_empty());
+    }
+
+    #[test]
+    fn volume_table_is_sorted_by_name() {
+        let volumes = [
+            NetworkVolume {
+                id: "v2".to_string(),
+                name: "zeta".to_string(),
+                size: 50,
+                data_center: "EU-RO-1".to_string(),
+            },
+            NetworkVolume {
+                id: "v1".to_string(),
+                name: "alpha".to_string(),
+                size: 100,
+                data_center: "US-KS-2".to_string(),
+            },
+        ];
+        let lines = volume_table(&volumes);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].starts_with("ID") && lines[0].ends_with("DATA CENTER"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("v1") && lines[1].contains("alpha") && lines[1].ends_with("US-KS-2"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("v2") && lines[2].contains("zeta") && lines[2].ends_with("EU-RO-1"),
+            "{}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn template_table_is_empty_without_rows() {
+        assert!(template_table(&[]).is_empty());
+    }
+
+    #[test]
+    fn template_table_is_sorted_by_name() {
+        let templates = [
+            Template {
+                id: "t2".to_string(),
+                name: "zeta".to_string(),
+                image: "img/z:1".to_string(),
+                serverless: false,
+            },
+            Template {
+                id: "t1".to_string(),
+                name: "alpha".to_string(),
+                image: "img/a:1".to_string(),
+                serverless: false,
+            },
+        ];
+        let lines = template_table(&templates);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].starts_with("ID") && lines[0].ends_with("IMAGE"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("t1") && lines[1].ends_with("img/a:1"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("t2") && lines[2].ends_with("img/z:1"),
+            "{}",
+            lines[2]
         );
     }
 }

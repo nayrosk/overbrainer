@@ -1,4 +1,5 @@
-//! `overbrainer pod ls`, `pod rm` and the pod column of `runs ls`, against a local
+//! `overbrainer pod ls`, `pod rm`, the pod column of `runs ls`, and the catalog
+//! listings (`gpus`, `datacenters`, `volumes`, `templates`), against a local
 //! stub of the Runpod API.
 
 use std::collections::{HashMap, HashSet};
@@ -7,11 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use assert_cmd::Command;
+use overbrainer::project_lock::ProjectLock;
 use overbrainer::runpod::{AttemptResult, DeletedBy, Pod, PodId, PodRecord, PodState};
 use overbrainer::runs::{RunRecord, RunState, Runs};
 use predicates::prelude::*;
 use serde_json::{Value, json};
-use wiremock::matchers::any;
+use wiremock::matchers::{any, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -429,5 +431,300 @@ fn runs_ls_shows_the_pod_of_a_runpod_run() -> TestResult {
         .stdout(predicate::str::contains(format!(
             "{FORGOTTEN}  failed     gpu_cloud  2026-09-20T12:00:00Z\n"
         )));
+    Ok(())
+}
+
+/// A project directory with just `overbrainer.toml`, no runs.
+fn bare_project() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("overbrainer.toml"), CONFIG)?;
+    Ok(dir)
+}
+
+#[tokio::test]
+async fn pod_gpus_prints_the_table_sorted_by_price_with_filters() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus"))
+        .and(query_param("count", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"gpus": [
+            {"id": "NVIDIA A40", "memory": 48, "price": {"secure": 0.4},
+             "maxCount": {"secure": 8}, "availability": "HIGH",
+             "dataCenters": [{"id": "EU-RO-1", "availability": "HIGH"}]},
+            {"id": "NVIDIA L4", "memory": 24, "price": {"secure": 0.2},
+             "maxCount": {"secure": 8}, "availability": "LOW",
+             "dataCenters": [{"id": "EU-RO-1", "availability": "NONE"}]},
+            {"id": "NVIDIA A100", "memory": 80, "price": {"secure": 1.5},
+             "maxCount": {"secure": 8}, "availability": "NONE"}
+        ]})))
+        .mount(&server)
+        .await;
+    let dir = bare_project()?;
+
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "gpus"]);
+    let result = output(cmd).await?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8(result.stdout)?;
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "{stdout}");
+    assert!(
+        lines[0].starts_with("ID") && lines[0].ends_with("STOCK"),
+        "{stdout}"
+    );
+    // Cheapest first: L4 (0.2), A40 (0.4), A100 (1.5, out of stock but listed).
+    assert!(lines[1].starts_with("NVIDIA L4"), "{stdout}");
+    assert!(lines[2].starts_with("NVIDIA A40"), "{stdout}");
+    assert!(
+        lines[3].starts_with("NVIDIA A100") && lines[3].ends_with("NONE"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("rp_cli_key_4411"));
+
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "gpus", "--min-vram", "40"]);
+    let stdout = String::from_utf8(output(cmd).await?.stdout)?;
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert!(lines[1].starts_with("NVIDIA A40"), "{stdout}");
+    assert!(lines[2].starts_with("NVIDIA A100"), "{stdout}");
+
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "gpus", "--max-price", "1.0"]);
+    let stdout = String::from_utf8(output(cmd).await?.stdout)?;
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert!(lines[1].starts_with("NVIDIA L4"), "{stdout}");
+    assert!(lines[2].starts_with("NVIDIA A40"), "{stdout}");
+
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "gpus", "--in-stock"]);
+    let stdout = String::from_utf8(output(cmd).await?.stdout)?;
+    assert!(!stdout.contains("NVIDIA A100"), "{stdout}");
+
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "gpus", "--data-center", "EU-RO-1"]);
+    let stdout = String::from_utf8(output(cmd).await?.stdout)?;
+    let lines: Vec<&str> = stdout.lines().collect();
+    // A100 has no entry for EU-RO-1 at all: left out even without --in-stock.
+    assert_eq!(lines.len(), 3, "{stdout}");
+    let l4 = lines
+        .iter()
+        .find(|line| line.starts_with("NVIDIA L4"))
+        .ok_or("no L4 row")?;
+    assert!(l4.ends_with("NONE"), "{l4}");
+    let a40 = lines
+        .iter()
+        .find(|line| line.starts_with("NVIDIA A40"))
+        .ok_or("no A40 row")?;
+    assert!(a40.ends_with("HIGH"), "{a40}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pod_datacenters_prints_the_table() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/datacenters"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"dataCenters": [
+                {"id": "US-KS-2", "name": "US Kansas 2", "region": "NORTH_AMERICA",
+                 "gpuAvailability": [
+                    {"id": "NVIDIA A40", "availability": "HIGH"},
+                    {"id": "NVIDIA L4", "availability": "NONE"}
+                 ]},
+                {"id": "EU-RO-1", "name": "EU Romania 1", "region": "EUROPE", "gpuAvailability": []}
+            ]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = bare_project()?;
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "datacenters"]);
+    let output = output(cmd).await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert!(
+        lines[0].starts_with("ID") && lines[0].ends_with("GPU TYPES IN STOCK"),
+        "{stdout}"
+    );
+    // Sorted by ID: EU-RO-1 before US-KS-2.
+    assert!(
+        lines[1].starts_with("EU-RO-1") && lines[1].ends_with('0'),
+        "{stdout}"
+    );
+    assert!(
+        lines[2].starts_with("US-KS-2") && lines[2].ends_with('1'),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("rp_cli_key_4411"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn pod_volumes_prints_the_table() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/network-volumes"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"networkVolumes": [
+                {"id": "v2", "name": "zeta", "size": 50, "dataCenterId": "EU-RO-1"},
+                {"id": "v1", "name": "alpha", "size": 100, "dataCenter": "US-KS-2"}
+            ]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = bare_project()?;
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "volumes"]);
+    let output = output(cmd).await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert!(
+        lines[0].starts_with("ID") && lines[0].ends_with("DATA CENTER"),
+        "{stdout}"
+    );
+    // Sorted by name: alpha (v1) before zeta (v2).
+    assert!(
+        lines[1].contains("v1") && lines[1].contains("alpha") && lines[1].ends_with("US-KS-2"),
+        "{stdout}"
+    );
+    assert!(
+        lines[2].contains("v2") && lines[2].contains("zeta") && lines[2].ends_with("EU-RO-1"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pod_volumes_says_when_the_account_has_no_network_volume() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/network-volumes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"networkVolumes": []})))
+        .mount(&server)
+        .await;
+    let dir = bare_project()?;
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "volumes"]);
+    let output = output(cmd).await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        "pod: no network volume on this account\n"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pod_templates_prints_the_table_and_leaves_out_serverless() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "templates": [
+                {"id": "t2", "name": "zeta", "image": "img/z:1", "serverless": false},
+                {"id": "t1", "name": "alpha", "image": "img/a:1", "serverless": false},
+                {"id": "s1", "name": "serverless one", "image": "img/s:1", "serverless": true}
+            ],
+            "pagination": {"hasNextPage": false, "nextCursor": null}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = bare_project()?;
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "templates"]);
+    let output = output(cmd).await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert!(
+        lines[0].starts_with("ID") && lines[0].ends_with("IMAGE"),
+        "{stdout}"
+    );
+    // Sorted by name: alpha (t1) before zeta (t2).
+    assert!(
+        lines[1].contains("t1") && lines[1].ends_with("img/a:1"),
+        "{stdout}"
+    );
+    assert!(
+        lines[2].contains("t2") && lines[2].ends_with("img/z:1"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("serverless one"), "{stdout}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pod_catalog_commands_need_the_api_key() -> TestResult {
+    let dir = bare_project()?;
+    let mut cmd = Command::cargo_bin("overbrainer")?;
+    cmd.env_clear()
+        .env("NO_COLOR", "1")
+        .env("HOME", "/nonexistent")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["pod", "gpus"]);
+    let output = output(cmd).await?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("set OVERBRAINER_RUNPOD__API_KEY"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn pod_catalog_commands_take_no_project_lock() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"gpus": []})))
+        .mount(&server)
+        .await;
+    let dir = bare_project()?;
+    let _held = ProjectLock::acquire(dir.path())?;
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["pod", "gpus"]);
+    let output = output(cmd).await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        "pod: no GPU type matches\n"
+    );
     Ok(())
 }

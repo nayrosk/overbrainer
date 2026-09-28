@@ -24,8 +24,8 @@ pub use bootstrap::{
     HOST_KEY_ENV, JOB_ENV, PodSettings, bootstrap_functions, pod_command, pod_env, watchdog_script,
 };
 pub use catalog::{
-    DataCenterStock, GpuFilter, by_price, data_center_stock, resolve, select_gpus,
-    stocked_data_centers,
+    DataCenterStock, GpuFilter, by_price, data_center_stock, data_center_table, gpu_table, resolve,
+    select_gpus, stocked_data_centers, template_table, volume_table,
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
 pub use flow::{

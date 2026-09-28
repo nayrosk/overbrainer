@@ -159,6 +159,32 @@ pub enum PodCommand {
         #[arg(long)]
         force: bool,
     },
+    /// List the Runpod catalog's Secure Cloud GPU types, cheapest first.
+    Gpus(GpuArgs),
+    /// List the Runpod catalog's data centers, by ID.
+    Datacenters,
+    /// List the account's network volumes, by name.
+    Volumes,
+    /// List the account's pod templates, by name.
+    Templates,
+}
+
+/// Options of `overbrainer pod gpus`.
+#[derive(Debug, Default, Args)]
+pub struct GpuArgs {
+    /// Only GPU types with at least this much VRAM, in GB.
+    #[arg(long)]
+    pub min_vram: Option<u32>,
+    /// Only GPU types priced at or under this, in USD per hour.
+    #[arg(long)]
+    pub max_price: Option<f64>,
+    /// Only GPU types offered in this data center, whose stock there is shown
+    /// instead of the overall stock.
+    #[arg(long)]
+    pub data_center: Option<String>,
+    /// Only GPU types with some stock.
+    #[arg(long)]
+    pub in_stock: bool,
 }
 
 /// Subcommands of `overbrainer skill`.
