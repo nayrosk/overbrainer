@@ -365,7 +365,8 @@ fn wants_wizard(cli: &Cli, stdout_is_terminal: bool) -> bool {
 /// Runs the parsed command line, whose logs were set up with `logs` (see
 /// [`Command::log_mode`]); `dotenv` are the keys `.env` set at start, which a
 /// reload of the configuration replaces (`tui`, and `run` between stages). Meanwhile it looks for a newer release, told on
-/// stderr once the command ended, even with an error (`tui` shows it itself).
+/// stderr once the command ended, even with an error (`tui` shows it itself),
+/// as is the need to run `overbrainer migrate` on a project from before 0.4.0.
 ///
 /// # Errors
 ///
@@ -383,7 +384,11 @@ pub async fn run(cli: Cli, logs: LogMode, dotenv: DotenvKeys) -> anyhow::Result<
                 update::check(&env, update::CRATES_IO_URL, SystemTime::now()).await
             })
         });
+    let hint = migrate::hints(&cli.command, &cli.project_dir);
     let result = dispatch(cli, logs, &mut check, dotenv).await;
+    if hint {
+        eprintln!("{}", migrate::HINT);
+    }
     // `tui` took the check, and shows its answer itself.
     if let Some(check) = check
         && let Some(newer) = settle(check).await

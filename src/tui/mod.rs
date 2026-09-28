@@ -130,9 +130,8 @@ pub async fn run(
         app.opening = app::Opening::Auto;
     }
     app.motion = Motion::new(MotionLevel::detect(&env, color)).colored(&theme);
-    for warning in env.warnings() {
-        tracing::warn!("{warning}");
-    }
+    // Logged after `App::new`, so the status line shows them on start.
+    warn_on_start(&env, project_dir);
     app.editor = editor::command(std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
     let guard = TerminalGuard::enter();
     let mut terminal = terminal::init().context("cannot set up the terminal")?;
@@ -147,4 +146,16 @@ pub async fn run(
         writeln!(io::stderr(), "{note}").ok();
     }
     result
+}
+
+/// Logs what the user should know on start: the look settings ignored, and
+/// the need to run `overbrainer migrate` on a project from before 0.4.0.
+fn warn_on_start(env: &LookEnv, project_dir: &Path) {
+    let mut warnings = env.warnings();
+    if crate::project_format::predates_versions(project_dir) {
+        warnings.push(crate::cli::migrate::HINT.to_string());
+    }
+    for warning in warnings {
+        tracing::warn!("{warning}");
+    }
 }

@@ -421,3 +421,65 @@ fn a_writing_command_outside_a_project_creates_nothing() -> Result<(), Box<dyn s
     assert!(!dir.path().join("missing").exists());
     Ok(())
 }
+
+const MIGRATE_HINT: &str = "this project predates overbrainer 0.4.0: run overbrainer migrate";
+
+#[test]
+fn an_old_project_hints_at_migrate_until_migrated() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(MIGRATE_HINT).not());
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .arg("history")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(MIGRATE_HINT).not());
+
+    std::fs::remove_file(dir.path().join(".overbrainer/version"))?;
+    let output = overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .arg("history")
+        .output()?;
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(stderr.matches(MIGRATE_HINT).count(), 1, "{stderr}");
+
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["migrate", "--dry-run"])
+        .assert()
+        .success()
+        .stdout("would write .overbrainer/version: format 1\n")
+        .stderr(predicate::str::contains(MIGRATE_HINT).not());
+    assert!(!dir.path().join(".overbrainer/version").exists());
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .arg("migrate")
+        .assert()
+        .success()
+        .stdout("wrote .overbrainer/version: format 1\n");
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .arg("migrate")
+        .assert()
+        .success()
+        .stdout("nothing to migrate\n");
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .arg("history")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(MIGRATE_HINT).not());
+    Ok(())
+}

@@ -13,6 +13,9 @@ use crate::history::{self, Entry, Status};
 use crate::project_format;
 use crate::runs::rfc3339;
 
+/// What every command on a project from before 0.4.0 says once.
+pub const HINT: &str = "this project predates overbrainer 0.4.0: run overbrainer migrate";
+
 /// The `.gitignore` entry of the state directory.
 const STATE_ENTRY: &str = "/.overbrainer/";
 
@@ -198,11 +201,25 @@ fn empty_entry(model: &str, at: &str) -> Entry {
     }
 }
 
+/// Whether `command` in `project_dir` should end with [`HINT`]: a project
+/// from before 0.4.0, and a command that works on it and that the hint does
+/// not concern (`init`, `migrate`, `skill`), outside the TUI, which shows it
+/// itself.
+pub(super) fn hints(command: &super::Command, project_dir: &Path) -> bool {
+    use super::Command;
+    !matches!(
+        command,
+        Command::Init { .. } | Command::Migrate(_) | Command::Skill { .. } | Command::Tui
+    ) && project_format::predates_versions(project_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::Cli;
     use crate::dataset::{Exclusion, FinishReason, Id, Meta, ReasoningKind};
     use crate::project_lock::STATE_DIR;
+    use clap::Parser as _;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -360,6 +377,31 @@ mod tests {
             Ok(lines) => return Err(format!("expected a refusal, got {lines:?}").into()),
         }
         assert!(history::read(dir.path())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn only_commands_on_an_old_project_hint() -> TestResult {
+        let dir = old_project()?;
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("overbrainer").chain(args.iter().copied()))
+                .map(|cli| cli.command)
+        };
+        for args in [
+            &["history"][..],
+            &["run"],
+            &["config", "check"],
+            &["pod", "ls"],
+        ] {
+            assert!(hints(&parse(args)?, dir.path()), "{args:?}");
+        }
+        for args in [&["init"][..], &["migrate"], &["skill", "install"], &["tui"]] {
+            assert!(!hints(&parse(args)?, dir.path()), "{args:?}");
+        }
+        project_format::write(dir.path())?;
+        assert!(!hints(&parse(&["history"])?, dir.path()));
+        let empty = tempfile::tempdir()?;
+        assert!(!hints(&parse(&["history"])?, empty.path()));
         Ok(())
     }
 }
