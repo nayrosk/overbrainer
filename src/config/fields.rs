@@ -81,8 +81,6 @@ pub enum FieldKind {
     Bool,
     /// One of these strings.
     Choice(&'static [&'static str]),
-    /// A list of strings, typed as comma-separated text.
-    List,
     /// `auto` (a [`FieldValue::Text`]) or a list of strings typed as
     /// comma-separated text; see [`ListOrAuto`].
     ListOrAuto,
@@ -186,7 +184,7 @@ impl FieldKind {
             Self::ListOrAuto if text.trim() == ListOrAuto::AUTO => {
                 FieldValue::Text(ListOrAuto::AUTO.to_string())
             },
-            Self::List | Self::ListOrAuto => list(text),
+            Self::ListOrAuto => list(text),
         };
         self.check(&value)?;
         Ok(value)
@@ -201,7 +199,7 @@ impl FieldKind {
         match (self, value) {
             (Self::Text, FieldValue::Text(_))
             | (Self::Bool, FieldValue::Bool(_))
-            | (Self::List | Self::ListOrAuto, FieldValue::List(_)) => Ok(()),
+            | (Self::ListOrAuto, FieldValue::List(_)) => Ok(()),
             (Self::ListOrAuto, FieldValue::Text(text)) if text == ListOrAuto::AUTO => Ok(()),
             (Self::Int { min, max }, FieldValue::Int(number)) if (min..=max).contains(number) => {
                 Ok(())
@@ -238,7 +236,6 @@ impl FieldKind {
             Self::Float { min, max } => describe_floats(min, max),
             Self::Bool => "true or false".to_string(),
             Self::Choice(choices) => format!("one of {}", choices.join(", ")),
-            Self::List => "a comma-separated list".to_string(),
             Self::ListOrAuto => "auto or a comma-separated list".to_string(),
         }
     }
@@ -948,14 +945,6 @@ max_hours = 6
             RUNTIMES.parse("vm").map_err(|error| error.to_string()),
             Err("must be one of docker, native".to_string())
         );
-        assert_eq!(
-            FieldKind::List.parse(" A40 , ,L40S"),
-            Ok(FieldValue::List(vec![
-                "A40".to_string(),
-                "L40S".to_string()
-            ]))
-        );
-        assert_eq!(FieldKind::List.parse(""), Ok(FieldValue::List(Vec::new())));
         assert_eq!(
             TEXT.parse(" a = \"b\" "),
             Ok(FieldValue::Text(" a = \"b\" ".to_string()))
