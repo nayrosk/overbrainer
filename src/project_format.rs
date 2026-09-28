@@ -24,9 +24,12 @@ const READ_LIMIT: u64 = 32;
 /// # Errors
 ///
 /// An [`io::Error`] when the file exists but cannot be read, is not a safe path
-/// (a symbolic or hard link), or does not hold an integer (`InvalidData`).
+/// (a symbolic or hard link, a FIFO), or does not hold an integer (`InvalidData`).
 pub fn read(project_dir: &Path) -> io::Result<Option<u32>> {
-    let file = match open_state_file(project_dir, VERSION_FILE, OFlags::RDONLY, false) {
+    // Non-blocking, so a FIFO planted as the file cannot hang every command:
+    // it is then refused as not a regular file.
+    let flags = OFlags::RDONLY | OFlags::NONBLOCK;
+    let file = match open_state_file(project_dir, VERSION_FILE, flags, false) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -53,7 +56,7 @@ pub fn read(project_dir: &Path) -> io::Result<Option<u32>> {
 ///
 /// An [`io::Error`] when the state directory or the file cannot be written or
 /// is not a safe path.
-pub fn write(project_dir: &Path) -> io::Result<()> {
+pub fn write_current(project_dir: &Path) -> io::Result<()> {
     replace_state_file(project_dir, VERSION_FILE, format!("{CURRENT}\n").as_bytes())
 }
 
@@ -75,7 +78,7 @@ mod tests {
     fn a_written_version_reads_back() -> TestResult {
         let dir = tempfile::tempdir()?;
         assert_eq!(read(dir.path())?, None);
-        write(dir.path())?;
+        write_current(dir.path())?;
         assert_eq!(read(dir.path())?, Some(CURRENT));
         assert_eq!(
             std::fs::read_to_string(dir.path().join(STATE_DIR).join(VERSION_FILE))?,
@@ -96,13 +99,32 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_version_is_refused_without_blocking() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join(STATE_DIR))?;
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            dir.path().join(STATE_DIR).join(VERSION_FILE),
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )?;
+        match read(dir.path()) {
+            Err(e) => assert_eq!(e.kind(), ErrorKind::InvalidInput),
+            other => return Err(format!("expected an error, got {other:?}").into()),
+        }
+        std::fs::write(dir.path().join(crate::config::CONFIG_FILE), "")?;
+        assert!(!predates_versions(dir.path()));
+        Ok(())
+    }
+
     #[test]
     fn only_a_project_without_a_version_predates_versions() -> TestResult {
         let dir = tempfile::tempdir()?;
         assert!(!predates_versions(dir.path()), "not a project");
         std::fs::write(dir.path().join(crate::config::CONFIG_FILE), "")?;
         assert!(predates_versions(dir.path()));
-        write(dir.path())?;
+        write_current(dir.path())?;
         assert!(!predates_versions(dir.path()));
         Ok(())
     }

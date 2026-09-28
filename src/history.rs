@@ -143,6 +143,17 @@ impl Entry {
 /// `.overbrainer` or the history file is not a safe path to write to (a symbolic
 /// link, a hard link to another file, or swapped for one of those).
 pub fn append(project_dir: &Path, entry: &Entry) -> io::Result<()> {
+    append_all(project_dir, std::slice::from_ref(entry))
+}
+
+/// Appends `entries` to the history of `project_dir` in one write, creating it
+/// when needed: a crash leaves all of them or none (at most a truncated last
+/// line, skipped when read).
+///
+/// # Errors
+///
+/// As [`append`].
+pub fn append_all(project_dir: &Path, entries: &[Entry]) -> io::Result<()> {
     // Opened relative to `project_dir`, so a swapped `.overbrainer` or history
     // file cannot redirect the write.
     let mut file = open_state_file(
@@ -157,9 +168,11 @@ pub fn append(project_dir: &Path, entry: &Entry) -> io::Result<()> {
     if !ends_a_line(&mut file)? {
         line.push('\n');
     }
-    line.push_str(&serde_json::to_string(entry).map_err(io::Error::other)?);
-    line.push('\n');
-    // One write per line, so a crash leaves at most a truncated last line.
+    for entry in entries {
+        line.push_str(&serde_json::to_string(entry).map_err(io::Error::other)?);
+        line.push('\n');
+    }
+    // One write for every line, so a crash leaves at most a truncated last line.
     file.write_all(line.as_bytes())
 }
 
@@ -391,6 +404,15 @@ mod tests {
         append(dir.path(), &first)?;
         append(dir.path(), &second)?;
         assert_eq!(read(dir.path())?, vec![first, second]);
+        Ok(())
+    }
+
+    #[test]
+    fn append_all_writes_every_entry_in_order() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let entries = [entry(Stage::Answers, None), entry(Stage::Split, None)];
+        append_all(dir.path(), &entries)?;
+        assert_eq!(read(dir.path())?, entries);
         Ok(())
     }
 

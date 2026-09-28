@@ -119,7 +119,13 @@ pub(crate) fn open_state_file(
     }
     let dir_path = project_dir.join(STATE_DIR);
     let state = open_state_dir(&project).map_err(|e| unsafe_or_io_error(&dir_path, e))?;
+    open_in_state(&state, &dir_path, name, flags)
+}
 
+/// Opens `name` in the state directory `state`, whose path is `dir_path`,
+/// never through a symbolic link, and only when it is a regular file with a
+/// single link.
+fn open_in_state(state: &OwnedFd, dir_path: &Path, name: &str, flags: OFlags) -> io::Result<File> {
     let mode = if flags.contains(OFlags::CREATE) {
         Mode::from_raw_mode(0o644)
     } else {
@@ -127,7 +133,7 @@ pub(crate) fn open_state_file(
     };
     let file_path = dir_path.join(name);
     let fd = rustix::fs::openat(
-        &state,
+        state,
         name,
         flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         mode,
@@ -171,24 +177,31 @@ pub(crate) fn remove_state_file(project_dir: &Path, name: &str) -> io::Result<()
 /// An [`io::Error`] when the state directory or the temporary file is not a
 /// safe path (see [`open_state_file`]), or when writing or renaming fails.
 pub(crate) fn replace_state_file(project_dir: &Path, name: &str, content: &[u8]) -> io::Result<()> {
-    let tmp = format!("{name}.tmp");
-    let mut file = open_state_file(
-        project_dir,
-        &tmp,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
-        true,
-    )?;
-    file.write_all(content)?;
-    file.sync_all()?;
     let project = rustix::fs::open(
         project_dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
+    match rustix::fs::mkdirat(&project, STATE_DIR, Mode::from_raw_mode(0o777)) {
+        Ok(()) => {},
+        Err(e) if e == Errno::EXIST => {},
+        Err(e) => return Err(e.into()),
+    }
     let dir_path = project_dir.join(STATE_DIR);
     let state = open_state_dir(&project).map_err(|e| unsafe_or_io_error(&dir_path, e))?;
+    let tmp = format!("{name}.tmp");
+    let mut file = open_in_state(
+        &state,
+        &dir_path,
+        &tmp,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+    )?;
+    file.write_all(content)?;
+    file.sync_all()?;
     // A rename replaces a symbolic link at `name` itself, never its target.
     rustix::fs::renameat(&state, tmp.as_str(), &state, name)?;
+    // The rename lasts through a power loss only once the directory is synced.
+    rustix::fs::fsync(&state)?;
     Ok(())
 }
 

@@ -281,7 +281,8 @@ pub struct HistoryArgs {
 /// Options of `overbrainer migrate`.
 #[derive(Debug, Default, Args)]
 pub struct MigrateArgs {
-    /// Print what would change, and change nothing.
+    /// Print what would change, and change no project file (the lock is still
+    /// taken).
     #[arg(long)]
     pub dry_run: bool,
 }

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, bail};
 
-use super::init::{GITIGNORE, add_gitignore_entries, gitignore_lacks};
+use super::init::{GITIGNORE, add_gitignore_entries};
 use crate::dataset::{DataFiles, Example};
 use crate::events::Stage;
 use crate::history::{self, Entry, Status};
@@ -19,8 +19,13 @@ pub const HINT: &str = "this project predates overbrainer 0.4.0: run overbrainer
 /// The `.gitignore` entry of the state directory.
 const STATE_ENTRY: &str = "/.overbrainer/";
 
-/// [`STATE_ENTRY`] as the line added to `.gitignore`.
-const STATE_LINE: &str = "/.overbrainer/\n";
+/// The `.gitignore` lines that already ignore the state directory.
+const STATE_ENTRIES: [&str; 4] = [
+    ".overbrainer",
+    ".overbrainer/",
+    "/.overbrainer",
+    STATE_ENTRY,
+];
 
 /// One change a migration makes.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,12 +106,10 @@ fn migrate(project_dir: &Path, dry_run: bool) -> anyhow::Result<Vec<String>> {
         }
         return Ok(lines);
     }
-    for change in &plan.changes {
-        if !dry_run {
-            apply(project_dir, change)?;
-        }
-        lines.push(change.line(dry_run));
+    if !dry_run {
+        apply(project_dir, &plan.changes)?;
     }
+    lines.extend(plan.changes.iter().map(|change| change.line(dry_run)));
     Ok(lines)
 }
 
@@ -124,7 +127,7 @@ fn plan(project_dir: &Path) -> anyhow::Result<Plan> {
         );
     }
     let mut plan = Plan::default();
-    if !gitignore_lacks(&project_dir.join(GITIGNORE), STATE_LINE)?.is_empty() {
+    if !ignores_state(&project_dir.join(GITIGNORE))? {
         plan.changes.push(Change::Gitignore);
     }
     if version.is_none() {
@@ -144,14 +147,38 @@ fn plan(project_dir: &Path) -> anyhow::Result<Plan> {
     Ok(plan)
 }
 
-fn apply(project_dir: &Path, change: &Change) -> anyhow::Result<()> {
-    match change {
-        Change::Gitignore => add_gitignore_entries(&project_dir.join(GITIGNORE), STATE_LINE),
-        Change::Backfill(entry) => history::append(project_dir, entry)
-            .with_context(|| format!("cannot write {}", history::path(project_dir).display())),
-        Change::Version => {
-            project_format::write(project_dir).context("cannot write the project format")
-        },
+/// Makes `changes`, in order. The backfill lines go in one append, so a crash
+/// leaves all of them or none.
+fn apply(project_dir: &Path, changes: &[Change]) -> anyhow::Result<()> {
+    if changes.contains(&Change::Gitignore) {
+        add_gitignore_entries(&project_dir.join(GITIGNORE), &format!("{STATE_ENTRY}\n"))?;
+    }
+    let backfill: Vec<Entry> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Backfill(entry) => Some(entry.clone()),
+            Change::Gitignore | Change::Version => None,
+        })
+        .collect();
+    if !backfill.is_empty() {
+        history::append_all(project_dir, &backfill)
+            .with_context(|| format!("cannot write {}", history::path(project_dir).display()))?;
+    }
+    if changes.contains(&Change::Version) {
+        project_format::write_current(project_dir).context("cannot write the project format")?;
+    }
+    Ok(())
+}
+
+/// Whether `.gitignore` at `path` has a line in [`STATE_ENTRIES`]; not when
+/// it does not exist.
+fn ignores_state(path: &Path) -> anyhow::Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text
+            .lines()
+            .any(|line| STATE_ENTRIES.contains(&line.trim()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
     }
 }
 
@@ -173,8 +200,12 @@ fn backfill(project_dir: &Path) -> anyhow::Result<Vec<Entry>> {
         let entry = models
             .entry(meta.model.as_str())
             .or_insert_with(|| empty_entry(&meta.model, &at));
-        entry.done += 1;
-        entry.excluded += usize::from(meta.excluded.is_some());
+        // As a recorded run counts them: kept for training, or excluded.
+        if meta.excluded.is_some() {
+            entry.excluded += 1;
+        } else {
+            entry.done += 1;
+        }
         entry.input_tokens += meta.input_tokens;
         entry.output_tokens += meta.output_tokens;
     }
@@ -266,7 +297,7 @@ mod tests {
             [
                 "added /.overbrainer/ to .gitignore",
                 "backfilled the answers history of other: 1 answer(s), 0 excluded; tokens 1 in, 2 out",
-                "backfilled the answers history of parent: 2 answer(s), 1 excluded; tokens 30 in, 300 out",
+                "backfilled the answers history of parent: 1 answer(s), 1 excluded; tokens 30 in, 300 out",
                 "wrote .overbrainer/version: format 1",
             ]
         );
@@ -282,7 +313,7 @@ mod tests {
         assert_eq!(other.model.as_deref(), Some("other"));
         assert_eq!(
             (parent.stage, parent.status, parent.done, parent.excluded),
-            (Stage::Answers, Status::Ok, 2, 1)
+            (Stage::Answers, Status::Ok, 1, 1)
         );
         assert_eq!((parent.input_tokens, parent.output_tokens), (30, 300));
         assert_eq!((parent.cost, parent.provider.as_deref()), (None, None));
@@ -303,7 +334,7 @@ mod tests {
             [
                 "would add /.overbrainer/ to .gitignore",
                 "would backfill the answers history of other: 1 answer(s), 0 excluded; tokens 1 in, 2 out",
-                "would backfill the answers history of parent: 2 answer(s), 1 excluded; tokens 30 in, 300 out",
+                "would backfill the answers history of parent: 1 answer(s), 1 excluded; tokens 30 in, 300 out",
                 "would write .overbrainer/version: format 1",
             ]
         );
@@ -359,6 +390,27 @@ mod tests {
     }
 
     #[test]
+    fn any_line_ignoring_the_state_directory_is_kept() -> TestResult {
+        for line in [
+            ".overbrainer",
+            ".overbrainer/",
+            "/.overbrainer",
+            " /.overbrainer/ ",
+        ] {
+            let dir = tempfile::tempdir()?;
+            let text = format!(".env\n{line}\n");
+            std::fs::write(dir.path().join(GITIGNORE), &text)?;
+            assert_eq!(
+                migrate(dir.path(), false)?,
+                ["wrote .overbrainer/version: format 1"],
+                "{line:?}"
+            );
+            assert_eq!(std::fs::read_to_string(dir.path().join(GITIGNORE))?, text);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_newer_format_is_refused() -> TestResult {
         let dir = old_project()?;
         std::fs::create_dir(dir.path().join(STATE_DIR))?;
@@ -398,7 +450,7 @@ mod tests {
         for args in [&["init"][..], &["migrate"], &["skill", "install"], &["tui"]] {
             assert!(!hints(&parse(args)?, dir.path()), "{args:?}");
         }
-        project_format::write(dir.path())?;
+        project_format::write_current(dir.path())?;
         assert!(!hints(&parse(&["history"])?, dir.path()));
         let empty = tempfile::tempdir()?;
         assert!(!hints(&parse(&["history"])?, empty.path()));
