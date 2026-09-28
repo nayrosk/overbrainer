@@ -657,9 +657,14 @@ fn dataset_while_a_filter_is_typed() -> TestResult {
         app.on_input(&key(code));
     }
     snapshot("dataset_filter_typing", &mut app)?;
-    let rows = text(&draw(&mut app, 80, 24)?);
+    let terminal = draw(&mut app, 80, 24)?;
+    let rows = text(&terminal);
     let footer = rows.last().ok_or("no footer")?;
     assert!(footer.contains("Enter keep · Esc clear"), "{footer}");
+    // The cursor, after "╰ /bo" on the pane's bottom border.
+    let buffer = terminal.backend().buffer();
+    assert!(buffer[(5, 22)].modifier.contains(Modifier::REVERSED));
+    assert!(!buffer[(4, 22)].modifier.contains(Modifier::REVERSED));
     Ok(())
 }
 

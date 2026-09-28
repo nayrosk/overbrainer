@@ -8,6 +8,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use tui_tree_widget::{TreeItem, TreeState};
 
+use super::widgets::form::Input;
+
 use crate::dataset::{Dataset, Example, Exclusion, Id, Question, Subtopic, normalize};
 use crate::pipeline::{SplitClass, SplitReport, eval_size, split_class};
 
@@ -527,7 +529,7 @@ pub(super) struct DatasetView {
     /// The applied filter.
     pub(super) filter: String,
     /// The filter being typed, while `/` is active.
-    pub(super) input: Option<String>,
+    pub(super) input: Option<Input>,
     /// Whether the stats pane replaces the detail pane.
     pub(super) stats: bool,
     /// Scroll of the detail pane, in lines.

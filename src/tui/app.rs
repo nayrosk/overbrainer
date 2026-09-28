@@ -20,6 +20,7 @@ use super::tasks::{Done, Edit, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
 use super::training::TrainingView;
 use super::views::logs::{export_line, level_name};
+use super::widgets::form::{Input, InputOutcome};
 use crate::cli::data::Command;
 use crate::cli::front::Report;
 use crate::config::Settings;
@@ -958,6 +959,10 @@ impl App {
     pub(super) fn on_input(&mut self, event: &Event) -> Vec<Effect> {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(*key),
+            Event::Paste(text) => {
+                self.on_paste(text);
+                Vec::new()
+            },
             Event::Resize(..) => {
                 self.dirty = true;
                 Vec::new()
@@ -1126,7 +1131,7 @@ impl App {
                 }
             },
             KeyCode::Char('s') => view.stats = !view.stats,
-            KeyCode::Char('/') => view.input = Some(view.filter.clone()),
+            KeyCode::Char('/') => view.input = Some(Input::new(view.filter.clone())),
             KeyCode::Esc if !view.filter.is_empty() => view.apply_filter(String::new()),
             _ => {},
         }
@@ -1233,26 +1238,29 @@ impl App {
     /// A key while the filter is typed: Enter applies it, Esc clears it.
     fn on_filter_key(&mut self, code: KeyCode) {
         let view = &mut self.dataset;
-        match code {
-            KeyCode::Char(c) => {
-                if let Some(input) = &mut view.input {
-                    input.push(c);
-                }
-            },
-            KeyCode::Backspace => {
-                if let Some(input) = &mut view.input {
-                    input.pop();
-                }
-            },
-            KeyCode::Enter => {
-                let filter = view.input.take().unwrap_or_default();
+        let Some(input) = &mut view.input else {
+            return;
+        };
+        match input.on_key(code) {
+            InputOutcome::Editing => {},
+            InputOutcome::Done(filter) => {
+                view.input = None;
                 view.apply_filter(filter);
             },
-            KeyCode::Esc => {
+            InputOutcome::Cancelled => {
                 view.input = None;
                 view.apply_filter(String::new());
             },
-            _ => {},
+        }
+    }
+
+    /// A bracketed paste goes to the input being typed; with none, it is dropped.
+    fn on_paste(&mut self, text: &str) {
+        if self.view == View::Dataset
+            && let Some(input) = &mut self.dataset.input
+        {
+            input.paste(text);
+            self.dirty = true;
         }
     }
 
@@ -1719,7 +1727,11 @@ mod tests {
         assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
         assert_eq!(app.overlay, None, "as any other key, g closes the menu");
         press(&mut app, &[KeyCode::Char('/'), KeyCode::Char('g')]);
-        assert_eq!(app.dataset.input.as_deref(), Some("g"), "g is typed");
+        assert_eq!(
+            app.dataset.input.as_ref().map(Input::text),
+            Some("g"),
+            "g is typed"
+        );
     }
 
     #[test]
@@ -2065,6 +2077,30 @@ mod tests {
         assert_eq!(app.dataset.filter, "");
         app.on_input(&ctrl_c());
         assert_eq!(app.exit, Some(Exit::Quit));
+    }
+
+    #[test]
+    fn the_filter_edits_at_its_cursor_and_takes_a_paste() {
+        let mut app = dataset_app();
+        press(
+            &mut app,
+            &[KeyCode::Char('/'), KeyCode::Char('b'), KeyCode::Home],
+        );
+        assert_eq!(app.on_input(&Event::Paste("bor\nde".into())), []);
+        press(
+            &mut app,
+            &[KeyCode::Char('a'), KeyCode::End, KeyCode::Enter],
+        );
+        assert_eq!(app.dataset.filter, "bor deab");
+    }
+
+    #[test]
+    fn a_paste_without_an_input_is_ignored() {
+        let mut app = dataset_app();
+        assert_eq!(app.on_input(&Event::Paste("q".into())), []);
+        assert_eq!(app.exit, None);
+        assert_eq!(app.dataset.filter, "");
+        assert_eq!(app.dataset.input, None);
     }
 
     /// The one load in `effects`.
@@ -4188,7 +4224,7 @@ mod tests {
                 app.overlay = Some(Overlay::Help);
             } else {
                 app.overlay = None;
-                app.dataset.input = Some("bor".into());
+                app.dataset.input = Some(Input::new("bor"));
             }
             app.prepare = Some(TaskId(3));
             let effects = app.on_done(

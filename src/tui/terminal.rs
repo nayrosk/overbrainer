@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, EventStream};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, EventStream};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -70,8 +70,9 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Enables raw mode and enters the alternate screen, like `ratatui::try_init`
-/// without the panic hook it installs (the guard's hook replaces it).
+/// Enables raw mode, enters the alternate screen and turns bracketed paste on,
+/// like `ratatui::try_init` without the panic hook it installs (the guard's
+/// hook replaces it).
 ///
 /// The terminal is never dropped. ratatui's `Drop for Terminal` shows a hidden
 /// cursor again and, when that fails on a closed terminal, reports it with
@@ -85,7 +86,7 @@ impl Drop for TerminalGuard {
 pub(super) fn init() -> io::Result<ManuallyDrop<DefaultTerminal>> {
     RESTORED.store(false, Ordering::SeqCst);
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     Terminal::new(CrosstermBackend::new(io::stdout())).map(ManuallyDrop::new)
 }
 
@@ -94,13 +95,14 @@ pub(super) fn init() -> io::Result<ManuallyDrop<DefaultTerminal>> {
 /// [`restore`] then has nothing to undo.
 static RESTORED: AtomicBool = AtomicBool::new(false);
 
-/// Leaves the alternate screen and raw mode, and shows the cursor, unless
-/// [`Screen::suspend`] already did. A failure is written to stderr, ignoring a
+/// Turns bracketed paste off, leaves the alternate screen and raw mode, and
+/// shows the cursor, unless [`Screen::suspend`] already did. A failure is written to stderr, ignoring a
 /// failed write: the terminal may be gone.
 fn restore() {
     if RESTORED.load(Ordering::SeqCst) {
         return;
     }
+    execute!(io::stdout(), DisableBracketedPaste).ok();
     if let Err(error) = ratatui::try_restore() {
         writeln!(io::stderr(), "cannot restore the terminal: {error}").ok();
     }
@@ -128,8 +130,8 @@ impl Screen {
 
     /// Hands the terminal over: stops reading it first and waits until the
     /// `EventStream` is dropped (so its reader thread takes no keystroke from the
-    /// editor), drops the keys read but not handled, then leaves the alternate
-    /// screen and raw mode, and shows the cursor. The terminal is put back in
+    /// editor), drops the keys read but not handled, then turns bracketed paste
+    /// off, leaves the alternate screen and raw mode, and shows the cursor. The terminal is put back in
     /// its normal mode even when the keys cannot be dropped.
     ///
     /// # Errors
@@ -143,7 +145,12 @@ impl Screen {
         // Keys crossterm already parsed stay in its global buffer, and would come
         // back after the editor: drop them, with any the tty still holds.
         let dropped = drop_keys();
-        let left = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        let left = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            Show
+        );
         let normal = disable_raw_mode();
         if left.is_ok() && normal.is_ok() {
             RESTORED.store(true, Ordering::SeqCst);
@@ -151,8 +158,8 @@ impl Screen {
         dropped.and(left).and(normal)
     }
 
-    /// Takes the terminal back: raw mode, the alternate screen and a hidden
-    /// cursor, then reads it again with a new `EventStream`. The caller clears
+    /// Takes the terminal back: raw mode, the alternate screen, bracketed paste
+    /// and a hidden cursor, then reads it again with a new `EventStream`. The caller clears
     /// the terminal so the next draw repaints it all.
     ///
     /// # Errors
@@ -161,7 +168,12 @@ impl Screen {
     pub(super) fn resume(&mut self) -> io::Result<()> {
         RESTORED.store(false, Ordering::SeqCst);
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            Hide
+        )?;
         self.reader = Some(InputTask::start(self.events.clone()));
         Ok(())
     }
