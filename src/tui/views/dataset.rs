@@ -326,8 +326,15 @@ fn question_detail(model: &Model, id: &Id, theme: &Theme) -> (Vec<Line<'static>>
     let mut parts = vec![0];
     if let Some(example) = model.answer(id) {
         lines.push(Line::from(""));
+        let offset = lines.len();
         let (answer, headers) = answer_detail(model, example, theme);
-        parts.extend(headers.into_iter().map(|header| header + lines.len()));
+        if headers.is_empty() {
+            // No reasoning or answer header: the metadata itself is the section,
+            // so `]` can still reach it.
+            parts.push(offset);
+        } else {
+            parts.extend(headers.into_iter().map(|header| header + offset));
+        }
         lines.extend(answer);
     }
     (lines, parts)
@@ -458,4 +465,39 @@ fn render_stats(frame: &mut Frame, area: Rect, app: &App, topic: Option<&str>) {
     let block = pane(theme.border).title(Span::styled(title, theme.title));
     let table = Table::new(rows, [Constraint::Length(16), Constraint::Fill(1)]).block(block);
     frame.render_widget(table, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Style;
+
+    use super::*;
+    use crate::dataset::Role;
+    use crate::tui::snapshots::{dataset, topics};
+    use crate::tui::theme::{ColorLevel, Theme};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn an_answer_without_an_assistant_message_still_gets_a_section() -> TestResult {
+        let mut data = dataset();
+        let id = data.answers[0].id.clone();
+        data.answers[0]
+            .messages
+            .retain(|message| message.role != Role::Assistant);
+        let model = Model::new(data, &topics(), ("", None), Style::new());
+        let theme = Theme::new(ColorLevel::TrueColor);
+        let (lines, parts) = question_detail(&model, &id, &theme);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        let metadata_line = lines
+            .get(parts[1])
+            .ok_or("no line at the section's index")?;
+        let text: String = metadata_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.starts_with("model "), "{text}");
+        Ok(())
+    }
 }
