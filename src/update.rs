@@ -29,6 +29,8 @@ const CACHE_FILE: &str = "latest-version.json";
 const MAX_BODY: usize = 64 * 1024;
 /// The most the check reads from its cache file.
 const MAX_CACHE: usize = 4096;
+/// The longest version the check accepts.
+const MAX_VERSION: usize = 64;
 
 /// A release newer than the running binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +77,15 @@ impl CheckEnv {
             cache_dir: base.map(|dir| dir.join("overbrainer")),
         }
     }
+}
+
+/// Whether `version` is short and only `[0-9A-Za-z.+-]`: anything else, such
+/// as an escape sequence, is never printed.
+fn plain_version(version: &str) -> bool {
+    version.len() <= MAX_VERSION
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".+-".contains(&byte))
 }
 
 /// `major.minor.patch` of a version, and whether it carries a pre-release.
@@ -152,7 +163,7 @@ fn read_cache(dir: &Path, now: SystemTime) -> Option<String> {
     let checked_at = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(cache.checked_at))?;
     // A cache from the future (a clock set back) fails here and is refreshed.
     let age = now.duration_since(checked_at).ok()?;
-    (age < MAX_AGE).then_some(cache.latest)
+    (age < MAX_AGE && plain_version(&cache.latest)).then_some(cache.latest)
 }
 
 fn read_small(path: &Path) -> std::io::Result<String> {
@@ -231,7 +242,11 @@ async fn fetch(url: &str, timeout: Duration) -> Result<String, Box<dyn Error + S
         body.extend_from_slice(&chunk);
     }
     let body: CrateResponse = serde_json::from_slice(&body)?;
-    Ok(body.krate.max_stable_version)
+    let version = body.krate.max_stable_version;
+    if !plain_version(&version) {
+        return Err(format!("not a version: {version:?}").into());
+    }
+    Ok(version)
 }
 
 #[cfg(test)]
@@ -522,6 +537,28 @@ mod tests {
             assert_eq!(found, None);
             assert!(!dir.path().join(CACHE_FILE).exists());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_version_that_is_not_plain_text_is_unknown() -> TestResult {
+        let escape = "9.9.9-\u{1b}[2J";
+        let long = format!("9.9.9-{}", "a".repeat(100));
+        for version in [escape, long.as_str()] {
+            let body = serde_json::json!({"crate": {"max_stable_version": version}}).to_string();
+            let dir = tempfile::tempdir()?;
+            let server = serve(ResponseTemplate::new(200).set_body_string(body), 1).await;
+            let found = latest(&env(dir.path()), &url(&server), now(), TIMEOUT).await;
+            assert_eq!(found, None, "{version:?} from crates.io");
+            let dir = tempfile::tempdir()?;
+            write_cache(dir.path(), now() - HOUR, version)?;
+            let server = serve(ResponseTemplate::new(500), 1).await;
+            let found = latest(&env(dir.path()), &url(&server), now(), TIMEOUT).await;
+            assert_eq!(found, None, "{version:?} from the cache");
+        }
+        let longest = format!("9.9.9-{}", "a".repeat(58));
+        assert!(plain_version(&longest));
+        assert!(!plain_version(&format!("{longest}a")));
         Ok(())
     }
 
