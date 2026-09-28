@@ -18,13 +18,13 @@ use hyper::header::{CONTENT_TYPE, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::events::{Event, Observer, Stage};
@@ -39,6 +39,12 @@ pub const CONTENT_TYPE_VALUE: &str = "application/openmetrics-text; version=1.0.
 
 /// Model label of tokens and cost whose stage named no model.
 const UNKNOWN_MODEL: &str = "unknown";
+
+/// Connections served at once; a new one beyond is closed at once.
+const MAX_CONNECTIONS: usize = 32;
+
+/// How long a connection may take to send a request's headers.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pause after a failed accept (out of file descriptors), so the loop never spins.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
@@ -443,31 +449,47 @@ pub async fn serve(address: SocketAddr, metrics: Arc<Metrics>) -> io::Result<Met
     Ok(MetricsServer { address, server })
 }
 
-/// Serves each connection in its own task, all of them dropped with this one.
+/// Serves each connection in its own task, at most [`MAX_CONNECTIONS`] at once,
+/// all of them dropped with this one.
 async fn accept(listener: TcpListener, metrics: Arc<Metrics>) {
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    connections.spawn(connection(stream, Arc::clone(&metrics)));
-                },
-                Err(error) => {
+            accepted = listener.accept() => {
+                if let Err(error) = admit(&mut connections, accepted, &metrics) {
                     tracing::debug!("cannot accept a metrics connection: {error}");
                     tokio::time::sleep(ACCEPT_PAUSE).await;
-                },
+                }
             },
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
         }
     }
 }
 
-async fn connection(stream: tokio::net::TcpStream, metrics: Arc<Metrics>) {
+/// Serves the `accepted` connection in `connections`, or closes it when
+/// [`MAX_CONNECTIONS`] are served already.
+fn admit(
+    connections: &mut JoinSet<()>,
+    accepted: io::Result<(TcpStream, SocketAddr)>,
+    metrics: &Arc<Metrics>,
+) -> io::Result<()> {
+    let (stream, _) = accepted?;
+    if connections.len() >= MAX_CONNECTIONS {
+        tracing::debug!("closing a metrics connection: {MAX_CONNECTIONS} are open");
+    } else {
+        connections.spawn(connection(stream, Arc::clone(metrics)));
+    }
+    Ok(())
+}
+
+async fn connection(stream: TcpStream, metrics: Arc<Metrics>) {
     let service = service_fn(move |request| {
         let response = respond(&request, &metrics);
         async move { Ok::<_, Infallible>(response) }
     });
     if let Err(error) = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_TIMEOUT)
         .serve_connection(TokioIo::new(stream), service)
         .await
     {
@@ -871,6 +893,23 @@ mod tests {
             .text()
             .await?;
         assert_value(&text, running, 1.0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connections_beyond_the_cap_are_closed() -> TestResult {
+        use tokio::io::AsyncReadExt as _;
+
+        let server = serve("127.0.0.1:0".parse()?, Arc::new(Metrics::new(&[]))).await?;
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(tokio::net::TcpStream::connect(server.address()).await?);
+        }
+        let mut extra = tokio::net::TcpStream::connect(server.address()).await?;
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), extra.read(&mut byte)).await;
+        assert!(matches!(read, Ok(Ok(0))), "{read:?}");
+        drop(idle);
         Ok(())
     }
 
