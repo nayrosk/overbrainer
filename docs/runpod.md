@@ -94,7 +94,7 @@ no data center has A or B in stock for data_center_ids = "auto" (gpu_count = 1)
 
 ## The pickers
 
-The [TUI](tui.md)'s Project view lets you set a Runpod target's `gpu_types`, `data_center_ids`, `network_volume_id` and `image` from the live catalog instead of typing them, and the confirmation before a run starts lets you re-pick the GPU types and data centers it will use, saving the choice to `overbrainer.toml` first. `o` sorts the GPU picker by price, VRAM (most first) or the number of data centers with the type in stock (most first), and the data center picker by ID or region. With `network_volume_id` set, `data_center_ids` holds the volume's data center: changing it in the Project view is refused, pick another volume instead. See [Terminal UI](tui.md) for the keys.
+The [TUI](tui.md)'s Project view lets you set a Runpod target's `gpu_types`, `data_center_ids`, `network_volume_id` and `image` from the live catalog instead of typing them, and the confirmation before a run starts lets you re-pick the GPU types and data centers it will use, saving the choice to `overbrainer.toml` first. `o` sorts the GPU picker by price, VRAM (most first) or the number of data centers with the type in stock (most first), and the data center picker by ID or region. With `network_volume_id` set to a volume the volume listing has, `data_center_ids` holds the volume's data center: changing it in the Project view is refused, pick another volume instead. See [Terminal UI](tui.md) for the keys.
 
 `container_disk_gb` is checked against fixed bounds (at least 20): the Runpod v2 API does not say how much container disk a GPU type allows.
 

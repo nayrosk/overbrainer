@@ -930,6 +930,9 @@ impl App {
             }
             listed.entries
         });
+        if kind == CatalogKind::Volumes && entries.is_ok() {
+            self.reconcile_volume_centers();
+        }
         if let Some(Overlay::Picker(picking)) = &mut self.overlay
             && picking.task == id
         {
