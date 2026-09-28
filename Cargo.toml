@@ -35,8 +35,11 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 dotenvy = "0.15.7"
 fastrand = "2.5.0"
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
+hyper = { version = "1.11.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "debug", "serde"] }
 openssh = { version = "0.11.6", default-features = false, features = ["native-mux"] }
+prometheus-client = "0.25.1"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "http2", "charset"] }
 rustify = { version = "0.7.0", default-features = false }
