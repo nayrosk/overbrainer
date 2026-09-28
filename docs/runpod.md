@@ -71,7 +71,7 @@ tp9z8y7x  axolotl-custom  myrepo/axolotl:0.20.0
 
 An empty listing prints one line saying so instead of a table (`pod: no GPU type matches`, `pod: no data center found`, `pod: no network volume on this account`, `pod: no pod template on this account`).
 
-Names, IDs and images come from the Runpod API: before a table is printed, or a picker drawn, escape sequences and other control characters (C0, DEL, C1) are dropped from them, so an odd name cannot move the cursor or change the terminal's state.
+The IDs, names, regions, data centers, images and CUDA versions of the catalog (GPU types, data centers, network volumes, templates) are cleaned as soon as they are read from the Runpod API: escape sequences are dropped, a newline, tab or other whitespace control character becomes a space, and any other control character (C0, DEL, C1) is dropped. Every later use (the `overbrainer pod` tables, the pickers, the start confirmation, the `"auto"` errors, a GPU type or data center written to `overbrainer.toml` from a picker) gets the clean text, so an odd name cannot move the cursor or change the terminal's state. `overbrainer pod ls` keeps only printable ASCII in the pod fields it prints.
 
 ## `"auto"`
 
