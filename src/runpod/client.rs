@@ -9,6 +9,7 @@ use reqwest::{Method, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 
+use super::target::MIN_CUDA_VERSION;
 use super::types::{
     CreatePod, DataCenter, DataCenterList, GpuType, GpuTypeList, NetworkVolume, NetworkVolumeList,
     Pagination, Pod, PodId, PodPage, Template, TemplatePage,
@@ -331,8 +332,10 @@ impl RunpodClient {
     }
 
     /// The Secure Cloud GPU types of the catalog with their pod stock for
-    /// `gpu_count` GPUs (at least 1), overall and per data center
-    /// (`GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=SECURE`).
+    /// `gpu_count` GPUs (at least 1), overall and per data center, counting
+    /// only machines whose driver has [`MIN_CUDA_VERSION`], the version every
+    /// create asks for (`GET /catalog/gpus?include=AVAILABILITY&product=POD`
+    /// `&cloud=SECURE&minCudaVersion=...`).
     ///
     /// # Errors
     ///
@@ -344,6 +347,7 @@ impl RunpodClient {
             ("product", "POD"),
             ("cloud", "SECURE"),
             ("count", count.as_str()),
+            ("minCudaVersion", MIN_CUDA_VERSION),
         ];
         let list: GpuTypeList = self.get_json(&self.list_url(GPUS_PATH, &query)?).await?;
         Ok(list.gpus)

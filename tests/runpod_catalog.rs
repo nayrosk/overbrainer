@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use overbrainer::retry::RetryPolicy;
-use overbrainer::runpod::{ApiError, Availability, RunpodClient};
+use overbrainer::runpod::{ApiError, Availability, MIN_CUDA_VERSION, RunpodClient};
 use secrecy::SecretString;
 use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
@@ -59,6 +59,7 @@ async fn gpu_types_are_listed_with_their_pod_availability() -> TestResult {
         .and(query_param("product", "POD"))
         .and(query_param("cloud", "SECURE"))
         .and(query_param("count", "2"))
+        .and(query_param("minCudaVersion", MIN_CUDA_VERSION))
         .and(header("authorization", format!("Bearer {KEY}").as_str()))
         .respond_with(ResponseTemplate::new(200).set_body_json(gpus_body()))
         .expect(1)
