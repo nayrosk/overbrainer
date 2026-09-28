@@ -491,12 +491,14 @@ where
         Ok(())
     }
 
-    /// Opens `url` in a browser, detached: no terminal I/O, never waited for.
-    /// The child is dropped at once and tokio reaps it in the background, so no
-    /// zombie is left and quitting never waits for it (`xdg-open` can run as
-    /// long as the browser it started). Its own process group keeps a Ctrl-C or
-    /// a job-control signal to the TUI from reaching it. A failed start comes
-    /// back as [`Msg::BrowserFailed`].
+    /// Opens `url` in a browser, detached: no terminal I/O, and the loop never
+    /// waits for it. A detached task waits for the child, so no zombie is left;
+    /// the runtime cancels that task when the TUI ends, so quitting never waits
+    /// for it (`xdg-open` can run as long as the browser it started). Its own
+    /// process group keeps a Ctrl-C or a job-control signal to the TUI from
+    /// reaching it. A failed start or a non-zero exit comes back as one
+    /// [`Msg::BrowserFailed`]; why is logged at debug, so no warning replaces
+    /// that message on the status line.
     fn open_url(&self, url: String) {
         let started = tokio::process::Command::new(opener(cfg!(target_os = "macos")))
             .arg(&url)
@@ -506,9 +508,11 @@ where
             .process_group(0)
             .spawn();
         match started {
-            Ok(child) => drop(child),
+            Ok(child) => {
+                tokio::spawn(watch_browser(child, url, self.messages.clone()));
+            },
             Err(error) => {
-                tracing::warn!("cannot open a browser on {url}: {error}");
+                tracing::debug!("cannot open a browser on {url}: {error}");
                 self.messages.send(Msg::BrowserFailed(url)).ok();
             },
         }
@@ -588,6 +592,18 @@ where
             message => Ok(app.on_message(message)),
         }
     }
+}
+
+/// Waits for the browser opener `child` of `url`, and sends
+/// [`Msg::BrowserFailed`] to `messages` when it ends with an error.
+async fn watch_browser(mut child: Child, url: String, messages: UnboundedSender<Msg>) {
+    let why = match child.wait().await {
+        Ok(status) if status.success() => return,
+        Ok(status) => status.to_string(),
+        Err(error) => error.to_string(),
+    };
+    tracing::debug!("the browser opener on {url} failed: {why}");
+    messages.send(Msg::BrowserFailed(url)).ok();
 }
 
 /// The program that opens a URL in the user's browser: `open` on macOS,
@@ -719,6 +735,24 @@ mod tests {
     fn the_browser_opener_is_open_on_macos_and_xdg_open_elsewhere() {
         assert_eq!(opener(true), "open");
         assert_eq!(opener(false), "xdg-open");
+    }
+
+    #[tokio::test]
+    async fn a_browser_opener_is_reported_only_when_it_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (messages, mut received) = mpsc::unbounded_channel();
+        let ok = tokio::process::Command::new("true").spawn()?;
+        watch_browser(ok, "https://a".into(), messages.clone()).await;
+        let failed = tokio::process::Command::new("false").spawn()?;
+        watch_browser(failed, "https://b".into(), messages).await;
+        let mut urls = Vec::new();
+        while let Some(message) = received.recv().await {
+            if let Msg::BrowserFailed(url) = message {
+                urls.push(url);
+            }
+        }
+        assert_eq!(urls, ["https://b"]);
+        Ok(())
     }
 
     #[test]

@@ -1706,12 +1706,18 @@ mod tests {
     }
 
     #[test]
-    fn a_browser_that_cannot_start_is_said() {
+    fn a_browser_that_fails_is_said_and_stays_said() {
         let mut app = app();
         let url = REPOSITORY.to_string();
         assert_eq!(app.on_message(Msg::BrowserFailed(url.clone())), []);
         let status = app.status.as_ref().map(|s| (s.severity, s.text.as_str()));
         let said = format!("cannot open a browser: {url}");
+        assert_eq!(status, Some((Severity::Warn, said.as_str())));
+        // The loop logs why at debug: the next tick keeps the message. A newer
+        // warning from elsewhere would replace it, as any status.
+        log(&app, Level::DEBUG, "xdg-open exited with 3");
+        app.on_tick(at(NOW + 1));
+        let status = app.status.as_ref().map(|s| (s.severity, s.text.as_str()));
         assert_eq!(status, Some((Severity::Warn, said.as_str())));
     }
 
