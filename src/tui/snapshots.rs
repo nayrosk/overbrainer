@@ -1417,8 +1417,14 @@ fn no_secret_is_ever_drawn_in_the_project_view() -> TestResult {
             seen.push_str(&text(&draw(&mut app, width, height)?).join("\n"));
             app.on_input(&key(KeyCode::Char('j')));
         }
-        for secret in [SECRET, "sk-live", "secret/overbrainer", "vault:"] {
-            assert!(!seen.contains(secret), "{secret} drawn at {width}x{height}");
+        for (index, secret) in [SECRET, "sk-live", "secret/overbrainer", "vault:"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                !seen.contains(secret),
+                "secret #{index} drawn at {width}x{height}"
+            );
         }
         assert!(seen.contains("vault ref"), "{width}x{height}");
         assert!(

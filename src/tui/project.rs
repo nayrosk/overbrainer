@@ -1251,8 +1251,11 @@ mod tests {
             Shown::Value("https://nano-gpt.com/api/v1".into())
         );
         let all = format!("{rows:?}");
-        assert!(!all.contains(SECRET), "{all}");
-        assert!(!all.contains("secret/overbrainer"), "{all}");
+        assert!(!all.contains(SECRET), "the secret value is in a row");
+        assert!(
+            !all.contains("secret/overbrainer"),
+            "the vault path is in a row"
+        );
         Ok(())
     }
 

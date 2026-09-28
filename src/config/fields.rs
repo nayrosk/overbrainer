@@ -894,11 +894,11 @@ max_hours = 6
     #[test]
     fn errors_never_quote_the_value() {
         let secret = "sk-secret-value";
-        for kind in [COUNT, BOOL, RUNTIMES, THRESHOLD] {
+        for (index, kind) in [COUNT, BOOL, RUNTIMES, THRESHOLD].into_iter().enumerate() {
             let message = kind.parse(secret).err().unwrap_or_default();
             assert!(
                 !message.is_empty() && !message.contains(secret),
-                "{message}"
+                "kind #{index} quotes the value or says nothing"
             );
         }
     }
