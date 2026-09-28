@@ -106,8 +106,9 @@ where
 
 /// What woke the loop while it settles.
 enum Settling {
-    /// A task ended, or none is left.
-    Ended(Option<(TaskId, Result<Done, String>)>),
+    /// A task ended, or none is left. Boxed: a result is far larger than the
+    /// other variants.
+    Ended(Option<Box<(TaskId, Result<Done, String>)>>),
     /// A process signal.
     Signal,
     /// Time to write the new log lines.
@@ -325,12 +326,13 @@ where
         let mut tick = tokio::time::interval(TICK);
         loop {
             let woke = tokio::select! {
-                next = self.tasks.next() => Settling::Ended(next),
+                next = self.tasks.next() => Settling::Ended(next.map(Box::new)),
                 () = Signals::recv(self.signals.as_mut(), true) => Settling::Signal,
                 _ = tick.tick() => Settling::Tick,
             };
             let effects = match woke {
-                Settling::Ended(Some((id, result))) => {
+                Settling::Ended(Some(ended)) => {
+                    let (id, result) = *ended;
                     self.drain_late(app);
                     app.on_done(id, result)
                 },

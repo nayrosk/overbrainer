@@ -4,7 +4,7 @@
 use super::app::App;
 use super::pipeline::{Row, StageState};
 use super::training::pod_spend;
-use crate::history::{self, Cost, Entry};
+use crate::history::{Cost, Total};
 use crate::llm::Usage;
 
 /// `total` plus one more expense, `None` when its amount is unknown; a `None`
@@ -26,9 +26,9 @@ pub(super) fn rows_cost(rows: &[Row]) -> Cost {
         .unwrap_or_default()
 }
 
-/// The cost of the stages recorded in `entries`, `None` when none spent anything.
-pub(super) fn history_cost(entries: &[Entry]) -> Option<Cost> {
-    let (_, all) = history::totals(entries);
+/// The cost of the stages whose overall total is `all`, `None` when none spent
+/// anything.
+pub(super) fn history_cost(all: &Total) -> Option<Cost> {
     all.spent().then_some(all.cost)
 }
 
@@ -309,6 +309,10 @@ mod tests {
             )),
         }];
         assert_eq!(project_cost(&app), Cost::Unknown);
+    }
+
+    fn history_cost(entries: &[crate::history::Entry]) -> Option<Cost> {
+        super::history_cost(&crate::history::totals(entries).1)
     }
 
     #[test]

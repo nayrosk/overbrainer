@@ -18,9 +18,7 @@ use crate::config::{
 };
 use crate::history::{Cost, Total};
 use crate::runs::RunState;
-
-/// What a secret's value starts with when it names a Vault field.
-const VAULT_PREFIX: &str = "vault:";
+use crate::secrets::is_reference;
 
 /// The configuration the Project view shows: the effective settings, the
 /// document they were read from, and which keys the environment sets.
@@ -56,28 +54,30 @@ impl ProjectConfig {
 }
 
 /// The dotted keys of `env` whose value is a `vault:` reference. Only the
-/// prefix of each value is looked at, and nothing of it is kept.
+/// `OVERBRAINER_*` variables are looked at, and only the prefix of their value;
+/// nothing of it is kept.
 pub(super) fn vault_keys(env: &EnvSource) -> BTreeSet<String> {
+    let prefix = format!("{ENV_PREFIX}_").to_lowercase();
+    let ours = |name: &str| name.to_lowercase().starts_with(&prefix);
     let references: Vec<String> = match env {
         EnvSource::Process => std::env::vars_os()
-            .filter(|(_, value)| {
-                value
-                    .to_str()
-                    .is_some_and(|value| value.starts_with(VAULT_PREFIX))
-            })
-            .filter_map(|(key, _)| key.into_string().ok())
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value)))
+            .filter(|(name, _)| ours(name))
+            .filter(|(_, value)| value.to_str().is_some_and(is_reference))
+            .map(|(name, _)| name)
             .collect(),
         EnvSource::Vars(pairs) => pairs
             .iter()
-            .filter(|(_, value)| value.starts_with(VAULT_PREFIX))
-            .map(|(key, _)| key.clone())
+            .filter(|(name, _)| ours(name))
+            .filter(|(_, value)| is_reference(value))
+            .map(|(name, _)| name.clone())
             .collect(),
     };
-    // Keys only: `env_keys` maps names to dotted keys as `load` reads them.
+    // Names only: `env_keys` maps them to dotted keys as `load` reads them.
     env_keys(&EnvSource::Vars(
         references
             .into_iter()
-            .map(|key| (key, String::new()))
+            .map(|name| (name, String::new()))
             .collect(),
     ))
 }
@@ -680,19 +680,7 @@ pub(super) fn stats(app: &App) -> Vec<Stat> {
         for (stage, total) in history.stages.iter().filter(|(_, total)| total.spent()) {
             lines.push(Stat::Pair(stage.name().to_string(), spent(total)));
         }
-        let all = history
-            .stages
-            .values()
-            .fold(Total::default(), |mut all, total| {
-                all.input_tokens += total.input_tokens;
-                all.output_tokens += total.output_tokens;
-                all
-            });
-        let all = Total {
-            cost: history.cost.unwrap_or_default(),
-            ..all
-        };
-        lines.push(Stat::Pair("all".to_string(), spent(&all)));
+        lines.push(Stat::Pair("all".to_string(), spent(&history.all)));
     } else {
         lines.push(Stat::Note("nothing spent yet".to_string()));
     }
@@ -730,23 +718,24 @@ pub(super) fn stats(app: &App) -> Vec<Stat> {
         None => lines.push(Stat::Note("not read yet".to_string())),
     }
     lines.push(Stat::Heading("training"));
-    let mut states: BTreeMap<&str, usize> = BTreeMap::new();
+    // An exhaustive match orders the states: a new one cannot be left out.
+    let rank = |state: RunState| match state {
+        RunState::Preparing => 0,
+        RunState::Running => 1,
+        RunState::Succeeded => 2,
+        RunState::Failed => 3,
+        RunState::Cancelled => 4,
+    };
+    let mut states: BTreeMap<u8, (&str, usize)> = BTreeMap::new();
     for run in &app.training.runs {
-        *states.entry(run.record.state.name()).or_default() += 1;
+        let state = run.record.state;
+        states.entry(rank(state)).or_insert((state.name(), 0)).1 += 1;
     }
     if states.is_empty() {
         lines.push(Stat::Note("no runs yet".to_string()));
     }
-    for state in [
-        RunState::Preparing,
-        RunState::Running,
-        RunState::Succeeded,
-        RunState::Failed,
-        RunState::Cancelled,
-    ] {
-        if let Some(count) = states.get(state.name()) {
-            lines.push(Stat::Pair(state.name().to_string(), count.to_string()));
-        }
+    for (name, count) in states.into_values() {
+        lines.push(Stat::Pair(name.to_string(), count.to_string()));
     }
     if let Some(pods) = pods_cost(app) {
         let spend = match pods {
@@ -769,7 +758,8 @@ pub(super) fn stats(app: &App) -> Vec<Stat> {
 mod tests {
     use super::*;
     use crate::tui::snapshots::{
-        SECRET, app, dataset_app, pipeline_running, project_config as config, project_env as env,
+        FINISHED, SECRET, app, dataset_app, pipeline_running, project_config as config,
+        project_env as env, training_app,
     };
     use crate::tui::tasks::TaskId;
     use crate::tui::training::{Follow, Job};
@@ -791,6 +781,18 @@ mod tests {
         assert_eq!(
             keys.into_iter().collect::<Vec<_>>(),
             vec!["runpod.api_key".to_string()]
+        );
+        let others = EnvSource::Vars(vec![
+            ("VAULT_REF".into(), "vault:secret/x#y".into()),
+            (
+                "overbrainer_hf_token".into(),
+                "vault:secret/hf#token".into(),
+            ),
+        ]);
+        assert_eq!(
+            vault_keys(&others).into_iter().collect::<Vec<_>>(),
+            vec!["hf_token".to_string()],
+            "only OVERBRAINER_* variables, in any case"
         );
     }
 
@@ -961,6 +963,75 @@ mod tests {
             locks.run,
             Some(("run 20260921-a1".to_string(), "gpu_cloud".to_string()))
         );
+    }
+
+    #[test]
+    fn a_start_locks_for_a_new_run_on_the_configured_target() {
+        let mut app = app();
+        app.training
+            .tasks
+            .insert(TaskId(4), Follow::new(Job::Start { runpod: true }, ""));
+        assert_eq!(
+            Locks::of(&app).run,
+            Some(("a new run".to_string(), "gpu_cloud".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_followed_run_locks_the_target_of_its_record() -> TestResult {
+        let mut app = training_app()?;
+        app.training.tasks.clear();
+        app.training
+            .tasks
+            .insert(TaskId(4), Follow::new(Job::Attach, FINISHED));
+        assert_eq!(
+            Locks::of(&app).run,
+            Some((format!("run {FINISHED}"), "homelab".to_string())),
+            "the run's own target, not training.target"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn questions_lock_the_embedder_and_the_generator() -> TestResult {
+        let locks = Locks {
+            stage: Some(("questions", roles_of(Command::Questions))),
+            run: None,
+        };
+        let rows = rows(&config()?, &locks);
+        for key in [
+            "roles.embedder.model",
+            "roles.generator.model",
+            "providers.nanogpt.protocol",
+        ] {
+            assert_eq!(
+                field(&rows, key)?.lock.as_deref(),
+                Some("questions"),
+                "{key}"
+            );
+        }
+        assert_eq!(field(&rows, "roles.parent.model")?.lock, None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_stats_count_the_runs_per_state_in_order() -> TestResult {
+        let app = training_app()?;
+        let lines = stats(&app);
+        let runs: Vec<&Stat> = lines
+            .iter()
+            .skip_while(|line| **line != Stat::Heading("training"))
+            .skip(1)
+            .take(2)
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                &Stat::Pair("running".into(), "2".into()),
+                &Stat::Pair("succeeded".into(), "1".into()),
+            ]
+        );
+        Ok(())
     }
 
     #[test]

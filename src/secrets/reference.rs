@@ -19,6 +19,13 @@ impl std::fmt::Display for VaultRef {
     }
 }
 
+/// Whether `raw` is a `vault:` reference, well formed or not. Only its prefix
+/// is looked at.
+#[must_use]
+pub fn is_reference(raw: &str) -> bool {
+    raw.starts_with(PREFIX)
+}
+
 /// Parses `vault:<mount>/<path>#<field>`. Returns `Ok(None)` for literal values.
 ///
 /// Error messages never include the raw value, since a malformed literal may be a secret.
@@ -48,6 +55,14 @@ pub fn parse_reference(raw: &str) -> Result<Option<VaultRef>, SecretError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reference_is_told_by_its_prefix_alone() {
+        assert!(is_reference("vault:secret/overbrainer/nanogpt#api_key"));
+        assert!(is_reference("vault:"), "malformed, still a reference");
+        assert!(!is_reference("sk-abc"));
+        assert!(!is_reference(" vault:x/y#z"));
+    }
 
     #[test]
     fn literal_values_are_not_references() -> Result<(), SecretError> {

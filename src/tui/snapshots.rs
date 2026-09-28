@@ -980,7 +980,7 @@ use crate::runs::RunState;
 use crate::tui::training::{Ended, Follow, Job, RunRow};
 
 const FOLLOWED: &str = "20260921-133200-a1b2";
-const FINISHED: &str = "20260920-101500-9f00";
+pub(super) const FINISHED: &str = "20260920-101500-9f00";
 const LEFT: &str = "20260919-090000-c3d4";
 
 /// Three runs: a Runpod run followed live, a finished local run, and a run left

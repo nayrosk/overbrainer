@@ -117,6 +117,8 @@ pub(super) struct History {
     pub(super) cost: Option<Cost>,
     /// Totals per stage.
     pub(super) stages: BTreeMap<Stage, Total>,
+    /// The total over every stage.
+    pub(super) all: Total,
     /// Totals per model.
     pub(super) models: BTreeMap<String, Total>,
 }
@@ -124,9 +126,11 @@ pub(super) struct History {
 impl History {
     /// The history of `entries`.
     pub(super) fn of(entries: &[Entry]) -> Self {
+        let (stages, all) = history::totals(entries);
         Self {
-            cost: history_cost(entries),
-            stages: history::totals(entries).0,
+            cost: history_cost(&all),
+            stages,
+            all,
             models: history::per_model(entries),
         }
     }
