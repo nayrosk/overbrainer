@@ -115,6 +115,9 @@ pub struct Metrics {
     runs: Option<Runs>,
     /// Per bus ID.
     buses: Mutex<BTreeMap<usize, Followed>>,
+    /// Held by a scrape from its spend refill to its encoding, so another never
+    /// sees the spend family half refilled.
+    scrape: Mutex<()>,
 }
 
 impl Metrics {
@@ -196,6 +199,7 @@ impl Metrics {
             spend,
             runs: None,
             buses: Mutex::default(),
+            scrape: Mutex::default(),
         };
         // Every stage shows, running or not.
         for stage in [
@@ -353,9 +357,10 @@ impl Metrics {
         let Some(runs) = &self.runs else {
             return;
         };
+        let spends = pod_spends(runs, now);
         // A run removed since the last scrape leaves no series behind.
         self.spend.clear();
-        for (run_id, spend) in pod_spends(runs, now) {
+        for (run_id, spend) in spends {
             self.spend.get_or_create(&RunLabels { run_id }).set(spend);
         }
     }
@@ -366,6 +371,7 @@ impl Metrics {
     ///
     /// Returns an error when a family cannot be written.
     pub fn encode(&self) -> Result<String, fmt::Error> {
+        let _scrape = self.scrape.lock().unwrap_or_else(PoisonError::into_inner);
         self.read_spend(SystemTime::now());
         let mut text = String::new();
         prometheus_client::encoding::text::encode(&mut text, &self.registry)?;
