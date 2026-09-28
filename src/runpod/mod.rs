@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 mod bootstrap;
+mod catalog;
 mod client;
 mod flow;
 mod keys;
@@ -21,6 +22,9 @@ mod types;
 
 pub use bootstrap::{
     HOST_KEY_ENV, JOB_ENV, PodSettings, bootstrap_functions, pod_command, pod_env, watchdog_script,
+};
+pub use catalog::{
+    DataCenterStock, GpuFilter, by_price, data_center_stock, select_gpus, stocked_data_centers,
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
 pub use flow::{
@@ -43,8 +47,10 @@ pub use record::{
 pub use status::{DeleteReason, PodStatus};
 pub use target::{MIN_CUDA_VERSION, RunpodTarget, VOLUME_MOUNT, VOLUME_WORKDIR, WORKDIR};
 pub use types::{
-    CreateEnv, CreatePod, GpuRequest, InvalidPodId, Mounts, NetworkMount, Pagination, Pod, PodEnv,
-    PodGpu, PodId, PodPage, PodSsh, RemoteStatus, SshDirect,
+    Availability, CreateEnv, CreatePod, CudaVersion, DataCenter, DataCenterList, GpuMaxCount,
+    GpuPrice, GpuRequest, GpuType, GpuTypeList, InvalidPodId, Mounts, NetworkMount, NetworkVolume,
+    NetworkVolumeList, Pagination, Pod, PodEnv, PodGpu, PodId, PodPage, PodSsh, RemoteStatus,
+    SshDirect, Stock, Template, TemplatePage,
 };
 
 /// Errors of a Runpod run's pod: provisioning, keys, readiness, deletion.

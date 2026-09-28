@@ -207,7 +207,7 @@ pub struct PodPage {
     pub pagination: Option<Pagination>,
 }
 
-/// Paging of `GET /pods`.
+/// Paging of `GET /pods` and `GET /templates`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pagination {
@@ -217,6 +217,255 @@ pub struct Pagination {
     /// The cursor of the next page.
     #[serde(default)]
     pub next_cursor: Option<String>,
+}
+
+/// Deserializes a field that may be `null` as its type's default, so a catalog
+/// entry with a `null` Runpod did not fill in still parses.
+fn nullable<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+/// A catalog stock band, as Runpod writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Availability {
+    /// Out of stock.
+    None,
+    /// Little stock.
+    Low,
+    /// Some stock.
+    Medium,
+    /// Plenty of stock.
+    High,
+    /// Absent, or a band this version of overbrainer does not know.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl Availability {
+    /// The band as Runpod writes it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Low => "LOW",
+            Self::Medium => "MEDIUM",
+            Self::High => "HIGH",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+
+    /// Whether some stock is reported: `LOW`, `MEDIUM` or `HIGH`. An unknown
+    /// band is not stock.
+    #[must_use]
+    pub fn is_in_stock(self) -> bool {
+        matches!(self, Self::Low | Self::Medium | Self::High)
+    }
+}
+
+/// A GPU type of the catalog (`GET /catalog/gpus` and `/catalog/gpus/{id}`).
+/// Only the fields overbrainer uses are read; every one tolerates `null`.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuType {
+    /// GPU type ID, as a pod create asks for it.
+    #[serde(default, deserialize_with = "nullable")]
+    pub id: String,
+    /// Display name.
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    /// `NVIDIA`, `AMD` or `UNKNOWN`.
+    #[serde(default, deserialize_with = "nullable")]
+    pub manufacturer: String,
+    /// VRAM of one GPU, in GB.
+    #[serde(default, deserialize_with = "nullable")]
+    pub memory: u32,
+    /// Whether Secure Cloud offers it; `None` when not said.
+    #[serde(default)]
+    pub secure: Option<bool>,
+    /// List prices of one GPU.
+    #[serde(default, deserialize_with = "nullable")]
+    pub price: GpuPrice,
+    /// Most GPUs of this type on one pod.
+    #[serde(default, deserialize_with = "nullable")]
+    pub max_count: GpuMaxCount,
+    /// Overall pod stock for the requested GPU count.
+    #[serde(default, deserialize_with = "nullable")]
+    pub availability: Availability,
+    /// Pod stock per data center offering it.
+    #[serde(default, deserialize_with = "nullable")]
+    pub data_centers: Vec<Stock>,
+    /// CUDA versions its machines offer.
+    #[serde(default, deserialize_with = "nullable")]
+    pub cuda_versions: Vec<CudaVersion>,
+}
+
+impl GpuType {
+    /// The Secure Cloud list price of one GPU, in USD per hour.
+    #[must_use]
+    pub fn secure_price(&self) -> Option<f64> {
+        self.price.secure
+    }
+
+    /// Whether Secure Cloud offers it (true unless Runpod says otherwise).
+    #[must_use]
+    pub fn on_secure_cloud(&self) -> bool {
+        self.secure != Some(false)
+    }
+
+    /// The stock of this GPU in `data_center`: `None` when it is not offered
+    /// there.
+    #[must_use]
+    pub fn stock_in(&self, data_center: &str) -> Availability {
+        self.data_centers
+            .iter()
+            .find(|entry| entry.id == data_center)
+            .map_or(Availability::None, |entry| entry.availability)
+    }
+}
+
+/// List prices of one GPU, in USD per hour.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+pub struct GpuPrice {
+    /// Secure Cloud.
+    #[serde(default)]
+    pub secure: Option<f64>,
+    /// Community Cloud.
+    #[serde(default)]
+    pub community: Option<f64>,
+}
+
+/// Most GPUs of one type a pod can have, per cloud: a ceiling, not stock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub struct GpuMaxCount {
+    /// Secure Cloud.
+    #[serde(default, deserialize_with = "nullable")]
+    pub secure: u32,
+    /// Community Cloud.
+    #[serde(default, deserialize_with = "nullable")]
+    pub community: u32,
+}
+
+/// The stock of one catalog entry (a GPU type in a data center, or a data
+/// center for a GPU type).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct Stock {
+    /// The entry's ID.
+    #[serde(default, deserialize_with = "nullable")]
+    pub id: String,
+    /// Its display name.
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    /// Its stock band.
+    #[serde(default, deserialize_with = "nullable")]
+    pub availability: Availability,
+}
+
+/// A CUDA version offered by a GPU type's machines.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct CudaVersion {
+    /// `major.minor`.
+    #[serde(default, deserialize_with = "nullable")]
+    pub version: String,
+    /// Whether a machine on it has free capacity now.
+    #[serde(default, deserialize_with = "nullable")]
+    pub available: bool,
+}
+
+/// `GET /catalog/gpus`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GpuTypeList {
+    /// The GPU types.
+    #[serde(default, deserialize_with = "nullable")]
+    pub gpus: Vec<GpuType>,
+}
+
+/// A data center of the catalog (`GET /catalog/datacenters`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataCenter {
+    /// Its ID, as `data_center_ids` names it.
+    #[serde(default, deserialize_with = "nullable")]
+    pub id: String,
+    /// Display name.
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    /// Continental region, such as `EUROPE`.
+    #[serde(default, deserialize_with = "nullable")]
+    pub region: String,
+    /// Stock of each GPU type it offers.
+    #[serde(default, deserialize_with = "nullable")]
+    pub gpu_availability: Vec<Stock>,
+}
+
+/// `GET /catalog/datacenters`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataCenterList {
+    /// The data centers.
+    #[serde(default, deserialize_with = "nullable")]
+    pub data_centers: Vec<DataCenter>,
+}
+
+/// A network volume of the account (`GET /network-volumes`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkVolume {
+    /// Its ID, as `network_volume_id` names it.
+    #[serde(default, deserialize_with = "nullable")]
+    pub id: String,
+    /// Its name.
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    /// Size in GB.
+    #[serde(default, deserialize_with = "nullable")]
+    pub size: u32,
+    /// The data center it lives in.
+    #[serde(default, alias = "dataCenterId", deserialize_with = "nullable")]
+    pub data_center: String,
+}
+
+/// `GET /network-volumes`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkVolumeList {
+    /// The volumes.
+    #[serde(default, deserialize_with = "nullable")]
+    pub network_volumes: Vec<NetworkVolume>,
+}
+
+/// A template of the account (`GET /templates`). Its `env`, which may hold
+/// secrets, is never read.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct Template {
+    /// Its ID.
+    #[serde(default, deserialize_with = "nullable")]
+    pub id: String,
+    /// Its name.
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    /// Its container image.
+    #[serde(default, deserialize_with = "nullable")]
+    pub image: String,
+    /// Whether it is for serverless workers rather than pods.
+    #[serde(default, deserialize_with = "nullable")]
+    pub serverless: bool,
+}
+
+/// One page of `GET /templates`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TemplatePage {
+    /// The templates of this page.
+    #[serde(default, deserialize_with = "nullable")]
+    pub templates: Vec<Template>,
+    /// Where the next page starts.
+    #[serde(default)]
+    pub pagination: Option<Pagination>,
 }
 
 /// The body of `POST /pods`: exactly the v2 fields overbrainer sets (the API

@@ -7,10 +7,12 @@ use std::time::Duration;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::{Method, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::types::{CreatePod, Pagination, Pod, PodId, PodPage};
+use super::types::{
+    CreatePod, DataCenter, DataCenterList, GpuType, GpuTypeList, NetworkVolume, NetworkVolumeList,
+    Pagination, Pod, PodId, PodPage, Template, TemplatePage,
+};
 use crate::retry::{RetryPolicy, Retryable, with_retry};
 
 /// `User-Agent` of every request. Runpod sits behind Cloudflare, which answers a
@@ -25,12 +27,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout of `POST /pods`, which answers once the pod is placed.
 const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Pods asked for per page of `GET /pods`.
+/// Items asked for per page of `GET /pods` and `GET /templates` (the v2 maximum).
 const PAGE_SIZE: &str = "1000";
+/// The GPU types of the catalog (v2 reference: `GET /v2/catalog/gpus`).
+const GPUS_PATH: &str = "catalog/gpus";
+/// The data centers of the catalog (v2 reference: `GET /v2/catalog/datacenters`).
+const DATA_CENTERS_PATH: &str = "catalog/datacenters";
+/// The account's network volumes (v2 reference: `GET /v2/network-volumes`).
+const NETWORK_VOLUMES_PATH: &str = "network-volumes";
+/// The account's templates, paginated (v2 reference: `GET /v2/templates`).
+const TEMPLATES_PATH: &str = "templates";
 /// Length of the substring windows checked against the account key, so a value
 /// Runpod echoes only in part still disappears.
 const REDACT_WINDOW: usize = 16;
-/// Pages of `GET /pods` followed before giving up: protects against a server
+/// Pages of a paginated list followed before giving up: protects against a server
 /// whose pagination never reports `hasNextPage: false`.
 const MAX_PAGES: usize = 100;
 /// Substring of Runpod's capacity failure (`POST /pods`, 400) that identifies
@@ -67,20 +77,6 @@ const INVALID_CREATE_ANSWER_MESSAGE: &str = "Runpod's answer to the create call 
 const INVALID_ANSWER_MESSAGE: &str = "Runpod's answer does not have the expected shape";
 /// A GPU catalog read failed: its answer's text is never shown.
 const CATALOG_MESSAGE: &str = "cannot read the GPU catalog";
-
-/// The part of `GET /catalog/gpus/{id}` overbrainer reads.
-#[derive(Debug, Deserialize)]
-struct GpuType {
-    #[serde(default)]
-    price: Option<GpuPrice>,
-}
-
-/// List prices of one GPU, in USD per hour.
-#[derive(Debug, Deserialize)]
-struct GpuPrice {
-    #[serde(default)]
-    secure: Option<f64>,
-}
 
 /// Errors of the Runpod API. No variant ever holds the API key or a pod's host
 /// key. A create call's error never holds any text from Runpod's answer either,
@@ -171,7 +167,7 @@ impl Retryable for ApiError {
     }
 }
 
-/// What to do after fetching one page of `GET /pods`.
+/// What to do after fetching one page of a paginated list.
 #[derive(Debug)]
 enum NextPage {
     /// No more pages follow.
@@ -328,30 +324,115 @@ impl RunpodClient {
     /// Returns an [`ApiError`] once retries are exhausted, on a fatal answer, when
     /// a pagination cursor repeats, or when the list does not end within that limit.
     pub async fn list_pods(&self) -> Result<Vec<Pod>, ApiError> {
-        let mut pods = Vec::new();
+        self.paginate("pods", |page: PodPage| (page.pods, page.pagination))
+            .await
+    }
+
+    /// The Secure Cloud GPU types of the catalog with their pod stock for
+    /// `gpu_count` GPUs (at least 1), overall and per data center
+    /// (`GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=SECURE`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
+    pub async fn list_gpu_types(&self, gpu_count: u32) -> Result<Vec<GpuType>, ApiError> {
+        let count = gpu_count.max(1).to_string();
+        let query = [
+            ("include", "AVAILABILITY"),
+            ("product", "POD"),
+            ("cloud", "SECURE"),
+            ("count", count.as_str()),
+        ];
+        let list: GpuTypeList = self.get_json(&self.list_url(GPUS_PATH, &query)?).await?;
+        Ok(list.gpus)
+    }
+
+    /// The data centers of the catalog with the stock of each GPU type they
+    /// offer (`GET /catalog/datacenters?include=GPU_AVAILABILITY`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
+    pub async fn list_data_centers(&self) -> Result<Vec<DataCenter>, ApiError> {
+        let query = [("include", "GPU_AVAILABILITY")];
+        let url = self.list_url(DATA_CENTERS_PATH, &query)?;
+        let list: DataCenterList = self.get_json(&url).await?;
+        Ok(list.data_centers)
+    }
+
+    /// The account's network volumes (`GET /network-volumes`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
+    pub async fn list_network_volumes(&self) -> Result<Vec<NetworkVolume>, ApiError> {
+        let url = self.list_url(NETWORK_VOLUMES_PATH, &[])?;
+        let list: NetworkVolumeList = self.get_json(&url).await?;
+        Ok(list.network_volumes)
+    }
+
+    /// The account's pod templates (serverless ones are left out), following
+    /// the pagination of `GET /templates` up to a fixed page limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted, on a fatal answer, when
+    /// a pagination cursor repeats, or when the list does not end within that limit.
+    pub async fn list_templates(&self) -> Result<Vec<Template>, ApiError> {
+        let templates = self
+            .paginate(TEMPLATES_PATH, |page: TemplatePage| {
+                (page.templates, page.pagination)
+            })
+            .await?;
+        Ok(templates
+            .into_iter()
+            .filter(|template| !template.serverless)
+            .collect())
+    }
+
+    /// Every item of the cursor-paginated list at `path`, `split` taking a
+    /// page apart into its items and its pagination.
+    async fn paginate<P, T>(
+        &self,
+        path: &str,
+        split: impl Fn(P) -> (Vec<T>, Option<Pagination>),
+    ) -> Result<Vec<T>, ApiError>
+    where
+        P: DeserializeOwned,
+    {
+        let mut items = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
         for _ in 0..MAX_PAGES {
-            let page = self.list_page(cursor.as_deref()).await?;
-            pods.extend(page.pods);
-            match next_page(page.pagination, &mut seen)? {
-                NextPage::Done => return Ok(pods),
+            let mut query = vec![("limit", PAGE_SIZE)];
+            if let Some(cursor) = cursor.as_deref() {
+                query.push(("cursor", cursor));
+            }
+            let page: P = self.get_json(&self.list_url(path, &query)?).await?;
+            let (page_items, pagination) = split(page);
+            items.extend(page_items);
+            match next_page(pagination, &mut seen)? {
+                NextPage::Done => return Ok(items),
                 NextPage::Cursor(next) => cursor = Some(next),
             }
         }
         Err(ApiError::InvalidResponse(format!(
-            "Runpod's pod list did not end after {MAX_PAGES} pages"
+            "Runpod's {path} list did not end after {MAX_PAGES} pages"
         )))
     }
 
-    /// One page of `GET /pods`, at `cursor` when given.
-    async fn list_page(&self, cursor: Option<&str>) -> Result<PodPage, ApiError> {
-        let mut url = reqwest::Url::parse(&self.url("pods"))
+    /// The URL of `path` with `query`.
+    fn list_url(&self, path: &str, query: &[(&str, &str)]) -> Result<reqwest::Url, ApiError> {
+        let mut url = reqwest::Url::parse(&self.url(path))
             .map_err(|error| ApiError::InvalidResponse(error.to_string()))?;
-        url.query_pairs_mut().append_pair("limit", PAGE_SIZE);
-        if let Some(cursor) = cursor {
-            url.query_pairs_mut().append_pair("cursor", cursor);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
         }
+        Ok(url)
+    }
+
+    /// `GET url`, retried, with a redacted error for a failed answer.
+    async fn get_json<T: DeserializeOwned>(&self, url: &reqwest::Url) -> Result<T, ApiError> {
         with_retry(
             &self.policy,
             || async {
@@ -402,7 +483,7 @@ impl RunpodClient {
     /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer. A
     /// failed answer's message is fixed: no text from Runpod is shown.
     pub async fn gpu_list_price(&self, gpu_id: &str) -> Result<Option<f64>, ApiError> {
-        let mut url = reqwest::Url::parse(&self.url("catalog/gpus"))
+        let mut url = reqwest::Url::parse(&self.url(GPUS_PATH))
             .map_err(|error| ApiError::InvalidResponse(error.to_string()))?;
         url.path_segments_mut()
             .map_err(|()| ApiError::InvalidResponse("invalid base URL".to_string()))?
@@ -422,7 +503,7 @@ impl RunpodClient {
                     });
                 }
                 let gpu: GpuType = decode(&body, false)?;
-                Ok(gpu.price.and_then(|price| price.secure))
+                Ok(gpu.secure_price())
             },
             log_retry,
         )
