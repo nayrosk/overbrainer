@@ -1,8 +1,8 @@
 //! The footer, on the last row: the key hints of what the keys act on, or the
 //! latest status message while it lasts, on the left; the work running, each
 //! with its spinner, `locked` while the data lock holds, the project cost and
-//! the version (not under a dialog, the help or the menu) and `? help` on the
-//! right.
+//! the version, marked `↑ X.Y.Z` when a newer release exists (not under a
+//! dialog, the help or the menu) and `? help` on the right.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -42,9 +42,14 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option
             Cost::Partial(usd) => Some(format!("${usd:.2}+")),
             Cost::Unknown => None,
         };
-        for fact in cost.into_iter().chain([VERSION.to_string()]) {
-            right.push(Span::styled(format!("{fact}  "), theme.dim));
+        if let Some(cost) = cost {
+            right.push(Span::styled(format!("{cost}  "), theme.dim));
         }
+        right.push(Span::styled(VERSION, theme.dim));
+        if let Some(newer) = &app.newer {
+            right.push(Span::styled(format!(" ↑ {newer}"), theme.accent));
+        }
+        right.push(Span::styled("  ", theme.dim));
     }
     let (key, label) = HELP_HINT.split_at(1);
     right.push(Span::styled(key, theme.key));
@@ -220,6 +225,36 @@ mod tests {
         assert!(shown.contains("n, Esc or Enter stay"), "{shown}");
         assert!(!shown.contains('$'), "{shown}");
         assert!(!shown.contains(VERSION), "{shown}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_newer_release_follows_the_version_in_the_accent() -> TestResult {
+        let mut app = app();
+        app.newer = Some("0.9.0".into());
+        let terminal = draw(&mut app, 120, 40)?;
+        let shown = text(&terminal).last().cloned().unwrap_or_default();
+        assert!(
+            shown.ends_with(&format!("{VERSION} ↑ 0.9.0  ? help ")),
+            "{shown}"
+        );
+        let buffer = terminal.backend().buffer();
+        let arrow = (0..120)
+            .find(|&x| buffer[(x, 39)].symbol() == "↑")
+            .ok_or("no marker")?;
+        assert_eq!(Some(buffer[(arrow, 39)].fg), app.theme.accent.fg);
+        app.overlay = Some(Overlay::Confirm(Confirm {
+            title: " Quit overbrainer? ".to_string(),
+            text: vec![],
+            yes: "quit",
+            no: "stay",
+            action: Action::Quit,
+        }));
+        let shown = text(&draw(&mut app, 120, 40)?)
+            .last()
+            .cloned()
+            .unwrap_or_default();
+        assert!(!shown.contains('↑'), "hidden with the version: {shown}");
         Ok(())
     }
 

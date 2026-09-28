@@ -18,6 +18,7 @@ use rustix::fs::OFlags;
 use tokio::process::Child;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tracing::Level;
 
@@ -25,6 +26,7 @@ use super::app::{App, Effect, Exit};
 use super::tasks::{Done, Msg, Task, TaskId, Tasks, TrainJob};
 use super::terminal::Screen;
 use super::ui;
+use crate::update::Newer;
 
 /// Time between two ticks of the app's clock.
 const TICK: Duration = Duration::from_millis(250);
@@ -33,11 +35,12 @@ const FRAME: Duration = Duration::from_millis(33);
 /// How long an editor asked to end with SIGTERM gets before SIGKILL.
 const EDITOR_GRACE: Duration = Duration::from_secs(2);
 
-/// What the real terminal adds to the loop: process signals, and the screen the
-/// editor borrows.
+/// What the real terminal adds to the loop: process signals, the screen the
+/// editor borrows, and the update check running.
 pub(super) struct Real {
     signals: Signals,
     screen: Screen,
+    check: Option<JoinHandle<Option<Newer>>>,
 }
 
 /// Runs the TUI on the real terminal until the app is done.
@@ -47,12 +50,17 @@ pub(super) struct Real {
 /// Returns an error when drawing fails, the terminal cannot be read, the signals
 /// cannot be caught, the terminal cannot be handed to the editor and back, or a
 /// process signal ended the TUI.
-pub(super) async fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+pub(super) async fn run(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    check: Option<JoinHandle<Option<Newer>>>,
+) -> anyhow::Result<()> {
     let signals = Signals::new().context("cannot catch the process signals")?;
     let (events, input) = mpsc::unbounded_channel();
     let real = Real {
         signals,
         screen: Screen::start(events),
+        check,
     };
     drive(terminal, app, input, Some(real)).await
 }
@@ -81,6 +89,9 @@ where
     if let Some(real) = real {
         looping.signals = Some(real.signals);
         looping.screen = Some(real.screen);
+        if let Some(check) = real.check {
+            tokio::spawn(forward_check(check, looping.messages.clone()));
+        }
     }
     let result = looping.run(app).await;
     if let Some(mut editor) = looping.editor.take() {
@@ -611,6 +622,18 @@ async fn watch_browser(mut child: Child, url: String, messages: UnboundedSender<
     messages.send(Msg::BrowserFailed(url)).ok();
 }
 
+/// Sends the answer of the update `check` to `messages` as
+/// [`Msg::NewerRelease`], when there is a newer release.
+async fn forward_check(check: JoinHandle<Option<Newer>>, messages: UnboundedSender<Msg>) {
+    match check.await {
+        Ok(Some(newer)) => {
+            messages.send(Msg::NewerRelease(newer.latest)).ok();
+        },
+        Ok(None) => {},
+        Err(error) => tracing::debug!("update check: {error}"),
+    }
+}
+
 /// The program that opens a URL in the user's browser: `open` on macOS,
 /// `xdg-open` elsewhere.
 fn opener(macos: bool) -> &'static str {
@@ -777,6 +800,26 @@ mod tests {
         }
         assert_eq!(urls, ["https://b"]);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_a_newer_release_reaches_the_app() {
+        let (messages, mut received) = mpsc::unbounded_channel();
+        let newer = crate::update::Newer {
+            latest: "0.9.0".into(),
+            current: "0.4.0",
+        };
+        let found = tokio::spawn(async move { Some(newer) });
+        forward_check(found, messages.clone()).await;
+        let nothing = tokio::spawn(async { None });
+        forward_check(nothing, messages).await;
+        let mut versions = Vec::new();
+        while let Some(message) = received.recv().await {
+            if let Msg::NewerRelease(version) = message {
+                versions.push(version);
+            }
+        }
+        assert_eq!(versions, ["0.9.0"]);
     }
 
     #[test]

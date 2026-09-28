@@ -28,6 +28,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use anyhow::{Context, bail};
+use tokio::task::JoinHandle;
 
 use self::app::{App, Project};
 use self::motion::{Motion, MotionLevel};
@@ -35,15 +36,21 @@ use self::terminal::TerminalGuard;
 use self::theme::{ColorLevel, LookEnv, Theme};
 use crate::config::EnvSource;
 use crate::logging::LogBuffer;
+use crate::update::Newer;
 
 /// Runs the terminal UI on the project in `project_dir`; `logs` holds the log
-/// lines the Logs view shows.
+/// lines the Logs view shows; the answer of `check`, when newer, shows in the
+/// footer.
 ///
 /// # Errors
 ///
 /// Returns an error when stdout is not a terminal, `overbrainer.toml` cannot be
 /// loaded, the terminal cannot be set up, or a process signal ended the TUI.
-pub async fn run(project_dir: &Path, logs: LogBuffer) -> anyhow::Result<()> {
+pub async fn run(
+    project_dir: &Path,
+    logs: LogBuffer,
+    check: Option<JoinHandle<Option<Newer>>>,
+) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() {
         bail!("overbrainer tui needs a terminal: stdout is not a TTY");
     }
@@ -60,7 +67,7 @@ pub async fn run(project_dir: &Path, logs: LogBuffer) -> anyhow::Result<()> {
     app.editor = editor::command(std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
     let guard = TerminalGuard::enter();
     let mut terminal = terminal::init().context("cannot set up the terminal")?;
-    let result = event_loop::run(&mut terminal, &mut app).await;
+    let result = event_loop::run(&mut terminal, &mut app, check).await;
     drop(guard);
     app.abandon_edit();
     for note in &app.exit_notes {

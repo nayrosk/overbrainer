@@ -354,6 +354,8 @@ pub(super) struct App {
     /// The task looking up list prices, if any; an earlier one's result is
     /// ignored.
     pub(super) prices: Option<TaskId>,
+    /// The release on crates.io, when newer than the one running.
+    pub(super) newer: Option<String>,
     /// Lines printed on stderr once the terminal is restored.
     pub(super) exit_notes: Vec<String>,
     /// Which of `exit_notes` were added because the TUI was leaving (a stage
@@ -409,6 +411,7 @@ impl App {
             refreshed: Self::never(),
             prepare: None,
             prices: None,
+            newer: None,
             exit_notes: Vec::new(),
             leaving_notes: Vec::new(),
             leaving: None,
@@ -720,6 +723,10 @@ impl App {
                 }
                 return Vec::new();
             },
+            Msg::NewerRelease(version) => {
+                self.newer = Some(version.clone());
+                return Vec::new();
+            },
         };
         if self.training.is_training(id) {
             return self.on_training_message(id, message);
@@ -734,7 +741,8 @@ impl App {
             Msg::Report(_, Report::RunCreated(_))
             | Msg::EditorExited(_)
             | Msg::BrowserFailed(_)
-            | Msg::LogsExported(_) => {},
+            | Msg::LogsExported(_)
+            | Msg::NewerRelease(_) => {},
         }
         Vec::new()
     }
@@ -1940,6 +1948,16 @@ mod tests {
         assert_eq!(press(&mut app, &[KeyCode::Char('x')]), []);
         let status = app.status.as_ref().map(|s| (s.severity, s.text.as_str()));
         assert_eq!(status, Some((Severity::Warn, "nothing to export at INFO")));
+    }
+
+    #[test]
+    fn a_newer_release_is_kept_for_the_footer_without_a_status() {
+        let mut app = app();
+        app.dirty = false;
+        assert_eq!(app.on_message(Msg::NewerRelease("0.9.0".into())), []);
+        assert_eq!(app.newer.as_deref(), Some("0.9.0"));
+        assert!(app.dirty);
+        assert_eq!(app.status, None);
     }
 
     #[test]
