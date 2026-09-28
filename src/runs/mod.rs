@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use id::{is_valid_run_id, new_run_id, rfc3339};
+pub use id::{compact_utc, is_valid_run_id, new_run_id, rfc3339};
 pub use summary::MetricsSummary;
 pub use train::{
     HF_CACHE_DIR, Launch, Outcome, RunCtx, RunError, artifacts_missing, cancel, collect, create,

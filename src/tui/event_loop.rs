@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, SystemTime};
 
@@ -14,6 +14,7 @@ use anyhow::Context;
 use crossterm::event::Event as TermEvent;
 use ratatui::backend::Backend;
 use ratatui::{DefaultTerminal, Terminal};
+use rustix::fs::OFlags;
 use tokio::process::Child;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -370,7 +371,10 @@ where
             },
             Effect::Cancel(id) => self.tasks.cancel(id),
             Effect::Abandon(id) => self.tasks.abandon(id),
-            Effect::Spawn(..) | Effect::OpenEditor { .. } | Effect::OpenUrl(_) => {},
+            Effect::Spawn(..)
+            | Effect::OpenEditor { .. }
+            | Effect::OpenUrl(_)
+            | Effect::ExportLogs { .. } => {},
         }
     }
 
@@ -482,6 +486,7 @@ where
             Effect::Abandon(id) => self.tasks.abandon(id),
             Effect::OpenEditor { command, path } => self.open_editor(&command, path).await?,
             Effect::OpenUrl(url) => self.open_url(url),
+            Effect::ExportLogs { name, lines } => self.export_logs(name, lines).await,
         }
         Ok(())
     }
@@ -505,6 +510,23 @@ where
                 self.messages.send(Msg::BrowserFailed(url)).ok();
             },
         }
+    }
+
+    /// Writes `lines` to `.overbrainer/<name>`, off the UI thread, never
+    /// overwriting an existing file. Reports the outcome as
+    /// [`Msg::LogsExported`].
+    async fn export_logs(&self, name: String, lines: Vec<String>) {
+        let dir = self.tasks.project_dir().to_path_buf();
+        let count = lines.len();
+        let file_name = name.clone();
+        let written =
+            tokio::task::spawn_blocking(move || write_log_export(&dir, &name, &lines)).await;
+        let message = match written {
+            Ok(Ok(())) => Msg::LogsExported(Ok((file_name, count))),
+            Ok(Err(error)) => Msg::LogsExported(Err(error.to_string())),
+            Err(error) => Msg::LogsExported(Err(format!("export task panicked: {error}"))),
+        };
+        self.messages.send(message).ok();
     }
 
     /// Hands the terminal to the editor: stops reading input, drops the keys
@@ -570,6 +592,28 @@ where
 /// `xdg-open` elsewhere.
 fn opener(macos: bool) -> &'static str {
     if macos { "open" } else { "xdg-open" }
+}
+
+/// Writes `lines`, one per line, to `.overbrainer/<name>` in `project_dir`, in
+/// one `write_all`. Refuses to overwrite an existing file.
+///
+/// # Errors
+///
+/// Returns an error when `name` already exists, or when the file cannot be
+/// created or written.
+fn write_log_export(project_dir: &Path, name: &str, lines: &[String]) -> io::Result<()> {
+    let mut content = String::new();
+    for line in lines {
+        content.push_str(line);
+        content.push('\n');
+    }
+    let mut file = crate::project_lock::open_state_file(
+        project_dir,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+        true,
+    )?;
+    file.write_all(content.as_bytes())
 }
 
 /// SIGINT, SIGTERM and SIGHUP: in raw mode they only come from outside (`kill`, a
@@ -674,6 +718,20 @@ mod tests {
     fn the_browser_opener_is_open_on_macos_and_xdg_open_elsewhere() {
         assert_eq!(opener(true), "open");
         assert_eq!(opener(false), "xdg-open");
+    }
+
+    #[test]
+    fn write_log_export_creates_the_file_and_refuses_to_overwrite()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let lines = vec!["line one".to_string(), "line two".to_string()];
+        write_log_export(project.path(), "logs-x.log", &lines)?;
+        let content = std::fs::read_to_string(project.path().join(".overbrainer/logs-x.log"))?;
+        assert_eq!(content, "line one\nline two\n");
+        let result = write_log_export(project.path(), "logs-x.log", &lines);
+        let error = result.err().ok_or("expected an error")?;
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        Ok(())
     }
 
     #[tokio::test]

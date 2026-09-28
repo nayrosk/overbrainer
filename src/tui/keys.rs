@@ -71,6 +71,7 @@ const LOGS: &[KeyHelp] = &[
     row("k j, Up Down, PgUp PgDn", "scroll"),
     row("G, End", "follow the newest lines"),
     row("f", "cycle level: error, warn, info, debug, trace"),
+    row("x", "export the shown lines to .overbrainer/"),
 ];
 
 /// One key hint of the footer: a key and what it does, in a word or two.
@@ -157,6 +158,7 @@ const FOOTER_LOGS: &[Hint] = &[
     hint("j/k", "scroll"),
     hint("G", "follow"),
     hint("f", "level"),
+    hint("x", "export"),
 ];
 const FOOTER_FILTER: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "clear")];
 const FOOTER_HELP: &[Hint] = &[hint("Esc", "close")];

@@ -153,6 +153,9 @@ pub(super) enum Msg {
     EditorExited(io::Result<ExitStatus>),
     /// No browser could be started on this URL.
     BrowserFailed(String),
+    /// The Logs export ended: the file name and how many lines were written, or
+    /// why it could not be written.
+    LogsExported(Result<(String, usize), String>),
     /// An event of a task's bus.
     Event(TaskId, Event),
     /// A task's forwarder fell behind and skipped this many events.
@@ -285,6 +288,11 @@ impl Tasks {
             abandons: HashMap::new(),
             lookups: HashMap::new(),
         }
+    }
+
+    /// The project directory tasks are spawned for.
+    pub(super) fn project_dir(&self) -> &Path {
+        &self.project_dir
     }
 
     /// Aborts the list price lookups: they only read, so the TUI never waits
@@ -677,7 +685,7 @@ mod tests {
             Msg::Event(id, event) => Some(Msg::Event(*id, event.clone())),
             Msg::Lagged(id, skipped) => Some(Msg::Lagged(*id, *skipped)),
             Msg::Report(id, report) => Some(Msg::Report(*id, report.clone())),
-            Msg::EditorExited(_) | Msg::BrowserFailed(_) => None,
+            Msg::EditorExited(_) | Msg::BrowserFailed(_) | Msg::LogsExported(_) => None,
         }
     }
 

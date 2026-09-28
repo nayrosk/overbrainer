@@ -19,6 +19,7 @@ use super::start::StartPlan;
 use super::tasks::{Done, Edit, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
 use super::training::TrainingView;
+use super::views::logs::export_line;
 use crate::cli::data::Command;
 use crate::cli::front::Report;
 use crate::config::Settings;
@@ -94,6 +95,14 @@ pub(super) enum Effect {
     },
     /// Open this URL in a browser, detached.
     OpenUrl(String),
+    /// Writes `lines` to `.overbrainer/<name>`, off the UI thread, never
+    /// overwriting an existing file.
+    ExportLogs {
+        /// File name inside `.overbrainer/`.
+        name: String,
+        /// The lines to write, oldest first.
+        lines: Vec<String>,
+    },
 }
 
 /// The four views, switched with `1` to `4`.
@@ -664,6 +673,18 @@ impl App {
                 self.say(Severity::Warn, format!("cannot open a browser: {url}"));
                 return Vec::new();
             },
+            Msg::LogsExported(result) => {
+                match result {
+                    Ok((name, count)) => self.say(
+                        Severity::Info,
+                        format!("exported {count} lines to .overbrainer/{name}"),
+                    ),
+                    Err(error) => {
+                        self.say(Severity::Error, format!("cannot export the logs: {error}"));
+                    },
+                }
+                return Vec::new();
+            },
         };
         if self.training.is_training(id) {
             return self.on_training_message(id, message);
@@ -677,7 +698,8 @@ impl App {
             Msg::Report(_, Report::Line(line)) => self.pipeline.results.push(line),
             Msg::Report(_, Report::RunCreated(_))
             | Msg::EditorExited(_)
-            | Msg::BrowserFailed(_) => {},
+            | Msg::BrowserFailed(_)
+            | Msg::LogsExported(_) => {},
         }
         Vec::new()
     }
@@ -1011,7 +1033,7 @@ impl App {
         match self.view {
             View::Dataset => return self.on_dataset_key(code),
             View::Training => return self.on_training_key(code),
-            View::Logs => self.on_logs_key(code),
+            View::Logs => return self.on_logs_key(code),
             View::Pipeline => {},
         }
         Vec::new()
@@ -1183,7 +1205,7 @@ impl App {
         }
     }
 
-    fn on_logs_key(&mut self, code: KeyCode) {
+    fn on_logs_key(&mut self, code: KeyCode) -> Vec<Effect> {
         match code {
             KeyCode::Up | KeyCode::Char('k') => self.scroll_logs(true, 1),
             KeyCode::Down | KeyCode::Char('j') => self.scroll_logs(false, 1),
@@ -1194,8 +1216,19 @@ impl App {
                 self.log_view.min = LogView::next_level(self.log_view.min);
                 self.log_view.anchor = None;
             },
+            KeyCode::Char('x') => return self.export_logs(),
             _ => {},
         }
+        Vec::new()
+    }
+
+    /// `x`: exports every retained line at the shown level or more severe,
+    /// oldest first, to a new file under `.overbrainer/`.
+    fn export_logs(&mut self) -> Vec<Effect> {
+        let window = self.logs.window(self.log_view.min, usize::MAX, 0);
+        let lines = window.lines.iter().map(export_line).collect();
+        let name = format!("logs-{}.log", crate::runs::compact_utc(self.now));
+        vec![Effect::ExportLogs { name, lines }]
     }
 
     /// Moves the Logs view `by` lines back (older) or forward, pinning it on the
@@ -1807,6 +1840,63 @@ mod tests {
             ]
         );
         assert_eq!(app.log_view.anchor, None);
+    }
+
+    #[test]
+    fn x_exports_only_the_shown_lines_oldest_first() -> TestResult {
+        let mut app = app();
+        log(&app, Level::DEBUG, "too quiet");
+        log(&app, Level::WARN, "first");
+        log(&app, Level::INFO, "second");
+        log(&app, Level::ERROR, "third");
+        press(&mut app, &[KeyCode::Char('4')]);
+        let effects = press(&mut app, &[KeyCode::Char('x')]);
+        let [Effect::ExportLogs { name, lines }] = effects.as_slice() else {
+            return Err(format!("expected an export effect: {effects:?}").into());
+        };
+        assert_eq!(
+            name,
+            &format!("logs-{}.log", crate::runs::compact_utc(at(NOW)))
+        );
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].contains("WARN") && lines[0].contains("first"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("INFO") && lines[1].contains("second"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].contains("ERROR") && lines[2].contains("third"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("too quiet")),
+            "{lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn logs_exported_says_the_outcome() {
+        let mut app = app();
+        let effects = app.on_message(Msg::LogsExported(Ok(("logs-x.log".into(), 3))));
+        assert_eq!(effects, []);
+        let status = app.status.clone();
+        assert_eq!(
+            status.as_ref().map(|s| s.text.as_str()),
+            Some("exported 3 lines to .overbrainer/logs-x.log")
+        );
+        assert_eq!(status.map(|s| s.severity), Some(Severity::Info));
+        let effects = app.on_message(Msg::LogsExported(Err("file exists".into())));
+        assert_eq!(effects, []);
+        let status = app.status.clone();
+        assert_eq!(
+            status.as_ref().map(|s| s.text.as_str()),
+            Some("cannot export the logs: file exists")
+        );
+        assert_eq!(status.map(|s| s.severity), Some(Severity::Error));
     }
 
     #[test]

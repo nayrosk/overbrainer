@@ -38,6 +38,14 @@ pub fn rfc3339(now: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// `now` in compact UTC form, UTC, to the second, for use in file names:
+/// `20260922T143005Z`.
+#[must_use]
+pub fn compact_utc(now: SystemTime) -> String {
+    let [year, month, day, hour, minute, second] = utc(now);
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
 /// Whether `id` can name a run directory: letters, digits and `-` only, so it
 /// never leaves `runs/`.
 #[must_use]
@@ -61,6 +69,12 @@ mod tests {
         assert_eq!(rfc3339(at(1_709_164_800)), "2024-02-29T00:00:00Z");
         assert_eq!(rfc3339(at(1_790_035_199)), "2026-09-21T23:59:59Z");
         assert_eq!(rfc3339(at(0)), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn compact_utc_gives_a_sortable_file_name() {
+        assert_eq!(compact_utc(at(1_790_000_000)), "20260921T141320Z");
+        assert_eq!(compact_utc(at(0)), "19700101T000000Z");
     }
 
     #[test]

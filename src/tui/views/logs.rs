@@ -80,3 +80,37 @@ fn level_name(level: Level) -> &'static str {
         _ => "TRACE",
     }
 }
+
+/// `line` formatted for the Logs export file: `2026-09-28T01:02:03Z INFO
+/// pipeline: message`.
+pub(in crate::tui) fn export_line(line: &LogLine) -> String {
+    format!(
+        "{} {} {}: {}",
+        crate::runs::rfc3339(line.time),
+        level_name(line.level),
+        short_target(&line.target),
+        line.message
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn export_line_formats_time_level_target_and_message() {
+        let line = LogLine {
+            seq: 1,
+            level: Level::INFO,
+            target: "overbrainer::pipeline".into(),
+            time: UNIX_EPOCH + Duration::from_secs(1_790_000_000),
+            message: "did a thing".into(),
+        };
+        assert_eq!(
+            export_line(&line),
+            "2026-09-21T14:13:20Z INFO pipeline: did a thing"
+        );
+    }
+}
