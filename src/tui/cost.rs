@@ -32,15 +32,33 @@ pub(super) fn history_cost(entries: &[Entry]) -> Option<Cost> {
     all.spent().then_some(all.cost)
 }
 
-/// The project's cost so far: the history, the stage running (a finished one is
-/// in the history once reloaded), and every Runpod pod, live or deleted.
-pub(super) fn project_cost(app: &App) -> Cost {
-    let mut total = app.history_cost;
-    for row in &app.pipeline.rows {
-        if row.state == StageState::Running && spent(row) {
+/// The history cost a pipeline task started with, `None` when none spent
+/// anything: its own stages add to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Base(pub(super) Option<Cost>);
+
+/// The cost of the stages so far, `None` when none spent anything. While a
+/// pipeline task runs, and until the reload after its end read the history,
+/// it is the history the task started with plus every stage the task started,
+/// done or stopped: the history gets a stage only once the task ended. Else it
+/// is the history plus a stage still running.
+pub(super) fn history_so_far(app: &App) -> Option<Cost> {
+    let (mut total, counted): (_, fn(&Row) -> bool) = match app.cost_base {
+        Some(Base(base)) => (base, |row| row.this_task),
+        None => (app.history_cost, |row| row.state == StageState::Running),
+    };
+    for row in app.pipeline.rows.iter().filter(|row| counted(row)) {
+        if spent(row) {
             total = Some(add(total, row.cost));
         }
     }
+    total
+}
+
+/// The project's cost so far: the stages (see [`history_so_far`]) and every
+/// Runpod pod, live or deleted.
+pub(super) fn project_cost(app: &App) -> Cost {
+    let mut total = history_so_far(app);
     for run in &app.training.runs {
         // A pod never created spent nothing.
         if let Some(pod) = run.pod.as_ref().filter(|pod| pod.pod_id.is_some()) {

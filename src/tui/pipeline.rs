@@ -53,6 +53,9 @@ pub(super) struct Row {
     pub(super) cost: Option<f64>,
     /// The stage's final counters.
     pub(super) stats: Option<StageStats>,
+    /// Whether the current or last task started it: its cost is not in the
+    /// history the task started with.
+    pub(super) this_task: bool,
 }
 
 impl Row {
@@ -66,6 +69,7 @@ impl Row {
             usage: Usage::default(),
             cost: None,
             stats: None,
+            this_task: false,
         }
     }
 
@@ -168,7 +172,10 @@ impl PipelineView {
         let rows = std::array::from_fn(|i| match command_stage(command) {
             None => Row::new(StageState::Pending),
             Some(stage) if stage == STAGES[i] => Row::new(StageState::Idle),
-            Some(_) => self.rows[i].clone(),
+            Some(_) => Row {
+                this_task: false,
+                ..self.rows[i].clone()
+            },
         });
         *self = Self {
             command: Some(command),
@@ -191,6 +198,7 @@ impl PipelineView {
                 let row = &mut self.rows[index(*stage)];
                 *row = Row::new(state);
                 row.total = *total;
+                row.this_task = true;
             },
             Event::ItemDone {
                 stage, usage, cost, ..

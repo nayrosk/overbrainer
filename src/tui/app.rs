@@ -330,6 +330,14 @@ pub(super) struct App {
     pub(super) history_cost: Option<crate::history::Cost>,
     /// The last error reading the history, warned once, until a read works.
     history_error: Option<String>,
+    /// While a pipeline task runs, and until the reload after its end read the
+    /// history: the history cost it started with, which its own rows add to.
+    pub(super) cost_base: Option<super::cost::Base>,
+    /// The load in flight when that task started: none of its stages is in the
+    /// history it reads, so it sets the base.
+    base_load: Option<TaskId>,
+    /// The reload after that task ended: once it read the history, the base goes.
+    settle: Option<TaskId>,
     /// The Pipeline view's state.
     pub(super) pipeline: PipelineView,
     /// The pipeline task running, if any.
@@ -391,6 +399,9 @@ impl App {
             editor: vec!["vi".to_string()],
             history_cost: None,
             history_error: None,
+            cost_base: None,
+            base_load: None,
+            settle: None,
             pipeline: PipelineView::default(),
             pipeline_task: None,
             pipeline_last: None,
@@ -442,6 +453,9 @@ impl App {
             return Vec::new();
         }
         let id = self.task_id();
+        if self.pipeline_task.is_none() && self.cost_base.is_some() {
+            self.settle = Some(id);
+        }
         self.load = Some(id);
         self.load_at = Some(self.motion.clock());
         self.quiet_load = false;
@@ -570,6 +584,16 @@ impl App {
             Ok(cost) => {
                 self.history_cost = cost;
                 self.history_error = None;
+                if self.base_load == Some(id) {
+                    self.base_load = None;
+                    if let Some(base) = &mut self.cost_base {
+                        base.0 = cost;
+                    }
+                }
+                if self.settle == Some(id) {
+                    self.settle = None;
+                    self.cost_base = None;
+                }
             },
             // Every quiet reload reads it again: warn once per new error.
             Err(error) if self.history_error.as_ref() != Some(&error) => {
@@ -756,6 +780,10 @@ impl App {
         }
         self.forget_notes(&NoteOf::Stage);
         let id = self.task_id();
+        // What the history holds so far, the last task's stages included.
+        self.cost_base = Some(super::cost::Base(super::cost::history_so_far(self)));
+        self.base_load = self.load;
+        self.settle = None;
         self.pipeline_task = Some(id);
         self.pipeline_last = None;
         self.pipeline.started(command, self.project.concurrency);
@@ -2713,6 +2741,136 @@ mod tests {
         assert!(matches!(reload.as_slice(), [Effect::Spawn(_, Task::Load)]));
         assert_eq!(status(&app), Some("answers finished"));
         assert_eq!(app.lock(), None);
+    }
+
+    /// Stage `stage` of task `id` starts, spends `cost` on one item, and finishes
+    /// when `finish`.
+    fn spend(app: &mut App, id: TaskId, stage: crate::events::Stage, cost: f64, finish: bool) {
+        use crate::events::{Event, StageStats};
+        app.on_message(Msg::Event(id, Event::StageStarted { stage, total: 2 }));
+        app.on_message(Msg::Event(
+            id,
+            Event::ItemDone {
+                stage,
+                id: "x".into(),
+                usage: Some(crate::llm::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                }),
+                cost: Some(cost),
+            },
+        ));
+        if finish {
+            let stats = StageStats {
+                cost: Some(cost),
+                ..StageStats::default()
+            };
+            app.on_message(Msg::Event(id, Event::StageFinished { stage, stats }));
+        }
+    }
+
+    #[test]
+    fn the_footer_keeps_the_finished_stages_of_a_run_until_the_history_has_them() -> TestResult {
+        use crate::events::Stage;
+        use crate::history::Cost;
+        use crate::tui::cost::{project_cost, rows_cost};
+
+        let mut app = dataset_app();
+        let load = only_load(&app.start())?;
+        app.on_done(
+            load,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+        );
+        let mut keys = vec![KeyCode::Char('r')];
+        keys.extend([KeyCode::Down; 4]);
+        keys.push(KeyCode::Enter);
+        let effects = press(&mut app, &keys);
+        let [Effect::Spawn(id, Task::Pipeline(Command::Run))] = effects.as_slice() else {
+            return Err(format!("expected a run: {effects:?}").into());
+        };
+        let id = *id;
+        spend(&mut app, id, Stage::Subtopics, 0.25, true);
+        assert_eq!(project_cost(&app), Cost::Known(1.25));
+        spend(&mut app, id, Stage::Questions, 0.5, false);
+        assert_eq!(project_cost(&app), Cost::Known(1.75));
+        let finished = crate::events::Event::StageFinished {
+            stage: Stage::Questions,
+            stats: crate::events::StageStats {
+                cost: Some(0.5),
+                ..crate::events::StageStats::default()
+            },
+        };
+        app.on_message(Msg::Event(id, finished));
+        assert_eq!(
+            project_cost(&app),
+            Cost::Known(1.75),
+            "a finished stage stays"
+        );
+        spend(&mut app, id, Stage::Answers, 0.125, false);
+        let pipeline = Cost::Known(1.0).plus(match rows_cost(&app.pipeline.rows) {
+            Cost::Known(cost) => Some(cost),
+            other => return Err(format!("the rows cost is {other:?}").into()),
+        });
+        assert_eq!(pipeline, Cost::Known(1.875));
+        assert_eq!(
+            project_cost(&app),
+            pipeline,
+            "the base plus the Pipeline view"
+        );
+        // A quiet reload lands with the finished stages in the history: the sum
+        // still counts each once.
+        let quiet = only_load(&press(&mut app, &[KeyCode::Char('1')]))?;
+        app.on_done(
+            quiet,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.75))))),
+        );
+        assert_eq!(
+            project_cost(&app),
+            pipeline,
+            "a quiet reload changes nothing"
+        );
+        // Stopped: the stage stays counted until the reload after the end lands.
+        let reload = only_load(&app.on_done(id, Ok(Done::Pipeline(Err("interrupted".into())))))?;
+        assert_eq!(
+            app.pipeline.row(Stage::Answers).state,
+            super::super::pipeline::StageState::Stopped
+        );
+        assert_eq!(project_cost(&app), pipeline, "a stopped stage stays");
+        app.on_done(
+            reload,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.875))))),
+        );
+        assert_eq!(
+            project_cost(&app),
+            Cost::Known(1.875),
+            "the history has them all"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_started_before_a_stage_sets_the_history_it_adds_to() -> TestResult {
+        use crate::events::Stage;
+        use crate::history::Cost;
+        use crate::tui::cost::project_cost;
+
+        let mut app = dataset_app();
+        let load = only_load(&app.start())?;
+        let effects = press(
+            &mut app,
+            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
+        );
+        let [Effect::Spawn(id, Task::Pipeline(_))] = effects.as_slice() else {
+            return Err(format!("expected a stage: {effects:?}").into());
+        };
+        let id = *id;
+        spend(&mut app, id, Stage::Questions, 0.5, true);
+        app.on_done(
+            load,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+        );
+        assert_eq!(project_cost(&app), Cost::Known(1.5));
+        Ok(())
     }
 
     #[test]
