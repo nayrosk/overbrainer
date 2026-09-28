@@ -38,7 +38,9 @@ const MAX_VERSION: usize = 64;
 /// A release newer than the running binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Newer {
+    /// The newest stable version on crates.io.
     pub latest: String,
+    /// The version of the running binary.
     pub current: &'static str,
 }
 
