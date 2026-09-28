@@ -19,6 +19,7 @@ pub mod runs;
 pub mod secrets;
 pub mod train;
 pub mod tui;
+pub mod update;
 
 /// What the unit tests share across modules.
 #[cfg(test)]
