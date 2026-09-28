@@ -209,8 +209,13 @@ async fn fetch(url: &str, timeout: Duration) -> Result<String, Box<dyn Error + S
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(timeout)
+        // Only crates.io answers: a redirect is a failure, never followed.
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let mut response = client.get(url).send().await?.error_for_status()?;
+    if !response.status().is_success() {
+        return Err(format!("unexpected status {}", response.status()).into());
+    }
     let too_large = || format!("the answer is larger than {MAX_BODY} bytes");
     if response
         .content_length()
@@ -517,6 +522,27 @@ mod tests {
             assert_eq!(found, None);
             assert!(!dir.path().join(CACHE_FILE).exists());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() -> TestResult {
+        let server = MockServer::start().await;
+        let elsewhere = format!("{}/elsewhere", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/api/v1/crates/overbrainer"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", elsewhere.as_str()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(BODY))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let found = fetch(&url(&server), TIMEOUT).await;
+        assert!(found.is_err(), "{found:?}");
         Ok(())
     }
 
