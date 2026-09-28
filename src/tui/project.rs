@@ -1236,16 +1236,29 @@ mod tests {
     #[test]
     fn secrets_show_set_unset_or_vault_ref_and_never_their_value() -> TestResult {
         let rows = rows(&config()?, None, &Locks::default());
+        // `matches!` with fixed messages: a failure never prints what a secret row shows.
         let key = field(&rows, "providers.nanogpt.api_key")?;
-        assert_eq!(key.shown, Shown::Set);
+        assert!(
+            matches!(key.shown, Shown::Set),
+            "nanogpt key not shown as set"
+        );
         assert!(key.env);
         assert!(key.path.is_none(), "env only");
-        assert_eq!(
-            field(&rows, "providers.claude.api_key")?.shown,
-            Shown::Unset
+        let claude = field(&rows, "providers.claude.api_key")?;
+        assert!(
+            matches!(claude.shown, Shown::Unset),
+            "claude key not shown as unset"
         );
-        assert_eq!(field(&rows, "runpod.api_key")?.shown, Shown::VaultRef);
-        assert_eq!(field(&rows, "hf_token")?.shown, Shown::Unset);
+        let runpod = field(&rows, "runpod.api_key")?;
+        assert!(
+            matches!(runpod.shown, Shown::VaultRef),
+            "runpod key not shown as a vault ref"
+        );
+        let hf = field(&rows, "hf_token")?;
+        assert!(
+            matches!(hf.shown, Shown::Unset),
+            "hf_token not shown as unset"
+        );
         assert_eq!(
             field(&rows, "providers.nanogpt.base_url")?.shown,
             Shown::Value("https://nano-gpt.com/api/v1".into())
