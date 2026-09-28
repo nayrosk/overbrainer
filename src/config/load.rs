@@ -136,7 +136,7 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
 pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> {
     let env: config::Map<String, String> = env_pairs(env)
         .into_iter()
-        .filter(|(key, _)| !key.starts_with(TUI_ENV_PREFIX))
+        .filter(|(key, _)| !is_tui_variable(key))
         .collect();
 
     let file_only = Config::builder()
@@ -185,16 +185,22 @@ pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> 
 #[must_use]
 pub fn env_keys(env: &EnvSource) -> BTreeSet<String> {
     let prefix = format!("{ENV_PREFIX}_").to_lowercase();
-    let tui_prefix = TUI_ENV_PREFIX.to_lowercase();
     env_pairs(env.clone())
         .into_iter()
+        .filter(|(key, _)| !is_tui_variable(key))
         .map(|(key, _)| key.to_lowercase())
-        .filter(|key| !key.starts_with(&tui_prefix))
         .filter_map(|key| {
             let rest = key.strip_prefix(&prefix)?;
             (!rest.is_empty()).then(|| rest.replace("__", "."))
         })
         .collect()
+}
+
+/// Whether `key` is under [`TUI_ENV_PREFIX`] once lower-cased, as `config::Environment`
+/// lower-cases keys before matching.
+fn is_tui_variable(key: &str) -> bool {
+    key.to_lowercase()
+        .starts_with(&TUI_ENV_PREFIX.to_lowercase())
 }
 
 /// The key-value pairs `env` provides: the process environment, or an explicit list.

@@ -129,6 +129,20 @@ fn the_tui_variables_are_not_configuration_keys() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn a_lower_case_tui_variable_is_not_a_configuration_key() -> Result<(), Box<dyn std::error::Error>>
+{
+    // `config::Environment` lower-cases keys, so the TUI prefix must match in any case.
+    load_str(
+        BASE,
+        env(&[
+            ("overbrainer_tui_color", "256"),
+            ("Overbrainer_Tui_Motion", "off"),
+        ]),
+    )?;
+    Ok(())
+}
+
+#[test]
 fn missing_file_reports_its_path() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     match load(dir.path(), env(&[])) {
