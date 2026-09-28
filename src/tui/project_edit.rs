@@ -345,9 +345,7 @@ impl App {
             return Vec::new();
         };
         let key = &field.key;
-        if let Some(user) = &field.lock {
-            let said = format!("refused: {key} is used by {user}; read-only until it ends");
-            self.say(Severity::Warn, said);
+        if self.refuse_lock(key, field.lock.as_deref()) {
             return Vec::new();
         }
         if let Some(note) = field.env_note() {
@@ -488,6 +486,11 @@ impl App {
             .find(&key)
             .and_then(|index| listing.field(index))
             .and_then(|field| field.lock.clone());
+        self.refuse_lock(&key, lock.as_deref())
+    }
+
+    /// Refuses a change of the field `key` when `lock` names what uses it.
+    fn refuse_lock(&mut self, key: &str, lock: Option<&str>) -> bool {
         let Some(user) = lock else {
             return false;
         };
