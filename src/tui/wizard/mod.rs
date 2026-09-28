@@ -6,6 +6,8 @@
 mod view;
 mod write;
 
+pub(super) use write::existing;
+
 use std::fmt;
 use std::io;
 use std::path::Path;

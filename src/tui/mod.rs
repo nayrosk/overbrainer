@@ -78,6 +78,20 @@ pub fn wizard(project_dir: &Path) -> anyhow::Result<WizardEnded> {
     wizard::run(project_dir)
 }
 
+/// Why the init wizard cannot run in `project_dir`, when a file it would
+/// write exists there: it never overwrites one, so it says so before asking
+/// anything.
+#[must_use]
+pub fn wizard_refusal(project_dir: &Path) -> Option<String> {
+    wizard::existing(project_dir).map(|path| {
+        format!(
+            "{} exists, and the init wizard never overwrites a file: move it away and run \
+             `overbrainer tui` again, or write the project with `overbrainer init`",
+            path.display()
+        )
+    })
+}
+
 /// Runs the terminal UI on the project in `project_dir`; `logs` holds the log
 /// lines the Logs view shows; the answer of `check`, when newer, shows in the
 /// footer; `start` holds the keys `.env` set at start and whether auto

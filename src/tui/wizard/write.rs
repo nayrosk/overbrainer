@@ -31,22 +31,39 @@ const TRAINING_START: &str = "[training]";
 const LOCAL_START: &str = "[targets.local]\nkind = \"local\"";
 /// The first line after the template's local target: the commented targets.
 const TARGETS_EXAMPLES: &str = "# [targets.homelab]";
+/// The first line of the template's commented SSH target.
+const SSH_EXAMPLE: &str = "# [targets.homelab]";
+/// The first line of the template's commented Runpod target.
+const RUNPOD_EXAMPLE: &str = "# [targets.gpu_cloud]";
 /// What replaces `[training]` and the local target when training is skipped.
 const NO_TRAINING: &str = "\
 # No [training]: auto mode stops after split. To train, add [training] and a
 # target: docs/training.md, or the overbrainer.toml `overbrainer init` writes.
 ";
 /// What the local target's first lines become for an SSH target: its
-/// comments apply as they are.
+/// comments apply as they are, with `workdir` from the template's commented
+/// SSH target, which goes.
 const SSH_START: &str = "\
 [targets.homelab]
-kind = \"ssh\"                   # host comes from OVERBRAINER_TARGETS__HOMELAB__HOST";
-/// What replaces the local target, its comments included, for a Runpod one.
+kind = \"ssh\"                   # host comes from OVERBRAINER_TARGETS__HOMELAB__HOST
+# workdir = \"overbrainer\"      # on the remote machine, relative to its home directory";
+/// What replaces the local target, its comments included, for a Runpod one,
+/// with the options of the template's commented Runpod target, which goes.
 const RUNPOD_TARGET_TEXT: &str = "\
 [targets.gpu_cloud]
 kind = \"runpod\"              # needs OVERBRAINER_RUNPOD__API_KEY; Secure Cloud only
 gpu_types = \"auto\"           # \"auto\": the cheapest in stock at start; or a list, tried in order
 max_hours = 6                # the pod watchdog deletes the pod after this, whatever it is doing
+# min_vram_gb = 48             # gpu_types = \"auto\" only: least VRAM per GPU
+# max_price_per_hour = 1.0     # gpu_types = \"auto\" only: highest list price of one GPU, USD
+# gpu_count = 1
+# image = \"axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1@sha256:f7b94da82913920a003e28e091d8528f57f76da7360fca87e95faf62fa32a680\"
+# venv = \"/workspace/axolotl-venv\"
+# container_disk_gb = 50
+# boot_grace_minutes = 30      # the watchdog deletes a pod whose job never started
+# retrieve_grace_minutes = 60  # the watchdog deletes a pod whose ended job was not retrieved
+# data_center_ids = [\"EU-RO-1\"]  # any when unset; \"auto\": those with a chosen GPU in stock
+# network_volume_id = \"...\"    # mounted at /workspace/data; needs exactly one data_center_ids entry, not \"auto\"
 ";
 
 /// What `.env` and `.env.example` end with: the optional variables.
@@ -116,33 +133,67 @@ pub(super) fn build(answers: &Answers) -> Result<Files, String> {
 /// invalid), or why writing stopped. No message quotes a value.
 pub(super) fn write(dir: &Path, answers: &Answers) -> Result<(), String> {
     let files = build(answers)?;
+    if let Some(path) = existing(dir) {
+        return Err(format!(
+            "{} already exists: nothing was written",
+            path.display()
+        ));
+    }
+    let mut targets = vec![
+        (PathBuf::from(ENV_FILE), files.env.as_str()),
+        (PathBuf::from(ENV_EXAMPLE_FILE), files.example.as_str()),
+    ];
+    targets.extend(prompt_files());
+    targets.push((PathBuf::from(CONFIG_FILE), files.config.as_str()));
+    let gitignore = dir.join(GITIGNORE);
+    let prompts_dir = dir.join(prompts::DIR);
+    let new_gitignore = gitignore.symlink_metadata().is_err();
+    let new_prompts_dir = prompts_dir.symlink_metadata().is_err();
+    let mut created = Vec::new();
+    // `.gitignore` first: `.env` never exists without its entry.
+    let mut written = || -> anyhow::Result<()> {
+        update_gitignore(&gitignore)?;
+        if new_gitignore {
+            created.push(gitignore.clone());
+        }
+        std::fs::create_dir_all(&prompts_dir)?;
+        for (path, content) in &targets {
+            let path = dir.join(path);
+            if path.ends_with(ENV_FILE) {
+                create_private(&path, content)?;
+            } else {
+                create_new(&path, content)?;
+            }
+            created.push(path);
+        }
+        Ok(())
+    };
+    let Err(error) = written() else {
+        return Ok(());
+    };
+    // Undo what this call created, so writing again works; nothing else.
+    for path in created.iter().rev() {
+        std::fs::remove_file(path).ok();
+    }
+    if new_prompts_dir {
+        std::fs::remove_dir(&prompts_dir).ok();
+    }
+    Err(format!("{error:#}; nothing was kept"))
+}
+
+/// The first file the wizard would write that already exists in `dir`: it
+/// never overwrites one. A dangling link counts: creating it would write
+/// through it.
+pub(in crate::tui) fn existing(dir: &Path) -> Option<PathBuf> {
     let mut paths = vec![
         PathBuf::from(ENV_FILE),
         PathBuf::from(ENV_EXAMPLE_FILE),
         PathBuf::from(CONFIG_FILE),
     ];
     paths.extend(prompt_files().into_iter().map(|(path, _)| path));
-    // A dangling link counts as a file: creating it would write through it.
-    if let Some(path) = paths
-        .iter()
+    paths
+        .into_iter()
         .find(|path| dir.join(path).symlink_metadata().is_ok())
-    {
-        return Err(format!(
-            "{} already exists: nothing was written",
-            path.display()
-        ));
-    }
-    let written = || -> anyhow::Result<()> {
-        std::fs::create_dir_all(dir.join(prompts::DIR))?;
-        create_private(&dir.join(ENV_FILE), &files.env)?;
-        create_new(&dir.join(ENV_EXAMPLE_FILE), &files.example)?;
-        for (path, content) in prompt_files() {
-            create_new(&dir.join(path), content)?;
-        }
-        update_gitignore(&dir.join(GITIGNORE))?;
-        create_new(&dir.join(CONFIG_FILE), &files.config)
-    };
-    written().map_err(|error| format!("{error:#}"))
 }
 
 /// `overbrainer.toml`: the template with the answers set.
@@ -278,8 +329,29 @@ fn template(training: TrainingKind) -> String {
     match training {
         TrainingKind::Skip => replaced(at(TRAINING_START), at(TARGETS_EXAMPLES), NO_TRAINING),
         TrainingKind::Local => template.to_string(),
-        TrainingKind::Ssh => template.replacen(LOCAL_START, SSH_START, 1),
-        TrainingKind::Runpod => replaced(at(LOCAL_START), at(TARGETS_EXAMPLES), RUNPOD_TARGET_TEXT),
+        TrainingKind::Ssh => {
+            without_example(&template.replacen(LOCAL_START, SSH_START, 1), SSH_EXAMPLE)
+        },
+        TrainingKind::Runpod => without_example(
+            &replaced(at(LOCAL_START), at(TARGETS_EXAMPLES), RUNPOD_TARGET_TEXT),
+            RUNPOD_EXAMPLE,
+        ),
+    }
+}
+
+/// `text` without the commented example target headed by the line `header`,
+/// down to the blank line after it or the end: the real target replaces it.
+fn without_example(text: &str, header: &str) -> String {
+    let Some(start) = text.find(&format!("\n{header}\n")).map(|at| at + 1) else {
+        return text.to_string();
+    };
+    let end = text[start..]
+        .find("\n\n")
+        .map_or(text.len(), |at| start + at + 2);
+    let kept = format!("{}{}", &text[..start], &text[end..]);
+    match kept.strip_suffix("\n\n") {
+        Some(trimmed) => format!("{trimmed}\n"),
+        None => kept,
     }
 }
 
@@ -469,10 +541,17 @@ mod tests {
         let skipped = template(TrainingKind::Skip);
         assert!(!skipped.contains("\n[training]\n") && !skipped.contains("[targets.local]"));
         assert!(skipped.contains(TARGETS_EXAMPLES) && skipped.contains("# request_timeout_secs"));
-        for kind in [TrainingKind::Ssh, TrainingKind::Runpod] {
+        for (kind, kept, dropped) in [
+            (TrainingKind::Ssh, RUNPOD_EXAMPLE, SSH_EXAMPLE),
+            (TrainingKind::Runpod, SSH_EXAMPLE, RUNPOD_EXAMPLE),
+        ] {
             let edited = template(kind);
             assert!(!edited.contains("[targets.local]"), "{kind:?}");
             assert!(edited.contains("\n[training]\n"), "{kind:?}");
+            assert!(
+                edited.contains(kept) && !edited.contains(dropped),
+                "{kind:?}"
+            );
         }
     }
 
@@ -556,6 +635,51 @@ mod tests {
                 "kept\n"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_write_keeps_nothing_it_created_and_a_retry_works() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let topics = topics();
+        let answers = answers(TrainingKind::Local, &topics);
+        // `.gitignore` cannot be written: nothing is created at all.
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join(GITIGNORE))?;
+        assert!(write(dir.path(), &answers).is_err());
+        let left: Vec<_> = std::fs::read_dir(dir.path())?.collect();
+        assert_eq!(left.len(), 1, "only the .gitignore directory");
+
+        // A prompt cannot be created, after `.env`: `.env` goes again.
+        let dir = tempfile::tempdir()?;
+        let prompts_dir = dir.path().join(prompts::DIR);
+        std::fs::create_dir(&prompts_dir)?;
+        std::fs::set_permissions(&prompts_dir, std::fs::Permissions::from_mode(0o500))?;
+        let failed = write(dir.path(), &answers);
+        std::fs::set_permissions(&prompts_dir, std::fs::Permissions::from_mode(0o700))?;
+        let error = failed.err().ok_or("the write did not fail")?;
+        assert!(error.ends_with("; nothing was kept"), "{error}");
+        assert!(!error.contains(KEY));
+        for file in [ENV_FILE, ENV_EXAMPLE_FILE, CONFIG_FILE] {
+            assert!(!dir.path().join(file).exists(), "{file} was kept");
+        }
+        assert!(prompts_dir.is_dir(), "a directory it did not create stays");
+        assert_eq!(existing(dir.path()), None);
+        write(dir.path(), &answers)?;
+        assert!(dir.path().join(CONFIG_FILE).is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn existing_names_the_first_file_in_the_way() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(existing(dir.path()), None);
+        assert_eq!(crate::tui::wizard_refusal(dir.path()), None);
+        std::fs::write(dir.path().join(ENV_FILE), "")?;
+        assert_eq!(existing(dir.path()), Some(PathBuf::from(ENV_FILE)));
+        let refusal = crate::tui::wizard_refusal(dir.path()).unwrap_or_default();
+        assert!(refusal.starts_with(".env exists, and the init wizard never overwrites"));
         Ok(())
     }
 
