@@ -362,7 +362,8 @@ where
     /// Runs `effect` once the loop ended: a training task or an edit starts
     /// (never lost, never cut), a token is cancelled, a task abandoned; a
     /// reading, a stage or the editor does not start any more, nor a new run
-    /// (the app notes it was not started).
+    /// (the app notes it was not started), and a browser to open or a logs
+    /// export is dropped.
     fn apply_late(&mut self, app: &mut App, effect: Effect) {
         match effect {
             Effect::Spawn(id, Task::Train(TrainJob::Start)) => app.start_dropped(id),
