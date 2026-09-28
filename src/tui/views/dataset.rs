@@ -167,23 +167,35 @@ fn error_pane(frame: &mut Frame, area: Rect, block: Block, error: &str, theme: &
 fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let view = &mut app.dataset;
-    let lines = match (&view.model, view.tree.selected().last()) {
+    let (lines, parts) = match (&view.model, view.tree.selected().last()) {
         (Some(model), Some(node)) => detail(model, node, &app.project.topics, &theme),
-        _ => Vec::new(),
+        _ => (Vec::new(), Vec::new()),
     };
     let title = match view.tree.selected().last() {
         Some(Node::Topic(_)) => " topic ",
         Some(Node::Subtopic(_) | Node::MissingSubtopic(_)) => " subtopic ",
         Some(Node::Question(_)) => " question ",
-        Some(Node::Answer(_)) => " answer ",
         None => " detail ",
     };
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let inner_width = area.width.saturating_sub(4);
+    let wrapped = |lines: &[Line<'static>]| {
+        Paragraph::new(lines.to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width)
+    };
     let height = usize::from(area.height.saturating_sub(2));
-    let total = paragraph.line_count(inner_width);
+    let total = wrapped(&lines);
     let last = u16::try_from(total.saturating_sub(height)).unwrap_or(u16::MAX);
     view.scroll = view.scroll.min(last);
+    view.sections.clear();
+    for part in parts {
+        let offset = lines.get(..part).map_or(0, &wrapped);
+        let offset = u16::try_from(offset).unwrap_or(u16::MAX).min(last);
+        if view.sections.last() != Some(&offset) {
+            view.sections.push(offset);
+        }
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let position = format!(
         " {}/{} ",
         (usize::from(view.scroll) + height).min(total),
@@ -204,17 +216,20 @@ pub(in crate::tui) fn short(id: &Id) -> String {
     }
 }
 
+/// The lines of the detail of `node`, and the index of the first line of each
+/// part of a question (the question, its reasoning, its answer).
 fn detail(
     model: &Model,
     node: &Node,
     topics: &[crate::tui::dataset::TopicInfo],
     theme: &Theme,
-) -> Vec<Line<'static>> {
-    match node {
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let lines = match node {
+        Node::Question(id) => return question_detail(model, id, theme),
         Node::Topic(topic) => topic_detail(model, topic, topics, theme),
         Node::Subtopic(id) => {
             let Some(subtopic) = model.data.subtopics.iter().find(|s| &s.id == id) else {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             };
             let questions: Vec<&Id> = model
                 .data
@@ -243,12 +258,8 @@ fn detail(
                  by an interrupted change or a hand edit. d deletes them with their answers."
             )),
         ],
-        Node::Question(id) => question_detail(model, id, theme),
-        Node::Answer(id) => model
-            .answer(id)
-            .map(|example| answer_detail(model, example, theme))
-            .unwrap_or_default(),
-    }
+    };
+    (lines, Vec::new())
 }
 
 fn topic_detail(
@@ -285,9 +296,11 @@ fn topic_detail(
     lines
 }
 
-fn question_detail(model: &Model, id: &Id, theme: &Theme) -> Vec<Line<'static>> {
+/// The question, its metadata, then its answer when it has one; with the index
+/// of the first line of each part.
+fn question_detail(model: &Model, id: &Id, theme: &Theme) -> (Vec<Line<'static>>, Vec<usize>) {
     let Some(question) = model.question(id) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let status = match model.class(id) {
         None => "unanswered".to_string(),
@@ -305,10 +318,22 @@ fn question_detail(model: &Model, id: &Id, theme: &Theme) -> Vec<Line<'static>> 
         format!("id {}  {status}", short(id)),
         theme.dim,
     )));
-    lines
+    let mut parts = vec![0];
+    if let Some(example) = model.answer(id) {
+        lines.push(Line::from(""));
+        let (answer, headers) = answer_detail(model, example, theme);
+        parts.extend(headers.into_iter().map(|header| header + lines.len()));
+        lines.extend(answer);
+    }
+    (lines, parts)
 }
 
-fn answer_detail(model: &Model, example: &Example, theme: &Theme) -> Vec<Line<'static>> {
+/// The metadata and text of an answer, with the index of each header line.
+fn answer_detail(
+    model: &Model,
+    example: &Example,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let meta = &example.meta;
     let excluded = match model.class(&example.id) {
         Some(SplitClass::Excluded(reason)) => format!("  excluded: {}", exclusion(reason)),
@@ -333,15 +358,18 @@ fn answer_detail(model: &Model, example: &Example, theme: &Theme) -> Vec<Line<'s
         )),
     ];
     let Some(text) = AnswerText::of(example) else {
-        return lines;
+        return (lines, Vec::new());
     };
+    let mut headers = Vec::new();
     if let Some(reasoning) = &text.reasoning {
+        headers.push(lines.len());
         lines.push(Line::from(Span::styled("── reasoning ──", theme.title)));
         lines.extend(reasoning.lines().map(|l| Line::from(l.to_string())));
     }
+    headers.push(lines.len());
     lines.push(Line::from(Span::styled("── answer ──", theme.title)));
     lines.extend(text.content.lines().map(|l| Line::from(l.to_string())));
-    lines
+    (lines, headers)
 }
 
 fn finish(reason: FinishReason) -> &'static str {

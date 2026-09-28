@@ -1019,9 +1019,9 @@ impl App {
 
     fn on_dataset_key(&mut self, code: KeyCode) -> Vec<Effect> {
         match code {
-            KeyCode::Char('e') => return self.edit_selected(),
-            KeyCode::Char('d') => {
-                self.delete_selected();
+            KeyCode::Char(key @ ('e' | 'E')) => return self.edit_selected(key == 'E'),
+            KeyCode::Char(key @ ('d' | 'D')) => {
+                self.delete_selected(key == 'D');
                 return Vec::new();
             },
             _ => {},
@@ -1042,6 +1042,16 @@ impl App {
             },
             KeyCode::PageDown => view.scroll = view.scroll.saturating_add(PAGE),
             KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(PAGE),
+            KeyCode::Char(']') => {
+                if let Some(&next) = view.sections.iter().find(|&&at| at > view.scroll) {
+                    view.scroll = next;
+                }
+            },
+            KeyCode::Char('[') => {
+                if let Some(&previous) = view.sections.iter().rfind(|&&at| at < view.scroll) {
+                    view.scroll = previous;
+                }
+            },
             KeyCode::Char('s') => view.stats = !view.stats,
             KeyCode::Char('/') => view.input = Some(view.filter.clone()),
             KeyCode::Esc if !view.filter.is_empty() => view.apply_filter(String::new()),
@@ -1050,12 +1060,13 @@ impl App {
         Vec::new()
     }
 
-    /// `e`: opens the selected question, answer or subtopic name in the editor.
-    fn edit_selected(&mut self) -> Vec<Effect> {
+    /// `e`: opens the selected question or subtopic name in the editor; `E`
+    /// (`answer`) opens the selected question's answer.
+    fn edit_selected(&mut self, answer: bool) -> Vec<Effect> {
         if self.locked() {
             return Vec::new();
         }
-        let target = match self.selected_target() {
+        let target = match self.selected_target(answer) {
             Ok(target) => target,
             Err(refusal) => {
                 self.say(Severity::Warn, refusal);
@@ -1088,23 +1099,27 @@ impl App {
         }
     }
 
-    /// What `e` edits for the selected node.
-    fn selected_target(&self) -> Result<Target, &'static str> {
+    /// What `e` edits for the selected node, or `E` (`answer`).
+    fn selected_target(&self, answer: bool) -> Result<Target, &'static str> {
         let model = self.dataset.model.as_ref().ok_or("nothing to edit")?;
+        if answer {
+            let Some(Node::Question(id)) = self.dataset.tree.selected().last() else {
+                return Err("no answer to edit");
+            };
+            let example = model.answer(id).ok_or("no answer to edit")?;
+            return AnswerText::of(example)
+                .map(|before| Target::Answer {
+                    id: id.clone(),
+                    before,
+                })
+                .ok_or("changed on disk; press R");
+        }
         match self.dataset.tree.selected().last() {
             Some(Node::Question(id)) => model
                 .question(id)
                 .map(|q| Target::Question {
                     id: id.clone(),
                     text: q.text.clone(),
-                })
-                .ok_or("changed on disk; press R"),
-            Some(Node::Answer(id)) => model
-                .answer(id)
-                .and_then(AnswerText::of)
-                .map(|before| Target::Answer {
-                    id: id.clone(),
-                    before,
                 })
                 .ok_or("changed on disk; press R"),
             Some(Node::Subtopic(id)) => model
@@ -1122,15 +1137,21 @@ impl App {
         }
     }
 
-    /// `d`: asks to delete the selected node, with what goes with it.
-    fn delete_selected(&mut self) {
+    /// `d`: asks to delete the selected node, with what goes with it; `D`
+    /// (`answer`): the selected question's answer only.
+    fn delete_selected(&mut self, answer: bool) {
         if self.locked() {
             return;
         }
         let Some(model) = &self.dataset.model else {
             return;
         };
-        match deletion(model, self.dataset.tree.selected(), &self.project.topics) {
+        match deletion(
+            model,
+            self.dataset.tree.selected(),
+            &self.project.topics,
+            answer,
+        ) {
             Ok(confirm) => self.overlay = Some(Overlay::Confirm(confirm)),
             Err(refusal) => self.say(Severity::Warn, refusal),
         }
@@ -1394,13 +1415,22 @@ impl App {
     }
 }
 
-/// The confirmation of `d` on the node at `path`, with what it removes.
-fn deletion(model: &Model, path: &[Node], topics: &[TopicInfo]) -> Result<Confirm, String> {
+/// The confirmation of `d` on the node at `path`, with what it removes, or of
+/// `D` (`answer`): the answer of the question at `path`.
+fn deletion(
+    model: &Model,
+    path: &[Node],
+    topics: &[TopicInfo],
+    answer: bool,
+) -> Result<Confirm, String> {
     let data = &model.data;
     let deletion = match path.last() {
+        Some(Node::Question(id)) if answer && model.answer(id).is_some() => {
+            Deletion::Answer(id.clone())
+        },
+        _ if answer => return Err("no answer to delete".to_string()),
         Some(Node::Subtopic(id)) => Deletion::Subtopic(id.clone()),
         Some(Node::Question(id)) => Deletion::Question(id.clone()),
-        Some(Node::Answer(id)) => Deletion::Answer(id.clone()),
         Some(Node::MissingSubtopic(topic)) => Deletion::MissingSubtopic(topic.clone()),
         Some(Node::Topic(_)) => {
             return Err("refused: topics live in overbrainer.toml".to_string());
@@ -1588,7 +1618,7 @@ mod tests {
     #[test]
     fn g_is_ignored_in_a_dialog_the_help_the_menu_and_the_filter() {
         let mut app = dataset_app();
-        open_to(&mut app, &path_to(MOVED, true));
+        open_to(&mut app, &path_to(MOVED));
         press(&mut app, &[KeyCode::Char('d')]);
         assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
         assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
@@ -1996,13 +2026,17 @@ mod tests {
     #[test]
     fn the_detail_scroll_is_clamped_to_the_text() -> TestResult {
         let mut app = dataset_app();
-        open_to(&mut app, &path_to(MOVED, true));
+        open_to(&mut app, &path_to(MOVED));
         app.dataset.scroll = 1000;
         let rows = text(&draw(&mut app, 120, 40)?);
-        assert_eq!(app.dataset.scroll, 0, "14 lines fit in 38 rows");
+        assert_eq!(
+            app.dataset.scroll, 0,
+            "the question and its answer fit in 38 rows"
+        );
         assert!(rows.iter().any(|row| row.contains("model deepseek-r1")));
+        app.dataset.scroll = 1000;
         let rows = text(&draw(&mut app, 80, 24)?);
-        assert_eq!(app.dataset.scroll, 0, "18 lines fit in 20 rows");
+        assert_eq!(app.dataset.scroll, 3, "23 lines, 20 rows");
         assert!(rows.iter().any(|row| row.contains("model deepseek-r1")));
         Ok(())
     }
@@ -2043,7 +2077,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = project_app()?;
         app.editor = vec!["my-editor".into(), "--wait".into()];
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { command, path }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2075,7 +2109,7 @@ mod tests {
     fn an_editor_that_fails_or_changes_nothing_saves_nothing()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false)[..2]);
+        open_to(&mut app, &path_to(MOVED)[..2]);
         for (exit, message) in [
             (
                 Ok(exited(1)),
@@ -2103,7 +2137,7 @@ mod tests {
     fn a_refused_save_keeps_the_typed_text_and_says_where() -> Result<(), Box<dyn std::error::Error>>
     {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2135,7 +2169,7 @@ mod tests {
         );
         press(&mut app, &[KeyCode::Char('d')]);
         assert_eq!(app.overlay, None);
-        open_to(&mut app, &path_to(MOVED, true));
+        open_to(&mut app, &path_to(MOVED));
         app.edit = Some(TaskId(9));
         for code in ['e', 'd'] {
             assert_eq!(press(&mut app, &[KeyCode::Char(code)]), []);
@@ -2153,10 +2187,10 @@ mod tests {
     }
 
     #[test]
-    fn d_asks_then_deletes_the_selected_answer_only_on_y() {
+    fn shift_d_asks_then_deletes_the_selected_question_s_answer_only_on_y() {
         let mut app = dataset_app();
-        open_to(&mut app, &path_to(MOVED, true));
-        press(&mut app, &[KeyCode::Char('d')]);
+        open_to(&mut app, &path_to(MOVED));
+        press(&mut app, &[KeyCode::Char('D')]);
         let Some(Overlay::Confirm(confirm)) = app.overlay.clone() else {
             return assert_eq!(app.overlay, None);
         };
@@ -2169,7 +2203,7 @@ mod tests {
         );
         assert_eq!(press(&mut app, &[KeyCode::Char('n')]), []);
         assert_eq!(app.overlay, None);
-        press(&mut app, &[KeyCode::Char('d')]);
+        press(&mut app, &[KeyCode::Char('D')]);
         let effects = press(&mut app, &[KeyCode::Char('y')]);
         let id = Id::question(&Id::subtopic("ownership", "Borrowing"), MOVED);
         assert!(matches!(
@@ -2179,11 +2213,99 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn shift_d_and_shift_e_warn_on_a_question_without_answer() {
+        let mut app = dataset_app();
+        open_to(&mut app, &path_to("When does NLL end a borrow?"));
+        assert_eq!(press(&mut app, &[KeyCode::Char('D')]), []);
+        assert_eq!(app.overlay, None);
+        assert_eq!(status(&app), Some("no answer to delete"));
+        assert_eq!(press(&mut app, &[KeyCode::Char('E')]), []);
+        assert_eq!(status(&app), Some("no answer to edit"));
+        assert!(app.editing.is_none());
+    }
+
+    #[test]
+    fn shift_e_opens_the_selected_question_s_answer() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = project_app()?;
+        open_to(&mut app, &path_to(MOVED));
+        let effects = press(&mut app, &[KeyCode::Char('E')]);
+        let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        let text = std::fs::read_to_string(path)?;
+        assert!(
+            text.contains("The borrow must end before the move."),
+            "{text}"
+        );
+        assert!(
+            matches!(
+                app.editing.as_ref().map(|session| &session.target),
+                Some(Target::Answer { .. })
+            ),
+            "the answer is edited"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn brackets_jump_between_the_parts_of_a_question() -> TestResult {
+        let mut app = dataset_app();
+        let mut data = dataset();
+        let reply = data.answers[0].messages.last_mut().ok_or("no reply")?;
+        reply.content.push_str(&"\nOne more line.".repeat(30));
+        app.dataset.loaded(data, &app.project.topics.clone());
+        open_to(&mut app, &path_to(MOVED));
+        draw(&mut app, 80, 24)?;
+        let sections = app.dataset.sections.clone();
+        assert_eq!(
+            sections.len(),
+            3,
+            "question, reasoning, answer: {sections:?}"
+        );
+        assert_eq!(sections.first(), Some(&0));
+        press(&mut app, &[KeyCode::Char(']')]);
+        assert_eq!(app.dataset.scroll, sections[1]);
+        press(&mut app, &[KeyCode::Char(']')]);
+        assert_eq!(app.dataset.scroll, sections[2]);
+        press(&mut app, &[KeyCode::Char(']')]);
+        assert_eq!(app.dataset.scroll, sections[2], "the last part stays");
+        press(&mut app, &[KeyCode::Char('[')]);
+        assert_eq!(app.dataset.scroll, sections[1]);
+        press(&mut app, &[KeyCode::Char('['), KeyCode::Char('[')]);
+        assert_eq!(app.dataset.scroll, 0);
+        let rows = text(&draw(&mut app, 80, 24)?);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(MOVED.get(..20).unwrap_or(MOVED)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn brackets_do_nothing_when_the_detail_fits() -> TestResult {
+        let mut app = dataset_app();
+        open_to(&mut app, &path_to(MOVED));
+        draw(&mut app, 120, 40)?;
+        press(&mut app, &[KeyCode::Char(']')]);
+        assert_eq!(app.dataset.scroll, 0);
+        press(&mut app, &[KeyCode::Char('[')]);
+        assert_eq!(app.dataset.scroll, 0);
+        open_to(&mut app, &path_to(MOVED)[..2]);
+        draw(&mut app, 80, 24)?;
+        assert_eq!(
+            app.dataset.sections,
+            Vec::<u16>::new(),
+            "only a question has parts"
+        );
+        Ok(())
+    }
+
     /// [`dataset_app`] on an answer, following a run, and leaving: after a
     /// signal, or with a quit waiting for that run.
     fn leaving_app(signal: bool) -> App {
         let mut app = dataset_app();
-        open_to(&mut app, &path_to(MOVED, true));
+        open_to(&mut app, &path_to(MOVED));
         app.training.tasks.insert(
             TaskId(9),
             crate::tui::training::Follow::new(
@@ -2224,16 +2346,21 @@ mod tests {
         Ok(())
     }
 
-    /// `e`, `d` and a confirmed deletion start nothing in `app`, and say why.
+    /// `e`, `E`, `d`, `D` and a confirmed deletion start nothing in `app`, and say why.
     fn no_edit_starts(app: &mut App) -> Result<(), String> {
-        for code in ['e', 'd'] {
+        for code in ['e', 'E', 'd', 'D'] {
             app.status = None;
             assert_eq!(press(app, &[KeyCode::Char(code)]), []);
             assert_eq!(app.overlay, None);
             assert_eq!(status(app), Some("refused: quitting; no edit starts"));
         }
         let model = app.dataset.model.as_ref().ok_or("no model")?;
-        let confirm = deletion(model, app.dataset.tree.selected(), &app.project.topics)?;
+        let confirm = deletion(
+            model,
+            app.dataset.tree.selected(),
+            &app.project.topics,
+            false,
+        )?;
         app.overlay = Some(Overlay::Confirm(confirm));
         app.status = None;
         assert_eq!(press(app, &[KeyCode::Char('y')]), []);
@@ -2245,7 +2372,7 @@ mod tests {
     fn an_edit_open_when_the_tui_ends_is_noted_for_the_exit()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2268,7 +2395,7 @@ mod tests {
     fn a_signal_during_a_save_waits_for_it_then_says_it_was_saved()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2303,7 +2430,7 @@ mod tests {
     fn a_signal_during_a_refused_save_notes_the_kept_file() -> Result<(), Box<dyn std::error::Error>>
     {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2332,7 +2459,7 @@ mod tests {
     fn an_edited_file_that_cannot_be_read_is_noted_for_the_exit()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2352,9 +2479,9 @@ mod tests {
     }
 
     /// The text of the dialog `d` opens on the node at `path`.
-    fn dialog_text(app: &mut App, path: &[Node]) -> Result<String, String> {
+    fn dialog_text(app: &mut App, path: &[Node], key: char) -> Result<String, String> {
         open_to(app, path);
-        press(app, &[KeyCode::Char('d')]);
+        press(app, &[KeyCode::Char(key)]);
         match app.overlay.take() {
             Some(Overlay::Confirm(confirm)) => Ok(confirm.text.concat()),
             other => Err(format!("{other:?}")),
@@ -2369,7 +2496,11 @@ mod tests {
         let topic = Node::Topic("old_topic".into());
         let not_configured = "its topic \"old_topic\" is not in overbrainer.toml, so no run \
                               replaces it. train and eval are rebuilt.";
-        let subtopic = dialog_text(&mut app, &[topic.clone(), Node::Subtopic(legacy.clone())])?;
+        let subtopic = dialog_text(
+            &mut app,
+            &[topic.clone(), Node::Subtopic(legacy.clone())],
+            'd',
+        )?;
         assert_eq!(
             subtopic,
             format!(
@@ -2382,7 +2513,7 @@ mod tests {
             Node::Subtopic(legacy),
             Node::Question(question.clone()),
         ];
-        let text = dialog_text(&mut app, &path)?;
+        let text = dialog_text(&mut app, &path, 'd')?;
         assert_eq!(
             text,
             format!(
@@ -2390,9 +2521,7 @@ mod tests {
                  {not_configured}"
             )
         );
-        let mut answer = path.to_vec();
-        answer.push(Node::Answer(question));
-        let text = dialog_text(&mut app, &answer)?;
+        let text = dialog_text(&mut app, &path, 'D')?;
         assert_eq!(
             text,
             format!("Delete this answer? The question stays; {not_configured}")

@@ -1,5 +1,5 @@
 //! The Dataset view's model, built once per load, filter change or edit: the tree
-//! of topics, subtopics, questions and answers, and the stats of each topic.
+//! of topics, subtopics and questions, and the stats of each topic.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -36,10 +36,8 @@ pub(super) enum Node {
     Subtopic(Id),
     /// The questions of a topic whose subtopic no longer exists.
     MissingSubtopic(String),
-    /// A question.
+    /// A question, shown with its answer.
     Question(Id),
-    /// The answer of a question.
-    Answer(Id),
 }
 
 /// The tree and stats of one loaded dataset.
@@ -470,7 +468,7 @@ impl<'a> Tree<'a> {
             let hit = self.hit(&question.text);
             hits |= hit;
             if self.needle.is_empty() || matched || hit {
-                children.push(self.question(question)?);
+                children.push(self.question(question));
             }
         }
         if children.is_empty() && !self.needle.is_empty() && !matched {
@@ -488,28 +486,21 @@ impl<'a> Tree<'a> {
         TreeItem::new(node, Line::from(label), children).map(Some)
     }
 
-    fn question(&self, question: &Question) -> std::io::Result<Item> {
+    fn question(&self, question: &Question) -> Item {
         let text = question
             .text
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        let Some(class) = self.model.class(&question.id) else {
-            return Ok(TreeItem::new_leaf(
-                Node::Question(question.id.clone()),
-                format!("[ ] {text}"),
-            ));
+        let marker = match self.model.class(&question.id) {
+            None => "[ ]",
+            Some(SplitClass::Usable) => "[a]",
+            Some(SplitClass::Excluded(_)) => "[x]",
+            Some(SplitClass::Orphaned) => "[o]",
         };
-        let (marker, note) = match class {
-            SplitClass::Usable => ("[a]", String::new()),
-            SplitClass::Excluded(reason) => ("[x]", format!("  excluded: {}", exclusion(reason))),
-            SplitClass::Orphaned => ("[o]", "  orphaned".to_string()),
-        };
-        let answer = TreeItem::new_leaf(Node::Answer(question.id.clone()), format!("answer{note}"));
-        TreeItem::new(
+        TreeItem::new_leaf(
             Node::Question(question.id.clone()),
             format!("{marker} {text}"),
-            vec![answer],
         )
     }
 }
@@ -541,6 +532,9 @@ pub(super) struct DatasetView {
     pub(super) stats: bool,
     /// Scroll of the detail pane, in lines.
     pub(super) scroll: u16,
+    /// Scroll of each part of the shown question (question, reasoning, answer),
+    /// capped at the last scroll; set at each draw, empty on other nodes.
+    pub(super) sections: Vec<u16>,
     /// The last split run in this session.
     pub(super) split: Option<SplitReport>,
     /// The style of the `(not configured)` label of a topic.
@@ -660,6 +654,21 @@ mod tests {
     }
 
     #[test]
+    fn a_question_is_a_leaf_even_when_answered() {
+        let mut view = loaded();
+        let path = path_to(MOVED);
+        view.tree.open(path[..1].to_vec());
+        view.tree.open(path[..2].to_vec());
+        view.tree.open(path.clone());
+        let shown = labels(&view);
+        assert!(
+            shown.iter().all(|label| !label.starts_with("      ")),
+            "{shown:#?}"
+        );
+        assert_eq!(shown.len(), 9, "{shown:#?}");
+    }
+
+    #[test]
     fn stepping_follows_the_visible_nodes() {
         let mut view = loaded();
         view.step(true);
@@ -678,7 +687,7 @@ mod tests {
         let model = view.model.as_ref();
         assert_eq!(model.and_then(|m| m.matches), Some(1));
         view.tree.open(vec![Node::Topic("ownership".into())]);
-        let path = path_to("When does NLL end a borrow?", false);
+        let path = path_to("When does NLL end a borrow?");
         view.tree.open(path[..2].to_vec());
         let shown = labels(&view);
         assert_eq!(shown.len(), 3, "{shown:#?}");
@@ -748,7 +757,7 @@ mod tests {
         assert_eq!(model.matches, Some(4), "the subtopic and its 3 questions");
         let shown = labels(&view);
         assert_eq!(shown.len(), 5, "{shown:#?}");
-        let nll = path_to("When does NLL end a borrow?", false);
+        let nll = path_to("When does NLL end a borrow?");
         assert!(view.shown(&nll), "{shown:#?}");
         Ok(())
     }

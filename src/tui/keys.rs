@@ -47,13 +47,16 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
 
 const DATASET: &[KeyHelp] = &[
     row("k j, Up Down", "move"),
-    row("l h, Right Left", "expand, collapse"),
-    row("Enter", "expand or collapse"),
-    row("PgUp PgDn", "scroll the detail pane"),
+    row("l h, Right Left, Enter", "expand, collapse (Enter toggles)"),
+    row(
+        "PgUp PgDn, [ ]",
+        "scroll the detail pane; [ ] jumps part to part",
+    ),
     row("/", "filter the tree (Enter keeps, Esc clears)"),
     row("s", "stats pane"),
-    row("e", "edit in $EDITOR (question, answer, subtopic)"),
+    row("e, E", "edit in $EDITOR; E edits the question's answer"),
     row("d", "delete, with what depends on it (asks first)"),
+    row("D", "delete the question's answer only (asks first)"),
 ];
 
 const TRAINING: &[KeyHelp] = &[
@@ -131,6 +134,7 @@ const FOOTER_DATASET: &[Hint] = &[
     hint("s", "stats"),
     locking("e", "edit"),
     locking("d", "delete"),
+    hint("[ ]", "parts"),
 ];
 const FOOTER_PIPELINE: &[Hint] = &[
     locking("r", "run a stage"),

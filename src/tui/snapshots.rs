@@ -241,19 +241,14 @@ pub(super) fn project() -> Result<tempfile::TempDir, Box<dyn std::error::Error>>
     Ok(dir)
 }
 
-/// The tree path of a question of `ownership`/`Borrowing`, and of its answer.
-pub(super) fn path_to(text: &str, answer: bool) -> Vec<Node> {
+/// The tree path of a question of `ownership`/`Borrowing`.
+pub(super) fn path_to(text: &str) -> Vec<Node> {
     let subtopic = Id::subtopic("ownership", "Borrowing");
-    let id = Id::question(&subtopic, text);
-    let mut path = vec![
+    vec![
         Node::Topic("ownership".into()),
-        Node::Subtopic(subtopic),
-        Node::Question(id.clone()),
-    ];
-    if answer {
-        path.push(Node::Answer(id));
-    }
-    path
+        Node::Subtopic(subtopic.clone()),
+        Node::Question(Id::question(&subtopic, text)),
+    ]
 }
 
 /// Opens every node of `path` but the last and selects it.
@@ -605,10 +600,10 @@ fn dataset_with_every_topic_collapsed() -> TestResult {
 }
 
 #[test]
-fn dataset_on_an_answer_with_its_reasoning() -> TestResult {
+fn dataset_on_an_answered_question_with_its_reasoning() -> TestResult {
     let mut app = dataset_app();
-    open_to(&mut app, &path_to(MOVED, true));
-    snapshot("dataset_answer", &mut app)?;
+    open_to(&mut app, &path_to(MOVED));
+    snapshot("dataset_answered", &mut app)?;
     Ok(())
 }
 
@@ -617,7 +612,7 @@ fn dataset_on_an_excluded_question() -> TestResult {
     let mut app = dataset_app();
     open_to(
         &mut app,
-        &path_to("Why can't a &mut and a & borrow coexist?", false),
+        &path_to("Why can't a &mut and a & borrow coexist?"),
     );
     snapshot("dataset_question", &mut app)?;
     Ok(())
@@ -736,7 +731,7 @@ fn dataset_load_error() -> TestResult {
 #[test]
 fn the_delete_dialog_says_what_goes_with_a_subtopic() -> TestResult {
     let mut app = dataset_app();
-    open_to(&mut app, &path_to(MOVED, false)[..2]);
+    open_to(&mut app, &path_to(MOVED)[..2]);
     app.on_input(&key(KeyCode::Char('d')));
     assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
     snapshot("dataset_delete", &mut app)?;
