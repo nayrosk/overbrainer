@@ -147,8 +147,8 @@ pub(super) struct Field {
 
 impl Field {
     /// The line under the list for the selected field: why it cannot be
-    /// changed here, or what it is.
-    pub(super) fn detail(&self) -> String {
+    /// changed here, or what it is, then `hint`.
+    pub(super) fn detail(&self, hint: Option<&str>) -> String {
         let key = &self.key;
         if let Some(error) = &self.error {
             return error.clone();
@@ -156,8 +156,10 @@ impl Field {
         if let Some(user) = &self.lock {
             return format!("{key}: used by {user}, read-only until it ends");
         }
-        self.env_note()
-            .unwrap_or_else(|| format!("{key}: {}", self.help))
+        self.env_note().unwrap_or_else(|| match hint {
+            Some(hint) => format!("{key}: {}; {hint}", self.help),
+            None => format!("{key}: {}", self.help),
+        })
     }
 
     /// Where to change the field when only the environment may: `.env`.
@@ -801,6 +803,8 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
         },
         Target::Runpod {
             gpu_types,
+            min_vram_gb,
+            max_price_per_hour,
             gpu_count,
             image,
             venv,
@@ -811,7 +815,9 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             data_center_ids,
             network_volume_id,
         } => match field {
-            "gpu_types" => Some(gpu_types.join(", ")),
+            "gpu_types" => Some(gpu_types.to_string()),
+            "min_vram_gb" => min_vram_gb.map(|gb| gb.to_string()),
+            "max_price_per_hour" => max_price_per_hour.map(float),
             "gpu_count" => Some(gpu_count.to_string()),
             "image" => image.clone(),
             "venv" => venv.clone(),
@@ -819,7 +825,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             "max_hours" => Some(float(*max_hours)),
             "boot_grace_minutes" => Some(boot_grace_minutes.to_string()),
             "retrieve_grace_minutes" => Some(retrieve_grace_minutes.to_string()),
-            "data_center_ids" => (!data_center_ids.is_empty()).then(|| data_center_ids.join(", ")),
+            "data_center_ids" => (!data_center_ids.is_any()).then(|| data_center_ids.to_string()),
             "network_volume_id" => network_volume_id.clone(),
             _ => None,
         },
@@ -1276,16 +1282,16 @@ mod tests {
     fn the_detail_says_where_a_value_comes_from() -> TestResult {
         let rows = rows(&config()?, None, &Locks::default());
         assert_eq!(
-            field(&rows, "providers.nanogpt.api_key")?.detail(),
+            field(&rows, "providers.nanogpt.api_key")?.detail(None),
             "providers.nanogpt.api_key: env only, set \
              OVERBRAINER_PROVIDERS__NANOGPT__API_KEY in .env"
         );
         assert_eq!(
-            field(&rows, "pipeline.concurrency")?.detail(),
+            field(&rows, "pipeline.concurrency")?.detail(None),
             "pipeline.concurrency: set by OVERBRAINER_PIPELINE__CONCURRENCY, change it in .env"
         );
         assert_eq!(
-            field(&rows, "pipeline.seed")?.detail(),
+            field(&rows, "pipeline.seed")?.detail(None),
             "pipeline.seed: Seed of the train/eval split (default 42)"
         );
         Ok(())
@@ -1316,7 +1322,7 @@ mod tests {
         );
         assert!(!locked.iter().any(|key| key.starts_with("training")));
         assert_eq!(
-            field(&rows, "roles.parent.model")?.detail(),
+            field(&rows, "roles.parent.model")?.detail(None),
             "roles.parent.model: used by answers, read-only until it ends"
         );
         Ok(())

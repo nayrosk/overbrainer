@@ -4,6 +4,7 @@
 //! or stderr while the terminal shows it.
 
 mod app;
+mod catalog;
 mod cost;
 mod dataset;
 mod editor;
@@ -19,6 +20,7 @@ mod project_save;
 #[cfg(test)]
 mod snapshots;
 mod start;
+mod start_pick;
 mod tasks;
 mod terminal;
 mod theme;

@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 mod bootstrap;
+mod catalog;
 mod client;
 mod flow;
 mod keys;
@@ -21,6 +22,10 @@ mod types;
 
 pub use bootstrap::{
     HOST_KEY_ENV, JOB_ENV, PodSettings, bootstrap_functions, pod_command, pod_env, watchdog_script,
+};
+pub use catalog::{
+    DataCenterStock, GpuFilter, by_price, data_center_stock, data_center_table, gpu_table, resolve,
+    select_gpus, stocked_data_centers, template_table, volume_table,
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
 pub use flow::{
@@ -35,7 +40,9 @@ pub use orphans::{
     PodRow, Removal, Removed, RowKind, listed_rows, orphan_warnings, pod_rows, remove_run_pods,
     table,
 };
-pub use provision::{PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, sweep};
+pub use provision::{
+    PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, resolve_target, sweep,
+};
 pub use record::{
     Attempt, AttemptResult, DeletedBy, POD_FILE, POD_RECORD_VERSION, PodRecord, PodState,
     SshEndpoint, hours,
@@ -43,8 +50,10 @@ pub use record::{
 pub use status::{DeleteReason, PodStatus};
 pub use target::{MIN_CUDA_VERSION, RunpodTarget, VOLUME_MOUNT, VOLUME_WORKDIR, WORKDIR};
 pub use types::{
-    CreateEnv, CreatePod, GpuRequest, InvalidPodId, Mounts, NetworkMount, Pagination, Pod, PodEnv,
-    PodGpu, PodId, PodPage, PodSsh, RemoteStatus, SshDirect,
+    Availability, CreateEnv, CreatePod, CudaVersion, DataCenter, DataCenterList, GpuMaxCount,
+    GpuPrice, GpuRequest, GpuType, GpuTypeList, InvalidPodId, Mounts, NetworkMount, NetworkVolume,
+    NetworkVolumeList, Pagination, Pod, PodEnv, PodGpu, PodId, PodPage, PodSsh, RemoteStatus,
+    SshDirect, Stock, Template, TemplatePage,
 };
 
 /// Errors of a Runpod run's pod: provisioning, keys, readiness, deletion.
@@ -81,6 +90,10 @@ pub enum PodError {
     /// pods created never became ready.
     #[error("{0}")]
     NoCapacity(String),
+    /// An `auto` choice of the target found nothing in stock in the Runpod
+    /// catalog; no pod was asked for. Says what was asked.
+    #[error("{0}")]
+    NotInStock(String),
     /// Runpod asks for credits (402).
     #[error(
         "Runpod refused for lack of credits (402): deploying needs at least one hour of credits"

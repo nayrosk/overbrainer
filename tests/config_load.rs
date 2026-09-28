@@ -1,6 +1,8 @@
 use std::fs;
 
-use overbrainer::config::{ConfigError, Engine, EnvSource, Target, env_keys, load, load_str};
+use overbrainer::config::{
+    ConfigError, Engine, EnvSource, ListOrAuto, Target, env_keys, load, load_str,
+};
 use secrecy::ExposeSecret;
 
 const BASE: &str = r#"
@@ -289,8 +291,8 @@ fn runpod_lists_come_from_a_comma_separated_env_value() -> Result<(), Box<dyn st
             retrieve_grace_minutes,
             ..
         }) => {
-            assert_eq!(gpu_types, &["NVIDIA GeForce RTX 4090", "NVIDIA A40"]);
-            assert_eq!(data_center_ids, &["EU-RO-1"]);
+            assert_eq!(gpu_types.list(), &["NVIDIA GeForce RTX 4090", "NVIDIA A40"]);
+            assert_eq!(data_center_ids.list(), &["EU-RO-1"]);
             assert_eq!(network_volume_id.as_deref(), Some("vol123"));
             assert_eq!(*boot_grace_minutes, 45);
             assert_eq!(*retrieve_grace_minutes, 90);
@@ -692,6 +694,76 @@ fn env_keys_agrees_with_load_str_on_a_mixed_case_nested_key()
     assert_eq!(
         env_keys(&pairs),
         std::collections::BTreeSet::from(["providers.nanogpt.api_key".to_string()])
+    );
+    Ok(())
+}
+
+#[test]
+fn runpod_auto_comes_from_env_and_from_the_file() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TARGETS}"))?;
+    let settings = load(
+        dir.path(),
+        env(&[
+            ("OVERBRAINER_TARGETS__GPU__GPU_TYPES", "auto"),
+            ("OVERBRAINER_TARGETS__GPU__DATA_CENTER_IDS", " auto "),
+            ("OVERBRAINER_TARGETS__GPU__MIN_VRAM_GB", "48"),
+            ("OVERBRAINER_TARGETS__GPU__MAX_PRICE_PER_HOUR", "1.25"),
+        ]),
+    )?;
+    match settings.targets.get("gpu") {
+        Some(Target::Runpod {
+            gpu_types,
+            data_center_ids,
+            min_vram_gb,
+            max_price_per_hour,
+            ..
+        }) => {
+            assert_eq!(*gpu_types, ListOrAuto::Auto);
+            assert_eq!(*data_center_ids, ListOrAuto::Auto);
+            assert_eq!(*min_vram_gb, Some(48));
+            assert_eq!(*max_price_per_hour, Some(1.25));
+        },
+        other => return Err(format!("expected runpod target, got {other:?}").into()),
+    }
+    let file = TARGETS.replace(
+        "gpu_types = [\"NVIDIA A40\"]",
+        "gpu_types = \"auto\"\ndata_center_ids = \"auto\"\nmin_vram_gb = 24",
+    );
+    let dir = project(&format!("{BASE}{file}"))?;
+    let settings = load(dir.path(), env(&[]))?;
+    match settings.targets.get("gpu") {
+        Some(Target::Runpod {
+            gpu_types,
+            data_center_ids,
+            min_vram_gb,
+            max_price_per_hour,
+            ..
+        }) => {
+            assert_eq!(*gpu_types, ListOrAuto::Auto);
+            assert_eq!(*data_center_ids, ListOrAuto::Auto);
+            assert_eq!(*min_vram_gb, Some(24));
+            assert_eq!(*max_price_per_hour, None);
+            Ok(())
+        },
+        other => Err(format!("expected runpod target, got {other:?}").into()),
+    }
+}
+
+#[test]
+fn only_lower_case_auto_is_auto() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TARGETS}"))?;
+    let settings = load(
+        dir.path(),
+        env(&[("OVERBRAINER_TARGETS__GPU__GPU_TYPES", "Auto")]),
+    );
+    // A list holding it, which validation then refuses.
+    let Err(ConfigError::Invalid(problems)) = settings else {
+        return Err(format!("expected invalid settings, got {settings:?}").into());
+    };
+    assert!(
+        problems.iter().any(|problem| problem
+            == "targets.gpu.gpu_types: write gpu_types = \"auto\", not a list holding it"),
+        "{problems:?}"
     );
     Ok(())
 }

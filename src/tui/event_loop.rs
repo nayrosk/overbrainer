@@ -286,7 +286,7 @@ where
     /// still writing is waited for first.
     async fn settle(&mut self, app: &mut App) {
         self.logged = app.logs.seq();
-        // List prices are only read: nothing waits for them.
+        // Catalog reads only read: nothing waits for them.
         self.tasks.abort_lookups();
         for effect in std::mem::take(&mut self.pending) {
             self.apply_late(app, effect);

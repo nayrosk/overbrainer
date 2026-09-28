@@ -13,7 +13,9 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 
 | Key | Default | Meaning |
 |---|---|---|
-| `gpu_types` | required | Runpod GPU type IDs, tried in order until one can be placed. From the environment, one comma-separated value: `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES="NVIDIA GeForce RTX 4090,NVIDIA A40"`. |
+| `gpu_types` | required | Runpod GPU type IDs, tried in order until one can be placed, or `"auto"` to try every GPU type in stock, cheapest first, when the run starts (see [`"auto"`](#auto) below). From the environment, one comma-separated value, or `auto`: `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES="NVIDIA GeForce RTX 4090,NVIDIA A40"` or `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. |
+| `min_vram_gb` | none | Least VRAM per GPU, in GB. Only with `gpu_types = "auto"`. At least 1. |
+| `max_price_per_hour` | none | Highest Secure Cloud list price of one GPU, in USD per hour. Only with `gpu_types = "auto"`. Greater than 0. |
 | `max_hours` | required | The pod's watchdog deletes the pod this long after it was created, whatever it is doing. At most 720. |
 | `gpu_count` | `1` | GPUs per pod. |
 | `image` | `axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1`, pinned by digest | Pod image (CUDA 13, driver 580 or newer). |
@@ -21,10 +23,76 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 | `container_disk_gb` | `50` | Container disk, at least 20. |
 | `boot_grace_minutes` | `30` | The watchdog deletes a pod whose job never started after this. At least 5. |
 | `retrieve_grace_minutes` | `60` | The watchdog deletes a pod whose ended job was not retrieved after this. |
-| `data_center_ids` | any | Data centers the pod may be placed in, for example `["EU-RO-1"]`. |
-| `network_volume_id` | none | Network volume mounted at `/workspace/data`; runs and the Hugging Face cache then live on it. Needs exactly one `data_center_ids` entry, the volume's data center. overbrainer never deletes anything on it. |
+| `data_center_ids` | any | Data centers the pod may be placed in, for example `["EU-RO-1"]`, or `"auto"` for those with a chosen GPU type in stock when the run starts (see [`"auto"`](#auto) below). Cannot be `"auto"` together with `network_volume_id`: list the volume's data center instead. |
+| `network_volume_id` | none | Network volume mounted at `/workspace/data`; runs and the Hugging Face cache then live on it. Needs exactly one `data_center_ids` entry, the volume's data center, never `"auto"`. overbrainer never deletes anything on it. |
 
 `gpu_type` became `gpu_types`: a configuration with the old key is rejected as `unknown field`.
+
+## The catalog
+
+`overbrainer pod gpus`, `overbrainer pod datacenters`, `overbrainer pod volumes` and `overbrainer pod templates` read the Runpod catalog and account directly; none of them needs a `[training]` section, only `OVERBRAINER_RUNPOD__API_KEY`.
+
+`overbrainer pod gpus` lists the Secure Cloud GPU types, cheapest first (ties by more VRAM, then by ID); a GPU type offered on the Community Cloud only is left out. The listing is for one GPU per pod, since the command takes no `gpu_count`.
+
+```
+$ overbrainer pod gpus
+ID                       VRAM GB   $/H  MAX COUNT  STOCK
+NVIDIA GeForce RTX 4090       24  0.34          8  HIGH
+NVIDIA A40                    48  0.40          8  MEDIUM
+NVIDIA H100 80GB HBM3         80     -          8  LOW
+```
+
+`--min-vram GB`, `--max-price PRICE` (USD/hour) and `--in-stock` narrow the list. `--data-center ID` keeps only the GPU types offered there and shows their stock there, in the STOCK column, instead of the overall band. `-` in `$/H` means Runpod lists no positive Secure Cloud price for that GPU type.
+
+`overbrainer pod datacenters` lists every data center, by ID, with how many GPU types are in stock there overall:
+
+```
+$ overbrainer pod datacenters
+ID       NAME          REGION         GPU TYPES IN STOCK
+EU-RO-1  EU Romania 1  EUROPE         14
+US-KS-2  US Kansas 2   NORTH_AMERICA  9
+```
+
+`overbrainer pod volumes` lists the account's network volumes, by name:
+
+```
+$ overbrainer pod volumes
+ID        NAME           SIZE GB  DATA CENTER
+nv1a2b3c  training-data      500  EU-RO-1
+```
+
+`overbrainer pod templates` lists the account's pod templates, by name (serverless templates are left out):
+
+```
+$ overbrainer pod templates
+ID        NAME            IMAGE
+tp9z8y7x  axolotl-custom  myrepo/axolotl:0.20.0
+```
+
+An empty listing prints one line saying so instead of a table (`pod: no GPU type matches`, `pod: no data center found`, `pod: no network volume on this account`, `pod: no pod template on this account`).
+
+## `"auto"`
+
+`gpu_types = "auto"` and `data_center_ids = "auto"` are resolved once, from the same GPU listing (scoped to the target's `gpu_count`), right before the run's first create call, never at `overbrainer pod gpus` time and never again later in the same run even if several GPU types are tried:
+
+1. `gpu_types = "auto"` picks every Secure Cloud GPU type in stock for `gpu_count` GPUs, within `min_vram_gb` and `max_price_per_hour` when set, and in one of the listed `data_center_ids` when any are listed, cheapest first (ties by more VRAM, then by ID).
+2. `data_center_ids = "auto"` then picks every data center with one of the chosen GPU types in stock for `gpu_count`, ordered by the cheapest such GPU type it has.
+
+When nothing in stock matches, the run fails before any pod is created, naming what was asked:
+
+```
+no GPU type in stock on Runpod's Secure Cloud for gpu_types = "auto" (gpu_count = 2, min_vram_gb = 48, max_price_per_hour = 1.5)
+```
+
+or, once GPU types are chosen but no data center has one of them in stock:
+
+```
+no data center has A or B in stock for data_center_ids = "auto" (gpu_count = 1)
+```
+
+## The pickers
+
+The [TUI](tui.md)'s Project view lets you set a Runpod target's `gpu_types`, `data_center_ids`, `network_volume_id` and `image` from the live catalog instead of typing them, and the confirmation before a run starts lets you re-pick the GPU types and data centers it will use, saving the choice to `overbrainer.toml` first. See [Terminal UI](tui.md) for the keys.
 
 ## What happens to a pod
 

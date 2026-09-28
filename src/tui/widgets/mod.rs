@@ -5,6 +5,7 @@ pub(super) mod dialog;
 pub(super) mod form;
 pub(super) mod help;
 pub(super) mod menu;
+pub(super) mod picker;
 pub(super) mod status;
 pub(super) mod too_small;
 

@@ -1,6 +1,7 @@
 //! The key tables the help overlay and the footer show, as data.
 
 use super::app::View;
+use super::widgets::picker::Mode;
 
 /// Width of the help overlay, borders included: it fits 80 columns.
 pub(super) const HELP_WIDTH: u16 = 78;
@@ -51,6 +52,10 @@ const PROJECT: &[KeyHelp] = &[
         "select a field, by page, the first or last",
     ),
     row("Enter", "edit the field; toggles a bool, cycles a choice"),
+    row(
+        "t, in a Runpod picker",
+        "type the value instead of picking it",
+    ),
     row("a", "add a topic, a provider or a target"),
     row("d", "delete the selected topic, provider or target"),
     row("s", "save to overbrainer.toml, validated first"),
@@ -78,6 +83,10 @@ const TRAINING: &[KeyHelp] = &[
     row("c", "cancel the selected run's job (asks first)"),
     row("c, Runpod run starting", "abandon it instead (asks first)"),
     row("t", "start a training run (asks first)"),
+    row(
+        "g c, starting on Runpod",
+        "choose GPU types, data centers (saved on y)",
+    ),
 ];
 
 const LOGS: &[KeyHelp] = &[
@@ -143,6 +152,21 @@ pub(super) enum Context {
     Help,
     /// The `r` menu.
     Menu,
+    /// A picker's entries.
+    Picker {
+        /// How entries are chosen.
+        mode: Mode,
+        /// Whether `t` types the value instead.
+        typed: bool,
+    },
+    /// A picker whose entries are being read, or cannot be.
+    Listing {
+        /// Whether `t` types the value instead.
+        typed: bool,
+    },
+    /// The dialog starting a run on a Runpod target: `g` and `c` choose its
+    /// GPU types and data centers.
+    Start,
 }
 
 const FOOTER_PROJECT: &[Hint] = &[
@@ -193,6 +217,28 @@ const FOOTER_PICK: &[Hint] = &[
     hint("Esc", "cancel"),
 ];
 const FOOTER_HELP: &[Hint] = &[hint("Esc", "close")];
+const FOOTER_LISTING: &[Hint] = &[hint("t", "type"), hint("Esc", "close")];
+const FOOTER_PICKER: &[Hint] = &[
+    hint("Space", "toggle"),
+    hint("J/K", "order"),
+    hint("/", "filter"),
+    hint("Enter", "keep"),
+    hint("t", "type"),
+    hint("Esc", "cancel"),
+];
+const FOOTER_PICK_ONE: &[Hint] = &[
+    hint("j/k", "move"),
+    hint("/", "filter"),
+    hint("Enter", "pick"),
+    hint("t", "type"),
+    hint("Esc", "cancel"),
+];
+const FOOTER_START: &[Hint] = &[
+    hint("y", "start"),
+    hint("g", "GPU types"),
+    hint("c", "data centers"),
+    hint("n, Esc or Enter", "cancel"),
+];
 const FOOTER_MENU: &[Hint] = &[
     hint("j/k", "move"),
     hint("Enter", "run"),
@@ -214,8 +260,27 @@ pub(super) fn footer(context: Context) -> Vec<Hint> {
         Context::Pick => FOOTER_PICK.to_vec(),
         Context::Dialog { yes, no } => vec![hint("y", yes), hint("n, Esc or Enter", no)],
         Context::Help => FOOTER_HELP.to_vec(),
+        Context::Listing { typed } => untyped(FOOTER_LISTING, typed),
         Context::Menu => FOOTER_MENU.to_vec(),
+        Context::Picker {
+            mode: Mode::Multi,
+            typed,
+        } => untyped(FOOTER_PICKER, typed),
+        Context::Picker {
+            mode: Mode::Single,
+            typed,
+        } => untyped(FOOTER_PICK_ONE, typed),
+        Context::Start => FOOTER_START.to_vec(),
     }
+}
+
+/// `hints`, without `t` unless `typed`.
+fn untyped(hints: &[Hint], typed: bool) -> Vec<Hint> {
+    hints
+        .iter()
+        .filter(|hint| typed || hint.key != "t")
+        .copied()
+        .collect()
 }
 
 /// Keys of `view`.
@@ -263,6 +328,16 @@ mod tests {
             dialog,
             Context::Help,
             Context::Menu,
+            Context::Picker {
+                mode: Mode::Multi,
+                typed: true,
+            },
+            Context::Picker {
+                mode: Mode::Single,
+                typed: true,
+            },
+            Context::Listing { typed: true },
+            Context::Start,
         ];
         for context in View::ALL.map(Context::View).into_iter().chain(others) {
             let hints = footer(context);

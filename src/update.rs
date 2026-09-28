@@ -619,8 +619,16 @@ mod tests {
         let slow = ResponseTemplate::new(200)
             .set_body_string(BODY)
             .set_delay(Duration::from_secs(10));
-        let server = serve(slow, 1).await;
-        let cut = Duration::from_millis(200);
+        // The request may never arrive: under load the cut can come before the
+        // client is built. The test is about the marker, so 0 or 1 requests.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/crates/overbrainer"))
+            .respond_with(slow)
+            .expect(0..=1)
+            .mount(&server)
+            .await;
+        let cut = Duration::from_secs(1);
         let (env, url) = (env(dir.path()), url(&server));
         let found = tokio::time::timeout(cut, latest(&env, &url, now(), TIMEOUT)).await;
         assert!(found.is_err(), "the fetch ended before it was dropped");

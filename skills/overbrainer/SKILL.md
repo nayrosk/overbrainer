@@ -83,7 +83,7 @@ Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.3
 
 - `kind = "local"`: this machine, `runtime = "native"` (Axolotl in `venv`) or `"docker"`.
 - `kind = "ssh"`: a machine reached with `ssh`, host from `OVERBRAINER_TARGETS__NAME__HOST`.
-- `kind = "runpod"`: a pod created for the run and deleted afterwards. Needs `gpu_types` and `max_hours`, and `OVERBRAINER_RUNPOD__API_KEY`. A watchdog on the pod deletes it at `max_hours` at the latest.
+- `kind = "runpod"`: a pod created for the run and deleted afterwards. Needs `gpu_types` (a list, or `"auto"` to try every GPU type in stock, cheapest first) and `max_hours`, and `OVERBRAINER_RUNPOD__API_KEY`. A watchdog on the pod deletes it at `max_hours` at the latest.
 
 | Command | What it does |
 |---|---|
@@ -95,6 +95,10 @@ Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.3
 | `overbrainer history [--all]` | Totals per stage (runs, items, tokens, cost), or every execution. |
 | `overbrainer pod ls` | List the Runpod pods overbrainer created. |
 | `overbrainer pod rm RUN_ID` | Delete the pods of a run. |
+| `overbrainer pod gpus` | List Runpod's Secure Cloud GPU types, cheapest first, with price, VRAM and stock. |
+| `overbrainer pod datacenters` | List Runpod's data centers with how many GPU types are in stock there. |
+| `overbrainer pod volumes` | List the account's network volumes. |
+| `overbrainer pod templates` | List the account's pod templates. |
 
 The job runs detached. Ctrl-C, a closed terminal or a lost connection only stop following it; the training goes on. `train` then exits non-zero and prints the `overbrainer train attach RUN_ID` command to use. That does not mean the run failed. A run ends as `succeeded`, `failed` or `cancelled`. Its files are in `runs/RUN_ID/`: `job.log` (the job's output, read it when a run fails), `metrics.jsonl`, and `output/` with the LoRA adapter (or the full model, and `output/merged/` with `merge = true`).
 

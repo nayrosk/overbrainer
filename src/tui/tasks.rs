@@ -15,11 +15,12 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use super::catalog::{Listed, Query, fetch};
 use super::cost::history_cost;
 use super::editor::Edited;
 use super::project::ProjectConfig;
 use super::project_edit::{SaveRefusal, save_config};
-use super::start::{Prices, StartPlan, list_prices, prepare};
+use super::start::{Gpus, StartPlan, list_gpus, prepare};
 use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::Command;
 use crate::cli::front::{Frontend, Report};
@@ -64,8 +65,11 @@ pub(super) enum Task {
     Series(String),
     /// What a training run started now would use.
     Prepare,
-    /// The list prices of these Runpod GPU types.
-    Prices(Vec<String>),
+    /// The Runpod GPU catalog for this many GPUs per pod, for the start
+    /// dialog: list prices, VRAM and stock.
+    StartCatalog(u32),
+    /// What a picker lists, or the GPU types a field hint needs.
+    Catalog(Query),
     /// Validates `text` with `env` and writes it to `overbrainer.toml`,
     /// unless the file no longer holds `base`.
     SaveConfig {
@@ -180,8 +184,10 @@ pub(super) enum Done {
     },
     /// What a training run started now would use, or why none can start.
     Prepared(Result<StartPlan, String>),
-    /// List prices of GPU types.
-    Prices(Prices),
+    /// The GPU catalog of the start dialog, or why it cannot be read.
+    StartCatalog(Gpus),
+    /// A picker's entries, or why they cannot be read.
+    Catalog(Result<Listed, String>),
     /// The configuration written to `overbrainer.toml`, or why nothing was.
     ConfigSaved(Result<Box<ProjectConfig>, SaveRefusal>),
 }
@@ -322,7 +328,8 @@ pub(super) struct Tasks {
     ids: HashMap<tokio::task::Id, TaskId>,
     tokens: HashMap<TaskId, CancellationToken>,
     abandons: HashMap<TaskId, Arc<AtomicBool>>,
-    /// The list price lookups running: only reads, aborted when the TUI ends.
+    /// The catalog lookups running: only reads, aborted when
+    /// the TUI ends.
     lookups: HashMap<TaskId, AbortHandle>,
 }
 
@@ -346,8 +353,8 @@ impl Tasks {
         &self.project_dir
     }
 
-    /// Aborts the list price lookups: they only read, so the TUI never waits
-    /// for them to end.
+    /// Aborts the catalog lookups: they only read, so the TUI
+    /// never waits for them to end.
     pub(super) fn abort_lookups(&mut self) {
         for (_, lookup) in self.lookups.drain() {
             lookup.abort();
@@ -463,16 +470,32 @@ impl Tasks {
                     })
                 })
             },
-            Task::Prices(gpu_types) => {
+            Task::StartCatalog(gpu_count) => {
                 let dir = self.project_dir.clone();
-                let handle = self.set.spawn(async move {
-                    Done::Prices(list_prices(&dir, EnvSource::Process, gpu_types).await)
-                });
-                self.lookups.insert(id, handle.clone());
-                handle
+                self.spawn_lookup(id, async move {
+                    Done::StartCatalog(list_gpus(&dir, EnvSource::Process, gpu_count).await)
+                })
+            },
+            Task::Catalog(query) => {
+                let dir = self.project_dir.clone();
+                self.spawn_lookup(id, async move {
+                    Done::Catalog(fetch(&dir, EnvSource::Process, query).await)
+                })
             },
         };
         self.ids.insert(handle.id(), id);
+    }
+
+    /// Starts the lookup `read` as `id`: it only reads, so it is aborted when
+    /// the TUI ends.
+    fn spawn_lookup(
+        &mut self,
+        id: TaskId,
+        read: impl Future<Output = Done> + Send + 'static,
+    ) -> AbortHandle {
+        let handle = self.set.spawn(read);
+        self.lookups.insert(id, handle.clone());
+        handle
     }
 
     /// Starts the pipeline `command` as `id`: its token interrupts the stage.
@@ -998,9 +1021,9 @@ exit 0
         Ok(())
     }
 
-    /// A list price lookup is aborted when the TUI ends: it ends at once.
+    /// A start catalog lookup is aborted when the TUI ends: it ends at once.
     #[tokio::test]
-    async fn a_price_lookup_is_aborted_when_the_tui_ends() -> TestResult {
+    async fn a_catalog_lookup_is_aborted_when_the_tui_ends() -> TestResult {
         let dir = tempfile::tempdir()?;
         let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
         let handle = tasks.set.spawn(std::future::pending::<Done>());

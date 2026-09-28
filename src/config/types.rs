@@ -394,10 +394,17 @@ pub enum Target {
     },
     /// Runs on a Runpod GPU pod, created for the run and deleted after it.
     Runpod {
-        /// Runpod GPU type IDs, tried in order until one can be placed. A TOML array,
-        /// or a comma-separated string from env.
-        #[serde(deserialize_with = "string_list")]
-        gpu_types: Vec<String>,
+        /// Runpod GPU type IDs, tried in order until one can be placed, or `"auto"`
+        /// to try every GPU type in stock, cheapest first, when the run starts. A
+        /// TOML array, or a comma-separated string from env.
+        gpu_types: ListOrAuto,
+        /// Least VRAM per GPU, in GB, for `gpu_types = "auto"` only. At least 1.
+        #[serde(default, deserialize_with = "optional_number")]
+        min_vram_gb: Option<u32>,
+        /// Highest list price of one GPU, in USD per hour, for `gpu_types = "auto"`
+        /// only. Greater than 0.
+        #[serde(default, deserialize_with = "optional_number")]
+        max_price_per_hour: Option<f64>,
         /// Number of GPUs to provision. Must be at least 1.
         #[serde(default = "default_gpu_count", deserialize_with = "number")]
         gpu_count: u32,
@@ -425,12 +432,13 @@ pub enum Target {
             deserialize_with = "number"
         )]
         retrieve_grace_minutes: u32,
-        /// Runpod data centers the pod may be placed in, for example `EU-RO-1`.
-        /// Any when empty.
-        #[serde(default, deserialize_with = "string_list")]
-        data_center_ids: Vec<String>,
+        /// Runpod data centers the pod may be placed in, for example `EU-RO-1`, any
+        /// when empty; or `"auto"` for those with a chosen GPU type in stock when
+        /// the run starts, cheapest first.
+        #[serde(default)]
+        data_center_ids: ListOrAuto,
         /// Network volume mounted at `/workspace/data`. Requires exactly one entry
-        /// in `data_center_ids`, the volume's data center.
+        /// in `data_center_ids`, the volume's data center (never `"auto"`).
         network_volume_id: Option<String>,
     },
 }
@@ -445,41 +453,126 @@ pub const DEFAULT_RUNPOD_VENV: &str = "/workspace/axolotl-venv";
 /// Base URL of the Runpod REST API (v2) when `runpod.base_url` is unset.
 pub const DEFAULT_RUNPOD_BASE_URL: &str = "https://api.runpod.io/v2";
 
-/// Deserializes a list of strings given as a TOML array or, since env values
-/// always arrive as strings, as one comma-separated string. Every item is trimmed.
-fn string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct ListVisitor;
+/// A list of strings, or `"auto"` for a choice made when a run starts.
+///
+/// Read from a TOML array or, since env values always arrive as strings, from
+/// one comma-separated string; every item is trimmed. Only the exact lower-case
+/// string `auto` (surrounding spaces aside) means [`ListOrAuto::Auto`]: `["auto"]`
+/// is a list, which validation refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListOrAuto {
+    /// Chosen from the Runpod catalog when the run starts.
+    Auto,
+    /// These items, in order.
+    List(Vec<String>),
+}
 
-    impl<'de> Visitor<'de> for ListVisitor {
-        type Value = Vec<String>;
+impl ListOrAuto {
+    /// The value that selects [`ListOrAuto::Auto`].
+    pub const AUTO: &'static str = "auto";
 
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a list of strings or a comma-separated string")
-        }
+    /// Whether the choice is left to the run's start.
+    #[must_use]
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
 
-        fn visit_str<E: de::Error>(self, value: &str) -> Result<Vec<String>, E> {
-            if value.trim().is_empty() {
-                return Ok(Vec::new());
-            }
-            Ok(value
-                .split(',')
-                .map(|item| item.trim().to_string())
-                .collect())
-        }
-
-        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<String>, A::Error> {
-            let mut items = Vec::new();
-            while let Some(item) = seq.next_element::<String>()? {
-                items.push(item.trim().to_string());
-            }
-            Ok(items)
+    /// The listed items; none for [`ListOrAuto::Auto`].
+    #[must_use]
+    pub fn list(&self) -> &[String] {
+        match self {
+            Self::Auto => &[],
+            Self::List(items) => items,
         }
     }
 
-    deserializer.deserialize_any(ListVisitor)
+    /// Whether this is the default, empty list: no items given, and not
+    /// `auto`, so any value is accepted.
+    #[must_use]
+    pub fn is_any(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `text` as a form holds it: `auto`, or items comma-separated. Unlike
+    /// deserialization, empty items are dropped.
+    #[must_use]
+    pub fn from_form_text(text: &str) -> Self {
+        if text.trim() == Self::AUTO {
+            return Self::Auto;
+        }
+        Self::List(
+            text.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+}
+
+impl Default for ListOrAuto {
+    fn default() -> Self {
+        Self::List(Vec::new())
+    }
+}
+
+impl fmt::Display for ListOrAuto {
+    /// `auto`, or the items joined by `, `.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => formatter.write_str(Self::AUTO),
+            Self::List(items) => formatter.write_str(&items.join(", ")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ListOrAuto {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ListVisitor;
+
+        impl<'de> Visitor<'de> for ListVisitor {
+            type Value = ListOrAuto;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("\"auto\", a list of strings or a comma-separated string")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<ListOrAuto, E> {
+                let value = value.trim();
+                if value == ListOrAuto::AUTO {
+                    return Ok(ListOrAuto::Auto);
+                }
+                if value.is_empty() {
+                    return Ok(ListOrAuto::default());
+                }
+                Ok(ListOrAuto::List(
+                    value
+                        .split(',')
+                        .map(|item| item.trim().to_string())
+                        .collect(),
+                ))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<ListOrAuto, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element::<String>()? {
+                    items.push(item.trim().to_string());
+                }
+                Ok(ListOrAuto::List(items))
+            }
+        }
+
+        deserializer.deserialize_any(ListVisitor)
+    }
+}
+
+/// [`number`] for an optional field, used with `#[serde(default)]`.
+fn optional_number<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+{
+    number(deserializer).map(Some)
 }
 
 /// Deserializes a number that may arrive as a string.

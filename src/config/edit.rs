@@ -1465,7 +1465,8 @@ runtime = "native"
             name: "cloud".to_string(),
             field: "gpu_types",
         };
-        doc.set(&gpus, FieldValue::List(vec!["A40".to_string()]))?;
+        // `auto`, so that min_vram_gb and max_price_per_hour are allowed.
+        doc.set(&gpus, FieldValue::Text("auto".to_string()))?;
         validate(&doc)?;
         let sections = [
             Section::Topic,

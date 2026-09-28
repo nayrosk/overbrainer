@@ -142,6 +142,8 @@ fn target_summary(target: &Target) -> String {
 fn runpod_summary(target: &Target) -> String {
     let Target::Runpod {
         gpu_types,
+        min_vram_gb,
+        max_price_per_hour,
         gpu_count,
         image,
         venv,
@@ -155,16 +157,27 @@ fn runpod_summary(target: &Target) -> String {
     else {
         return String::new();
     };
-    let data_centers = if data_center_ids.is_empty() {
+    let data_centers = if data_center_ids.is_any() {
         "any".to_string()
     } else {
-        data_center_ids.join(", ")
+        data_center_ids.to_string()
+    };
+    let mut limits = Vec::new();
+    if let Some(gb) = min_vram_gb {
+        limits.push(format!("at least {gb} GB"));
+    }
+    if let Some(price) = max_price_per_hour {
+        limits.push(format!("at most ${price}/h per GPU"));
+    }
+    let limits = if limits.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", limits.join(", "))
     };
     format!(
-        "runpod {gpu_count}x [{}], max {max_hours}h, image {}, venv {}, disk {container_disk_gb} GB, \
+        "runpod {gpu_count}x [{gpu_types}]{limits}, max {max_hours}h, image {}, venv {}, disk {container_disk_gb} GB, \
          boot grace {boot_grace_minutes} min, retrieve grace {retrieve_grace_minutes} min, \
          data centers {data_centers}, network volume {}",
-        gpu_types.join(", "),
         image.as_deref().unwrap_or(DEFAULT_RUNPOD_IMAGE),
         venv.as_deref().unwrap_or(DEFAULT_RUNPOD_VENV),
         network_volume_id.as_deref().unwrap_or("none"),

@@ -41,8 +41,8 @@ pub(in crate::tui) fn destructive(action: &Action, stage_running: bool) -> bool 
 
 /// Draws `confirm` centered over `area`. The key line always shows; when the
 /// text does not fit, the paragraphs that do come first, then [`CUT`], then
-/// the start dialog's most-it-can-cost line, which is never cut. `y` is drawn
-/// as an error when `destructive`. Returns where the dialog is.
+/// the start dialog's lines saying what `y` saves and what the run costs at
+/// most, which are never cut. `y` is drawn as an error when `destructive`. Returns where the dialog is.
 pub(in crate::tui) fn render(
     frame: &mut Frame,
     area: Rect,
@@ -52,12 +52,12 @@ pub(in crate::tui) fn render(
 ) -> Rect {
     let width = area.width.saturating_sub(2 * MARGIN).min(MAX_WIDTH);
     let pinned = match &confirm.action {
-        Action::Start(plan) => start::cost_line(plan),
-        _ => None,
+        Action::Start(_) => start::pinned(&confirm.text),
+        _ => Vec::new(),
     };
     let room = usize::from(area.height.saturating_sub(CHROME_ROWS));
     let text_width = width.saturating_sub(2 + 2 * PADDING);
-    let (lines, rows) = fitted(&confirm.text, text_width, room, pinned, theme);
+    let (lines, rows) = fitted(&confirm.text, text_width, room, &pinned, theme);
     let height = u16::try_from(rows)
         .unwrap_or(u16::MAX)
         .saturating_add(CHROME_ROWS);
@@ -103,13 +103,13 @@ fn rows_of(paragraph: &str, width: u16) -> usize {
 
 /// The paragraphs of `text` shown in `room` rows at `width`, with the rows
 /// they take. All of them when they fit; otherwise, in order, those that fit
-/// before the first that does not, [`CUT`], and paragraph `pinned` wherever it
-/// is (it is kept whenever it fits with the cut mark).
+/// before the first that does not, [`CUT`], and the paragraphs `pinned`
+/// wherever they are (each kept, in order, while they fit with the cut mark).
 fn fitted<'a>(
     text: &'a [String],
     width: u16,
     room: usize,
-    pinned: Option<usize>,
+    pinned: &[usize],
     theme: &Theme,
 ) -> (Vec<Line<'a>>, usize) {
     let rows: Vec<usize> = text.iter().map(|p| rows_of(p, width)).collect();
@@ -117,12 +117,21 @@ fn fitted<'a>(
     if total <= room {
         return (text.iter().map(|p| Line::from(p.as_str())).collect(), total);
     }
-    let kept = pinned.filter(|index| rows.get(*index).is_some_and(|r| *r < room));
-    let mut left = room.saturating_sub(1 + kept.and_then(|i| rows.get(i)).map_or(0, |r| *r));
+    let mut kept = Vec::new();
+    let mut kept_rows = 0;
+    for index in pinned {
+        if let Some(height) = rows.get(*index)
+            && kept_rows + height < room
+        {
+            kept.push(*index);
+            kept_rows += height;
+        }
+    }
+    let mut left = room.saturating_sub(1 + kept_rows);
     let (mut lines, mut used) = (Vec::new(), 0);
     let mut cut = false;
     for (index, (paragraph, height)) in text.iter().zip(&rows).enumerate() {
-        if Some(index) == kept {
+        if kept.contains(&index) {
             lines.push(Line::from(paragraph.as_str()));
             used += height;
         } else if !cut && *height <= left {

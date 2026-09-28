@@ -145,16 +145,18 @@ enum Created {
     Ambiguous,
 }
 
-/// Creates the run's pod, trying `plan.target.gpu_types` in order, and waits
-/// until it is ready. `record` (`pod.json`) is saved before every create call and
-/// after every answer. A pod that dies or stays unreachable is deleted and the
+/// Creates the run's pod, trying `plan.target.gpu_types` in order (its `auto`
+/// choices resolved first, see [`resolve_target`]), and waits until it is
+/// ready. `record` (`pod.json`) is saved before every create call and after
+/// every answer. A pod that dies or stays unreachable is deleted and the
 /// next GPU type tried. When provisioning fails after a create call got no clear
 /// answer, every pod of the run still listed is deleted (see [`sweep`]).
 ///
 /// # Errors
 ///
-/// Returns [`PodError::NoCapacity`] when no GPU type could be placed or gave a
-/// ready pod,
+/// Returns [`PodError::NotInStock`] when an `auto` choice finds nothing in
+/// stock (no create call is made), [`PodError::NoCapacity`] when no GPU type
+/// could be placed or gave a ready pod,
 /// [`PodError::Unanswered`] when no create call got a clear answer,
 /// [`PodError::NoCredits`] on a 402, [`PodError::Rejected`] on a 422 or a 400
 /// that is not a capacity failure, [`PodError::WatchdogRefused`] when the
@@ -169,11 +171,57 @@ pub async fn provision(
     plan: &PodPlan<'_>,
     record: &mut PodRecord,
 ) -> Result<Provisioned, PodError> {
+    ctx.check()?;
+    let target = resolve_target(ctx.client, plan.target).await?;
+    let plan = &PodPlan {
+        target: &target,
+        ..*plan
+    };
     let result = walk(ctx, plan, record).await;
     if result.is_err() {
         after_failure(ctx, record).await;
     }
     result
+}
+
+/// `target` with its `auto` choices resolved from the Runpod catalog (see
+/// [`resolve`](super::resolve)), logged at info level; a target without any
+/// is returned as it is, without an API call. Both choices are resolved from
+/// the same GPU listing, scoped to `target.gpu_count`: `catalog/datacenters`
+/// is never read for this.
+///
+/// # Errors
+///
+/// Returns [`PodError::NotInStock`] when nothing in stock matches, and
+/// [`PodError::Api`] when the catalog cannot be read.
+pub async fn resolve_target(
+    client: &RunpodClient,
+    target: &RunpodTarget,
+) -> Result<RunpodTarget, PodError> {
+    if !target.gpu_types.is_auto() && !target.data_center_ids.is_auto() {
+        return Ok(target.clone());
+    }
+    let gpus = client.list_gpu_types(target.gpu_count).await?;
+    let resolved = super::resolve(target, &gpus).map_err(PodError::NotInStock)?;
+    log_picks(target, &resolved);
+    Ok(resolved)
+}
+
+/// Logs what the `auto` choices of `target` became in `resolved`.
+fn log_picks(target: &RunpodTarget, resolved: &RunpodTarget) {
+    let picks = [
+        ("gpu_types", &target.gpu_types, &resolved.gpu_types),
+        (
+            "data_center_ids",
+            &target.data_center_ids,
+            &resolved.data_center_ids,
+        ),
+    ];
+    for (field, asked, picked) in picks {
+        if asked.is_auto() {
+            tracing::info!("{field} = \"auto\" picked {picked}");
+        }
+    }
 }
 
 /// After a failed walk: a create call with no clear answer may still produce a
@@ -218,7 +266,7 @@ async fn walk(
 ) -> Result<Provisioned, PodError> {
     let first = record.attempts.len();
     let mut last_detail = None;
-    for gpu in &plan.target.gpu_types {
+    for gpu in plan.target.gpu_types.list() {
         let mut ambiguous = 0;
         loop {
             ctx.check()?;
@@ -391,8 +439,8 @@ fn request(plan: &PodPlan<'_>, keep: bool, attempt: &Attempt) -> CreatePod {
         disk: target.container_disk_gb,
         ports: vec!["22/tcp".to_string()],
         start_ssh: false,
-        data_center_ids: (!target.data_center_ids.is_empty())
-            .then(|| target.data_center_ids.clone()),
+        data_center_ids: (!target.data_center_ids.list().is_empty())
+            .then(|| target.data_center_ids.list().to_vec()),
         mounts: target.network_volume_id.as_ref().map(|volume| Mounts {
             network: vec![NetworkMount {
                 volume_id: volume.clone(),

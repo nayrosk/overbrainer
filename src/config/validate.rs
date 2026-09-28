@@ -1,4 +1,4 @@
-use super::types::{Adapter, Protocol, Runtime, Settings, Target, Training};
+use super::types::{Adapter, ListOrAuto, Protocol, Runtime, Settings, Target, Training};
 
 /// Highest `pipeline.concurrency`: far above what providers allow, and well within
 /// what a semaphore can hold.
@@ -366,6 +366,8 @@ const MIN_BOOT_GRACE_MINUTES: u32 = 5;
 fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) {
     let Target::Runpod {
         gpu_types,
+        min_vram_gb,
+        max_price_per_hour,
         gpu_count,
         image,
         venv,
@@ -380,6 +382,7 @@ fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) 
         return;
     };
     check_gpu_types(name, gpu_types, problems);
+    check_auto_limits(name, gpu_types, *min_vram_gb, *max_price_per_hour, problems);
     let minimums = [
         ("gpu_count", *gpu_count, 1),
         (
@@ -419,9 +422,15 @@ fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) 
     );
 }
 
-/// `gpu_types` holds at least one entry, each non-empty, unique, without a comma
-/// (the env separator) and without a control character.
-fn check_gpu_types(name: &str, gpu_types: &[String], problems: &mut Vec<String>) {
+/// `gpu_types` is `auto`, or holds at least one entry, each non-empty, unique,
+/// without a comma (the env separator) and without a control character.
+fn check_gpu_types(name: &str, gpu_types: &ListOrAuto, problems: &mut Vec<String>) {
+    let ListOrAuto::List(gpu_types) = gpu_types else {
+        return;
+    };
+    if holds_auto(name, "gpu_types", gpu_types, problems) {
+        return;
+    }
     if gpu_types.is_empty() {
         problems.push(format!(
             "targets.{name}.gpu_types: must list at least one GPU type"
@@ -441,14 +450,91 @@ fn check_gpu_types(name: &str, gpu_types: &[String], problems: &mut Vec<String>)
     }
 }
 
-/// Data center IDs use `[A-Z0-9-]` and are unique; a network volume ID uses
-/// `[A-Za-z0-9]` and needs exactly one data center, its own.
+/// A list holding `auto` in any case, which means `field = "auto"` was meant:
+/// one problem, and `true`.
+fn holds_auto(name: &str, field: &str, items: &[String], problems: &mut Vec<String>) -> bool {
+    let found = items
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case(ListOrAuto::AUTO));
+    if found {
+        problems.push(format!(
+            "targets.{name}.{field}: write {field} = \"auto\", not a list holding it"
+        ));
+    }
+    found
+}
+
+/// `min_vram_gb` (at least 1) and `max_price_per_hour` (greater than 0) only
+/// narrow `gpu_types = "auto"`.
+fn check_auto_limits(
+    name: &str,
+    gpu_types: &ListOrAuto,
+    min_vram_gb: Option<u32>,
+    max_price_per_hour: Option<f64>,
+    problems: &mut Vec<String>,
+) {
+    let mut limit = |field: &str, set: bool, valid: bool, bound: &str| {
+        if !set {
+            return;
+        }
+        if !gpu_types.is_auto() {
+            problems.push(format!(
+                "targets.{name}.{field}: only with gpu_types = \"auto\""
+            ));
+        } else if !valid {
+            problems.push(format!("targets.{name}.{field}: must be {bound}"));
+        }
+    };
+    limit(
+        "min_vram_gb",
+        min_vram_gb.is_some(),
+        min_vram_gb.is_some_and(|gb| gb >= 1),
+        "at least 1",
+    );
+    limit(
+        "max_price_per_hour",
+        max_price_per_hour.is_some(),
+        max_price_per_hour.is_some_and(|price| price.is_finite() && price > 0.0),
+        "greater than 0",
+    );
+}
+
+/// Data center IDs are `auto`, or use `[A-Z0-9-]` and are unique; a network
+/// volume ID uses `[A-Za-z0-9]` and needs exactly one data center, its own,
+/// never `auto`.
 fn check_data_centers(
     name: &str,
-    data_center_ids: &[String],
+    data_center_ids: &ListOrAuto,
     network_volume_id: Option<&str>,
     problems: &mut Vec<String>,
 ) {
+    if let ListOrAuto::List(ids) = data_center_ids {
+        check_data_center_ids(name, ids, problems);
+    }
+    let Some(volume) = network_volume_id else {
+        return;
+    };
+    if volume.is_empty() || !volume.chars().all(|c| c.is_ascii_alphanumeric()) {
+        problems.push(format!(
+            "targets.{name}.network_volume_id: must use only letters and digits"
+        ));
+    }
+    if data_center_ids.is_auto() {
+        problems.push(format!(
+            "targets.{name}.data_center_ids: cannot be \"auto\" with network_volume_id: list the volume's data center"
+        ));
+    } else if data_center_ids.list().len() != 1 {
+        problems.push(format!(
+            "targets.{name}.network_volume_id: needs data_center_ids with exactly one entry, the volume's data center"
+        ));
+    }
+}
+
+/// Listed data center IDs use `[A-Z0-9-]` and are unique.
+fn check_data_center_ids(name: &str, data_center_ids: &[String], problems: &mut Vec<String>) {
+    if holds_auto(name, "data_center_ids", data_center_ids, problems) {
+        return;
+    }
     let mut seen = std::collections::BTreeSet::new();
     for id in data_center_ids {
         let valid = !id.is_empty()
@@ -464,19 +550,6 @@ fn check_data_centers(
                 "targets.{name}.data_center_ids: `{id}` is listed twice"
             ));
         }
-    }
-    let Some(volume) = network_volume_id else {
-        return;
-    };
-    if volume.is_empty() || !volume.chars().all(|c| c.is_ascii_alphanumeric()) {
-        problems.push(format!(
-            "targets.{name}.network_volume_id: must use only letters and digits"
-        ));
-    }
-    if data_center_ids.len() != 1 {
-        problems.push(format!(
-            "targets.{name}.network_volume_id: needs data_center_ids with exactly one entry, the volume's data center"
-        ));
     }
 }
 
@@ -746,7 +819,7 @@ mod tests {
                 assert_eq!(*container_disk_gb, 50);
                 assert_eq!(*boot_grace_minutes, 30);
                 assert_eq!(*retrieve_grace_minutes, 60);
-                assert!(data_center_ids.is_empty());
+                assert_eq!(*data_center_ids, ListOrAuto::default());
                 assert_eq!(*network_volume_id, None);
             },
             other => return Err(format!("expected a runpod target, got {other:?}").into()),
@@ -867,6 +940,98 @@ mod tests {
                     .to_string(),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_gpu_types_and_data_centers_are_valid_without_constraints()
+    -> Result<(), config::ConfigError> {
+        let toml = with_runpod("data_center_ids = \"auto\"")
+            .replace("gpu_types = [\"NVIDIA A40\"]", "gpu_types = \"auto\"");
+        let settings = settings(&toml)?;
+        assert_eq!(check(&settings), Vec::<String>::new());
+        assert!(matches!(
+            settings.targets.get("cloud"),
+            Some(Target::Runpod {
+                gpu_types: ListOrAuto::Auto,
+                data_center_ids: ListOrAuto::Auto,
+                min_vram_gb: None,
+                max_price_per_hour: None,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn auto_constraints_are_checked() -> Result<(), config::ConfigError> {
+        let auto = |extra: &str| {
+            with_runpod(extra).replace("gpu_types = [\"NVIDIA A40\"]", "gpu_types = \"auto\"")
+        };
+        let toml = auto("min_vram_gb = 48\nmax_price_per_hour = 1.5");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        let toml = auto("min_vram_gb = 0\nmax_price_per_hour = 0");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "targets.cloud.min_vram_gb: must be at least 1".to_string(),
+                "targets.cloud.max_price_per_hour: must be greater than 0".to_string(),
+            ]
+        );
+        for value in ["-1.0", "nan", "inf"] {
+            let toml = auto(&format!("max_price_per_hour = {value}"));
+            assert_eq!(
+                check(&settings(&toml)?),
+                vec!["targets.cloud.max_price_per_hour: must be greater than 0".to_string()],
+                "{value}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn auto_constraints_need_auto_gpu_types() -> Result<(), config::ConfigError> {
+        let toml = with_runpod("min_vram_gb = 48\nmax_price_per_hour = 1.5");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "targets.cloud.min_vram_gb: only with gpu_types = \"auto\"".to_string(),
+                "targets.cloud.max_price_per_hour: only with gpu_types = \"auto\"".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_inside_a_list_is_refused() -> Result<(), config::ConfigError> {
+        let toml = with_runpod("data_center_ids = [\"AUTO\"]")
+            .replace("gpu_types = [\"NVIDIA A40\"]", "gpu_types = [\"auto\"]");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "targets.cloud.gpu_types: write gpu_types = \"auto\", not a list holding it"
+                    .to_string(),
+                "targets.cloud.data_center_ids: write data_center_ids = \"auto\", not a list holding it"
+                    .to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_data_centers_are_refused_with_a_network_volume() -> Result<(), config::ConfigError> {
+        let toml = with_runpod("network_volume_id = \"abc123\"\ndata_center_ids = \"auto\"");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "targets.cloud.data_center_ids: cannot be \"auto\" with network_volume_id: list the volume's data center"
+                    .to_string()
+            ]
+        );
+        // `auto` GPU types still work on a volume: they are chosen in its data center.
+        let toml = with_runpod("network_volume_id = \"abc123\"\ndata_center_ids = [\"EU-RO-1\"]")
+            .replace("gpu_types = [\"NVIDIA A40\"]", "gpu_types = \"auto\"");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
         Ok(())
     }
 

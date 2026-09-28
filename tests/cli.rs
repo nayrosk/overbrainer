@@ -106,6 +106,34 @@ fn config_check_shows_a_runpod_target_with_its_defaults() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn config_check_shows_auto_runpod_choices() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .success();
+    let toml = std::fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+    let runpod = "[targets.gpu_cloud]\nkind = \"runpod\"\ngpu_types = \"auto\"\ngpu_count = 2\n\
+                  min_vram_gb = 48\nmax_price_per_hour = 1.5\ndata_center_ids = \"auto\"\nmax_hours = 6\n";
+    std::fs::write(
+        dir.path().join("overbrainer.toml"),
+        format!("{toml}\n{runpod}"),
+    )?;
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["config", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "targets.gpu_cloud = runpod 2x [auto] (at least 48 GB, at most $1.5/h per GPU), max 6h, ",
+        ))
+        .stdout(predicate::str::contains("data centers auto, network volume none"));
+    Ok(())
+}
+
+#[test]
 fn a_missing_config_names_its_cause_once() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let output = overbrainer()?

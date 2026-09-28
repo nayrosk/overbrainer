@@ -10,13 +10,20 @@ use std::sync::Arc;
 
 use crossterm::event::KeyCode;
 
-use super::app::{Action, App, Confirm, Effect, Overlay, PAGE, Project, Severity};
+use super::app::{Action, App, Confirm, Effect, Origin, Overlay, PAGE, Picked, Project, Severity};
+use super::catalog::{
+    CatalogKind, DEFAULT_IMAGE, NO_VOLUME, Query, Sizing, cost_hint, gpu_count_hint,
+    volume_data_center,
+};
+use super::follow::NOT_STARTED;
 use super::project::{Addable, Form, Listing, Locks, Pending, ProjectConfig, Shown};
+use super::start::{AUTO_LIMITS, GPU_TYPES};
 use super::tasks::Task;
 use super::widgets::form::{Input, InputOutcome};
+use super::widgets::picker::Choice;
 use crate::config::edit::{Collection, ConfigDoc, FieldPath};
 use crate::config::fields::{FieldKind, FieldValue, TargetKind};
-use crate::config::{CONFIG_FILE, ConfigError, EnvSource, Protocol, is_valid_name};
+use crate::config::{CONFIG_FILE, ConfigError, EnvSource, ListOrAuto, Protocol, is_valid_name};
 
 /// What a confirmed `d` takes out of the pending document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +114,51 @@ fn error_key(mut path: &str, listing: &Listing) -> Option<String> {
     }
 }
 
+/// What Enter on the field `field` of a Runpod target picks from the catalog;
+/// its other fields keep the form.
+fn picked_kind(field: &str) -> Option<CatalogKind> {
+    match field {
+        "gpu_types" => Some(CatalogKind::Gpus),
+        "data_center_ids" => Some(CatalogKind::DataCenters),
+        "network_volume_id" => Some(CatalogKind::Volumes),
+        "image" => Some(CatalogKind::Templates),
+        _ => None,
+    }
+}
+
+/// The value the field `key` of `listing` shows, from the file, the
+/// environment or its default; none when unset.
+fn shown_value(listing: &Listing, key: &str) -> Option<String> {
+    let field = listing.field(listing.find(key)?)?;
+    match &field.shown {
+        Shown::Value(text) | Shown::Default(text) => Some(text.clone()),
+        Shown::Unset | Shown::Set | Shown::VaultRef => None,
+    }
+}
+
+/// The fields of the Runpod target `name` that the hints and the pickers
+/// need, as `listing` shows them.
+fn sizing(listing: &Listing, name: &str) -> Sizing {
+    let value = |field: &str| shown_value(listing, &format!("targets.{name}.{field}"));
+    Sizing {
+        gpu_types: value("gpu_types").unwrap_or_default(),
+        gpu_count: value("gpu_count")
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(1),
+        max_hours: value("max_hours").and_then(|hours| hours.parse().ok()),
+        max_price: value("max_price_per_hour").and_then(|price| price.parse().ok()),
+    }
+}
+
+/// The first of `problems`, with how many more there are.
+fn first_of(problems: &[String]) -> String {
+    let first = problems.first().cloned().unwrap_or_default();
+    match problems.len() {
+        0 | 1 => first,
+        count => format!("{first} (+{} more)", count - 1),
+    }
+}
+
 /// `count` changes, in words.
 fn changes(count: usize) -> String {
     if count == 1 {
@@ -133,7 +185,7 @@ impl App {
     /// A key in the Project view with no form open.
     pub(super) fn on_project_key(&mut self, code: KeyCode) -> Vec<Effect> {
         match code {
-            KeyCode::Enter => self.edit_field(),
+            KeyCode::Enter => return self.edit_field(),
             KeyCode::Char('a') => self.start_adding(),
             KeyCode::Char('d') => self.ask_removal(),
             KeyCode::Char('s') => return self.save_changes(),
@@ -243,38 +295,87 @@ impl App {
         };
         pending.mark(&path, &config.doc);
         self.settle_pending();
+        if let (FieldPath::Target { name, field }, Some(FieldValue::List(_))) = (&path, value)
+            && *field == GPU_TYPES
+        {
+            self.drop_auto_limits(name)?;
+        }
+        Ok(())
+    }
+
+    /// GPU types listed for the target `name`: its `min_vram_gb` and
+    /// `max_price_per_hour`, which go with `auto` only, are unset too, and the
+    /// status line says so.
+    fn drop_auto_limits(&mut self, name: &str) -> Result<(), String> {
+        let mut removed = Vec::new();
+        for field in AUTO_LIMITS {
+            let path = FieldPath::Target {
+                name: name.to_string(),
+                field,
+            };
+            if self.shown_doc().and_then(|doc| doc.get(&path)).is_some() {
+                self.apply(&path, None)?;
+                removed.push(path.to_string());
+            }
+        }
+        if !removed.is_empty() {
+            self.say(
+                Severity::Info,
+                format!(
+                    "{} removed: only with gpu_types = \"auto\"",
+                    removed.join(" and ")
+                ),
+            );
+        }
         Ok(())
     }
 
     /// Enter: toggles a bool, cycles a choice (to unset after the last, when
-    /// the field may be left out), or opens the form on the value; refused on
-    /// a locked, env-only or env-set field.
-    fn edit_field(&mut self) {
+    /// the field may be left out), opens the catalog picker on the GPU types,
+    /// data centers, volume or image of a Runpod target, or opens the form on
+    /// the value (reading the GPU types for the hints of a Runpod target's
+    /// `gpu_count` and `max_hours`); refused on a locked, env-only or env-set
+    /// field.
+    fn edit_field(&mut self) -> Vec<Effect> {
         if self.refuse_change() {
-            return;
+            return Vec::new();
         }
         let listing = self.project_listing();
         let Some(field) = listing.field(self.project_view.selected) else {
-            return;
+            return Vec::new();
         };
         let key = &field.key;
-        if let Some(user) = &field.lock {
-            let said = format!("refused: {key} is used by {user}; read-only until it ends");
-            self.say(Severity::Warn, said);
-            return;
+        if self.refuse_lock(key, field.lock.as_deref()) {
+            return Vec::new();
         }
         if let Some(note) = field.env_note() {
             self.say(Severity::Warn, note);
-            return;
+            return Vec::new();
         }
         let Some(path) = field.path.clone() else {
-            return;
+            return Vec::new();
         };
         let Some(spec) = self.shown_doc().and_then(|doc| doc.spec(&path)) else {
             let said = format!("{key}: not edited here; E opens {CONFIG_FILE}");
             self.say(Severity::Warn, said);
-            return;
+            return Vec::new();
         };
+        let mut effects = Vec::new();
+        if let FieldPath::Target {
+            name,
+            field: name_of,
+        } = &path
+            && self.shown_doc().and_then(|doc| doc.target_kind(name)) == Some(TargetKind::Runpod)
+        {
+            let sizing = sizing(&listing, name);
+            if let Some(kind) = picked_kind(name_of) {
+                let shown = shown_value(&listing, key).unwrap_or_default();
+                return self.open_field_picker(path, kind, &shown, &sizing);
+            }
+            if matches!(*name_of, "gpu_count" | "max_hours") {
+                effects = self.read_gpu_catalog(sizing.gpu_count);
+            }
+        }
         let now = field.shown.text();
         let value = match spec.kind {
             FieldKind::Bool => Some(FieldValue::Bool(now != "true")),
@@ -303,11 +404,180 @@ impl App {
                     input: Input::new(text),
                     error: None,
                 });
-                return;
+                return effects;
             },
         };
         if let Err(error) = self.apply(&path, value.as_ref()) {
             self.say(Severity::Warn, error);
+        }
+        effects
+    }
+
+    /// Opens the picker of `kind` on the Runpod target field `path`, which
+    /// shows `shown`: what it shows is chosen, its target's GPU count and GPU
+    /// types scope the stock.
+    fn open_field_picker(
+        &mut self,
+        path: FieldPath,
+        kind: CatalogKind,
+        shown: &str,
+        sizing: &Sizing,
+    ) -> Vec<Effect> {
+        let preselected = match kind {
+            CatalogKind::Gpus | CatalogKind::DataCenters => {
+                Choice::from(&ListOrAuto::from_form_text(shown))
+            },
+            // Unset: the `none` or `default` entry is the one chosen.
+            CatalogKind::Volumes | CatalogKind::Templates => Choice::List(vec![shown.to_string()]),
+        };
+        let query = Query {
+            kind,
+            gpu_count: sizing.gpu_count,
+            gpu_types: ListOrAuto::from_form_text(&sizing.gpu_types)
+                .list()
+                .to_vec(),
+        };
+        self.open_picker(query, preselected, Origin::Field(path))
+    }
+
+    /// A picker opened on the Runpod target field `path` kept `picked`: it
+    /// becomes a pending edit of that field. `auto` is written as such, an
+    /// empty data center list unsets it (any), a volume sets the target's
+    /// data centers to its own, `none` unsets it and leaves them.
+    pub(super) fn picked_field(&mut self, path: &FieldPath, picked: Picked) {
+        if self.refuse_change() || self.refuse_locked(path) {
+            return;
+        }
+        let ids = match picked.choice {
+            Choice::Auto => {
+                let auto = FieldValue::Text(ListOrAuto::AUTO.to_string());
+                if let Err(error) = self.apply(path, Some(&auto)) {
+                    self.say(Severity::Warn, error);
+                }
+                return;
+            },
+            Choice::List(ids) => ids,
+        };
+        let applied = match (picked.kind, ids.first()) {
+            (CatalogKind::Gpus, None) => Err(format!(
+                "{path}: choose a GPU type or auto; nothing changed"
+            )),
+            (CatalogKind::DataCenters, None) => self.apply(path, None),
+            (CatalogKind::Gpus | CatalogKind::DataCenters, Some(_)) => {
+                self.apply(path, Some(&FieldValue::List(ids)))
+            },
+            (CatalogKind::Volumes | CatalogKind::Templates, None) => Ok(()),
+            (CatalogKind::Volumes, Some(id)) if id == NO_VOLUME => self.apply(path, None),
+            (CatalogKind::Volumes, Some(id)) => self.picked_volume(path, id, &picked.entries),
+            (CatalogKind::Templates, Some(image)) if image == DEFAULT_IMAGE => {
+                self.apply(path, None)
+            },
+            (CatalogKind::Templates, Some(image)) => {
+                self.apply(path, Some(&FieldValue::Text(image.clone())))
+            },
+        };
+        if let Err(error) = applied {
+            self.say(Severity::Warn, error);
+        }
+    }
+
+    /// Refuses a change of the field `path` while something uses it, as the
+    /// form does.
+    fn refuse_locked(&mut self, path: &FieldPath) -> bool {
+        let key = path.to_string();
+        let listing = self.project_listing();
+        let lock = listing
+            .find(&key)
+            .and_then(|index| listing.field(index))
+            .and_then(|field| field.lock.clone());
+        self.refuse_lock(&key, lock.as_deref())
+    }
+
+    /// Refuses a change of the field `key` when `lock` names what uses it.
+    fn refuse_lock(&mut self, key: &str, lock: Option<&str>) -> bool {
+        let Some(user) = lock else {
+            return false;
+        };
+        let said = format!("refused: {key} is used by {user}; read-only until it ends");
+        self.say(Severity::Warn, said);
+        true
+    }
+
+    /// `t` in a picker opened on the field `path`: the form opens on its value
+    /// instead.
+    pub(super) fn type_field(&mut self, path: &FieldPath) {
+        if self.refuse_change() || self.refuse_locked(path) {
+            return;
+        }
+        let Some(spec) = self.shown_doc().and_then(|doc| doc.spec(path)) else {
+            return;
+        };
+        let listing = self.project_listing();
+        let text = shown_value(&listing, &path.to_string()).unwrap_or_default();
+        self.project_view.form = Some(Form::Value {
+            path: path.clone(),
+            kind: spec.kind,
+            optional: spec.optional,
+            input: Input::new(text),
+            error: None,
+        });
+    }
+
+    /// The volume `id` picked for the field `path`: it is set, and its
+    /// target's data centers become the volume's, when `entries` says which;
+    /// both or neither.
+    fn picked_volume(
+        &mut self,
+        path: &FieldPath,
+        id: &str,
+        entries: &[super::widgets::picker::Entry],
+    ) -> Result<(), String> {
+        let center = entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(volume_data_center)
+            .map(str::to_string);
+        let before = self.project_view.pending.clone();
+        let applied = self.apply(path, Some(&FieldValue::Text(id.to_string())));
+        let (FieldPath::Target { name, .. }, Some(center), Ok(())) = (path, center, &applied)
+        else {
+            return applied;
+        };
+        let centers = FieldPath::Target {
+            name: name.clone(),
+            field: "data_center_ids",
+        };
+        if let Err(error) = self.apply(&centers, Some(&FieldValue::List(vec![center.clone()]))) {
+            self.project_view.pending = before;
+            self.settle_pending();
+            return Err(error);
+        }
+        self.say(
+            Severity::Info,
+            format!("{centers} = {center}, the volume's data center"),
+        );
+        Ok(())
+    }
+
+    /// What the selected field's hint adds, from the GPU types read last: the
+    /// most GPUs per pod for a Runpod target's `gpu_count`, the most the run
+    /// can cost for its `max_hours`.
+    pub(super) fn field_hint(&mut self) -> Option<String> {
+        self.gpu_catalog.as_ref()?;
+        let listing = self.project_listing();
+        let field = listing.field(self.project_view.selected)?;
+        let Some(FieldPath::Target { name, field: key }) = &field.path else {
+            return None;
+        };
+        if self.shown_doc()?.target_kind(name) != Some(TargetKind::Runpod) {
+            return None;
+        }
+        let gpus = self.gpu_catalog.as_deref()?;
+        let sizing = sizing(&listing, name);
+        match *key {
+            "gpu_count" => gpu_count_hint(gpus, &sizing),
+            "max_hours" => cost_hint(gpus, &sizing),
+            _ => None,
         }
     }
 
@@ -655,12 +925,14 @@ impl App {
     }
 
     /// The save ended: the app reads the configuration written, or each
-    /// problem is shown on the field it names and nothing changed.
+    /// problem is shown on the field it names and nothing changed. A save of
+    /// the choices made at start then starts the run, or says why it does not.
     pub(super) fn config_saved(
         &mut self,
         saved: Result<Box<ProjectConfig>, SaveRefusal>,
     ) -> Vec<Effect> {
         self.project_view.save = None;
+        let start = self.start_after_save.take();
         let mut effects = Vec::new();
         match saved {
             Ok(config) => {
@@ -674,15 +946,36 @@ impl App {
                 }
                 self.say(Severity::Info, format!("✓ saved {CONFIG_FILE}"));
                 effects = self.reload();
+                match start {
+                    Some(_) if self.leaving.is_some() => {
+                        self.exit_notes.push(NOT_STARTED.to_string());
+                    },
+                    Some(plan) => effects.extend(self.started_after_save(&plan)),
+                    None => {},
+                }
+            },
+            Err(refusal) if start.is_some() => {
+                // The file keeps its values: the Project view marks nothing.
+                let why = match refusal {
+                    SaveRefusal::Invalid(problems) => first_of(&problems),
+                    SaveRefusal::Failed(error) => error,
+                };
+                if self.leaving.is_some() {
+                    self.exit_notes.push(format!(
+                        "a new training run was not started: {CONFIG_FILE} not saved: {why}"
+                    ));
+                }
+                self.say(
+                    Severity::Error,
+                    format!("run not started: {CONFIG_FILE} not saved: {why}"),
+                );
             },
             Err(SaveRefusal::Invalid(problems)) => {
                 self.mark_errors(&problems);
-                let first = problems.first().cloned().unwrap_or_default();
-                let more = match problems.len() {
-                    0 | 1 => String::new(),
-                    count => format!(" (+{} more)", count - 1),
-                };
-                self.say(Severity::Error, format!("not saved: {first}{more}"));
+                self.say(
+                    Severity::Error,
+                    format!("not saved: {}", first_of(&problems)),
+                );
             },
             Err(SaveRefusal::Failed(error)) => {
                 self.say(Severity::Error, format!("not saved: {error}"));
@@ -868,11 +1161,15 @@ mod tests {
 
     use super::*;
     use crate::cli::data::Command;
+    use crate::runpod::{GpuType, NetworkVolume, Template};
     use crate::tui::app::View;
+    use crate::tui::catalog::{Listed, template_entries, volume_entries};
     use crate::tui::snapshots::{
         PROJECT_CONFIG, draw, key, project_app, project_env, text as screen,
     };
+    use crate::tui::snapshots::{gpu_catalog, gpu_types};
     use crate::tui::tasks::{Done, TaskId};
+    use crate::tui::widgets::picker::Entry;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1028,7 +1325,10 @@ mod tests {
             marked.error.as_deref(),
             Some("roles.generator.reasoning_effort: requires reasoning = true")
         );
-        assert_eq!(marked.detail(), marked.error.clone().unwrap_or_default());
+        assert_eq!(
+            marked.detail(None),
+            marked.error.clone().unwrap_or_default()
+        );
         assert_eq!(
             app.project_listing()
                 .field(app.project_view.selected)
@@ -1634,6 +1934,540 @@ mod tests {
             "refused: run 20260921-a1 uses the training table; E edits the whole file"
         );
         Ok(())
+    }
+
+    /// Enter on the field `key`: the catalog listing it spawns, and the query.
+    fn open_picker_on(app: &mut App, key: &str) -> Result<(TaskId, Query), String> {
+        select(app, key)?;
+        let effects = press(app, &[KeyCode::Enter]);
+        match effects.as_slice() {
+            [Effect::Spawn(id, Task::Catalog(query))] => Ok((*id, query.clone())),
+            _ => Err(format!("no listing: {effects:?} ({})", status(app))),
+        }
+    }
+
+    /// The picker open lists `entries` (and `gpus`), read by `id`.
+    fn listed(app: &mut App, id: TaskId, entries: Vec<Entry>, gpus: Vec<GpuType>) {
+        app.on_done(id, Ok(Done::Catalog(Ok(Listed { entries, gpus }))));
+    }
+
+    fn shown(app: &mut App, key: &str) -> Result<String, String> {
+        Ok(field(app, key)?.shown.text().to_string())
+    }
+
+    fn picker_open(app: &App) -> bool {
+        matches!(app.overlay, Some(Overlay::Picker(_)))
+    }
+
+    #[test]
+    fn picking_gpus_writes_an_ordered_list_to_the_pending_document() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        let (id, query) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        assert_eq!(
+            query,
+            Query {
+                kind: CatalogKind::Gpus,
+                gpu_count: 1,
+                gpu_types: vec!["NVIDIA A40".into()],
+            }
+        );
+        assert!(picker_open(&app));
+        listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
+        // The cursor is on A40, chosen; the RTX 2000 under it is chosen, then
+        // moved before A40.
+        press(
+            &mut app,
+            &[
+                KeyCode::Down,
+                KeyCode::Char(' '),
+                KeyCode::Char('K'),
+                KeyCode::Enter,
+            ],
+        );
+        assert!(!picker_open(&app));
+        let gpus = field(&mut app, "targets.gpu_cloud.gpu_types")?;
+        assert!(gpus.changed, "a pending change");
+        assert_eq!(
+            gpus.shown.text(),
+            "NVIDIA RTX 2000 Ada Generation, NVIDIA A40"
+        );
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "nothing written yet");
+        save(&mut app, dir.path())?;
+        let text = written(dir.path())?;
+        assert!(
+            text.contains(r#"gpu_types = ["NVIDIA RTX 2000 Ada Generation", "NVIDIA A40"]"#),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_is_offered_at_the_top_of_the_gpu_and_data_center_pickers() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
+        press(
+            &mut app,
+            &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        assert_eq!(shown(&mut app, "targets.gpu_cloud.gpu_types")?, "auto");
+        let (id, query) = open_picker_on(&mut app, "targets.gpu_cloud.data_center_ids")?;
+        assert_eq!(query.kind, CatalogKind::DataCenters);
+        assert!(query.gpu_types.is_empty(), "auto GPUs: any GPU's stock");
+        let center = |id: &str| Entry {
+            id: id.into(),
+            columns: vec![id.into(), String::new(), String::new(), "1 GPU type".into()],
+            selectable: true,
+        };
+        listed(
+            &mut app,
+            id,
+            vec![center("EU-RO-1"), center("US-KS-2")],
+            Vec::new(),
+        );
+        press(
+            &mut app,
+            &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "auto"
+        );
+        // Opened again: auto is chosen; choosing a data center takes it out.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.data_center_ids")?;
+        listed(
+            &mut app,
+            id,
+            vec![center("EU-RO-1"), center("US-KS-2")],
+            Vec::new(),
+        );
+        press(
+            &mut app,
+            &[KeyCode::End, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "US-KS-2"
+        );
+        // Nothing chosen: any data center, the field unset.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.data_center_ids")?;
+        listed(
+            &mut app,
+            id,
+            vec![center("EU-RO-1"), center("US-KS-2")],
+            Vec::new(),
+        );
+        press(&mut app, &[KeyCode::Char(' '), KeyCode::Enter]);
+        assert_eq!(
+            field(&mut app, "targets.gpu_cloud.data_center_ids")?.shown,
+            Shown::Unset
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_data_center_picker_asks_the_stock_of_the_chosen_gpus() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        set(&mut app, "targets.gpu_cloud.gpu_count", "2")?;
+        let (_, query) = open_picker_on(&mut app, "targets.gpu_cloud.data_center_ids")?;
+        assert_eq!(
+            query,
+            Query {
+                kind: CatalogKind::DataCenters,
+                gpu_count: 2,
+                gpu_types: vec!["NVIDIA A40".into()],
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_gpu_type_chosen_changes_nothing() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
+        press(&mut app, &[KeyCode::Char(' '), KeyCode::Enter]);
+        assert!(app.project_view.pending.is_none());
+        assert_eq!(
+            status(&app),
+            "targets.gpu_cloud.gpu_types: choose a GPU type or auto; nothing changed"
+        );
+        Ok(())
+    }
+
+    fn volumes() -> Vec<Entry> {
+        volume_entries(&[
+            NetworkVolume {
+                id: "vol-eu".into(),
+                name: "alpha".into(),
+                size: 100,
+                data_center: "EU-RO-1".into(),
+            },
+            NetworkVolume {
+                id: "vol-us".into(),
+                name: "zeta".into(),
+                size: 50,
+                data_center: "US-KS-2".into(),
+            },
+        ])
+    }
+
+    #[test]
+    fn picking_a_volume_sets_it_and_its_single_data_center() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let centers = FieldPath::Target {
+            name: "gpu_cloud".into(),
+            field: "data_center_ids",
+        };
+        let two = FieldValue::List(vec!["US-KS-2".into(), "CA-MTL-1".into()]);
+        app.apply(&centers, Some(&two))?;
+        let (id, query) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        assert_eq!(query.kind, CatalogKind::Volumes);
+        listed(&mut app, id, volumes(), Vec::new());
+        // none, alpha, zeta: alpha is picked.
+        press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.network_volume_id")?,
+            "vol-eu"
+        );
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "EU-RO-1"
+        );
+        assert_eq!(
+            status(&app),
+            "targets.gpu_cloud.data_center_ids = EU-RO-1, the volume's data center"
+        );
+        // none unsets the volume and leaves the data centers.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        press(&mut app, &[KeyCode::Home, KeyCode::Enter]);
+        assert_eq!(
+            field(&mut app, "targets.gpu_cloud.network_volume_id")?.shown,
+            Shown::Unset
+        );
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "EU-RO-1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn picking_a_template_sets_its_image_and_esc_keeps_the_value() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let templates = template_entries(&[Template {
+            id: "t1".into(),
+            name: "trainer".into(),
+            image: "img/trainer:2".into(),
+            serverless: false,
+        }]);
+        let (id, query) = open_picker_on(&mut app, "targets.gpu_cloud.image")?;
+        assert_eq!(query.kind, CatalogKind::Templates);
+        listed(&mut app, id, templates.clone(), Vec::new());
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.project_view.pending.is_none(), "Esc keeps the image");
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.image")?;
+        listed(&mut app, id, templates, Vec::new());
+        press(&mut app, &[KeyCode::End, KeyCode::Enter]);
+        assert_eq!(shown(&mut app, "targets.gpu_cloud.image")?, "img/trainer:2");
+        Ok(())
+    }
+
+    #[test]
+    fn a_locked_field_refuses_the_picker_like_the_form() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let mut follow =
+            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, "20260921-a1");
+        follow.watching = true;
+        app.training.tasks.insert(TaskId(9), follow);
+        select(&mut app, "targets.gpu_cloud.gpu_types")?;
+        assert!(press(&mut app, &[KeyCode::Enter]).is_empty());
+        assert!(!picker_open(&app));
+        assert_eq!(
+            status(&app),
+            "refused: targets.gpu_cloud.gpu_types is used by run 20260921-a1; \
+             read-only until it ends"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn other_runpod_fields_keep_the_form_with_catalog_hints() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        select(&mut app, "targets.gpu_cloud.gpu_count")?;
+        let effects = press(&mut app, &[KeyCode::Enter]);
+        let [Effect::Spawn(id, Task::Catalog(query))] = effects.as_slice() else {
+            return Err(format!("no GPU listing: {effects:?}").into());
+        };
+        assert_eq!(query.kind, CatalogKind::Gpus);
+        assert!(matches!(app.project_view.form, Some(Form::Value { .. })));
+        assert_eq!(app.field_hint(), None, "not read yet");
+        let id = *id;
+        listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
+        assert!(!picker_open(&app), "a hint's listing opens nothing");
+        assert_eq!(
+            app.field_hint().as_deref(),
+            Some("at most 10 with the chosen types")
+        );
+        let rows = screen(&draw(&mut app, 120, 40)?).join("\n");
+        assert!(rows.contains("at most 10 with the chosen types"), "{rows}");
+        press(&mut app, &[KeyCode::Esc]);
+        select(&mut app, "targets.gpu_cloud.max_hours")?;
+        assert!(press(&mut app, &[KeyCode::Enter]).is_empty(), "read once");
+        press(&mut app, &[KeyCode::Esc]);
+        assert_eq!(
+            app.field_hint().as_deref(),
+            Some("at most $2.40 at the chosen prices (1 × $0.40/h × 6 h)")
+        );
+        let rows = screen(&draw(&mut app, 120, 40)?).join("\n");
+        assert!(
+            rows.contains("at most $2.40 at the chosen prices"),
+            "{rows}"
+        );
+        select(&mut app, "targets.gpu_cloud.container_disk_gb")?;
+        assert_eq!(app.field_hint(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_fields_of_other_targets_keep_the_form() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        press(
+            &mut app,
+            &[KeyCode::Char('a'), KeyCode::Right, KeyCode::Right],
+        );
+        press(&mut app, &[KeyCode::Enter]);
+        chars(&mut app, "box");
+        press(&mut app, &[KeyCode::Enter, KeyCode::Enter]);
+        select(&mut app, "targets.box.image")?;
+        assert!(press(&mut app, &[KeyCode::Enter]).is_empty());
+        assert!(!picker_open(&app));
+        assert!(matches!(app.project_view.form, Some(Form::Value { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn t_in_a_picker_types_the_value_in_the_form_instead() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        // While the catalog is read, and for each of the four fields.
+        for (key, now) in [
+            ("targets.gpu_cloud.gpu_types", "NVIDIA A40"),
+            ("targets.gpu_cloud.data_center_ids", ""),
+            ("targets.gpu_cloud.network_volume_id", ""),
+            ("targets.gpu_cloud.image", ""),
+        ] {
+            open_picker_on(&mut app, key)?;
+            press(&mut app, &[KeyCode::Char('t')]);
+            assert!(!picker_open(&app), "{key}");
+            let Some(Form::Value { path, input, .. }) = &app.project_view.form else {
+                return Err(format!("no form on {key}").into());
+            };
+            assert_eq!(path.to_string(), key);
+            assert_eq!(input.text(), now, "{key}");
+            press(&mut app, &[KeyCode::Esc]);
+        }
+        // A failed listing still lets the value be typed.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        app.on_done(id, Ok(Done::Catalog(Err("no Runpod API key".into()))));
+        press(&mut app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        chars(&mut app, "auto");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.project_view.form, None);
+        assert_eq!(shown(&mut app, "targets.gpu_cloud.gpu_types")?, "auto");
+        open_picker_on(&mut app, "targets.gpu_cloud.data_center_ids")?;
+        press(&mut app, &[KeyCode::Char('t')]);
+        chars(&mut app, "EU-RO-1, US-KS-2");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "EU-RO-1, US-KS-2"
+        );
+        save(&mut app, dir.path())?;
+        let text = written(dir.path())?;
+        assert!(text.contains(r#"gpu_types = "auto""#), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn auto_picked_is_saved_as_a_string() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
+        press(
+            &mut app,
+            &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        save(&mut app, dir.path())?;
+        assert_eq!(status(&app), "✓ saved overbrainer.toml");
+        let text = written(dir.path())?;
+        assert!(text.contains(r#"gpu_types = "auto""#), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_default_row_of_the_template_picker_unsets_the_image() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let templates = template_entries(&[Template {
+            id: "t1".into(),
+            name: "trainer".into(),
+            image: "img/trainer:2".into(),
+            serverless: false,
+        }]);
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.image")?;
+        listed(&mut app, id, templates.clone(), Vec::new());
+        press(&mut app, &[KeyCode::End, KeyCode::Enter]);
+        assert_eq!(shown(&mut app, "targets.gpu_cloud.image")?, "img/trainer:2");
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.image")?;
+        listed(&mut app, id, templates, Vec::new());
+        press(&mut app, &[KeyCode::Home, KeyCode::Enter]);
+        assert_eq!(
+            field(&mut app, "targets.gpu_cloud.image")?.shown,
+            Shown::Unset,
+            "the pinned default applies"
+        );
+        assert!(app.project_view.pending.is_none(), "back to the file");
+        Ok(())
+    }
+
+    #[test]
+    fn a_lock_taken_while_the_picker_is_open_refuses_the_choice() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
+        let mut follow =
+            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, "20260921-a1");
+        follow.watching = true;
+        app.training.tasks.insert(TaskId(9), follow);
+        press(
+            &mut app,
+            &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        assert!(app.project_view.pending.is_none());
+        assert_eq!(
+            status(&app),
+            "refused: targets.gpu_cloud.gpu_types is used by run 20260921-a1; \
+             read-only until it ends"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_env_set_picker_field_refuses_enter() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let EnvSource::Vars(mut vars) = project_env() else {
+            return Err("vars expected".into());
+        };
+        vars.push((
+            "OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES".into(),
+            "NVIDIA L4".into(),
+        ));
+        app.env = EnvSource::Vars(vars);
+        let config = ProjectConfig::new(PROJECT_CONFIG, &app.env)?;
+        app.set_config(config);
+        select(&mut app, "targets.gpu_cloud.gpu_types")?;
+        assert!(press(&mut app, &[KeyCode::Enter]).is_empty());
+        assert!(!picker_open(&app));
+        assert_eq!(
+            status(&app),
+            "targets.gpu_cloud.gpu_types: set by OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES, \
+             change it in .env"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_volume_the_catalog_does_not_list_leaves_the_data_centers() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let path = FieldPath::Target {
+            name: "gpu_cloud".into(),
+            field: "network_volume_id",
+        };
+        app.apply(&path, Some(&FieldValue::Text("vol-gone".into())))?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        // none, alpha, zeta, then vol-gone, kept in view: picked again.
+        press(&mut app, &[KeyCode::End, KeyCode::Enter]);
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.network_volume_id")?,
+            "vol-gone"
+        );
+        assert_eq!(
+            field(&mut app, "targets.gpu_cloud.data_center_ids")?.shown,
+            Shown::Unset
+        );
+        Ok(())
+    }
+
+    /// [`editing_app`] on `gpu_types = "auto"` with both limits.
+    fn auto_limits_app() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
+        let (dir, mut app) = editing_app()?;
+        let config = PROJECT_CONFIG.replace(
+            "gpu_types = [\"NVIDIA A40\"]",
+            "gpu_types = \"auto\"\nmin_vram_gb = 24\nmax_price_per_hour = 1.5",
+        );
+        std::fs::write(dir.path().join(CONFIG_FILE), &config)?;
+        app.set_config(ProjectConfig::new(&config, &app.env)?);
+        Ok((dir, app))
+    }
+
+    /// Both `auto` limits are unset and marked changed, the status says so,
+    /// and `s` writes a file without them.
+    fn limits_dropped(app: &mut App, dir: &Path) -> TestResult {
+        for key in [
+            "targets.gpu_cloud.min_vram_gb",
+            "targets.gpu_cloud.max_price_per_hour",
+        ] {
+            let limit = field(app, key)?;
+            assert!(limit.changed, "{key} marked");
+            assert_eq!(limit.shown, Shown::Unset, "{key}");
+        }
+        assert_eq!(
+            status(app),
+            "targets.gpu_cloud.min_vram_gb and targets.gpu_cloud.max_price_per_hour removed: \
+             only with gpu_types = \"auto\""
+        );
+        save(app, dir)?;
+        let text = written(dir)?;
+        assert!(text.contains(r#"gpu_types = ["NVIDIA A40"]"#), "{text}");
+        assert!(!text.contains("min_vram_gb") && !text.contains("max_price_per_hour"));
+        assert_eq!(status(app), "✓ saved overbrainer.toml");
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_types_picked_as_a_list_drop_the_auto_limits() -> TestResult {
+        let (dir, mut app) = auto_limits_app()?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
+        // The A40, second cheapest, alone.
+        press(
+            &mut app,
+            &[
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Char(' '),
+                KeyCode::Enter,
+            ],
+        );
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.gpu_types")?,
+            "NVIDIA A40"
+        );
+        limits_dropped(&mut app, dir.path())
+    }
+
+    #[test]
+    fn gpu_types_typed_as_a_list_drop_the_auto_limits() -> TestResult {
+        let (dir, mut app) = auto_limits_app()?;
+        select(&mut app, "targets.gpu_cloud.gpu_types")?;
+        press(&mut app, &[KeyCode::Enter, KeyCode::Char('t')]);
+        press(&mut app, &[KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 10]);
+        chars(&mut app, "NVIDIA A40");
+        press(&mut app, &[KeyCode::Enter]);
+        limits_dropped(&mut app, dir.path())
     }
 
     #[test]
