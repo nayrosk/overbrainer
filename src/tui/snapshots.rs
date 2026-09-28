@@ -467,7 +467,12 @@ pub(super) fn series() -> Vec<crate::train::TrainMetric> {
 pub(super) fn gpu_catalog(
     gpu_count: u32,
 ) -> Result<Vec<super::widgets::picker::Entry>, serde_json::Error> {
-    let gpus: Vec<crate::runpod::GpuType> = serde_json::from_value(serde_json::json!([
+    Ok(super::catalog::gpu_entries(&gpu_types()?, gpu_count))
+}
+
+/// The fixture GPU catalog as listed.
+pub(super) fn gpu_types() -> Result<Vec<crate::runpod::GpuType>, serde_json::Error> {
+    serde_json::from_value(serde_json::json!([
         {"id": "NVIDIA A40", "memory": 48, "price": {"secure": 0.4},
          "maxCount": {"secure": 10}, "availability": "HIGH"},
         {"id": "NVIDIA GeForce RTX 4090", "memory": 24, "price": {"secure": 0.69},
@@ -487,8 +492,15 @@ pub(super) fn gpu_catalog(
         {"id": "AMD Instinct MI300X OAM", "memory": 192, "price": {"secure": 2.49},
          "maxCount": {"secure": 8}, "availability": "NONE"},
         {"id": "NVIDIA H200", "memory": 141, "maxCount": {"secure": 8}}
-    ]))?;
-    Ok(super::catalog::gpu_entries(&gpus, gpu_count))
+    ]))
+}
+
+/// A listing of `entries` only, as a picker of volumes or templates reads it.
+fn listed(entries: Vec<super::widgets::picker::Entry>) -> super::catalog::Listed {
+    super::catalog::Listed {
+        entries,
+        gpus: Vec::new(),
+    }
 }
 
 /// A key press.
@@ -992,7 +1004,17 @@ fn picker_app(
 ) -> Result<(App, TaskId), Box<dyn std::error::Error>> {
     let mut app = app();
     let chosen = chosen.iter().map(|id| (*id).to_string()).collect();
-    let effects = app.open_picker(kind, 2, super::widgets::picker::Choice::List(chosen));
+    let query = super::catalog::Query {
+        kind,
+        gpu_count: 2,
+        gpu_types: Vec::new(),
+    };
+    let origin = super::app::Origin::Field(crate::config::edit::FieldPath::Target {
+        name: "gpu_cloud".into(),
+        field: "gpu_types",
+    });
+    let choice = super::widgets::picker::Choice::List(chosen);
+    let effects = app.open_picker(query, choice, origin);
     match effects.as_slice() {
         [Effect::Spawn(id, _)] => Ok((app, *id)),
         _ => Err(format!("{effects:?}").into()),
@@ -1011,7 +1033,7 @@ fn the_gpu_picker_on_a_fixture_catalog() -> TestResult {
             .any(|row| row.contains("reading the Runpod catalog")),
         "{rows:#?}"
     );
-    app.on_done(id, Ok(Done::Catalog(Ok(gpu_catalog(2)?))));
+    app.on_done(id, Ok(Done::Catalog(Ok(listed(gpu_catalog(2)?)))));
     app.on_input(&key(KeyCode::Down));
     app.on_input(&key(KeyCode::Down));
     snapshot("picker_gpus", &mut app)?;
@@ -1021,7 +1043,7 @@ fn the_gpu_picker_on_a_fixture_catalog() -> TestResult {
 #[test]
 fn a_picker_filtered_while_typed() -> TestResult {
     let (mut app, id) = picker_app(super::catalog::CatalogKind::Gpus, &[])?;
-    app.on_done(id, Ok(Done::Catalog(Ok(gpu_catalog(2)?))));
+    app.on_done(id, Ok(Done::Catalog(Ok(listed(gpu_catalog(2)?)))));
     for c in "/h1".chars() {
         app.on_input(&key(KeyCode::Char(c)));
     }

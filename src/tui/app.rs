@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tracing::Level;
 
-use super::catalog::CatalogKind;
+use super::catalog::{CatalogKind, Listed, Query};
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
 use super::editor::{self, Session, Target};
 use super::follow::REFRESH;
@@ -27,6 +27,7 @@ use super::widgets::form::{Input, InputOutcome};
 use super::widgets::picker::{Choice, Entry, Picker, PickerOutcome};
 use crate::cli::data::Command;
 use crate::cli::front::Report;
+use crate::config::edit::FieldPath;
 use crate::config::{EnvSource, Settings};
 use crate::dataset::{AnswerText, Counts, Dataset, Deletion, Id};
 use crate::logging::LogBuffer;
@@ -197,11 +198,21 @@ pub(super) enum Overlay {
     Picker(Box<Picking>),
 }
 
+/// What opened a picker, which its kept choice goes back to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Origin {
+    /// Enter on this field of the Project view: the choice becomes a pending
+    /// edit of it.
+    Field(FieldPath),
+}
+
 /// A picker open over the view, and the listing that fills it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Picking {
     /// What it lists.
     pub(super) kind: CatalogKind,
+    /// What opened it.
+    pub(super) origin: Origin,
     /// The task reading its entries; a result of any other is ignored.
     pub(super) task: TaskId,
     /// Its state.
@@ -215,6 +226,8 @@ pub(super) struct Picked {
     pub(super) kind: CatalogKind,
     /// What was kept.
     pub(super) choice: Choice,
+    /// The entries of the IDs kept, as listed.
+    pub(super) entries: Vec<Entry>,
 }
 
 /// The entries of the `r` menu: every pipeline command, all topics, no `--force`.
@@ -403,8 +416,12 @@ pub(super) struct App {
     /// The task looking up list prices, if any; an earlier one's result is
     /// ignored.
     pub(super) prices: Option<TaskId>,
-    /// The last choice kept in a picker, for what opened it.
-    pub(super) picked: Option<Picked>,
+    /// The catalog listings running, a picker's or a hint's: their failure
+    /// shows in their picker, if still open, and nowhere else.
+    catalog_reads: Vec<TaskId>,
+    /// The GPU types a catalog listing read last, for the hints of the Runpod
+    /// target fields.
+    pub(super) gpu_catalog: Option<Vec<crate::runpod::GpuType>>,
     /// The release on crates.io, when newer than the one running.
     pub(super) newer: Option<String>,
     /// Lines printed on stderr once the terminal is restored.
@@ -466,7 +483,8 @@ impl App {
             refreshed: Self::never(),
             prepare: None,
             prices: None,
-            picked: None,
+            catalog_reads: Vec::new(),
+            gpu_catalog: None,
             newer: None,
             exit_notes: Vec::new(),
             leaving_notes: Vec::new(),
@@ -628,8 +646,8 @@ impl App {
             Ok(Done::ConfigSaved(saved)) if self.project_view.save == Some(id) => {
                 self.config_saved(saved)
             },
-            Ok(Done::Catalog(entries)) => {
-                self.listed_catalog(id, entries);
+            Ok(Done::Catalog(listed)) => {
+                self.listed_catalog(id, listed);
                 Vec::new()
             },
             Ok(Done::Prepared(_) | Done::Prices(_) | Done::ConfigSaved(_)) => Vec::new(),
@@ -706,7 +724,7 @@ impl App {
             self.priced(&Vec::new());
             return Vec::new();
         }
-        if self.picking(id) {
+        if self.catalog_reads.contains(&id) {
             self.listed_catalog(id, Err(error));
             return Vec::new();
         }
@@ -829,32 +847,57 @@ impl App {
         self.pipeline_task == Some(id) || self.pipeline_last == Some(id)
     }
 
-    /// Opens the picker of `kind` over the view, `preselected` chosen, and
-    /// reads its entries in the background, GPU stock for `gpu_count` GPUs;
-    /// what it keeps goes to [`App::picked`].
+    /// Opens the picker `query` asks for over the view, `preselected` chosen,
+    /// and reads its entries in the background; what it keeps goes back to
+    /// `origin`.
     pub(super) fn open_picker(
         &mut self,
-        kind: CatalogKind,
-        gpu_count: u32,
+        query: Query,
         preselected: Choice,
+        origin: Origin,
     ) -> Vec<Effect> {
+        let kind = query.kind;
         let task = self.task_id();
         self.overlay = Some(Overlay::Picker(Box::new(Picking {
             kind,
+            origin,
             task,
             picker: Picker::new(kind.spec(), preselected),
         })));
-        vec![Effect::Spawn(task, Task::Catalog { kind, gpu_count })]
+        self.catalog_reads.push(task);
+        vec![Effect::Spawn(task, Task::Catalog(query))]
     }
 
-    /// Whether task `id` reads the entries of the picker open.
-    fn picking(&self, id: TaskId) -> bool {
-        matches!(&self.overlay, Some(Overlay::Picker(picking)) if picking.task == id)
+    /// Reads the GPU types for the field hints in the background, unless they
+    /// were read or are being read.
+    pub(super) fn read_gpu_catalog(&mut self, gpu_count: u32) -> Vec<Effect> {
+        if self.gpu_catalog.is_some() || !self.catalog_reads.is_empty() {
+            return Vec::new();
+        }
+        let task = self.task_id();
+        self.catalog_reads.push(task);
+        let query = Query {
+            kind: CatalogKind::Gpus,
+            gpu_count,
+            gpu_types: Vec::new(),
+        };
+        vec![Effect::Spawn(task, Task::Catalog(query))]
     }
 
-    /// Listing `id` read `entries`: shown when it fills the picker open, else
-    /// ignored (that picker was closed).
-    fn listed_catalog(&mut self, id: TaskId, entries: Result<Vec<Entry>, String>) {
+    /// Listing `id` read `listed`: its GPU types kept for the hints, its
+    /// entries shown when it fills the picker open. Its failure shows in that
+    /// picker only: once the picker is closed, nothing is said.
+    fn listed_catalog(&mut self, id: TaskId, listed: Result<Listed, String>) {
+        let Some(at) = self.catalog_reads.iter().position(|read| *read == id) else {
+            return;
+        };
+        self.catalog_reads.remove(at);
+        let entries = listed.map(|listed| {
+            if !listed.gpus.is_empty() {
+                self.gpu_catalog = Some(listed.gpus);
+            }
+            listed.entries
+        });
         if let Some(Overlay::Picker(picking)) = &mut self.overlay
             && picking.task == id
         {
@@ -862,9 +905,11 @@ impl App {
         }
     }
 
-    /// A picker kept `picked`: noted for what opened it.
-    fn picked(&mut self, picked: Picked) -> Vec<Effect> {
-        self.picked = Some(picked);
+    /// A picker opened from `origin` kept `picked`: it goes back there.
+    fn picked(&mut self, origin: Origin, picked: Picked) -> Vec<Effect> {
+        match origin {
+            Origin::Field(path) => self.picked_field(&path, picked),
+        }
         Vec::new()
     }
 
@@ -1098,7 +1143,6 @@ impl App {
             if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
                 return Vec::new();
             }
-            let kind = picking.kind;
             return match picking.picker.on_key(key.code) {
                 PickerOutcome::Open => Vec::new(),
                 PickerOutcome::Cancelled => {
@@ -1106,8 +1150,21 @@ impl App {
                     Vec::new()
                 },
                 PickerOutcome::Kept(choice) => {
+                    let entries = match &choice {
+                        Choice::Auto => Vec::new(),
+                        Choice::List(ids) => ids
+                            .iter()
+                            .filter_map(|id| picking.picker.entry(id).cloned())
+                            .collect(),
+                    };
+                    let (kind, origin) = (picking.kind, picking.origin.clone());
                     self.overlay = None;
-                    self.picked(Picked { kind, choice })
+                    let picked = Picked {
+                        kind,
+                        choice,
+                        entries,
+                    };
+                    self.picked(origin, picked)
                 },
             };
         }
@@ -4673,25 +4730,47 @@ mod tests {
         assert_eq!(app.prepare, None);
     }
 
-    /// The GPU picker open on the fixture catalog, `A40` then `4090` chosen.
+    /// The Runpod target field `field` of the Project view's configuration.
+    fn gpu_cloud(field: &'static str) -> FieldPath {
+        FieldPath::Target {
+            name: "gpu_cloud".into(),
+            field,
+        }
+    }
+
+    /// The GPU picker of the Project view's `gpu_types` open on the fixture
+    /// catalog, `A40` then `4090` chosen.
     fn gpu_picker() -> Result<(App, TaskId), Box<dyn std::error::Error>> {
-        let mut app = app();
+        let mut app = crate::tui::snapshots::project_app()?;
         let chosen = Choice::List(vec!["NVIDIA A40".into(), "NVIDIA GeForce RTX 4090".into()]);
-        let effects = app.open_picker(CatalogKind::Gpus, 2, chosen);
-        let [
-            Effect::Spawn(
-                id,
-                Task::Catalog {
-                    kind: CatalogKind::Gpus,
-                    gpu_count: 2,
-                },
-            ),
-        ] = effects.as_slice()
-        else {
+        let query = Query {
+            kind: CatalogKind::Gpus,
+            gpu_count: 2,
+            gpu_types: Vec::new(),
+        };
+        let effects = app.open_picker(query.clone(), chosen, Origin::Field(gpu_cloud("gpu_types")));
+        let [Effect::Spawn(id, Task::Catalog(asked))] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
         };
+        assert_eq!(asked, &query);
         let id = *id;
         Ok((app, id))
+    }
+
+    /// The fixture GPU catalog, listed for 2 GPUs.
+    fn gpus_listed() -> Result<Listed, Box<dyn std::error::Error>> {
+        Ok(Listed {
+            entries: crate::tui::snapshots::gpu_catalog(2)?,
+            gpus: crate::tui::snapshots::gpu_types()?,
+        })
+    }
+
+    /// The `gpu_types` the Project view shows.
+    fn gpu_types_shown(app: &App) -> Option<String> {
+        app.project_view
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.doc.get(&gpu_cloud("gpu_types")))
     }
 
     fn picker_of(app: &App) -> Option<&Picker> {
@@ -4706,22 +4785,21 @@ mod tests {
         let (mut app, id) = gpu_picker()?;
         assert!(picker_of(&app).is_some_and(Picker::loading));
         assert_eq!(app.work(), ["reading the catalog"]);
-        let entries = crate::tui::snapshots::gpu_catalog(2)?;
-        app.on_done(TaskId(id.0 + 100), Ok(Done::Catalog(Ok(entries.clone()))));
+        app.on_done(TaskId(id.0 + 100), Ok(Done::Catalog(Ok(gpus_listed()?))));
         assert!(
             picker_of(&app).is_some_and(Picker::loading),
             "another listing is ignored"
         );
-        app.on_done(id, Ok(Done::Catalog(Ok(entries))));
+        assert_eq!(app.gpu_catalog, None, "nor kept");
+        app.on_done(id, Ok(Done::Catalog(Ok(gpus_listed()?))));
         assert!(app.work().is_empty());
+        assert!(app.gpu_catalog.is_some(), "kept for the hints");
         press(&mut app, &[KeyCode::Char('J'), KeyCode::Enter]);
         assert_eq!(app.overlay, None);
         assert_eq!(
-            app.picked,
-            Some(Picked {
-                kind: CatalogKind::Gpus,
-                choice: Choice::List(vec!["NVIDIA GeForce RTX 4090".into(), "NVIDIA A40".into()]),
-            })
+            gpu_types_shown(&app).as_deref(),
+            Some("NVIDIA GeForce RTX 4090, NVIDIA A40"),
+            "back to the field that opened it"
         );
         Ok(())
     }
@@ -4730,14 +4808,33 @@ mod tests {
     fn esc_or_ctrl_c_closes_a_picker_and_keeps_nothing() -> TestResult {
         let (mut app, id) = gpu_picker()?;
         press(&mut app, &[KeyCode::Esc]);
-        assert_eq!((app.overlay.clone(), app.picked.clone()), (None, None));
-        let entries = crate::tui::snapshots::gpu_catalog(2)?;
-        assert_eq!(app.on_done(id, Ok(Done::Catalog(Ok(entries)))), []);
+        assert_eq!(app.overlay, None);
+        assert!(app.project_view.pending.is_none());
+        assert_eq!(app.on_done(id, Ok(Done::Catalog(Ok(gpus_listed()?)))), []);
         assert_eq!(app.overlay, None, "a late listing opens nothing");
         let (mut app, _) = gpu_picker()?;
         app.on_input(&ctrl_c());
         assert_eq!(app.overlay, None);
-        assert_eq!(app.picked, None);
+        assert!(app.project_view.pending.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_listing_failing_after_its_picker_closed_says_nothing() -> TestResult {
+        let (mut app, id) = gpu_picker()?;
+        press(&mut app, &[KeyCode::Esc]);
+        app.status = None;
+        assert_eq!(
+            app.on_done(id, Err("a background task failed: boom".into())),
+            []
+        );
+        assert_eq!(app.status, None);
+        assert_eq!(app.overlay, None);
+        let (mut app, id) = gpu_picker()?;
+        press(&mut app, &[KeyCode::Esc]);
+        app.status = None;
+        app.on_done(id, Ok(Done::Catalog(Err("cannot read".into()))));
+        assert_eq!(app.status, None);
         Ok(())
     }
 
@@ -4762,8 +4859,7 @@ mod tests {
     #[test]
     fn keys_go_to_the_picker_not_the_view() -> TestResult {
         let (mut app, id) = gpu_picker()?;
-        let entries = crate::tui::snapshots::gpu_catalog(2)?;
-        app.on_done(id, Ok(Done::Catalog(Ok(entries))));
+        app.on_done(id, Ok(Done::Catalog(Ok(gpus_listed()?))));
         app.on_input(&Event::Paste("A40".into()));
         assert!(
             !picker_of(&app).is_some_and(Picker::typing),
@@ -4776,11 +4872,12 @@ mod tests {
             &[KeyCode::Enter, KeyCode::Char(' '), KeyCode::Enter],
         );
         // A40, found through the pasted filter, is taken out.
-        let rest = Choice::List(vec!["NVIDIA GeForce RTX 4090".into()]);
-        assert_eq!(app.picked.map(|picked| picked.choice), Some(rest));
+        assert_eq!(
+            gpu_types_shown(&app).as_deref(),
+            Some("NVIDIA GeForce RTX 4090")
+        );
         let (mut app, id) = gpu_picker()?;
-        let entries = crate::tui::snapshots::gpu_catalog(2)?;
-        app.on_done(id, Ok(Done::Catalog(Ok(entries))));
+        app.on_done(id, Ok(Done::Catalog(Ok(gpus_listed()?))));
         let view = app.view;
         let effects = press(
             &mut app,

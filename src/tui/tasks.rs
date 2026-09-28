@@ -15,14 +15,13 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use super::catalog::{CatalogKind, fetch};
+use super::catalog::{Listed, Query, fetch};
 use super::cost::history_cost;
 use super::editor::Edited;
 use super::project::ProjectConfig;
 use super::project_edit::{SaveRefusal, save_config};
 use super::start::{Prices, StartPlan, list_prices, prepare};
 use super::training::{Listing, list_runs, read_series};
-use super::widgets::picker;
 use crate::cli::data::Command;
 use crate::cli::front::{Frontend, Report};
 use crate::cli::{StageArgs, TrainArgs, TrainCommand};
@@ -68,13 +67,8 @@ pub(super) enum Task {
     Prepare,
     /// The list prices of these Runpod GPU types.
     Prices(Vec<String>),
-    /// What a picker of `kind` lists, GPU stock for `gpu_count` GPUs.
-    Catalog {
-        /// What is listed.
-        kind: CatalogKind,
-        /// GPUs per pod.
-        gpu_count: u32,
-    },
+    /// What a picker lists, or the GPU types a field hint needs.
+    Catalog(Query),
     /// Validates `text` with `env` and writes it to `overbrainer.toml`,
     /// unless the file no longer holds `base`.
     SaveConfig {
@@ -192,7 +186,7 @@ pub(super) enum Done {
     /// List prices of GPU types.
     Prices(Prices),
     /// A picker's entries, or why they cannot be read.
-    Catalog(Result<Vec<picker::Entry>, String>),
+    Catalog(Result<Listed, String>),
     /// The configuration written to `overbrainer.toml`, or why nothing was.
     ConfigSaved(Result<Box<ProjectConfig>, SaveRefusal>),
 }
@@ -358,8 +352,8 @@ impl Tasks {
         &self.project_dir
     }
 
-    /// Aborts the list price and catalog lookups: they only read, so the TUI never waits
-    /// for them to end.
+    /// Aborts the list price and catalog lookups: they only read, so the TUI
+    /// never waits for them to end.
     pub(super) fn abort_lookups(&mut self) {
         for (_, lookup) in self.lookups.drain() {
             lookup.abort();
@@ -481,10 +475,10 @@ impl Tasks {
                     Done::Prices(list_prices(&dir, EnvSource::Process, gpu_types).await)
                 })
             },
-            Task::Catalog { kind, gpu_count } => {
+            Task::Catalog(query) => {
                 let dir = self.project_dir.clone();
                 self.spawn_lookup(id, async move {
-                    Done::Catalog(fetch(&dir, EnvSource::Process, kind, gpu_count).await)
+                    Done::Catalog(fetch(&dir, EnvSource::Process, query).await)
                 })
             },
         };

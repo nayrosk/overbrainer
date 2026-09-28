@@ -40,8 +40,10 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(left);
     frame.render_widget(block, left);
     if app.config.is_some() {
+        let hint = app.field_hint();
         let listing = app.project_listing();
-        render_rows(frame, inner, (&listing, &mut app.project_view), &theme);
+        let view: (&Listing, _) = (&listing, &mut app.project_view);
+        render_rows(frame, inner, view, hint.as_deref(), &theme);
     } else {
         frame.render_widget(
             Paragraph::new(Span::styled("No configuration read.", theme.dim)),
@@ -55,11 +57,13 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The rows, scrolled so the selected field shows, then its detail.
+/// The rows, scrolled so the selected field shows, then its detail with
+/// `hint`.
 fn render_rows(
     frame: &mut Frame,
     area: Rect,
     (listing, view): (&Listing, &mut ProjectView),
+    hint: Option<&str>,
     theme: &Theme,
 ) {
     let [list, detail] =
@@ -101,7 +105,7 @@ fn render_rows(
     frame.render_widget(Paragraph::new(lines), list);
     if let Some(form) = &view.form {
         frame.render_widget(
-            Paragraph::new(form_lines(form, detail.width, theme)),
+            Paragraph::new(form_lines(form, detail.width, hint, theme)),
             detail,
         );
     } else if let Some(Row::Field(field)) = rows.get(selected) {
@@ -110,7 +114,7 @@ fn render_rows(
         } else {
             theme.dim
         };
-        let lines: Vec<Line> = hang(&field.detail(), detail.width, 0)
+        let lines: Vec<Line> = hang(&field.detail(hint), detail.width, 0)
             .into_iter()
             .take(usize::from(DETAIL_ROWS))
             .map(|line| Line::from(Span::styled(line, style)))
@@ -120,8 +124,8 @@ fn render_rows(
 }
 
 /// The form in the detail rows: what it asks with the input or the choices,
-/// then why the last Enter was refused, or what it accepts.
-fn form_lines(form: &Form, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+/// then why the last Enter was refused, or what it accepts and `hint`.
+fn form_lines(form: &Form, width: u16, hint: Option<&str>, theme: &Theme) -> Vec<Line<'static>> {
     let columns = usize::from(width);
     let prompt = |text: String| {
         let text = cut(&text, columns / 2);
@@ -158,9 +162,10 @@ fn form_lines(form: &Form, width: u16, theme: &Theme) -> Vec<Line<'static>> {
             let mut line = vec![prompt];
             line.extend(input.line(room, Style::new()).spans);
             let empty = if *optional { ", empty unsets" } else { "" };
+            let hint = hint.map(|hint| format!("; {hint}")).unwrap_or_default();
             vec![
                 Line::from(line),
-                note(error, format!("{}{empty}", kind.describe())),
+                note(error, format!("{}{empty}{hint}", kind.describe())),
             ]
         },
         Form::Adding(at) => {

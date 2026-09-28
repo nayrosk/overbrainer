@@ -209,6 +209,11 @@ impl Picker {
         }
     }
 
+    /// The entry of `id`, once the entries are read.
+    pub(in crate::tui) fn entry(&self, id: &str) -> Option<&Entry> {
+        self.entries().iter().find(|entry| entry.id == id)
+    }
+
     /// Handles `code`: moves, toggles, reorders, filters, keeps or cancels.
     /// Until the entries are read, only Esc does something.
     pub(in crate::tui) fn on_key(&mut self, code: KeyCode) -> PickerOutcome {

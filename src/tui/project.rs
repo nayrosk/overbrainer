@@ -147,8 +147,8 @@ pub(super) struct Field {
 
 impl Field {
     /// The line under the list for the selected field: why it cannot be
-    /// changed here, or what it is.
-    pub(super) fn detail(&self) -> String {
+    /// changed here, or what it is, then `hint`.
+    pub(super) fn detail(&self, hint: Option<&str>) -> String {
         let key = &self.key;
         if let Some(error) = &self.error {
             return error.clone();
@@ -156,8 +156,10 @@ impl Field {
         if let Some(user) = &self.lock {
             return format!("{key}: used by {user}, read-only until it ends");
         }
-        self.env_note()
-            .unwrap_or_else(|| format!("{key}: {}", self.help))
+        self.env_note().unwrap_or_else(|| match hint {
+            Some(hint) => format!("{key}: {}; {hint}", self.help),
+            None => format!("{key}: {}", self.help),
+        })
     }
 
     /// Where to change the field when only the environment may: `.env`.
@@ -1280,16 +1282,16 @@ mod tests {
     fn the_detail_says_where_a_value_comes_from() -> TestResult {
         let rows = rows(&config()?, None, &Locks::default());
         assert_eq!(
-            field(&rows, "providers.nanogpt.api_key")?.detail(),
+            field(&rows, "providers.nanogpt.api_key")?.detail(None),
             "providers.nanogpt.api_key: env only, set \
              OVERBRAINER_PROVIDERS__NANOGPT__API_KEY in .env"
         );
         assert_eq!(
-            field(&rows, "pipeline.concurrency")?.detail(),
+            field(&rows, "pipeline.concurrency")?.detail(None),
             "pipeline.concurrency: set by OVERBRAINER_PIPELINE__CONCURRENCY, change it in .env"
         );
         assert_eq!(
-            field(&rows, "pipeline.seed")?.detail(),
+            field(&rows, "pipeline.seed")?.detail(None),
             "pipeline.seed: Seed of the train/eval split (default 42)"
         );
         Ok(())
@@ -1320,7 +1322,7 @@ mod tests {
         );
         assert!(!locked.iter().any(|key| key.starts_with("training")));
         assert_eq!(
-            field(&rows, "roles.parent.model")?.detail(),
+            field(&rows, "roles.parent.model")?.detail(None),
             "roles.parent.model: used by answers, read-only until it ends"
         );
         Ok(())
