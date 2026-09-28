@@ -2431,7 +2431,7 @@ mod tests {
         Ok(())
     }
 
-    /// [`dataset_app`] on an answer, following a run, and leaving: after a
+    /// [`dataset_app`] on an answered question, following a run, and leaving: after a
     /// signal, or with a quit waiting for that run.
     fn leaving_app(signal: bool) -> App {
         let mut app = dataset_app();

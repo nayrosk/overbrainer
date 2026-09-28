@@ -604,9 +604,8 @@ fn opener(macos: bool) -> &'static str {
 /// Returns an error when `name` already exists, or when the file cannot be
 /// created or written.
 fn write_log_export(project_dir: &Path, name: &str, lines: &[String]) -> io::Result<()> {
-    let mut content = String::new();
-    for line in lines {
-        content.push_str(line);
+    let mut content = lines.join("\n");
+    if !lines.is_empty() {
         content.push('\n');
     }
     let mut file = crate::project_lock::open_state_file(

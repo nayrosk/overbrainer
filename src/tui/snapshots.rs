@@ -443,6 +443,7 @@ fn snapshot_at(name: &str, app: &mut App, width: u16, height: u16) -> Result<(),
     settings.set_prepend_module_to_snapshot(false);
     settings.set_omit_expression(true);
     // The version changes at every release: its digits are masked, its width kept.
+    // A release that adds a digit (v0.9.9 to v0.10.0) still changes the snapshots.
     let masked: String = VERSION
         .chars()
         .map(|c| if c.is_ascii_digit() { '#' } else { c })

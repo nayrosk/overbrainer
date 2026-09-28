@@ -178,24 +178,29 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
         None => " detail ",
     };
     let inner_width = area.width.saturating_sub(4);
-    let wrapped = |lines: &[Line<'static>]| {
-        Paragraph::new(lines.to_vec())
-            .wrap(Wrap { trim: false })
-            .line_count(inner_width)
-    };
+    // Where each part starts: only its prefix is copied, to count its rows.
+    let offsets: Vec<usize> = parts
+        .into_iter()
+        .map(|part| {
+            lines.get(..part).map_or(0, |prefix| {
+                Paragraph::new(prefix.to_vec())
+                    .wrap(Wrap { trim: false })
+                    .line_count(inner_width)
+            })
+        })
+        .collect();
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let height = usize::from(area.height.saturating_sub(2));
-    let total = wrapped(&lines);
+    let total = paragraph.line_count(inner_width);
     let last = u16::try_from(total.saturating_sub(height)).unwrap_or(u16::MAX);
     view.scroll = view.scroll.min(last);
     view.sections.clear();
-    for part in parts {
-        let offset = lines.get(..part).map_or(0, &wrapped);
+    for offset in offsets {
         let offset = u16::try_from(offset).unwrap_or(u16::MAX).min(last);
         if view.sections.last() != Some(&offset) {
             view.sections.push(offset);
         }
     }
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let position = format!(
         " {}/{} ",
         (usize::from(view.scroll) + height).min(total),
