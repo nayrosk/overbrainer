@@ -176,8 +176,13 @@ fn read_dotenv(path: &Path) -> Result<Vec<(String, String)>, DotenvError> {
         Err(error) => return Err(DotenvError::Read(error)),
     };
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let mut lines = Lines {
+        rest: text.as_bytes(),
+        line: 0,
+        at_start: true,
+    };
     let mut entries: Vec<(String, String)> = Vec::new();
-    for entry in dotenvy::from_read_iter(text.as_bytes()) {
+    for entry in dotenvy::from_read_iter(&mut lines) {
         match entry {
             Ok((key, value)) => {
                 if !entries.iter().any(|(seen, _)| *seen == key) {
@@ -185,28 +190,50 @@ fn read_dotenv(path: &Path) -> Result<Vec<(String, String)>, DotenvError> {
                 }
             },
             Err(dotenvy::Error::Io(error)) => return Err(DotenvError::Read(error)),
-            Err(dotenvy::Error::LineParse(line, _)) => {
+            // The error holds the offending text, often a secret: only the
+            // line it was read from is kept.
+            Err(_) => {
                 return Err(DotenvError::Syntax {
-                    line: line_of(text, &line),
+                    line: Some(lines.line),
                 });
             },
-            Err(_) => return Err(DotenvError::Syntax { line: None }),
         }
     }
     Ok(entries)
 }
 
-/// The line of `text`, from 1, where the entry `entry` that failed to parse
-/// starts: the first line equal to its first line, else the first starting
-/// with it (a comment cut from its end).
-fn line_of(text: &str, entry: &str) -> Option<usize> {
-    let first = entry.lines().next().unwrap_or_default().trim_end();
-    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
-    let at = lines
-        .iter()
-        .position(|line| *line == first)
-        .or_else(|| lines.iter().position(|line| line.starts_with(first)))?;
-    Some(at + 1)
+/// A reader over a text that gives at most one line per read, and counts
+/// the lines it started giving: when `dotenvy` fails on an entry, the last
+/// one is the line it failed on, whatever the error holds.
+struct Lines<'a> {
+    /// What is left to give.
+    rest: &'a [u8],
+    /// The lines given so far, the last maybe in part.
+    line: usize,
+    /// Whether the next byte starts a line.
+    at_start: bool,
+}
+
+impl io::Read for Lines<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.rest.is_empty() || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.at_start {
+            self.line += 1;
+        }
+        let line_end = self
+            .rest
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(self.rest.len(), |at| at + 1);
+        let count = line_end.min(buf.len());
+        let (given, rest) = self.rest.split_at(count);
+        buf[..count].copy_from_slice(given);
+        self.at_start = given.last() == Some(&b'\n');
+        self.rest = rest;
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +382,28 @@ parent = { provider = "p", model = "parent" }
             matches!(error, Err(ReloadError::Config(ConfigError::Invalid(_)))),
             "{error:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_syntax_error_names_the_exact_line() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(DOTENV_FILE);
+        for (text, line) in [
+            ("A=1\nB=two words\n", 2),
+            ("A=1\n# c\n\nB=\"bad\\q\"\n", 4),
+            ("A=\"multi\nline\"\nC=x y\n", 3),
+            ("A=1\nB=\"open\nstill open\n", 3),
+            ("two=1\nX=two words\n", 2),
+        ] {
+            fs::write(&path, text)?;
+            let error = read_dotenv(&path).err().ok_or("must fail")?;
+            assert_eq!(
+                error.to_string(),
+                format!("cannot parse .env (syntax error at line {line})"),
+                "{text:?}"
+            );
+        }
         Ok(())
     }
 

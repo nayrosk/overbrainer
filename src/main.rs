@@ -90,16 +90,14 @@ fn process_vars() -> impl Iterator<Item = (String, String)> {
 
 /// Loads `path` into the process environment. A missing file is not an error.
 ///
-/// The returned message never contains file content: dotenvy's parse error displays
-/// the whole offending line, which usually holds a secret, so only its position is
-/// reported. I/O errors carry no file content and are shown as is.
+/// A syntax error was already reported, with its line, by [`DotenvKeys::record`],
+/// which parses the file first. The returned message never contains file content:
+/// dotenvy's parse error displays the offending text, which usually holds a
+/// secret. I/O errors carry no file content and are shown as is.
 fn load_dotenv(path: &Path) -> Result<(), String> {
     match dotenvy::from_path(path) {
         Ok(()) => Ok(()),
         Err(dotenvy::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(dotenvy::Error::LineParse(_, index)) => {
-            Err(format!("cannot parse .env (syntax error at index {index})"))
-        },
         Err(dotenvy::Error::Io(e)) => Err(format!("cannot load .env: {e}")),
         Err(_) => Err("cannot load .env".to_string()),
     }

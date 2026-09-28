@@ -225,6 +225,31 @@ fn malformed_dotenv_does_not_leak_its_content() -> Result<(), Box<dyn std::error
 }
 
 #[test]
+fn a_dotenv_value_error_names_its_line() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .success();
+    std::fs::write(
+        dir.path().join(".env"),
+        "# keys\nA=1\nOVERBRAINER_HF_TOKEN=hf_marker two words\n",
+    )?;
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["config", "check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "cannot parse .env (syntax error at line 3)",
+        ))
+        .stderr(predicate::str::contains("hf_marker").not());
+    Ok(())
+}
+
+#[test]
 fn dependency_logs_stay_quiet_by_default() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     overbrainer()?
