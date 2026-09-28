@@ -71,7 +71,7 @@ fn short_target(target: &str) -> &str {
 }
 
 /// The level in upper case.
-fn level_name(level: Level) -> &'static str {
+pub(in crate::tui) fn level_name(level: Level) -> &'static str {
     match level {
         Level::ERROR => "ERROR",
         Level::WARN => "WARN",

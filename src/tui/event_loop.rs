@@ -528,8 +528,7 @@ where
         let written =
             tokio::task::spawn_blocking(move || write_log_export(&dir, &name, &lines)).await;
         let message = match written {
-            Ok(Ok(())) => Msg::LogsExported(Ok((file_name, count))),
-            Ok(Err(error)) => Msg::LogsExported(Err(error.to_string())),
+            Ok(written) => exported(file_name, count, written),
             Err(error) => Msg::LogsExported(Err(format!("export task panicked: {error}"))),
         };
         self.messages.send(message).ok();
@@ -610,6 +609,18 @@ async fn watch_browser(mut child: Child, url: String, messages: UnboundedSender<
 /// `xdg-open` elsewhere.
 fn opener(macos: bool) -> &'static str {
     if macos { "open" } else { "xdg-open" }
+}
+
+/// What writing `count` lines to `.overbrainer/<name>` gave, as the app is
+/// told: a file already there is named.
+fn exported(name: String, count: usize, written: io::Result<()>) -> Msg {
+    Msg::LogsExported(match written {
+        Ok(()) => Ok((name, count)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Err(format!(".overbrainer/{name} already exists"))
+        },
+        Err(error) => Err(error.to_string()),
+    })
 }
 
 /// Writes `lines`, one per line, to `.overbrainer/<name>` in `project_dir`, in
@@ -752,6 +763,23 @@ mod tests {
             }
         }
         assert_eq!(urls, ["https://b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_export_to_a_file_that_exists_says_which() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let lines = vec!["line one".to_string()];
+        let first = write_log_export(project.path(), "logs-x.log", &lines);
+        let Msg::LogsExported(Ok((name, 1))) = exported("logs-x.log".into(), 1, first) else {
+            return Err("the first export fails".into());
+        };
+        assert_eq!(name, "logs-x.log");
+        let second = write_log_export(project.path(), "logs-x.log", &lines);
+        let Msg::LogsExported(Err(error)) = exported("logs-x.log".into(), 1, second) else {
+            return Err("the second export works".into());
+        };
+        assert_eq!(error, ".overbrainer/logs-x.log already exists");
         Ok(())
     }
 

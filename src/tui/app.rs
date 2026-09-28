@@ -19,7 +19,7 @@ use super::start::StartPlan;
 use super::tasks::{Done, Edit, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
 use super::training::TrainingView;
-use super::views::logs::export_line;
+use super::views::logs::{export_line, level_name};
 use crate::cli::data::Command;
 use crate::cli::front::Report;
 use crate::config::Settings;
@@ -1262,9 +1262,14 @@ impl App {
     }
 
     /// `x`: exports every retained line at the shown level or more severe,
-    /// oldest first, to a new file under `.overbrainer/`.
+    /// oldest first, to a new file under `.overbrainer/`; no file without one.
     fn export_logs(&mut self) -> Vec<Effect> {
         let window = self.logs.window(self.log_view.min, usize::MAX, 0);
+        if window.lines.is_empty() {
+            let level = level_name(self.log_view.min);
+            self.say(Severity::Warn, format!("nothing to export at {level}"));
+            return Vec::new();
+        }
         let lines = window.lines.iter().map(export_line).collect();
         let name = format!("logs-{}.log", crate::runs::compact_utc(self.now));
         vec![Effect::ExportLogs { name, lines }]
@@ -1921,6 +1926,16 @@ mod tests {
             "{lines:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn x_with_no_line_at_the_shown_level_exports_nothing() {
+        let mut app = app();
+        log(&app, Level::DEBUG, "too quiet");
+        press(&mut app, &[KeyCode::Char('4')]);
+        assert_eq!(press(&mut app, &[KeyCode::Char('x')]), []);
+        let status = app.status.as_ref().map(|s| (s.severity, s.text.as_str()));
+        assert_eq!(status, Some((Severity::Warn, "nothing to export at INFO")));
     }
 
     #[test]
