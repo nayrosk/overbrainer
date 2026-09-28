@@ -61,7 +61,7 @@ ID        NAME           SIZE GB  DATA CENTER
 nv1a2b3c  training-data      500  EU-RO-1
 ```
 
-`overbrainer pod templates` lists the account's pod templates, by name (serverless templates are left out):
+`overbrainer pod templates` lists the account's pod templates, by name (serverless templates are left out; a template ID the API lists twice shows once, its first occurrence):
 
 ```
 $ overbrainer pod templates
@@ -70,6 +70,8 @@ tp9z8y7x  axolotl-custom  myrepo/axolotl:0.20.0
 ```
 
 An empty listing prints one line saying so instead of a table (`pod: no GPU type matches`, `pod: no data center found`, `pod: no network volume on this account`, `pod: no pod template on this account`).
+
+Names, IDs and images come from the Runpod API: before a table is printed, or a picker drawn, escape sequences and other control characters (C0, DEL, C1) are dropped from them, so an odd name cannot move the cursor or change the terminal's state.
 
 ## `"auto"`
 
@@ -92,7 +94,9 @@ no data center has A or B in stock for data_center_ids = "auto" (gpu_count = 1)
 
 ## The pickers
 
-The [TUI](tui.md)'s Project view lets you set a Runpod target's `gpu_types`, `data_center_ids`, `network_volume_id` and `image` from the live catalog instead of typing them, and the confirmation before a run starts lets you re-pick the GPU types and data centers it will use, saving the choice to `overbrainer.toml` first. See [Terminal UI](tui.md) for the keys.
+The [TUI](tui.md)'s Project view lets you set a Runpod target's `gpu_types`, `data_center_ids`, `network_volume_id` and `image` from the live catalog instead of typing them, and the confirmation before a run starts lets you re-pick the GPU types and data centers it will use, saving the choice to `overbrainer.toml` first. `o` sorts the GPU picker by price, VRAM (most first) or the number of data centers with the type in stock (most first), and the data center picker by ID or region. With `network_volume_id` set, `data_center_ids` holds the volume's data center: changing it in the Project view is refused, pick another volume instead. See [Terminal UI](tui.md) for the keys.
+
+`container_disk_gb` is checked against fixed bounds (at least 20): the Runpod v2 API does not say how much container disk a GPU type allows.
 
 ## What happens to a pod
 
