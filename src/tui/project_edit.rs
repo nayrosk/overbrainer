@@ -3,12 +3,16 @@
 //! stay in a pending document until `s` validates and writes it.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
 use crossterm::event::KeyCode;
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 
 use super::app::{Action, App, Confirm, Effect, Overlay, PAGE, Project, Severity};
 use super::project::{Addable, Form, Listing, Locks, Pending, ProjectConfig, Shown};
@@ -70,26 +74,29 @@ pub(super) fn save_config(
     let path = dir.join(CONFIG_FILE);
     let cannot_read =
         |error: io::Error| SaveRefusal::Failed(format!("cannot read {}: {error}", path.display()));
-    let metadata = std::fs::symlink_metadata(&path).map_err(cannot_read)?;
-    if metadata.file_type().is_symlink() {
-        // A rename would replace the link, not the file it points to.
-        return Err(SaveRefusal::Failed(format!(
-            "{CONFIG_FILE} is a symlink; nothing written, edit it with E"
-        )));
-    }
-    let on_disk = std::fs::read_to_string(&path).map_err(cannot_read)?;
+    // One handle, never through a link: a rename would replace the link, not
+    // the file it points to.
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut file = match rustix::fs::open(&path, flags, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::LOOP) => {
+            return Err(SaveRefusal::Failed(format!(
+                "{CONFIG_FILE} is a symlink; nothing written, edit it with E"
+            )));
+        },
+        Err(errno) => return Err(cannot_read(errno.into())),
+    };
+    let mode = file.metadata().map_err(cannot_read)?.permissions().mode();
+    let mut on_disk = String::new();
+    file.read_to_string(&mut on_disk).map_err(cannot_read)?;
+    drop(file);
     if on_disk != base {
         return Err(SaveRefusal::Failed(format!(
             "{CONFIG_FILE} changed on disk since it was read; drop the changes (u), then E"
         )));
     }
-    crate::runs::write_atomic_synced(
-        dir,
-        CONFIG_FILE,
-        text.as_bytes(),
-        Some(metadata.permissions()),
-    )
-    .map_err(|error| SaveRefusal::Failed(error.to_string()))?;
+    crate::runs::write_atomic_synced(dir, CONFIG_FILE, text.as_bytes(), mode)
+        .map_err(|error| SaveRefusal::Failed(error.to_string()))?;
     Ok(config)
 }
 
@@ -1522,10 +1529,17 @@ mod tests {
         set(&mut app, "project.name", "rust_pro")?;
         save(&mut app, dir.path())?;
         assert_eq!(status(&app), "✓ saved overbrainer.toml");
-        assert_eq!(
-            std::fs::metadata(&path)?.permissions().mode() & 0o777,
-            0o640
-        );
+        let mode = |path: &Path| -> std::io::Result<u32> {
+            Ok(std::fs::metadata(path)?.permissions().mode() & 0o7777)
+        };
+        assert_eq!(mode(&path)?, 0o640);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755))?;
+        set(&mut app, "project.name", "rust_suid")?;
+        save(&mut app, dir.path())?;
+        assert_eq!(status(&app), "✓ saved overbrainer.toml");
+        assert_eq!(mode(&path)?, 0o755, "never setuid, setgid or sticky");
+        set(&mut app, "project.name", "rust_pro")?;
+        save(&mut app, dir.path())?;
         let real = dir.path().join("real.toml");
         std::fs::rename(&path, &real)?;
         std::os::unix::fs::symlink(&real, &path)?;

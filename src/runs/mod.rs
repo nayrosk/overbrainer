@@ -7,6 +7,7 @@ mod train;
 
 use std::fs;
 use std::io::{self, Write as _};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -251,50 +252,34 @@ impl Runs {
 /// Returns [`RunsError::Io`] when the temporary file cannot be created or
 /// written, or cannot be renamed over `dir/name`.
 pub(crate) fn write_atomic(dir: &Path, name: &str, content: &[u8]) -> Result<(), RunsError> {
-    replace(dir, name, content, |_| Ok(()))
+    replace(dir, name, content, None)
 }
 
-/// [`write_atomic`] for a file a user owns: the temporary file takes
-/// `permissions` (the mode of the file it replaces) and is synced to disk
-/// before the rename.
+/// [`write_atomic`] for a file a user owns: the temporary file is created
+/// with mode `0o600`, takes `mode & 0o777` (the mode of the file it replaces,
+/// never setuid, setgid or sticky) and is synced to disk before the rename;
+/// the directory is synced after it.
 ///
 /// # Errors
 ///
-/// Returns [`RunsError::Io`] as [`write_atomic`] does, and when the
-/// permissions cannot be set or the file cannot be synced.
+/// Returns [`RunsError::Io`] as [`write_atomic`] does, and when the mode
+/// cannot be set or the file cannot be synced.
 pub(crate) fn write_atomic_synced(
     dir: &Path,
     name: &str,
     content: &[u8],
-    permissions: Option<fs::Permissions>,
+    mode: u32,
 ) -> Result<(), RunsError> {
-    replace(dir, name, content, |file| {
-        if let Some(permissions) = permissions {
-            file.set_permissions(permissions)?;
-        }
-        file.sync_all()
-    })
+    replace(dir, name, content, Some(mode))
 }
 
-/// Writes `content` to a temporary file, runs `finish` on it, then renames it
-/// over `dir/name`; the temporary file goes when a step fails.
-fn replace(
-    dir: &Path,
-    name: &str,
-    content: &[u8],
-    finish: impl FnOnce(&fs::File) -> io::Result<()>,
-) -> Result<(), RunsError> {
+/// Writes `content` to a temporary file, then renames it over `dir/name`;
+/// the temporary file goes when a step fails. With `synced`, the temporary
+/// file is private until it takes that mode, the file is synced before the
+/// rename and `dir` after it.
+fn replace(dir: &Path, name: &str, content: &[u8], synced: Option<u32>) -> Result<(), RunsError> {
     let tmp = dir.join(format!(".{name}.{:016x}.tmp", fastrand::u64(..)));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(io_error(&tmp))?;
-    let written = file
-        .write_all(content)
-        .and_then(|()| finish(&file))
-        .map_err(io_error(&tmp));
-    drop(file);
+    let written = write_tmp(&tmp, content, synced).map_err(io_error(&tmp));
     let path = dir.join(name);
     let renamed = written.and_then(|()| fs::rename(&tmp, &path).map_err(io_error(&path)));
     if renamed.is_err()
@@ -302,7 +287,35 @@ fn replace(
     {
         tracing::warn!("cannot remove {}: {error}", tmp.display());
     }
+    if renamed.is_ok() && synced.is_some() {
+        sync_dir(dir);
+    }
     renamed
+}
+
+/// Syncs `dir`, so a rename in it is on disk; a failure is only logged, the
+/// new content being in place already.
+fn sync_dir(dir: &Path) {
+    if let Err(error) = fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+        tracing::warn!("cannot sync {}: {error}", dir.display());
+    }
+}
+
+/// Creates `tmp` and writes `content` to it; with `synced`, created `0o600`,
+/// then given `mode & 0o777` and synced.
+fn write_tmp(tmp: &Path, content: &[u8], synced: Option<u32>) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    if synced.is_some() {
+        options.mode(0o600);
+    }
+    let mut file = options.open(tmp)?;
+    file.write_all(content)?;
+    let Some(mode) = synced else {
+        return Ok(());
+    };
+    file.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+    file.sync_all()
 }
 
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> RunsError + '_ {
@@ -530,6 +543,22 @@ pub(crate) mod tests {
         )?;
         let ids: Vec<String> = runs.list()?.into_iter().map(|run| run.id).collect();
         assert_eq!(ids, vec!["20260921-000000-good"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_synced_write_takes_the_mode_without_its_special_bits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        // A regular file, setuid, 0o640: as `st_mode` reads it.
+        write_atomic_synced(dir.path(), "a.toml", b"x = 1\n", 0o104_640)?;
+        let path = dir.path().join("a.toml");
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(fs::read_to_string(&path)?, "x = 1\n");
+        let names: Vec<_> = fs::read_dir(dir.path())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(names, ["a.toml"], "no temporary file left");
         Ok(())
     }
 }
