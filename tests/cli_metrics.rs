@@ -144,9 +144,15 @@ async fn a_locked_command_serves_its_metrics_while_it_runs() -> TestResult {
         r#"overbrainer_stage_items_total{stage="answers",result="excluded"} 1"#,
         r#"overbrainer_cost_usd_total{stage="answers",model="parent"} 0.5"#,
     ] {
-        assert!(text.lines().any(|line| line == sample), "{sample}:\n{text}");
+        assert!(
+            text.lines().any(|line| line == sample),
+            "missing sample: {sample}"
+        );
     }
-    assert!(!text.contains("sk-metrics-test"), "{text}");
+    assert!(
+        !text.contains("sk-metrics-test"),
+        "the scrape leaks the provider key"
+    );
     // The command ended: nothing serves anymore.
     assert!(
         reqwest::get(format!("http://{address}/metrics"))
