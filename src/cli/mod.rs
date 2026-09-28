@@ -5,7 +5,7 @@ mod config_check;
 pub(crate) mod data;
 pub(crate) mod front;
 mod history;
-mod init;
+pub(crate) mod init;
 pub(crate) mod pod;
 mod progress;
 mod record;

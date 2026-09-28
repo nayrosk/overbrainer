@@ -3,6 +3,8 @@
 //! the state alone: the screens, their fields, what a key does, and what a
 //! screen refuses before the next one. Nothing here draws or writes a file.
 
+mod write;
+
 use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -859,7 +861,7 @@ impl Wizard {
         match code {
             KeyCode::Up | KeyCode::BackTab => form.focus = form.focus.saturating_sub(1),
             KeyCode::Down | KeyCode::Tab => {
-                form.focus = (form.focus + 1).min(TOPIC_FIELDS.len() - 1)
+                form.focus = (form.focus + 1).min(TOPIC_FIELDS.len() - 1);
             },
             code => {
                 let Some(input) = form.inputs.get_mut(form.focus) else {

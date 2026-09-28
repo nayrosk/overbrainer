@@ -8,26 +8,36 @@ use anyhow::{Context, bail};
 
 use crate::prompts;
 
+/// The example `overbrainer.toml`.
+pub(crate) const CONFIG_TEMPLATE: &str = include_str!("../../templates/overbrainer.toml");
+/// The example `.env.example`.
+const ENV_TEMPLATE: &str = include_str!("../../templates/env.example");
+/// The environment file, next to `overbrainer.toml`.
+pub(crate) const ENV_FILE: &str = ".env";
+/// Its example, meant to be committed.
+pub(crate) const ENV_EXAMPLE_FILE: &str = ".env.example";
+
 /// Files that are never overwritten, relative to the project directory: `init`
 /// refuses when any of them exists.
 fn files() -> Vec<(PathBuf, &'static str)> {
     let mut files = vec![
-        (
-            PathBuf::from("overbrainer.toml"),
-            include_str!("../../templates/overbrainer.toml"),
-        ),
-        (
-            PathBuf::from(".env.example"),
-            include_str!("../../templates/env.example"),
-        ),
+        (PathBuf::from(crate::config::CONFIG_FILE), CONFIG_TEMPLATE),
+        (PathBuf::from(ENV_EXAMPLE_FILE), ENV_TEMPLATE),
     ];
-    for (name, content) in prompts::DEFAULTS {
-        files.push((Path::new(prompts::DIR).join(name), content));
-    }
+    files.extend(prompt_files());
     files
 }
 
-const GITIGNORE: &str = ".gitignore";
+/// The default prompt templates, relative to the project directory.
+pub(crate) fn prompt_files() -> Vec<(PathBuf, &'static str)> {
+    prompts::DEFAULTS
+        .iter()
+        .map(|(name, content)| (Path::new(prompts::DIR).join(name), *content))
+        .collect()
+}
+
+/// `.gitignore`, relative to the project directory.
+pub(crate) const GITIGNORE: &str = ".gitignore";
 const GITIGNORE_TEMPLATE: &str = include_str!("../../templates/gitignore");
 
 /// Writes the example project files into `dir`: `overbrainer.toml`, `.env.example`,
@@ -59,10 +69,36 @@ pub fn run(dir: &Path) -> anyhow::Result<()> {
 
 /// Creates `path` with `content`, failing if it exists, even if it appeared after
 /// the existence check.
-fn create_new(path: &Path, content: &str) -> anyhow::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+///
+/// # Errors
+///
+/// Returns an error when the file exists or cannot be created or written.
+pub(crate) fn create_new(path: &Path, content: &str) -> anyhow::Result<()> {
+    create(
+        path,
+        content,
+        OpenOptions::new().write(true).create_new(true),
+    )
+}
+
+/// [`create_new`] for a file holding secrets: readable by its owner only
+/// (mode 600) from its creation, so it is never world-readable, even briefly.
+///
+/// # Errors
+///
+/// Returns an error when the file exists or cannot be created or written.
+pub(crate) fn create_private(path: &Path, content: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    create(
+        path,
+        content,
+        OpenOptions::new().write(true).create_new(true).mode(0o600),
+    )
+}
+
+fn create(path: &Path, content: &str, options: &OpenOptions) -> anyhow::Result<()> {
+    let mut file = options
         .open(path)
         .with_context(|| format!("cannot create {}", path.display()))?;
     file.write_all(content.as_bytes())
@@ -73,7 +109,11 @@ fn create_new(path: &Path, content: &str) -> anyhow::Result<()> {
 
 /// Creates `.gitignore` from the template, or appends the template entries that an
 /// existing file lacks.
-fn update_gitignore(path: &Path) -> anyhow::Result<()> {
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read, created or written.
+pub(crate) fn update_gitignore(path: &Path) -> anyhow::Result<()> {
     let existing = match std::fs::read_to_string(path) {
         Ok(existing) => existing,
         Err(e) if e.kind() == ErrorKind::NotFound => {
