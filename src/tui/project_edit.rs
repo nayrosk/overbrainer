@@ -75,8 +75,8 @@ pub(super) fn save_config(
     let cannot_read =
         |error: io::Error| SaveRefusal::Failed(format!("cannot read {}: {error}", path.display()));
     // One handle, never through a link: a rename would replace the link, not
-    // the file it points to.
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    // the file it points to. NONBLOCK keeps a FIFO from hanging the open.
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     let mut file = match rustix::fs::open(&path, flags, Mode::empty()) {
         Ok(fd) => File::from(fd),
         Err(Errno::LOOP) => {
@@ -86,7 +86,11 @@ pub(super) fn save_config(
         },
         Err(errno) => return Err(cannot_read(errno.into())),
     };
-    let mode = file.metadata().map_err(cannot_read)?.permissions().mode();
+    let metadata = file.metadata().map_err(cannot_read)?;
+    if !metadata.is_file() {
+        return Err(cannot_read(io::Error::other("not a regular file")));
+    }
+    let mode = metadata.permissions().mode();
     let mut on_disk = String::new();
     file.read_to_string(&mut on_disk).map_err(cannot_read)?;
     drop(file);
@@ -1557,6 +1561,31 @@ mod tests {
         );
         assert!(std::fs::symlink_metadata(&path)?.file_type().is_symlink());
         assert!(std::fs::read_to_string(&real)?.contains("rust_pro"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_never_blocks_on_a_fifo() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            dir.path().join(CONFIG_FILE),
+            Mode::from_raw_mode(0o600),
+        )?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let path = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let saved = save_config(&path, PROJECT_CONFIG, PROJECT_CONFIG, &project_env());
+            sender.send(saved.map(drop)).ok();
+        });
+        let saved = receiver.recv_timeout(std::time::Duration::from_secs(5))?;
+        let Err(SaveRefusal::Failed(error)) = saved else {
+            return Err(format!("{saved:?}").into());
+        };
+        assert!(error.ends_with("not a regular file"), "{error}");
+        let kind = std::fs::symlink_metadata(dir.path().join(CONFIG_FILE))?.file_type();
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&kind), "untouched");
         Ok(())
     }
 
