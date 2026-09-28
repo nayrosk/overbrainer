@@ -82,15 +82,26 @@ fn level_name(level: Level) -> &'static str {
 }
 
 /// `line` formatted for the Logs export file: `2026-09-28T01:02:03Z INFO
-/// pipeline: message`.
+/// pipeline: message`, on one line: a newline and a carriage return are written
+/// `\n` and `\r`, other control characters `\u{..}`.
 pub(in crate::tui) fn export_line(line: &LogLine) -> String {
-    format!(
+    let line = format!(
         "{} {} {}: {}",
         crate::runs::rfc3339(line.time),
         level_name(line.level),
         short_target(&line.target),
         line.message
-    )
+    );
+    let mut escaped = String::with_capacity(line.len());
+    for c in line.chars() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            c if c.is_control() => escaped.extend(c.escape_unicode()),
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -111,6 +122,21 @@ mod tests {
         assert_eq!(
             export_line(&line),
             "2026-09-21T14:13:20Z INFO pipeline: did a thing"
+        );
+    }
+
+    #[test]
+    fn export_line_escapes_control_characters_to_stay_on_one_line() {
+        let line = LogLine {
+            seq: 1,
+            level: Level::WARN,
+            target: "overbrainer::llm".into(),
+            time: UNIX_EPOCH + Duration::from_secs(1_790_000_000),
+            message: "first\r\nsecond\tthird\u{1b}[0m".into(),
+        };
+        assert_eq!(
+            export_line(&line),
+            "2026-09-21T14:13:20Z WARN llm: first\\r\\nsecond\\u{9}third\\u{1b}[0m"
         );
     }
 }
