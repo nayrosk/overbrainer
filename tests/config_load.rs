@@ -1,6 +1,6 @@
 use std::fs;
 
-use overbrainer::config::{ConfigError, Engine, EnvSource, Target, load};
+use overbrainer::config::{ConfigError, Engine, EnvSource, Target, env_keys, load, load_str};
 use secrecy::ExposeSecret;
 
 const BASE: &str = r#"
@@ -544,4 +544,107 @@ fn env_values_in_axolotl_extra_get_their_types() -> Result<(), Box<dyn std::erro
         })
     );
     Ok(())
+}
+
+/// Runs both `load` (reading `toml` from a temp file) and `load_str` (given `toml`
+/// directly) with the same `env`, and asserts they agree: same `Ok`/`Err` shape, and
+/// the same `Debug` rendering (which, for `Settings`, never includes a secret's value:
+/// `SecretString`'s `Debug` impl always prints a redacted placeholder).
+fn assert_load_and_load_str_agree(
+    toml: &str,
+    pairs: EnvSource,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(toml)?;
+    let content = fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+    let from_load = load(dir.path(), pairs.clone());
+    let from_load_str = load_str(&content, pairs);
+    assert_eq!(
+        format!("{from_load:?}"),
+        format!("{from_load_str:?}"),
+        "load and load_str disagree for this fixture"
+    );
+    Ok(())
+}
+
+#[test]
+fn load_str_agrees_with_load_on_a_valid_document() -> Result<(), Box<dyn std::error::Error>> {
+    assert_load_and_load_str_agree(BASE, env(&[("OVERBRAINER_PIPELINE__CONCURRENCY", "16")]))
+}
+
+#[test]
+fn load_str_agrees_with_load_on_targets_and_axolotl_extra() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_load_and_load_str_agree(
+        &format!("{BASE}{TARGETS}{TRAINING}"),
+        env(&[
+            ("OVERBRAINER_TARGETS__GPU__MAX_HOURS", "2"),
+            ("OVERBRAINER_TARGETS__BOX__HOST", "trainer@gpu-box"),
+            (
+                "OVERBRAINER_TRAINING__AXOLOTL_EXTRA__GRADIENT_CHECKPOINTING",
+                "true",
+            ),
+        ]),
+    )
+}
+
+#[test]
+fn load_str_agrees_with_load_on_an_env_only_key_leaked_in_the_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let toml = format!("{BASE}\n[runpod]\napi_key = \"rp-leak\"\n");
+    assert_load_and_load_str_agree(&toml, env(&[]))
+}
+
+#[test]
+fn load_str_agrees_with_load_on_malformed_toml() -> Result<(), Box<dyn std::error::Error>> {
+    let malformed = "not valid toml here = !!broken!!\n";
+    assert_load_and_load_str_agree(malformed, env(&[]))
+}
+
+#[test]
+fn load_str_of_an_invalid_document_returns_dotted_path_messages()
+-> Result<(), Box<dyn std::error::Error>> {
+    // No file, no temp dir: `load_str` validates the text directly.
+    let toml = format!("{BASE}\n[runpod]\napi_key = \"rp-leak\"\n");
+    match load_str(&toml, env(&[])) {
+        Err(ConfigError::Invalid(problems)) => {
+            assert!(
+                problems.contains(
+                    &"runpod.api_key: must be set through env, not in overbrainer.toml".to_string()
+                ),
+                "{problems:?}"
+            );
+            assert!(
+                !problems.join("\n").contains("rp-leak"),
+                "values must not leak"
+            );
+            Ok(())
+        },
+        other => Err(format!("expected Invalid, got {other:?}").into()),
+    }
+}
+
+#[test]
+fn load_str_of_a_valid_document_matches_load() -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_str(BASE, env(&[]))?;
+    assert_eq!(settings.project.name, "demo");
+    Ok(())
+}
+
+#[test]
+fn env_keys_from_vars_maps_dotted_lower_case_keys() {
+    let keys = env_keys(&env(&[
+        ("OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY", "sk-x"),
+        ("OVERBRAINER_LOG", "debug"),
+        ("OVERBRAINER_TUI_COLOR", "256"),
+        ("OVERBRAINER_TARGETS__GPU__MAX_HOURS", "2"),
+        ("UNRELATED_VAR", "1"),
+    ]));
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "providers.openrouter.api_key".to_string(),
+            "log".to_string(),
+            "targets.gpu.max_hours".to_string(),
+        ])
+    );
 }

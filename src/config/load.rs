@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use config::{Config, Environment, File, FileFormat};
@@ -119,24 +119,33 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
         path: path.clone(),
         error,
     })?;
-    let pairs: Vec<(String, String)> = match env {
-        EnvSource::Process => std::env::vars_os()
-            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-            .collect(),
-        EnvSource::Vars(pairs) => pairs,
-    };
-    let env: config::Map<String, String> = pairs
+    load_str(&content, env)
+}
+
+/// Validates a configuration text (the would-be contents of `overbrainer.toml`) layered
+/// with `OVERBRAINER_*` variables from `env`, without reading any file.
+///
+/// This is what [`load`] does after reading the file; a caller that already has the
+/// text (an editor buffer, a value about to be written) can validate it directly.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Parse`] when `content` or the environment cannot be parsed
+/// into [`Settings`], and [`ConfigError::Invalid`] when the parsed settings fail
+/// semantic validation or when an env-only key is set in `content`.
+pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> {
+    let env: config::Map<String, String> = env_pairs(env)
         .into_iter()
         .filter(|(key, _)| !key.starts_with(TUI_ENV_PREFIX))
         .collect();
 
     let file_only = Config::builder()
-        .add_source(File::from_str(&content, FileFormat::Toml))
+        .add_source(File::from_str(content, FileFormat::Toml))
         .build()?;
     let mut problems = validate::env_only_in_file(&file_only);
 
     let mut settings: Settings = Config::builder()
-        .add_source(File::from_str(&content, FileFormat::Toml))
+        .add_source(File::from_str(content, FileFormat::Toml))
         .add_source(
             Environment::with_prefix(ENV_PREFIX)
                 .prefix_separator("_")
@@ -158,6 +167,35 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
         Ok(settings)
     } else {
         Err(ConfigError::Invalid(problems))
+    }
+}
+
+/// The dotted, lower-case configuration keys `env` sets through `OVERBRAINER_*`
+/// variables, with the same prefix and separators [`load`] and [`load_str`] use.
+///
+/// `OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY` gives `providers.openrouter.api_key`;
+/// `OVERBRAINER_LOG` gives `log`. Variables under [`TUI_ENV_PREFIX`] are not
+/// configuration keys ([`load_str`] skips them too) and are left out.
+#[must_use]
+pub fn env_keys(env: &EnvSource) -> BTreeSet<String> {
+    let prefix = format!("{ENV_PREFIX}_");
+    env_pairs(env.clone())
+        .into_iter()
+        .filter(|(key, _)| !key.starts_with(TUI_ENV_PREFIX))
+        .filter_map(|(key, _)| {
+            let rest = key.strip_prefix(&prefix)?;
+            (!rest.is_empty()).then(|| rest.to_lowercase().replace("__", "."))
+        })
+        .collect()
+}
+
+/// The key-value pairs `env` provides: the process environment, or an explicit list.
+fn env_pairs(env: EnvSource) -> Vec<(String, String)> {
+    match env {
+        EnvSource::Process => std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect(),
+        EnvSource::Vars(pairs) => pairs,
     }
 }
 
@@ -313,5 +351,46 @@ mod tests {
             None,
             "a negative integer past i64::MIN must stay a string, not become an imprecise float"
         );
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> EnvSource {
+        EnvSource::Vars(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn env_keys_maps_double_underscores_to_dots_and_lower_cases() {
+        let env = vars(&[("OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY", "sk-something")]);
+        assert_eq!(
+            env_keys(&env),
+            BTreeSet::from(["providers.openrouter.api_key".to_string()])
+        );
+    }
+
+    #[test]
+    fn env_keys_maps_log_to_a_bare_key() {
+        let env = vars(&[("OVERBRAINER_LOG", "debug")]);
+        assert_eq!(env_keys(&env), BTreeSet::from(["log".to_string()]));
+    }
+
+    #[test]
+    fn env_keys_skips_tui_variables_and_unrelated_prefixes() {
+        let env = vars(&[
+            ("OVERBRAINER_TUI_COLOR", "256"),
+            ("OVERBRAINER_TUI_MOTION", "off"),
+            ("PATH", "/usr/bin"),
+            ("OVERBRAINERX", "not us"),
+        ]);
+        assert!(env_keys(&env).is_empty());
+    }
+
+    #[test]
+    fn env_keys_skips_the_bare_prefix_with_nothing_after_it() {
+        let env = vars(&[("OVERBRAINER_", "")]);
+        assert!(env_keys(&env).is_empty());
     }
 }
