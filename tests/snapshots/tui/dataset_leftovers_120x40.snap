@@ -1,7 +1,7 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ overbrainer   1 Dataset  2 Pipeline  3 Training  4 Logs                                                  rust_expert "
+" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs                                       rust_expert "
 "╭ data ──────────────────────────────────────────────╮╭ topic ─────────────────────────────────────────────────────────╮"
 "│ ▼ ownership  2 sub, 5 q, 4 a                       ││ old_topic                                                      │"
 "│   ▶ Borrowing  3 q, 2 a                            ││ not in overbrainer.toml: split counts its answers as orphaned  │"

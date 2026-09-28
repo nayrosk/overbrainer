@@ -33,7 +33,7 @@ pub(super) const NOTE: &str = "e, d, r and t are refused while a stage, an edit 
 
 /// Keys that work in every view.
 pub(super) const GLOBAL: &[KeyHelp] = &[
-    row("1 2 3 4, Tab, Shift-Tab", "switch view"),
+    row("1 2 3 4 5, Tab, Shift-Tab", "switch view"),
     row("?", "this help (Esc, ? or q closes it)"),
     row("q, Ctrl-C", "quit"),
     row("R", "reload the data files and runs"),
@@ -42,6 +42,14 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
     row(
         "y, n Esc Enter",
         "in a dialog: confirm, cancel (the default, n)",
+    ),
+];
+
+const PROJECT: &[KeyHelp] = &[
+    row("k j, Up Down", "select a field"),
+    row(
+        "PgUp PgDn, Home End",
+        "move a page, to the first or last field",
     ),
 ];
 
@@ -128,6 +136,12 @@ pub(super) enum Context {
     Menu,
 }
 
+const FOOTER_PROJECT: &[Hint] = &[
+    hint("j/k", "move"),
+    hint("PgUp/PgDn", "page"),
+    hint("1-5", "views"),
+    hint("q", "quit"),
+];
 const FOOTER_DATASET: &[Hint] = &[
     hint("j/k", "move"),
     hint("l", "open"),
@@ -139,7 +153,7 @@ const FOOTER_DATASET: &[Hint] = &[
 ];
 const FOOTER_PIPELINE: &[Hint] = &[
     locking("r", "run a stage"),
-    hint("1-4", "views"),
+    hint("1-5", "views"),
     hint("q", "quit"),
 ];
 const FOOTER_TRAINING: &[Hint] = &[
@@ -172,6 +186,7 @@ const FOOTER_MENU: &[Hint] = &[
 /// from the end when it runs out of room.
 pub(super) fn footer(context: Context) -> Vec<Hint> {
     match context {
+        Context::View(View::Project) => FOOTER_PROJECT.to_vec(),
         Context::View(View::Dataset) => FOOTER_DATASET.to_vec(),
         Context::View(View::Pipeline) => FOOTER_PIPELINE.to_vec(),
         Context::View(View::Training) => FOOTER_TRAINING.to_vec(),
@@ -187,6 +202,7 @@ pub(super) fn footer(context: Context) -> Vec<Hint> {
 /// Keys of `view`.
 pub(super) fn of(view: View) -> &'static [KeyHelp] {
     match view {
+        View::Project => PROJECT,
         View::Dataset => DATASET,
         View::Training => TRAINING,
         View::Logs => LOGS,

@@ -916,7 +916,7 @@ mod tests {
         let (events, input) = mpsc::unbounded_channel();
         terminal.backend_mut().resize(100, 30);
         events.send(Ok(TermEvent::Resize(100, 30)))?;
-        events.send(Ok(key(KeyCode::Char('4'))))?;
+        events.send(Ok(key(KeyCode::Char('5'))))?;
         events.send(Ok(key(KeyCode::Char('q'))))?;
         tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await??;
         let area = terminal.backend().buffer().area;
@@ -1002,7 +1002,7 @@ mod tests {
         let (events, input) = mpsc::unbounded_channel();
         let run_loop = drive(&mut terminal, &mut app, input, None);
         let keys = async {
-            events.send(Ok(key(KeyCode::Char('3'))))?;
+            events.send(Ok(key(KeyCode::Char('4'))))?;
             drawn(&frame, run).await?;
             events.send(Ok(key(KeyCode::Char('a'))))?;
             events.send(Err(io::Error::other("the terminal is gone")))?;
@@ -1245,7 +1245,7 @@ mod tests {
         let (events, input) = mpsc::unbounded_channel();
         let run_loop = drive(&mut terminal, &mut app, input, None);
         let keys = async {
-            events.send(Ok(key(KeyCode::Char('3'))))?;
+            events.send(Ok(key(KeyCode::Char('4'))))?;
             drawn(&frame, RUN).await?;
             events.send(Ok(key(KeyCode::Char('c'))))?;
             drawn(&frame, "Cancel a run?").await?;
@@ -1634,7 +1634,7 @@ mod tests {
             KeyCode::Char('j'),
             KeyCode::Char('e'),
             // Typed before the editor took the terminal: dropped, not replayed.
-            KeyCode::Char('4'),
+            KeyCode::Char('5'),
         ];
         let quit = async {
             for code in keys {

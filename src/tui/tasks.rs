@@ -1,7 +1,7 @@
 //! The TUI's background work: each task runs on its own, owns its inputs and
 //! returns what the app needs when it ends. The app only ever sees results.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -24,8 +24,8 @@ use crate::cli::front::{Frontend, Report};
 use crate::cli::{StageArgs, TrainArgs, TrainCommand};
 use crate::config::EnvSource;
 use crate::dataset::{Counts, DataFiles, Dataset, Deletion};
-use crate::events::{Event, EventBus};
-use crate::history::{self, Cost};
+use crate::events::{Event, EventBus, Stage};
+use crate::history::{self, Cost, Entry, Total};
 use crate::pipeline::{Ctx, SplitReport};
 use crate::prompts::Prompts;
 use crate::train::TrainMetric;
@@ -110,12 +110,43 @@ pub(super) enum Edit {
     },
 }
 
+/// What the history records, as the TUI shows it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct History {
+    /// The cost of every stage, `None` while none spent anything.
+    pub(super) cost: Option<Cost>,
+    /// Totals per stage.
+    pub(super) stages: BTreeMap<Stage, Total>,
+    /// Totals per model.
+    pub(super) models: BTreeMap<String, Total>,
+}
+
+impl History {
+    /// The history of `entries`.
+    pub(super) fn of(entries: &[Entry]) -> Self {
+        Self {
+            cost: history_cost(entries),
+            stages: history::totals(entries).0,
+            models: history::per_model(entries),
+        }
+    }
+
+    /// A history whose stages cost `cost`, and nothing else.
+    #[cfg(test)]
+    pub(super) fn costing(cost: Cost) -> Self {
+        Self {
+            cost: Some(cost),
+            ..Self::default()
+        }
+    }
+}
+
 /// What a task gives back.
 #[derive(Debug)]
 pub(super) enum Done {
-    /// The dataset files, or why they cannot be read; then the cost the history
-    /// records, `None` when no stage spent anything, or why it cannot be read.
-    Loaded(Result<Dataset, String>, Result<Option<Cost>, String>),
+    /// The dataset files, or why they cannot be read; then what the history
+    /// records, or why it cannot be read.
+    Loaded(Result<Dataset, String>, Result<History, String>),
     /// What an edit did, or why nothing changed.
     Saved(Result<Saved, String>),
     /// How a pipeline command ended.
@@ -336,7 +367,7 @@ impl Tasks {
                 self.set.spawn(async move {
                     let read = tokio::task::spawn_blocking(move || {
                         let history = history::read(&dir)
-                            .map(|entries| history_cost(&entries))
+                            .map(|entries| History::of(&entries))
                             .map_err(|error| {
                                 format!("cannot read {}: {error}", history::path(&dir).display())
                             });
@@ -532,11 +563,16 @@ mod tests {
         tasks.spawn(TaskId(7), Task::Load);
         assert!(!tasks.is_empty());
         let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
-        let Some((TaskId(7), Ok(Done::Loaded(Ok(data), Ok(Some(Cost::Known(cost))))))) = next
-        else {
+        let Some((TaskId(7), Ok(Done::Loaded(Ok(data), Ok(history))))) = next else {
             return Err(format!("unexpected end: {next:?}").into());
         };
+        let Some(Cost::Known(cost)) = history.cost else {
+            return Err(format!("unexpected history: {history:?}").into());
+        };
         assert_eq!(data.subtopics.len(), 3);
+        let answers = history.stages.get(&crate::events::Stage::Answers);
+        assert_eq!(answers.map(|total| total.cost), Some(Cost::Known(0.5)));
+        assert!(history.models.is_empty(), "no model recorded");
         assert!((cost - 0.5).abs() < f64::EPSILON, "{cost}");
         assert!(tasks.is_empty());
         assert!(tasks.next().await.is_none());
@@ -554,10 +590,11 @@ mod tests {
         let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
         tasks.spawn(TaskId(1), Task::Load);
         let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
-        let Some((TaskId(1), Ok(Done::Loaded(Err(error), Ok(None))))) = next else {
+        let Some((TaskId(1), Ok(Done::Loaded(Err(error), Ok(history))))) = next else {
             return Err(format!("unexpected end: {next:?}").into());
         };
         assert!(error.contains("answers.jsonl"), "{error}");
+        assert_eq!(history, History::default());
         Ok(())
     }
 

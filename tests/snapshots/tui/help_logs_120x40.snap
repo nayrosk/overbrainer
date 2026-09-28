@@ -1,7 +1,7 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ overbrainer   1 Dataset  2 Pipeline  3 Training  4 Logs                                                  rust_expert "
+" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs                                       rust_expert "
 "  Logs · INFO and above                                                                                                 "
 "                                                                                                                        "
 "                                                                                                                        "
@@ -13,7 +13,7 @@ source: src/tui/snapshots.rs
 "                                                                                                                        "
 "                     ╭ Keys ──────────────────────────────────────────────────────────────────────╮                     "
 "                     │ Everywhere                                                                 │                     "
-"                     │ 1 2 3 4, Tab, Shift-Tab    switch view                                     │                     "
+"                     │ 1 2 3 4 5, Tab, Shift-Tab  switch view                                     │                     "
 "                     │ ?                          this help (Esc, ? or q closes it)               │                     "
 "                     │ q, Ctrl-C                  quit                                            │                     "
 "                     │ R                          reload the data files and runs                  │                     "

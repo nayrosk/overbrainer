@@ -16,11 +16,13 @@ use tracing::Level;
 use super::app::{App, Effect, Overlay, Project, View};
 use super::dataset::{Node, TopicInfo};
 use super::motion::MotionLevel;
-use super::tasks::{Done, TaskId};
+use super::project::ProjectConfig;
+use super::tasks::{Done, History, TaskId};
 use super::theme::{ColorLevel, LookEnv, Theme};
 use super::ui;
 use super::widgets::status::VERSION;
 use crate::cli::data::Command;
+use crate::config::{ConfigError, EnvSource};
 use crate::dataset::{
     Dataset, Example, Exclusion, FinishReason, Id, Message, Meta, Question, ReasoningKind,
     Rejected, Role, Subtopic,
@@ -48,7 +50,8 @@ pub(super) fn app() -> App {
     app_with(&Theme::new(ColorLevel::TrueColor))
 }
 
-/// An app on the project `rust_expert` at [`NOW`], with `theme`.
+/// An app on the project `rust_expert` at [`NOW`], with `theme`, on the
+/// Dataset view: most tests are about the data.
 pub(super) fn app_with(theme: &Theme) -> App {
     let project = Project {
         name: "rust_expert".into(),
@@ -58,7 +61,9 @@ pub(super) fn app_with(theme: &Theme) -> App {
         concurrency: 8,
         target: Some("gpu_cloud".into()),
     };
-    App::new(project, LogBuffer::new(100), theme, at(NOW))
+    let mut app = App::new(project, LogBuffer::new(100), theme, at(NOW));
+    app.view = View::Dataset;
+    app
 }
 
 /// The fixtures' topics: `ownership` and `traits`.
@@ -227,6 +232,71 @@ protocol = "openai"
 generator = { provider = "fake", model = "gen" }
 parent = { provider = "fake", model = "parent" }
 "#;
+
+/// A provider key, a runpod key by Vault reference, an env value and a
+/// runpod target.
+pub(super) const PROJECT_CONFIG: &str = r#"# the project
+[project]
+name = "rust_expert"
+
+[[topics]]
+name = "ownership"
+description = "Moves, borrows and lifetimes in Rust"
+subtopics = 2
+questions_per_subtopic = 3
+
+[providers.nanogpt]
+protocol = "openai"
+
+[providers.claude]
+protocol = "anthropic"
+
+[roles]
+generator = { provider = "nanogpt", model = "gen" }
+parent = { provider = "claude", model = "claude-opus-5", reasoning = true }
+
+[pipeline]
+concurrency = 16 # overridden by env
+
+[training]
+target = "gpu_cloud"
+base_model = "Qwen/Qwen3-8B"
+adapter = "lora"
+
+[targets.gpu_cloud]
+kind = "runpod"
+gpu_types = ["NVIDIA A40"]
+max_hours = 6
+"#;
+
+/// A secret no row may show.
+pub(super) const SECRET: &str = "sk-live-0123456789abcdef";
+
+/// The environment of [`PROJECT_CONFIG`].
+pub(super) fn project_env() -> EnvSource {
+    EnvSource::Vars(vec![
+        (
+            "OVERBRAINER_PROVIDERS__NANOGPT__API_KEY".into(),
+            SECRET.into(),
+        ),
+        (
+            "OVERBRAINER_PROVIDERS__NANOGPT__BASE_URL".into(),
+            "https://nano-gpt.com/api/v1".into(),
+        ),
+        (
+            "OVERBRAINER_RUNPOD__API_KEY".into(),
+            "vault:secret/overbrainer/runpod#api_key".into(),
+        ),
+        ("OVERBRAINER_PIPELINE__CONCURRENCY".into(), "4".into()),
+        ("OVERBRAINER_TUI_COLOR".into(), "none".into()),
+        ("HOME".into(), "/home/me".into()),
+    ])
+}
+
+/// [`PROJECT_CONFIG`] in [`project_env`].
+pub(super) fn project_config() -> Result<ProjectConfig, ConfigError> {
+    ProjectConfig::new(PROJECT_CONFIG, &project_env())
+}
 
 /// A project directory holding [`CONFIG`] and the files of [`dataset`].
 pub(super) fn project() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
@@ -568,6 +638,7 @@ fn the_monochrome_theme_uses_no_color() -> TestResult {
     assert_eq!(level, ColorLevel::Mono);
     assert_eq!(MotionLevel::detect(&env, level), MotionLevel::Off);
     let mut app = dataset_app_with(&Theme::mono());
+    app.config = Some(project_config()?);
     logs(&app);
     for view in View::ALL {
         app.view = view;
@@ -737,7 +808,10 @@ fn dataset_load_error() -> TestResult {
     let Some(Effect::Spawn(id, _)) = app.start().first().cloned() else {
         return Err("no load started".into());
     };
-    app.on_done(id, Ok(Done::Loaded(Err(error.into()), Ok(None))));
+    app.on_done(
+        id,
+        Ok(Done::Loaded(Err(error.into()), Ok(History::default()))),
+    );
     app.status = None;
     snapshot("dataset_error", &mut app)?;
     Ok(())
@@ -1240,5 +1314,118 @@ fn a_pod_asked_to_be_kept_is_kept_only_once_its_job_starts() -> TestResult {
     let line = pod_text(&mut app)?;
     assert!(line.contains("kept, no time limit"), "{line}");
     assert!(!line.contains("watchdog"), "{line}");
+    Ok(())
+}
+
+/// A history entry of `stage` by `model`: `tokens` in and out, for `cost`.
+fn history_entry(
+    stage: Stage,
+    model: &str,
+    (input_tokens, output_tokens): (u64, u64),
+    cost: Option<f64>,
+) -> crate::history::Entry {
+    crate::history::Entry {
+        stage,
+        started_at: "2026-09-21T12:00:00Z".into(),
+        ended_at: "2026-09-21T12:10:00Z".into(),
+        status: crate::history::Status::Ok,
+        provider: Some("nanogpt".into()),
+        model: Some(model.into()),
+        done: 10,
+        skipped: 0,
+        failed: 0,
+        excluded: 0,
+        input_tokens,
+        output_tokens,
+        cost,
+        split: None,
+    }
+}
+
+/// The Project view on [`project_config`], with [`dataset`], a history of
+/// three stages by two models, and the runs of [`training_app`], none followed.
+pub(super) fn project_app() -> Result<App, Box<dyn std::error::Error>> {
+    let mut app = training_app()?;
+    app.training.tasks.clear();
+    app.view = View::Project;
+    app.config = Some(project_config()?);
+    app.project.topics = topics();
+    app.dataset.loaded(dataset(), &app.project.topics);
+    app.history = History::of(&[
+        history_entry(Stage::Subtopics, "gen", (3000, 750), Some(0.0012)),
+        history_entry(Stage::Questions, "gen", (40_210, 9120), Some(0.0123)),
+        history_entry(
+            Stage::Answers,
+            "claude-opus-5-20260901-long-name",
+            (412_000, 1_530_000),
+            None,
+        ),
+    ]);
+    app.history_cost = app.history.cost;
+    Ok(app)
+}
+
+#[test]
+fn project_view_with_its_configuration_and_stats() -> TestResult {
+    let mut app = project_app()?;
+    snapshot("project", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn project_view_while_a_stage_uses_the_configuration() -> TestResult {
+    let mut app = project_app()?;
+    app.pipeline_task = Some(TaskId(7));
+    app.pipeline.started(Command::Answers, 8);
+    // Down to `roles.parent.model`, which `answers` uses.
+    for _ in 0..19 {
+        app.on_input(&key(KeyCode::Char('j')));
+    }
+    snapshot("project_locked", &mut app)?;
+    let terminal = draw(&mut app, 120, 40)?;
+    let rows = text(&terminal);
+    let y = rows
+        .iter()
+        .position(|row| row.contains("model") && row.contains("claude-opus-5"))
+        .ok_or("no parent model row")?;
+    let row = rows.get(y).ok_or("no row")?;
+    assert!(row.contains("(used by answers)"), "{row}");
+    let x = row
+        .find("claude-opus-5")
+        .map(|at| row[..at].chars().count());
+    let x = u16::try_from(x.ok_or("no value")?)?;
+    let cell = terminal
+        .backend()
+        .buffer()
+        .cell((x, u16::try_from(y)?))
+        .ok_or("no cell")?;
+    assert_eq!(Some(cell.fg), app.theme.dim.fg, "a locked value is dim");
+    let text = rows.join("\n");
+    assert!(!text.contains("gen (used"), "the generator is not locked");
+    assert!(!text.contains("openai (used"), "nor its provider");
+    Ok(())
+}
+
+/// Every row of the Project view, drawn once each while `j` walks down,
+/// shows `set`, `unset` or `vault ref` for a secret, never its value.
+#[test]
+fn no_secret_is_ever_drawn_in_the_project_view() -> TestResult {
+    for (width, height) in [(80, 24), (120, 40)] {
+        let mut app = project_app()?;
+        let mut seen = String::new();
+        for _ in 0..120 {
+            seen.push_str(&text(&draw(&mut app, width, height)?).join("\n"));
+            app.on_input(&key(KeyCode::Char('j')));
+        }
+        for secret in [SECRET, "sk-live", "secret/overbrainer", "vault:"] {
+            assert!(!seen.contains(secret), "{secret} drawn at {width}x{height}");
+        }
+        assert!(seen.contains("vault ref"), "{width}x{height}");
+        assert!(
+            seen.contains("env only, set OVERBRAINER_"),
+            "{width}x{height}"
+        );
+        assert!(seen.contains("hf_token"), "the last row is reached");
+    }
     Ok(())
 }

@@ -59,17 +59,29 @@ pub(super) fn history_so_far(app: &App) -> Option<Cost> {
 /// Runpod pod, live or deleted.
 pub(super) fn project_cost(app: &App) -> Cost {
     let mut total = history_so_far(app);
-    for run in &app.training.runs {
-        // A pod never created spent nothing.
-        if let Some(pod) = run.pod.as_ref().filter(|pod| pod.pod_id.is_some()) {
-            let latest = app
-                .training
-                .task_of(&run.record.id)
-                .and_then(|(_, follow)| follow.pod.as_ref());
-            total = Some(add(total, pod_spend(pod, latest, app.now)));
-        }
+    for spend in pod_spends(app) {
+        total = Some(add(total, spend));
     }
     total.unwrap_or_default()
+}
+
+/// What every Runpod pod of the runs spent, live or deleted, `None` when no
+/// pod was created.
+pub(super) fn pods_cost(app: &App) -> Option<Cost> {
+    pod_spends(app).fold(None, |total, spend| Some(add(total, spend)))
+}
+
+/// What each pod of the runs spent, `None` when unknown. A pod never created
+/// spent nothing and is left out.
+fn pod_spends(app: &App) -> impl Iterator<Item = Option<f64>> + '_ {
+    app.training.runs.iter().filter_map(|run| {
+        let pod = run.pod.as_ref().filter(|pod| pod.pod_id.is_some())?;
+        let latest = app
+            .training
+            .task_of(&run.record.id)
+            .and_then(|(_, follow)| follow.pod.as_ref());
+        Some(pod_spend(pod, latest, app.now))
+    })
 }
 
 #[cfg(test)]

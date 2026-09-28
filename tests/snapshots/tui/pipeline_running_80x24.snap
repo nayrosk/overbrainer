@@ -1,7 +1,7 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ overbrainer   1 Dataset  2 Pipeline  3 Training  4 Logs          rust_expert "
+" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  rust_ex… "
 "  Pipeline · run                                    in flight  retries  failed  "
 "  ✓ subtopics   █████████████████████████       3/3         0        0       0  "
 "  ✓ questions   █████████████████████████     36/36         0        0       0  "
@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "      out; cost $0.0123                                                         "
 "                                                                                "
 "                                                                                "
-" r run a stage · 1-4 views · q quit … answers 120/400 · locked · v#.#.#  ? help "
+" r run a stage · 1-5 views · q quit … answers 120/400 · locked · v#.#.#  ? help "
