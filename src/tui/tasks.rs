@@ -15,12 +15,14 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use super::catalog::{CatalogKind, fetch};
 use super::cost::history_cost;
 use super::editor::Edited;
 use super::project::ProjectConfig;
 use super::project_edit::{SaveRefusal, save_config};
 use super::start::{Prices, StartPlan, list_prices, prepare};
 use super::training::{Listing, list_runs, read_series};
+use super::widgets::picker;
 use crate::cli::data::Command;
 use crate::cli::front::{Frontend, Report};
 use crate::cli::{StageArgs, TrainArgs, TrainCommand};
@@ -66,6 +68,13 @@ pub(super) enum Task {
     Prepare,
     /// The list prices of these Runpod GPU types.
     Prices(Vec<String>),
+    /// What a picker of `kind` lists, GPU stock for `gpu_count` GPUs.
+    Catalog {
+        /// What is listed.
+        kind: CatalogKind,
+        /// GPUs per pod.
+        gpu_count: u32,
+    },
     /// Validates `text` with `env` and writes it to `overbrainer.toml`,
     /// unless the file no longer holds `base`.
     SaveConfig {
@@ -182,6 +191,8 @@ pub(super) enum Done {
     Prepared(Result<StartPlan, String>),
     /// List prices of GPU types.
     Prices(Prices),
+    /// A picker's entries, or why they cannot be read.
+    Catalog(Result<Vec<picker::Entry>, String>),
     /// The configuration written to `overbrainer.toml`, or why nothing was.
     ConfigSaved(Result<Box<ProjectConfig>, SaveRefusal>),
 }
@@ -322,7 +333,8 @@ pub(super) struct Tasks {
     ids: HashMap<tokio::task::Id, TaskId>,
     tokens: HashMap<TaskId, CancellationToken>,
     abandons: HashMap<TaskId, Arc<AtomicBool>>,
-    /// The list price lookups running: only reads, aborted when the TUI ends.
+    /// The list price and catalog lookups running: only reads, aborted when
+    /// the TUI ends.
     lookups: HashMap<TaskId, AbortHandle>,
 }
 
@@ -346,7 +358,7 @@ impl Tasks {
         &self.project_dir
     }
 
-    /// Aborts the list price lookups: they only read, so the TUI never waits
+    /// Aborts the list price and catalog lookups: they only read, so the TUI never waits
     /// for them to end.
     pub(super) fn abort_lookups(&mut self) {
         for (_, lookup) in self.lookups.drain() {
@@ -465,14 +477,30 @@ impl Tasks {
             },
             Task::Prices(gpu_types) => {
                 let dir = self.project_dir.clone();
-                let handle = self.set.spawn(async move {
+                self.spawn_lookup(id, async move {
                     Done::Prices(list_prices(&dir, EnvSource::Process, gpu_types).await)
-                });
-                self.lookups.insert(id, handle.clone());
-                handle
+                })
+            },
+            Task::Catalog { kind, gpu_count } => {
+                let dir = self.project_dir.clone();
+                self.spawn_lookup(id, async move {
+                    Done::Catalog(fetch(&dir, EnvSource::Process, kind, gpu_count).await)
+                })
             },
         };
         self.ids.insert(handle.id(), id);
+    }
+
+    /// Starts the lookup `read` as `id`: it only reads, so it is aborted when
+    /// the TUI ends.
+    fn spawn_lookup(
+        &mut self,
+        id: TaskId,
+        read: impl Future<Output = Done> + Send + 'static,
+    ) -> AbortHandle {
+        let handle = self.set.spawn(read);
+        self.lookups.insert(id, handle.clone());
+        handle
     }
 
     /// Starts the pipeline `command` as `id`: its token interrupts the stage.

@@ -12,7 +12,7 @@ use super::app::{App, Overlay, View};
 use super::format::cut;
 use super::motion::Areas;
 use super::views;
-use super::widgets::{dialog, help, menu, status, too_small};
+use super::widgets::{dialog, help, menu, picker, status, too_small};
 
 /// Columns of the header's brand, before the tabs.
 const BRAND_WIDTH: u16 = 17;
@@ -73,6 +73,13 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
             ))
         },
         Some(Overlay::Menu(selected)) => Some(menu::render(frame, area, *selected, &app.theme)),
+        Some(Overlay::Picker(picking)) => Some(picker::render(
+            frame,
+            area,
+            &picking.picker,
+            &app.theme,
+            app.motion.spinner(),
+        )),
         None => None,
     };
     if let Some(popup) = overlay {

@@ -463,6 +463,34 @@ pub(super) fn series() -> Vec<crate::train::TrainMetric> {
         .collect()
 }
 
+/// The fixture GPU catalog as the GPU picker lists it for `gpu_count` GPUs.
+pub(super) fn gpu_catalog(
+    gpu_count: u32,
+) -> Result<Vec<super::widgets::picker::Entry>, serde_json::Error> {
+    let gpus: Vec<crate::runpod::GpuType> = serde_json::from_value(serde_json::json!([
+        {"id": "NVIDIA A40", "memory": 48, "price": {"secure": 0.4},
+         "maxCount": {"secure": 10}, "availability": "HIGH"},
+        {"id": "NVIDIA GeForce RTX 4090", "memory": 24, "price": {"secure": 0.69},
+         "maxCount": {"secure": 8}, "availability": "MEDIUM"},
+        {"id": "NVIDIA L4", "memory": 24, "price": {"secure": 0.43},
+         "maxCount": {"secure": 1}, "availability": "HIGH"},
+        {"id": "NVIDIA RTX A6000", "memory": 48, "price": {"secure": 0.49},
+         "maxCount": {"secure": 8}, "availability": "LOW"},
+        {"id": "NVIDIA A100 80GB PCIe", "memory": 80, "price": {"secure": 1.64},
+         "maxCount": {"secure": 8}, "availability": "NONE"},
+        {"id": "NVIDIA H100 80GB HBM3", "memory": 80, "price": {"secure": 2.99},
+         "maxCount": {"secure": 8}, "availability": "LOW"},
+        {"id": "NVIDIA RTX 2000 Ada Generation", "memory": 16, "price": {"secure": 0.24},
+         "maxCount": {"secure": 4}, "availability": "HIGH"},
+        {"id": "NVIDIA L40S", "memory": 48, "price": {"secure": 0.86},
+         "maxCount": {"secure": 8}, "availability": "MEDIUM"},
+        {"id": "AMD Instinct MI300X OAM", "memory": 192, "price": {"secure": 2.49},
+         "maxCount": {"secure": 8}, "availability": "NONE"},
+        {"id": "NVIDIA H200", "memory": 141, "maxCount": {"secure": 8}}
+    ]))?;
+    Ok(super::catalog::gpu_entries(&gpus, gpu_count))
+}
+
 /// A key press.
 pub(super) fn key(code: KeyCode) -> TermEvent {
     TermEvent::Key(KeyEvent {
@@ -953,6 +981,69 @@ fn a_failed_run_keeps_its_error_in_view_at_80x24() -> TestResult {
         !rows.iter().any(|row| row.contains("3f1c…000a")),
         "{rows:#?}"
     );
+    Ok(())
+}
+
+/// The app with the picker of `kind` open, `chosen` preselected; returns the
+/// task reading its entries.
+fn picker_app(
+    kind: super::catalog::CatalogKind,
+    chosen: &[&str],
+) -> Result<(App, TaskId), Box<dyn std::error::Error>> {
+    let mut app = app();
+    let chosen = chosen.iter().map(|id| (*id).to_string()).collect();
+    let effects = app.open_picker(kind, 2, super::widgets::picker::Choice::List(chosen));
+    match effects.as_slice() {
+        [Effect::Spawn(id, _)] => Ok((app, *id)),
+        _ => Err(format!("{effects:?}").into()),
+    }
+}
+
+#[test]
+fn the_gpu_picker_on_a_fixture_catalog() -> TestResult {
+    let (mut app, id) = picker_app(
+        super::catalog::CatalogKind::Gpus,
+        &["NVIDIA A40", "NVIDIA GeForce RTX 4090"],
+    )?;
+    let rows = text(&draw(&mut app, 80, 24)?);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("reading the Runpod catalog")),
+        "{rows:#?}"
+    );
+    app.on_done(id, Ok(Done::Catalog(Ok(gpu_catalog(2)?))));
+    app.on_input(&key(KeyCode::Down));
+    app.on_input(&key(KeyCode::Down));
+    snapshot("picker_gpus", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn a_picker_filtered_while_typed() -> TestResult {
+    let (mut app, id) = picker_app(super::catalog::CatalogKind::Gpus, &[])?;
+    app.on_done(id, Ok(Done::Catalog(Ok(gpu_catalog(2)?))));
+    for c in "/h1".chars() {
+        app.on_input(&key(KeyCode::Char(c)));
+    }
+    let rows = text(&draw(&mut app, 80, 24)?);
+    let listed: Vec<&String> = rows.iter().filter(|row| row.contains("NVIDIA")).collect();
+    assert_eq!(listed.len(), 1, "{rows:#?}");
+    assert!(listed[0].contains("NVIDIA H100 80GB HBM3"), "{rows:#?}");
+    assert!(rows.iter().any(|row| row.contains("/ h1")), "{rows:#?}");
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Enter keep · Esc clear"))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_picker_whose_catalog_cannot_be_read() -> TestResult {
+    let (mut app, id) = picker_app(super::catalog::CatalogKind::Volumes, &["vol-1"])?;
+    let error =
+        "cannot read the Runpod catalog: no Runpod API key: set OVERBRAINER_RUNPOD__API_KEY";
+    app.on_done(id, Ok(Done::Catalog(Err(error.into()))));
+    snapshot("picker_error", &mut app)?;
     Ok(())
 }
 

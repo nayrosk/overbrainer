@@ -426,6 +426,7 @@ impl App {
             Overlay::Help => "help".to_string(),
             Overlay::Menu(_) => "menu".to_string(),
             Overlay::Confirm(confirm) => confirm.title.clone(),
+            Overlay::Picker(picking) => format!("picker {:?}", picking.kind),
         });
         let status = self
             .status

@@ -1,6 +1,7 @@
 //! The key tables the help overlay and the footer show, as data.
 
 use super::app::View;
+use super::widgets::picker::Mode;
 
 /// Width of the help overlay, borders included: it fits 80 columns.
 pub(super) const HELP_WIDTH: u16 = 78;
@@ -143,6 +144,10 @@ pub(super) enum Context {
     Help,
     /// The `r` menu.
     Menu,
+    /// A picker's entries, in this mode.
+    Picker(Mode),
+    /// A picker whose entries are being read, or cannot be.
+    Listing,
 }
 
 const FOOTER_PROJECT: &[Hint] = &[
@@ -193,6 +198,19 @@ const FOOTER_PICK: &[Hint] = &[
     hint("Esc", "cancel"),
 ];
 const FOOTER_HELP: &[Hint] = &[hint("Esc", "close")];
+const FOOTER_PICKER: &[Hint] = &[
+    hint("Space", "toggle"),
+    hint("J/K", "order"),
+    hint("/", "filter"),
+    hint("Enter", "keep"),
+    hint("Esc", "cancel"),
+];
+const FOOTER_PICK_ONE: &[Hint] = &[
+    hint("j/k", "move"),
+    hint("/", "filter"),
+    hint("Enter", "pick"),
+    hint("Esc", "cancel"),
+];
 const FOOTER_MENU: &[Hint] = &[
     hint("j/k", "move"),
     hint("Enter", "run"),
@@ -213,8 +231,10 @@ pub(super) fn footer(context: Context) -> Vec<Hint> {
         Context::Form => FOOTER_FORM.to_vec(),
         Context::Pick => FOOTER_PICK.to_vec(),
         Context::Dialog { yes, no } => vec![hint("y", yes), hint("n, Esc or Enter", no)],
-        Context::Help => FOOTER_HELP.to_vec(),
+        Context::Help | Context::Listing => FOOTER_HELP.to_vec(),
         Context::Menu => FOOTER_MENU.to_vec(),
+        Context::Picker(Mode::Multi) => FOOTER_PICKER.to_vec(),
+        Context::Picker(Mode::Single) => FOOTER_PICK_ONE.to_vec(),
     }
 }
 
@@ -263,6 +283,9 @@ mod tests {
             dialog,
             Context::Help,
             Context::Menu,
+            Context::Picker(Mode::Multi),
+            Context::Picker(Mode::Single),
+            Context::Listing,
         ];
         for context in View::ALL.map(Context::View).into_iter().chain(others) {
             let hints = footer(context);

@@ -77,6 +77,16 @@ pub(in crate::tui) fn context(app: &App) -> Context {
         },
         Some(Overlay::Help) => Context::Help,
         Some(Overlay::Menu(_)) => Context::Menu,
+        Some(Overlay::Picker(picking)) => {
+            let picker = &picking.picker;
+            if picker.typing() {
+                Context::Filter
+            } else if picker.loading() || picker.error().is_some() {
+                Context::Listing
+            } else {
+                Context::Picker(picker.mode())
+            }
+        },
         None if app.view == View::Dataset && app.dataset.input.is_some() => Context::Filter,
         None if app.view == View::Project => match &app.project_view.form {
             Some(Form::Value { .. } | Form::Name { .. }) => Context::Form,

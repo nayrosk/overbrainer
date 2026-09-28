@@ -38,7 +38,6 @@ impl Input {
     }
 
     /// The text typed so far.
-    #[cfg(test)]
     pub(in crate::tui) fn text(&self) -> &str {
         &self.text
     }

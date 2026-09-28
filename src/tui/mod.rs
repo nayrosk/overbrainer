@@ -4,6 +4,7 @@
 //! or stderr while the terminal shows it.
 
 mod app;
+mod catalog;
 mod cost;
 mod dataset;
 mod editor;
