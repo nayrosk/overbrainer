@@ -250,6 +250,29 @@ mod tests {
         Ok(())
     }
 
+    /// A job leading its own process group and ignoring `SIGTERM`, returned once its
+    /// trap is set: a `SIGTERM` sent before that would kill it at once.
+    fn spawn_ignoring_term(
+        shell: Shell,
+    ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+        use std::io::BufRead as _;
+        let mut child = shell
+            .run("trap '' TERM; echo ready; sleep 30")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut line = String::new();
+        if let Some(stdout) = child.stdout.take() {
+            std::io::BufReader::new(stdout).read_line(&mut line)?;
+        }
+        if line.trim() != "ready" {
+            child.kill()?;
+            child.wait()?;
+            return Err(format!("{shell}: the job did not start: {line:?}").into());
+        }
+        Ok(child)
+    }
+
     #[test]
     fn quoting_survives_single_quotes() {
         assert_eq!(quote("a b"), "'a b'");
@@ -551,10 +574,7 @@ mod tests {
         // second grace period: this gives the test a window to observe `status`
         // mid-cancel.
         for &shell in shells() {
-            let child = shell
-                .run("trap '' TERM; sleep 30")
-                .process_group(0)
-                .spawn()?;
+            let child = spawn_ignoring_term(shell)?;
             let pid = child.id();
             let reaper = std::thread::spawn(move || {
                 let mut child = child;
@@ -598,10 +618,7 @@ mod tests {
         // the killed leader is a zombie, which still counts as a member of its process
         // group. The marker must wait for that, not follow the SIGKILL at once.
         for &shell in shells() {
-            let child = shell
-                .run("trap '' TERM; sleep 30")
-                .process_group(0)
-                .spawn()?;
+            let child = spawn_ignoring_term(shell)?;
             let pid = child.id();
             let reaper = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(12));

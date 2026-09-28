@@ -391,55 +391,15 @@ fn warn_about_reasoning<C>(ctx: &Ctx<'_>, parent: &RoleClient<C>) {
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::sync::Mutex;
 
-    use tracing_subscriber::fmt::MakeWriter;
+    use tracing::Level;
 
     use super::*;
     use crate::dataset::DatasetError;
     use crate::llm::{Reasoning, Usage};
 
-    /// Collects formatted log lines.
-    #[derive(Clone, Default)]
-    struct Logs(Arc<Mutex<Vec<u8>>>);
-
-    impl Logs {
-        fn text(&self) -> String {
-            self.0
-                .lock()
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .unwrap_or_default()
-        }
-    }
-
-    impl io::Write for Logs {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if let Ok(mut bytes) = self.0.lock() {
-                bytes.extend_from_slice(buf);
-            }
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl MakeWriter<'_> for Logs {
-        type Writer = Self;
-
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[test]
     fn a_disk_error_after_a_fatal_stop_still_logs_the_provider_error() {
-        let logs = Logs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_ansi(false)
-            .finish();
         let stop = PipelineError::Llm {
             stage: Stage::Answers,
             source: LlmError::Status {
@@ -453,17 +413,19 @@ mod tests {
             path: "data/answers.jsonl".into(),
             source: io::Error::other("no space left"),
         });
-        let returned = tracing::subscriber::with_default(subscriber, || {
-            stopped(stop, Err(disk), StageStats::default())
-        });
+        let (returned, logs) =
+            crate::logging::capture(|| stopped(stop, Err(disk), StageStats::default()));
         assert!(
             matches!(returned, PipelineError::Dataset(_)),
             "the disk error is returned"
         );
-        let text = logs.text();
-        assert!(text.contains("ERROR"), "{text}");
-        assert!(text.contains("answers stopped"), "{text}");
-        assert!(text.contains("401"), "{text}");
+        let errors = logs.since(Level::ERROR, 0);
+        assert!(
+            errors.iter().any(
+                |line| line.message.contains("answers stopped") && line.message.contains("401")
+            ),
+            "{errors:?}"
+        );
     }
 
     fn completion(content: &str, kind: ReasoningKind, finish: FinishReason) -> Completion {

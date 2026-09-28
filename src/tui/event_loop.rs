@@ -1132,6 +1132,20 @@ mod tests {
         Err(format!("never drawn: {text}"))
     }
 
+    /// Waits until the screen shows `text` and not `busy`.
+    async fn drawn_without(frame: &Mutex<String>, text: &str, busy: &str) -> Result<(), String> {
+        for _ in 0..1000 {
+            if frame
+                .lock()
+                .is_ok_and(|frame| frame.contains(text) && !frame.contains(busy))
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(format!("never drawn: {text} without {busy}"))
+    }
+
     /// Why a test timed out: what `app` was at and the last screen drawn, so a
     /// timeout on a slow runner says where it stopped.
     fn stalled(stage: &str, app: &App, frame: &Mutex<String>) -> String {
@@ -1307,7 +1321,10 @@ mod tests {
             let (events, input) = mpsc::unbounded_channel();
             let run_loop = drive(&mut terminal, &mut app, input, None);
             let keys = async {
-                drawn(&frame, "configuration").await?;
+                // Once the start's load ended: while it runs, its spinner is
+                // drawn every frame, and the draw after `s` may then not be due
+                // before the save ends.
+                drawn_without(&frame, "configuration", "loading").await?;
                 tokio::time::sleep(FRAME * 2).await;
                 if draw_fails {
                     fail.store(true, Ordering::SeqCst);

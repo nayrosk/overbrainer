@@ -2518,12 +2518,8 @@ mod tests {
 
     #[test]
     fn a_history_read_error_is_warned_once_until_it_changes() -> TestResult {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let buffer = crate::logging::LogBuffer::new(10);
-        let subscriber = tracing_subscriber::registry().with(buffer.layer());
         let mut app = app();
-        tracing::subscriber::with_default(subscriber, || -> TestResult {
+        let (loaded, buffer) = crate::logging::capture(|| -> TestResult {
             let mut id = only_load(&app.start())?;
             // A read that works again forgets the error.
             for history in ["denied", "denied", "gone", "gone"]
@@ -2535,7 +2531,8 @@ mod tests {
                 id = only_load(&but_runs(press(&mut app, &[KeyCode::Char('R')])))?;
             }
             Ok(())
-        })?;
+        });
+        loaded?;
         let warned: Vec<String> = buffer
             .since(tracing::Level::WARN, 0)
             .into_iter()
