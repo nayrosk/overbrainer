@@ -611,7 +611,7 @@ mod tests {
     fn pending_changes_a_lock_or_a_volume_refuse_the_choice() -> TestResult {
         let (_dir, mut app) = starting(PROJECT_CONFIG)?;
         app.project_view.pending = Some(crate::tui::project::Pending::new(
-            &crate::config::edit::ConfigDoc::parse(PROJECT_CONFIG)?,
+            &crate::tui::project::ProjectConfig::new(PROJECT_CONFIG, &app.env)?,
         ));
         assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
         assert_eq!(

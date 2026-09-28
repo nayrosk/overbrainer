@@ -24,7 +24,7 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 
 use self::front::Frontend;
-use crate::config::DotenvKeys;
+use crate::config::{DotenvKeys, EnvSource};
 use crate::logging::{LOG_LINES, LogBuffer, LogMode};
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
 use crate::update::{self, CheckEnv, Newer};
@@ -380,7 +380,7 @@ async fn dispatch(
             stage(dir, data::Command::Run, &StageArgs::default()).await?;
             train::after_run(dir, &Frontend::Cli).await
         },
-        Command::Train(args) => train::run(dir, &args, &Frontend::Cli).await,
+        Command::Train(args) => train::run(dir, &args, &Frontend::Cli, &EnvSource::Process).await,
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
@@ -396,7 +396,7 @@ async fn dispatch(
 
 /// Runs a pipeline command on the command line.
 async fn stage(dir: &Path, command: data::Command, args: &StageArgs) -> anyhow::Result<()> {
-    data::run(dir, command, args, &Frontend::Cli).await
+    data::run(dir, command, args, &Frontend::Cli, &EnvSource::Process).await
 }
 
 /// Secret resolver from `VAULT_ADDR`, `VAULT_TOKEN` and `~/.vault-token`. Vault is

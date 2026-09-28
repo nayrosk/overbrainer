@@ -53,10 +53,10 @@ struct Session {
 }
 
 impl Session {
-    fn open(project_dir: &Path) -> anyhow::Result<Self> {
+    fn open(project_dir: &Path, env: &EnvSource) -> anyhow::Result<Self> {
         Ok(Self {
             project_dir: project_dir.to_path_buf(),
-            settings: crate::config::load(project_dir, EnvSource::Process)?,
+            settings: crate::config::load(project_dir, env.clone())?,
             files: DataFiles::new(project_dir),
             resolver: super::resolver(),
             generator: OnceCell::new(),
@@ -142,10 +142,11 @@ impl Session {
     }
 }
 
-/// Runs `command` in `project_dir`, publishing progress on `front`'s bus, emitting a
-/// usage summary per stage through `front` (stdout on the command line) and
-/// recording each stage it starts in the project's history. The command stops at
-/// `front`'s interruption (Ctrl-C on the command line).
+/// Runs `command` in `project_dir` with the settings read with `env`, publishing
+/// progress on `front`'s bus, emitting a usage summary per stage through `front`
+/// (stdout on the command line) and recording each stage it starts in the
+/// project's history. The command stops at `front`'s interruption (Ctrl-C on the
+/// command line).
 ///
 /// # Errors
 ///
@@ -157,8 +158,9 @@ pub async fn run(
     command: Command,
     args: &StageArgs,
     front: &Frontend,
+    env: &EnvSource,
 ) -> anyhow::Result<()> {
-    let session = Session::open(project_dir)?;
+    let session = Session::open(project_dir, env)?;
     let guard = front.open_bus();
     let mut recorder = Recorder::new(project_dir, &guard.bus);
     let steps = Steps {

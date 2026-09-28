@@ -11,6 +11,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tracing::Level;
 
 use super::catalog::{CatalogKind, Listed, Query};
+use super::config_watch::ConfigWatch;
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
 use super::editor::{self, Session, Target};
 use super::follow::REFRESH;
@@ -101,6 +102,9 @@ pub(super) enum Effect {
     },
     /// Open this URL in a browser, detached.
     OpenUrl(String),
+    /// Has the tasks started from now read the settings with this
+    /// environment: the configuration was read again.
+    UseEnv(EnvSource),
     /// Writes `lines` to `.overbrainer/<name>`, off the UI thread, never
     /// overwriting an existing file.
     ExportLogs {
@@ -393,6 +397,9 @@ pub(super) struct App {
     pub(super) project_view: ProjectView,
     /// The environment the configuration is read with.
     pub(super) env: EnvSource,
+    /// The look at the configuration files every few seconds, `None` when
+    /// they are not watched (the tests).
+    pub(super) watch: Option<ConfigWatch>,
     /// The last error reading the history, warned once, until a read works.
     history_error: Option<String>,
     /// While a pipeline task runs, and until the reload after its end read the
@@ -487,6 +494,7 @@ impl App {
             config: None,
             project_view: ProjectView::default(),
             env: EnvSource::Process,
+            watch: None,
             history_error: None,
             cost_base: None,
             base_load: None,
@@ -673,6 +681,7 @@ impl App {
                 self.listed_catalog(id, listed);
                 Vec::new()
             },
+            Ok(Done::ConfigChecked(checked)) => self.config_checked(id, *checked),
             Ok(Done::Prepared(_) | Done::StartCatalog(_) | Done::ConfigSaved(_)) => Vec::new(),
             Err(error) => self.failed(id, error),
         }
@@ -732,6 +741,9 @@ impl App {
         }
         if self.project_view.save == Some(id) {
             return self.config_saved(Err(SaveRefusal::Failed(error)));
+        }
+        if self.check_failed(id) {
+            return Vec::new();
         }
         if self.pipeline_task == Some(id) {
             return self.pipeline_ended(id, Err(error));
@@ -1795,12 +1807,14 @@ impl App {
 
     /// Moves the clock to `now`: expires the status message and shows new log
     /// lines, and the newest warning or error on the status line; reads `runs/`
-    /// again when the Training view is shown and it is time, and the data files
-    /// when the Dataset view is shown while a stage runs.
+    /// again when the Training view is shown and it is time, the data files
+    /// when the Dataset view is shown while a stage runs, and the configuration
+    /// when its files changed.
     pub(super) fn on_tick(&mut self, now: SystemTime) -> Vec<Effect> {
         self.now = now;
         let mut effects = self.refresh_when_due();
         effects.extend(self.reload_while_running(false));
+        effects.extend(self.check_config());
         if self.status.as_ref().is_some_and(|status| {
             now.duration_since(status.at)
                 .is_ok_and(|shown| shown >= STATUS_FOR)

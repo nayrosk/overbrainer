@@ -25,7 +25,7 @@ use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::Command;
 use crate::cli::front::{Frontend, Report};
 use crate::cli::{StageArgs, TrainArgs, TrainCommand};
-use crate::config::EnvSource;
+use crate::config::{DotenvKeys, EnvSource, ReloadError, Stamp, reload, stamp};
 use crate::dataset::{Counts, DataFiles, Dataset, Deletion};
 use crate::events::{Event, EventBus, Stage};
 use crate::history::{self, Cost, Entry, Total};
@@ -70,6 +70,15 @@ pub(super) enum Task {
     StartCatalog(u32),
     /// What a picker lists, or the GPU types a field hint needs.
     Catalog(Query),
+    /// Reads `overbrainer.toml` and `.env` again when their stamp is no
+    /// longer `seen`, with the process environment but the keys `.env` set at
+    /// start, `dotenv`.
+    CheckConfig {
+        /// The stamp of the files the configuration shown was read from.
+        seen: Stamp,
+        /// The keys `.env` set at start.
+        dotenv: DotenvKeys,
+    },
     /// Validates `text` with `env` and writes it to `overbrainer.toml`,
     /// unless the file no longer holds `base`.
     SaveConfig {
@@ -190,6 +199,51 @@ pub(super) enum Done {
     Catalog(Result<Listed, String>),
     /// The configuration written to `overbrainer.toml`, or why nothing was.
     ConfigSaved(Result<Box<ProjectConfig>, SaveRefusal>),
+    /// What a look at the configuration files found.
+    ConfigChecked(Box<Checked>),
+}
+
+/// What a look at `overbrainer.toml` and `.env` found.
+#[derive(Debug)]
+pub(super) struct Checked {
+    /// The stamp of the files, taken before they were read.
+    pub(super) stamp: Stamp,
+    /// When the stamp changed: the configuration read again, or why it
+    /// cannot be used.
+    pub(super) read: Option<Result<Reread, ReloadError>>,
+}
+
+/// The configuration read again, and the environment it was read with.
+#[derive(Debug)]
+pub(super) struct Reread {
+    /// The configuration.
+    pub(super) config: ProjectConfig,
+    /// Its environment, which the next tasks read the settings with.
+    pub(super) env: EnvSource,
+}
+
+/// Reads the configuration of the project in `dir` again unless the stamp of
+/// its files is still `seen`; `dotenv` are the keys `.env` set at start.
+pub(super) fn check_config(dir: &Path, seen: Stamp, dotenv: &DotenvKeys) -> Checked {
+    let now = stamp(dir);
+    if now == seen {
+        return Checked {
+            stamp: now,
+            read: None,
+        };
+    }
+    let read = reload(dir, dotenv).and_then(|reloaded| {
+        let mut config = ProjectConfig::new(&reloaded.text, &reloaded.env)?;
+        config.stamp = Some(now);
+        Ok(Reread {
+            config,
+            env: reloaded.env,
+        })
+    });
+    Checked {
+        stamp: now,
+        read: Some(read),
+    }
 }
 
 /// A saved edit.
@@ -331,6 +385,8 @@ pub(super) struct Tasks {
     /// The catalog lookups running: only reads, aborted when
     /// the TUI ends.
     lookups: HashMap<TaskId, AbortHandle>,
+    /// The environment the tasks started from now read the settings with.
+    env: EnvSource,
 }
 
 impl Tasks {
@@ -345,7 +401,14 @@ impl Tasks {
             tokens: HashMap::new(),
             abandons: HashMap::new(),
             lookups: HashMap::new(),
+            env: EnvSource::Process,
         }
+    }
+
+    /// Has the tasks started from now read the settings with `env`; those
+    /// running keep the settings they read.
+    pub(super) fn use_env(&mut self, env: EnvSource) {
+        self.env = env;
     }
 
     /// The project directory tasks are spawned for.
@@ -413,28 +476,17 @@ impl Tasks {
             },
             Task::Edit(edit) => {
                 let dir = self.project_dir.clone();
+                let env = self.env.clone();
                 self.set.spawn(async move {
-                    let saved =
-                        tokio::task::spawn_blocking(move || save(&dir, &edit, EnvSource::Process))
-                            .await;
+                    let saved = tokio::task::spawn_blocking(move || save(&dir, &edit, env)).await;
                     Done::Saved(match saved {
                         Ok(saved) => saved,
                         Err(error) => Err(format!("the edit failed: {error}")),
                     })
                 })
             },
-            Task::SaveConfig { text, base, env } => {
-                let dir = self.project_dir.clone();
-                self.set.spawn(async move {
-                    let saved = tokio::task::spawn_blocking(move || {
-                        save_config(&dir, &text, &base, &env).map(Box::new)
-                    })
-                    .await;
-                    Done::ConfigSaved(saved.unwrap_or_else(|error| {
-                        Err(SaveRefusal::Failed(format!("the save failed: {error}")))
-                    }))
-                })
-            },
+            Task::CheckConfig { seen, dotenv } => self.spawn_check(seen, dotenv),
+            Task::SaveConfig { text, base, env } => self.spawn_save(text, base, env),
             Task::Pipeline(command) => self.spawn_pipeline(id, command),
             Task::Train(job) => self.spawn_train(id, job),
             Task::Runs => {
@@ -460,10 +512,9 @@ impl Tasks {
             },
             Task::Prepare => {
                 let dir = self.project_dir.clone();
+                let env = self.env.clone();
                 self.set.spawn(async move {
-                    let plan =
-                        tokio::task::spawn_blocking(move || prepare(&dir, EnvSource::Process))
-                            .await;
+                    let plan = tokio::task::spawn_blocking(move || prepare(&dir, env)).await;
                     Done::Prepared(match plan {
                         Ok(plan) => plan,
                         Err(error) => Err(format!("cannot prepare the run: {error}")),
@@ -472,18 +523,53 @@ impl Tasks {
             },
             Task::StartCatalog(gpu_count) => {
                 let dir = self.project_dir.clone();
+                let env = self.env.clone();
                 self.spawn_lookup(id, async move {
-                    Done::StartCatalog(list_gpus(&dir, EnvSource::Process, gpu_count).await)
+                    Done::StartCatalog(list_gpus(&dir, env, gpu_count).await)
                 })
             },
             Task::Catalog(query) => {
                 let dir = self.project_dir.clone();
-                self.spawn_lookup(id, async move {
-                    Done::Catalog(fetch(&dir, EnvSource::Process, query).await)
-                })
+                let env = self.env.clone();
+                self.spawn_lookup(
+                    id,
+                    async move { Done::Catalog(fetch(&dir, env, query).await) },
+                )
             },
         };
         self.ids.insert(handle.id(), id);
+    }
+
+    /// Starts writing `text` to `overbrainer.toml`, validated with `env`,
+    /// unless the file no longer holds `base`.
+    fn spawn_save(&mut self, text: String, base: String, env: EnvSource) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        self.set.spawn(async move {
+            let saved = tokio::task::spawn_blocking(move || {
+                save_config(&dir, &text, &base, &env).map(Box::new)
+            })
+            .await;
+            Done::ConfigSaved(saved.unwrap_or_else(|error| {
+                Err(SaveRefusal::Failed(format!("the save failed: {error}")))
+            }))
+        })
+    }
+
+    /// Starts a look at the configuration files, whose stamp was `seen`; a
+    /// look that fails finds nothing new, and the next one looks again.
+    fn spawn_check(&mut self, seen: Stamp, dotenv: DotenvKeys) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        self.set.spawn(async move {
+            let checked =
+                tokio::task::spawn_blocking(move || check_config(&dir, seen, &dotenv)).await;
+            Done::ConfigChecked(Box::new(checked.unwrap_or_else(|error| {
+                tracing::warn!("cannot check the configuration files: {error}");
+                Checked {
+                    stamp: seen,
+                    read: None,
+                }
+            })))
+        })
     }
 
     /// Starts the lookup `read` as `id`: it only reads, so it is aborted when
@@ -501,6 +587,7 @@ impl Tasks {
     /// Starts the pipeline `command` as `id`: its token interrupts the stage.
     fn spawn_pipeline(&mut self, id: TaskId, command: Command) -> AbortHandle {
         let dir = self.project_dir.clone();
+        let env = self.env.clone();
         let token = CancellationToken::new();
         let abandon = Arc::new(AtomicBool::new(false));
         let (front, forwarder) = front_end(id, &self.messages, &token, &abandon);
@@ -508,7 +595,7 @@ impl Tasks {
         self.set.spawn(async move {
             let args = StageArgs::default();
             // The flow ends itself when the token is cancelled, recording the stage.
-            let outcome = crate::cli::data::run(&dir, command, &args, &front)
+            let outcome = crate::cli::data::run(&dir, command, &args, &front, &env)
                 .await
                 .map_err(|error| format!("{error:#}"));
             forwarded(front, forwarder, "stage").await;
@@ -520,6 +607,7 @@ impl Tasks {
     /// its abandon flag makes a Runpod provisioning delete its pod.
     fn spawn_train(&mut self, id: TaskId, job: TrainJob) -> AbortHandle {
         let dir = self.project_dir.clone();
+        let env = self.env.clone();
         let token = CancellationToken::new();
         let abandon = Arc::new(AtomicBool::new(false));
         let (front, forwarder) = front_end(id, &self.messages, &token, &abandon);
@@ -528,7 +616,7 @@ impl Tasks {
         self.set.spawn(async move {
             // Never aborted: the flow shields its starts and cancels, and only
             // its token detaches it.
-            let result = crate::cli::train::run(&dir, &job.args(), &front).await;
+            let result = crate::cli::train::run(&dir, &job.args(), &front, &env).await;
             forwarded(front, forwarder, "training").await;
             Done::Trained(result.map_err(|error| format!("{error:#}")))
         })
@@ -615,6 +703,64 @@ mod tests {
             std::fs::read_to_string(dir.path().join("overbrainer.toml"))?,
             text
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_task_started_after_a_reload_reads_the_settings_with_its_env() -> TestResult {
+        let dir = crate::tui::snapshots::project()?;
+        let config = format!(
+            "{}\n[training]\ntarget = \"homelab\"\nbase_model = \"Qwen/Qwen3-4B\"\n\
+             adapter = \"qlora\"\nhub_model_id = \"me/model\"\n\n[targets.homelab]\n\
+             kind = \"ssh\"\nruntime = \"docker\"\n",
+            crate::tui::snapshots::CONFIG
+        );
+        std::fs::write(dir.path().join("overbrainer.toml"), config)?;
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
+        let mut warned = Vec::new();
+        for (id, env) in [
+            (TaskId(1), Vec::new()),
+            (
+                TaskId(2),
+                vec![("OVERBRAINER_HF_TOKEN".to_string(), "hf_x".to_string())],
+            ),
+        ] {
+            tasks.use_env(EnvSource::Vars(env));
+            tasks.spawn(id, Task::Prepare);
+            let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+            let Some((ended, Ok(Done::Prepared(Ok(plan))))) = next else {
+                return Err(format!("unexpected end: {next:?}").into());
+            };
+            assert_eq!(ended, id);
+            warned.push(
+                plan.warnings
+                    .iter()
+                    .any(|w| w.contains("OVERBRAINER_HF_TOKEN")),
+            );
+        }
+        assert_eq!(warned, [true, false], "the token set by the new env");
+        Ok(())
+    }
+
+    #[test]
+    fn a_look_reads_the_files_again_only_once_they_changed() -> TestResult {
+        let dir = crate::tui::snapshots::project()?;
+        let seen = stamp(dir.path());
+        let none = check_config(dir.path(), seen, &DotenvKeys::default());
+        assert!(none.read.is_none());
+        assert_eq!(none.stamp, seen);
+        std::fs::write(
+            dir.path().join(crate::config::DOTENV_FILE),
+            "OVERBRAINER_PROJECT__NAME=renamed\n",
+        )?;
+        let checked = check_config(dir.path(), seen, &DotenvKeys::default());
+        assert_ne!(checked.stamp, seen);
+        let Some(Ok(reread)) = checked.read else {
+            return Err(format!("not read again: {:?}", checked.read).into());
+        };
+        assert_eq!(reread.config.settings.project.name, "renamed");
+        assert_eq!(reread.config.stamp, Some(checked.stamp));
+        assert!(reread.config.env.contains("project.name"));
         Ok(())
     }
 
