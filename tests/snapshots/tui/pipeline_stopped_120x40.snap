@@ -5,7 +5,7 @@ source: src/tui/snapshots.rs
 "  Pipeline · run                                                                            in flight  retries  failed  "
 "  ✓ subtopics   █████████████████████████████████████████████████████████████████       3/3         0        0       0  "
 "  ✓ questions   █████████████████████████████████████████████████████████████████     36/36         0        0       0  "
-"  ✗ answers     ███████████████████▌ stopped                                        120/400         0       14       1  "
+"  ✗ answers     ███████████████████▌ stopped                                        120/400         0        0       1  "
 "    split                                                                                                               "
 "                                                                                                                        "
 "  tokens  in 162210  out 39620        cost $0.0135+                                                                     "

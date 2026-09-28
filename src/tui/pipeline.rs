@@ -45,8 +45,6 @@ pub(super) struct Row {
     /// Items whose retryable failure has not yet resolved: on their first
     /// retryable failure, off once they succeed or fail for good.
     in_retry: BTreeSet<String>,
-    /// Items currently being retried, `in_retry.len()`.
-    pub(super) retries: usize,
     /// Items that failed for good.
     pub(super) failed: usize,
     /// Tokens so far, then the stage's own count once it finished.
@@ -68,13 +66,17 @@ impl Row {
             total: 0,
             finished: 0,
             in_retry: BTreeSet::new(),
-            retries: 0,
             failed: 0,
             usage: Usage::default(),
             cost: None,
             stats: None,
             this_task: false,
         }
+    }
+
+    /// Items currently being retried.
+    pub(super) fn retries(&self) -> usize {
+        self.in_retry.len()
     }
 
     /// The share of its items finished, 1 when it has none.
@@ -212,9 +214,7 @@ impl PipelineView {
             } => {
                 let row = &mut self.rows[index(*stage)];
                 row.finished = (row.finished + 1).min(row.total);
-                if row.in_retry.remove(id) {
-                    row.retries = row.in_retry.len();
-                }
+                row.in_retry.remove(id);
                 if let Some(usage) = usage {
                     row.usage += *usage;
                 }
@@ -250,7 +250,6 @@ impl PipelineView {
             row.failed += 1;
             row.finished = (row.finished + 1).min(row.total);
         }
-        row.retries = row.in_retry.len();
         if self.errors.len() == ERRORS {
             self.errors.pop_front();
         }
@@ -278,12 +277,16 @@ impl PipelineView {
     }
 
     /// The task ended: a stage it was running is stopped, and a stage it had
-    /// not reached is no longer pending.
+    /// not reached is no longer pending. Its in-flight retries are no longer
+    /// being retried.
     pub(super) fn stopped(&mut self) {
         self.running = false;
         for row in &mut self.rows {
             row.state = match row.state {
-                StageState::Running => StageState::Stopped,
+                StageState::Running => {
+                    row.in_retry.clear();
+                    StageState::Stopped
+                },
                 StageState::Pending => StageState::Idle,
                 state => state,
             };
@@ -381,7 +384,7 @@ mod tests {
         }
         let row = view.row(Stage::Answers);
         assert_eq!(
-            (row.finished, row.retries, row.failed),
+            (row.finished, row.retries(), row.failed),
             (3, 0, 1),
             "the same item retried twice counts once, and leaves the count once it fails for good"
         );
@@ -419,15 +422,15 @@ mod tests {
             total: 3,
         });
         view.event(&failed_id(Stage::Answers, "a", true));
-        assert_eq!(view.row(Stage::Answers).retries, 1);
+        assert_eq!(view.row(Stage::Answers).retries(), 1);
         view.event(&failed_id(Stage::Answers, "a", true));
         assert_eq!(
-            view.row(Stage::Answers).retries,
+            view.row(Stage::Answers).retries(),
             1,
             "the same item failing again does not count twice"
         );
         view.event(&done_id(Stage::Answers, "a"));
-        assert_eq!(view.row(Stage::Answers).retries, 0);
+        assert_eq!(view.row(Stage::Answers).retries(), 0);
     }
 
     #[test]
@@ -440,7 +443,7 @@ mod tests {
         });
         view.event(&failed_id(Stage::Answers, "a", true));
         view.event(&failed_id(Stage::Answers, "b", true));
-        assert_eq!(view.row(Stage::Answers).retries, 2);
+        assert_eq!(view.row(Stage::Answers).retries(), 2);
     }
 
     #[test]
@@ -452,10 +455,10 @@ mod tests {
             total: 3,
         });
         view.event(&failed_id(Stage::Answers, "a", true));
-        assert_eq!(view.row(Stage::Answers).retries, 1);
+        assert_eq!(view.row(Stage::Answers).retries(), 1);
         view.event(&failed_id(Stage::Answers, "a", false));
         let row = view.row(Stage::Answers);
-        assert_eq!((row.retries, row.failed), (0, 1));
+        assert_eq!((row.retries(), row.failed), (0, 1));
     }
 
     #[test]
@@ -628,5 +631,23 @@ mod tests {
             "a late start is not running"
         );
         assert_eq!(view.in_flight(Stage::Questions), 0);
+    }
+
+    #[test]
+    fn stopped_clears_the_retries_of_a_running_row() {
+        let mut view = PipelineView::default();
+        view.started(Command::Answers, 1);
+        view.event(&Event::StageStarted {
+            stage: Stage::Answers,
+            total: 3,
+        });
+        view.event(&failed_id(Stage::Answers, "a", true));
+        assert_eq!(view.row(Stage::Answers).retries(), 1);
+        view.stopped();
+        assert_eq!(
+            view.row(Stage::Answers).retries(),
+            0,
+            "an item in retry is no longer being retried once the task stops"
+        );
     }
 }

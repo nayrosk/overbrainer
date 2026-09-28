@@ -127,7 +127,7 @@ fn render_row(
         Paragraph::new(format!(
             " {:>9}  {:>7}  {:>6}",
             view.in_flight(stage),
-            row.retries,
+            row.retries(),
             row.failed
         )),
         counts_area,
