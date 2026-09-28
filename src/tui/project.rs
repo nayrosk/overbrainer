@@ -17,8 +17,8 @@ use crate::cli::data::Command;
 use crate::config::edit::{Collection, ConfigDoc, EditError, FieldPath, Role};
 use crate::config::fields::{self, FieldKind, FieldSpec, Section, TargetKind};
 use crate::config::{
-    Adapter, ConfigError, ENV_PREFIX, Engine, EnvSource, ListOrAuto, Pipeline, Protocol, RoleModel,
-    Runtime, Settings, Target, Topic, Training, env_keys, load_str,
+    Adapter, ConfigError, ENV_PREFIX, Engine, EnvSource, Pipeline, Protocol, RoleModel, Runtime,
+    Settings, Target, Topic, Training, env_keys, load_str,
 };
 use crate::history::{Cost, Total};
 use crate::runs::RunState;
@@ -823,9 +823,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             "max_hours" => Some(float(*max_hours)),
             "boot_grace_minutes" => Some(boot_grace_minutes.to_string()),
             "retrieve_grace_minutes" => Some(retrieve_grace_minutes.to_string()),
-            "data_center_ids" => {
-                (*data_center_ids != ListOrAuto::default()).then(|| data_center_ids.to_string())
-            },
+            "data_center_ids" => (!data_center_ids.is_any()).then(|| data_center_ids.to_string()),
             "network_volume_id" => network_volume_id.clone(),
             _ => None,
         },

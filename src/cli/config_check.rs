@@ -7,7 +7,7 @@ use secrecy::SecretString;
 
 use crate::config::{
     DEFAULT_IMAGE, DEFAULT_RUNPOD_BASE_URL, DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV,
-    DEFAULT_WORKDIR, Engine, EnvSource, ListOrAuto, Runtime, Settings, Target,
+    DEFAULT_WORKDIR, Engine, EnvSource, Runtime, Settings, Target,
 };
 
 /// Prints the resolved configuration with secrets masked. With `resolve`, also
@@ -157,7 +157,7 @@ fn runpod_summary(target: &Target) -> String {
     else {
         return String::new();
     };
-    let data_centers = if *data_center_ids == ListOrAuto::default() {
+    let data_centers = if data_center_ids.is_any() {
         "any".to_string()
     } else {
         data_center_ids.to_string()

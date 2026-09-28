@@ -485,6 +485,13 @@ impl ListOrAuto {
             Self::List(items) => items,
         }
     }
+
+    /// Whether this is the default, empty list: no items given, and not
+    /// `auto`, so any value is accepted.
+    #[must_use]
+    pub fn is_any(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for ListOrAuto {
