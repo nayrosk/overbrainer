@@ -15,6 +15,7 @@ use super::catalog::{
     CatalogKind, DEFAULT_IMAGE, NO_VOLUME, Query, Sizing, cost_hint, gpu_count_hint, parse_list,
     volume_data_center,
 };
+use super::follow::NOT_STARTED;
 use super::project::{Addable, Form, Listing, Locks, Pending, ProjectConfig, Shown};
 use super::start::{AUTO_LIMITS, GPU_TYPES};
 use super::tasks::Task;
@@ -938,8 +939,12 @@ impl App {
                 }
                 self.say(Severity::Info, format!("✓ saved {CONFIG_FILE}"));
                 effects = self.reload();
-                if let Some(plan) = start {
-                    effects.extend(self.started_after_save(&plan));
+                match start {
+                    Some(_) if self.leaving.is_some() => {
+                        self.exit_notes.push(NOT_STARTED.to_string());
+                    },
+                    Some(plan) => effects.extend(self.started_after_save(&plan)),
+                    None => {},
                 }
             },
             Err(refusal) if start.is_some() => {
@@ -948,6 +953,11 @@ impl App {
                     SaveRefusal::Invalid(problems) => first_of(&problems),
                     SaveRefusal::Failed(error) => error,
                 };
+                if self.leaving.is_some() {
+                    self.exit_notes.push(format!(
+                        "a new training run was not started: {CONFIG_FILE} not saved: {why}"
+                    ));
+                }
                 self.say(
                     Severity::Error,
                     format!("run not started: {CONFIG_FILE} not saved: {why}"),

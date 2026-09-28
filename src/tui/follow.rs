@@ -262,11 +262,7 @@ impl App {
     /// forgotten, and the exit notes say so.
     pub(super) fn start_dropped(&mut self, id: TaskId) {
         self.training.tasks.remove(&id);
-        self.exit_notes.push(
-            "a new training run was not started: the TUI ended first; start it again with \
-             `overbrainer train` or t"
-                .to_string(),
-        );
+        self.exit_notes.push(NOT_STARTED.to_string());
         self.leave_when_idle();
     }
 
@@ -729,6 +725,10 @@ fn capitalized(text: &str) -> String {
         first.to_uppercase().chain(chars).collect()
     })
 }
+
+/// The exit note of a run asked for but not started because the TUI ended.
+pub(super) const NOT_STARTED: &str = "a new training run was not started: the TUI ended first; \
+                                       start it again with `overbrainer train` or t";
 
 /// The dialog asking to start the run of `plan`, with the GPU catalog `gpus`
 /// once read.

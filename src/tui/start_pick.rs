@@ -550,6 +550,44 @@ mod tests {
     }
 
     #[test]
+    fn quitting_while_the_choice_is_saved_starts_nothing_and_notes_it() -> TestResult {
+        for (signal, moved) in [(false, false), (true, false), (false, true)] {
+            let (dir, mut app) = starting(PROJECT_CONFIG)?;
+            pick_gpus(&mut app)?;
+            let effects = press(&mut app, &[KeyCode::Char('y')]);
+            let [Effect::Spawn(id, Task::SaveConfig { text, base, env })] = effects.as_slice()
+            else {
+                return Err(format!("{effects:?}").into());
+            };
+            if signal {
+                app.on_signal();
+            } else {
+                press(&mut app, &[KeyCode::Char('q'), KeyCode::Char('y')]);
+            }
+            assert_eq!(app.exit, None, "waits for the save");
+            if moved {
+                std::fs::write(dir.path().join(CONFIG_FILE), "# changed elsewhere\n")?;
+            }
+            let saved = save_config(dir.path(), text, base, env).map(Box::new);
+            let effects = app.on_done(*id, Ok(Done::ConfigSaved(saved)));
+            assert!(!starts(&effects), "{effects:?}");
+            assert!(app.exit.is_some());
+            let note = if moved {
+                "a new training run was not started: overbrainer.toml not saved: \
+                 overbrainer.toml changed"
+            } else {
+                crate::tui::follow::NOT_STARTED
+            };
+            assert!(
+                app.exit_notes.iter().any(|said| said.starts_with(note)),
+                "{:?}",
+                app.exit_notes
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pending_changes_a_lock_or_a_volume_refuse_the_choice() -> TestResult {
         let (_dir, mut app) = starting(PROJECT_CONFIG)?;
         app.project_view.pending = Some(crate::tui::project::Pending::new(
@@ -605,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn a_start_on_another_target_ignores_g_and_c() -> TestResult {
+    fn g_and_c_cancel_a_start_on_another_target_like_any_key() -> TestResult {
         let (_dir, mut app) = starting(PROJECT_CONFIG)?;
         for code in ['g', 'c'] {
             let plan = StartPlan {
@@ -618,8 +656,10 @@ mod tests {
                 Box::new(plan),
                 None,
             )));
+            // Like any key but `y`: the dialog closes, nothing opens or starts.
             assert_eq!(press(&mut app, &[KeyCode::Char(code)]), [], "{code}");
-            assert!(!matches!(app.overlay, Some(Overlay::Picker(_))));
+            assert_eq!(app.overlay, None, "{code}");
+            assert_eq!(app.start_held, None);
         }
         Ok(())
     }
