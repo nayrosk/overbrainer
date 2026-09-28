@@ -992,7 +992,7 @@ mod tests {
         }]));
         assert_eq!(
             picker.entry("odd").map(|entry| entry.columns.clone()),
-            Some(vec!["oddname".to_string(), "48".to_string()])
+            Some(vec!["odd name".to_string(), "48".to_string()])
         );
         let theme = Theme::mono();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))?;
@@ -1000,7 +1000,7 @@ mod tests {
             render(frame, frame.area(), &picker, &theme, "*");
         })?;
         let screen = terminal.backend().to_string();
-        assert!(screen.contains("oddname"), "{screen}");
+        assert!(screen.contains("odd name"), "{screen}");
         Ok(())
     }
 

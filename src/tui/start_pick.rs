@@ -417,6 +417,25 @@ mod tests {
     }
 
     #[test]
+    fn a_gpu_id_from_the_api_reaches_the_dialog_without_control_characters() -> TestResult {
+        let (_dir, mut app) = starting(PROJECT_CONFIG)?;
+        let gpus: Vec<crate::runpod::GpuType> = serde_json::from_value(serde_json::json!([
+            {"id": "odd\u{1b}[2J\ngpu", "memory": 48, "price": {"secure": 0.3},
+             "maxCount": {"secure": 8}, "availability": "HIGH"}
+        ]))?;
+        let (id, _) = open(&mut app, 'g')?;
+        listed(&mut app, id, crate::tui::catalog::gpu_entries(&gpus, 1));
+        press(
+            &mut app,
+            &[KeyCode::End, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        let shown = dialog(&app);
+        assert!(shown.contains("odd gpu"), "{shown}");
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
+        Ok(())
+    }
+
+    #[test]
     fn a_choice_is_shown_then_saved_before_the_run_starts() -> TestResult {
         let (dir, mut app) = starting(PROJECT_CONFIG)?;
         pick_gpus(&mut app)?;

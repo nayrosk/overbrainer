@@ -123,7 +123,8 @@ pub fn gpu_table(gpus: &[GpuType], data_center: Option<&str>) -> Vec<String> {
 
 /// `text`, from the Runpod API, without what could move the cursor or change
 /// the terminal's state: ANSI escape sequences (CSI, OSC and two-character
-/// ones) and every other control character (C0, DEL, C1) are dropped.
+/// ones) are dropped, a control character that is whitespace (newline, tab,
+/// CR...) becomes a space, and every other one (C0, DEL, C1) is dropped.
 #[must_use]
 pub fn printable(text: &str) -> String {
     let mut kept = String::with_capacity(text.len());
@@ -137,6 +138,7 @@ pub fn printable(text: &str) -> String {
             },
             '\u{9b}' => skip_csi(&mut chars),
             '\u{9d}' => skip_osc(&mut chars),
+            c if c.is_control() && c.is_whitespace() => kept.push(' '),
             c if c.is_control() => {},
             c => kept.push(c),
         }
@@ -1102,12 +1104,13 @@ mod tests {
 
     #[test]
     fn printable_strips_control_characters_and_escape_sequences() {
-        assert_eq!(printable("A40\u{1b}[2J\nname"), "A40name");
+        assert_eq!(printable("A40\u{1b}[2J\nname"), "A40 name");
+        assert_eq!(printable("a\nb\tc\r\nd  e"), "a b c  d  e", "no collapsing");
         assert_eq!(
             printable("a\u{1b}]0;title\u{7}b\u{1b}]8;;x\u{1b}\\c"),
             "abc"
         );
-        assert_eq!(printable("a\u{1b}Mb\u{7f}c\u{9b}31md\te"), "abcde");
+        assert_eq!(printable("a\u{1b}Mb\u{7f}c\u{9b}31md\te"), "abcd e");
         assert_eq!(
             printable("RTX 4090 é"),
             "RTX 4090 é",
@@ -1140,12 +1143,31 @@ mod tests {
         ];
         for lines in tables {
             let text = lines.join("\n");
-            assert!(text.contains("oddname"), "{text:?}");
+            assert!(text.contains("odd name"), "{text:?}");
             assert_eq!(lines.len(), 2, "{lines:?}");
             assert!(
                 !text.chars().any(|c| c.is_control() && c != '\n'),
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_gpu_id_from_the_api_reaches_a_resolve_error_clean() -> Result<(), serde_json::Error> {
+        let gpus: Vec<GpuType> = serde_json::from_value(serde_json::json!([
+            {"id": "odd\u{1b}[2J\ngpu", "memory": 48, "price": {"secure": 0.3},
+             "maxCount": {"secure": 8}, "availability": "HIGH",
+             "dataCenters": [{"id": "EU\u{1b}[31m-RO-1", "availability": "NONE"}]}
+        ]))?;
+        assert_eq!(gpus[0].id, "odd gpu", "cleaned when parsed");
+        assert_eq!(gpus[0].data_centers[0].id, "EU-RO-1");
+        let error = resolve(&target(list(&["odd gpu"]), ListOrAuto::Auto), &gpus).err();
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                "no data center has odd gpu in stock for data_center_ids = \"auto\" (gpu_count = 1)"
+            )
+        );
+        Ok(())
     }
 }
