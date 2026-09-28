@@ -26,15 +26,10 @@ pub(super) fn rows_cost(rows: &[Row]) -> Cost {
         .unwrap_or_default()
 }
 
-/// The cost of the stages recorded in `entries`, `None` when none spent anything:
-/// `split` and a stage with nothing to do never make the sum partial.
+/// The cost of the stages recorded in `entries`, `None` when none spent anything.
 pub(super) fn history_cost(entries: &[Entry]) -> Option<Cost> {
-    let spent: Vec<Entry> = entries
-        .iter()
-        .filter(|e| e.cost.is_some() || e.input_tokens > 0 || e.output_tokens > 0)
-        .cloned()
-        .collect();
-    (!spent.is_empty()).then(|| history::totals(&spent).1.cost)
+    let (_, all) = history::totals(entries);
+    all.spent().then_some(all.cost)
 }
 
 /// The project's cost so far: the history, the stage running (a finished one is
