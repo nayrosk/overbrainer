@@ -6,8 +6,12 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// A one-line text being edited. The cursor is a char index, from 0 (before
-/// the first char) to the char count (after the last).
+/// The most chars an [`Input`] holds: typing and pasting stop there.
+pub(in crate::tui) const MAX_CHARS: usize = 4096;
+
+/// A one-line text being edited, at most [`MAX_CHARS`] chars. The cursor is a
+/// char index, from 0 (before the first char) to the char count (after the
+/// last).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::tui) struct Input {
     text: String,
@@ -44,7 +48,7 @@ impl Input {
         match code {
             KeyCode::Enter => return InputOutcome::Done(self.text.clone()),
             KeyCode::Esc => return InputOutcome::Cancelled,
-            KeyCode::Char(c) if !c.is_control() => {
+            KeyCode::Char(c) if !c.is_control() && self.len() < MAX_CHARS => {
                 self.text.insert(self.byte(self.cursor), c);
                 self.cursor += 1;
             },
@@ -65,8 +69,10 @@ impl Input {
     }
 
     /// Inserts pasted text at the cursor, on one line: the line breaks at its
-    /// ends are dropped, the others become spaces, other control chars go.
+    /// ends are dropped, the others become spaces, other control chars go. What
+    /// goes past [`MAX_CHARS`] is dropped.
     pub(in crate::tui) fn paste(&mut self, pasted: &str) {
+        let room = MAX_CHARS.saturating_sub(self.len());
         let clean: String = pasted
             .trim_matches(['\r', '\n'])
             .replace("\r\n", "\n")
@@ -76,6 +82,7 @@ impl Input {
                 c if c.is_control() => None,
                 c => Some(c),
             })
+            .take(room)
             .collect();
         self.text.insert_str(self.byte(self.cursor), &clean);
         self.cursor += clean.chars().count();
@@ -248,6 +255,28 @@ mod tests {
             "aone two three[31m!b",
             "the cursor is after the paste"
         );
+    }
+
+    #[test]
+    fn typing_and_pasting_stop_at_the_cap() {
+        let mut input = Input::new("a".repeat(MAX_CHARS - 2));
+        input.paste("bcd");
+        assert_eq!(input.text().chars().count(), MAX_CHARS);
+        assert!(input.text().ends_with("abc"), "the paste is cut at the cap");
+        typed(&mut input, &[KeyCode::Home]);
+        typed(&mut input, &chars("x"));
+        assert_eq!(
+            input.text().chars().count(),
+            MAX_CHARS,
+            "no key goes past it"
+        );
+        assert!(input.text().starts_with('a'));
+        typed(
+            &mut input,
+            &[KeyCode::Backspace, KeyCode::End, KeyCode::Backspace],
+        );
+        typed(&mut input, &chars("日"));
+        assert!(input.text().ends_with("ab日"), "room again after a delete");
     }
 
     #[test]
