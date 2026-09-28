@@ -134,24 +134,27 @@ Runpod: [runpod.io](https://runpod.io?ref=ym24z23f) (referral link). A run's LoR
 
 ## Terminal UI
 
-`overbrainer tui` has four views:
+`overbrainer tui` has five views, and opens on Project:
 
-- Dataset (`1`): the topics, subtopics and questions as a tree, with a question's answer, reasoning, stats and a filter in a detail pane. Edit or delete a question, its answer or a subtopic in place.
-- Pipeline (`2`): run a stage and watch its progress, tokens and cost, live as it runs.
-- Training (`3`): the runs, with progress, pod, spend, a loss chart and learning rate and gradient norm sparklines. Start, follow or cancel a run.
-- Logs (`4`): the captured log lines, filtered by level, exportable to a file.
+- Project (`1`): the effective configuration by section, with env-set and secret values marked, next to the project's stats. Edit a field, add or delete a topic, provider or target, and save to `overbrainer.toml` with its comments kept.
+- Dataset (`2`): the topics, subtopics and questions as a tree, with a question's answer, reasoning, stats and a filter in a detail pane. Edit or delete a question, its answer or a subtopic in place.
+- Pipeline (`3`): run a stage and watch its progress, tokens and cost, live as it runs.
+- Training (`4`): the runs, with progress, pod, spend, a loss chart and learning rate and gradient norm sparklines. Start, follow or cancel a run.
+- Logs (`5`): the captured log lines, filtered by level, exportable to a file.
 
 | Keys | Action |
 |---|---|
-| `1` to `4`, Tab, Shift-Tab | Switch view. |
+| `1` to `5`, Tab, Shift-Tab | Switch view. |
 | `?` | The keys of the current view. |
-| `j` `k`, `l` `h`, Enter | Move, expand and collapse (Enter toggles). |
-| `/`, `s` | Filter the tree, show the stats. |
+| `j` `k`, `l` `h`, Enter | Move, expand and collapse (Enter toggles); in Project, move and edit a field. |
+| `/`, `s` | Filter the tree, show the stats; in Project, `s` saves the configuration. |
 | `[` `]` | Jump the detail between a question, its reasoning and its answer. |
-| `e`, `d` | Edit in `$EDITOR`, delete (asks first). |
-| `E`, `D` | Edit or delete only a question's answer. |
+| `e`, `d` | Edit in `$EDITOR`, delete (asks first); in Project, `d` deletes the selected topic, provider or target. |
+| `E`, `D` | Edit or delete only a question's answer; in Project, `E` opens `overbrainer.toml` in `$EDITOR`. |
+| `a` | Attach to a training run; in Project, add a topic, a provider or a target. |
+| `u` | In Project, drop the pending changes (asks first). |
 | `r` | Run a pipeline stage. |
-| `t`, `a`, `c` | Start, attach to, or cancel a training run. |
+| `t`, `c` | Start, or cancel a training run. |
 | `x` | Export the Logs view to a file. |
 | `R` | Reload from disk. |
 | `g` | Open the repository in a browser. |
