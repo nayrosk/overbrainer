@@ -268,6 +268,9 @@ impl Metrics {
     }
 
     fn follow(&self, followed: &mut Followed, event: &Event) {
+        if let Some((stage, result)) = event.item_result() {
+            self.item(stage.name(), result.name(), 1);
+        }
         match event {
             Event::StageStarted { stage, .. } => {
                 self.stage_running(*stage).inc();
@@ -277,30 +280,27 @@ impl Metrics {
                 followed.models.insert(*stage, model.clone());
             },
             Event::ItemDone {
-                stage, usage, cost, ..
-            } => match usage {
-                Some(usage) => {
-                    self.item(stage.name(), "done", 1);
-                    let model = followed
-                        .models
-                        .get(stage)
-                        .map_or(UNKNOWN_MODEL, String::as_str);
-                    self.spent(stage.name(), model, *usage, *cost);
-                },
-                None => self.item(stage.name(), "skipped", 1),
+                stage,
+                usage: Some(usage),
+                cost,
+                ..
+            } => {
+                let model = followed
+                    .models
+                    .get(stage)
+                    .map_or(UNKNOWN_MODEL, String::as_str);
+                self.spent(stage.name(), model, *usage, *cost);
             },
             Event::ItemFailed {
-                stage, retryable, ..
+                stage,
+                retryable: true,
+                ..
             } => {
-                if *retryable {
-                    self.retries
-                        .get_or_create(&StageLabels {
-                            stage: stage.name(),
-                        })
-                        .inc();
-                } else {
-                    self.item(stage.name(), "failed", 1);
-                }
+                self.retries
+                    .get_or_create(&StageLabels {
+                        stage: stage.name(),
+                    })
+                    .inc();
             },
             Event::StageFinished { stage, stats } => {
                 if stats.excluded > 0 {
@@ -317,7 +317,10 @@ impl Metrics {
                     self.train(run_id, metric);
                 }
             },
-            Event::JobStatus(_) | Event::PodStatus(_) => {},
+            Event::ItemDone { .. }
+            | Event::ItemFailed { .. }
+            | Event::JobStatus(_)
+            | Event::PodStatus(_) => {},
         }
     }
 

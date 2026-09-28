@@ -148,6 +148,53 @@ pub enum Event {
     PodStatus(PodStatus),
 }
 
+/// How an item ended, as its event says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemResult {
+    /// Produced: an [`Event::ItemDone`] with its usage.
+    Done,
+    /// Already present: an [`Event::ItemDone`] without usage.
+    Skipped,
+    /// Failed for good: an [`Event::ItemFailed`] not retried.
+    Failed,
+}
+
+impl ItemResult {
+    /// Lowercase name, as the history counts it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl Event {
+    /// The stage and result of the item this event ends; `None` for any other
+    /// event, a failed attempt that is retried included.
+    #[must_use]
+    pub fn item_result(&self) -> Option<(Stage, ItemResult)> {
+        match self {
+            Self::ItemDone {
+                stage,
+                usage: Some(_),
+                ..
+            } => Some((*stage, ItemResult::Done)),
+            Self::ItemDone {
+                stage, usage: None, ..
+            } => Some((*stage, ItemResult::Skipped)),
+            Self::ItemFailed {
+                stage,
+                retryable: false,
+                ..
+            } => Some((*stage, ItemResult::Failed)),
+            _ => None,
+        }
+    }
+}
+
 /// Sees every event of the buses built with it, as they are published: nothing is
 /// ever skipped, however many come at once.
 pub trait Observer: Send + Sync {
@@ -326,6 +373,51 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn item_events_say_how_their_item_ended() {
+        let done = |usage| Event::ItemDone {
+            stage: Stage::Answers,
+            id: "a".into(),
+            usage,
+            cost: None,
+        };
+        let failed = |retryable| Event::ItemFailed {
+            stage: Stage::Questions,
+            id: "q".into(),
+            error: "no".into(),
+            retryable,
+        };
+        assert_eq!(
+            done(Some(Usage::default())).item_result(),
+            Some((Stage::Answers, ItemResult::Done))
+        );
+        assert_eq!(
+            done(None).item_result(),
+            Some((Stage::Answers, ItemResult::Skipped))
+        );
+        assert_eq!(
+            failed(false).item_result(),
+            Some((Stage::Questions, ItemResult::Failed))
+        );
+        assert_eq!(
+            failed(true).item_result(),
+            None,
+            "a retried attempt ends nothing"
+        );
+        assert_eq!(
+            Event::StageStarted {
+                stage: Stage::Split,
+                total: 1
+            }
+            .item_result(),
+            None
+        );
+        assert_eq!(
+            [ItemResult::Done, ItemResult::Skipped, ItemResult::Failed].map(ItemResult::name),
+            ["done", "skipped", "failed"]
+        );
     }
 
     #[test]

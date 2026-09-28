@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::RoleModel;
-use crate::events::{Event, EventBus, Stage, StageStats};
+use crate::events::{Event, EventBus, ItemResult, Stage, StageStats};
 use crate::history::{self, Entry, Span, SplitCounts, Status};
 use crate::pipeline::SplitReport;
 use crate::runs::rfc3339;
@@ -185,29 +185,23 @@ impl Drop for Tally {
 }
 
 fn count(counts: &Counts, event: &Event) {
+    let Some((stage, result)) = event.item_result() else {
+        return;
+    };
     let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);
-    match event {
-        Event::ItemDone {
-            stage, usage, cost, ..
-        } => {
-            let stats = counts.entry(*stage).or_default();
-            match usage {
-                Some(usage) => {
-                    stats.done += 1;
-                    stats.usage += *usage;
-                },
-                None => stats.skipped += 1,
-            }
-            if let Some(cost) = cost {
-                *stats.cost.get_or_insert(0.0) += cost;
-            }
-        },
-        Event::ItemFailed {
-            stage,
-            retryable: false,
-            ..
-        } => counts.entry(*stage).or_default().failed += 1,
-        _ => {},
+    let stats = counts.entry(stage).or_default();
+    match result {
+        ItemResult::Done => stats.done += 1,
+        ItemResult::Skipped => stats.skipped += 1,
+        ItemResult::Failed => stats.failed += 1,
+    }
+    if let Event::ItemDone { usage, cost, .. } = event {
+        if let Some(usage) = usage {
+            stats.usage += *usage;
+        }
+        if let Some(cost) = cost {
+            *stats.cost.get_or_insert(0.0) += cost;
+        }
     }
 }
 
