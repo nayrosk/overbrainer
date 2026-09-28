@@ -12,7 +12,7 @@ use crossterm::event::KeyCode;
 
 use super::app::{Action, App, Confirm, Effect, Origin, Overlay, PAGE, Picked, Project, Severity};
 use super::catalog::{
-    CatalogKind, NO_VOLUME, Query, Sizing, cost_hint, gpu_count_hint, parse_list,
+    CatalogKind, DEFAULT_IMAGE, NO_VOLUME, Query, Sizing, cost_hint, gpu_count_hint, parse_list,
     volume_data_center,
 };
 use super::project::{Addable, Form, Listing, Locks, Pending, ProjectConfig, Shown};
@@ -387,9 +387,8 @@ impl App {
                 ListOrAuto::Auto => Choice::Auto,
                 ListOrAuto::List(ids) => Choice::List(ids),
             },
-            CatalogKind::Volumes | CatalogKind::Templates => {
-                Choice::List(parse_list(shown).list().to_vec())
-            },
+            // Unset: the `none` or `default` entry is the one chosen.
+            CatalogKind::Volumes | CatalogKind::Templates => Choice::List(vec![shown.to_string()]),
         };
         let query = Query {
             kind,
@@ -404,7 +403,7 @@ impl App {
     /// empty data center list unsets it (any), a volume sets the target's
     /// data centers to its own, `none` unsets it and leaves them.
     pub(super) fn picked_field(&mut self, path: &FieldPath, picked: Picked) {
-        if self.refuse_change() {
+        if self.refuse_change() || self.refuse_locked(path) {
             return;
         }
         let ids = match picked.choice {
@@ -428,6 +427,9 @@ impl App {
             (CatalogKind::Volumes | CatalogKind::Templates, None) => Ok(()),
             (CatalogKind::Volumes, Some(id)) if id == NO_VOLUME => self.apply(path, None),
             (CatalogKind::Volumes, Some(id)) => self.picked_volume(path, id, &picked.entries),
+            (CatalogKind::Templates, Some(image)) if image == DEFAULT_IMAGE => {
+                self.apply(path, None)
+            },
             (CatalogKind::Templates, Some(image)) => {
                 self.apply(path, Some(&FieldValue::Text(image.clone())))
             },
@@ -437,33 +439,76 @@ impl App {
         }
     }
 
+    /// Refuses a change of the field `path` while something uses it, as the
+    /// form does.
+    fn refuse_locked(&mut self, path: &FieldPath) -> bool {
+        let key = path.to_string();
+        let listing = self.project_listing();
+        let lock = listing
+            .find(&key)
+            .and_then(|index| listing.field(index))
+            .and_then(|field| field.lock.clone());
+        let Some(user) = lock else {
+            return false;
+        };
+        let said = format!("refused: {key} is used by {user}; read-only until it ends");
+        self.say(Severity::Warn, said);
+        true
+    }
+
+    /// `t` in a picker opened on the field `path`: the form opens on its value
+    /// instead.
+    pub(super) fn type_field(&mut self, path: &FieldPath) {
+        if self.refuse_change() || self.refuse_locked(path) {
+            return;
+        }
+        let Some(spec) = self.shown_doc().and_then(|doc| doc.spec(path)) else {
+            return;
+        };
+        let listing = self.project_listing();
+        let text = shown_value(&listing, &path.to_string()).unwrap_or_default();
+        self.project_view.form = Some(Form::Value {
+            path: path.clone(),
+            kind: spec.kind,
+            optional: spec.optional,
+            input: Input::new(text),
+            error: None,
+        });
+    }
+
     /// The volume `id` picked for the field `path`: it is set, and its
-    /// target's data centers become the volume's, when `entries` says which.
+    /// target's data centers become the volume's, when `entries` says which;
+    /// both or neither.
     fn picked_volume(
         &mut self,
         path: &FieldPath,
         id: &str,
         entries: &[super::widgets::picker::Entry],
     ) -> Result<(), String> {
-        self.apply(path, Some(&FieldValue::Text(id.to_string())))?;
-        let FieldPath::Target { name, .. } = path else {
-            return Ok(());
-        };
         let center = entries
             .iter()
             .find(|entry| entry.id == id)
-            .and_then(volume_data_center);
-        if let Some(center) = center {
-            let centers = FieldPath::Target {
-                name: name.clone(),
-                field: "data_center_ids",
-            };
-            self.apply(&centers, Some(&FieldValue::List(vec![center.to_string()])))?;
-            self.say(
-                Severity::Info,
-                format!("{centers} = {center}, the volume's data center"),
-            );
+            .and_then(volume_data_center)
+            .map(str::to_string);
+        let before = self.project_view.pending.clone();
+        let applied = self.apply(path, Some(&FieldValue::Text(id.to_string())));
+        let (FieldPath::Target { name, .. }, Some(center), Ok(())) = (path, center, &applied)
+        else {
+            return applied;
+        };
+        let centers = FieldPath::Target {
+            name: name.clone(),
+            field: "data_center_ids",
+        };
+        if let Err(error) = self.apply(&centers, Some(&FieldValue::List(vec![center.clone()]))) {
+            self.project_view.pending = before;
+            self.settle_pending();
+            return Err(error);
         }
+        self.say(
+            Severity::Info,
+            format!("{centers} = {center}, the volume's data center"),
+        );
         Ok(())
     }
 
@@ -2054,7 +2099,7 @@ mod tests {
         assert!(app.project_view.pending.is_none(), "Esc keeps the image");
         let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.image")?;
         listed(&mut app, id, templates, Vec::new());
-        press(&mut app, &[KeyCode::Enter]);
+        press(&mut app, &[KeyCode::End, KeyCode::Enter]);
         assert_eq!(shown(&mut app, "targets.gpu_cloud.image")?, "img/trainer:2");
         Ok(())
     }
@@ -2129,6 +2174,159 @@ mod tests {
         assert!(press(&mut app, &[KeyCode::Enter]).is_empty());
         assert!(!picker_open(&app));
         assert!(matches!(app.project_view.form, Some(Form::Value { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn t_in_a_picker_types_the_value_in_the_form_instead() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        // While the catalog is read, and for each of the four fields.
+        for (key, now) in [
+            ("targets.gpu_cloud.gpu_types", "NVIDIA A40"),
+            ("targets.gpu_cloud.data_center_ids", ""),
+            ("targets.gpu_cloud.network_volume_id", ""),
+            ("targets.gpu_cloud.image", ""),
+        ] {
+            open_picker_on(&mut app, key)?;
+            press(&mut app, &[KeyCode::Char('t')]);
+            assert!(!picker_open(&app), "{key}");
+            let Some(Form::Value { path, input, .. }) = &app.project_view.form else {
+                return Err(format!("no form on {key}").into());
+            };
+            assert_eq!(path.to_string(), key);
+            assert_eq!(input.text(), now, "{key}");
+            press(&mut app, &[KeyCode::Esc]);
+        }
+        // A failed listing still lets the value be typed.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        app.on_done(id, Ok(Done::Catalog(Err("no Runpod API key".into()))));
+        press(&mut app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        chars(&mut app, "auto");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.project_view.form, None);
+        assert_eq!(shown(&mut app, "targets.gpu_cloud.gpu_types")?, "auto");
+        open_picker_on(&mut app, "targets.gpu_cloud.data_center_ids")?;
+        press(&mut app, &[KeyCode::Char('t')]);
+        chars(&mut app, "EU-RO-1, US-KS-2");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "EU-RO-1, US-KS-2"
+        );
+        save(&mut app, dir.path())?;
+        let text = written(dir.path())?;
+        assert!(text.contains(r#"gpu_types = "auto""#), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn auto_picked_is_saved_as_a_string() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
+        press(
+            &mut app,
+            &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        save(&mut app, dir.path())?;
+        assert_eq!(status(&app), "✓ saved overbrainer.toml");
+        let text = written(dir.path())?;
+        assert!(text.contains(r#"gpu_types = "auto""#), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_default_row_of_the_template_picker_unsets_the_image() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let templates = template_entries(&[Template {
+            id: "t1".into(),
+            name: "trainer".into(),
+            image: "img/trainer:2".into(),
+            serverless: false,
+        }]);
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.image")?;
+        listed(&mut app, id, templates.clone(), Vec::new());
+        press(&mut app, &[KeyCode::End, KeyCode::Enter]);
+        assert_eq!(shown(&mut app, "targets.gpu_cloud.image")?, "img/trainer:2");
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.image")?;
+        listed(&mut app, id, templates, Vec::new());
+        press(&mut app, &[KeyCode::Home, KeyCode::Enter]);
+        assert_eq!(
+            field(&mut app, "targets.gpu_cloud.image")?.shown,
+            Shown::Unset,
+            "the pinned default applies"
+        );
+        assert!(app.project_view.pending.is_none(), "back to the file");
+        Ok(())
+    }
+
+    #[test]
+    fn a_lock_taken_while_the_picker_is_open_refuses_the_choice() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
+        listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
+        let mut follow =
+            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, "20260921-a1");
+        follow.watching = true;
+        app.training.tasks.insert(TaskId(9), follow);
+        press(
+            &mut app,
+            &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        assert!(app.project_view.pending.is_none());
+        assert_eq!(
+            status(&app),
+            "refused: targets.gpu_cloud.gpu_types is used by run 20260921-a1; \
+             read-only until it ends"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_env_set_picker_field_refuses_enter() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let EnvSource::Vars(mut vars) = project_env() else {
+            return Err("vars expected".into());
+        };
+        vars.push((
+            "OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES".into(),
+            "NVIDIA L4".into(),
+        ));
+        app.env = EnvSource::Vars(vars);
+        let config = ProjectConfig::new(PROJECT_CONFIG, &app.env)?;
+        app.set_config(config);
+        select(&mut app, "targets.gpu_cloud.gpu_types")?;
+        assert!(press(&mut app, &[KeyCode::Enter]).is_empty());
+        assert!(!picker_open(&app));
+        assert_eq!(
+            status(&app),
+            "targets.gpu_cloud.gpu_types: set by OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES, \
+             change it in .env"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_volume_the_catalog_does_not_list_leaves_the_data_centers() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let path = FieldPath::Target {
+            name: "gpu_cloud".into(),
+            field: "network_volume_id",
+        };
+        app.apply(&path, Some(&FieldValue::Text("vol-gone".into())))?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        // none, alpha, zeta, then vol-gone, kept in view: picked again.
+        press(&mut app, &[KeyCode::End, KeyCode::Enter]);
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.network_volume_id")?,
+            "vol-gone"
+        );
+        assert_eq!(
+            field(&mut app, "targets.gpu_cloud.data_center_ids")?.shown,
+            Shown::Unset
+        );
         Ok(())
     }
 

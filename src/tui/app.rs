@@ -418,7 +418,7 @@ pub(super) struct App {
     pub(super) prices: Option<TaskId>,
     /// The catalog listings running, a picker's or a hint's: their failure
     /// shows in their picker, if still open, and nowhere else.
-    catalog_reads: Vec<TaskId>,
+    catalog_reads: Vec<(TaskId, CatalogKind)>,
     /// The GPU types a catalog listing read last, for the hints of the Runpod
     /// target fields.
     pub(super) gpu_catalog: Option<Vec<crate::runpod::GpuType>>,
@@ -724,7 +724,7 @@ impl App {
             self.priced(&Vec::new());
             return Vec::new();
         }
-        if self.catalog_reads.contains(&id) {
+        if self.catalog_reads.iter().any(|(read, _)| *read == id) {
             self.listed_catalog(id, Err(error));
             return Vec::new();
         }
@@ -864,18 +864,22 @@ impl App {
             task,
             picker: Picker::new(kind.spec(), preselected),
         })));
-        self.catalog_reads.push(task);
+        self.catalog_reads.push((task, kind));
         vec![Effect::Spawn(task, Task::Catalog(query))]
     }
 
     /// Reads the GPU types for the field hints in the background, unless they
-    /// were read or are being read.
+    /// were read or a listing reading them runs.
     pub(super) fn read_gpu_catalog(&mut self, gpu_count: u32) -> Vec<Effect> {
-        if self.gpu_catalog.is_some() || !self.catalog_reads.is_empty() {
+        let reading = self
+            .catalog_reads
+            .iter()
+            .any(|(_, kind)| matches!(kind, CatalogKind::Gpus | CatalogKind::DataCenters));
+        if self.gpu_catalog.is_some() || reading {
             return Vec::new();
         }
         let task = self.task_id();
-        self.catalog_reads.push(task);
+        self.catalog_reads.push((task, CatalogKind::Gpus));
         let query = Query {
             kind: CatalogKind::Gpus,
             gpu_count,
@@ -888,7 +892,7 @@ impl App {
     /// entries shown when it fills the picker open. Its failure shows in that
     /// picker only: once the picker is closed, nothing is said.
     fn listed_catalog(&mut self, id: TaskId, listed: Result<Listed, String>) {
-        let Some(at) = self.catalog_reads.iter().position(|read| *read == id) else {
+        let Some(at) = self.catalog_reads.iter().position(|(read, _)| *read == id) else {
             return;
         };
         self.catalog_reads.remove(at);
@@ -1147,6 +1151,14 @@ impl App {
                 PickerOutcome::Open => Vec::new(),
                 PickerOutcome::Cancelled => {
                     self.overlay = None;
+                    Vec::new()
+                },
+                PickerOutcome::Typed => {
+                    let origin = picking.origin.clone();
+                    self.overlay = None;
+                    match origin {
+                        Origin::Field(path) => self.type_field(&path),
+                    }
                     Vec::new()
                 },
                 PickerOutcome::Kept(choice) => {

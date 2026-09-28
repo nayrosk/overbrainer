@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::widgets::picker::{Entry, Mode, Spec};
-use crate::config::{EnvSource, ListOrAuto};
+use crate::config::{DEFAULT_RUNPOD_IMAGE, EnvSource, ListOrAuto};
 use crate::runpod::{
     ApiError, Availability, DataCenter, GpuFilter, GpuType, NetworkVolume, RunpodClient, Template,
     select_gpus,
@@ -16,6 +16,10 @@ pub(super) const CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The ID of the volume picker's `none` entry: picking it unsets the volume.
 pub(super) const NO_VOLUME: &str = "";
+
+/// The ID of the template picker's `default` entry: picking it unsets the
+/// image, so the pinned default applies.
+pub(super) const DEFAULT_IMAGE: &str = "";
 
 /// The column of a volume entry holding its data center.
 const VOLUME_DATA_CENTER: usize = 3;
@@ -258,21 +262,35 @@ pub(super) fn volume_data_center(entry: &Entry) -> Option<&str> {
         .filter(|center| entry.id != NO_VOLUME && !center.is_empty() && *center != "-")
 }
 
-/// The pod templates, by name; picking one gives its image, so one without
-/// an image cannot be chosen.
+/// The pod templates, by name, after a `default` entry that unsets the image;
+/// picking one gives its image, so one without an image cannot be chosen (its
+/// entry's ID is then the template's).
 pub(super) fn template_entries(templates: &[Template]) -> Vec<Entry> {
     let mut rows: Vec<&Template> = templates.iter().collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    rows.into_iter()
-        .map(|template| Entry {
-            id: template.image.clone(),
+    let default = Entry {
+        id: DEFAULT_IMAGE.to_string(),
+        columns: vec![
+            "default".to_string(),
+            "the pinned Axolotl image".to_string(),
+            DEFAULT_RUNPOD_IMAGE.to_string(),
+        ],
+        selectable: true,
+    };
+    std::iter::once(default)
+        .chain(rows.into_iter().map(|template| Entry {
+            id: if template.image.is_empty() {
+                template.id.clone()
+            } else {
+                template.image.clone()
+            },
             columns: vec![
                 template.id.clone(),
                 template.name.clone(),
                 template.image.clone(),
             ],
             selectable: !template.image.is_empty(),
-        })
+        }))
         .collect()
 }
 
@@ -344,20 +362,20 @@ pub(super) fn gpu_count_hint(gpus: &[GpuType], sizing: &Sizing) -> Option<String
 /// `max_price_per_hour`. None when a price is not known.
 pub(super) fn cost_hint(gpus: &[GpuType], sizing: &Sizing) -> Option<String> {
     let hours = sizing.max_hours?;
-    let price = match sizing.gpu_types() {
-        ListOrAuto::Auto => sizing.max_price?,
+    let (price, at) = match sizing.gpu_types() {
+        ListOrAuto::Auto => (sizing.max_price?, "max_price_per_hour"),
         ListOrAuto::List(ids) => {
             let prices: Option<Vec<f64>> = chosen_gpus(gpus, &ids)?
                 .iter()
                 .map(|gpu| gpu.secure_price())
                 .collect();
-            prices?.into_iter().fold(0.0, f64::max)
+            (prices?.into_iter().fold(0.0, f64::max), "the chosen prices")
         },
     };
     let count = sizing.gpu_count;
     let most = hours * f64::from(count) * price;
     Some(format!(
-        "at most ${most:.2} at the chosen prices ({count} × ${price:.2}/h × {hours} h)"
+        "at most ${most:.2} at {at} ({count} × ${price:.2}/h × {hours} h)"
     ))
 }
 
@@ -470,8 +488,14 @@ mod tests {
         let templates = fetch(dir.path(), env, query(CatalogKind::Templates, 1, &[]))
             .await?
             .entries;
-        assert_eq!(ids(&templates), ["", "img/z:1"], "an image is picked");
-        assert!(!templates[0].selectable, "no image, nothing to pick");
+        assert_eq!(
+            ids(&templates),
+            [DEFAULT_IMAGE, "t1", "img/z:1"],
+            "the default first, then an image is picked"
+        );
+        assert_eq!(templates[0].columns[0], "default");
+        assert!(templates[0].selectable);
+        assert!(!templates[1].selectable, "no image, nothing to pick");
         Ok(())
     }
 
@@ -654,7 +678,7 @@ mod tests {
         capped.max_price = Some(1.5);
         assert_eq!(
             hint(&capped).as_deref(),
-            Some("at most $3.00 at the chosen prices (1 × $1.50/h × 2 h)")
+            Some("at most $3.00 at max_price_per_hour (1 × $1.50/h × 2 h)")
         );
         Ok(())
     }

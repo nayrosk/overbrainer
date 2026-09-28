@@ -52,6 +52,10 @@ const PROJECT: &[KeyHelp] = &[
         "select a field, by page, the first or last",
     ),
     row("Enter", "edit the field; toggles a bool, cycles a choice"),
+    row(
+        "t, in a Runpod picker",
+        "type the value instead of picking it",
+    ),
     row("a", "add a topic, a provider or a target"),
     row("d", "delete the selected topic, provider or target"),
     row("s", "save to overbrainer.toml, validated first"),
@@ -198,17 +202,20 @@ const FOOTER_PICK: &[Hint] = &[
     hint("Esc", "cancel"),
 ];
 const FOOTER_HELP: &[Hint] = &[hint("Esc", "close")];
+const FOOTER_LISTING: &[Hint] = &[hint("t", "type"), hint("Esc", "close")];
 const FOOTER_PICKER: &[Hint] = &[
     hint("Space", "toggle"),
     hint("J/K", "order"),
     hint("/", "filter"),
     hint("Enter", "keep"),
+    hint("t", "type"),
     hint("Esc", "cancel"),
 ];
 const FOOTER_PICK_ONE: &[Hint] = &[
     hint("j/k", "move"),
     hint("/", "filter"),
     hint("Enter", "pick"),
+    hint("t", "type"),
     hint("Esc", "cancel"),
 ];
 const FOOTER_MENU: &[Hint] = &[
@@ -231,7 +238,8 @@ pub(super) fn footer(context: Context) -> Vec<Hint> {
         Context::Form => FOOTER_FORM.to_vec(),
         Context::Pick => FOOTER_PICK.to_vec(),
         Context::Dialog { yes, no } => vec![hint("y", yes), hint("n, Esc or Enter", no)],
-        Context::Help | Context::Listing => FOOTER_HELP.to_vec(),
+        Context::Help => FOOTER_HELP.to_vec(),
+        Context::Listing => FOOTER_LISTING.to_vec(),
         Context::Menu => FOOTER_MENU.to_vec(),
         Context::Picker(Mode::Multi) => FOOTER_PICKER.to_vec(),
         Context::Picker(Mode::Single) => FOOTER_PICK_ONE.to_vec(),
