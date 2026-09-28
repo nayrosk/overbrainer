@@ -17,7 +17,7 @@ use crate::runpod::{PodRecord, RunpodTarget};
 use crate::runs::{
     Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, cancel, create, start, watch,
 };
-use crate::train::{Axolotl, OUTPUT_DIR, reasoning_template_warning};
+use crate::train::{Axolotl, OUTPUT_DIR, Outputs, reasoning_template_warning};
 
 /// Time between two looks at a running job.
 pub(super) const POLL: Duration = Duration::from_secs(2);
@@ -154,7 +154,7 @@ async fn train(
         },
     };
     guard.close().await;
-    finish(&runs, &id, result, front)
+    finish(&runs, &id, result, front, trainer.outputs())
 }
 
 async fn attach(
@@ -186,7 +186,7 @@ async fn attach(
     };
     let result = front.interrupt().race(flow).await.transpose();
     guard.close().await;
-    finish(&runs, run_id, result, front)
+    finish(&runs, run_id, result, front, trainer.outputs())
 }
 
 async fn cancel_run(
@@ -358,13 +358,15 @@ async fn run_executor(
     executor(project_dir, &record.target, target).await
 }
 
-/// Emits the outcome through `front` (stdout on the command line), or explains how
-/// to follow an interrupted run.
+/// Emits the outcome through `front` (stdout on the command line), then, for a
+/// run that succeeded, where its `outputs` are; or explains how to follow an
+/// interrupted run.
 pub(super) fn finish(
     runs: &Runs,
     id: &str,
     result: anyhow::Result<Option<Outcome>>,
     front: &Frontend,
+    outputs: Outputs,
 ) -> anyhow::Result<()> {
     let Some(outcome) = result? else {
         return interrupted(runs, id);
@@ -382,7 +384,12 @@ pub(super) fn finish(
         outcome.summary.describe()
     ));
     match record.state {
-        RunState::Succeeded => Ok(()),
+        RunState::Succeeded => {
+            for (what, path) in outputs.paths(&record.id) {
+                front.line(&format!("train: {what} in {path}"));
+            }
+            Ok(())
+        },
         RunState::Cancelled => bail!("run {} was cancelled", record.id),
         _ => bail!(
             "{}",

@@ -81,6 +81,12 @@ pub struct Axolotl<'a> {
 }
 
 impl<'a> Axolotl<'a> {
+    /// What a succeeded run of this trainer leaves.
+    #[must_use]
+    pub fn outputs(&self) -> Outputs {
+        Outputs::of(self.training)
+    }
+
     /// A trainer for `training`, reading the split files of `files`.
     #[must_use]
     pub fn new(training: &'a Training, files: &DataFiles) -> Self {

@@ -1241,10 +1241,14 @@ exit 0
             }
         }
         assert_eq!(metrics, 2, "every metric of the run, from its first");
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
             lines[0].starts_with(&format!("train: run {run} succeeded; ")),
             "the command line's own outcome line: {lines:?}"
+        );
+        assert!(
+            lines[1].ends_with(&format!(" in runs/{run}/output")),
+            "then where the model is: {lines:?}"
         );
         Ok(())
     }

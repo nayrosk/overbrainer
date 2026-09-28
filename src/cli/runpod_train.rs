@@ -283,6 +283,7 @@ impl Job<'_> {
             &id,
             Ok(Some(outcome)),
             self.session.front,
+            self.trainer.outputs(),
         );
         ended(pod, ending, &id, finished)
     }
@@ -573,7 +574,13 @@ async fn from_local_files(
         poll: POLL,
     };
     let outcome = watch(&run_ctx, trainer, record).await?;
-    finish(&session.runs, &id, Ok(Some(outcome)), session.front)
+    finish(
+        &session.runs,
+        &id,
+        Ok(Some(outcome)),
+        session.front,
+        trainer.outputs(),
+    )
 }
 
 /// `overbrainer train cancel` on a Runpod run.
