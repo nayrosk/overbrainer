@@ -1839,6 +1839,7 @@ dependencies = [
  "ratatui",
  "reqwest",
  "rustify",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",
