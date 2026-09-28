@@ -60,7 +60,7 @@ The topics, their subtopics and questions as a tree, with a detail pane for the 
 
 ### Pipeline (`2`)
 
-`r` opens a menu of the stages and `run`, always on every topic and without `--force` (both stay command-line options). The view shows each stage's progress, requests in flight, retries, failures, tokens and cost, and the summary lines the command would print. The cost updates live as the running stage's items finish, before the stage itself reports its total. `run` stops after `split` here: training starts only with `t`.
+`r` opens a menu of the stages and `run`, always on every topic and without `--force` (both stay command-line options). The view shows each stage's progress, requests in flight, items being retried, failures, tokens and cost, and the summary lines the command would print. The cost updates live as the running stage's items finish, before the stage itself reports its total. `run` stops after `split` here: training starts only with `t`.
 
 ### Training (`3`)
 
