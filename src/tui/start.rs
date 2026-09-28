@@ -290,11 +290,15 @@ pub(super) fn text(plan: &StartPlan, gpus: Option<&Gpus>) -> Vec<String> {
     text
 }
 
-/// The position in `text`, a start dialog's, of the line saying what a
-/// Runpod run costs at most (`max_hours`): a dialog too tall for the
-/// terminal keeps it.
-pub(super) fn cost_line(text: &[String]) -> Option<usize> {
-    text.iter().position(|line| line.starts_with(COST_LABEL))
+/// The positions in `text`, a start dialog's, of the lines a dialog too
+/// tall for the terminal keeps: what `y` saves first, and what a Runpod run
+/// costs at most (`max_hours`).
+pub(super) fn pinned(text: &[String]) -> Vec<usize> {
+    text.iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with(CHANGED_LABEL) || line.starts_with(COST_LABEL))
+        .map(|(at, _)| at)
+        .collect()
 }
 
 /// The GPU types of `spec`, or those `auto` picks now from `gpus`, each with
@@ -468,6 +472,11 @@ mod tests {
 
     use super::*;
     use crate::tui::snapshots::gpu_types;
+
+    /// The position of the `max_hours` line in `text`.
+    fn cost_line(text: &[String]) -> Option<usize> {
+        text.iter().position(|line| line.starts_with(COST_LABEL))
+    }
 
     fn list(ids: &[&str]) -> ListOrAuto {
         ListOrAuto::List(ids.iter().map(|id| (*id).to_string()).collect())
@@ -685,6 +694,7 @@ mod tests {
              run starts"
         );
         assert_eq!(cost_line(&lines), Some(7));
+        assert_eq!(pinned(&lines), [3, 7]);
         Ok(())
     }
 

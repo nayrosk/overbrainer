@@ -1280,6 +1280,40 @@ fn c_on_a_starting_runpod_run_offers_to_abandon_it() -> TestResult {
     Ok(())
 }
 
+/// A start dialog switched to `auto`, too tall for 80x24 with its warnings
+/// and what auto picks now, keeps what `y` saves and the most the run costs.
+#[test]
+fn a_changed_start_keeps_what_it_saves_and_its_cost() -> TestResult {
+    let mut app = app();
+    app.view = View::Training;
+    let mut plan = runpod_plan();
+    if let Some(runpod) = &mut plan.runpod {
+        runpod.choose_gpus(ListOrAuto::Auto);
+    }
+    plan.warnings = (1..=4)
+        .map(|n| format!("warning number {n} about this run"))
+        .collect();
+    app.prepared(Ok(plan));
+    app.start_catalog_read(Ok(gpu_types()?));
+    snapshot("start_runpod_changed", &mut app)?;
+    // More warnings than fit: the changed line would be cut, it is kept.
+    let many = (5..=11).map(|n| format!("warning     warning number {n} about this run"));
+    if let Some(Overlay::Confirm(confirm)) = &mut app.overlay {
+        confirm.text.splice(7..7, many);
+    }
+    let rows = text(&draw(&mut app, 80, 24)?).join("\n");
+    assert!(!rows.contains("warning number 11"), "cut: {rows}");
+    for shown in [
+        "changed     gpu_types: saved to overbrainer.toml on y",
+        "max_hours   6",
+        "…",
+        "y start",
+    ] {
+        assert!(rows.contains(shown), "{shown}\n{rows}");
+    }
+    Ok(())
+}
+
 /// A start dialog taller than the terminal keeps its key line and its
 /// most-it-can-cost line, and marks the text it cut; so does a quit dialog.
 #[test]
