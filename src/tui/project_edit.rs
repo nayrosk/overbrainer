@@ -1292,10 +1292,17 @@ impl App {
             .map_err(|error| format!("cannot read {}: {error}", path.display()))
             .and_then(|text| {
                 ProjectConfig::new(&text, &self.env).map_err(|error| {
+                    if let ConfigError::Invalid(problems) = &error {
+                        self.note_errors(problems);
+                    }
                     let text = error.to_string();
                     text.lines().map(str::trim).collect::<Vec<_>>().join(" ")
                 })
             });
+        // The file just read is not reported again by the look at the files.
+        if let Some(watch) = self.watch.as_mut() {
+            watch.seen(read_at);
+        }
         let mut config = match read {
             Ok(config) => config,
             Err(error) => {

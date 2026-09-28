@@ -117,6 +117,19 @@ pub struct Stamp {
     dotenv: Option<(SystemTime, u64)>,
 }
 
+impl Stamp {
+    /// This stamp with the `overbrainer.toml` half of `other`: what is known
+    /// once that file alone was read again (a save, an editor), so a change of
+    /// `.env` meanwhile is still seen.
+    #[must_use]
+    pub fn with_config(self, other: Stamp) -> Stamp {
+        Stamp {
+            config: other.config,
+            dotenv: self.dotenv,
+        }
+    }
+}
+
 /// The [`Stamp`] of the files of the project in `project_dir` now.
 #[must_use]
 pub fn stamp(project_dir: &Path) -> Stamp {

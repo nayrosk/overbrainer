@@ -38,10 +38,12 @@ impl ConfigWatch {
         }
     }
 
-    /// The files were just read at `stamp` (a save, the editor): the look
-    /// running, which may have read them before, is ignored.
+    /// `overbrainer.toml` was just read at `stamp` (a save, the editor, a
+    /// reload): the look running, which may have read it before, is ignored.
+    /// Only its half of the stamp is taken: a `.env` changed meanwhile is read
+    /// by the next look.
     pub(super) fn seen(&mut self, stamp: Stamp) {
-        self.stamp = stamp;
+        self.stamp = self.stamp.with_config(stamp);
         self.check = None;
     }
 }
@@ -135,6 +137,10 @@ impl App {
                 self.note_errors(problems);
                 format!("✗ {CONFIG_FILE}: {}", first_of(problems))
             },
+            // A syntax error already names the file.
+            ReloadError::Config(ConfigError::Parse(problem)) if problem.contains(CONFIG_FILE) => {
+                format!("✗ {problem}")
+            },
             ReloadError::Config(ConfigError::Parse(problem)) => {
                 format!("✗ {CONFIG_FILE}: {problem}")
             },
@@ -148,6 +154,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::process::ExitStatusExt as _;
     use std::path::Path;
 
     use crossterm::event::KeyCode;
@@ -442,6 +449,78 @@ mod tests {
                 .is_none()
         );
         assert_eq!(status(&app), "✓ saved overbrainer.toml");
+        Ok(())
+    }
+
+    #[test]
+    fn an_env_file_changed_during_a_save_is_still_read() -> TestResult {
+        let (dir, mut app) = watched()?;
+        fs::write(
+            dir.path().join(DOTENV_FILE),
+            "OVERBRAINER_PIPELINE__SEED=7\n",
+        )?;
+        let saved = save_config(
+            dir.path(),
+            &PROJECT_CONFIG.replace("rust_expert", "rust_pro"),
+            PROJECT_CONFIG,
+            &project_env(),
+        )
+        .map_err(|refusal| format!("{refusal:?}"))?;
+        let id = app.task_id();
+        app.project_view.save = Some(id);
+        app.on_done(id, Ok(Done::ConfigSaved(Ok(Box::new(saved)))));
+        let (_, seen) = tick(&mut app, NOW)?;
+        let checked = check_config(dir.path(), seen, &DotenvKeys::default());
+        assert!(
+            matches!(&checked.read, Some(Ok(reread)) if reread.config.settings.pipeline.seed == 7),
+            "{:?}",
+            checked.read.as_ref().map(Result::is_ok)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_invalid_file_left_by_the_editor_is_said_once() -> TestResult {
+        let (dir, mut app) = watched()?;
+        app.project_view.editing = true;
+        fs::write(
+            dir.path().join(CONFIG_FILE),
+            PROJECT_CONFIG.replace("subtopics = 2", "subtopics = 0"),
+        )?;
+        let exited = std::process::ExitStatus::from_raw(0);
+        assert_eq!(app.on_editor_exit(Ok(exited)), []);
+        assert!(status(&app).contains("subtopics"), "{}", status(&app));
+        assert!(
+            app.project_view
+                .errors
+                .keys()
+                .any(|key| key.starts_with("topics.ownership")),
+            "{:?}",
+            app.project_view.errors
+        );
+        let (_, seen) = tick(&mut app, NOW)?;
+        assert!(
+            check_config(dir.path(), seen, &DotenvKeys::default())
+                .read
+                .is_none(),
+            "not read again"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_toml_syntax_error_is_said_without_the_file_name_twice() -> TestResult {
+        let (dir, mut app) = watched()?;
+        let (id, _) = tick(&mut app, NOW)?;
+        let checked = rewritten(dir.path(), "[project\nname = 1\n")?;
+        app.on_done(id, Ok(Done::ConfigChecked(Box::new(checked))));
+        assert_eq!(
+            status(&app).matches(CONFIG_FILE).count(),
+            1,
+            "{}",
+            status(&app)
+        );
+        assert!(status(&app).starts_with("✗ TOML syntax error in overbrainer.toml"));
         Ok(())
     }
 
