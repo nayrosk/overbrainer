@@ -96,8 +96,8 @@ pub(super) fn init() -> io::Result<ManuallyDrop<DefaultTerminal>> {
 static RESTORED: AtomicBool = AtomicBool::new(false);
 
 /// Turns bracketed paste off, leaves the alternate screen and raw mode, and
-/// shows the cursor, unless [`Screen::suspend`] already did. A failure is written to stderr, ignoring a
-/// failed write: the terminal may be gone.
+/// shows the cursor, unless [`Screen::suspend`] already did. A failure is
+/// written to stderr, ignoring a failed write: the terminal may be gone.
 fn restore() {
     if RESTORED.load(Ordering::SeqCst) {
         return;
@@ -131,8 +131,9 @@ impl Screen {
     /// Hands the terminal over: stops reading it first and waits until the
     /// `EventStream` is dropped (so its reader thread takes no keystroke from the
     /// editor), drops the keys read but not handled, then turns bracketed paste
-    /// off, leaves the alternate screen and raw mode, and shows the cursor. The terminal is put back in
-    /// its normal mode even when the keys cannot be dropped.
+    /// off, leaves the alternate screen and raw mode, and shows the cursor.
+    /// The terminal is put back in its normal mode even when the keys cannot
+    /// be dropped.
     ///
     /// # Errors
     ///
