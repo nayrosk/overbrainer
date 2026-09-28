@@ -209,7 +209,7 @@ fn holder(pid: Option<u32>) -> String {
 /// The held lock, on the project directory. Dropping it releases the lock.
 #[derive(Debug)]
 pub struct ProjectLock {
-    _project: OwnedFd,
+    project: OwnedFd,
 }
 
 impl ProjectLock {
@@ -259,7 +259,15 @@ impl ProjectLock {
         pid_file.set_len(0).map_err(pid_io)?;
         write!(pid_file, "{}", std::process::id()).map_err(pid_io)?;
         pid_file.flush().map_err(pid_io)?;
-        Ok(Self { _project: project })
+        Ok(Self { project })
+    }
+}
+
+impl Drop for ProjectLock {
+    /// Unlocks explicitly: the lock belongs to the open file description, so a
+    /// dup held by a child forked before its exec would otherwise keep it.
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.project, FlockOperation::Unlock);
     }
 }
 
@@ -284,6 +292,17 @@ mod tests {
     fn the_lock_is_released_on_drop() -> TestResult {
         let dir = tempfile::tempdir()?;
         drop(ProjectLock::acquire(dir.path())?);
+        ProjectLock::acquire(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_lock_is_released_on_drop_while_a_dup_of_its_fd_lives() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let lock = ProjectLock::acquire(dir.path())?;
+        // What a child forked by a parallel test holds until its exec.
+        let _dup = lock.project.try_clone()?;
+        drop(lock);
         ProjectLock::acquire(dir.path())?;
         Ok(())
     }
