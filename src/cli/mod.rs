@@ -9,6 +9,7 @@ mod init;
 pub(crate) mod pod;
 mod progress;
 mod record;
+mod reload;
 mod runpod_train;
 mod skill;
 pub(crate) mod train;
@@ -24,6 +25,7 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 
 use self::front::Frontend;
+use self::reload::Reloader;
 use crate::config::{DotenvKeys, EnvSource};
 use crate::logging::{LOG_LINES, LogBuffer, LogMode};
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
@@ -377,8 +379,11 @@ async fn dispatch(
             stage(dir, data::Command::Split, &args).await
         },
         Command::Run => {
-            stage(dir, data::Command::Run, &StageArgs::default()).await?;
-            train::after_run(dir, &Frontend::Cli).await
+            let mut reloader = Reloader::new(dir, dotenv);
+            let args = StageArgs::default();
+            let load = data::Load::Reload(&mut reloader);
+            data::run(dir, data::Command::Run, &args, &Frontend::Cli, load).await?;
+            train::after_run(dir, &Frontend::Cli, &mut reloader).await
         },
         Command::Train(args) => train::run(dir, &args, &Frontend::Cli, &EnvSource::Process).await,
         Command::Runs {
@@ -396,7 +401,8 @@ async fn dispatch(
 
 /// Runs a pipeline command on the command line.
 async fn stage(dir: &Path, command: data::Command, args: &StageArgs) -> anyhow::Result<()> {
-    data::run(dir, command, args, &Frontend::Cli, &EnvSource::Process).await
+    let load = data::Load::Env(&EnvSource::Process);
+    data::run(dir, command, args, &Frontend::Cli, load).await
 }
 
 /// Secret resolver from `VAULT_ADDR`, `VAULT_TOKEN` and `~/.vault-token`. Vault is

@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 use super::front::Frontend;
 use super::record::Recorder;
+use super::reload::Reloader;
 use super::{LazyVault, StageArgs};
 use crate::config::{EnvSource, RoleModel, Settings};
 use crate::dataset::{DataFiles, Subtopic, read};
@@ -39,6 +40,15 @@ pub enum Command {
 
 type Client = RoleClient<ProtocolClient>;
 
+/// How a pipeline command reads its settings.
+pub(crate) enum Load<'a> {
+    /// Once, with this environment.
+    Env(&'a EnvSource),
+    /// With the environment of this reloader, and, for `run`, again before
+    /// each stage after the first when the files changed (on the command line).
+    Reload(&'a mut Reloader),
+}
+
 /// Everything a pipeline command needs. Role clients are built on first use and at
 /// most once per command, and each provider's model listing is read at most once.
 struct Session {
@@ -54,16 +64,22 @@ struct Session {
 
 impl Session {
     fn open(project_dir: &Path, env: &EnvSource) -> anyhow::Result<Self> {
-        Ok(Self {
+        let settings = crate::config::load(project_dir, env.clone())?;
+        Ok(Self::new(project_dir, settings))
+    }
+
+    /// A session on `settings`: no client built yet, no listing read.
+    fn new(project_dir: &Path, settings: Settings) -> Self {
+        Self {
             project_dir: project_dir.to_path_buf(),
-            settings: crate::config::load(project_dir, env.clone())?,
+            settings,
             files: DataFiles::new(project_dir),
             resolver: super::resolver(),
             generator: OnceCell::new(),
             parent: OnceCell::new(),
             embedder: OnceCell::new(),
             listings: Mutex::new(BTreeMap::new()),
-        })
+        }
     }
 
     /// The role `stage` uses; none for `split`.
@@ -142,7 +158,7 @@ impl Session {
     }
 }
 
-/// Runs `command` in `project_dir` with the settings read with `env`, publishing
+/// Runs `command` in `project_dir` with the settings `load` reads, publishing
 /// progress on `front`'s bus, emitting a usage summary per stage through `front`
 /// (stdout on the command line) and recording each stage it starts in the
 /// project's history. The command stops at `front`'s interruption (Ctrl-C on the
@@ -158,9 +174,13 @@ pub async fn run(
     command: Command,
     args: &StageArgs,
     front: &Frontend,
-    env: &EnvSource,
+    load: Load<'_>,
 ) -> anyhow::Result<()> {
-    let session = Session::open(project_dir, env)?;
+    let (env, reloader) = match load {
+        Load::Env(env) => (env.clone(), None),
+        Load::Reload(reloader) => (reloader.env().clone(), Some(reloader)),
+    };
+    let session = Session::open(project_dir, &env)?;
     let guard = front.open_bus();
     let mut recorder = Recorder::new(project_dir, &guard.bus);
     let steps = Steps {
@@ -168,7 +188,7 @@ pub async fn run(
         front,
         recorder: &mut recorder,
     };
-    let flow = execute(&guard.bus, command, args, steps);
+    let flow = execute(&guard.bus, command, args, steps, reloader);
     let result = if let Some(result) = front.interrupt().race(flow).await {
         result
     } else {
@@ -185,6 +205,7 @@ async fn execute(
     command: Command,
     args: &StageArgs,
     mut steps: Steps<'_>,
+    reloader: Option<&mut Reloader>,
 ) -> anyhow::Result<()> {
     let session = steps.session;
     let empty = Prompts::empty();
@@ -217,17 +238,61 @@ async fn execute(
         },
         Command::Answers => steps.stage(Stage::Answers, answers(session, &ctx)).await,
         Command::Split => steps.split(&ctx).await,
-        Command::Run => {
-            steps
-                .stage(Stage::Subtopics, subtopics(session, &ctx))
-                .await?;
-            steps
-                .stage(Stage::Questions, questions(session, &ctx))
-                .await?;
-            steps.stage(Stage::Answers, answers(session, &ctx)).await?;
-            steps.split(&ctx).await
-        },
+        // Boxed: its sessions and stages would weigh on every command's future.
+        Command::Run => Box::pin(run_stages(bus, args, steps, reloader)).await,
     }
+}
+
+/// The stages of `run`, in order.
+const RUN_STAGES: [Stage; 4] = [
+    Stage::Subtopics,
+    Stage::Questions,
+    Stage::Answers,
+    Stage::Split,
+];
+
+/// Runs the stages of `run` with the session of `steps`; before each stage
+/// after the first, `reloader`, when given, reads the settings again when
+/// their files changed, and the next stages use them.
+async fn run_stages(
+    bus: &EventBus,
+    args: &StageArgs,
+    steps: Steps<'_>,
+    mut reloader: Option<&mut Reloader>,
+) -> anyhow::Result<()> {
+    let Steps {
+        session: first,
+        front,
+        recorder,
+    } = steps;
+    let mut reread: Option<Session> = None;
+    for (index, stage) in RUN_STAGES.into_iter().enumerate() {
+        if index > 0
+            && let Some(reloader) = reloader.as_deref_mut()
+            && let Some(settings) = reloader.changed()?
+        {
+            reread = Some(Session::new(&first.project_dir, settings));
+        }
+        let session = reread.as_ref().unwrap_or(first);
+        let prompts = if stage == Stage::Split {
+            Prompts::empty()
+        } else {
+            Prompts::load(&session.project_dir)?
+        };
+        let ctx = session.ctx(bus, args, &prompts);
+        let mut steps = Steps {
+            session,
+            front,
+            recorder: &mut *recorder,
+        };
+        match stage {
+            Stage::Subtopics => steps.stage(stage, subtopics(session, &ctx)).await?,
+            Stage::Questions => steps.stage(stage, questions(session, &ctx)).await?,
+            Stage::Answers => steps.stage(stage, answers(session, &ctx)).await?,
+            Stage::Split => steps.split(&ctx).await?,
+        }
+    }
+    Ok(())
 }
 
 /// Runs stages one at a time, reporting and recording each.

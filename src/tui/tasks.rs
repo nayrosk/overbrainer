@@ -22,7 +22,7 @@ use super::project::ProjectConfig;
 use super::project_edit::{SaveRefusal, save_config};
 use super::start::{Gpus, StartPlan, list_gpus, prepare};
 use super::training::{Listing, list_runs, read_series};
-use crate::cli::data::Command;
+use crate::cli::data::{Command, Load};
 use crate::cli::front::{Frontend, Report};
 use crate::cli::{StageArgs, TrainArgs, TrainCommand};
 use crate::config::{DotenvKeys, EnvSource, ReloadError, Stamp, reload, stamp};
@@ -595,7 +595,7 @@ impl Tasks {
         self.set.spawn(async move {
             let args = StageArgs::default();
             // The flow ends itself when the token is cancelled, recording the stage.
-            let outcome = crate::cli::data::run(&dir, command, &args, &front, &env)
+            let outcome = crate::cli::data::run(&dir, command, &args, &front, Load::Env(&env))
                 .await
                 .map_err(|error| format!("{error:#}"));
             forwarded(front, forwarder, "stage").await;

@@ -7,6 +7,7 @@ use anyhow::{Context, anyhow, bail};
 
 use super::front::{Frontend, Interrupt};
 use super::progress::status_name;
+use super::reload::Reloader;
 use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
 use crate::config::{DEFAULT_WORKDIR, EnvSource, Settings, Target, Training};
@@ -51,13 +52,22 @@ pub async fn run(
     }
 }
 
-/// Trains after `overbrainer run` when `[training]` is set.
+/// Trains after `overbrainer run` when `[training]` is set, with the settings
+/// `reloader` reads again when their files changed since the last stage.
 ///
 /// # Errors
 ///
-/// Returns an error when training fails.
-pub async fn after_run(project_dir: &Path, front: &Frontend) -> anyhow::Result<()> {
-    let settings = crate::config::load(project_dir, EnvSource::Process)?;
+/// Returns an error when the changed configuration cannot be used or training
+/// fails.
+pub(crate) async fn after_run(
+    project_dir: &Path,
+    front: &Frontend,
+    reloader: &mut Reloader,
+) -> anyhow::Result<()> {
+    let settings = match reloader.changed()? {
+        Some(settings) => settings,
+        None => crate::config::load(project_dir, reloader.env().clone())?,
+    };
     if settings.training.is_none() {
         no_training();
         return Ok(());
