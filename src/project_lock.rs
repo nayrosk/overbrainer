@@ -54,8 +54,8 @@ pub enum LockError {
     },
 }
 
-/// Why an [`io::Error`] from [`check_path`] or [`verify_opened`] was raised: the
-/// path is not safe to treat as a single, owned file.
+/// Why an [`io::Error`] from [`open_state_file`] was raised: the path is not
+/// safe to treat as a single, owned file.
 #[derive(Debug)]
 struct UnsafePath(PathBuf);
 
@@ -76,54 +76,91 @@ fn unsafe_path_error(path: &Path) -> io::Error {
     io::Error::new(ErrorKind::InvalidInput, UnsafePath(path.to_path_buf()))
 }
 
-/// Whether `path` is a symbolic link; a missing path is not.
-fn is_symlink(path: &Path) -> io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
+/// Maps an `openat` failure with `O_NOFOLLOW` for `path`: a symbolic link (or,
+/// for a directory, anything but one) is [`unsafe_path_error`]; anything else
+/// is the plain I/O failure.
+fn unsafe_or_io_error(path: &Path, errno: Errno) -> io::Error {
+    if errno == Errno::LOOP || errno == Errno::NOTDIR {
+        unsafe_path_error(path)
+    } else {
+        errno.into()
     }
 }
 
-/// Refuses `path` when it is currently a symbolic link; a missing path is fine,
-/// since `open` will create it.
+/// Opens `name` inside `project_dir`'s state directory (`.overbrainer`),
+/// creating the state directory first when `create_dir`. Every step is
+/// relative to the previous descriptor and never follows a symbolic link, so
+/// renaming or swapping a path component cannot redirect the open.
 ///
-/// This narrows the window before the file is opened but does not close it:
-/// [`verify_opened`] checks what was actually opened.
-pub(crate) fn check_path(path: &Path) -> io::Result<()> {
-    if is_symlink(path)? {
-        return Err(unsafe_path_error(path));
+/// # Errors
+///
+/// An [`io::Error`] of kind `InvalidInput` when `.overbrainer` or `name` is a
+/// symbolic link, a hard link to another file, or not a regular file.
+/// `ErrorKind::NotFound` when `name` (or, without `create_dir`, `.overbrainer`)
+/// does not exist. Any other failure opening `project_dir`, creating
+/// `.overbrainer`, or opening `name`.
+pub(crate) fn open_state_file(
+    project_dir: &Path,
+    name: &str,
+    flags: OFlags,
+    create_dir: bool,
+) -> io::Result<File> {
+    let project = rustix::fs::open(
+        project_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    if create_dir {
+        match rustix::fs::mkdirat(&project, STATE_DIR, Mode::from_raw_mode(0o777)) {
+            Ok(()) => {},
+            Err(e) if e == Errno::EXIST => {},
+            Err(e) => return Err(e.into()),
+        }
     }
-    Ok(())
+    let dir_path = project_dir.join(STATE_DIR);
+    let state = open_state_dir(&project).map_err(|e| unsafe_or_io_error(&dir_path, e))?;
+
+    let mode = if flags.contains(OFlags::CREATE) {
+        Mode::from_raw_mode(0o644)
+    } else {
+        Mode::empty()
+    };
+    let file_path = dir_path.join(name);
+    let fd = rustix::fs::openat(
+        &state,
+        name,
+        flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        mode,
+    )
+    .map_err(|e| unsafe_or_io_error(&file_path, e))?;
+
+    let file = File::from(fd);
+    let metadata = file.metadata()?;
+    // A second hard link would make writes land in a file we do not own.
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(unsafe_path_error(&file_path));
+    }
+    Ok(file)
 }
 
-/// Verifies that `file`, opened from `path` inside `dir`, is a regular file
-/// with a single link that is still the file at `path`, and that `dir` is not
-/// a symbolic link.
-///
-/// `open` follows symbolic links, so this compares what was opened (`fstat`)
-/// with what is on disk now (`lstat`).
-pub(crate) fn verify_opened(dir: &Path, path: &Path, file: &File) -> io::Result<()> {
-    if is_symlink(dir)? {
-        return Err(unsafe_path_error(dir));
+/// Converts an [`io::Error`] from [`open_state_file`] into a [`LockError`] for
+/// the project lock: the exact unsafe path when the error names one,
+/// `fallback` otherwise.
+fn to_lock_error(fallback: &Path, error: io::Error) -> LockError {
+    if error.kind() == ErrorKind::InvalidInput {
+        let path = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<UnsafePath>())
+            .map_or_else(
+                || fallback.to_path_buf(),
+                |unsafe_path| unsafe_path.0.clone(),
+            );
+        return LockError::UnsafePath { path };
     }
-
-    let opened = file.metadata()?;
-    // A second hard link makes the file reachable through a path we do not own.
-    if !opened.is_file() || opened.nlink() != 1 {
-        return Err(unsafe_path_error(path));
+    LockError::Io {
+        path: fallback.to_path_buf(),
+        source: error,
     }
-
-    // `path` must still be that very inode, and not a symbolic link.
-    let on_disk = std::fs::symlink_metadata(path)?;
-    if on_disk.file_type().is_symlink()
-        || on_disk.dev() != opened.dev()
-        || on_disk.ino() != opened.ino()
-    {
-        return Err(unsafe_path_error(path));
-    }
-
-    Ok(())
 }
 
 /// A [`LockError::Io`] for `path`.
@@ -131,18 +168,6 @@ fn io_error(path: &Path, errno: Errno) -> LockError {
     LockError::Io {
         path: path.to_path_buf(),
         source: errno.into(),
-    }
-}
-
-/// Maps an `openat` failure with `O_NOFOLLOW`: a symbolic link (or, for a
-/// directory, anything but one) is [`LockError::UnsafePath`].
-fn open_error(path: &Path, errno: Errno) -> LockError {
-    if errno == Errno::LOOP || errno == Errno::NOTDIR {
-        LockError::UnsafePath {
-            path: path.to_path_buf(),
-        }
-    } else {
-        io_error(path, errno)
     }
 }
 
@@ -222,33 +247,15 @@ impl ProjectLock {
             Err(e) => return Err(io_error(project_dir, e)),
         }
 
-        // Everything below is relative to the locked descriptor, so a rename
-        // of either directory cannot redirect it.
-        match rustix::fs::mkdirat(&project, STATE_DIR, Mode::from_raw_mode(0o777)) {
-            Ok(()) => {},
-            Err(e) if e == Errno::EXIST => {},
-            Err(e) => return Err(io_error(&dir, e)),
-        }
-        let state = open_state_dir(&project).map_err(|e| open_error(&dir, e))?;
-        let pid_fd = rustix::fs::openat(
-            &state,
-            LOCK_FILE,
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o644),
-        )
-        .map_err(|e| open_error(&pid_path, e))?;
-        let mut pid_file = File::from(pid_fd);
+        // Everything below is opened relative to `project_dir` fresh, so a
+        // rename of either directory after the flock above cannot redirect it.
+        let mut pid_file =
+            open_state_file(project_dir, LOCK_FILE, OFlags::RDWR | OFlags::CREATE, true)
+                .map_err(|e| to_lock_error(&pid_path, e))?;
         let pid_io = |source| LockError::Io {
             path: pid_path.clone(),
             source,
         };
-        // A second hard link would make the write land in a file we do not own.
-        let metadata = pid_file.metadata().map_err(pid_io)?;
-        if !metadata.is_file() || metadata.nlink() != 1 {
-            return Err(LockError::UnsafePath {
-                path: pid_path.clone(),
-            });
-        }
         pid_file.set_len(0).map_err(pid_io)?;
         write!(pid_file, "{}", std::process::id()).map_err(pid_io)?;
         pid_file.flush().map_err(pid_io)?;

@@ -3,15 +3,16 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::{self, BufRead as _, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
+use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RoleModel;
 use crate::events::{Stage, StageStats};
-use crate::project_lock::{STATE_DIR, check_path, verify_opened};
+use crate::project_lock::{STATE_DIR, open_state_file};
 
 /// File name of the history in the state directory.
 pub const HISTORY_FILE: &str = "history.jsonl";
@@ -137,20 +138,14 @@ impl Entry {
 /// `.overbrainer` or the history file is not a safe path to write to (a symbolic
 /// link, a hard link to another file, or swapped for one of those).
 pub fn append(project_dir: &Path, entry: &Entry) -> io::Result<()> {
-    let dir = project_dir.join(STATE_DIR);
-    let path = path(project_dir);
-    std::fs::create_dir_all(&dir)?;
-    // Never follow a symbolic link into an unrelated file. This narrows the
-    // window but does not close it; `verify_opened` below closes it.
-    for link in [&dir, &path] {
-        check_path(link)?;
-    }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    verify_opened(&dir, &path, &file)?;
+    // Opened relative to `project_dir`, so a swapped `.overbrainer` or history
+    // file cannot redirect the write.
+    let mut file = open_state_file(
+        project_dir,
+        HISTORY_FILE,
+        OFlags::RDWR | OFlags::APPEND | OFlags::CREATE,
+        true,
+    )?;
     let mut line = String::new();
     // A crash can leave a last line without its newline: end it first, so that
     // line alone is lost.
@@ -164,7 +159,7 @@ pub fn append(project_dir: &Path, entry: &Entry) -> io::Result<()> {
 }
 
 /// Whether `file` is empty or ends with a newline.
-fn ends_a_line(file: &mut std::fs::File) -> io::Result<bool> {
+fn ends_a_line(file: &mut File) -> io::Result<bool> {
     if file.metadata()?.len() == 0 {
         return Ok(true);
     }
@@ -182,13 +177,9 @@ fn ends_a_line(file: &mut std::fs::File) -> io::Result<bool> {
 /// Returns an error when the file exists but cannot be read, or when
 /// `.overbrainer` or the history file is a symbolic link.
 pub fn read(project_dir: &Path) -> io::Result<Vec<Entry>> {
-    let dir = project_dir.join(STATE_DIR);
-    let path = path(project_dir);
-    // Never follow a symbolic link into an unrelated file.
-    for link in [&dir, &path] {
-        check_path(link)?;
-    }
-    let file = match std::fs::File::open(&path) {
+    // A missing history file or a missing `.overbrainer` are both an empty
+    // history; anything else, including a symbolic link, is an error.
+    let file = match open_state_file(project_dir, HISTORY_FILE, OFlags::RDONLY, false) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -214,7 +205,10 @@ pub fn read(project_dir: &Path) -> io::Result<Vec<Entry>> {
         match serde_json::from_slice(line) {
             Ok(entry) => entries.push(entry),
             Err(error) => {
-                tracing::warn!("skipping line {number} of {}: {error}", path.display());
+                tracing::warn!(
+                    "skipping line {number} of {}: {error}",
+                    path(project_dir).display()
+                );
             },
         }
     }
@@ -341,6 +335,8 @@ pub fn per_model(entries: &[Entry]) -> BTreeMap<String, Total> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -459,6 +455,17 @@ mod tests {
         let good = entry(Stage::Answers, Some(1.0));
         assert!(append(dir.path(), &good).is_err());
         assert_eq!(std::fs::read_to_string(&target)?, "keep me");
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlinked_state_directory_makes_append_fail_without_writing_the_target() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(STATE_DIR))?;
+        let good = entry(Stage::Answers, Some(1.0));
+        assert!(append(dir.path(), &good).is_err());
+        assert!(std::fs::read_dir(elsewhere.path())?.next().is_none());
         Ok(())
     }
 
