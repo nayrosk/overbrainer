@@ -122,8 +122,8 @@ pub fn gpu_table(gpus: &[GpuType], data_center: Option<&str>) -> Vec<String> {
 }
 
 /// `text`, from the Runpod API, without what could move the cursor or change
-/// the terminal's state: ANSI escape sequences (CSI, OSC and two-character
-/// ones) are dropped, a control character that is whitespace (newline, tab,
+/// the terminal's state: ANSI escape sequences (CSI, string controls such as
+/// OSC or DCS through their terminator, and two-character ones) are dropped, a control character that is whitespace (newline, tab,
 /// CR...) becomes a space, and every other one (C0, DEL, C1) is dropped.
 #[must_use]
 pub fn printable(text: &str) -> String {
@@ -133,11 +133,11 @@ pub fn printable(text: &str) -> String {
         match c {
             '\u{1b}' => match chars.next() {
                 Some('[') => skip_csi(&mut chars),
-                Some(']') => skip_osc(&mut chars),
+                Some(']' | 'P' | 'X' | '^' | '_') => skip_string(&mut chars),
                 _ => {},
             },
             '\u{9b}' => skip_csi(&mut chars),
-            '\u{9d}' => skip_osc(&mut chars),
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars),
             c if c.is_control() && c.is_whitespace() => kept.push(' '),
             c if c.is_control() => {},
             c => kept.push(c),
@@ -152,8 +152,9 @@ fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     chars.next_if(|c| matches!(c, '@'..='~'));
 }
 
-/// Skips an OSC sequence up to its terminator: BEL, ST or `ESC \`.
-fn skip_osc(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+/// Skips a string control (OSC, DCS, SOS, PM or APC) up to its terminator:
+/// BEL, ST or `ESC \`; an unterminated one takes the rest of the text.
+fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     while let Some(c) = chars.next() {
         match c {
             '\u{7}' | '\u{9c}' => return,
@@ -1116,6 +1117,24 @@ mod tests {
             "RTX 4090 é",
             "printable text stays"
         );
+    }
+
+    #[test]
+    fn string_controls_are_skipped_through_their_terminator() {
+        for introducer in ['P', 'X', '^', '_'] {
+            let st = format!("a\u{1b}{introducer}bad\u{1b}\\b");
+            assert_eq!(printable(&st), "ab", "ESC {introducer}");
+            let bel = format!("a\u{1b}{introducer}bad\u{7}b");
+            assert_eq!(printable(&bel), "ab", "ESC {introducer} ended by BEL");
+            let open = format!("a\u{1b}{introducer}bad and more");
+            assert_eq!(printable(&open), "a", "ESC {introducer} unterminated");
+        }
+        for introducer in ['\u{90}', '\u{98}', '\u{9e}', '\u{9f}'] {
+            let st = format!("a{introducer}bad\u{9c}b");
+            assert_eq!(printable(&st), "ab", "{introducer:?}");
+            let open = format!("a{introducer}bad and more");
+            assert_eq!(printable(&open), "a", "{introducer:?} unterminated");
+        }
     }
 
     #[test]
