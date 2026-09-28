@@ -127,29 +127,55 @@ pub enum FieldValue {
     List(Vec<String>),
 }
 
+/// Why a value does not fit a field. No message quotes the value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FieldError {
+    /// Text typed for an integer field is not a whole number.
+    #[error("must be a whole number")]
+    NotInt,
+    /// Text typed for a float field is not a number.
+    #[error("must be a number")]
+    NotNumber,
+    /// Text typed for a boolean field is neither `true` nor `false`.
+    #[error("must be true or false")]
+    NotBool,
+    /// A number outside the field's bounds, with the bounds in words.
+    #[error("must be {0}")]
+    OutOfRange(String),
+    /// Text outside the field's choices, with the choices in words.
+    #[error("must be {0}")]
+    NotAChoice(String),
+    /// A value of another kind than the field's.
+    #[error("has the wrong type")]
+    WrongType,
+    /// A required field cannot be removed.
+    #[error("is required and cannot be removed")]
+    Required,
+}
+
 impl FieldKind {
     /// Reads `text`, as typed in a form, into a value of this kind.
     ///
     /// # Errors
     ///
     /// Returns why `text` is not accepted. The message never quotes `text`.
-    pub fn parse(self, text: &str) -> Result<FieldValue, String> {
+    pub fn parse(self, text: &str) -> Result<FieldValue, FieldError> {
         let value = match self {
             Self::Text => FieldValue::Text(text.to_string()),
             Self::Int { .. } => text
                 .trim()
                 .parse()
                 .map(FieldValue::Int)
-                .map_err(|_| "must be a whole number".to_string())?,
+                .map_err(|_| FieldError::NotInt)?,
             Self::Float { .. } => text
                 .trim()
                 .parse()
                 .map(FieldValue::Float)
-                .map_err(|_| "must be a number".to_string())?,
+                .map_err(|_| FieldError::NotNumber)?,
             Self::Bool => match text.trim() {
                 "true" => FieldValue::Bool(true),
                 "false" => FieldValue::Bool(false),
-                _ => return Err("must be true or false".to_string()),
+                _ => return Err(FieldError::NotBool),
             },
             Self::Choice(_) => FieldValue::Text(text.trim().to_string()),
             Self::List => FieldValue::List(
@@ -169,7 +195,7 @@ impl FieldKind {
     /// # Errors
     ///
     /// Returns why `value` is not accepted. The message never quotes the value.
-    pub fn check(self, value: &FieldValue) -> Result<(), String> {
+    pub fn check(self, value: &FieldValue) -> Result<(), FieldError> {
         match (self, value) {
             (Self::Text, FieldValue::Text(_))
             | (Self::Bool, FieldValue::Bool(_))
@@ -185,10 +211,11 @@ impl FieldKind {
             (Self::Choice(choices), FieldValue::Text(text)) if choices.contains(&text.as_str()) => {
                 Ok(())
             },
-            (Self::Int { .. }, FieldValue::Int(_))
-            | (Self::Float { .. }, FieldValue::Float(_))
-            | (Self::Choice(_), FieldValue::Text(_)) => Err(format!("must be {}", self.describe())),
-            _ => Err("has the wrong type".to_string()),
+            (Self::Int { .. }, FieldValue::Int(_)) | (Self::Float { .. }, FieldValue::Float(_)) => {
+                Err(FieldError::OutOfRange(self.describe()))
+            },
+            (Self::Choice(_), FieldValue::Text(_)) => Err(FieldError::NotAChoice(self.describe())),
+            _ => Err(FieldError::WrongType),
         }
     }
 
@@ -847,22 +874,37 @@ max_hours = 6
     fn numbers_are_parsed_with_their_bounds() {
         let int = FieldKind::Int { min: 1, max: 10 };
         assert_eq!(int.parse(" 7 "), Ok(FieldValue::Int(7)));
-        assert_eq!(int.parse("0"), Err("must be between 1 and 10".to_string()));
-        assert_eq!(COUNT.parse("0"), Err("must be at least 1".to_string()));
+        assert_eq!(
+            int.parse("0").map_err(|error| error.to_string()),
+            Err("must be between 1 and 10".to_string())
+        );
+        assert_eq!(
+            COUNT.parse("0").map_err(|error| error.to_string()),
+            Err("must be at least 1".to_string())
+        );
         assert!(int.parse("7.5").is_err());
         let float = floats(Bound::Excl(0.0), Bound::Incl(1.0));
         assert_eq!(float.parse("0.5"), Ok(FieldValue::Float(0.5)));
         assert_eq!(float.parse("1"), Ok(FieldValue::Float(1.0)));
-        assert_eq!(float.parse("0"), Err("must be in (0, 1]".to_string()));
+        assert_eq!(
+            float.parse("0").map_err(|error| error.to_string()),
+            Err("must be in (0, 1]".to_string())
+        );
         for text in ["NaN", "inf", "1.5", "x"] {
             assert!(float.parse(text).is_err(), "{text}");
         }
         let rate = floats(Bound::Excl(0.0), Bound::Unbounded);
         assert_eq!(rate.parse("1e9"), Ok(FieldValue::Float(1e9)));
-        assert_eq!(rate.parse("0"), Err("must be greater than 0".to_string()));
+        assert_eq!(
+            rate.parse("0").map_err(|error| error.to_string()),
+            Err("must be greater than 0".to_string())
+        );
         let dropout = floats(Bound::Incl(0.0), Bound::Excl(1.0));
         assert_eq!(dropout.parse("0"), Ok(FieldValue::Float(0.0)));
-        assert_eq!(dropout.parse("1"), Err("must be in [0, 1)".to_string()));
+        assert_eq!(
+            dropout.parse("1").map_err(|error| error.to_string()),
+            Err("must be in [0, 1)".to_string())
+        );
     }
 
     #[test]
@@ -874,7 +916,7 @@ max_hours = 6
             Ok(FieldValue::Text("native".to_string()))
         );
         assert_eq!(
-            RUNTIMES.parse("vm"),
+            RUNTIMES.parse("vm").map_err(|error| error.to_string()),
             Err("must be one of docker, native".to_string())
         );
         assert_eq!(
@@ -895,7 +937,11 @@ max_hours = 6
     fn errors_never_quote_the_value() {
         let secret = "sk-secret-value";
         for (index, kind) in [COUNT, BOOL, RUNTIMES, THRESHOLD].into_iter().enumerate() {
-            let message = kind.parse(secret).err().unwrap_or_default();
+            let message = kind
+                .parse(secret)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
             assert!(
                 !message.is_empty() && !message.contains(secret),
                 "kind #{index} quotes the value or says nothing"

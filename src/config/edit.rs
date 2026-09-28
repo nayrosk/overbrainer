@@ -12,7 +12,7 @@ use toml_edit::{
     Value, value,
 };
 
-use super::fields::{self, FieldSpec, FieldValue, Section, TargetKind};
+use super::fields::{self, FieldError, FieldSpec, FieldValue, Section, TargetKind};
 use super::types::Protocol;
 use super::validate::is_valid_name;
 
@@ -100,7 +100,7 @@ pub enum EditError {
         /// Dotted path of the field.
         path: String,
         /// Why the value is refused.
-        reason: String,
+        reason: FieldError,
     },
     /// A table or topic with this name already exists.
     #[error("{0}: already exists")]
@@ -250,7 +250,7 @@ impl ConfigDoc {
             Ok(spec) if !spec.optional => {
                 return Err(EditError::Invalid {
                     path: path.to_string(),
-                    reason: "is required and cannot be removed".to_string(),
+                    reason: FieldError::Required,
                 });
             },
             Ok(_) => {},
@@ -1017,7 +1017,7 @@ runtime = "native"
             doc.unset(&FieldPath::Training("target")),
             Err(EditError::Invalid {
                 path: "training.target".to_string(),
-                reason: "is required and cannot be removed".to_string(),
+                reason: FieldError::Required,
             })
         );
         assert!(doc.remove_table(Collection::Targets, "box"));

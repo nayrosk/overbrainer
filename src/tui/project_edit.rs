@@ -438,7 +438,7 @@ impl App {
         let value = match (text.trim().is_empty(), optional) {
             (true, true) => None,
             (true, false) => return Err("is required".to_string()),
-            (false, _) => Some(kind.parse(text)?),
+            (false, _) => Some(kind.parse(text).map_err(|error| error.to_string())?),
         };
         if let (FieldPath::Topic { index, field, .. }, Some(FieldValue::Text(new))) = (path, &value)
             && *field == "name"
