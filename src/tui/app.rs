@@ -4554,7 +4554,7 @@ mod tests {
         assert!(dialog(&app).contains("looking up the catalog..."), "stale");
         app.on_done(*new, Err("a background task failed: cancelled".into()));
         assert!(!dialog(&app).contains("looking up"), "{}", dialog(&app));
-        assert!(dialog(&app).contains("NVIDIA A40                 catalog unread"));
+        assert!(dialog(&app).contains("NVIDIA A40               catalog unread"));
         assert!(dialog(&app).contains("catalog     a background task failed: cancelled"));
         assert_eq!(app.start_catalog, None);
         Ok(())

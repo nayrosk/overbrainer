@@ -36,37 +36,37 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 
 ```
 $ overbrainer pod gpus
-ID                            VRAM GB     $/H  MAX COUNT  STOCK
-NVIDIA GeForce RTX 4090            24    0.34          8  HIGH
-NVIDIA A40                         48    0.40          8  MEDIUM
-NVIDIA H100 80GB HBM3              80       -          8  LOW
+ID                       VRAM GB   $/H  MAX COUNT  STOCK
+NVIDIA GeForce RTX 4090       24  0.34          8  HIGH
+NVIDIA A40                    48  0.40          8  MEDIUM
+NVIDIA H100 80GB HBM3         80     -          8  LOW
 ```
 
-`--min-vram GB`, `--max-price PRICE` (USD/hour) and `--in-stock` narrow the list. `--data-center ID` keeps only the GPU types offered there and shows their stock there, in the STOCK column, instead of the overall band. `-` in `$/H` means Runpod lists no Secure Cloud price for that GPU type.
+`--min-vram GB`, `--max-price PRICE` (USD/hour) and `--in-stock` narrow the list. `--data-center ID` keeps only the GPU types offered there and shows their stock there, in the STOCK column, instead of the overall band. `-` in `$/H` means Runpod lists no positive Secure Cloud price for that GPU type.
 
 `overbrainer pod datacenters` lists every data center, by ID, with how many GPU types are in stock there overall:
 
 ```
 $ overbrainer pod datacenters
-ID            NAME                      REGION            GPU TYPES IN STOCK
-EU-RO-1       EU Romania 1              EUROPE            14
-US-KS-2       US Kansas 2               NORTH_AMERICA     9
+ID       NAME          REGION         GPU TYPES IN STOCK
+EU-RO-1  EU Romania 1  EUROPE         14
+US-KS-2  US Kansas 2   NORTH_AMERICA  9
 ```
 
 `overbrainer pod volumes` lists the account's network volumes, by name:
 
 ```
 $ overbrainer pod volumes
-ID            NAME                      SIZE GB  DATA CENTER
-nv1a2b3c      training-data                 500  EU-RO-1
+ID        NAME           SIZE GB  DATA CENTER
+nv1a2b3c  training-data      500  EU-RO-1
 ```
 
 `overbrainer pod templates` lists the account's pod templates, by name (serverless templates are left out):
 
 ```
 $ overbrainer pod templates
-ID            NAME                      IMAGE
-tp9z8y7x      axolotl-custom            myrepo/axolotl:0.20.0
+ID        NAME            IMAGE
+tp9z8y7x  axolotl-custom  myrepo/axolotl:0.20.0
 ```
 
 An empty listing prints one line saying so instead of a table (`pod: no GPU type matches`, `pod: no data center found`, `pod: no network volume on this account`, `pod: no pod template on this account`).

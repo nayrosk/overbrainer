@@ -92,23 +92,72 @@ pub fn gpu_table(gpus: &[GpuType], data_center: Option<&str>) -> Vec<String> {
     if gpus.is_empty() {
         return Vec::new();
     }
-    let mut lines = vec![format!(
-        "{:<28}  {:>7}  {:>6}  {:>9}  STOCK",
-        "ID", "VRAM GB", "$/H", "MAX COUNT"
-    )];
-    for gpu in gpus {
-        let price = gpu
-            .secure_price()
-            .map_or_else(|| "-".to_string(), |price| format!("{price:.2}"));
-        let stock = data_center.map_or(gpu.availability, |center| gpu.stock_in(center));
-        lines.push(format!(
-            "{:<28}  {:>7}  {price:>6}  {:>9}  {}",
-            gpu.id,
-            gpu.memory,
-            gpu.max_count.secure,
-            stock.name()
-        ));
+    let rows: Vec<Vec<String>> = gpus
+        .iter()
+        .map(|gpu| {
+            let price = gpu
+                .secure_price()
+                .map_or_else(|| "-".to_string(), |price| format!("{price:.2}"));
+            let stock = data_center.map_or(gpu.availability, |center| gpu.stock_in(center));
+            vec![
+                gpu.id.clone(),
+                gpu.memory.to_string(),
+                price,
+                gpu.max_count.secure.to_string(),
+                stock.name().to_string(),
+            ]
+        })
+        .collect();
+    columns(
+        &["ID", "VRAM GB", "$/H", "MAX COUNT", "STOCK"],
+        &[
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+            Align::Left,
+        ],
+        &rows,
+    )
+}
+
+/// Whether a [`columns`] column is aligned to the left or the right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Align {
+    Left,
+    Right,
+}
+
+/// `header` and `rows` laid out in columns two spaces apart, each as wide as
+/// its longest value, `align` giving each column's side; the last column is
+/// never padded.
+fn columns(header: &[&str], align: &[Align], rows: &[Vec<String>]) -> Vec<String> {
+    let mut widths: Vec<usize> = header.iter().map(|title| title.chars().count()).collect();
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
     }
+    let line = |cells: Vec<&str>| {
+        let last = cells.len().saturating_sub(1);
+        let padded: Vec<String> = cells
+            .iter()
+            .zip(&widths)
+            .zip(align)
+            .enumerate()
+            .map(|(index, ((cell, width), side))| match side {
+                _ if index == last => (*cell).to_string(),
+                Align::Left => format!("{cell:<width$}"),
+                Align::Right => format!("{cell:>width$}"),
+            })
+            .collect();
+        padded.join("  ")
+    };
+    let mut lines = vec![line(header.to_vec())];
+    lines.extend(
+        rows.iter()
+            .map(|row| line(row.iter().map(String::as_str).collect())),
+    );
     lines
 }
 
@@ -180,22 +229,27 @@ pub fn data_center_table(data_centers: &[DataCenter]) -> Vec<String> {
     }
     let mut rows: Vec<&DataCenter> = data_centers.iter().collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut lines = vec![format!(
-        "{:<12}  {:<24}  {:<16}  GPU TYPES IN STOCK",
-        "ID", "NAME", "REGION"
-    )];
-    for center in rows {
-        let in_stock = center
-            .gpu_availability
-            .iter()
-            .filter(|entry| entry.availability.is_in_stock())
-            .count();
-        lines.push(format!(
-            "{:<12}  {:<24}  {:<16}  {in_stock}",
-            center.id, center.name, center.region
-        ));
-    }
-    lines
+    let rows: Vec<Vec<String>> = rows
+        .into_iter()
+        .map(|center| {
+            let in_stock = center
+                .gpu_availability
+                .iter()
+                .filter(|entry| entry.availability.is_in_stock())
+                .count();
+            vec![
+                center.id.clone(),
+                center.name.clone(),
+                center.region.clone(),
+                in_stock.to_string(),
+            ]
+        })
+        .collect();
+    columns(
+        &["ID", "NAME", "REGION", "GPU TYPES IN STOCK"],
+        &[Align::Left; 4],
+        &rows,
+    )
 }
 
 /// The data centers with at least one `chosen` GPU type in stock, ordered by
@@ -363,17 +417,22 @@ pub fn volume_table(volumes: &[NetworkVolume]) -> Vec<String> {
     }
     let mut rows: Vec<&NetworkVolume> = volumes.iter().collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut lines = vec![format!(
-        "{:<12}  {:<24}  {:>7}  DATA CENTER",
-        "ID", "NAME", "SIZE GB"
-    )];
-    for volume in rows {
-        lines.push(format!(
-            "{:<12}  {:<24}  {:>7}  {}",
-            volume.id, volume.name, volume.size, volume.data_center
-        ));
-    }
-    lines
+    let rows: Vec<Vec<String>> = rows
+        .into_iter()
+        .map(|volume| {
+            vec![
+                volume.id.clone(),
+                volume.name.clone(),
+                volume.size.to_string(),
+                volume.data_center.clone(),
+            ]
+        })
+        .collect();
+    columns(
+        &["ID", "NAME", "SIZE GB", "DATA CENTER"],
+        &[Align::Left, Align::Left, Align::Right, Align::Left],
+        &rows,
+    )
 }
 
 /// The rows of `overbrainer pod templates`, header first, sorted by name;
@@ -385,14 +444,17 @@ pub fn template_table(templates: &[Template]) -> Vec<String> {
     }
     let mut rows: Vec<&Template> = templates.iter().collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut lines = vec![format!("{:<12}  {:<24}  IMAGE", "ID", "NAME")];
-    for template in rows {
-        lines.push(format!(
-            "{:<12}  {:<24}  {}",
-            template.id, template.name, template.image
-        ));
-    }
-    lines
+    let rows: Vec<Vec<String>> = rows
+        .into_iter()
+        .map(|template| {
+            vec![
+                template.id.clone(),
+                template.name.clone(),
+                template.image.clone(),
+            ]
+        })
+        .collect();
+    columns(&["ID", "NAME", "IMAGE"], &[Align::Left; 3], &rows)
 }
 
 #[cfg(test)]
@@ -919,5 +981,75 @@ mod tests {
             "{}",
             lines[2]
         );
+    }
+
+    /// A live GPU ID, far longer than the old fixed ID column of 28.
+    const LONG: &str = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition";
+
+    /// Where `word` starts in `line`, for checking that a row lines up with
+    /// its header.
+    fn at(line: &str, word: &str) -> Option<usize> {
+        line.find(word)
+    }
+
+    #[test]
+    fn gpu_table_widens_its_id_column_to_the_longest_id() {
+        let lines = gpu_table(&[gpu(LONG, 32, Some(0.9)), gpu("a", 8, Some(0.1))], None);
+        assert!(lines[1].starts_with(&format!("{LONG}  ")), "{}", lines[1]);
+        for line in &lines[1..] {
+            assert_eq!(at(line, "HIGH"), at(&lines[0], "STOCK"), "{lines:#?}");
+        }
+        assert_eq!(
+            at(&lines[2], "0.10").map(|at| at + 4),
+            at(&lines[0], "$/H").map(|at| at + 3),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn data_center_table_widens_its_columns_to_the_longest_values() {
+        let mut long = center("A", vec![stock("x", Availability::High)]);
+        long.name = LONG.to_string();
+        let lines = data_center_table(&[long, center("B", Vec::new())]);
+        for line in &lines[1..] {
+            assert_eq!(
+                line.rfind("  ").map(|at| at + 2),
+                at(&lines[0], "GPU TYPES"),
+                "{lines:#?}"
+            );
+        }
+        assert_eq!(
+            at(&lines[2], "EUROPE"),
+            at(&lines[0], "REGION"),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn volume_and_template_tables_widen_their_name_columns() {
+        let volume = |id: &str, name: &str| NetworkVolume {
+            id: id.to_string(),
+            name: name.to_string(),
+            size: 50,
+            data_center: "EU-RO-1".to_string(),
+        };
+        let lines = volume_table(&[volume("v1", LONG), volume("v2", "z")]);
+        for line in &lines[1..] {
+            assert_eq!(
+                at(line, "EU-RO-1"),
+                at(&lines[0], "DATA CENTER"),
+                "{lines:#?}"
+            );
+        }
+        let template = |id: &str, name: &str| Template {
+            id: id.to_string(),
+            name: name.to_string(),
+            image: "img/a:1".to_string(),
+            serverless: false,
+        };
+        let lines = template_table(&[template("t1", LONG), template("t2", "z")]);
+        for line in &lines[1..] {
+            assert_eq!(at(line, "img/"), at(&lines[0], "IMAGE"), "{lines:#?}");
+        }
     }
 }

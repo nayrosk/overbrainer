@@ -381,7 +381,7 @@ mod tests {
     fn g_and_c_open_untyped_pickers_on_what_the_run_would_use() -> TestResult {
         let (_dir, mut app) = starting(PROJECT_CONFIG)?;
         assert!(
-            dialog(&app).contains("- NVIDIA A40                 $0.40/h        48 GB  HIGH"),
+            dialog(&app).contains("- NVIDIA A40  $0.40/h        48 GB  HIGH"),
             "price, VRAM and stock: {}",
             dialog(&app)
         );
@@ -434,7 +434,7 @@ mod tests {
             "{shown}"
         );
         assert!(
-            shown.contains("- NVIDIA RTX 2000 Ada Generation $0.24/h        16 GB  HIGH"),
+            shown.contains("- NVIDIA RTX 2000 Ada Generation  $0.24/h        16 GB  HIGH"),
             "{shown}"
         );
         let rows = screen(&draw(&mut app, 80, 24)?).join("\n");

@@ -331,8 +331,14 @@ fn runpod_lines(spec: &RunpodTarget, gpus: Option<&Gpus>) -> Vec<String> {
         ids.len()
     };
     let centers = spec.data_center_ids.list();
+    let width = ids
+        .iter()
+        .take(shown)
+        .map(|id| id.chars().count())
+        .max()
+        .unwrap_or(0);
     for id in ids.iter().take(shown) {
-        lines.push(gpu_line(id, count, centers, gpus));
+        lines.push(gpu_line(id, width, count, centers, gpus));
     }
     if ids.len() > shown {
         lines.push(format!("- and {} more", ids.len() - shown));
@@ -355,9 +361,9 @@ fn auto_gpus(spec: &RunpodTarget, gpus: &[GpuType]) -> Result<Vec<String>, Strin
     resolve(&alone, gpus).map(|resolved| resolved.gpu_types.list().to_vec())
 }
 
-/// The line of the GPU type `id`: its list price for `count` GPUs, its VRAM
-/// and its stock in `centers`, once `gpus` are read.
-fn gpu_line(id: &str, count: u32, centers: &[String], gpus: Option<&Gpus>) -> String {
+/// The line of the GPU type `id`, padded to `width`: its list price for
+/// `count` GPUs, its VRAM and its stock in `centers`, once `gpus` are read.
+fn gpu_line(id: &str, width: usize, count: u32, centers: &[String], gpus: Option<&Gpus>) -> String {
     let about = match gpus {
         None => "looking up the catalog...".to_string(),
         Some(Err(_)) => "catalog unread".to_string(),
@@ -376,7 +382,7 @@ fn gpu_line(id: &str, count: u32, centers: &[String], gpus: Option<&Gpus>) -> St
             },
         },
     };
-    format!("- {id:<26} {about}")
+    format!("- {id:<width$}  {about}")
 }
 
 /// The data centers of `spec`, or those `auto` picks now from `gpus` when
@@ -541,9 +547,9 @@ mod tests {
         );
         assert_eq!(
             lines[4],
-            "- NVIDIA GeForce RTX 4090    $1.38/h        24 GB  MEDIUM"
+            "- NVIDIA GeForce RTX 4090  $1.38/h        24 GB  MEDIUM"
         );
-        assert_eq!(lines[5], "- NVIDIA B300                not in the catalog");
+        assert_eq!(lines[5], "- NVIDIA B300              not in the catalog");
         assert_eq!(lines[6], "datacenters any");
         assert_eq!(
             lines[7],
@@ -570,11 +576,11 @@ mod tests {
         let lines = text(&plan(true), Some(&Ok(gpus)));
         assert_eq!(
             lines[4],
-            "- NVIDIA GeForce RTX 4090    price unknown  24 GB  HIGH"
+            "- NVIDIA GeForce RTX 4090  price unknown  24 GB  HIGH"
         );
         assert_eq!(
             lines[5],
-            "- NVIDIA B300                price unknown 288 GB  UNKNOWN"
+            "- NVIDIA B300              price unknown 288 GB  UNKNOWN"
         );
         assert_eq!(
             lines[7],
@@ -594,11 +600,11 @@ mod tests {
         );
         assert_eq!(
             lines[4],
-            "- NVIDIA RTX 2000 Ada Generation $0.24/h        16 GB  HIGH"
+            "- NVIDIA RTX 2000 Ada Generation  $0.24/h        16 GB  HIGH"
         );
         assert_eq!(
             lines[5],
-            "- NVIDIA A40                 $0.40/h        48 GB  HIGH"
+            "- NVIDIA A40                      $0.40/h        48 GB  HIGH"
         );
         assert_eq!(lines[8], "- and 3 more");
         // The dearest picked, the H100, bounds the run even though not shown.
@@ -656,10 +662,29 @@ mod tests {
     }
 
     #[test]
+    fn the_gpu_column_is_as_wide_as_the_longest_id_shown() {
+        let long = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition";
+        let failed: Gpus = Err("unread".into());
+        let lines = text(
+            &planned(runpod_spec(list(&[long, "NVIDIA A40"]), 1)),
+            Some(&failed),
+        );
+        assert_eq!(lines[4], format!("- {long}  catalog unread"));
+        assert_eq!(
+            lines[5],
+            format!(
+                "- {:<width$}  catalog unread",
+                "NVIDIA A40",
+                width = long.len()
+            )
+        );
+    }
+
+    #[test]
     fn an_unread_catalog_says_why_and_bounds_nothing() {
         let failed: Gpus = Err("cannot read the Runpod catalog: no Runpod API key".into());
         let lines = text(&plan(true), Some(&failed));
-        assert_eq!(lines[4], "- NVIDIA GeForce RTX 4090    catalog unread");
+        assert_eq!(lines[4], "- NVIDIA GeForce RTX 4090  catalog unread");
         assert_eq!(
             lines[6],
             "catalog     cannot read the Runpod catalog: no Runpod API key"
@@ -779,10 +804,10 @@ mod tests {
         let gpus = list_gpus(dir.path(), env, runpod.spec.gpu_count).await;
         let shown = text(&plan, Some(&gpus)).join("\n");
         assert!(
-            shown.contains("- NVIDIA GeForce RTX 4090    $1.48/h        24 GB  LOW"),
+            shown.contains("- NVIDIA GeForce RTX 4090  $1.48/h        24 GB  LOW"),
             "{shown}"
         );
-        assert!(shown.contains("- NVIDIA A40                 not in the catalog"));
+        assert!(shown.contains("- NVIDIA A40               not in the catalog"));
         assert!(!shown.contains(KEY) && !format!("{plan:?}").contains(KEY));
         Ok(())
     }
