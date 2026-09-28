@@ -848,8 +848,8 @@ impl App {
             .is_some_and(|shown| shown.text == config.text);
         let dir = self.project.dir.clone();
         self.project = Project::new(&dir, &config.settings);
-        self.set_config(config);
         self.project_view.errors.clear();
+        self.set_config(config);
         let what = if unchanged {
             format!("{CONFIG_FILE} unchanged")
         } else {
