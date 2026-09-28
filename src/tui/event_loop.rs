@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, SystemTime};
 
@@ -14,6 +14,7 @@ use anyhow::Context;
 use crossterm::event::Event as TermEvent;
 use ratatui::backend::Backend;
 use ratatui::{DefaultTerminal, Terminal};
+use rustix::fs::OFlags;
 use tokio::process::Child;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -361,7 +362,8 @@ where
     /// Runs `effect` once the loop ended: a training task or an edit starts
     /// (never lost, never cut), a token is cancelled, a task abandoned; a
     /// reading, a stage or the editor does not start any more, nor a new run
-    /// (the app notes it was not started).
+    /// (the app notes it was not started), and a browser to open or a logs
+    /// export is dropped.
     fn apply_late(&mut self, app: &mut App, effect: Effect) {
         match effect {
             Effect::Spawn(id, Task::Train(TrainJob::Start)) => app.start_dropped(id),
@@ -370,7 +372,10 @@ where
             },
             Effect::Cancel(id) => self.tasks.cancel(id),
             Effect::Abandon(id) => self.tasks.abandon(id),
-            Effect::Spawn(..) | Effect::OpenEditor { .. } => {},
+            Effect::Spawn(..)
+            | Effect::OpenEditor { .. }
+            | Effect::OpenUrl(_)
+            | Effect::ExportLogs { .. } => {},
         }
     }
 
@@ -481,8 +486,58 @@ where
             Effect::Cancel(id) => self.tasks.cancel(id),
             Effect::Abandon(id) => self.tasks.abandon(id),
             Effect::OpenEditor { command, path } => self.open_editor(&command, path).await?,
+            Effect::OpenUrl(url) => self.open_url(url),
+            Effect::ExportLogs { name, lines } => self.export_logs(name, lines),
         }
         Ok(())
+    }
+
+    /// Opens `url` in a browser, detached: no terminal I/O, and the loop never
+    /// waits for it. A detached task waits for the child, so no zombie is left;
+    /// the runtime cancels that task when the TUI ends, so quitting never waits
+    /// for it (`xdg-open` can run as long as the browser it started). Its own
+    /// process group keeps a Ctrl-C or a job-control signal to the TUI from
+    /// reaching it. A failed start or a non-zero exit comes back as one
+    /// [`Msg::BrowserFailed`]; why is logged at debug, so no warning replaces
+    /// that message on the status line.
+    fn open_url(&self, url: String) {
+        let started = tokio::process::Command::new(opener(cfg!(target_os = "macos")))
+            .arg(&url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn();
+        match started {
+            Ok(child) => {
+                tokio::spawn(watch_browser(child, url, self.messages.clone()));
+            },
+            Err(error) => {
+                tracing::debug!("cannot open a browser on {url}: {error}");
+                self.messages.send(Msg::BrowserFailed(url)).ok();
+            },
+        }
+    }
+
+    /// Writes `lines` to `.overbrainer/<name>`, off the UI thread and off the
+    /// event loop: the write runs in its own spawned task, so `Loop::run` keeps
+    /// handling events while it happens, never overwriting an existing file.
+    /// Reports the outcome as [`Msg::LogsExported`], dropped once the loop has
+    /// ended.
+    fn export_logs(&self, name: String, lines: Vec<String>) {
+        let dir = self.tasks.project_dir().to_path_buf();
+        let count = lines.len();
+        let file_name = name.clone();
+        let messages = self.messages.clone();
+        tokio::spawn(async move {
+            let written =
+                tokio::task::spawn_blocking(move || write_log_export(&dir, &name, &lines)).await;
+            let message = match written {
+                Ok(written) => exported(file_name, count, written),
+                Err(error) => Msg::LogsExported(Err(format!("export task panicked: {error}"))),
+            };
+            messages.send(message).ok();
+        });
     }
 
     /// Hands the terminal to the editor: stops reading input, drops the keys
@@ -542,6 +597,64 @@ where
             message => Ok(app.on_message(message)),
         }
     }
+}
+
+/// Waits for the browser opener `child` of `url`, and sends
+/// [`Msg::BrowserFailed`] to `messages` when it ends with an error.
+async fn watch_browser(mut child: Child, url: String, messages: UnboundedSender<Msg>) {
+    let why = match child.wait().await {
+        Ok(status) if status.success() => return,
+        Ok(status) => status.to_string(),
+        Err(error) => error.to_string(),
+    };
+    tracing::debug!("the browser opener on {url} failed: {why}");
+    messages.send(Msg::BrowserFailed(url)).ok();
+}
+
+/// The program that opens a URL in the user's browser: `open` on macOS,
+/// `xdg-open` elsewhere.
+fn opener(macos: bool) -> &'static str {
+    if macos { "open" } else { "xdg-open" }
+}
+
+/// What writing `count` lines to `.overbrainer/<name>` gave, as the app is
+/// told: a file already there is named.
+fn exported(name: String, count: usize, written: io::Result<()>) -> Msg {
+    Msg::LogsExported(match written {
+        Ok(()) => Ok((name, count)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Err(format!(".overbrainer/{name} already exists"))
+        },
+        Err(error) => Err(error.to_string()),
+    })
+}
+
+/// Writes `lines`, one per line, to `.overbrainer/<name>` in `project_dir`, in
+/// one `write_all`. Refuses to overwrite an existing file. A failed write
+/// removes the partial file it created, so a later export can try `name`
+/// again; a failure removing it is ignored, the write error is what is
+/// returned.
+///
+/// # Errors
+///
+/// Returns an error when `name` already exists, or when the file cannot be
+/// created or written.
+fn write_log_export(project_dir: &Path, name: &str, lines: &[String]) -> io::Result<()> {
+    let mut content = lines.join("\n");
+    if !lines.is_empty() {
+        content.push('\n');
+    }
+    let mut file = crate::project_lock::open_state_file(
+        project_dir,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+        true,
+    )?;
+    if let Err(error) = file.write_all(content.as_bytes()) {
+        let _ = crate::project_lock::remove_state_file(project_dir, name);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// SIGINT, SIGTERM and SIGHUP: in raw mode they only come from outside (`kill`, a
@@ -641,6 +754,61 @@ mod tests {
 
     /// An upper bound only: a shared CI runner can be far slower than a laptop.
     const LIMIT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn the_browser_opener_is_open_on_macos_and_xdg_open_elsewhere() {
+        assert_eq!(opener(true), "open");
+        assert_eq!(opener(false), "xdg-open");
+    }
+
+    #[tokio::test]
+    async fn a_browser_opener_is_reported_only_when_it_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (messages, mut received) = mpsc::unbounded_channel();
+        let ok = tokio::process::Command::new("true").spawn()?;
+        watch_browser(ok, "https://a".into(), messages.clone()).await;
+        let failed = tokio::process::Command::new("false").spawn()?;
+        watch_browser(failed, "https://b".into(), messages).await;
+        let mut urls = Vec::new();
+        while let Some(message) = received.recv().await {
+            if let Msg::BrowserFailed(url) = message {
+                urls.push(url);
+            }
+        }
+        assert_eq!(urls, ["https://b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_export_to_a_file_that_exists_says_which() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let lines = vec!["line one".to_string()];
+        let first = write_log_export(project.path(), "logs-x.log", &lines);
+        let Msg::LogsExported(Ok((name, 1))) = exported("logs-x.log".into(), 1, first) else {
+            return Err("the first export fails".into());
+        };
+        assert_eq!(name, "logs-x.log");
+        let second = write_log_export(project.path(), "logs-x.log", &lines);
+        let Msg::LogsExported(Err(error)) = exported("logs-x.log".into(), 1, second) else {
+            return Err("the second export works".into());
+        };
+        assert_eq!(error, ".overbrainer/logs-x.log already exists");
+        Ok(())
+    }
+
+    #[test]
+    fn write_log_export_creates_the_file_and_refuses_to_overwrite()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let lines = vec!["line one".to_string(), "line two".to_string()];
+        write_log_export(project.path(), "logs-x.log", &lines)?;
+        let content = std::fs::read_to_string(project.path().join(".overbrainer/logs-x.log"))?;
+        assert_eq!(content, "line one\nline two\n");
+        let result = write_log_export(project.path(), "logs-x.log", &lines);
+        let error = result.err().ok_or("expected an error")?;
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn q_ends_the_loop_after_a_resize_is_drawn() -> Result<(), Box<dyn std::error::Error>> {

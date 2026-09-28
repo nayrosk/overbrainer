@@ -3,11 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use super::tasks::TaskId;
 use crate::events::Event;
-use crate::runpod::{PodRecord, PodStatus};
+use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, Runs};
 use crate::train::{METRICS_FILE, MetricLine, TrainMetric, parse_line};
 
@@ -18,6 +18,38 @@ pub(super) struct RunRow {
     pub(super) record: RunRecord,
     /// `pod.json`, for a Runpod run.
     pub(super) pod: Option<PodRecord>,
+}
+
+/// What the pod of `record` spent by `now` at `rate` USD per hour, while it
+/// exists; `None` when the rate or its creation time is unknown.
+fn live_spend(record: &PodRecord, rate: Option<f64>, now: SystemTime) -> Option<f64> {
+    Some(rate? * record.uptime(now)?.as_secs_f64() / 3600.0)
+}
+
+/// The rate of the pod of `record`, USD per hour: as recorded, else as its
+/// `latest` status gave it.
+pub(super) fn pod_rate(record: &PodRecord, latest: Option<&PodStatus>) -> Option<f64> {
+    record.cost_per_hour.or(match latest {
+        Some(PodStatus::Created { cost_per_hour, .. }) => *cost_per_hour,
+        _ => None,
+    })
+}
+
+/// What the pod of `record` spent by `now`: as its `latest` status or its
+/// record gave it once deleted, else its rate (see [`pod_rate`]) times its
+/// uptime. `None` when unknown.
+pub(super) fn pod_spend(
+    record: &PodRecord,
+    latest: Option<&PodStatus>,
+    now: SystemTime,
+) -> Option<f64> {
+    match latest {
+        Some(PodStatus::Deleted {
+            estimated_spend, ..
+        }) => estimated_spend.or(record.estimated_spend),
+        _ if record.state == PodState::Deleted => record.estimated_spend,
+        _ => live_spend(record, pod_rate(record, latest), now),
+    }
 }
 
 /// What a training task does.

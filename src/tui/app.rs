@@ -19,6 +19,7 @@ use super::start::StartPlan;
 use super::tasks::{Done, Edit, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
 use super::training::TrainingView;
+use super::views::logs::{export_line, level_name};
 use crate::cli::data::Command;
 use crate::cli::front::Report;
 use crate::config::Settings;
@@ -73,6 +74,9 @@ impl Project {
     }
 }
 
+/// The repository `g` opens.
+pub(super) const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+
 /// What the app asks the loop to do.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Effect {
@@ -88,6 +92,16 @@ pub(super) enum Effect {
         command: Vec<String>,
         /// The file to edit.
         path: PathBuf,
+    },
+    /// Open this URL in a browser, detached.
+    OpenUrl(String),
+    /// Writes `lines` to `.overbrainer/<name>`, off the UI thread, never
+    /// overwriting an existing file.
+    ExportLogs {
+        /// File name inside `.overbrainer/`.
+        name: String,
+        /// The lines to write, oldest first.
+        lines: Vec<String>,
     },
 }
 
@@ -311,6 +325,19 @@ pub(super) struct App {
     pub(super) editing: Option<Session>,
     /// The editor command.
     pub(super) editor: Vec<String>,
+    /// The cost of the stages the history recorded at the last load, `None`
+    /// while none spent anything.
+    pub(super) history_cost: Option<crate::history::Cost>,
+    /// The last error reading the history, warned once, until a read works.
+    history_error: Option<String>,
+    /// While a pipeline task runs, and until the reload after its end read the
+    /// history: the history cost it started with, which its own rows add to.
+    pub(super) cost_base: Option<super::cost::Base>,
+    /// The load in flight when that task started: none of its stages is in the
+    /// history it reads, so it sets the base.
+    base_load: Option<TaskId>,
+    /// The reload after that task ended: once it read the history, the base goes.
+    settle: Option<TaskId>,
     /// The Pipeline view's state.
     pub(super) pipeline: PipelineView,
     /// The pipeline task running, if any.
@@ -370,6 +397,11 @@ impl App {
             edit: None,
             editing: None,
             editor: vec!["vi".to_string()],
+            history_cost: None,
+            history_error: None,
+            cost_base: None,
+            base_load: None,
+            settle: None,
             pipeline: PipelineView::default(),
             pipeline_task: None,
             pipeline_last: None,
@@ -421,6 +453,9 @@ impl App {
             return Vec::new();
         }
         let id = self.task_id();
+        if self.pipeline_task.is_none() && self.cost_base.is_some() {
+            self.settle = Some(id);
+        }
         self.load = Some(id);
         self.load_at = Some(self.motion.clock());
         self.quiet_load = false;
@@ -515,7 +550,7 @@ impl App {
     pub(super) fn on_done(&mut self, id: TaskId, result: Result<Done, String>) -> Vec<Effect> {
         self.dirty = true;
         match result {
-            Ok(Done::Loaded(loaded)) => self.on_loaded(id, loaded),
+            Ok(Done::Loaded(loaded, history)) => self.on_loaded(id, loaded, history),
             Ok(Done::Saved(saved)) => self.saved(saved),
             Ok(Done::Pipeline(outcome)) => self.pipeline_ended(id, outcome),
             Ok(Done::Trained(result)) => self.trained(id, result),
@@ -531,13 +566,42 @@ impl App {
         }
     }
 
-    /// Load `id` read `loaded`: shown when it is the load running, else ignored.
-    fn on_loaded(&mut self, id: TaskId, loaded: Result<Dataset, String>) -> Vec<Effect> {
+    /// Load `id` read `loaded` and the cost in the history: shown when it is the
+    /// load running, else ignored. A history that cannot be read keeps the cost
+    /// known so far; its error is warned once, not at every quiet reload.
+    fn on_loaded(
+        &mut self,
+        id: TaskId,
+        loaded: Result<Dataset, String>,
+        history: Result<Option<crate::history::Cost>, String>,
+    ) -> Vec<Effect> {
         if self.load != Some(id) {
             return Vec::new();
         }
         self.load = None;
         self.reloaded = self.now;
+        match history {
+            Ok(cost) => {
+                self.history_cost = cost;
+                self.history_error = None;
+                if self.base_load == Some(id) {
+                    self.base_load = None;
+                    if let Some(base) = &mut self.cost_base {
+                        base.0 = cost;
+                    }
+                }
+                if self.settle == Some(id) {
+                    self.settle = None;
+                    self.cost_base = None;
+                }
+            },
+            // Every quiet reload reads it again: warn once per new error.
+            Err(error) if self.history_error.as_ref() != Some(&error) => {
+                tracing::warn!("{error}");
+                self.history_error = Some(error);
+            },
+            Err(_) => {},
+        }
         match loaded {
             Ok(data) => self.dataset.loaded(data, &self.project.topics),
             Err(error) => self.load_failed(error),
@@ -640,6 +704,22 @@ impl App {
         let id = match &message {
             Msg::Event(id, _) | Msg::Lagged(id, _) | Msg::Report(id, _) => *id,
             Msg::EditorExited(_) => return Vec::new(),
+            Msg::BrowserFailed(url) => {
+                self.say(Severity::Warn, format!("cannot open a browser: {url}"));
+                return Vec::new();
+            },
+            Msg::LogsExported(result) => {
+                match result {
+                    Ok((name, count)) => self.say(
+                        Severity::Info,
+                        format!("exported {count} lines to .overbrainer/{name}"),
+                    ),
+                    Err(error) => {
+                        self.say(Severity::Error, format!("cannot export the logs: {error}"));
+                    },
+                }
+                return Vec::new();
+            },
         };
         if self.training.is_training(id) {
             return self.on_training_message(id, message);
@@ -651,7 +731,10 @@ impl App {
             Msg::Event(_, event) => self.pipeline.event(&event),
             Msg::Lagged(_, skipped) => self.pipeline.skipped += skipped,
             Msg::Report(_, Report::Line(line)) => self.pipeline.results.push(line),
-            Msg::Report(_, Report::RunCreated(_)) | Msg::EditorExited(_) => {},
+            Msg::Report(_, Report::RunCreated(_))
+            | Msg::EditorExited(_)
+            | Msg::BrowserFailed(_)
+            | Msg::LogsExported(_) => {},
         }
         Vec::new()
     }
@@ -697,6 +780,13 @@ impl App {
         }
         self.forget_notes(&NoteOf::Stage);
         let id = self.task_id();
+        // What the history holds so far, the last task's stages included. The
+        // load in flight may set it only when no task's stages are missing from
+        // it: no window was open, or it is the last task's settling reload.
+        let fresh = self.cost_base.is_none() || (self.load.is_some() && self.settle == self.load);
+        self.cost_base = Some(super::cost::Base(super::cost::history_so_far(self)));
+        self.base_load = if fresh { self.load } else { None };
+        self.settle = None;
         self.pipeline_task = Some(id);
         self.pipeline_last = None;
         self.pipeline.started(command, self.project.concurrency);
@@ -910,6 +1000,7 @@ impl App {
             },
             KeyCode::Char('r') => self.run_menu(),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
+            KeyCode::Char('g') => return vec![Effect::OpenUrl(REPOSITORY.to_string())],
             KeyCode::Char('1') => return self.show(View::Dataset),
             KeyCode::Char('2') => return self.show(View::Pipeline),
             KeyCode::Char('3') => return self.show(View::Training),
@@ -984,7 +1075,7 @@ impl App {
         match self.view {
             View::Dataset => return self.on_dataset_key(code),
             View::Training => return self.on_training_key(code),
-            View::Logs => self.on_logs_key(code),
+            View::Logs => return self.on_logs_key(code),
             View::Pipeline => {},
         }
         Vec::new()
@@ -992,9 +1083,9 @@ impl App {
 
     fn on_dataset_key(&mut self, code: KeyCode) -> Vec<Effect> {
         match code {
-            KeyCode::Char('e') => return self.edit_selected(),
-            KeyCode::Char('d') => {
-                self.delete_selected();
+            KeyCode::Char(key @ ('e' | 'E')) => return self.edit_selected(key == 'E'),
+            KeyCode::Char(key @ ('d' | 'D')) => {
+                self.delete_selected(key == 'D');
                 return Vec::new();
             },
             _ => {},
@@ -1012,9 +1103,20 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => {
                 view.tree.key_left();
                 view.scroll = 0;
+                view.sections.clear();
             },
             KeyCode::PageDown => view.scroll = view.scroll.saturating_add(PAGE),
             KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(PAGE),
+            KeyCode::Char(']') => {
+                if let Some(&next) = view.sections.iter().find(|&&at| at > view.scroll) {
+                    view.scroll = next;
+                }
+            },
+            KeyCode::Char('[') => {
+                if let Some(&previous) = view.sections.iter().rfind(|&&at| at < view.scroll) {
+                    view.scroll = previous;
+                }
+            },
             KeyCode::Char('s') => view.stats = !view.stats,
             KeyCode::Char('/') => view.input = Some(view.filter.clone()),
             KeyCode::Esc if !view.filter.is_empty() => view.apply_filter(String::new()),
@@ -1023,12 +1125,13 @@ impl App {
         Vec::new()
     }
 
-    /// `e`: opens the selected question, answer or subtopic name in the editor.
-    fn edit_selected(&mut self) -> Vec<Effect> {
+    /// `e`: opens the selected question or subtopic name in the editor; `E`
+    /// (`answer`) opens the selected question's answer.
+    fn edit_selected(&mut self, answer: bool) -> Vec<Effect> {
         if self.locked() {
             return Vec::new();
         }
-        let target = match self.selected_target() {
+        let target = match self.selected_target(answer) {
             Ok(target) => target,
             Err(refusal) => {
                 self.say(Severity::Warn, refusal);
@@ -1061,23 +1164,27 @@ impl App {
         }
     }
 
-    /// What `e` edits for the selected node.
-    fn selected_target(&self) -> Result<Target, &'static str> {
+    /// What `e` edits for the selected node, or `E` (`answer`).
+    fn selected_target(&self, answer: bool) -> Result<Target, &'static str> {
         let model = self.dataset.model.as_ref().ok_or("nothing to edit")?;
+        if answer {
+            let Some(Node::Question(id)) = self.dataset.tree.selected().last() else {
+                return Err("no answer to edit");
+            };
+            let example = model.answer(id).ok_or("no answer to edit")?;
+            return AnswerText::of(example)
+                .map(|before| Target::Answer {
+                    id: id.clone(),
+                    before,
+                })
+                .ok_or("changed on disk; press R");
+        }
         match self.dataset.tree.selected().last() {
             Some(Node::Question(id)) => model
                 .question(id)
                 .map(|q| Target::Question {
                     id: id.clone(),
                     text: q.text.clone(),
-                })
-                .ok_or("changed on disk; press R"),
-            Some(Node::Answer(id)) => model
-                .answer(id)
-                .and_then(AnswerText::of)
-                .map(|before| Target::Answer {
-                    id: id.clone(),
-                    before,
                 })
                 .ok_or("changed on disk; press R"),
             Some(Node::Subtopic(id)) => model
@@ -1095,15 +1202,21 @@ impl App {
         }
     }
 
-    /// `d`: asks to delete the selected node, with what goes with it.
-    fn delete_selected(&mut self) {
+    /// `d`: asks to delete the selected node, with what goes with it; `D`
+    /// (`answer`): the selected question's answer only.
+    fn delete_selected(&mut self, answer: bool) {
         if self.locked() {
             return;
         }
         let Some(model) = &self.dataset.model else {
             return;
         };
-        match deletion(model, self.dataset.tree.selected(), &self.project.topics) {
+        match deletion(
+            model,
+            self.dataset.tree.selected(),
+            &self.project.topics,
+            answer,
+        ) {
             Ok(confirm) => self.overlay = Some(Overlay::Confirm(confirm)),
             Err(refusal) => self.say(Severity::Warn, refusal),
         }
@@ -1135,7 +1248,7 @@ impl App {
         }
     }
 
-    fn on_logs_key(&mut self, code: KeyCode) {
+    fn on_logs_key(&mut self, code: KeyCode) -> Vec<Effect> {
         match code {
             KeyCode::Up | KeyCode::Char('k') => self.scroll_logs(true, 1),
             KeyCode::Down | KeyCode::Char('j') => self.scroll_logs(false, 1),
@@ -1146,8 +1259,24 @@ impl App {
                 self.log_view.min = LogView::next_level(self.log_view.min);
                 self.log_view.anchor = None;
             },
+            KeyCode::Char('x') => return self.export_logs(),
             _ => {},
         }
+        Vec::new()
+    }
+
+    /// `x`: exports every retained line at the shown level or more severe,
+    /// oldest first, to a new file under `.overbrainer/`; no file without one.
+    fn export_logs(&mut self) -> Vec<Effect> {
+        let window = self.logs.window(self.log_view.min, usize::MAX, 0);
+        if window.lines.is_empty() {
+            let level = level_name(self.log_view.min);
+            self.say(Severity::Warn, format!("nothing to export at {level}"));
+            return Vec::new();
+        }
+        let lines = window.lines.iter().map(export_line).collect();
+        let name = format!("logs-{}.log", crate::runs::compact_utc(self.now));
+        vec![Effect::ExportLogs { name, lines }]
     }
 
     /// Moves the Logs view `by` lines back (older) or forward, pinning it on the
@@ -1367,13 +1496,22 @@ impl App {
     }
 }
 
-/// The confirmation of `d` on the node at `path`, with what it removes.
-fn deletion(model: &Model, path: &[Node], topics: &[TopicInfo]) -> Result<Confirm, String> {
+/// The confirmation of `d` on the node at `path`, with what it removes, or of
+/// `D` (`answer`): the answer of the question at `path`.
+fn deletion(
+    model: &Model,
+    path: &[Node],
+    topics: &[TopicInfo],
+    answer: bool,
+) -> Result<Confirm, String> {
     let data = &model.data;
     let deletion = match path.last() {
+        Some(Node::Question(id)) if answer && model.answer(id).is_some() => {
+            Deletion::Answer(id.clone())
+        },
+        _ if answer => return Err("no answer to delete".to_string()),
         Some(Node::Subtopic(id)) => Deletion::Subtopic(id.clone()),
         Some(Node::Question(id)) => Deletion::Question(id.clone()),
-        Some(Node::Answer(id)) => Deletion::Answer(id.clone()),
         Some(Node::MissingSubtopic(topic)) => Deletion::MissingSubtopic(topic.clone()),
         Some(Node::Topic(_)) => {
             return Err("refused: topics live in overbrainer.toml".to_string());
@@ -1546,6 +1684,53 @@ mod tests {
     }
 
     #[test]
+    fn g_opens_the_repository_in_every_view() {
+        let mut app = app();
+        for view in View::ALL {
+            app.view = view;
+            assert_eq!(
+                press(&mut app, &[KeyCode::Char('g')]),
+                [Effect::OpenUrl(REPOSITORY.to_string())],
+                "{view:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn g_is_ignored_in_a_dialog_the_help_the_menu_and_the_filter() {
+        let mut app = dataset_app();
+        open_to(&mut app, &path_to(MOVED));
+        press(&mut app, &[KeyCode::Char('d')]);
+        assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
+        assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
+        assert_eq!(app.overlay, None, "as any key but y, g answers no");
+        app.overlay = Some(Overlay::Help);
+        assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
+        assert_eq!(app.overlay, Some(Overlay::Help), "the help stays");
+        app.overlay = Some(Overlay::Menu(0));
+        assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
+        assert_eq!(app.overlay, None, "as any other key, g closes the menu");
+        press(&mut app, &[KeyCode::Char('/'), KeyCode::Char('g')]);
+        assert_eq!(app.dataset.input.as_deref(), Some("g"), "g is typed");
+    }
+
+    #[test]
+    fn a_browser_that_fails_is_said_and_stays_said() {
+        let mut app = app();
+        let url = REPOSITORY.to_string();
+        assert_eq!(app.on_message(Msg::BrowserFailed(url.clone())), []);
+        let status = app.status.as_ref().map(|s| (s.severity, s.text.as_str()));
+        let said = format!("cannot open a browser: {url}");
+        assert_eq!(status, Some((Severity::Warn, said.as_str())));
+        // The loop logs why at debug: the next tick keeps the message. A newer
+        // warning from elsewhere would replace it, as any status.
+        log(&app, Level::DEBUG, "xdg-open exited with 3");
+        app.on_tick(at(NOW + 1));
+        let status = app.status.as_ref().map(|s| (s.severity, s.text.as_str()));
+        assert_eq!(status, Some((Severity::Warn, said.as_str())));
+    }
+
+    #[test]
     fn q_and_ctrl_c_quit_when_nothing_runs() {
         let mut first = app();
         press(&mut first, &[KeyCode::Char('q')]);
@@ -1712,6 +1897,73 @@ mod tests {
     }
 
     #[test]
+    fn x_exports_only_the_shown_lines_oldest_first() -> TestResult {
+        let mut app = app();
+        log(&app, Level::DEBUG, "too quiet");
+        log(&app, Level::WARN, "first");
+        log(&app, Level::INFO, "second");
+        log(&app, Level::ERROR, "third");
+        press(&mut app, &[KeyCode::Char('4')]);
+        let effects = press(&mut app, &[KeyCode::Char('x')]);
+        let [Effect::ExportLogs { name, lines }] = effects.as_slice() else {
+            return Err(format!("expected an export effect: {effects:?}").into());
+        };
+        assert_eq!(
+            name,
+            &format!("logs-{}.log", crate::runs::compact_utc(at(NOW)))
+        );
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].contains("WARN") && lines[0].contains("first"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("INFO") && lines[1].contains("second"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].contains("ERROR") && lines[2].contains("third"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("too quiet")),
+            "{lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn x_with_no_line_at_the_shown_level_exports_nothing() {
+        let mut app = app();
+        log(&app, Level::DEBUG, "too quiet");
+        press(&mut app, &[KeyCode::Char('4')]);
+        assert_eq!(press(&mut app, &[KeyCode::Char('x')]), []);
+        let status = app.status.as_ref().map(|s| (s.severity, s.text.as_str()));
+        assert_eq!(status, Some((Severity::Warn, "nothing to export at INFO")));
+    }
+
+    #[test]
+    fn logs_exported_says_the_outcome() {
+        let mut app = app();
+        let effects = app.on_message(Msg::LogsExported(Ok(("logs-x.log".into(), 3))));
+        assert_eq!(effects, []);
+        let status = app.status.clone();
+        assert_eq!(
+            status.as_ref().map(|s| s.text.as_str()),
+            Some("exported 3 lines to .overbrainer/logs-x.log")
+        );
+        assert_eq!(status.map(|s| s.severity), Some(Severity::Info));
+        let effects = app.on_message(Msg::LogsExported(Err("file exists".into())));
+        assert_eq!(effects, []);
+        let status = app.status.clone();
+        assert_eq!(
+            status.as_ref().map(|s| s.text.as_str()),
+            Some("cannot export the logs: file exists")
+        );
+        assert_eq!(status.map(|s| s.severity), Some(Severity::Error));
+    }
+
+    #[test]
     fn a_tick_shows_the_newest_warning_then_expires_it() {
         let mut app = app();
         log(&app, Level::INFO, "plain");
@@ -1838,12 +2090,60 @@ mod tests {
             but_runs(press(&mut app, &[KeyCode::Char('R'), KeyCode::Char('R')])),
             []
         );
-        let second = only_load(&app.on_done(first, Ok(Done::Loaded(Ok(dataset())))))?;
+        let second = only_load(&app.on_done(first, Ok(Done::Loaded(Ok(dataset()), Ok(None)))))?;
         assert_ne!(second, first);
         assert_eq!(app.load, Some(second));
         assert!(app.dataset.model.is_some(), "the first load is shown");
-        assert_eq!(app.on_done(second, Ok(Done::Loaded(Ok(dataset())))), []);
+        assert_eq!(
+            app.on_done(second, Ok(Done::Loaded(Ok(dataset()), Ok(None)))),
+            []
+        );
         assert_eq!(app.load, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_sets_the_history_cost_and_keeps_it_when_the_history_cannot_be_read() -> TestResult {
+        let mut app = app();
+        let known = Ok(Some(crate::history::Cost::Known(1.5)));
+        let id = only_load(&app.start())?;
+        app.on_done(id, Ok(Done::Loaded(Ok(dataset()), known)));
+        assert_eq!(app.history_cost, Some(crate::history::Cost::Known(1.5)));
+        let id = only_load(&but_runs(press(&mut app, &[KeyCode::Char('R')])))?;
+        app.on_done(
+            id,
+            Ok(Done::Loaded(Ok(dataset()), Err("permission denied".into()))),
+        );
+        assert_eq!(app.history_cost, Some(crate::history::Cost::Known(1.5)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_history_read_error_is_warned_once_until_it_changes() -> TestResult {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = crate::logging::LogBuffer::new(10);
+        let subscriber = tracing_subscriber::registry().with(buffer.layer());
+        let mut app = app();
+        tracing::subscriber::with_default(subscriber, || -> TestResult {
+            let mut id = only_load(&app.start())?;
+            // A read that works again forgets the error.
+            for history in ["denied", "denied", "gone", "gone"]
+                .map(|error| Err(error.to_string()))
+                .into_iter()
+                .chain([Ok(None), Err("gone".to_string())])
+            {
+                app.on_done(id, Ok(Done::Loaded(Ok(dataset()), history)));
+                id = only_load(&but_runs(press(&mut app, &[KeyCode::Char('R')])))?;
+            }
+            Ok(())
+        })?;
+        let warned: Vec<String> = buffer
+            .since(tracing::Level::WARN, 0)
+            .into_iter()
+            .map(|line| line.message)
+            .collect();
+        assert_eq!(warned, ["denied", "gone", "gone"]);
         Ok(())
     }
 
@@ -1852,12 +2152,18 @@ mod tests {
         let mut app = app();
         let id = only_load(&app.start())?;
         let stale = TaskId(id.0 + 100);
-        assert_eq!(app.on_done(stale, Ok(Done::Loaded(Ok(dataset())))), []);
+        assert_eq!(
+            app.on_done(stale, Ok(Done::Loaded(Ok(dataset()), Ok(None)))),
+            []
+        );
         assert!(app.dataset.model.is_none());
         assert_eq!(app.load, Some(id));
         app.on_done(
             id,
-            Ok(Done::Loaded(Err("data/answers.jsonl:1: bad".into()))),
+            Ok(Done::Loaded(
+                Err("data/answers.jsonl:1: bad".into()),
+                Ok(None),
+            )),
         );
         assert_eq!(
             app.dataset.error.as_deref(),
@@ -1903,13 +2209,17 @@ mod tests {
     #[test]
     fn the_detail_scroll_is_clamped_to_the_text() -> TestResult {
         let mut app = dataset_app();
-        open_to(&mut app, &path_to(MOVED, true));
+        open_to(&mut app, &path_to(MOVED));
         app.dataset.scroll = 1000;
         let rows = text(&draw(&mut app, 120, 40)?);
-        assert_eq!(app.dataset.scroll, 0, "14 lines fit in 38 rows");
+        assert_eq!(
+            app.dataset.scroll, 0,
+            "the question and its answer fit in 38 rows"
+        );
         assert!(rows.iter().any(|row| row.contains("model deepseek-r1")));
+        app.dataset.scroll = 1000;
         let rows = text(&draw(&mut app, 80, 24)?);
-        assert_eq!(app.dataset.scroll, 0, "18 lines fit in 20 rows");
+        assert_eq!(app.dataset.scroll, 3, "23 lines, 20 rows");
         assert!(rows.iter().any(|row| row.contains("model deepseek-r1")));
         Ok(())
     }
@@ -1950,7 +2260,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = project_app()?;
         app.editor = vec!["my-editor".into(), "--wait".into()];
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { command, path }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -1982,7 +2292,7 @@ mod tests {
     fn an_editor_that_fails_or_changes_nothing_saves_nothing()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false)[..2]);
+        open_to(&mut app, &path_to(MOVED)[..2]);
         for (exit, message) in [
             (
                 Ok(exited(1)),
@@ -2010,7 +2320,7 @@ mod tests {
     fn a_refused_save_keeps_the_typed_text_and_says_where() -> Result<(), Box<dyn std::error::Error>>
     {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2042,7 +2352,7 @@ mod tests {
         );
         press(&mut app, &[KeyCode::Char('d')]);
         assert_eq!(app.overlay, None);
-        open_to(&mut app, &path_to(MOVED, true));
+        open_to(&mut app, &path_to(MOVED));
         app.edit = Some(TaskId(9));
         for code in ['e', 'd'] {
             assert_eq!(press(&mut app, &[KeyCode::Char(code)]), []);
@@ -2060,10 +2370,10 @@ mod tests {
     }
 
     #[test]
-    fn d_asks_then_deletes_the_selected_answer_only_on_y() {
+    fn shift_d_asks_then_deletes_the_selected_question_s_answer_only_on_y() {
         let mut app = dataset_app();
-        open_to(&mut app, &path_to(MOVED, true));
-        press(&mut app, &[KeyCode::Char('d')]);
+        open_to(&mut app, &path_to(MOVED));
+        press(&mut app, &[KeyCode::Char('D')]);
         let Some(Overlay::Confirm(confirm)) = app.overlay.clone() else {
             return assert_eq!(app.overlay, None);
         };
@@ -2076,7 +2386,7 @@ mod tests {
         );
         assert_eq!(press(&mut app, &[KeyCode::Char('n')]), []);
         assert_eq!(app.overlay, None);
-        press(&mut app, &[KeyCode::Char('d')]);
+        press(&mut app, &[KeyCode::Char('D')]);
         let effects = press(&mut app, &[KeyCode::Char('y')]);
         let id = Id::question(&Id::subtopic("ownership", "Borrowing"), MOVED);
         assert!(matches!(
@@ -2086,11 +2396,116 @@ mod tests {
         ));
     }
 
-    /// [`dataset_app`] on an answer, following a run, and leaving: after a
+    #[test]
+    fn shift_d_and_shift_e_warn_on_a_question_without_answer() {
+        let mut app = dataset_app();
+        open_to(&mut app, &path_to("When does NLL end a borrow?"));
+        assert_eq!(press(&mut app, &[KeyCode::Char('D')]), []);
+        assert_eq!(app.overlay, None);
+        assert_eq!(status(&app), Some("no answer to delete"));
+        assert_eq!(press(&mut app, &[KeyCode::Char('E')]), []);
+        assert_eq!(status(&app), Some("no answer to edit"));
+        assert!(app.editing.is_none());
+    }
+
+    #[test]
+    fn shift_e_opens_the_selected_question_s_answer() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = project_app()?;
+        open_to(&mut app, &path_to(MOVED));
+        let effects = press(&mut app, &[KeyCode::Char('E')]);
+        let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        let text = std::fs::read_to_string(path)?;
+        assert!(
+            text.contains("The borrow must end before the move."),
+            "{text}"
+        );
+        assert!(
+            matches!(
+                app.editing.as_ref().map(|session| &session.target),
+                Some(Target::Answer { .. })
+            ),
+            "the answer is edited"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn brackets_jump_between_the_parts_of_a_question() -> TestResult {
+        let mut app = dataset_app();
+        let mut data = dataset();
+        let reply = data.answers[0].messages.last_mut().ok_or("no reply")?;
+        reply.content.push_str(&"\nOne more line.".repeat(30));
+        app.dataset.loaded(data, &app.project.topics.clone());
+        open_to(&mut app, &path_to(MOVED));
+        draw(&mut app, 80, 24)?;
+        let sections = app.dataset.sections.clone();
+        assert_eq!(
+            sections.len(),
+            3,
+            "question, reasoning, answer: {sections:?}"
+        );
+        assert_eq!(sections.first(), Some(&0));
+        press(&mut app, &[KeyCode::Char(']')]);
+        assert_eq!(app.dataset.scroll, sections[1]);
+        press(&mut app, &[KeyCode::Char(']')]);
+        assert_eq!(app.dataset.scroll, sections[2]);
+        press(&mut app, &[KeyCode::Char(']')]);
+        assert_eq!(app.dataset.scroll, sections[2], "the last part stays");
+        press(&mut app, &[KeyCode::Char('[')]);
+        assert_eq!(app.dataset.scroll, sections[1]);
+        press(&mut app, &[KeyCode::Char('['), KeyCode::Char('[')]);
+        assert_eq!(app.dataset.scroll, 0);
+        let rows = text(&draw(&mut app, 80, 24)?);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(MOVED.get(..20).unwrap_or(MOVED)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn brackets_do_not_jump_by_the_parts_of_the_node_left_before_a_draw() -> TestResult {
+        let mut app = dataset_app();
+        let mut data = dataset();
+        let reply = data.answers[0].messages.last_mut().ok_or("no reply")?;
+        reply.content.push_str(&"\nOne more line.".repeat(30));
+        app.dataset.loaded(data, &app.project.topics.clone());
+        for key in [KeyCode::Char('j'), KeyCode::Char('k'), KeyCode::Char('h')] {
+            open_to(&mut app, &path_to(MOVED));
+            draw(&mut app, 80, 24)?;
+            assert_eq!(app.dataset.sections.len(), 3);
+            press(&mut app, &[key, KeyCode::Char(']')]);
+            assert_eq!(app.dataset.scroll, 0, "{key:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn brackets_do_nothing_when_the_detail_fits() -> TestResult {
+        let mut app = dataset_app();
+        open_to(&mut app, &path_to(MOVED));
+        draw(&mut app, 120, 40)?;
+        press(&mut app, &[KeyCode::Char(']')]);
+        assert_eq!(app.dataset.scroll, 0);
+        press(&mut app, &[KeyCode::Char('[')]);
+        assert_eq!(app.dataset.scroll, 0);
+        open_to(&mut app, &path_to(MOVED)[..2]);
+        draw(&mut app, 80, 24)?;
+        assert_eq!(
+            app.dataset.sections,
+            Vec::<u16>::new(),
+            "only a question has parts"
+        );
+        Ok(())
+    }
+
+    /// [`dataset_app`] on an answered question, following a run, and leaving: after a
     /// signal, or with a quit waiting for that run.
     fn leaving_app(signal: bool) -> App {
         let mut app = dataset_app();
-        open_to(&mut app, &path_to(MOVED, true));
+        open_to(&mut app, &path_to(MOVED));
         app.training.tasks.insert(
             TaskId(9),
             crate::tui::training::Follow::new(
@@ -2131,16 +2546,21 @@ mod tests {
         Ok(())
     }
 
-    /// `e`, `d` and a confirmed deletion start nothing in `app`, and say why.
+    /// `e`, `E`, `d`, `D` and a confirmed deletion start nothing in `app`, and say why.
     fn no_edit_starts(app: &mut App) -> Result<(), String> {
-        for code in ['e', 'd'] {
+        for code in ['e', 'E', 'd', 'D'] {
             app.status = None;
             assert_eq!(press(app, &[KeyCode::Char(code)]), []);
             assert_eq!(app.overlay, None);
             assert_eq!(status(app), Some("refused: quitting; no edit starts"));
         }
         let model = app.dataset.model.as_ref().ok_or("no model")?;
-        let confirm = deletion(model, app.dataset.tree.selected(), &app.project.topics)?;
+        let confirm = deletion(
+            model,
+            app.dataset.tree.selected(),
+            &app.project.topics,
+            false,
+        )?;
         app.overlay = Some(Overlay::Confirm(confirm));
         app.status = None;
         assert_eq!(press(app, &[KeyCode::Char('y')]), []);
@@ -2152,7 +2572,7 @@ mod tests {
     fn an_edit_open_when_the_tui_ends_is_noted_for_the_exit()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2175,7 +2595,7 @@ mod tests {
     fn a_signal_during_a_save_waits_for_it_then_says_it_was_saved()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2210,7 +2630,7 @@ mod tests {
     fn a_signal_during_a_refused_save_notes_the_kept_file() -> Result<(), Box<dyn std::error::Error>>
     {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2239,7 +2659,7 @@ mod tests {
     fn an_edited_file_that_cannot_be_read_is_noted_for_the_exit()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = project_app()?;
-        open_to(&mut app, &path_to(MOVED, false));
+        open_to(&mut app, &path_to(MOVED));
         let effects = press(&mut app, &[KeyCode::Char('e')]);
         let [Effect::OpenEditor { path, .. }] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
@@ -2259,9 +2679,9 @@ mod tests {
     }
 
     /// The text of the dialog `d` opens on the node at `path`.
-    fn dialog_text(app: &mut App, path: &[Node]) -> Result<String, String> {
+    fn dialog_text(app: &mut App, path: &[Node], key: char) -> Result<String, String> {
         open_to(app, path);
-        press(app, &[KeyCode::Char('d')]);
+        press(app, &[KeyCode::Char(key)]);
         match app.overlay.take() {
             Some(Overlay::Confirm(confirm)) => Ok(confirm.text.concat()),
             other => Err(format!("{other:?}")),
@@ -2276,7 +2696,11 @@ mod tests {
         let topic = Node::Topic("old_topic".into());
         let not_configured = "its topic \"old_topic\" is not in overbrainer.toml, so no run \
                               replaces it. train and eval are rebuilt.";
-        let subtopic = dialog_text(&mut app, &[topic.clone(), Node::Subtopic(legacy.clone())])?;
+        let subtopic = dialog_text(
+            &mut app,
+            &[topic.clone(), Node::Subtopic(legacy.clone())],
+            'd',
+        )?;
         assert_eq!(
             subtopic,
             format!(
@@ -2289,7 +2713,7 @@ mod tests {
             Node::Subtopic(legacy),
             Node::Question(question.clone()),
         ];
-        let text = dialog_text(&mut app, &path)?;
+        let text = dialog_text(&mut app, &path, 'd')?;
         assert_eq!(
             text,
             format!(
@@ -2297,9 +2721,7 @@ mod tests {
                  {not_configured}"
             )
         );
-        let mut answer = path.to_vec();
-        answer.push(Node::Answer(question));
-        let text = dialog_text(&mut app, &answer)?;
+        let text = dialog_text(&mut app, &path, 'D')?;
         assert_eq!(
             text,
             format!("Delete this answer? The question stays; {not_configured}")
@@ -2363,6 +2785,169 @@ mod tests {
         assert_eq!(app.lock(), None);
     }
 
+    /// Stage `stage` of task `id` starts, spends `cost` on one item, and finishes
+    /// when `finish`.
+    fn spend(app: &mut App, id: TaskId, stage: crate::events::Stage, cost: f64, finish: bool) {
+        use crate::events::{Event, StageStats};
+        app.on_message(Msg::Event(id, Event::StageStarted { stage, total: 2 }));
+        app.on_message(Msg::Event(
+            id,
+            Event::ItemDone {
+                stage,
+                id: "x".into(),
+                usage: Some(crate::llm::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                }),
+                cost: Some(cost),
+            },
+        ));
+        if finish {
+            let stats = StageStats {
+                cost: Some(cost),
+                ..StageStats::default()
+            };
+            app.on_message(Msg::Event(id, Event::StageFinished { stage, stats }));
+        }
+    }
+
+    #[test]
+    fn the_footer_keeps_the_finished_stages_of_a_run_until_the_history_has_them() -> TestResult {
+        use crate::events::Stage;
+        use crate::history::Cost;
+        use crate::tui::cost::{project_cost, rows_cost};
+
+        let mut app = dataset_app();
+        let load = only_load(&app.start())?;
+        app.on_done(
+            load,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+        );
+        let mut keys = vec![KeyCode::Char('r')];
+        keys.extend([KeyCode::Down; 4]);
+        keys.push(KeyCode::Enter);
+        let effects = press(&mut app, &keys);
+        let [Effect::Spawn(id, Task::Pipeline(Command::Run))] = effects.as_slice() else {
+            return Err(format!("expected a run: {effects:?}").into());
+        };
+        let id = *id;
+        spend(&mut app, id, Stage::Subtopics, 0.25, true);
+        assert_eq!(project_cost(&app), Cost::Known(1.25));
+        spend(&mut app, id, Stage::Questions, 0.5, false);
+        assert_eq!(project_cost(&app), Cost::Known(1.75));
+        let finished = crate::events::Event::StageFinished {
+            stage: Stage::Questions,
+            stats: crate::events::StageStats {
+                cost: Some(0.5),
+                ..crate::events::StageStats::default()
+            },
+        };
+        app.on_message(Msg::Event(id, finished));
+        assert_eq!(
+            project_cost(&app),
+            Cost::Known(1.75),
+            "a finished stage stays"
+        );
+        spend(&mut app, id, Stage::Answers, 0.125, false);
+        let pipeline = Cost::Known(1.0).plus(match rows_cost(&app.pipeline.rows) {
+            Cost::Known(cost) => Some(cost),
+            other => return Err(format!("the rows cost is {other:?}").into()),
+        });
+        assert_eq!(pipeline, Cost::Known(1.875));
+        assert_eq!(
+            project_cost(&app),
+            pipeline,
+            "the base plus the Pipeline view"
+        );
+        // A quiet reload lands with the finished stages in the history: the sum
+        // still counts each once.
+        let quiet = only_load(&press(&mut app, &[KeyCode::Char('1')]))?;
+        app.on_done(
+            quiet,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.75))))),
+        );
+        assert_eq!(
+            project_cost(&app),
+            pipeline,
+            "a quiet reload changes nothing"
+        );
+        // Stopped: the stage stays counted until the reload after the end lands.
+        let reload = only_load(&app.on_done(id, Ok(Done::Pipeline(Err("interrupted".into())))))?;
+        assert_eq!(
+            app.pipeline.row(Stage::Answers).state,
+            super::super::pipeline::StageState::Stopped
+        );
+        assert_eq!(project_cost(&app), pipeline, "a stopped stage stays");
+        app.on_done(
+            reload,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.875))))),
+        );
+        assert_eq!(
+            project_cost(&app),
+            Cost::Known(1.875),
+            "the history has them all"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_started_before_a_stage_sets_the_history_it_adds_to() -> TestResult {
+        use crate::events::Stage;
+        use crate::history::Cost;
+        use crate::tui::cost::project_cost;
+
+        let mut app = dataset_app();
+        let load = only_load(&app.start())?;
+        let effects = press(
+            &mut app,
+            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
+        );
+        let [Effect::Spawn(id, Task::Pipeline(_))] = effects.as_slice() else {
+            return Err(format!("expected a stage: {effects:?}").into());
+        };
+        let id = *id;
+        spend(&mut app, id, Stage::Questions, 0.5, true);
+        app.on_done(
+            load,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+        );
+        assert_eq!(project_cost(&app), Cost::Known(1.5));
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_older_than_the_last_task_leaves_the_next_base_alone() -> TestResult {
+        use crate::events::Stage;
+        use crate::history::Cost;
+        use crate::tui::cost::project_cost;
+
+        let mut app = dataset_app();
+        let load = only_load(&app.start())?;
+        app.on_done(
+            load,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+        );
+        let questions = [KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter];
+        let [Effect::Spawn(first, Task::Pipeline(_))] = press(&mut app, &questions)[..] else {
+            return Err("expected a stage".into());
+        };
+        spend(&mut app, first, Stage::Questions, 0.5, true);
+        // A quiet load starts during the task, which ends before it lands.
+        let quiet = only_load(&press(&mut app, &[KeyCode::Char('1')]))?;
+        assert_eq!(app.on_done(first, Ok(Done::Pipeline(Ok(())))), []);
+        let [Effect::Spawn(_, Task::Pipeline(_))] = press(&mut app, &questions)[..] else {
+            return Err("expected a second stage".into());
+        };
+        assert_eq!(project_cost(&app), Cost::Known(1.5));
+        // Its history predates the first task's entry: the base keeps that task.
+        app.on_done(
+            quiet,
+            Ok(Done::Loaded(Ok(dataset()), Ok(Some(Cost::Known(1.0))))),
+        );
+        assert_eq!(project_cost(&app), Cost::Known(1.5));
+        Ok(())
+    }
+
     #[test]
     fn the_dataset_view_reloads_quietly_while_a_stage_runs() {
         let mut app = dataset_app();
@@ -2386,7 +2971,7 @@ mod tests {
         let load = *load;
         assert!(!app.work().contains(&"loading".to_string()), "quiet");
         assert_eq!(app.on_tick(at(NOW + 11)), [], "one load at a time");
-        app.on_done(load, Ok(Done::Loaded(Ok(dataset()))));
+        app.on_done(load, Ok(Done::Loaded(Ok(dataset()), Ok(None))));
         assert_eq!(app.on_tick(at(NOW + 12)), [], "ended less than 2 s ago");
         let effects = app.on_tick(at(NOW + 13));
         assert!(matches!(effects.as_slice(), [Effect::Spawn(_, Task::Load)]));
@@ -2416,7 +3001,7 @@ mod tests {
         };
         let load = *load;
         app.on_tick(at(NOW + 1));
-        app.on_done(load, Ok(Done::Loaded(Ok(dataset()))));
+        app.on_done(load, Ok(Done::Loaded(Ok(dataset()), Ok(None))));
         assert_eq!(
             press(&mut app, &[KeyCode::Char('1')]),
             [],

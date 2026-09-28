@@ -228,7 +228,9 @@ pub enum Cost {
 }
 
 impl Cost {
-    fn add(self, cost: Option<f64>) -> Self {
+    /// Adds one more cost to the sum, `None` when that one is unknown.
+    #[must_use]
+    pub fn plus(self, cost: Option<f64>) -> Self {
         match (self, cost) {
             (Self::Unknown, None) => Self::Unknown,
             (Self::Unknown, Some(c)) => Self::Partial(c),
@@ -284,12 +286,21 @@ pub struct Total {
 }
 
 impl Total {
+    /// Whether anything was spent: a cost or tokens. An entry that spent
+    /// nothing (`split`, a stage with nothing to do) is neutral for the cost.
+    #[must_use]
+    pub fn spent(&self) -> bool {
+        !matches!(self.cost, Cost::Unknown) || self.input_tokens > 0 || self.output_tokens > 0
+    }
+
     fn add(&mut self, entry: &Entry) {
-        self.cost = if self.runs == 0 {
-            Cost::first(entry.cost)
-        } else {
-            self.cost.add(entry.cost)
-        };
+        if entry.cost.is_some() || entry.input_tokens > 0 || entry.output_tokens > 0 {
+            self.cost = if self.spent() {
+                self.cost.plus(entry.cost)
+            } else {
+                Cost::first(entry.cost)
+            };
+        }
         self.runs += 1;
         self.done += entry.done;
         self.failed += entry.failed;
@@ -307,11 +318,13 @@ pub fn totals(entries: &[Entry]) -> (BTreeMap<Stage, Total>, Total) {
     }
     let mut all = Total::default();
     for total in per_stage.values() {
-        all.cost = if all.runs == 0 {
-            total.cost
-        } else {
-            all.cost.merge(total.cost)
-        };
+        if total.spent() {
+            all.cost = if all.spent() {
+                all.cost.merge(total.cost)
+            } else {
+                total.cost
+            };
+        }
         all.runs += total.runs;
         all.done += total.done;
         all.failed += total.failed;
@@ -416,6 +429,28 @@ mod tests {
         assert_eq!(per_stage[&Stage::Subtopics].cost, Cost::Unknown);
         assert_eq!(all.cost, Cost::Partial(1.25));
         assert_eq!(all.runs, 4);
+    }
+
+    #[test]
+    fn an_entry_that_spent_nothing_is_neutral_for_the_cost() {
+        let mut split = entry(Stage::Split, None);
+        split.input_tokens = 0;
+        split.output_tokens = 0;
+        let priced = entry(Stage::Answers, Some(1.0));
+        let (per_stage, all) = totals(&[priced.clone(), split.clone()]);
+        assert_eq!(all.cost, Cost::Known(1.0));
+        assert_eq!(all.runs, 2);
+        assert_eq!(per_stage[&Stage::Split].cost, Cost::Unknown);
+        let (_, all) = totals(&[split.clone(), priced.clone(), split.clone()]);
+        assert_eq!(all.cost, Cost::Known(1.0));
+        // Within one stage too: a run with nothing to do stays neutral.
+        let mut idle = priced.clone();
+        idle.cost = None;
+        idle.input_tokens = 0;
+        idle.output_tokens = 0;
+        let (per_stage, _) = totals(&[idle.clone(), priced, idle]);
+        assert_eq!(per_stage[&Stage::Answers].cost, Cost::Known(1.0));
+        assert_eq!(totals(&[split]).1.cost, Cost::Unknown);
     }
 
     #[test]

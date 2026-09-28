@@ -15,7 +15,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{FlockOperation, Mode, OFlags};
+use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 
 /// Directory of the project's own state, next to `overbrainer.toml`.
@@ -143,6 +143,25 @@ pub(crate) fn open_state_file(
     Ok(file)
 }
 
+/// Removes `name` from `project_dir`'s state directory (`.overbrainer`),
+/// never through a symbolic link.
+///
+/// # Errors
+///
+/// An [`io::Error`] when `project_dir` cannot be opened, `.overbrainer` does
+/// not exist or is a symbolic link, or `name` cannot be removed.
+pub(crate) fn remove_state_file(project_dir: &Path, name: &str) -> io::Result<()> {
+    let project = rustix::fs::open(
+        project_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let dir_path = project_dir.join(STATE_DIR);
+    let state = open_state_dir(&project).map_err(|e| unsafe_or_io_error(&dir_path, e))?;
+    rustix::fs::unlinkat(&state, name, AtFlags::empty())
+        .map_err(|e| unsafe_or_io_error(&dir_path.join(name), e))
+}
+
 /// Converts an [`io::Error`] from [`open_state_file`] into a [`LockError`] for
 /// the project lock: the exact unsafe path when the error names one,
 /// `fallback` otherwise.
@@ -209,7 +228,7 @@ fn holder(pid: Option<u32>) -> String {
 /// The held lock, on the project directory. Dropping it releases the lock.
 #[derive(Debug)]
 pub struct ProjectLock {
-    _project: OwnedFd,
+    project: OwnedFd,
 }
 
 impl ProjectLock {
@@ -259,7 +278,15 @@ impl ProjectLock {
         pid_file.set_len(0).map_err(pid_io)?;
         write!(pid_file, "{}", std::process::id()).map_err(pid_io)?;
         pid_file.flush().map_err(pid_io)?;
-        Ok(Self { _project: project })
+        Ok(Self { project })
+    }
+}
+
+impl Drop for ProjectLock {
+    /// Unlocks explicitly: the lock belongs to the open file description, so a
+    /// dup held by a child forked before its exec would otherwise keep it.
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.project, FlockOperation::Unlock);
     }
 }
 
@@ -284,6 +311,17 @@ mod tests {
     fn the_lock_is_released_on_drop() -> TestResult {
         let dir = tempfile::tempdir()?;
         drop(ProjectLock::acquire(dir.path())?);
+        ProjectLock::acquire(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_lock_is_released_on_drop_while_a_dup_of_its_fd_lives() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let lock = ProjectLock::acquire(dir.path())?;
+        // What a child forked by a parallel test holds until its exec.
+        let _dup = lock.project.try_clone()?;
+        drop(lock);
         ProjectLock::acquire(dir.path())?;
         Ok(())
     }
@@ -387,5 +425,35 @@ mod tests {
             error.to_string(),
             "another overbrainer (pid 42) is using this project"
         );
+    }
+
+    #[test]
+    fn remove_state_file_removes_the_file() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        open_state_file(
+            dir.path(),
+            "logs-x.log",
+            OFlags::WRONLY | OFlags::CREATE,
+            true,
+        )?;
+        let path = dir.path().join(STATE_DIR).join("logs-x.log");
+        assert!(path.exists());
+        remove_state_file(dir.path(), "logs-x.log")?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_state_file_refuses_a_symlinked_state_directory() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        std::fs::write(elsewhere.path().join("logs-x.log"), "keep me")?;
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(STATE_DIR))?;
+        match remove_state_file(dir.path(), "logs-x.log") {
+            Err(error) => assert_eq!(error.kind(), ErrorKind::InvalidInput),
+            other => return Err(format!("expected an error, got {other:?}").into()),
+        }
+        assert!(elsewhere.path().join("logs-x.log").exists());
+        Ok(())
     }
 }

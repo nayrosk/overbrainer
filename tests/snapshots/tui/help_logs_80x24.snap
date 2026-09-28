@@ -2,7 +2,6 @@
 source: src/tui/snapshots.rs
 ---
 " ⠿ overbrainer   1 Dataset  2 Pipeline  3 Training  4 Logs          rust_expert "
-"  Logs · INFO and above                                                         "
 "                                                                                "
 " ╭ Keys ──────────────────────────────────────────────────────────────────────╮ "
 " │ Everywhere                                                                 │ "
@@ -10,6 +9,7 @@ source: src/tui/snapshots.rs
 " │ ?                          this help (Esc, ? or q closes it)               │ "
 " │ q, Ctrl-C                  quit                                            │ "
 " │ R                          reload the data files and runs                  │ "
+" │ g                          open the overbrainer repository in a browser    │ "
 " │ r                          run a pipeline stage, or run (asks which)       │ "
 " │ y, n Esc Enter             in a dialog: confirm, cancel (the default, n)   │ "
 " │                                                                            │ "
@@ -17,11 +17,11 @@ source: src/tui/snapshots.rs
 " │ k j, Up Down, PgUp PgDn    scroll                                          │ "
 " │ G, End                     follow the newest lines                         │ "
 " │ f                          cycle level: error, warn, info, debug, trace    │ "
+" │ x                          export the shown lines to .overbrainer/         │ "
 " │                                                                            │ "
 " │ e, d, r and t are refused while a stage, an edit or a training start runs  │ "
 " │ in this TUI; the TUI also holds the project lock, so no other overbrainer  │ "
 " │ command writes to the project meanwhile.                                   │ "
 " ╰────────────────────────────────────────────────────────────────────────────╯ "
-"                                                                                "
 "                                                                                "
 " Esc close                                                               ? help "

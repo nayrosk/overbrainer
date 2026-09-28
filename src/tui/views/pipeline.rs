@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::events::Stage;
+use crate::history::Cost;
 use crate::tui::app::App;
+use crate::tui::cost::rows_cost;
 use crate::tui::format::hang;
 use crate::tui::motion::Bar;
 use crate::tui::pipeline::{PipelineView, STAGES, StageState, command_name};
@@ -144,21 +146,10 @@ fn details(view: &PipelineView, theme: &Theme, errors: usize, width: u16) -> Vec
         return lines;
     }
     let usage = view.usage();
-    let cost = STAGES
-        .iter()
-        .filter_map(|stage| view.row(*stage).stats.as_ref())
-        .filter_map(|stats| stats.cost)
-        .reduce(|a, b| a + b)
-        .map_or_else(
-            || {
-                if view.running {
-                    "cost: at the end of each stage".to_string()
-                } else {
-                    "cost unknown".to_string()
-                }
-            },
-            |cost| format!("cost ${cost:.4}"),
-        );
+    let cost = match rows_cost(&view.rows) {
+        Cost::Unknown => "cost unknown".to_string(),
+        cost => format!("cost {cost}"),
+    };
     lines.push(Line::from(format!(
         "tokens  in {}  out {}        {cost}",
         usage.input_tokens, usage.output_tokens

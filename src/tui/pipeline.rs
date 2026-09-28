@@ -48,8 +48,14 @@ pub(super) struct Row {
     pub(super) failed: usize,
     /// Tokens so far, then the stage's own count once it finished.
     pub(super) usage: Usage,
+    /// Cost so far of the items whose price is known, then the stage's own;
+    /// `None` until one is known.
+    pub(super) cost: Option<f64>,
     /// The stage's final counters.
     pub(super) stats: Option<StageStats>,
+    /// Whether the current or last task started it: its cost is not in the
+    /// history the task started with.
+    pub(super) this_task: bool,
 }
 
 impl Row {
@@ -61,7 +67,9 @@ impl Row {
             retries: 0,
             failed: 0,
             usage: Usage::default(),
+            cost: None,
             stats: None,
+            this_task: false,
         }
     }
 
@@ -164,7 +172,10 @@ impl PipelineView {
         let rows = std::array::from_fn(|i| match command_stage(command) {
             None => Row::new(StageState::Pending),
             Some(stage) if stage == STAGES[i] => Row::new(StageState::Idle),
-            Some(_) => self.rows[i].clone(),
+            Some(_) => Row {
+                this_task: false,
+                ..self.rows[i].clone()
+            },
         });
         *self = Self {
             command: Some(command),
@@ -187,12 +198,18 @@ impl PipelineView {
                 let row = &mut self.rows[index(*stage)];
                 *row = Row::new(state);
                 row.total = *total;
+                row.this_task = true;
             },
-            Event::ItemDone { stage, usage, .. } => {
+            Event::ItemDone {
+                stage, usage, cost, ..
+            } => {
                 let row = &mut self.rows[index(*stage)];
                 row.finished = (row.finished + 1).min(row.total);
                 if let Some(usage) = usage {
                     row.usage += *usage;
+                }
+                if let Some(cost) = cost {
+                    *row.cost.get_or_insert(0.0) += cost;
                 }
             },
             Event::ItemFailed {
@@ -207,6 +224,7 @@ impl PipelineView {
                 row.finished = row.total;
                 row.failed = stats.failed;
                 row.usage = stats.usage;
+                row.cost = stats.cost;
                 row.stats = Some(stats.clone());
             },
             _ => {},
@@ -453,6 +471,36 @@ mod tests {
             StageState::Idle,
             "the stage being run starts fresh"
         );
+    }
+
+    #[test]
+    fn item_costs_sum_into_the_row_until_the_stage_reports_its_own() {
+        let mut view = PipelineView::default();
+        view.started(Command::Answers, 4);
+        view.event(&Event::StageStarted {
+            stage: Stage::Answers,
+            total: 10,
+        });
+        assert_eq!(view.row(Stage::Answers).cost, None);
+        view.event(&done(Stage::Answers, 5));
+        assert_eq!(view.row(Stage::Answers).cost, None, "no price known yet");
+        for cost in [0.25, 0.5] {
+            view.event(&Event::ItemDone {
+                stage: Stage::Answers,
+                id: "y".into(),
+                usage: None,
+                cost: Some(cost),
+            });
+        }
+        assert_eq!(view.row(Stage::Answers).cost, Some(0.75));
+        view.event(&Event::StageFinished {
+            stage: Stage::Answers,
+            stats: StageStats {
+                cost: Some(0.8),
+                ..StageStats::default()
+            },
+        });
+        assert_eq!(view.row(Stage::Answers).cost, Some(0.8));
     }
 
     #[test]

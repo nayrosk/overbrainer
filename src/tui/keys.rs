@@ -37,6 +37,7 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
     row("?", "this help (Esc, ? or q closes it)"),
     row("q, Ctrl-C", "quit"),
     row("R", "reload the data files and runs"),
+    row("g", "open the overbrainer repository in a browser"),
     row("r", "run a pipeline stage, or run (asks which)"),
     row(
         "y, n Esc Enter",
@@ -46,13 +47,16 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
 
 const DATASET: &[KeyHelp] = &[
     row("k j, Up Down", "move"),
-    row("l h, Right Left", "expand, collapse"),
-    row("Enter", "expand or collapse"),
-    row("PgUp PgDn", "scroll the detail pane"),
+    row("l h, Right Left, Enter", "expand, collapse (Enter toggles)"),
+    row(
+        "PgUp PgDn, [ ]",
+        "scroll the detail pane; [ ] jumps part to part",
+    ),
     row("/", "filter the tree (Enter keeps, Esc clears)"),
     row("s", "stats pane"),
-    row("e", "edit in $EDITOR (question, answer, subtopic)"),
+    row("e, E", "edit in $EDITOR; E edits the question's answer"),
     row("d", "delete, with what depends on it (asks first)"),
+    row("D", "delete the question's answer only (asks first)"),
 ];
 
 const TRAINING: &[KeyHelp] = &[
@@ -67,6 +71,7 @@ const LOGS: &[KeyHelp] = &[
     row("k j, Up Down, PgUp PgDn", "scroll"),
     row("G, End", "follow the newest lines"),
     row("f", "cycle level: error, warn, info, debug, trace"),
+    row("x", "export the shown lines to .overbrainer/"),
 ];
 
 /// One key hint of the footer: a key and what it does, in a word or two.
@@ -130,6 +135,7 @@ const FOOTER_DATASET: &[Hint] = &[
     hint("s", "stats"),
     locking("e", "edit"),
     locking("d", "delete"),
+    hint("[ ]", "parts"),
 ];
 const FOOTER_PIPELINE: &[Hint] = &[
     locking("r", "run a stage"),
@@ -152,6 +158,7 @@ const FOOTER_LOGS: &[Hint] = &[
     hint("j/k", "scroll"),
     hint("G", "follow"),
     hint("f", "level"),
+    hint("x", "export"),
 ];
 const FOOTER_FILTER: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "clear")];
 const FOOTER_HELP: &[Hint] = &[hint("Esc", "close")];

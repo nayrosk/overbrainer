@@ -134,10 +134,10 @@ Runpod: [runpod.io](https://runpod.io?ref=ym24z23f) (referral link). A run's LoR
 
 `overbrainer tui` has four views:
 
-- Dataset (`1`): the topics, subtopics, questions and answers as a tree, with each answer's reasoning, stats and a filter. Edit or delete items in place.
-- Pipeline (`2`): run a stage and watch its progress, tokens and cost.
+- Dataset (`1`): the topics, subtopics and questions as a tree, with a question's answer, reasoning, stats and a filter in a detail pane. Edit or delete a question, its answer or a subtopic in place.
+- Pipeline (`2`): run a stage and watch its progress, tokens and cost, live as it runs.
 - Training (`3`): the runs, with progress, pod, spend, a loss chart and learning rate and gradient norm sparklines. Start, follow or cancel a run.
-- Logs (`4`): the captured log lines, filtered by level.
+- Logs (`4`): the captured log lines, filtered by level, exportable to a file.
 
 | Keys | Action |
 |---|---|
@@ -145,10 +145,14 @@ Runpod: [runpod.io](https://runpod.io?ref=ym24z23f) (referral link). A run's LoR
 | `?` | The keys of the current view. |
 | `j` `k`, `l` `h`, Enter | Move, expand and collapse (Enter toggles). |
 | `/`, `s` | Filter the tree, show the stats. |
+| `[` `]` | Jump the detail between a question, its reasoning and its answer. |
 | `e`, `d` | Edit in `$EDITOR`, delete (asks first). |
+| `E`, `D` | Edit or delete only a question's answer. |
 | `r` | Run a pipeline stage. |
 | `t`, `a`, `c` | Start, attach to, or cancel a training run. |
+| `x` | Export the Logs view to a file. |
 | `R` | Reload from disk. |
+| `g` | Open the repository in a browser. |
 | `q`, Ctrl-C | Quit (asks first when work is running). |
 
 The TUI draws its own crimson theme in 24-bit or 256 colors, and falls back to the terminal's 16 colors. `OVERBRAINER_TUI_COLOR` (`truecolor`, `256` or `16`) and `OVERBRAINER_TUI_MOTION` (`on`, `reduced` or `off`) override the detection, and `NO_COLOR` turns it monochrome. [The TUI page](docs/tui.md) has every key and behavior.
