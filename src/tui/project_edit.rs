@@ -21,8 +21,8 @@ use crate::config::{CONFIG_FILE, ConfigError, EnvSource, Protocol, is_valid_name
 /// What a confirmed `d` takes out of the pending document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Removal {
-    /// The topic of this name.
-    Topic(String),
+    /// The topic at this index, of this name.
+    Topic(usize, String),
     /// A provider or a target.
     Table(Collection, String),
 }
@@ -31,7 +31,7 @@ impl Removal {
     /// The dotted key of what goes: `topics.traits`, `providers.claude`.
     pub(super) fn key(&self) -> String {
         match self {
-            Self::Topic(name) => format!("topics.{name}"),
+            Self::Topic(_, name) => format!("topics.{name}"),
             Self::Table(collection, name) => format!("{}.{name}", collection.key()),
         }
     }
@@ -429,6 +429,21 @@ impl App {
             (true, false) => return Err("is required".to_string()),
             (false, _) => Some(kind.parse(text)?),
         };
+        if let (FieldPath::Topic { index, field, .. }, Some(FieldValue::Text(new))) = (path, &value)
+            && *field == "name"
+        {
+            let names = self
+                .shown_doc()
+                .map(ConfigDoc::topic_names)
+                .unwrap_or_default();
+            let clash = names
+                .iter()
+                .enumerate()
+                .any(|(at, topic)| at != *index && topic == new);
+            if clash {
+                return Err(format!("topics.{new} already exists"));
+            }
+        }
         self.apply(path, value.as_ref())
     }
 
@@ -538,7 +553,9 @@ impl App {
             return;
         };
         let removal = match &field.path {
-            Some(FieldPath::Topic { name, .. }) => Some(Removal::Topic(name.clone())),
+            Some(FieldPath::Topic { index, name, .. }) => {
+                Some(Removal::Topic(*index, name.clone()))
+            },
             Some(FieldPath::Provider { name, .. }) => {
                 Some(Removal::Table(Collection::Providers, name.clone()))
             },
@@ -597,12 +614,9 @@ impl App {
             return;
         };
         let removed = match removal {
-            Removal::Topic(name) => pending
-                .doc
-                .topic_names()
-                .iter()
-                .position(|topic| topic == name)
-                .is_some_and(|index| pending.remove_topic(index)),
+            Removal::Topic(index, name) => {
+                pending.doc.topic_names().get(*index) == Some(name) && pending.remove_topic(*index)
+            },
             Removal::Table(collection, name) => pending.doc.remove_table(*collection, name),
         };
         if removed {
@@ -1082,6 +1096,46 @@ mod tests {
             "{text}"
         );
         assert_eq!(app.project.topics.len(), 2);
+        Ok(())
+    }
+
+    /// [`editing_app`] with a second topic, `traits`, pending.
+    fn two_topics() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
+        let (dir, mut app) = editing_app()?;
+        press(&mut app, &[KeyCode::Char('a'), KeyCode::Enter]);
+        chars(&mut app, "traits");
+        press(&mut app, &[KeyCode::Enter]);
+        Ok((dir, app))
+    }
+
+    fn topic_names(app: &App) -> Vec<String> {
+        app.shown_doc()
+            .map(ConfigDoc::topic_names)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_rename_to_the_name_of_another_topic_is_refused_on_enter() -> TestResult {
+        let (_dir, mut app) = two_topics()?;
+        set(&mut app, "topics.traits.name", "ownership")?;
+        let Some(Form::Value { error, .. }) = &app.project_view.form else {
+            return Err("the form closed".into());
+        };
+        assert_eq!(error.as_deref(), Some("topics.ownership already exists"));
+        assert_eq!(topic_names(&app), ["ownership", "traits"]);
+        press(&mut app, &[KeyCode::Esc]);
+        set(&mut app, "topics.traits.name", "traits")?;
+        assert_eq!(app.project_view.form, None, "its own name is no clash");
+        Ok(())
+    }
+
+    #[test]
+    fn d_removes_the_topic_selected() -> TestResult {
+        let (_dir, mut app) = two_topics()?;
+        select(&mut app, "topics.traits.subtopics")?;
+        press(&mut app, &[KeyCode::Char('d'), KeyCode::Char('y')]);
+        assert_eq!(topic_names(&app), ["ownership"]);
+        assert_eq!(status(&app), "topics.traits deleted; s saves it");
         Ok(())
     }
 
