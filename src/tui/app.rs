@@ -1100,6 +1100,7 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => {
                 view.tree.key_left();
                 view.scroll = 0;
+                view.sections.clear();
             },
             KeyCode::PageDown => view.scroll = view.scroll.saturating_add(PAGE),
             KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(PAGE),
@@ -2458,6 +2459,23 @@ mod tests {
             rows.iter()
                 .any(|row| row.contains(MOVED.get(..20).unwrap_or(MOVED)))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn brackets_do_not_jump_by_the_parts_of_the_node_left_before_a_draw() -> TestResult {
+        let mut app = dataset_app();
+        let mut data = dataset();
+        let reply = data.answers[0].messages.last_mut().ok_or("no reply")?;
+        reply.content.push_str(&"\nOne more line.".repeat(30));
+        app.dataset.loaded(data, &app.project.topics.clone());
+        for key in [KeyCode::Char('j'), KeyCode::Char('k'), KeyCode::Char('h')] {
+            open_to(&mut app, &path_to(MOVED));
+            draw(&mut app, 80, 24)?;
+            assert_eq!(app.dataset.sections.len(), 3);
+            press(&mut app, &[key, KeyCode::Char(']')]);
+            assert_eq!(app.dataset.scroll, 0, "{key:?}");
+        }
         Ok(())
     }
 

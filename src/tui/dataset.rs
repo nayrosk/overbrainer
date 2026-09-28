@@ -583,6 +583,7 @@ impl DatasetView {
             let identifier = flat.identifier.clone();
             self.tree.select(identifier);
             self.scroll = 0;
+            self.sections.clear();
         }
     }
 
