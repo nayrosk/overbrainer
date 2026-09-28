@@ -146,8 +146,9 @@ enum Created {
 }
 
 /// Creates the run's pod, trying `plan.target.gpu_types` in order (its `auto`
-/// choices resolved first, see [`resolve_target`]), and waits until it is ready. `record` (`pod.json`) is saved before every create call and
-/// after every answer. A pod that dies or stays unreachable is deleted and the
+/// choices resolved first, see [`resolve_target`]), and waits until it is
+/// ready. `record` (`pod.json`) is saved before every create call and after
+/// every answer. A pod that dies or stays unreachable is deleted and the
 /// next GPU type tried. When provisioning fails after a create call got no clear
 /// answer, every pod of the run still listed is deleted (see [`sweep`]).
 ///
