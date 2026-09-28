@@ -154,7 +154,7 @@ async fn train(
         },
     };
     guard.close().await;
-    finish(&runs, &id, result, front, trainer.outputs())
+    finish(&runs, &id, result, front)
 }
 
 async fn attach(
@@ -186,7 +186,7 @@ async fn attach(
     };
     let result = front.interrupt().race(flow).await.transpose();
     guard.close().await;
-    finish(&runs, run_id, result, front, trainer.outputs())
+    finish(&runs, run_id, result, front)
 }
 
 async fn cancel_run(
@@ -359,14 +359,14 @@ async fn run_executor(
 }
 
 /// Emits the outcome through `front` (stdout on the command line), then, for a
-/// run that succeeded, where its `outputs` are; or explains how to follow an
-/// interrupted run.
+/// run that succeeded, where its model is, read from the run's own files (the
+/// settings may have changed since it started; nothing is said when they
+/// cannot be read); or explains how to follow an interrupted run.
 pub(super) fn finish(
     runs: &Runs,
     id: &str,
     result: anyhow::Result<Option<Outcome>>,
     front: &Frontend,
-    outputs: Outputs,
 ) -> anyhow::Result<()> {
     let Some(outcome) = result? else {
         return interrupted(runs, id);
@@ -385,7 +385,11 @@ pub(super) fn finish(
     ));
     match record.state {
         RunState::Succeeded => {
-            for (what, path) in outputs.paths(&record.id) {
+            let outputs = runs
+                .run_dir(&record.id)
+                .ok()
+                .and_then(|dir| Outputs::recorded(&dir));
+            for (what, path) in outputs.map(|o| o.paths(&record.id)).unwrap_or_default() {
                 front.line(&format!("train: {what} in {path}"));
             }
             Ok(())

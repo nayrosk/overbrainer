@@ -654,6 +654,9 @@ if [ "$1" = train ]; then
   printf '{"event": "log", "time": 2, "step": 1, "epoch": 1.0, "max_steps": 1, "loss": 0.75}\n' >> "$OVERBRAINER_METRICS"
   mkdir -p output && echo adapter > output/adapter_model.safetensors
 fi
+if [ "$1" = merge-lora ]; then
+  mkdir -p output/merged && echo merged > output/merged/model.safetensors
+fi
 "#;
 
 #[tokio::test(flavor = "multi_thread")]

@@ -53,6 +53,29 @@ impl Outputs {
         }
     }
 
+    /// What the succeeded run in the local directory `run_dir` left, read
+    /// from its own files: its `axolotl.yaml` names the adapter (none for
+    /// `full`), and `output/merged/` is there when it was merged. `None` when
+    /// its `axolotl.yaml` cannot be read or names an unknown adapter.
+    #[must_use]
+    pub fn recorded(run_dir: &Path) -> Option<Self> {
+        let config = fs::read_to_string(run_dir.join(CONFIG_FILE)).ok()?;
+        let adapter = config
+            .lines()
+            .find_map(|line| line.strip_prefix("adapter:"))
+            .map(|value| value.trim().trim_matches(['"', '\'']));
+        let adapter = match adapter {
+            None => Adapter::Full,
+            Some("lora") => Adapter::Lora,
+            Some("qlora") => Adapter::Qlora,
+            Some(_) => return None,
+        };
+        Some(Self {
+            adapter,
+            merge: run_dir.join(OUTPUT_DIR).join(MERGED_DIR).is_dir(),
+        })
+    }
+
     /// Where the model of succeeded run `run_id` is, relative to the project
     /// directory, each with what it is: the adapter (the model for `full`),
     /// then the merged model with `merge = true`.
@@ -81,12 +104,6 @@ pub struct Axolotl<'a> {
 }
 
 impl<'a> Axolotl<'a> {
-    /// What a succeeded run of this trainer leaves.
-    #[must_use]
-    pub fn outputs(&self) -> Outputs {
-        Outputs::of(self.training)
-    }
-
     /// A trainer for `training`, reading the split files of `files`.
     #[must_use]
     pub fn new(training: &'a Training, files: &DataFiles) -> Self {
@@ -377,6 +394,33 @@ pub fn reasoning_template_warning(training: &Training) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_outputs_come_from_the_run_s_own_files() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(Outputs::recorded(dir.path()), None, "no axolotl.yaml");
+        fs::write(
+            dir.path().join(CONFIG_FILE),
+            "base_model: m\nadapter: qlora\n",
+        )?;
+        let qlora = Outputs {
+            adapter: Adapter::Qlora,
+            merge: false,
+        };
+        assert_eq!(Outputs::recorded(dir.path()), Some(qlora));
+        fs::create_dir_all(dir.path().join(OUTPUT_DIR).join(MERGED_DIR))?;
+        let merged = Outputs {
+            merge: true,
+            ..qlora
+        };
+        assert_eq!(Outputs::recorded(dir.path()), Some(merged));
+        fs::write(dir.path().join(CONFIG_FILE), "base_model: m\n")?;
+        let full = Outputs::recorded(dir.path()).map(|outputs| outputs.adapter);
+        assert_eq!(full, Some(Adapter::Full));
+        fs::write(dir.path().join(CONFIG_FILE), "adapter: dora\n")?;
+        assert_eq!(Outputs::recorded(dir.path()), None);
+        Ok(())
+    }
 
     #[test]
     fn outputs_name_the_adapter_then_the_merged_model() {
