@@ -14,6 +14,7 @@ Everywhere:
 | `?` | List the keys of the current view. Esc, `?` or `q` closes it. |
 | `q`, Ctrl-C | Quit. |
 | `R` | Reload the data files and the runs list from disk. |
+| `g` | Open the overbrainer repository in a browser. |
 | `r` | Run a pipeline stage, or `run` (asks which). |
 | `y`, then `n`, Esc or Enter | In a dialog: confirm, or cancel (the default, `n`). |
 
@@ -25,10 +26,13 @@ Dataset:
 | `l` `h`, Right, Left | Expand, collapse. |
 | Enter | Expand or collapse. |
 | PgUp, PgDn | Scroll the detail pane. |
+| `[` `]` | Jump the detail pane from part to part (the question, its reasoning, its answer). |
 | `/` | Filter the tree. Enter keeps the filter, Esc clears it. |
 | `s` | Stats pane. |
-| `e` | Edit the selected question, answer or subtopic in `$EDITOR`. |
+| `e` | Edit the selected question's text or a subtopic's name in `$EDITOR`. |
+| `E` | Edit the selected question's answer in `$EDITOR`. |
 | `d` | Delete the selected item, with what depends on it (asks first). |
+| `D` | Delete the selected question's answer only (asks first). |
 
 Training:
 
@@ -46,16 +50,17 @@ Logs:
 | `k` `j`, Up, Down, PgUp, PgDn | Scroll. |
 | `G`, End | Follow the newest lines. |
 | `f` | Cycle the level shown: error, warn, info, debug, trace. |
+| `x` | Export the lines at the level shown to `.overbrainer/logs-<timestamp>.log`. |
 
 ## The views
 
 ### Dataset (`1`)
 
-The topics, their subtopics, questions and answers as a tree, with a detail pane: an answer's reasoning and content, which PgUp and PgDn scroll. With `s`, the pane shows the stats of the selected topic and the train and eval sizes. `/` filters the tree by a case-insensitive substring of question texts and subtopic names. Enter keeps the typed filter applied; Esc clears the filter, whether it is being typed or already applied. Questions show `[a]` when answered and used for training, `[x]` when the answer is excluded, `[o]` when orphaned (its topic is no longer configured), and `[ ]` when unanswered. Topics no longer in `overbrainer.toml` and questions whose subtopic is gone are shown too, so they can be deleted. While a stage started from the TUI runs, the view reads the data files again every 2 seconds and whenever it is shown, so its counts follow what the stage writes; the selection and open nodes stay.
+The topics, their subtopics and questions as a tree, with a detail pane for the selected item. A question's detail shows the question's text, its answer metadata (model, tokens, finish reason), then, when it has an answer, `── reasoning ──` (when the answer has one) and `── answer ──` with the answer's text; there is no separate node for the answer in the tree. PgUp and PgDn scroll the detail pane; `[` and `]` jump it from part to part (the question, its reasoning, its answer). With `s`, the pane shows the stats of the selected topic and the train and eval sizes instead. `/` filters the tree by a case-insensitive substring of question texts and subtopic names. Enter keeps the typed filter applied; Esc clears the filter, whether it is being typed or already applied. Questions show `[a]` when answered and used for training, `[x]` when the answer is excluded, `[o]` when orphaned (its topic is no longer configured), and `[ ]` when unanswered. Topics no longer in `overbrainer.toml` and questions whose subtopic is gone are shown too, so they can be deleted. While a stage started from the TUI runs, the view reads the data files again every 2 seconds and whenever it is shown, so its counts follow what the stage writes; the selection and open nodes stay.
 
 ### Pipeline (`2`)
 
-`r` opens a menu of the stages and `run`, always on every topic and without `--force` (both stay command-line options). The view shows each stage's progress, requests in flight, retries, failures, tokens and cost, and the summary lines the command would print. `run` stops after `split` here: training starts only with `t`.
+`r` opens a menu of the stages and `run`, always on every topic and without `--force` (both stay command-line options). The view shows each stage's progress, requests in flight, retries, failures, tokens and cost, and the summary lines the command would print. The cost updates live as the running stage's items finish, before the stage itself reports its total. `run` stops after `split` here: training starts only with `t`.
 
 ### Training (`3`)
 
@@ -68,23 +73,23 @@ The runs of `runs/`, and for the selected one its progress, ETA, pod and estimat
 
 ### Logs (`4`)
 
-The captured log lines, newest at the bottom. Scrolling back with `k`/`j`, the arrows or PgUp/PgDn pins the view on the line it reached; `G` or End follows the newest lines again. `f` cycles the level shown (error, warn, info, debug, trace) and resumes following.
+The captured log lines, newest at the bottom. Scrolling back with `k`/`j`, the arrows or PgUp/PgDn pins the view on the line it reached; `G` or End follows the newest lines again. `f` cycles the level shown (error, warn, info, debug, trace) and resumes following. `x` exports every retained line at the shown level or more severe, oldest first, to a new file `.overbrainer/logs-<YYYYMMDDTHHMMSSZ>.log`; it never overwrites an existing file, and the footer says how many lines went where, or why it could not write the file.
 
 ## The footer and dialogs
 
-The footer lists the keys of what the keys act on (the view, the filter being typed, a dialog or the help), dropping the last ones when the row is full. A new message replaces them for ten seconds, marked `✓` or `✗`. On the right, the footer shows the work running, each with a spinner, then `? help`. While `e`, `d`, `r` and `t` are refused (see below), they are drawn crossed out and `locked` joins the work.
+The footer lists the keys of what the keys act on (the view, the filter being typed, a dialog or the help), dropping the last ones when the row is full. A new message replaces them for ten seconds, marked `✓` or `✗`. On the right, the footer shows the work running, each with a spinner, `locked` while the data lock holds (see below), the project's cost so far, the version, then `? help`. The cost is `$` with two decimals, a trailing `+` when part of it is unknown, and it is left out once nothing has been spent. The cost and the version are left out while a dialog, the help overlay or the `r` menu is open, so the hints have the room. While `e`, `d`, `r` and `t` are refused (see below), they are drawn crossed out and `locked` joins the work.
 
 A dialog highlights its default answer, `n`. `y` confirms; `n`, Esc and Enter cancel. A `y` that deletes, cancels or abandons something, or quits while a stage runs (its requests in flight are lost), is drawn as an error. The view under a dialog, the help or a menu goes dim.
 
 ## Editing and deleting
 
-`e` edits the selected question, answer or subtopic name in `$VISUAL` or `$EDITOR` (`vi` by default; `code --wait` works). The text goes through a file in `data/` readable only by you. An answer shows its reasoning and content between two marker lines, which must stay as they are.
+`e` edits the selected question's text or a subtopic's name in `$VISUAL` or `$EDITOR` (`vi` by default; `code --wait` works); `E` edits the selected question's answer instead. The text goes through a file in `data/` readable only by you. An answer shows its reasoning and content between two marker lines, which must stay as they are.
 
 - Editing a question's text gives it a new ID and deletes its old answer, since it now answers another question: run `answers` to answer it again.
 - Renaming a subtopic gives its questions new IDs and keeps their answers.
 - An edit that collides with another question or subtopic is refused. An edit refused after you typed it keeps its file, whose path is shown.
 
-`d` deletes the selected item after a confirmation that says what goes with it: a subtopic takes its questions and their answers, a question its answer, an answer only itself. After every edit or deletion, `split` runs again.
+`d` deletes the selected item after a confirmation that says what goes with it: a subtopic takes its questions and their answers, a question its answer; `D` deletes only the selected question's answer, leaving the question. After every edit or deletion, `split` runs again.
 
 A deleted subtopic or question is recorded in `data/rejected.jsonl`, so the stages do not generate it again: `subtopics` drops that name, and `questions` treats that text as already asked (its exact text, a case or spacing variant, or a near-duplicate). `--force` keeps these rejections. To allow one again, remove its line from `data/rejected.jsonl`.
 

@@ -134,10 +134,10 @@ Runpod: [runpod.io](https://runpod.io?ref=ym24z23f) (referral link). A run's LoR
 
 `overbrainer tui` has four views:
 
-- Dataset (`1`): the topics, subtopics, questions and answers as a tree, with each answer's reasoning, stats and a filter. Edit or delete items in place.
-- Pipeline (`2`): run a stage and watch its progress, tokens and cost.
+- Dataset (`1`): the topics, subtopics and questions as a tree, with a question's answer, reasoning, stats and a filter in a detail pane. Edit or delete a question, its answer or a subtopic in place.
+- Pipeline (`2`): run a stage and watch its progress, tokens and cost, live as it runs.
 - Training (`3`): the runs, with progress, pod, spend, a loss chart and learning rate and gradient norm sparklines. Start, follow or cancel a run.
-- Logs (`4`): the captured log lines, filtered by level.
+- Logs (`4`): the captured log lines, filtered by level, exportable to a file.
 
 | Keys | Action |
 |---|---|
