@@ -8,3 +8,4 @@ mod validate;
 
 pub use load::{CONFIG_FILE, ConfigError, ENV_PREFIX, EnvSource, env_keys, load, load_str};
 pub use types::*;
+pub(crate) use validate::is_valid_name;

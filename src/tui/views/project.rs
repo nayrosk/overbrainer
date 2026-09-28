@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
 
 use crate::tui::app::App;
 use crate::tui::format::{cut, hang};
-use crate::tui::project::{self, Field, Locks, ProjectView, Row, Shown, Stat};
+use crate::tui::project::{self, Addable, Field, Form, Listing, ProjectView, Row, Shown, Stat};
 use crate::tui::theme::Theme;
 
 /// Columns of a stat's label: a longer one, or a value that does not fit
@@ -31,18 +31,22 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
-    let block = pane(theme.border_focus).title(Span::styled(" configuration ", theme.title));
+    let title = match app.project_view.changes() {
+        0 if app.project_view.pending.is_none() => " configuration ".to_string(),
+        1 => " configuration · 1 change ".to_string(),
+        count => format!(" configuration · {count} changes "),
+    };
+    let block = pane(theme.border_focus).title(Span::styled(title, theme.title));
     let inner = block.inner(left);
     frame.render_widget(block, left);
-    match &app.config {
-        Some(config) => {
-            let rows = project::rows(config, &Locks::of(app));
-            render_rows(frame, inner, (&rows, &mut app.project_view), &theme);
-        },
-        None => frame.render_widget(
+    if app.config.is_some() {
+        let listing = app.project_listing();
+        render_rows(frame, inner, (&listing, &mut app.project_view), &theme);
+    } else {
+        frame.render_widget(
             Paragraph::new(Span::styled("No configuration read.", theme.dim)),
             inner,
-        ),
+        );
     }
     let block = pane(theme.border).title(Span::styled(" stats ", theme.title));
     let inner = block.inner(right);
@@ -55,16 +59,12 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 fn render_rows(
     frame: &mut Frame,
     area: Rect,
-    (rows, view): (&[Row], &mut ProjectView),
+    (listing, view): (&Listing, &mut ProjectView),
     theme: &Theme,
 ) {
     let [list, detail] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(DETAIL_ROWS)]).areas(area);
-    let fields: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter_map(|(at, row)| matches!(row, Row::Field(_)).then_some(at))
-        .collect();
+    let (rows, fields) = (&listing.rows, &listing.fields);
     view.selected = view.selected.min(fields.len().saturating_sub(1));
     let selected = fields.get(view.selected).copied().unwrap_or(0);
     let height = usize::from(list.height).max(1);
@@ -99,13 +99,103 @@ fn render_rows(
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), list);
-    if let Some(Row::Field(field)) = rows.get(selected) {
+    if let Some(form) = &view.form {
+        frame.render_widget(
+            Paragraph::new(form_lines(form, detail.width, theme)),
+            detail,
+        );
+    } else if let Some(Row::Field(field)) = rows.get(selected) {
+        let style = if field.error.is_some() {
+            theme.error
+        } else {
+            theme.dim
+        };
         let lines: Vec<Line> = hang(&field.detail(), detail.width, 0)
             .into_iter()
             .take(usize::from(DETAIL_ROWS))
-            .map(|line| Line::from(Span::styled(line, theme.dim)))
+            .map(|line| Line::from(Span::styled(line, style)))
             .collect();
         frame.render_widget(Paragraph::new(lines), detail);
+    }
+}
+
+/// The form in the detail rows: what it asks with the input or the choices,
+/// then why the last Enter was refused, or what it accepts.
+fn form_lines(form: &Form, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let columns = usize::from(width);
+    let prompt = |text: String| {
+        let text = cut(&text, columns / 2);
+        let room = u16::try_from(columns.saturating_sub(text.chars().count())).unwrap_or(0);
+        (Span::styled(text, theme.title), room)
+    };
+    let choices = |names: &[&str], at: usize| -> Vec<Span<'static>> {
+        names
+            .iter()
+            .enumerate()
+            .flat_map(|(index, name)| {
+                let style = if index == at {
+                    theme.selected
+                } else {
+                    Style::new()
+                };
+                [Span::styled(format!(" {name} "), style), Span::raw(" ")]
+            })
+            .collect()
+    };
+    let note = |error: &Option<String>, hint: String| match error {
+        Some(error) => Line::from(Span::styled(cut(error, columns), theme.error)),
+        None => Line::from(Span::styled(cut(&hint, columns), theme.dim)),
+    };
+    match form {
+        Form::Value {
+            path,
+            kind,
+            optional,
+            input,
+            error,
+        } => {
+            let (prompt, room) = prompt(format!("{} = ", path.field()));
+            let mut line = vec![prompt];
+            line.extend(input.line(room, Style::new()).spans);
+            let empty = if *optional { ", empty unsets" } else { "" };
+            vec![
+                Line::from(line),
+                note(error, format!("{}{empty}", kind.describe())),
+            ]
+        },
+        Form::Adding(at) => {
+            let names: Vec<&str> = Addable::ALL.iter().map(|what| what.as_str()).collect();
+            let mut line = vec![Span::styled("add ", theme.title)];
+            line.extend(choices(&names, *at));
+            vec![
+                Line::from(line),
+                note(&None, "←/→ choose, Enter picks, Esc cancels".to_string()),
+            ]
+        },
+        Form::Name { what, input, error } => {
+            let (prompt, room) = prompt(format!("new {} name: ", what.as_str()));
+            let mut line = vec![prompt];
+            line.extend(input.line(room, Style::new()).spans);
+            let hint = match what {
+                Addable::Topic => "a name no topic has",
+                Addable::Provider | Addable::Target => "a-z, 0-9 and _",
+            };
+            vec![Line::from(line), note(error, hint.to_string())]
+        },
+        Form::Kind { what, name, choice } => {
+            let asked = if *what == Addable::Provider {
+                "protocol"
+            } else {
+                "kind"
+            };
+            let (prompt, _) = prompt(format!("{} {name} {asked}: ", what.as_str()));
+            let mut line = vec![prompt];
+            line.extend(choices(what.kinds(), *choice));
+            vec![
+                Line::from(line),
+                note(&None, "←/→ choose, Enter adds, Esc cancels".to_string()),
+            ]
+        },
     }
 }
 
@@ -129,6 +219,9 @@ fn field_line(
     // `(used by …)` becomes `(used)` when the value and it do not fit: the
     // detail line under the list says by what.
     let mut marks = String::new();
+    if field.changed {
+        marks.push_str(" *");
+    }
     if field.env {
         marks.push_str(" (env)");
     }
@@ -137,6 +230,8 @@ fn field_line(
         let fits = value.chars().count() + marks.chars().count() + long.chars().count() <= room;
         marks.push_str(if fits { &long } else { " (used)" });
     }
+    let flag = if field.error.is_some() { " !" } else { "" };
+    let room = room.saturating_sub(flag.len());
     // The marks come first: a long value is cut to what they leave.
     let value = cut(value, room.saturating_sub(marks.chars().count()));
     let marks = cut(&marks, room.saturating_sub(value.chars().count()));
@@ -150,6 +245,7 @@ fn field_line(
         Span::raw(" "),
         Span::styled(value, value_style),
         Span::styled(marks, theme.dim),
+        Span::styled(flag, theme.error),
     ]);
     if selected {
         line.style(theme.selected)

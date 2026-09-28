@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "│ roles.parent.model: used by answers,     ││           412k/1.5M cost ?       │"
 "│   read-only until it ends                ││   gen         43k/9.9k $0.0135   │"
 "╰──────────────────────────────────────────╯╰──────────────────────────────────╯"
-" j/k move · PgUp/PgDn page          … answers · locked · $0.38+  v#.#.#  ? help "
+" j/k move · Enter edit · a add      … answers · locked · $0.38+  v#.#.#  ? help "

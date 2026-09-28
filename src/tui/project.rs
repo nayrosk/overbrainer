@@ -1,17 +1,20 @@
 //! The Project view's model: one row per configuration field, built from the
 //! effective settings, the text of `overbrainer.toml`, the keys the environment
-//! sets and what a running stage or training uses; and the project's stats.
+//! sets, the pending changes and what a running stage or training uses; and the
+//! project's stats.
 //! Secrets are never read: a row says `set`, `unset` or `vault ref`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use super::app::App;
 use super::cost::pods_cost;
 use super::dataset::sizes;
 use super::pipeline::command_name;
+use super::widgets::form::Input;
 use crate::cli::data::Command;
-use crate::config::edit::{ConfigDoc, FieldPath, Role};
-use crate::config::fields::{self, FieldSpec, Section, TargetKind};
+use crate::config::edit::{Collection, ConfigDoc, FieldPath, Role};
+use crate::config::fields::{self, FieldKind, FieldSpec, Section, TargetKind};
 use crate::config::{
     Adapter, ConfigError, ENV_PREFIX, Engine, EnvSource, Pipeline, Protocol, RoleModel, Runtime,
     Settings, Target, Topic, Training, env_keys, load_str,
@@ -32,6 +35,9 @@ pub(super) struct ProjectConfig {
     pub(super) env: BTreeSet<String>,
     /// Those whose value is a `vault:` reference.
     pub(super) vault: BTreeSet<String>,
+    /// The text it was read from: a save refuses to overwrite a file that no
+    /// longer holds it.
+    pub(super) text: String,
 }
 
 impl ProjectConfig {
@@ -49,6 +55,7 @@ impl ProjectConfig {
             doc,
             env: env_keys(env),
             vault: vault_keys(env),
+            text: content.to_string(),
         })
     }
 }
@@ -131,6 +138,10 @@ pub(super) struct Field {
     pub(super) lock: Option<String>,
     /// What it is.
     pub(super) help: &'static str,
+    /// Whether a pending change sets it, or adds its table.
+    pub(super) changed: bool,
+    /// Why the last save refused it.
+    pub(super) error: Option<String>,
 }
 
 impl Field {
@@ -138,6 +149,9 @@ impl Field {
     /// changed here, or what it is.
     pub(super) fn detail(&self) -> String {
         let key = &self.key;
+        if let Some(error) = &self.error {
+            return error.clone();
+        }
         if let Some(user) = &self.lock {
             return format!("{key}: used by {user}, read-only until it ends");
         }
@@ -192,6 +206,41 @@ impl Locks {
     }
 }
 
+impl Locks {
+    /// What uses `key` now, a field or a table, if anything: the roles the
+    /// stage running uses and their providers, the training table and its
+    /// run's target.
+    pub(super) fn user_of(&self, settings: &Settings, key: &str) -> Option<String> {
+        let mut tables: Vec<(String, &str)> = Vec::new();
+        if let Some((stage, roles)) = &self.stage {
+            for role in roles {
+                tables.push((format!("roles.{}", role.as_str()), stage));
+                let model = match role {
+                    Role::Generator => Some(&settings.roles.generator),
+                    Role::Parent => Some(&settings.roles.parent),
+                    Role::Embedder => settings.roles.embedder.as_ref(),
+                };
+                if let Some(model) = model {
+                    tables.push((format!("providers.{}", model.provider), stage));
+                }
+            }
+        }
+        if let Some((run, target)) = &self.run {
+            tables.push(("training".to_string(), run));
+            tables.push((format!("targets.{target}"), run));
+        }
+        tables
+            .into_iter()
+            .find(|(table, _)| {
+                key == table
+                    || key
+                        .strip_prefix(table.as_str())
+                        .is_some_and(|rest| rest.starts_with('.'))
+            })
+            .map(|(_, user)| user.to_string())
+    }
+}
+
 /// The roles `command` sends requests to.
 fn roles_of(command: Command) -> Vec<Role> {
     match command {
@@ -202,12 +251,44 @@ fn roles_of(command: Command) -> Vec<Role> {
     }
 }
 
-/// The rows of `config`, in file order: project, topics, providers, roles,
-/// pipeline, training, targets, then the env-only `runpod` and the rest.
-pub(super) fn rows(config: &ProjectConfig, locks: &Locks) -> Vec<Row> {
+/// The changes not saved yet: the edited document, and the dotted keys of the
+/// fields they set and of the tables they add or remove.
+#[derive(Debug, Clone)]
+pub(super) struct Pending {
+    /// `overbrainer.toml` as edited.
+    pub(super) doc: ConfigDoc,
+    /// What changed: `pipeline.seed`, `providers.local`.
+    pub(super) changed: BTreeSet<String>,
+}
+
+impl Pending {
+    /// No change yet to `doc`.
+    pub(super) fn new(doc: &ConfigDoc) -> Self {
+        Self {
+            doc: doc.clone(),
+            changed: BTreeSet::new(),
+        }
+    }
+
+    /// Whether a change sets `key` or adds its table.
+    fn covers(&self, key: &str) -> bool {
+        self.changed.contains(key)
+            || key
+                .rsplit_once('.')
+                .is_some_and(|(table, _)| self.changed.contains(table))
+    }
+}
+
+/// The rows of `config` with the `pending` changes: project, topics,
+/// providers, roles, pipeline, training, targets, then the env-only `runpod`
+/// and the rest. Topics, providers and targets are those of the document,
+/// with the tables only the environment sets.
+pub(super) fn rows(config: &ProjectConfig, pending: Option<&Pending>, locks: &Locks) -> Vec<Row> {
     let settings = &config.settings;
-    let mut rows = Rows {
+    let mut rows = Builder {
         config,
+        doc: pending.map_or(&config.doc, |pending| &pending.doc),
+        pending,
         rows: Vec::new(),
     };
     rows.heading("project");
@@ -217,16 +298,17 @@ pub(super) fn rows(config: &ProjectConfig, locks: &Locks) -> Vec<Row> {
         value: &|field| (field == "name").then(|| settings.project.name.clone()),
         lock: None,
     });
-    for (index, topic) in settings.topics.iter().enumerate() {
-        rows.heading(&format!("topics.{}", topic.name));
+    for (index, name) in rows.doc.topic_names().into_iter().enumerate() {
+        let topic = settings.topics.iter().find(|topic| topic.name == name);
+        rows.heading(&format!("topics.{name}"));
         rows.fields(&Table {
             section: Section::Topic,
             path: &|field| FieldPath::Topic {
                 index,
-                name: topic.name.clone(),
+                name: name.clone(),
                 field,
             },
-            value: &|field| topic_value(topic, field),
+            value: &|field| topic.and_then(|topic| topic_value(topic, field)),
             lock: None,
         });
     }
@@ -268,8 +350,25 @@ pub(super) fn rows(config: &ProjectConfig, locks: &Locks) -> Vec<Row> {
     rows.rows
 }
 
+/// The names of `collection` in the document, with those only the
+/// environment sets among `effective`, sorted.
+fn names<'a>(
+    rows: &Builder<'_>,
+    collection: Collection,
+    effective: impl Iterator<Item = &'a String>,
+) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = rows.doc.names(collection).into_iter().collect();
+    for name in effective {
+        let table = format!("{}.{name}.", collection.key());
+        if rows.config.env.iter().any(|key| key.starts_with(&table)) {
+            names.insert(name.clone());
+        }
+    }
+    names
+}
+
 /// The providers, then the roles; those the stage running uses are locked.
-fn providers_and_roles(rows: &mut Rows<'_>, settings: &Settings, locks: &Locks) {
+fn providers_and_roles(rows: &mut Builder<'_>, settings: &Settings, locks: &Locks) {
     let stage = locks.stage.as_ref();
     let locked_roles: Vec<Role> = stage.map(|(_, roles)| roles.clone()).unwrap_or_default();
     let stage_user = stage.map(|(name, _)| (*name).to_string());
@@ -283,7 +382,8 @@ fn providers_and_roles(rows: &mut Rows<'_>, settings: &Settings, locks: &Locks) 
         .filter_map(|role| role_model(*role))
         .map(|model| model.provider.as_str())
         .collect();
-    for (name, provider) in &settings.providers {
+    for name in names(rows, Collection::Providers, settings.providers.keys()) {
+        let provider = settings.providers.get(&name);
         let lock = locked_providers
             .contains(name.as_str())
             .then(|| stage_user.clone())
@@ -295,18 +395,24 @@ fn providers_and_roles(rows: &mut Rows<'_>, settings: &Settings, locks: &Locks) 
                 name: name.clone(),
                 field,
             },
-            value: &|field| (field == "protocol").then(|| protocol(provider.protocol).to_string()),
+            value: &|field| {
+                provider
+                    .filter(|_| field == "protocol")
+                    .map(|provider| protocol(provider.protocol).to_string())
+            },
             lock: lock.clone(),
         });
         let key = format!("providers.{name}");
         rows.env_only(
             (&key, "base_url", "Base URL of the API"),
-            provider.base_url.clone().map_or(Shown::Unset, Shown::Value),
+            provider
+                .and_then(|provider| provider.base_url.clone())
+                .map_or(Shown::Unset, Shown::Value),
             lock.clone(),
         );
         rows.secret(
             (&key, "api_key", "API key"),
-            provider.api_key.is_some(),
+            provider.is_some_and(|provider| provider.api_key.is_some()),
             lock,
         );
     }
@@ -328,7 +434,7 @@ fn providers_and_roles(rows: &mut Rows<'_>, settings: &Settings, locks: &Locks) 
 
 /// The training table, then the targets; the training run and its target
 /// are locked.
-fn training_and_targets(rows: &mut Rows<'_>, settings: &Settings, locks: &Locks) {
+fn training_and_targets(rows: &mut Builder<'_>, settings: &Settings, locks: &Locks) {
     let run_user = locks.run.as_ref().map(|(run, _)| run.clone());
     rows.heading("training");
     rows.fields(&Table {
@@ -342,12 +448,15 @@ fn training_and_targets(rows: &mut Rows<'_>, settings: &Settings, locks: &Locks)
         },
         lock: run_user.clone(),
     });
-    for (name, target) in &settings.targets {
-        let kind = target_kind(target);
+    for name in names(rows, Collection::Targets, settings.targets.keys()) {
+        let target = settings.targets.get(&name);
+        let Some(kind) = rows.doc.target_kind(&name).or(target.map(target_kind)) else {
+            continue;
+        };
         let lock = locks
             .run
             .as_ref()
-            .filter(|(_, used)| used == name)
+            .filter(|(_, used)| *used == name)
             .and(run_user.clone());
         rows.heading(&format!("targets.{name} ({})", kind.as_str()));
         rows.fields(&Table {
@@ -356,17 +465,21 @@ fn training_and_targets(rows: &mut Rows<'_>, settings: &Settings, locks: &Locks)
                 name: name.clone(),
                 field,
             },
-            value: &|field| target_value(target, field),
+            value: &|field| target.and_then(|target| target_value(target, field)),
             lock: lock.clone(),
         });
-        if let Target::Ssh { host, .. } = target {
+        if kind == TargetKind::Ssh {
+            let host = match target {
+                Some(Target::Ssh { host, .. }) => host.clone(),
+                _ => None,
+            };
             rows.env_only(
                 (
                     &format!("targets.{name}"),
                     "host",
                     "user@host or an ssh alias",
                 ),
-                host.clone().map_or(Shown::Unset, Shown::Value),
+                host.map_or(Shown::Unset, Shown::Value),
                 lock,
             );
         }
@@ -385,28 +498,34 @@ struct Table<'a> {
 }
 
 /// The rows being built.
-struct Rows<'a> {
+struct Builder<'a> {
     config: &'a ProjectConfig,
+    /// The document shown: the pending one, else the file's.
+    doc: &'a ConfigDoc,
+    pending: Option<&'a Pending>,
     rows: Vec<Row>,
 }
 
-impl Rows<'_> {
+impl Builder<'_> {
     fn heading(&mut self, text: &str) {
         self.rows.push(Row::Heading(text.to_string()));
     }
 
-    /// Every editable field of `table`: its value in the file, else the one
-    /// the environment sets, else its default.
+    /// Every editable field of `table`: its value in the document, else the
+    /// one the environment sets, else its default. A field a pending change
+    /// took out of the document is unset: the value read before no longer
+    /// applies.
     fn fields(&mut self, table: &Table<'_>) {
         for FieldSpec { name, help, .. } in fields::for_section(table.section) {
             let path = (table.path)(name);
             let key = path.to_string();
             let env = self.config.env.contains(&key);
+            let changed = self.pending.is_some_and(|pending| pending.covers(&key));
             let effective = (table.value)(name);
-            let shown = match (env, self.config.doc.get(&path), effective) {
+            let shown = match (env, self.doc.get(&path), effective) {
                 (true, _, Some(value)) | (false, Some(value), _) => Shown::Value(value),
-                (false, None, Some(value)) => Shown::Default(value),
-                (_, _, None) => Shown::Unset,
+                (false, None, Some(value)) if !changed => Shown::Default(value),
+                _ => Shown::Unset,
             };
             self.rows.push(Row::Field(Field {
                 name,
@@ -416,6 +535,8 @@ impl Rows<'_> {
                 env,
                 lock: table.lock.clone(),
                 help,
+                changed,
+                error: None,
             }));
         }
     }
@@ -440,6 +561,8 @@ impl Rows<'_> {
             shown,
             lock,
             help,
+            changed: false,
+            error: None,
         }));
     }
 
@@ -615,13 +738,148 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
     }
 }
 
-/// The Project view's state: the selected field and the first row shown.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The rows of the Project view, with where its fields are.
+#[derive(Debug, Default)]
+pub(super) struct Listing {
+    /// Headings and fields, in order.
+    pub(super) rows: Vec<Row>,
+    /// The position in `rows` of each field.
+    pub(super) fields: Vec<usize>,
+}
+
+impl Listing {
+    /// `rows`, each field marked with its error in `errors`.
+    pub(super) fn new(mut rows: Vec<Row>, errors: &BTreeMap<String, String>) -> Self {
+        let mut fields = Vec::new();
+        for (at, row) in rows.iter_mut().enumerate() {
+            if let Row::Field(field) = row {
+                field.error = errors.get(&field.key).cloned();
+                fields.push(at);
+            }
+        }
+        Self { rows, fields }
+    }
+
+    /// The `index`-th field.
+    pub(super) fn field(&self, index: usize) -> Option<&Field> {
+        match self.fields.get(index).and_then(|at| self.rows.get(*at)) {
+            Some(Row::Field(field)) => Some(field),
+            _ => None,
+        }
+    }
+
+    /// The position among the fields of the first one whose key is `key` or
+    /// lies in the table `key`.
+    pub(super) fn find(&self, key: &str) -> Option<usize> {
+        let table = format!("{key}.");
+        (0..self.fields.len()).find(|index| {
+            self.field(*index)
+                .is_some_and(|field| field.key == key || field.key.starts_with(&table))
+        })
+    }
+}
+
+/// What `a` adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Addable {
+    /// A `[[topics]]` entry.
+    Topic,
+    /// A `[providers.<name>]` table.
+    Provider,
+    /// A `[targets.<name>]` table.
+    Target,
+}
+
+impl Addable {
+    /// Every kind, in the order the form offers them.
+    pub(super) const ALL: [Self; 3] = [Self::Topic, Self::Provider, Self::Target];
+
+    /// Its name in the form.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Topic => "topic",
+            Self::Provider => "provider",
+            Self::Target => "target",
+        }
+    }
+
+    /// The choices asked after the name: a provider's protocol, a target's kind.
+    pub(super) fn kinds(self) -> &'static [&'static str] {
+        match self {
+            Self::Topic => &[],
+            Self::Provider => match fields::find(Section::Provider, "protocol") {
+                Some(FieldSpec {
+                    kind: FieldKind::Choice(protocols),
+                    ..
+                }) => protocols,
+                _ => &[],
+            },
+            // `TargetKind::ALL` by name; a test keeps them in step.
+            Self::Target => &["local", "ssh", "runpod"],
+        }
+    }
+}
+
+/// What the Project view's form asks, in the detail rows under the list.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum Form {
+    /// The value of the field `path`.
+    Value {
+        /// The field.
+        path: FieldPath,
+        /// What it accepts.
+        kind: FieldKind,
+        /// Whether an empty value unsets it.
+        optional: bool,
+        /// The text typed.
+        input: Input,
+        /// Why the last Enter was refused.
+        error: Option<String>,
+    },
+    /// What to add, the `0`-th of [`Addable::ALL`] selected.
+    Adding(usize),
+    /// The name of the new table.
+    Name {
+        /// What is added.
+        what: Addable,
+        /// The name typed.
+        input: Input,
+        /// Why the last Enter was refused.
+        error: Option<String>,
+    },
+    /// A provider's protocol or a target's kind.
+    Kind {
+        /// What is added.
+        what: Addable,
+        /// Its name.
+        name: String,
+        /// The choice selected, among [`Addable::kinds`].
+        choice: usize,
+    },
+}
+
+/// The Project view's state: the selection, the changes not saved yet, the
+/// form open, and the rows as last built.
+#[derive(Debug, Default)]
 pub(super) struct ProjectView {
     /// Position of the selected field among the fields.
     pub(super) selected: usize,
     /// The first row shown, set at each draw so the selection stays in view.
     pub(super) offset: usize,
+    /// The changes not saved yet.
+    pub(super) pending: Option<Pending>,
+    /// Why the last save was refused, by field key.
+    pub(super) errors: BTreeMap<String, String>,
+    /// The form open, if any.
+    pub(super) form: Option<Form>,
+    /// Whether a save runs.
+    pub(super) saving: bool,
+    /// Whether the editor open is on `overbrainer.toml`.
+    pub(super) editing: bool,
+    /// Bumped by every change of what the rows show but the locks.
+    generation: u64,
+    /// The rows built last, for this generation and these locks.
+    cache: Option<(u64, Locks, Arc<Listing>)>,
 }
 
 impl ProjectView {
@@ -630,6 +888,35 @@ impl ProjectView {
     pub(super) fn step(&mut self, by: isize, count: usize) {
         let last = count.saturating_sub(1);
         self.selected = self.selected.saturating_add_signed(by).min(last);
+    }
+
+    /// Notes that the configuration, the pending changes or the errors changed:
+    /// the rows are built again.
+    pub(super) fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The rows of `config` with the pending changes and `locks`: those built
+    /// last while nothing changed.
+    pub(super) fn listing(&mut self, config: Option<&ProjectConfig>, locks: Locks) -> Arc<Listing> {
+        if let Some((generation, cached, listing)) = &self.cache
+            && *generation == self.generation
+            && *cached == locks
+        {
+            return Arc::clone(listing);
+        }
+        let listing = Arc::new(config.map_or_else(Listing::default, |config| {
+            Listing::new(rows(config, self.pending.as_ref(), &locks), &self.errors)
+        }));
+        self.cache = Some((self.generation, locks, Arc::clone(&listing)));
+        listing
+    }
+
+    /// How many changes are pending.
+    pub(super) fn changes(&self) -> usize {
+        self.pending
+            .as_ref()
+            .map_or(0, |pending| pending.changed.len())
     }
 }
 
@@ -798,7 +1085,7 @@ mod tests {
 
     #[test]
     fn the_rows_follow_the_file_order_with_the_env_only_tables_last() -> TestResult {
-        let rows = rows(&config()?, &Locks::default());
+        let rows = rows(&config()?, None, &Locks::default());
         let headings: Vec<&str> = rows
             .iter()
             .filter_map(|row| match row {
@@ -828,7 +1115,7 @@ mod tests {
 
     #[test]
     fn values_come_from_the_file_the_environment_or_the_defaults() -> TestResult {
-        let rows = rows(&config()?, &Locks::default());
+        let rows = rows(&config()?, None, &Locks::default());
         let concurrency = field(&rows, "pipeline.concurrency")?;
         assert_eq!(concurrency.shown, Shown::Value("4".into()));
         assert!(concurrency.env);
@@ -860,7 +1147,7 @@ mod tests {
 
     #[test]
     fn secrets_show_set_unset_or_vault_ref_and_never_their_value() -> TestResult {
-        let rows = rows(&config()?, &Locks::default());
+        let rows = rows(&config()?, None, &Locks::default());
         let key = field(&rows, "providers.nanogpt.api_key")?;
         assert_eq!(key.shown, Shown::Set);
         assert!(key.env);
@@ -883,7 +1170,7 @@ mod tests {
 
     #[test]
     fn the_detail_says_where_a_value_comes_from() -> TestResult {
-        let rows = rows(&config()?, &Locks::default());
+        let rows = rows(&config()?, None, &Locks::default());
         assert_eq!(
             field(&rows, "providers.nanogpt.api_key")?.detail(),
             "providers.nanogpt.api_key: env only, set \
@@ -906,7 +1193,7 @@ mod tests {
             stage: Some(("answers", roles_of(Command::Answers))),
             run: None,
         };
-        let rows = rows(&config()?, &locks);
+        let rows = rows(&config()?, None, &locks);
         let locked: Vec<&str> = rows
             .iter()
             .filter_map(|row| match row {
@@ -937,7 +1224,7 @@ mod tests {
             stage: None,
             run: Some(("run 20260921-a1".into(), "gpu_cloud".into())),
         };
-        let rows = rows(&config()?, &locks);
+        let rows = rows(&config()?, None, &locks);
         for key in ["training.epochs", "targets.gpu_cloud.max_hours"] {
             assert_eq!(
                 field(&rows, key)?.lock.as_deref(),
@@ -998,7 +1285,7 @@ mod tests {
             stage: Some(("questions", roles_of(Command::Questions))),
             run: None,
         };
-        let rows = rows(&config()?, &locks);
+        let rows = rows(&config()?, None, &locks);
         for key in [
             "roles.embedder.model",
             "roles.generator.model",

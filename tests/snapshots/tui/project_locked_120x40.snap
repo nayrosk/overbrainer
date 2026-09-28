@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "│ roles.parent.model: used by answers, read-only until it ends   ││                                                    │"
 "│                                                                ││                                                    │"
 "╰────────────────────────────────────────────────────────────────╯╰────────────────────────────────────────────────────╯"
-" j/k move · PgUp/PgDn page · 1-5 views · q quit                             … answers · locked · $0.38+  v#.#.#  ? help "
+" j/k move · Enter edit · a add · d delete · s save · E $EDITOR              … answers · locked · $0.38+  v#.#.#  ? help "

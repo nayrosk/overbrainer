@@ -24,14 +24,17 @@ const PADDING: u16 = 2;
 const CHROME_ROWS: u16 = 6;
 
 /// Whether `y` on a dialog running `action` loses something: a deletion, a
-/// cancel, an abandon, or quitting while a stage runs (its requests in flight
-/// are lost). Its `y` is then drawn as an error.
+/// cancel, an abandon, pending changes dropped, or quitting while a stage runs
+/// (its requests in flight are lost). Its `y` is then drawn as an error.
 pub(in crate::tui) fn destructive(action: &Action, stage_running: bool) -> bool {
     match action {
         Action::Delete { .. }
         | Action::Cancel(_)
         | Action::Abandon(_)
-        | Action::AbandonStart(_) => true,
+        | Action::AbandonStart(_)
+        | Action::Remove(_)
+        | Action::DropChanges
+        | Action::Leave(_) => true,
         Action::Quit => stage_running,
         Action::Start(_) => false,
     }

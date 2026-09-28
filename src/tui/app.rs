@@ -15,7 +15,8 @@ use super::editor::{self, Session, Target};
 use super::follow::REFRESH;
 use super::motion::{Motion, MotionLevel};
 use super::pipeline::{PipelineView, STAGES, command_name};
-use super::project::{self, Locks, ProjectConfig, ProjectView, Row};
+use super::project::{ProjectConfig, ProjectView};
+use super::project_edit::Removal;
 use super::start::StartPlan;
 use super::tasks::{Done, Edit, History, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
@@ -24,7 +25,7 @@ use super::views::logs::{export_line, level_name};
 use super::widgets::form::{Input, InputOutcome};
 use crate::cli::data::Command;
 use crate::cli::front::Report;
-use crate::config::Settings;
+use crate::config::{EnvSource, Settings};
 use crate::dataset::{AnswerText, Counts, Dataset, Deletion, Id};
 use crate::logging::LogBuffer;
 
@@ -97,6 +98,14 @@ pub(super) enum Effect {
     },
     /// Open this URL in a browser, detached.
     OpenUrl(String),
+    /// Validates `text` and writes it to `overbrainer.toml`, off the UI
+    /// thread, unless the file no longer holds `base`.
+    SaveConfig {
+        /// The new text.
+        text: String,
+        /// The text the file held when it was read.
+        base: String,
+    },
     /// Writes `lines` to `.overbrainer/<name>`, off the UI thread, never
     /// overwriting an existing file.
     ExportLogs {
@@ -236,6 +245,12 @@ pub(super) enum Action {
     Abandon(Vec<TaskId>),
     /// Abandoning the Runpod start `0` still provisioning, asked for with `c`.
     AbandonStart(TaskId),
+    /// Taking a topic, a provider or a target out of the pending changes.
+    Remove(Removal),
+    /// Dropping the pending changes to `overbrainer.toml`.
+    DropChanges,
+    /// Leaving the Project view for `0`, dropping its pending changes.
+    Leave(View),
 }
 
 /// What an exit note added while leaving is about.
@@ -346,6 +361,8 @@ pub(super) struct App {
     pub(super) config: Option<ProjectConfig>,
     /// The Project view's state.
     pub(super) project_view: ProjectView,
+    /// The environment the configuration is read with.
+    pub(super) env: EnvSource,
     /// The last error reading the history, warned once, until a read works.
     history_error: Option<String>,
     /// While a pipeline task runs, and until the reload after its end read the
@@ -421,6 +438,7 @@ impl App {
             history: History::default(),
             config: None,
             project_view: ProjectView::default(),
+            env: EnvSource::Process,
             history_error: None,
             cost_base: None,
             base_load: None,
@@ -470,7 +488,7 @@ impl App {
 
     /// Reloads the data files; while a load runs, one more starts when it ends,
     /// and the footer shows the running load even when it started quietly.
-    fn reload(&mut self) -> Vec<Effect> {
+    pub(super) fn reload(&mut self) -> Vec<Effect> {
         if self.load.is_some() {
             self.reload_pending = true;
             self.quiet_load = false;
@@ -727,9 +745,13 @@ impl App {
     /// end); those of any other task are dropped.
     pub(super) fn on_message(&mut self, message: Msg) -> Vec<Effect> {
         self.dirty = true;
+        let message = match message {
+            Msg::ConfigSaved(saved) => return self.config_saved(saved),
+            message => message,
+        };
         let id = match &message {
             Msg::Event(id, _) | Msg::Lagged(id, _) | Msg::Report(id, _) => *id,
-            Msg::EditorExited(_) => return Vec::new(),
+            Msg::EditorExited(_) | Msg::ConfigSaved(_) => return Vec::new(),
             Msg::BrowserFailed(url) => {
                 self.say(Severity::Warn, format!("cannot open a browser: {url}"));
                 return Vec::new();
@@ -763,6 +785,7 @@ impl App {
             Msg::Report(_, Report::Line(line)) => self.pipeline.results.push(line),
             Msg::Report(_, Report::RunCreated(_))
             | Msg::EditorExited(_)
+            | Msg::ConfigSaved(_)
             | Msg::BrowserFailed(_)
             | Msg::LogsExported(_)
             | Msg::NewerRelease(_) => {},
@@ -858,8 +881,10 @@ impl App {
 
     /// Ends the TUI once nothing it waits for runs.
     pub(super) fn leave_when_idle(&mut self) {
-        let idle =
-            self.edit.is_none() && self.pipeline_task.is_none() && self.training.tasks.is_empty();
+        let idle = self.edit.is_none()
+            && !self.project_view.saving
+            && self.pipeline_task.is_none()
+            && self.training.tasks.is_empty();
         if self.leaving.is_some() && idle {
             self.exit = self.leaving;
         }
@@ -914,6 +939,9 @@ impl App {
 
     /// The editor ended with `status`: checks the edited file and saves it.
     pub(super) fn on_editor_exit(&mut self, status: io::Result<ExitStatus>) -> Vec<Effect> {
+        if std::mem::take(&mut self.project_view.editing) {
+            return self.config_edited(status);
+        }
         let Some(session) = self.editing.clone() else {
             return Vec::new();
         };
@@ -1000,7 +1028,14 @@ impl App {
         if ctrl_c {
             self.close_overlay();
             self.dataset.input = None;
+            self.project_view.form = None;
             return self.quit();
+        }
+        if self.view == View::Project && self.project_view.form.is_some() {
+            if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+                self.on_form_key(key.code);
+            }
+            return Vec::new();
         }
         if self.view == View::Dataset && self.dataset.input.is_some() {
             if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
@@ -1052,6 +1087,14 @@ impl App {
     /// Dataset view reads the data files again while a stage runs. Leaving a
     /// view never touches a task.
     fn show(&mut self, view: View) -> Vec<Effect> {
+        if self.ask_leave(view) {
+            return Vec::new();
+        }
+        self.show_now(view)
+    }
+
+    /// Shows `view` without asking.
+    fn show_now(&mut self, view: View) -> Vec<Effect> {
         let entered = self.view != view;
         self.view = view;
         match view {
@@ -1093,6 +1136,19 @@ impl App {
             Action::Start(plan) => self.start_run(&plan),
             Action::Abandon(tasks) => self.abandon(&tasks),
             Action::AbandonStart(task) => self.abandon_start(task),
+            Action::Remove(removal) => {
+                self.remove(&removal);
+                Vec::new()
+            },
+            Action::DropChanges => {
+                self.drop_changes();
+                self.say(Severity::Info, "pending changes dropped");
+                Vec::new()
+            },
+            Action::Leave(view) => {
+                self.drop_changes();
+                self.show_now(view)
+            },
             Action::Delete { deletion, counts } => {
                 if self.locked() {
                     return Vec::new();
@@ -1109,35 +1165,13 @@ impl App {
 
     fn on_view_key(&mut self, code: KeyCode) -> Vec<Effect> {
         match self.view {
-            View::Project => self.on_project_key(code),
+            View::Project => return self.on_project_key(code),
             View::Dataset => return self.on_dataset_key(code),
             View::Training => return self.on_training_key(code),
             View::Logs => return self.on_logs_key(code),
             View::Pipeline => {},
         }
         Vec::new()
-    }
-
-    /// Moves in the Project view's fields.
-    fn on_project_key(&mut self, code: KeyCode) {
-        let Some(config) = &self.config else {
-            return;
-        };
-        let count = project::rows(config, &Locks::default())
-            .iter()
-            .filter(|row| matches!(row, Row::Field(_)))
-            .count();
-        let page = isize::try_from(PAGE).unwrap_or(isize::MAX);
-        let by = match code {
-            KeyCode::Up | KeyCode::Char('k') => -1,
-            KeyCode::Down | KeyCode::Char('j') => 1,
-            KeyCode::PageUp => -page,
-            KeyCode::PageDown => page,
-            KeyCode::Home => isize::MIN,
-            KeyCode::End => isize::MAX,
-            _ => return,
-        };
-        self.project_view.step(by, count);
     }
 
     fn on_dataset_key(&mut self, code: KeyCode) -> Vec<Effect> {
@@ -1302,6 +1336,9 @@ impl App {
 
     /// A bracketed paste goes to the input being typed; with none, it is dropped.
     fn on_paste(&mut self, text: &str) {
+        if self.view == View::Project {
+            self.on_project_paste(text);
+        }
         if self.view == View::Dataset
             && let Some(input) = &mut self.dataset.input
         {
@@ -1391,6 +1428,15 @@ impl App {
         }
         if self.edit.is_some() {
             text.push("An edit is being saved: quitting waits for it.".to_string());
+        }
+        if self.project_view.saving {
+            text.push("overbrainer.toml is being saved: quitting waits for it.".to_string());
+        }
+        if self.project_view.pending.is_some() {
+            text.push(
+                "The pending changes to overbrainer.toml are not saved: quitting drops them."
+                    .to_string(),
+            );
         }
         text.extend(self.training_quit_text());
         if text.is_empty() {
@@ -1491,6 +1537,7 @@ impl App {
     pub(super) fn on_loop_end(&mut self) -> Vec<Effect> {
         self.close_overlay();
         self.dataset.input = None;
+        self.project_view.form = None;
         self.leave(Exit::Quit)
     }
 
@@ -1505,6 +1552,9 @@ impl App {
             let mut waited = Vec::new();
             if self.edit.is_some() {
                 waited.push("the edit is saved".to_string());
+            }
+            if self.project_view.saving {
+                waited.push("overbrainer.toml is saved".to_string());
             }
             if self.pipeline_task.is_some() {
                 let name = self.pipeline.command.map_or("stage", command_name);
@@ -1745,10 +1795,11 @@ mod tests {
     fn the_project_view_moves_by_field_and_by_page() -> TestResult {
         let mut app = app();
         let config = crate::tui::snapshots::project_config()?;
-        let count = project::rows(&config, &Locks::default())
-            .iter()
-            .filter(|row| matches!(row, Row::Field(_)))
-            .count();
+        let count =
+            crate::tui::project::rows(&config, None, &crate::tui::project::Locks::default())
+                .iter()
+                .filter(|row| matches!(row, crate::tui::project::Row::Field(_)))
+                .count();
         app.config = Some(config);
         press(
             &mut app,

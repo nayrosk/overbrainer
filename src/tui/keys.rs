@@ -46,11 +46,16 @@ pub(super) const GLOBAL: &[KeyHelp] = &[
 ];
 
 const PROJECT: &[KeyHelp] = &[
-    row("k j, Up Down", "select a field"),
     row(
-        "PgUp PgDn, Home End",
-        "move a page, to the first or last field",
+        "k j, PgUp PgDn, Home End",
+        "select a field, by page, the first or last",
     ),
+    row("Enter", "edit the field; toggles a bool, cycles a choice"),
+    row("a", "add a topic, a provider or a target"),
+    row("d", "delete the selected topic, provider or target"),
+    row("s", "save to overbrainer.toml, validated first"),
+    row("u", "drop the pending changes (asks first)"),
+    row("E", "open overbrainer.toml in $EDITOR"),
 ];
 
 const DATASET: &[KeyHelp] = &[
@@ -123,6 +128,10 @@ pub(super) enum Context {
     Abandon,
     /// The filter being typed.
     Filter,
+    /// A value or a name being typed in the Project view's form.
+    Form,
+    /// A choice being made in the Project view's form.
+    Pick,
     /// A dialog answered with `y`, labelled `yes` and `no`.
     Dialog {
         /// What `y` does.
@@ -138,9 +147,11 @@ pub(super) enum Context {
 
 const FOOTER_PROJECT: &[Hint] = &[
     hint("j/k", "move"),
-    hint("PgUp/PgDn", "page"),
-    hint("1-5", "views"),
-    hint("q", "quit"),
+    hint("Enter", "edit"),
+    hint("a", "add"),
+    hint("d", "delete"),
+    hint("s", "save"),
+    hint("E", "$EDITOR"),
 ];
 const FOOTER_DATASET: &[Hint] = &[
     hint("j/k", "move"),
@@ -175,6 +186,12 @@ const FOOTER_LOGS: &[Hint] = &[
     hint("x", "export"),
 ];
 const FOOTER_FILTER: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "clear")];
+const FOOTER_FORM: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "cancel")];
+const FOOTER_PICK: &[Hint] = &[
+    hint("←/→", "choose"),
+    hint("Enter", "pick"),
+    hint("Esc", "cancel"),
+];
 const FOOTER_HELP: &[Hint] = &[hint("Esc", "close")];
 const FOOTER_MENU: &[Hint] = &[
     hint("j/k", "move"),
@@ -193,6 +210,8 @@ pub(super) fn footer(context: Context) -> Vec<Hint> {
         Context::View(View::Logs) => FOOTER_LOGS.to_vec(),
         Context::Abandon => FOOTER_ABANDON.to_vec(),
         Context::Filter => FOOTER_FILTER.to_vec(),
+        Context::Form => FOOTER_FORM.to_vec(),
+        Context::Pick => FOOTER_PICK.to_vec(),
         Context::Dialog { yes, no } => vec![hint("y", yes), hint("n, Esc or Enter", no)],
         Context::Help => FOOTER_HELP.to_vec(),
         Context::Menu => FOOTER_MENU.to_vec(),
@@ -239,6 +258,8 @@ mod tests {
         let others = [
             Context::Abandon,
             Context::Filter,
+            Context::Form,
+            Context::Pick,
             dialog,
             Context::Help,
             Context::Menu,

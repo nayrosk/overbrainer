@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::cost::history_cost;
 use super::editor::Edited;
+use super::project::ProjectConfig;
+use super::project_edit::SaveRefusal;
 use super::start::{Prices, StartPlan, list_prices, prepare};
 use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::Command;
@@ -186,6 +188,9 @@ pub(super) struct Saved {
 pub(super) enum Msg {
     /// The editor ended, or could not be started.
     EditorExited(io::Result<ExitStatus>),
+    /// The save of `overbrainer.toml` ended: the configuration written, or
+    /// why nothing was.
+    ConfigSaved(Result<Box<ProjectConfig>, SaveRefusal>),
     /// No browser could be started on this URL.
     BrowserFailed(String),
     /// The Logs export ended: the file name and how many lines were written, or
@@ -729,6 +734,7 @@ mod tests {
             Msg::Lagged(id, skipped) => Some(Msg::Lagged(*id, *skipped)),
             Msg::Report(id, report) => Some(Msg::Report(*id, report.clone())),
             Msg::EditorExited(_)
+            | Msg::ConfigSaved(_)
             | Msg::BrowserFailed(_)
             | Msg::LogsExported(_)
             | Msg::NewerRelease(_) => None,

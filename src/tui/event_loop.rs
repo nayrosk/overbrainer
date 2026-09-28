@@ -23,9 +23,11 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tracing::Level;
 
 use super::app::{App, Effect, Exit};
+use super::project_edit::{SaveRefusal, save_config};
 use super::tasks::{Done, Msg, Task, TaskId, Tasks, TrainJob};
 use super::terminal::Screen;
 use super::ui;
+use crate::config::EnvSource;
 use crate::update::Newer;
 
 /// Time between two ticks of the app's clock.
@@ -393,6 +395,14 @@ where
             },
             Effect::Cancel(id) => self.tasks.cancel(id),
             Effect::Abandon(id) => self.tasks.abandon(id),
+            // Never lost: written at once, the file being small.
+            Effect::SaveConfig { text, base } => {
+                let dir = self.tasks.project_dir().to_path_buf();
+                let saved = save_config(&dir, &text, &base, &EnvSource::Process).map(Box::new);
+                for effect in app.on_message(Msg::ConfigSaved(saved)) {
+                    self.apply_late(app, effect);
+                }
+            },
             Effect::Spawn(..)
             | Effect::OpenEditor { .. }
             | Effect::OpenUrl(_)
@@ -509,6 +519,7 @@ where
             Effect::OpenEditor { command, path } => self.open_editor(&command, path).await?,
             Effect::OpenUrl(url) => self.open_url(url),
             Effect::ExportLogs { name, lines } => self.export_logs(name, lines),
+            Effect::SaveConfig { text, base } => self.save_config(text, base),
         }
         Ok(())
     }
@@ -560,6 +571,26 @@ where
             };
             messages.send(message).ok();
         }));
+    }
+
+    /// Validates `text` and writes it to `overbrainer.toml` unless the file no
+    /// longer holds `base`, in a blocking task of its own so `Loop::run` keeps
+    /// handling events; the outcome comes back as [`Msg::ConfigSaved`].
+    fn save_config(&self, text: String, base: String) {
+        let dir = self.tasks.project_dir().to_path_buf();
+        let messages = self.messages.clone();
+        tokio::spawn(async move {
+            let saved = tokio::task::spawn_blocking(move || {
+                save_config(&dir, &text, &base, &EnvSource::Process).map(Box::new)
+            })
+            .await;
+            let saved = saved.unwrap_or_else(|error| {
+                Err(SaveRefusal::Failed(format!(
+                    "the save task failed: {error}"
+                )))
+            });
+            messages.send(Msg::ConfigSaved(saved)).ok();
+        });
     }
 
     /// Hands the terminal to the editor: stops reading input, drops the keys

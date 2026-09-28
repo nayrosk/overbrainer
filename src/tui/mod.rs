@@ -14,6 +14,7 @@ mod keys;
 mod motion;
 mod pipeline;
 mod project;
+mod project_edit;
 #[cfg(test)]
 mod snapshots;
 mod start;
@@ -66,7 +67,7 @@ pub async fn run(
     let color = ColorLevel::detect(&env);
     let theme = Theme::new(color);
     let mut app = App::new(project, logs, &theme, SystemTime::now());
-    app.config = Some(config);
+    app.set_config(config);
     app.motion = Motion::new(MotionLevel::detect(&env, color)).colored(&theme);
     for warning in env.warnings() {
         tracing::warn!("{warning}");
@@ -77,6 +78,10 @@ pub async fn run(
     let result = event_loop::run(&mut terminal, &mut app, check).await;
     drop(guard);
     app.abandon_edit();
+    if app.project_view.pending.is_some() {
+        app.exit_notes
+            .push("the pending changes to overbrainer.toml were not saved".to_string());
+    }
     for note in &app.exit_notes {
         writeln!(io::stderr(), "{note}").ok();
     }
