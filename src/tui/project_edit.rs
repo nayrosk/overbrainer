@@ -507,8 +507,11 @@ impl App {
             return None;
         }
         let listing = self.project_listing();
-        shown_value(&listing, &format!("targets.{name}.network_volume_id"))
+        let volume = shown_value(&listing, &format!("targets.{name}.network_volume_id"))
             .filter(|volume| !volume.is_empty())?;
+        if self.project_view.unknown_volumes.get(name) == Some(&volume) {
+            return None;
+        }
         let now =
             shown_value(&listing, &path.to_string()).map(|text| ListOrAuto::from_form_text(&text));
         let new = match value {
@@ -567,6 +570,27 @@ impl App {
         });
     }
 
+    /// The volume `volume` typed for the field `path` of the target `name`:
+    /// as if picked when the volume listing read last has it, so its data
+    /// center is set too; otherwise set alone, `data_center_ids` left as is
+    /// and free to change while that volume is set.
+    fn typed_volume(&mut self, path: &FieldPath, name: &str, volume: &str) -> Result<(), String> {
+        let known = self.volume_catalog.as_ref().and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.id == volume && volume_data_center(entry).is_some())
+                .cloned()
+        });
+        if let Some(entry) = known {
+            return self.picked_volume(path, volume, &[entry]);
+        }
+        self.apply(path, Some(&FieldValue::Text(volume.to_string())))?;
+        self.project_view
+            .unknown_volumes
+            .insert(name.to_string(), volume.to_string());
+        Ok(())
+    }
+
     /// The volume `id` picked for the field `path`: it is set, and its
     /// target's data centers become the volume's, when `entries` says which;
     /// both or neither.
@@ -587,6 +611,7 @@ impl App {
         else {
             return applied;
         };
+        self.project_view.unknown_volumes.remove(name);
         let centers = FieldPath::Target {
             name: name.clone(),
             field: "data_center_ids",
@@ -724,6 +749,11 @@ impl App {
         };
         if let Some(refusal) = self.volume_centers_refusal(path, value.as_ref()) {
             return Err(refusal);
+        }
+        if let (FieldPath::Target { name, field }, Some(FieldValue::Text(volume))) = (path, &value)
+            && *field == "network_volume_id"
+        {
+            return self.typed_volume(path, name, volume);
         }
         if let (FieldPath::Topic { index, field, .. }, Some(FieldValue::Text(new))) = (path, &value)
             && *field == "name"
@@ -2264,6 +2294,70 @@ mod tests {
             &[KeyCode::End, KeyCode::Char(' '), KeyCode::Enter],
         );
         assert_eq!(shown(&mut app, key)?, "EU-RO-1, US-KS-2");
+        Ok(())
+    }
+
+    /// `t` in the volume picker, `volume` typed, then Enter.
+    fn type_volume(app: &mut App, volume: &str, catalog: Option<Vec<Entry>>) -> TestResult {
+        let (id, _) = open_picker_on(app, "targets.gpu_cloud.network_volume_id")?;
+        if let Some(entries) = catalog {
+            listed(app, id, entries, Vec::new());
+        }
+        press(app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(app, &[KeyCode::Backspace; 20]);
+        chars(app, volume);
+        press(app, &[KeyCode::Enter]);
+        assert_eq!(app.project_view.form, None, "{}", status(app));
+        Ok(())
+    }
+
+    #[test]
+    fn a_typed_volume_the_catalog_lists_sets_its_data_center() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        type_volume(&mut app, "vol-eu", Some(volumes()))?;
+        let key = "targets.gpu_cloud.data_center_ids";
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1");
+        // Typed again, while the listing is still read: the one read is used.
+        type_volume(&mut app, "vol-us", None)?;
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.network_volume_id")?,
+            "vol-us"
+        );
+        assert_eq!(shown(&mut app, key)?, "US-KS-2");
+        assert_eq!(
+            status(&app),
+            "targets.gpu_cloud.data_center_ids = US-KS-2, the volume's data center"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_typed_volume_the_catalog_lacks_leaves_the_data_centers_free() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        type_volume(&mut app, "vol-eu", Some(volumes()))?;
+        type_volume(&mut app, "volnew", Some(volumes()))?;
+        let key = "targets.gpu_cloud.data_center_ids";
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1", "unchanged");
+        app.status = None;
+        open_picker_on(&mut app, key)?;
+        press(&mut app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        chars(&mut app, "US-KS-2");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.project_view.form, None, "not refused: {}", status(&app));
+        assert_eq!(shown(&mut app, key)?, "US-KS-2");
+        // Picking a listed volume makes its data center known again.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        press(&mut app, &[KeyCode::Home, KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1");
+        let (id, _) = open_picker_on(&mut app, key)?;
+        listed(&mut app, id, Vec::new(), Vec::new());
+        press(&mut app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        chars(&mut app, "US-KS-2");
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.project_view.form.is_some(), "refused again");
         Ok(())
     }
 

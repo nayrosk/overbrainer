@@ -431,6 +431,9 @@ pub(super) struct App {
     /// The GPU types a catalog listing read last, for the hints of the Runpod
     /// target fields.
     pub(super) gpu_catalog: Option<Vec<crate::runpod::GpuType>>,
+    /// The network volumes a catalog listing read last, for a volume typed
+    /// instead of picked.
+    pub(super) volume_catalog: Option<Vec<Entry>>,
     /// The release on crates.io, when newer than the one running.
     pub(super) newer: Option<String>,
     /// Lines printed on stderr once the terminal is restored.
@@ -497,6 +500,7 @@ impl App {
             start_after_save: None,
             catalog_reads: Vec::new(),
             gpu_catalog: None,
+            volume_catalog: None,
             newer: None,
             exit_notes: Vec::new(),
             leaving_notes: Vec::new(),
@@ -910,16 +914,19 @@ impl App {
     }
 
     /// Listing `id` read `listed`: its GPU types kept for the hints, its
-    /// entries shown when it fills the picker open. Its failure shows in that
+    /// volumes for a volume typed, its entries shown when it fills the picker open. Its failure shows in that
     /// picker only: once the picker is closed, nothing is said.
     fn listed_catalog(&mut self, id: TaskId, listed: Result<Listed, String>) {
         let Some(at) = self.catalog_reads.iter().position(|(read, _)| *read == id) else {
             return;
         };
-        self.catalog_reads.remove(at);
+        let (_, kind) = self.catalog_reads.remove(at);
         let entries = listed.map(|listed| {
             if !listed.gpus.is_empty() {
                 self.gpu_catalog = Some(listed.gpus);
+            }
+            if kind == CatalogKind::Volumes {
+                self.volume_catalog = Some(listed.entries.clone());
             }
             listed.entries
         });

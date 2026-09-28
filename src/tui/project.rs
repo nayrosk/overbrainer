@@ -970,6 +970,10 @@ pub(super) struct ProjectView {
     pub(super) save: Option<TaskId>,
     /// Whether the editor open is on `overbrainer.toml`.
     pub(super) editing: bool,
+    /// The network volume typed for a Runpod target, by target name, when the
+    /// volume listing did not have it: its data center is not known, so
+    /// `data_center_ids` is not held to it while that volume is set.
+    pub(super) unknown_volumes: BTreeMap<String, String>,
     /// Bumped by every change of what the rows show but the locks.
     generation: u64,
     /// The rows built last, for this generation and these locks.
