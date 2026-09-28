@@ -185,9 +185,9 @@ pub(super) enum Row {
 pub(super) struct Locks {
     /// The stage running and the roles it uses.
     pub(super) stage: Option<(&'static str, Vec<Role>)>,
-    /// The training run started or followed (`run <id>`, `a new run`) and its
-    /// target.
-    pub(super) run: Option<(String, String)>,
+    /// Each training run started or followed (`run <id>`, `a new run`) and
+    /// its target.
+    pub(super) runs: Vec<(String, String)>,
 }
 
 impl Locks {
@@ -197,18 +197,23 @@ impl Locks {
             .pipeline_task
             .and(app.pipeline.command)
             .map(|command| (command_name(command), roles_of(command)));
-        let run = app.training.tasks.values().next().map(|follow| {
-            let target = app
-                .training
-                .runs
-                .iter()
-                .find(|row| row.record.id == follow.run_id)
-                .map(|row| row.record.target.clone())
-                .or_else(|| app.project.target.clone())
-                .unwrap_or_default();
-            (follow.run(), target)
-        });
-        Self { stage, run }
+        let runs = app
+            .training
+            .tasks
+            .values()
+            .map(|follow| {
+                let target = app
+                    .training
+                    .runs
+                    .iter()
+                    .find(|row| row.record.id == follow.run_id)
+                    .map(|row| row.record.target.clone())
+                    .or_else(|| app.project.target.clone())
+                    .unwrap_or_default();
+                (follow.run(), target)
+            })
+            .collect();
+        Self { stage, runs }
     }
 }
 
@@ -231,7 +236,7 @@ impl Locks {
                 }
             }
         }
-        if let Some((run, target)) = &self.run {
+        for (run, target) in &self.runs {
             tables.push(("training".to_string(), run));
             tables.push((format!("targets.{target}"), run));
         }
@@ -518,7 +523,7 @@ fn providers_and_roles(rows: &mut Builder<'_>, settings: &Settings, locks: &Lock
 /// The training table, then the targets; the training run and its target
 /// are locked.
 fn training_and_targets(rows: &mut Builder<'_>, settings: &Settings, locks: &Locks) {
-    let run_user = locks.run.as_ref().map(|(run, _)| run.clone());
+    let run_user = locks.runs.first().map(|(run, _)| run.clone());
     rows.heading("training");
     rows.fields(&Table {
         section: Section::Training,
@@ -537,10 +542,10 @@ fn training_and_targets(rows: &mut Builder<'_>, settings: &Settings, locks: &Loc
             continue;
         };
         let lock = locks
-            .run
-            .as_ref()
-            .filter(|(_, used)| *used == name)
-            .and(run_user.clone());
+            .runs
+            .iter()
+            .find(|(_, used)| *used == name)
+            .map(|(run, _)| run.clone());
         rows.heading(&format!("targets.{name} ({})", kind.as_str()));
         rows.fields(&Table {
             section: Section::Target(kind),
@@ -1274,7 +1279,7 @@ mod tests {
     fn a_stage_locks_its_roles_and_their_providers() -> TestResult {
         let locks = Locks {
             stage: Some(("answers", roles_of(Command::Answers))),
-            run: None,
+            runs: Vec::new(),
         };
         let rows = rows(&config()?, None, &locks);
         let locked: Vec<&str> = rows
@@ -1305,7 +1310,7 @@ mod tests {
     fn a_training_locks_the_training_table_and_its_target() -> TestResult {
         let locks = Locks {
             stage: None,
-            run: Some(("run 20260921-a1".into(), "gpu_cloud".into())),
+            runs: vec![("run 20260921-a1".into(), "gpu_cloud".into())],
         };
         let rows = rows(&config()?, None, &locks);
         for key in ["training.epochs", "targets.gpu_cloud.max_hours"] {
@@ -1330,8 +1335,8 @@ mod tests {
         let locks = Locks::of(&app);
         assert_eq!(locks.stage, Some(("run", Role::ALL.to_vec())));
         assert_eq!(
-            locks.run,
-            Some(("run 20260921-a1".to_string(), "gpu_cloud".to_string()))
+            locks.runs,
+            [("run 20260921-a1".to_string(), "gpu_cloud".to_string())]
         );
     }
 
@@ -1342,8 +1347,8 @@ mod tests {
             .tasks
             .insert(TaskId(4), Follow::new(Job::Start { runpod: true }, ""));
         assert_eq!(
-            Locks::of(&app).run,
-            Some(("a new run".to_string(), "gpu_cloud".to_string()))
+            Locks::of(&app).runs,
+            [("a new run".to_string(), "gpu_cloud".to_string())]
         );
     }
 
@@ -1355,9 +1360,32 @@ mod tests {
             .tasks
             .insert(TaskId(4), Follow::new(Job::Attach, FINISHED));
         assert_eq!(
-            Locks::of(&app).run,
-            Some((format!("run {FINISHED}"), "homelab".to_string())),
+            Locks::of(&app).runs,
+            [(format!("run {FINISHED}"), "homelab".to_string())],
             "the run's own target, not training.target"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_followed_runs_lock_both_targets() -> TestResult {
+        let mut app = training_app()?;
+        app.training
+            .tasks
+            .insert(TaskId(4), Follow::new(Job::Attach, FINISHED));
+        let locks = Locks::of(&app);
+        assert_eq!(locks.runs.len(), 2, "{:?}", locks.runs);
+        let config = config()?;
+        let settings = &config.settings;
+        let followed = locks.user_of(settings, "targets.gpu_cloud.max_hours");
+        assert_eq!(followed.as_deref(), Some("run 20260921-133200-a1b2"));
+        let finished = locks.user_of(settings, "targets.homelab.host");
+        assert_eq!(finished, Some(format!("run {FINISHED}")));
+        assert!(locks.user_of(settings, "training.epochs").is_some());
+        let rows = rows(&config, None, &locks);
+        assert_eq!(
+            field(&rows, "targets.gpu_cloud.max_hours")?.lock.as_deref(),
+            Some("run 20260921-133200-a1b2")
         );
         Ok(())
     }
@@ -1366,7 +1394,7 @@ mod tests {
     fn questions_lock_the_embedder_and_the_generator() -> TestResult {
         let locks = Locks {
             stage: Some(("questions", roles_of(Command::Questions))),
-            run: None,
+            runs: Vec::new(),
         };
         let rows = rows(&config()?, None, &locks);
         for key in [

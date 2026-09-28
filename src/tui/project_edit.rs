@@ -786,7 +786,7 @@ impl App {
         if self.refuse_new("E edits the whole file", "edit") {
             return Vec::new();
         }
-        if let Some((run, _)) = Locks::of(self).run {
+        if let Some((run, _)) = Locks::of(self).runs.first().cloned() {
             self.say(
                 Severity::Warn,
                 format!("refused: {run} uses the training table; E edits the whole file"),
