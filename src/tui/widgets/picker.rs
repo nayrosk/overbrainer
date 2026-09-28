@@ -115,6 +115,8 @@ pub(in crate::tui) struct Picker {
     filter: Option<Input>,
     /// Whether the filter is being typed.
     typing: bool,
+    /// Whether `t` asks to type the value instead.
+    typed: bool,
 }
 
 impl Picker {
@@ -143,7 +145,19 @@ impl Picker {
             cursor: 0,
             filter: None,
             typing: false,
+            typed: true,
         }
+    }
+
+    /// The picker without `t`: what it keeps cannot be typed instead.
+    pub(in crate::tui) fn untyped(mut self) -> Self {
+        self.typed = false;
+        self
+    }
+
+    /// Whether `t` asks to type the value instead.
+    pub(in crate::tui) fn typed(&self) -> bool {
+        self.typed
     }
 
     /// Shows the entries read, or why they cannot be. A chosen ID no entry
@@ -217,8 +231,8 @@ impl Picker {
     }
 
     /// Handles `code`: moves, toggles, reorders, filters, keeps or cancels;
-    /// `t` asks to type the value instead. Until the entries are read, only
-    /// Esc and `t` do something.
+    /// `t` asks to type the value instead, unless [`Self::untyped`]. Until
+    /// the entries are read, only Esc and `t` do something.
     pub(in crate::tui) fn on_key(&mut self, code: KeyCode) -> PickerOutcome {
         if self.typing {
             self.on_filter_key(code);
@@ -227,7 +241,7 @@ impl Picker {
         if code == KeyCode::Esc {
             return PickerOutcome::Cancelled;
         }
-        if code == KeyCode::Char('t') {
+        if code == KeyCode::Char('t') && self.typed {
             return PickerOutcome::Typed;
         }
         if !matches!(self.load, Load::Ready(_)) {
@@ -484,10 +498,13 @@ pub(in crate::tui) fn render(
         (Mode::Multi, false) if chosen > 0 => format!(" {}: {chosen} chosen ", picker.spec.title),
         _ => format!(" {} ", picker.spec.title),
     };
-    let keys = match (&picker.load, picker.spec.mode) {
-        (Load::Ready(_), Mode::Multi) => " Space toggles, Enter keeps, t types, Esc cancels ",
-        (Load::Ready(_), Mode::Single) => " Enter picks, t types, Esc cancels ",
-        _ => " t types the value, Esc closes ",
+    let keys = match (&picker.load, picker.spec.mode, picker.typed) {
+        (Load::Ready(_), Mode::Multi, true) => " Space toggles, Enter keeps, t types, Esc cancels ",
+        (Load::Ready(_), Mode::Multi, false) => " Space toggles, Enter keeps, Esc cancels ",
+        (Load::Ready(_), Mode::Single, true) => " Enter picks, t types, Esc cancels ",
+        (Load::Ready(_), Mode::Single, false) => " Enter picks, Esc cancels ",
+        (_, _, true) => " t types the value, Esc closes ",
+        (_, _, false) => " Esc closes ",
     };
     let block = overlay(frame, popup, theme)
         .title(Span::styled(title, theme.title))
@@ -715,6 +732,21 @@ mod tests {
         let outcome = keys(&mut filtered, &[KeyCode::Char('/'), KeyCode::Char('t')]);
         assert_eq!(outcome, PickerOutcome::Open, "typed in the filter");
         assert_eq!(filtered.filter_text(), "t");
+    }
+
+    #[test]
+    fn an_untyped_picker_ignores_t() {
+        let mut loading = Picker::new(spec(Mode::Multi, true), list(&[])).untyped();
+        assert!(!loading.typed());
+        assert_eq!(
+            keys(&mut loading, &[KeyCode::Char('t')]),
+            PickerOutcome::Open
+        );
+        let mut single = picker_single().untyped();
+        assert_eq!(
+            keys(&mut single, &[KeyCode::Char('t'), KeyCode::Enter]),
+            PickerOutcome::Kept(list(&["a"]))
+        );
     }
 
     fn picker_single() -> Picker {

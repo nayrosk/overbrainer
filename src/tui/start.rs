@@ -1,17 +1,19 @@
 //! What `t` shows before a training run starts: the target, the model, the data,
-//! and for Runpod the GPU types with their list prices and the most `max_hours`
-//! can cost.
+//! and for Runpod the GPU types (configured, chosen with `g`, or what `auto`
+//! picks now) with their list price, VRAM and stock, the data centers, and the
+//! most `max_hours` can cost.
 
 use std::path::Path;
 use std::time::Duration;
 
 use serde::de::IgnoredAny;
 
-use crate::config::{Adapter, EnvSource, Runtime, Target};
+use crate::config::{Adapter, CONFIG_FILE, EnvSource, ListOrAuto, Runtime, Target};
 use crate::dataset::{DataFiles, read};
+use crate::runpod::{Availability, GpuType, RunpodTarget, resolve};
 use crate::train::reasoning_template_warning;
 
-/// Total time the list prices may take; the dialog never waits for them.
+/// Total time the GPU catalog may take; the dialog never waits for it.
 pub(super) const PRICES_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a training run started now would use.
@@ -28,7 +30,7 @@ pub(super) struct StartPlan {
     /// Examples in `data/eval.jsonl`.
     pub(super) eval: usize,
     /// The pod of a Runpod target.
-    pub(super) runpod: Option<RunpodPlan>,
+    pub(super) runpod: Option<Box<RunpodPlan>>,
     /// What the flow would warn about.
     pub(super) warnings: Vec<String>,
 }
@@ -36,18 +38,53 @@ pub(super) struct StartPlan {
 /// The pod a Runpod run would ask for.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct RunpodPlan {
-    /// GPU types, tried in order; none when `auto` chooses them at the start.
-    pub(super) gpu_types: Vec<String>,
-    /// Whether the GPU types are `auto`.
-    pub(super) auto: bool,
-    /// GPUs per pod.
-    pub(super) gpu_count: u32,
-    /// When the watchdog deletes the pod.
-    pub(super) max_hours: f64,
+    /// The target as the run would use it, with the GPU types and data
+    /// centers chosen in the dialog.
+    pub(super) spec: RunpodTarget,
+    /// `gpu_types` as the settings have it.
+    pub(super) file_gpu_types: ListOrAuto,
+    /// `data_center_ids` as the settings have it.
+    pub(super) file_data_center_ids: ListOrAuto,
 }
 
-/// The list price of each GPU type, per GPU and hour, when it could be read.
-pub(super) type Prices = Vec<(String, Option<f64>)>;
+impl RunpodPlan {
+    /// The plan of `spec`, nothing chosen yet.
+    pub(super) fn new(spec: RunpodTarget) -> Self {
+        Self {
+            file_gpu_types: spec.gpu_types.clone(),
+            file_data_center_ids: spec.data_center_ids.clone(),
+            spec,
+        }
+    }
+
+    /// The fields chosen in the dialog that differ from the settings, which
+    /// `y` saves before the run starts.
+    pub(super) fn changed(&self) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.spec.gpu_types != self.file_gpu_types {
+            changed.push(GPU_TYPES);
+        }
+        if self.spec.data_center_ids != self.file_data_center_ids {
+            changed.push(DATA_CENTER_IDS);
+        }
+        changed
+    }
+}
+
+/// The GPU types field of a Runpod target.
+pub(super) const GPU_TYPES: &str = "gpu_types";
+/// The data centers field of a Runpod target.
+pub(super) const DATA_CENTER_IDS: &str = "data_center_ids";
+
+/// The Secure Cloud GPU types listed for the run's GPU count, or why they
+/// cannot be.
+pub(super) type Gpus = Result<Vec<GpuType>, String>;
+
+/// Entries an `auto` choice shows at most; the others are counted.
+const AUTO_SHOWN: usize = 4;
+
+/// The start of the line saying what the run costs at most.
+const COST_LABEL: &str = "max_hours   ";
 
 /// What a run started now in the project in `dir` would use, from its settings
 /// (read with `env`) and data files only.
@@ -93,12 +130,7 @@ pub(super) fn prepare(dir: &Path, env: EnvSource) -> Result<StartPlan, String> {
         ),
         train: count(&files.train)?,
         eval: count(&files.eval)?,
-        runpod: crate::runpod::RunpodTarget::from_target(target).map(|spec| RunpodPlan {
-            gpu_types: spec.gpu_types.list().to_vec(),
-            auto: spec.gpu_types.is_auto(),
-            gpu_count: spec.gpu_count,
-            max_hours: spec.max_hours,
-        }),
+        runpod: RunpodTarget::from_target(target).map(|spec| Box::new(RunpodPlan::new(spec))),
         warnings,
     })
 }
@@ -116,87 +148,61 @@ fn kind(target: &Target) -> String {
     }
 }
 
-/// The list price of each of `gpu_types` on the Runpod account of the project
-/// in `dir` (its settings read with `env`), best effort: a type whose price
-/// cannot be read has none, and the whole lookup gives up after
-/// [`PRICES_TIMEOUT`]. Only the client's fixed messages reach the logs.
-pub(super) async fn list_prices(dir: &Path, env: EnvSource, gpu_types: Vec<String>) -> Prices {
-    list_prices_within(dir, env, gpu_types, PRICES_TIMEOUT).await
-}
-
-/// [`list_prices`], giving up after `limit`: the prices read by then are
-/// kept, the types still unread have none. Each warning of [`lookup_prices`]
-/// is logged.
-async fn list_prices_within(
-    dir: &Path,
-    env: EnvSource,
-    gpu_types: Vec<String>,
-    limit: Duration,
-) -> Prices {
-    let (prices, warnings) = lookup_prices(dir, env, gpu_types, limit).await;
-    for warning in warnings {
-        tracing::warn!("{warning}");
+/// The Secure Cloud GPU types for `gpu_count` GPUs on the Runpod account of
+/// the project in `dir` (its settings read with `env`), giving up after
+/// [`PRICES_TIMEOUT`]. Why they cannot be read is logged too, with only the
+/// client's fixed messages.
+pub(super) async fn list_gpus(dir: &Path, env: EnvSource, gpu_count: u32) -> Gpus {
+    let gpus = lookup_gpus(dir, env, gpu_count, PRICES_TIMEOUT).await;
+    if let Err(error) = &gpus {
+        tracing::warn!("{error}");
     }
-    prices
+    gpus
 }
 
-/// [`list_prices_within`] without logging: the prices, and a warning for each
-/// price that cannot be read and for a lookup that fails or gives up, holding
-/// only the client's fixed messages.
-async fn lookup_prices(
-    dir: &Path,
-    env: EnvSource,
-    gpu_types: Vec<String>,
-    limit: Duration,
-) -> (Prices, Vec<String>) {
-    let mut prices = Vec::new();
-    let mut warnings = Vec::new();
+/// [`list_gpus`] without logging, giving up after `limit`.
+async fn lookup_gpus(dir: &Path, env: EnvSource, gpu_count: u32, limit: Duration) -> Gpus {
     let lookup = async {
         let settings = crate::config::load(dir, env)?;
         let client = crate::cli::pod::client(&settings).await?;
-        read_prices(&client, &gpu_types, &mut prices, &mut warnings).await;
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>(client.list_gpu_types(gpu_count).await?)
     };
-    let failure = match tokio::time::timeout(limit, lookup).await {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(format!("cannot look up list prices: {error:#}")),
-        Err(_) => Some("list prices took too long".to_string()),
-    };
-    warnings.extend(failure);
-    let unread = gpu_types.into_iter().skip(prices.len());
-    prices.extend(unread.map(|gpu| (gpu, None)));
-    (prices, warnings)
-}
-
-/// Reads the list price of each of `gpu_types` into `prices`, in order, `None`
-/// for one that cannot be read, which adds a warning to `warnings`.
-async fn read_prices(
-    client: &crate::runpod::RunpodClient,
-    gpu_types: &[String],
-    prices: &mut Prices,
-    warnings: &mut Vec<String>,
-) {
-    for gpu in gpu_types {
-        let price = client.gpu_list_price(gpu).await.unwrap_or_else(|error| {
-            warnings.push(format!("cannot read the list price of {gpu}: {error}"));
-            None
-        });
-        prices.push((gpu.clone(), price));
+    match tokio::time::timeout(limit, lookup).await {
+        Ok(Ok(gpus)) => Ok(gpus),
+        Ok(Err(error)) => Err(format!("cannot read the Runpod catalog: {error:#}")),
+        Err(_) => Err("the Runpod catalog took too long to answer".to_string()),
     }
 }
 
-/// The usable list price of `gpu` in `prices`: none when it is not there, or
-/// not a positive number.
-fn listed(prices: &Prices, gpu: &str) -> Option<f64> {
-    prices
-        .iter()
-        .find(|(name, _)| name == gpu)
-        .and_then(|(_, price)| *price)
+/// The usable Secure Cloud list price of one `gpu`: none when it is not a
+/// positive number.
+fn list_price(gpu: &GpuType) -> Option<f64> {
+    gpu.secure_price()
         .filter(|price| price.is_finite() && *price > 0.0)
 }
 
-/// The confirmation text of `plan`, with the list `prices` once looked up.
-pub(super) fn text(plan: &StartPlan, prices: Option<&Prices>) -> Vec<String> {
+/// Stock of `gpu` for the run: its best in `centers`, or overall when they
+/// are any.
+fn stock(gpu: &GpuType, centers: &[String]) -> Availability {
+    let rank = |band: &Availability| match band {
+        Availability::High => 3,
+        Availability::Medium => 2,
+        Availability::Low => 1,
+        Availability::None | Availability::Unknown => 0,
+    };
+    if centers.is_empty() {
+        return gpu.availability;
+    }
+    centers
+        .iter()
+        .map(|center| gpu.stock_in(center))
+        .max_by_key(rank)
+        .unwrap_or(Availability::None)
+}
+
+/// The confirmation text of `plan`, with the GPU types of the catalog once
+/// looked up.
+pub(super) fn text(plan: &StartPlan, gpus: Option<&Gpus>) -> Vec<String> {
     let mut text = vec![
         format!("target      {} ({})", plan.target, plan.kind),
         format!("model       {}", plan.model),
@@ -210,7 +216,14 @@ pub(super) fn text(plan: &StartPlan, prices: Option<&Prices>) -> Vec<String> {
         text.push(format!("warning     {warning}"));
     }
     if let Some(runpod) = &plan.runpod {
-        text.extend(gpu_lines(runpod, prices));
+        let changed = runpod.changed();
+        if !changed.is_empty() {
+            text.push(format!(
+                "changed     {}: saved to {CONFIG_FILE} on y, then the run starts",
+                changed.join(", ")
+            ));
+        }
+        text.extend(runpod_lines(&runpod.spec, gpus));
     }
     text.push(
         "The run keeps going when you leave this view or quit; attach again here or with \
@@ -220,70 +233,188 @@ pub(super) fn text(plan: &StartPlan, prices: Option<&Prices>) -> Vec<String> {
     text
 }
 
-/// The position in [`text`] of the line saying what a Runpod run costs at
-/// most (`max_hours`): a dialog too tall for the terminal keeps it.
-pub(super) fn cost_line(plan: &StartPlan) -> Option<usize> {
-    // After the target, model and data lines, the warnings, the GPU header
-    // and its types.
-    plan.runpod
-        .as_ref()
-        .map(|runpod| 3 + plan.warnings.len() + 1 + runpod.gpu_types.len())
+/// The position in `text`, a start dialog's, of the line saying what a
+/// Runpod run costs at most (`max_hours`): a dialog too tall for the
+/// terminal keeps it.
+pub(super) fn cost_line(text: &[String]) -> Option<usize> {
+    text.iter().position(|line| line.starts_with(COST_LABEL))
 }
 
-/// The GPU types of `runpod`, each with its list price times the GPU count
-/// once `prices` are known, then `max_hours` with the most it can cost at the
-/// highest listed rate.
-fn gpu_lines(runpod: &RunpodPlan, prices: Option<&Prices>) -> Vec<String> {
-    let count = f64::from(runpod.gpu_count);
-    let mut lines = vec![if runpod.auto {
-        format!(
-            "GPU types   auto: those in stock for {} GPU, cheapest first, chosen at the start",
-            runpod.gpu_count
-        )
+/// The GPU types of `spec`, or those `auto` picks now from `gpus`, each with
+/// its list price times the GPU count, VRAM and stock; the data centers; then
+/// `max_hours` with the most it can cost at the highest listed rate.
+fn runpod_lines(spec: &RunpodTarget, gpus: Option<&Gpus>) -> Vec<String> {
+    let count = spec.gpu_count;
+    let catalog = match gpus {
+        Some(Ok(listed)) => Some(listed.as_slice()),
+        _ => None,
+    };
+    let (header, chosen) = match (&spec.gpu_types, catalog) {
+        (ListOrAuto::List(ids), _) => (
+            format!("GPU types   tried in order, list price x {count} GPU, VRAM, stock:"),
+            Ok(ids.clone()),
+        ),
+        (ListOrAuto::Auto, None) => (
+            format!(
+                "GPU types   auto: those in stock for {count} GPU, cheapest first, chosen at \
+                 the start"
+            ),
+            Ok(Vec::new()),
+        ),
+        (ListOrAuto::Auto, Some(listed)) => match auto_gpus(spec, listed) {
+            Ok(ids) => (
+                format!("GPU types   auto picks now, list price x {count} GPU, VRAM, stock:"),
+                Ok(ids),
+            ),
+            Err(error) => (format!("GPU types   auto: {error}"), Err(())),
+        },
+    };
+    let mut lines = vec![header];
+    let ids = chosen.clone().unwrap_or_default();
+    let shown = if spec.gpu_types.is_auto() {
+        AUTO_SHOWN
     } else {
-        format!(
-            "GPU types   tried in order, list price x {} GPU:",
-            runpod.gpu_count
-        )
-    }];
-    let rates: Vec<Option<f64>> = runpod
-        .gpu_types
-        .iter()
-        .map(|gpu| prices.and_then(|prices| listed(prices, gpu)))
-        .collect();
-    for (gpu, rate) in runpod.gpu_types.iter().zip(&rates) {
-        let price = match (prices, rate) {
-            (None, _) => "looking up list prices...".to_string(),
-            (Some(_), Some(rate)) => format!("${:.2}/h", rate * count),
-            (Some(_), None) => "list price unknown".to_string(),
-        };
-        lines.push(format!("- {gpu:<26} {price}"));
+        ids.len()
+    };
+    let centers = spec.data_center_ids.list();
+    for id in ids.iter().take(shown) {
+        lines.push(gpu_line(id, count, centers, gpus));
     }
+    if ids.len() > shown {
+        lines.push(format!("- and {} more", ids.len() - shown));
+    }
+    if let Some(Err(error)) = gpus {
+        lines.push(format!("catalog     {error}"));
+    }
+    lines.push(center_line(spec, catalog, chosen.is_ok()));
+    lines.push(max_hours_line(spec, catalog, &ids));
+    lines
+}
+
+/// The GPU types `auto` picks now from `gpus`, in the data centers listed if
+/// any.
+fn auto_gpus(spec: &RunpodTarget, gpus: &[GpuType]) -> Result<Vec<String>, String> {
+    let mut alone = spec.clone();
+    if alone.data_center_ids.is_auto() {
+        alone.data_center_ids = ListOrAuto::default();
+    }
+    resolve(&alone, gpus).map(|resolved| resolved.gpu_types.list().to_vec())
+}
+
+/// The line of the GPU type `id`: its list price for `count` GPUs, its VRAM
+/// and its stock in `centers`, once `gpus` are read.
+fn gpu_line(id: &str, count: u32, centers: &[String], gpus: Option<&Gpus>) -> String {
+    let about = match gpus {
+        None => "looking up the catalog...".to_string(),
+        Some(Err(_)) => "catalog unread".to_string(),
+        Some(Ok(listed)) => match listed.iter().find(|gpu| gpu.id == id) {
+            None => "not in the catalog".to_string(),
+            Some(gpu) => {
+                let price = list_price(gpu).map_or_else(
+                    || "price unknown".to_string(),
+                    |rate| format!("${:.2}/h", rate * f64::from(count)),
+                );
+                format!(
+                    "{price:<13} {:>3} GB  {}",
+                    gpu.memory,
+                    stock(gpu, centers).name()
+                )
+            },
+        },
+    };
+    format!("- {id:<26} {about}")
+}
+
+/// The data centers of `spec`, or those `auto` picks now from `gpus` when
+/// `auto` found GPU types (`placed`).
+fn center_line(spec: &RunpodTarget, gpus: Option<&[GpuType]>, placed: bool) -> String {
+    let centers = match (&spec.data_center_ids, gpus) {
+        (ListOrAuto::List(ids), _) if ids.is_empty() => "any".to_string(),
+        (ListOrAuto::List(ids), _) => ids.join(", "),
+        (ListOrAuto::Auto, Some(listed)) if placed => match resolve(spec, listed) {
+            Ok(resolved) => {
+                let ids = resolved.data_center_ids.list();
+                let more = ids.len().saturating_sub(AUTO_SHOWN);
+                let shown = ids
+                    .iter()
+                    .take(AUTO_SHOWN)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if more > 0 {
+                    format!("auto picks now: {shown} and {more} more")
+                } else {
+                    format!("auto picks now: {shown}")
+                }
+            },
+            Err(error) => format!("auto: {error}"),
+        },
+        (ListOrAuto::Auto, _) => {
+            "auto: those with a chosen GPU type in stock, chosen at the start".to_string()
+        },
+    };
+    format!("datacenters {centers}")
+}
+
+/// `max_hours` of `spec`, with the most the run can cost at the highest list
+/// price of the GPU types `ids` once `gpus` are read.
+fn max_hours_line(spec: &RunpodTarget, gpus: Option<&[GpuType]>, ids: &[String]) -> String {
+    let rates: Vec<Option<f64>> = ids
+        .iter()
+        .map(|id| {
+            gpus.and_then(|listed| listed.iter().find(|gpu| gpu.id == *id))
+                .and_then(list_price)
+        })
+        .collect();
     let highest = rates.iter().flatten().copied().reduce(f64::max);
     let some_unknown = if rates.contains(&None) {
         " (some prices unknown)"
     } else {
         ""
     };
+    let count = f64::from(spec.gpu_count);
     let most = highest.map_or_else(String::new, |rate| {
         format!(
             ", about ${:.2} at most at the highest listed rate{some_unknown}",
-            rate * count * runpod.max_hours
+            rate * count * spec.max_hours
         )
     });
-    lines.push(format!(
-        "max_hours   {}: the watchdog deletes the pod by then{most}",
-        runpod.max_hours
-    ));
-    lines
+    format!(
+        "{COST_LABEL}{}: the watchdog deletes the pod by then{most}",
+        spec.max_hours
+    )
+}
+
+#[cfg(test)]
+/// A Runpod target trying `gpus` in order, `count` per pod, for 6 hours.
+pub(super) fn runpod_spec(gpus: ListOrAuto, count: u32) -> RunpodTarget {
+    RunpodTarget {
+        gpu_types: gpus,
+        min_vram_gb: None,
+        max_price_per_hour: None,
+        gpu_count: count,
+        image: crate::config::DEFAULT_RUNPOD_IMAGE.to_string(),
+        venv: crate::config::DEFAULT_RUNPOD_VENV.to_string(),
+        container_disk_gb: 50,
+        max_hours: 6.0,
+        boot_grace: Duration::from_secs(1800),
+        retrieve_grace: Duration::from_secs(3600),
+        data_center_ids: ListOrAuto::default(),
+        network_volume_id: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::tui::snapshots::gpu_types;
+
+    fn list(ids: &[&str]) -> ListOrAuto {
+        ListOrAuto::List(ids.iter().map(|id| (*id).to_string()).collect())
+    }
 
     fn plan(runpod: bool) -> StartPlan {
         StartPlan {
@@ -292,71 +423,212 @@ mod tests {
             model: "Qwen/Qwen3-4B, qlora, 3 epochs, lr 2e-4".into(),
             train: 1234,
             eval: 137,
-            runpod: runpod.then(|| RunpodPlan {
-                gpu_types: vec!["NVIDIA GeForce RTX 4090".into(), "NVIDIA A40".into()],
-                auto: false,
-                gpu_count: 2,
-                max_hours: 6.0,
+            runpod: runpod.then(|| {
+                Box::new(RunpodPlan::new(runpod_spec(
+                    list(&["NVIDIA GeForce RTX 4090", "NVIDIA B300"]),
+                    2,
+                )))
             }),
             warnings: Vec::new(),
         }
     }
 
-    #[test]
-    fn auto_gpu_types_say_they_are_chosen_at_the_start() {
-        let mut auto = plan(true);
-        if let Some(runpod) = &mut auto.runpod {
-            runpod.gpu_types.clear();
-            runpod.auto = true;
+    /// [`plan`] on `spec`, as the settings have it.
+    fn planned(spec: RunpodTarget) -> StartPlan {
+        StartPlan {
+            runpod: Some(Box::new(RunpodPlan::new(spec))),
+            ..plan(false)
         }
-        let lines = text(&auto, Some(&Vec::new()));
+    }
+
+    fn runpod(plan: &mut StartPlan) -> Result<&mut RunpodPlan, String> {
+        plan.runpod
+            .as_deref_mut()
+            .ok_or_else(|| "no Runpod plan".to_string())
+    }
+
+    fn fixture() -> Result<Gpus, serde_json::Error> {
+        gpu_types().map(Ok)
+    }
+
+    #[test]
+    fn auto_gpu_types_say_they_are_chosen_at_the_start() -> Result<(), String> {
+        let mut auto = plan(true);
+        runpod(&mut auto)?.spec.gpu_types = ListOrAuto::Auto;
+        let lines = text(&auto, None);
         assert!(
             lines.iter().any(|line| line
                 == "GPU types   auto: those in stock for 2 GPU, cheapest first, chosen at the start"),
             "{lines:?}"
         );
-        let line = cost_line(&auto).and_then(|at| lines.get(at).cloned());
-        assert!(
-            line.as_deref()
-                .is_some_and(|line| line.starts_with("max_hours   6: ")),
-            "{line:?}"
-        );
-    }
-
-    #[test]
-    fn the_cost_line_is_the_max_hours_line() {
-        let mut runpod = plan(true);
-        runpod.warnings = vec!["one".into(), "two".into()];
-        let line = cost_line(&runpod).and_then(|at| text(&runpod, None).get(at).cloned());
-        assert!(
-            line.as_deref()
-                .is_some_and(|line| line.starts_with("max_hours ")),
-            "{line:?}"
-        );
-        assert_eq!(cost_line(&plan(false)), None);
-    }
-
-    #[test]
-    fn list_prices_count_every_gpu_and_bound_the_run() {
-        let prices = vec![
-            ("NVIDIA GeForce RTX 4090".to_string(), Some(0.74)),
-            ("NVIDIA A40".to_string(), None),
-        ];
-        let text = text(&plan(true), Some(&prices));
-        assert_eq!(text[4], "- NVIDIA GeForce RTX 4090    $1.48/h");
-        assert_eq!(text[5], "- NVIDIA A40                 list price unknown");
+        assert!(lines.contains(&"datacenters any".to_string()), "{lines:?}");
+        let line = cost_line(&lines).and_then(|at| lines.get(at).cloned());
         assert_eq!(
-            text[6],
-            "max_hours   6: the watchdog deletes the pod by then, about $8.88 at most at the \
+            line.as_deref(),
+            Some("max_hours   6: the watchdog deletes the pod by then")
+        );
+        assert_eq!(cost_line(&text(&plan(false), None)), None);
+        Ok(())
+    }
+
+    #[test]
+    fn listed_gpus_show_price_vram_and_stock_and_bound_the_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let gpus = fixture()?;
+        let lines = text(&plan(true), Some(&gpus));
+        assert_eq!(
+            lines[3],
+            "GPU types   tried in order, list price x 2 GPU, VRAM, stock:"
+        );
+        assert_eq!(
+            lines[4],
+            "- NVIDIA GeForce RTX 4090    $1.38/h        24 GB  MEDIUM"
+        );
+        assert_eq!(lines[5], "- NVIDIA B300                not in the catalog");
+        assert_eq!(lines[6], "datacenters any");
+        assert_eq!(
+            lines[7],
+            "max_hours   6: the watchdog deletes the pod by then, about $8.28 at most at the \
              highest listed rate (some prices unknown)"
         );
-        let all = vec![
-            ("NVIDIA GeForce RTX 4090".to_string(), Some(0.74)),
-            ("NVIDIA A40".to_string(), Some(0.44)),
-        ];
-        assert!(super::text(&plan(true), Some(&all))[6].ends_with("at the highest listed rate"));
-        let waiting = super::text(&plan(true), None);
-        assert!(waiting[4].ends_with("looking up list prices..."));
+        assert_eq!(cost_line(&lines), Some(7));
+        let waiting = text(&plan(true), None);
+        assert!(
+            waiting[4].ends_with("looking up the catalog..."),
+            "{waiting:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_price_of_zero_or_less_is_unknown_and_never_bounds_the_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let gpus: Vec<GpuType> = serde_json::from_value(serde_json::json!([
+            {"id": "NVIDIA GeForce RTX 4090", "memory": 24, "price": {"secure": 0.0},
+             "availability": "HIGH"},
+            {"id": "NVIDIA B300", "memory": 288, "price": {"secure": -1.0}}
+        ]))?;
+        let lines = text(&plan(true), Some(&Ok(gpus)));
+        assert_eq!(
+            lines[4],
+            "- NVIDIA GeForce RTX 4090    price unknown  24 GB  HIGH"
+        );
+        assert_eq!(
+            lines[5],
+            "- NVIDIA B300                price unknown 288 GB  UNKNOWN"
+        );
+        assert_eq!(
+            lines[7],
+            "max_hours   6: the watchdog deletes the pod by then"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_shows_what_it_picks_now_and_bounds_the_run_by_all_of_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut auto = runpod_spec(ListOrAuto::Auto, 1);
+        let lines = text(&planned(auto.clone()), Some(&fixture()?));
+        assert_eq!(
+            lines[3],
+            "GPU types   auto picks now, list price x 1 GPU, VRAM, stock:"
+        );
+        assert_eq!(
+            lines[4],
+            "- NVIDIA RTX 2000 Ada Generation $0.24/h        16 GB  HIGH"
+        );
+        assert_eq!(
+            lines[5],
+            "- NVIDIA A40                 $0.40/h        48 GB  HIGH"
+        );
+        assert_eq!(lines[8], "- and 3 more");
+        // The dearest picked, the H100, bounds the run even though not shown.
+        assert!(
+            lines[10].ends_with("about $17.94 at most at the highest listed rate"),
+            "{lines:?}"
+        );
+        auto.min_vram_gb = Some(500);
+        let lines = text(&planned(auto), Some(&fixture()?));
+        assert!(
+            lines[3].starts_with("GPU types   auto: no GPU type in stock"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[4], "datacenters any");
+        Ok(())
+    }
+
+    /// Two GPU types, stocked per data center.
+    fn stocked() -> Result<Vec<GpuType>, serde_json::Error> {
+        serde_json::from_value(serde_json::json!([
+            {"id": "NVIDIA A40", "memory": 48, "price": {"secure": 0.4},
+             "maxCount": {"secure": 8}, "availability": "HIGH",
+             "dataCenters": [{"id": "EU-RO-1", "availability": "LOW"},
+                             {"id": "US-TX-3", "availability": "NONE"}]},
+            {"id": "NVIDIA L40S", "memory": 48, "price": {"secure": 0.86},
+             "maxCount": {"secure": 8}, "availability": "MEDIUM",
+             "dataCenters": [{"id": "US-TX-3", "availability": "MEDIUM"},
+                             {"id": "EU-SE-1", "availability": "HIGH"}]}
+        ]))
+    }
+
+    #[test]
+    fn stock_is_judged_in_the_data_centers_chosen_and_auto_ones_are_shown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut listed = runpod_spec(list(&["NVIDIA A40", "NVIDIA L40S"]), 2);
+        listed.data_center_ids = list(&["US-TX-3"]);
+        let lines = text(&planned(listed.clone()), Some(&Ok(stocked()?)));
+        assert!(lines[4].ends_with("48 GB  NONE"), "{lines:?}");
+        assert!(lines[5].ends_with("48 GB  MEDIUM"), "{lines:?}");
+        assert_eq!(lines[6], "datacenters US-TX-3");
+        listed.data_center_ids = ListOrAuto::Auto;
+        let listed = planned(listed);
+        let lines = text(&listed, Some(&Ok(stocked()?)));
+        assert_eq!(
+            lines[6],
+            "datacenters auto picks now: EU-RO-1, EU-SE-1, US-TX-3"
+        );
+        assert!(lines[4].ends_with("HIGH"), "overall stock: {lines:?}");
+        let waiting = text(&listed, None);
+        assert_eq!(
+            waiting[6],
+            "datacenters auto: those with a chosen GPU type in stock, chosen at the start"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unread_catalog_says_why_and_bounds_nothing() {
+        let failed: Gpus = Err("cannot read the Runpod catalog: no Runpod API key".into());
+        let lines = text(&plan(true), Some(&failed));
+        assert_eq!(lines[4], "- NVIDIA GeForce RTX 4090    catalog unread");
+        assert_eq!(
+            lines[6],
+            "catalog     cannot read the Runpod catalog: no Runpod API key"
+        );
+        assert_eq!(
+            lines[8],
+            "max_hours   6: the watchdog deletes the pod by then"
+        );
+    }
+
+    #[test]
+    fn a_choice_made_in_the_dialog_says_it_is_saved_first() -> Result<(), String> {
+        let mut chosen = plan(true);
+        assert_eq!(runpod(&mut chosen)?.changed(), Vec::<&str>::new());
+        runpod(&mut chosen)?.spec.data_center_ids = ListOrAuto::Auto;
+        runpod(&mut chosen)?.spec.gpu_types = list(&["NVIDIA A40"]);
+        assert_eq!(
+            runpod(&mut chosen)?.changed(),
+            ["gpu_types", "data_center_ids"]
+        );
+        let lines = text(&chosen, None);
+        assert_eq!(
+            lines[3],
+            "changed     gpu_types, data_center_ids: saved to overbrainer.toml on y, then the \
+             run starts"
+        );
+        assert_eq!(cost_line(&lines), Some(7));
+        Ok(())
     }
 
     #[test]
@@ -425,151 +697,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_prices_are_read_from_the_catalog_best_effort()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn the_catalog_is_read_for_the_gpu_count() -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v2/catalog/gpus/NVIDIA%20GeForce%20RTX%204090"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "NVIDIA GeForce RTX 4090",
-                "price": {"community": 0.34, "secure": 0.74}
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v2/catalog/gpus/NVIDIA%20A40"))
-            .respond_with(ResponseTemplate::new(404).set_body_string(format!("no, {KEY}")))
+            .and(path("/v2/catalog/gpus"))
+            .and(query_param("count", "2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"gpus": [
+                    {"id": "NVIDIA GeForce RTX 4090", "memory": 24, "price": {"secure": 0.74},
+                     "maxCount": {"secure": 8}, "availability": "LOW"}
+                ]})),
+            )
             .expect(1)
             .mount(&server)
             .await;
         let (dir, env) = runpod_project(Some(&server))?;
         let plan = prepare(dir.path(), env.clone())?;
         let runpod = plan.runpod.clone().ok_or("no Runpod plan")?;
-        assert_eq!((runpod.gpu_count, runpod.max_hours), (2, 6.0));
-        let prices = list_prices(dir.path(), env, runpod.gpu_types).await;
-        assert_eq!(
-            prices,
-            [
-                ("NVIDIA GeForce RTX 4090".to_string(), Some(0.74)),
-                ("NVIDIA A40".to_string(), None),
-            ]
+        assert_eq!((runpod.spec.gpu_count, runpod.spec.max_hours), (2, 6.0));
+        assert_eq!(runpod.changed(), Vec::<&str>::new());
+        let gpus = list_gpus(dir.path(), env, runpod.spec.gpu_count).await;
+        let shown = text(&plan, Some(&gpus)).join("\n");
+        assert!(
+            shown.contains("- NVIDIA GeForce RTX 4090    $1.48/h        24 GB  LOW"),
+            "{shown}"
         );
-        let shown = text(&plan, Some(&prices)).join("\n");
-        assert!(shown.contains("$1.48/h") && shown.contains("list price unknown"));
+        assert!(shown.contains("- NVIDIA A40                 not in the catalog"));
         assert!(!shown.contains(KEY) && !format!("{plan:?}").contains(KEY));
         Ok(())
     }
 
-    #[test]
-    fn a_price_of_zero_or_less_is_unknown_and_never_bounds_the_run() {
-        let prices = vec![
-            ("NVIDIA GeForce RTX 4090".to_string(), Some(0.0)),
-            ("NVIDIA A40".to_string(), Some(-1.0)),
-        ];
-        let text = text(&plan(true), Some(&prices));
-        assert_eq!(text[4], "- NVIDIA GeForce RTX 4090    list price unknown");
-        assert_eq!(text[5], "- NVIDIA A40                 list price unknown");
-        assert_eq!(
-            text[6],
-            "max_hours   6: the watchdog deletes the pod by then"
-        );
-        let prices = vec![
-            ("NVIDIA GeForce RTX 4090".to_string(), Some(f64::NAN)),
-            ("NVIDIA A40".to_string(), Some(0.44)),
-        ];
-        let text = super::text(&plan(true), Some(&prices));
-        assert_eq!(text[4], "- NVIDIA GeForce RTX 4090    list price unknown");
-        assert!(
-            text[6]
-                .contains("about $5.28 at most at the highest listed rate (some prices unknown)"),
-            "{}",
-            text[6]
-        );
-    }
-
-    /// A catalog answering `price` for `gpu`, after `delay`.
-    async fn priced(server: &MockServer, gpu: &str, price: f64, delay: Duration) {
-        Mock::given(method("GET"))
-            .and(path(format!(
-                "/v2/catalog/gpus/{}",
-                gpu.replace(' ', "%20")
-            )))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"id": gpu, "price": {"secure": price}}))
-                    .set_delay(delay),
-            )
-            .mount(server)
-            .await;
-    }
-
+    /// A failed read says the client's fixed message, never the key the error
+    /// body echoes.
     #[tokio::test]
-    async fn a_lookup_past_its_time_keeps_the_prices_read_in_time()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let server = MockServer::start().await;
-        priced(&server, "NVIDIA GeForce RTX 4090", 0.74, Duration::ZERO).await;
-        priced(&server, "NVIDIA A40", 0.44, Duration::from_secs(30)).await;
-        let (dir, env) = runpod_project(Some(&server))?;
-        let gpus = vec![
-            "NVIDIA GeForce RTX 4090".to_string(),
-            "NVIDIA A40".to_string(),
-            "NVIDIA RTX A6000".to_string(),
-        ];
-        let started = std::time::Instant::now();
-        let prices = list_prices_within(dir.path(), env, gpus, Duration::from_secs(2)).await;
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "gave up in time"
-        );
-        assert_eq!(
-            prices,
-            [
-                ("NVIDIA GeForce RTX 4090".to_string(), Some(0.74)),
-                ("NVIDIA A40".to_string(), None),
-                ("NVIDIA RTX A6000".to_string(), None),
-            ]
-        );
-        Ok(())
-    }
-
-    /// The warnings of a failed price read, which are what gets logged, hold
-    /// the client's fixed message, never the key the error body echoes. They
-    /// are checked as returned rather than captured from `tracing`, whose
-    /// callsite interest cache is shared by every test thread.
-    #[tokio::test]
-    async fn a_failed_price_read_never_logs_the_key() -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_failed_catalog_read_never_shows_the_key() -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v2/catalog/gpus/NVIDIA%20A40"))
+            .and(path("/v2/catalog/gpus"))
             .respond_with(
                 ResponseTemplate::new(404).set_body_string(format!("{{\"detail\": \"{KEY}\"}}")),
             )
             .mount(&server)
             .await;
         let (dir, env) = runpod_project(Some(&server))?;
-        let (prices, warnings) =
-            lookup_prices(dir.path(), env, vec!["NVIDIA A40".into()], PRICES_TIMEOUT).await;
-        assert_eq!(prices, [("NVIDIA A40".to_string(), None)]);
-        assert_eq!(
-            warnings,
-            [
-                "cannot read the list price of NVIDIA A40: Runpod answered 404: cannot read the \
-              GPU catalog"
-            ]
+        let error = lookup_gpus(dir.path(), env, 2, PRICES_TIMEOUT)
+            .await
+            .err()
+            .ok_or("read")?;
+        assert!(
+            error.starts_with("cannot read the Runpod catalog: Runpod answered 404"),
+            "{error}"
         );
-        for warning in &warnings {
-            assert!(!warning.contains(KEY), "{warning}");
-        }
+        assert!(!error.contains(KEY), "the key shows");
         Ok(())
     }
 
     #[tokio::test]
-    async fn without_an_api_key_every_list_price_is_unknown()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_lookup_past_its_time_gives_up() -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/catalog/gpus"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"gpus": []}))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let (dir, env) = runpod_project(Some(&server))?;
+        let started = std::time::Instant::now();
+        let gpus = lookup_gpus(dir.path(), env, 2, Duration::from_secs(1)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "gave up in time"
+        );
+        assert_eq!(
+            gpus,
+            Err("the Runpod catalog took too long to answer".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_an_api_key_the_catalog_is_unread() -> Result<(), Box<dyn std::error::Error>> {
         let (dir, env) = runpod_project(None)?;
-        let prices = list_prices(dir.path(), env, vec!["NVIDIA A40".into()]).await;
-        assert_eq!(prices, [("NVIDIA A40".to_string(), None)]);
+        let gpus = list_gpus(dir.path(), env, 1).await;
+        assert!(
+            gpus.as_ref()
+                .err()
+                .is_some_and(|error| error.contains("no Runpod API key")),
+            "{gpus:?}"
+        );
         Ok(())
     }
 }

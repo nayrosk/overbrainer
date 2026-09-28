@@ -52,7 +52,7 @@ pub(in crate::tui) fn render(
 ) -> Rect {
     let width = area.width.saturating_sub(2 * MARGIN).min(MAX_WIDTH);
     let pinned = match &confirm.action {
-        Action::Start(plan) => start::cost_line(plan),
+        Action::Start(_) => start::cost_line(&confirm.text),
         _ => None,
     };
     let room = usize::from(area.height.saturating_sub(CHROME_ROWS));

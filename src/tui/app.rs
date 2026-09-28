@@ -18,7 +18,7 @@ use super::motion::{Motion, MotionLevel};
 use super::pipeline::{PipelineView, STAGES, command_name};
 use super::project::{ProjectConfig, ProjectView};
 use super::project_edit::{Removal, SaveRefusal, editor_failure};
-use super::start::StartPlan;
+use super::start::{Gpus, StartPlan};
 use super::tasks::{Done, Edit, History, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
 use super::training::TrainingView;
@@ -204,6 +204,9 @@ pub(super) enum Origin {
     /// Enter on this field of the Project view: the choice becomes a pending
     /// edit of it.
     Field(FieldPath),
+    /// `g` or `c` in the dialog starting a run on this Runpod target: the
+    /// choice is used for the run and saved on `y`.
+    Start(String),
 }
 
 /// A picker open over the view, and the listing that fills it.
@@ -413,9 +416,15 @@ pub(super) struct App {
     pub(super) refreshed: SystemTime,
     /// The task preparing a training start, if any.
     pub(super) prepare: Option<TaskId>,
-    /// The task looking up list prices, if any; an earlier one's result is
-    /// ignored.
+    /// The task reading the GPU catalog of the start dialog, if any; an
+    /// earlier one's result is ignored.
     pub(super) prices: Option<TaskId>,
+    /// The GPU catalog of the start dialog, while it or its picker is open.
+    pub(super) start_gpus: Option<Gpus>,
+    /// The plan of the start dialog while its picker is open.
+    pub(super) start_held: Option<Box<StartPlan>>,
+    /// The run started once the save of its choices ends well.
+    pub(super) start_after_save: Option<Box<StartPlan>>,
     /// The catalog listings running, a picker's or a hint's: their failure
     /// shows in their picker, if still open, and nowhere else.
     catalog_reads: Vec<(TaskId, CatalogKind)>,
@@ -483,6 +492,9 @@ impl App {
             refreshed: Self::never(),
             prepare: None,
             prices: None,
+            start_gpus: None,
+            start_held: None,
+            start_after_save: None,
             catalog_reads: Vec::new(),
             gpu_catalog: None,
             newer: None,
@@ -601,6 +613,9 @@ impl App {
         if self.edit.is_some() || self.editing.is_some() {
             return Some("an edit is being saved".to_string());
         }
+        if self.start_after_save.is_some() {
+            return Some("a new run is starting".to_string());
+        }
         if let Some(follow) = self.training.tasks.values().find(|f| f.starting()) {
             return Some(format!("{} is starting", follow.run()));
         }
@@ -639,8 +654,8 @@ impl App {
             Ok(Done::Runs(listing)) => self.listed(id, listing),
             Ok(Done::Series { run, series }) => self.series_read(id, run, series),
             Ok(Done::Prepared(plan)) if self.prepare == Some(id) => self.prepared(plan),
-            Ok(Done::Prices(prices)) if self.prices == Some(id) => {
-                self.priced(&prices);
+            Ok(Done::Prices(gpus)) if self.prices == Some(id) => {
+                self.priced(gpus);
                 Vec::new()
             },
             Ok(Done::ConfigSaved(saved)) if self.project_view.save == Some(id) => {
@@ -720,8 +735,8 @@ impl App {
             return self.prepared(Err(error));
         }
         if self.prices == Some(id) {
-            // Every price unknown: the dialog never keeps waiting.
-            self.priced(&Vec::new());
+            // The dialog never keeps waiting.
+            self.priced(Err(error));
             return Vec::new();
         }
         if self.catalog_reads.iter().any(|(read, _)| *read == id) {
@@ -858,11 +873,17 @@ impl App {
     ) -> Vec<Effect> {
         let kind = query.kind;
         let task = self.task_id();
+        let picker = Picker::new(kind.spec(), preselected);
+        // A choice at start is used as picked, never typed.
+        let picker = match origin {
+            Origin::Field(_) => picker,
+            Origin::Start(_) => picker.untyped(),
+        };
         self.overlay = Some(Overlay::Picker(Box::new(Picking {
             kind,
             origin,
             task,
-            picker: Picker::new(kind.spec(), preselected),
+            picker,
         })));
         self.catalog_reads.push((task, kind));
         vec![Effect::Spawn(task, Task::Catalog(query))]
@@ -913,6 +934,7 @@ impl App {
     fn picked(&mut self, origin: Origin, picked: Picked) -> Vec<Effect> {
         match origin {
             Origin::Field(path) => self.picked_field(&path, picked),
+            Origin::Start(target) => self.picked_start(&target, picked),
         }
         Vec::new()
     }
@@ -1143,42 +1165,11 @@ impl App {
             self.project_view.form = None;
             return self.quit();
         }
-        if let Some(Overlay::Picker(picking)) = &mut self.overlay {
+        if matches!(self.overlay, Some(Overlay::Picker(_))) {
             if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
                 return Vec::new();
             }
-            return match picking.picker.on_key(key.code) {
-                PickerOutcome::Open => Vec::new(),
-                PickerOutcome::Cancelled => {
-                    self.overlay = None;
-                    Vec::new()
-                },
-                PickerOutcome::Typed => {
-                    let origin = picking.origin.clone();
-                    self.overlay = None;
-                    match origin {
-                        Origin::Field(path) => self.type_field(&path),
-                    }
-                    Vec::new()
-                },
-                PickerOutcome::Kept(choice) => {
-                    let entries = match &choice {
-                        Choice::Auto => Vec::new(),
-                        Choice::List(ids) => ids
-                            .iter()
-                            .filter_map(|id| picking.picker.entry(id).cloned())
-                            .collect(),
-                    };
-                    let (kind, origin) = (picking.kind, picking.origin.clone());
-                    self.overlay = None;
-                    let picked = Picked {
-                        kind,
-                        choice,
-                        entries,
-                    };
-                    self.picked(origin, picked)
-                },
-            };
+            return self.on_picker_key(key.code);
         }
         if self.view == View::Project && self.project_view.form.is_some() {
             if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
@@ -1232,6 +1223,52 @@ impl App {
         Vec::new()
     }
 
+    /// A key in the picker open: it goes back to what opened it once kept,
+    /// cancelled or typed instead.
+    fn on_picker_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        let Some(Overlay::Picker(picking)) = &mut self.overlay else {
+            return Vec::new();
+        };
+        match picking.picker.on_key(code) {
+            PickerOutcome::Open => Vec::new(),
+            PickerOutcome::Cancelled => {
+                let origin = picking.origin.clone();
+                self.overlay = None;
+                if let Origin::Start(_) = origin {
+                    self.reopen_start();
+                }
+                Vec::new()
+            },
+            PickerOutcome::Typed => {
+                let origin = picking.origin.clone();
+                self.overlay = None;
+                match origin {
+                    Origin::Field(path) => self.type_field(&path),
+                    // Never: a picker at start is untyped.
+                    Origin::Start(_) => self.reopen_start(),
+                }
+                Vec::new()
+            },
+            PickerOutcome::Kept(choice) => {
+                let entries = match &choice {
+                    Choice::Auto => Vec::new(),
+                    Choice::List(ids) => ids
+                        .iter()
+                        .filter_map(|id| picking.picker.entry(id).cloned())
+                        .collect(),
+                };
+                let (kind, origin) = (picking.kind, picking.origin.clone());
+                self.overlay = None;
+                let picked = Picked {
+                    kind,
+                    choice,
+                    entries,
+                };
+                self.picked(origin, picked)
+            },
+        }
+    }
+
     /// Shows `view`; the Training view reads `runs/` again, and switching to the
     /// Dataset view reads the data files again while a stage runs. Leaving a
     /// view never touches a task.
@@ -1245,22 +1282,37 @@ impl App {
         }
     }
 
-    /// Closes the overlay and returns it. Closing the start dialog forgets its
-    /// list price lookup: nothing shows its prices any more.
+    /// Closes the overlay and returns it. Closing the start dialog, or its
+    /// picker, forgets its plan and its GPU catalog lookup: nothing shows them
+    /// any more.
     fn close_overlay(&mut self) -> Option<Overlay> {
         let overlay = self.overlay.take();
-        if let Some(Overlay::Confirm(Confirm {
-            action: Action::Start(_),
-            ..
-        })) = &overlay
-        {
+        let start = match &overlay {
+            Some(Overlay::Confirm(confirm)) => matches!(confirm.action, Action::Start(_)),
+            Some(Overlay::Picker(picking)) => matches!(picking.origin, Origin::Start(_)),
+            _ => false,
+        };
+        if start {
             self.prices = None;
+            self.start_gpus = None;
+            self.start_held = None;
         }
         overlay
     }
 
-    /// `y` runs the dialog's action; any other key closes it.
+    /// `y` runs the dialog's action; `g` and `c` in the dialog starting a run
+    /// on a Runpod target choose its GPU types and data centers; any other key
+    /// closes it.
     fn on_confirm_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        if let KeyCode::Char(key @ ('g' | 'c')) = code
+            && let Some(Overlay::Confirm(Confirm {
+                action: Action::Start(plan),
+                ..
+            })) = &self.overlay
+            && plan.runpod.is_some()
+        {
+            return self.choose_for_start(key == 'g');
+        }
         let Some(Overlay::Confirm(confirm)) = self.close_overlay() else {
             return Vec::new();
         };
@@ -1274,7 +1326,7 @@ impl App {
                 effects
             },
             Action::Cancel(run_id) => self.cancel_run(&run_id),
-            Action::Start(plan) => self.start_run(&plan),
+            Action::Start(plan) => self.confirm_start(plan),
             Action::Abandon(tasks) => self.abandon(&tasks),
             Action::AbandonStart(task) => self.abandon_start(task),
             Action::Remove(removal) => {
@@ -4279,16 +4331,22 @@ mod tests {
             *prepare,
             Ok(Done::Prepared(Ok(crate::tui::snapshots::runpod_plan()))),
         );
-        let [Effect::Spawn(prices, Task::Prices(gpus))] = effects.as_slice() else {
+        let [Effect::Spawn(prices, Task::Prices(1))] = effects.as_slice() else {
             return Err(format!("{effects:?}"));
         };
-        assert_eq!(gpus.len(), 3);
-        let listed = vec![("NVIDIA A40".to_string(), Some(0.44))];
-        app.on_done(*prices, Ok(Done::Prices(listed)));
+        let listed = crate::tui::snapshots::gpu_types().map_err(|error| error.to_string())?;
+        app.on_done(*prices, Ok(Done::Prices(Ok(listed))));
         let Some(Overlay::Confirm(confirm)) = &app.overlay else {
             return Err("no dialog".into());
         };
-        assert!(confirm.text.iter().any(|line| line.ends_with("$0.44/h")));
+        assert!(
+            confirm
+                .text
+                .iter()
+                .any(|line| line.ends_with("$0.40/h        48 GB  HIGH")),
+            "{:?}",
+            confirm.text
+        );
         let effects = press(&mut app, &[KeyCode::Char('y')]);
         let [Effect::Spawn(start, Task::Train(TrainJob::Start))] = effects.as_slice() else {
             return Err(format!("{effects:?}"));
@@ -4491,12 +4549,13 @@ mod tests {
         else {
             return Err(format!("{first:?} {second:?}"));
         };
-        let listed = vec![("NVIDIA A40".to_string(), Some(0.44))];
-        app.on_done(*old, Ok(Done::Prices(listed)));
-        assert!(dialog(&app).contains("looking up list prices..."), "stale");
+        let listed = crate::tui::snapshots::gpu_types().map_err(|error| error.to_string())?;
+        app.on_done(*old, Ok(Done::Prices(Ok(listed))));
+        assert!(dialog(&app).contains("looking up the catalog..."), "stale");
         app.on_done(*new, Err("a background task failed: cancelled".into()));
         assert!(!dialog(&app).contains("looking up"), "{}", dialog(&app));
-        assert!(dialog(&app).contains("NVIDIA A40                 list price unknown"));
+        assert!(dialog(&app).contains("NVIDIA A40                 catalog unread"));
+        assert!(dialog(&app).contains("catalog     a background task failed: cancelled"));
         assert_eq!(app.prices, None);
         Ok(())
     }
@@ -4585,7 +4644,7 @@ mod tests {
             press(&mut app, &[code]);
             assert_eq!(app.prices, None, "{code:?}");
             assert!(!app.work().contains(&"preparing a run".to_string()));
-            app.on_done(*lookup, Ok(Done::Prices(Vec::new())));
+            app.on_done(*lookup, Ok(Done::Prices(Ok(Vec::new()))));
         }
         let mut app = app();
         app.prepared(Ok(crate::tui::snapshots::runpod_plan()));

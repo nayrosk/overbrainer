@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use crossterm::event::KeyCode;
 
 use super::app::{Action, App, Confirm, Effect, Exit, NoteOf, Overlay, Severity, View};
-use super::start::{self, Prices, StartPlan};
+use super::start::{self, Gpus, StartPlan};
 use super::tasks::{Msg, Task, TaskId, TrainJob};
 use super::training::{Detach, Ended, Follow, Job, Listing, RunActivity};
 use crate::cli::front::Report;
@@ -198,8 +198,8 @@ impl App {
         vec![Effect::Spawn(id, Task::Prepare)]
     }
 
-    /// The plan of a new run is ready: asks to start it, and looks up the list
-    /// prices of a Runpod run meanwhile (an earlier lookup no longer counts).
+    /// The plan of a new run is ready: asks to start it, and reads the GPU
+    /// catalog of a Runpod run meanwhile (an earlier lookup no longer counts).
     /// Dropped once the TUI is quitting, and while a dialog, the help, the menu
     /// or the filter is open (it never replaces what the user is answering):
     /// the status line then says to press `t` again.
@@ -222,31 +222,27 @@ impl App {
             );
             return Vec::new();
         }
-        let gpu_types = plan.runpod.as_ref().map(|runpod| runpod.gpu_types.clone());
-        self.overlay = Some(Overlay::Confirm(Confirm {
-            title: " Start a training run? ".to_string(),
-            text: start::text(&plan, None),
-            yes: "start",
-            no: "cancel",
-            action: Action::Start(Box::new(plan)),
-        }));
+        let gpu_count = plan.runpod.as_ref().map(|runpod| runpod.spec.gpu_count);
+        self.overlay = Some(Overlay::Confirm(start_dialog(Box::new(plan), None)));
         self.prices = None;
-        let Some(gpu_types) = gpu_types else {
+        self.start_gpus = None;
+        let Some(gpu_count) = gpu_count else {
             return Vec::new();
         };
         let id = self.task_id();
         self.prices = Some(id);
-        vec![Effect::Spawn(id, Task::Prices(gpu_types))]
+        vec![Effect::Spawn(id, Task::Prices(gpu_count))]
     }
 
-    /// The list prices arrived: shown in the start dialog if it is still open;
-    /// a type missing from `prices` has an unknown price.
-    pub(super) fn priced(&mut self, prices: &Prices) {
+    /// The GPU catalog of the start dialog arrived: kept while the dialog or
+    /// its picker is open, and shown in the dialog.
+    pub(super) fn priced(&mut self, gpus: Gpus) {
         self.prices = None;
+        self.start_gpus = Some(gpus);
         if let Some(Overlay::Confirm(confirm)) = &mut self.overlay
             && let Action::Start(plan) = &confirm.action
         {
-            confirm.text = start::text(plan, Some(prices));
+            confirm.text = start::text(plan, self.start_gpus.as_ref());
         }
     }
 
@@ -732,4 +728,16 @@ fn capitalized(text: &str) -> String {
     chars.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(chars).collect()
     })
+}
+
+/// The dialog asking to start the run of `plan`, with the GPU catalog `gpus`
+/// once read.
+pub(super) fn start_dialog(plan: Box<StartPlan>, gpus: Option<&Gpus>) -> Confirm {
+    Confirm {
+        title: " Start a training run? ".to_string(),
+        text: start::text(&plan, gpus),
+        yes: "start",
+        no: "cancel",
+        action: Action::Start(plan),
+    }
 }

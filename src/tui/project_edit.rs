@@ -148,6 +148,15 @@ fn sizing(listing: &Listing, name: &str) -> Sizing {
     }
 }
 
+/// The first of `problems`, with how many more there are.
+fn first_of(problems: &[String]) -> String {
+    let first = problems.first().cloned().unwrap_or_default();
+    match problems.len() {
+        0 | 1 => first,
+        count => format!("{first} (+{} more)", count - 1),
+    }
+}
+
 /// `count` changes, in words.
 fn changes(count: usize) -> String {
     if count == 1 {
@@ -878,12 +887,14 @@ impl App {
     }
 
     /// The save ended: the app reads the configuration written, or each
-    /// problem is shown on the field it names and nothing changed.
+    /// problem is shown on the field it names and nothing changed. A save of
+    /// the choices made at start then starts the run, or says why it does not.
     pub(super) fn config_saved(
         &mut self,
         saved: Result<Box<ProjectConfig>, SaveRefusal>,
     ) -> Vec<Effect> {
         self.project_view.save = None;
+        let start = self.start_after_save.take();
         let mut effects = Vec::new();
         match saved {
             Ok(config) => {
@@ -897,15 +908,27 @@ impl App {
                 }
                 self.say(Severity::Info, format!("✓ saved {CONFIG_FILE}"));
                 effects = self.reload();
+                if let Some(plan) = start {
+                    effects.extend(self.started_after_save(&plan));
+                }
+            },
+            Err(refusal) if start.is_some() => {
+                // The file keeps its values: the Project view marks nothing.
+                let why = match refusal {
+                    SaveRefusal::Invalid(problems) => first_of(&problems),
+                    SaveRefusal::Failed(error) => error,
+                };
+                self.say(
+                    Severity::Error,
+                    format!("run not started: {CONFIG_FILE} not saved: {why}"),
+                );
             },
             Err(SaveRefusal::Invalid(problems)) => {
                 self.mark_errors(&problems);
-                let first = problems.first().cloned().unwrap_or_default();
-                let more = match problems.len() {
-                    0 | 1 => String::new(),
-                    count => format!(" (+{} more)", count - 1),
-                };
-                self.say(Severity::Error, format!("not saved: {first}{more}"));
+                self.say(
+                    Severity::Error,
+                    format!("not saved: {}", first_of(&problems)),
+                );
             },
             Err(SaveRefusal::Failed(error)) => {
                 self.say(Severity::Error, format!("not saved: {error}"));

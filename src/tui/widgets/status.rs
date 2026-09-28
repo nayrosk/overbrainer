@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::history::Cost;
-use crate::tui::app::{App, Overlay, Severity, Status, View};
+use crate::tui::app::{Action, App, Confirm, Overlay, Severity, Status, View};
 use crate::tui::cost::project_cost;
 use crate::tui::keys::{self, Context, HELP_HINT, Hint, SEPARATOR};
 use crate::tui::project::Form;
@@ -71,6 +71,10 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &App) -> Option
 /// What the keys act on now.
 pub(in crate::tui) fn context(app: &App) -> Context {
     match &app.overlay {
+        Some(Overlay::Confirm(Confirm {
+            action: Action::Start(plan),
+            ..
+        })) if plan.runpod.is_some() => Context::Start,
         Some(Overlay::Confirm(confirm)) => Context::Dialog {
             yes: confirm.yes,
             no: confirm.no,
@@ -79,12 +83,16 @@ pub(in crate::tui) fn context(app: &App) -> Context {
         Some(Overlay::Menu(_)) => Context::Menu,
         Some(Overlay::Picker(picking)) => {
             let picker = &picking.picker;
+            let typed = picker.typed();
             if picker.typing() {
                 Context::Filter
             } else if picker.loading() || picker.error().is_some() {
-                Context::Listing
+                Context::Listing { typed }
             } else {
-                Context::Picker(picker.mode())
+                Context::Picker {
+                    mode: picker.mode(),
+                    typed,
+                }
             }
         },
         None if app.view == View::Dataset && app.dataset.input.is_some() => Context::Filter,

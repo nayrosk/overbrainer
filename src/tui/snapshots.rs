@@ -22,7 +22,7 @@ use super::theme::{ColorLevel, LookEnv, Theme};
 use super::ui;
 use super::widgets::status::VERSION;
 use crate::cli::data::Command;
-use crate::config::{ConfigError, EnvSource};
+use crate::config::{ConfigError, EnvSource, ListOrAuto};
 use crate::dataset::{
     Dataset, Example, Exclusion, FinishReason, Id, Message, Meta, Question, ReasoningKind,
     Rejected, Role, Subtopic,
@@ -1205,16 +1205,14 @@ pub(super) fn runpod_plan() -> StartPlan {
         model: "Qwen/Qwen3-4B, qlora, 3 epochs, lr 2e-4".into(),
         train: 1234,
         eval: 137,
-        runpod: Some(RunpodPlan {
-            gpu_types: vec![
+        runpod: Some(Box::new(RunpodPlan::new(crate::tui::start::runpod_spec(
+            ListOrAuto::List(vec![
                 "NVIDIA GeForce RTX 4090".into(),
                 "NVIDIA RTX A6000".into(),
                 "NVIDIA A40".into(),
-            ],
-            auto: false,
-            gpu_count: 1,
-            max_hours: 6.0,
-        }),
+            ]),
+            1,
+        )))),
         warnings: vec!["qwen2 renders no reasoning_content (see the logs)".into()],
     }
 }
@@ -1225,11 +1223,9 @@ fn the_start_dialog_of_a_runpod_run_before_and_with_its_prices() -> TestResult {
     app.view = View::Training;
     app.prepared(Ok(runpod_plan()));
     snapshot("start_runpod_looking_up", &mut app)?;
-    app.priced(&vec![
-        ("NVIDIA GeForce RTX 4090".to_string(), Some(0.74)),
-        ("NVIDIA RTX A6000".to_string(), Some(0.79)),
-        ("NVIDIA A40".to_string(), None),
-    ]);
+    let mut gpus = gpu_types()?;
+    gpus.retain(|gpu| gpu.id != "NVIDIA A40");
+    app.priced(Ok(gpus));
     snapshot("start_runpod", &mut app)?;
     Ok(())
 }
@@ -1293,13 +1289,19 @@ fn a_tall_dialog_keeps_its_keys_and_its_cost_at_80x24() -> TestResult {
     let mut plan = runpod_plan();
     let gpus: Vec<String> = (1..=14).map(|n| format!("NVIDIA GPU model {n}")).collect();
     if let Some(runpod) = &mut plan.runpod {
-        runpod.gpu_types.clone_from(&gpus);
+        runpod.spec.gpu_types = ListOrAuto::List(gpus.clone());
     }
     plan.warnings = (1..=4)
         .map(|n| format!("warning number {n} about this run"))
         .collect();
     app.prepared(Ok(plan));
-    app.priced(&gpus.iter().map(|gpu| (gpu.clone(), Some(0.5))).collect());
+    let listed = gpus
+        .iter()
+        .map(|gpu| serde_json::json!({"id": gpu, "memory": 48, "price": {"secure": 0.5}}))
+        .collect();
+    app.priced(Ok(serde_json::from_value(serde_json::Value::Array(
+        listed,
+    ))?));
     let rows = text(&draw(&mut app, 80, 24)?).join("\n");
     for shown in [
         "warning     warning number 1 about this run",

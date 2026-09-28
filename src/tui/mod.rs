@@ -20,6 +20,7 @@ mod project_save;
 #[cfg(test)]
 mod snapshots;
 mod start;
+mod start_pick;
 mod tasks;
 mod terminal;
 mod theme;

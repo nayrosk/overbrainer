@@ -20,7 +20,7 @@ use super::cost::history_cost;
 use super::editor::Edited;
 use super::project::ProjectConfig;
 use super::project_edit::{SaveRefusal, save_config};
-use super::start::{Prices, StartPlan, list_prices, prepare};
+use super::start::{Gpus, StartPlan, list_gpus, prepare};
 use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::Command;
 use crate::cli::front::{Frontend, Report};
@@ -65,8 +65,9 @@ pub(super) enum Task {
     Series(String),
     /// What a training run started now would use.
     Prepare,
-    /// The list prices of these Runpod GPU types.
-    Prices(Vec<String>),
+    /// The Runpod GPU catalog for this many GPUs per pod, for the start
+    /// dialog: list prices, VRAM and stock.
+    Prices(u32),
     /// What a picker lists, or the GPU types a field hint needs.
     Catalog(Query),
     /// Validates `text` with `env` and writes it to `overbrainer.toml`,
@@ -183,8 +184,8 @@ pub(super) enum Done {
     },
     /// What a training run started now would use, or why none can start.
     Prepared(Result<StartPlan, String>),
-    /// List prices of GPU types.
-    Prices(Prices),
+    /// The GPU catalog of the start dialog, or why it cannot be read.
+    Prices(Gpus),
     /// A picker's entries, or why they cannot be read.
     Catalog(Result<Listed, String>),
     /// The configuration written to `overbrainer.toml`, or why nothing was.
@@ -469,10 +470,10 @@ impl Tasks {
                     })
                 })
             },
-            Task::Prices(gpu_types) => {
+            Task::Prices(gpu_count) => {
                 let dir = self.project_dir.clone();
                 self.spawn_lookup(id, async move {
-                    Done::Prices(list_prices(&dir, EnvSource::Process, gpu_types).await)
+                    Done::Prices(list_gpus(&dir, EnvSource::Process, gpu_count).await)
                 })
             },
             Task::Catalog(query) => {
