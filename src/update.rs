@@ -4,6 +4,7 @@
 //! the check must never get in the way of the command it runs beside.
 
 use std::cmp::Ordering;
+use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,10 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 /// A cache younger than this skips the request.
 const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
 const CACHE_FILE: &str = "latest-version.json";
+/// The most the check reads from crates.io (its answer is a few KiB).
+const MAX_BODY: usize = 64 * 1024;
+/// The most the check reads from its cache file.
+const MAX_CACHE: usize = 4096;
 
 /// A release newer than the running binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,19 +139,35 @@ async fn latest(env: &CheckEnv, url: &str, now: SystemTime, timeout: Duration) -
     Some(latest)
 }
 
-/// The cached version when the cache is readable and younger than a day.
+/// The cached version when the cache is readable and younger than a day. A
+/// symlink or a file past [`MAX_CACHE`] is ignored.
 fn read_cache(dir: &Path, now: SystemTime) -> Option<String> {
     let path = dir.join(CACHE_FILE);
-    let text = std::fs::read_to_string(&path)
+    let text = read_small(&path)
         .map_err(|error| tracing::debug!("update check: cannot read {}: {error}", path.display()))
         .ok()?;
     let cache: Cache = serde_json::from_str(&text)
         .map_err(|error| tracing::debug!("update check: cannot parse {}: {error}", path.display()))
         .ok()?;
-    let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(cache.checked_at);
+    let checked_at = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(cache.checked_at))?;
     // A cache from the future (a clock set back) fails here and is refreshed.
     let age = now.duration_since(checked_at).ok()?;
     (age < MAX_AGE).then_some(cache.latest)
+}
+
+fn read_small(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, Read as _};
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(Error::other("a symlink"));
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take(MAX_CACHE as u64 + 1)
+        .read_to_string(&mut text)?;
+    if text.len() > MAX_CACHE {
+        return Err(Error::other(format!("larger than {MAX_CACHE} bytes")));
+    }
+    Ok(text)
 }
 
 fn write_cache(dir: &Path, now: SystemTime, latest: &str) {
@@ -182,13 +203,27 @@ struct CrateInfo {
     max_stable_version: String,
 }
 
-async fn fetch(url: &str, timeout: Duration) -> reqwest::Result<String> {
+async fn fetch(url: &str, timeout: Duration) -> Result<String, Box<dyn Error + Send + Sync>> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(timeout)
         .build()?;
-    let response = client.get(url).send().await?.error_for_status()?;
-    let body: CrateResponse = response.json().await?;
+    let mut response = client.get(url).send().await?.error_for_status()?;
+    let too_large = || format!("the answer is larger than {MAX_BODY} bytes");
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_BODY as u64)
+    {
+        return Err(too_large().into());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_BODY {
+            return Err(too_large().into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body: CrateResponse = serde_json::from_slice(&body)?;
     Ok(body.krate.max_stable_version)
 }
 
@@ -347,13 +382,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreadable_cache_is_fetched() -> TestResult {
+    async fn a_cache_that_does_not_parse_is_fetched() -> TestResult {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join(CACHE_FILE), "not json")?;
         let server = serve(ResponseTemplate::new(200).set_body_string(BODY), 1).await;
         let found = latest(&env(dir.path()), &url(&server), now(), TIMEOUT).await;
         assert_eq!(found.as_deref(), Some("0.4.2"));
         assert_eq!(read_cache(dir.path())?["latest"], "0.4.2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cache_that_cannot_be_read_is_fetched() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join(CACHE_FILE))?;
+        let server = serve(ResponseTemplate::new(200).set_body_string(BODY), 1).await;
+        let found = latest(&env(dir.path()), &url(&server), now(), TIMEOUT).await;
+        assert_eq!(found.as_deref(), Some("0.4.2"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_oversized_cache_is_fetched() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let padding = " ".repeat(8192);
+        let json = format!(
+            r#"{{"checked_at": {}, {padding}"latest": "0.4.7"}}"#,
+            unix(now())
+        );
+        std::fs::write(dir.path().join(CACHE_FILE), json)?;
+        let server = serve(ResponseTemplate::new(200).set_body_string(BODY), 1).await;
+        let found = latest(&env(dir.path()), &url(&server), now(), TIMEOUT).await;
+        assert_eq!(found.as_deref(), Some("0.4.2"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_huge_checked_at_is_fetched_without_panicking() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let json = format!(r#"{{"checked_at": {}, "latest": "0.4.7"}}"#, u64::MAX);
+        std::fs::write(dir.path().join(CACHE_FILE), json)?;
+        let server = serve(ResponseTemplate::new(200).set_body_string(BODY), 1).await;
+        let found = latest(&env(dir.path()), &url(&server), now(), TIMEOUT).await;
+        assert_eq!(found.as_deref(), Some("0.4.2"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_cache_is_ignored_and_replaced() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("elsewhere.json");
+        let json = serde_json::json!({"checked_at": unix(now()), "latest": "0.4.7"}).to_string();
+        std::fs::write(&target, &json)?;
+        std::os::unix::fs::symlink(&target, dir.path().join(CACHE_FILE))?;
+        let server = serve(ResponseTemplate::new(200).set_body_string(BODY), 1).await;
+        let found = latest(&env(dir.path()), &url(&server), now(), TIMEOUT).await;
+        assert_eq!(found.as_deref(), Some("0.4.2"));
+        assert_eq!(
+            std::fs::read_to_string(&target)?,
+            json,
+            "the target is untouched"
+        );
+        let written = std::fs::symlink_metadata(dir.path().join(CACHE_FILE))?;
+        assert!(written.is_file(), "the symlink was replaced by a file");
         Ok(())
     }
 
@@ -416,6 +508,43 @@ mod tests {
         fn spawnable<F: std::future::Future + Send + 'static>(_: F) {}
         let env = CheckEnv::default();
         spawnable(async move { check(&env, CRATES_IO_URL, now()).await });
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_gives_nothing() -> TestResult {
+        let padding = " ".repeat(MAX_BODY + 1);
+        let big = format!(r#"{{"crate":{{"max_stable_version":"0.4.2"}}{padding}}}"#);
+        let dir = tempfile::tempdir()?;
+        let server = serve(ResponseTemplate::new(200).set_body_string(big), 1).await;
+        let found = latest(&env(dir.path()), &url(&server), now(), TIMEOUT).await;
+        assert_eq!(found, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_without_a_length_gives_nothing() -> TestResult {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let body = format!(
+            r#"{{"crate":{{"max_stable_version":"0.4.2"}}{}}}"#,
+            " ".repeat(MAX_BODY + 1)
+        );
+        let serving = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await?;
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+            stream.write_all(head.as_bytes()).await?;
+            // No length: the body ends when the connection closes.
+            let _ = stream.write_all(body.as_bytes()).await;
+            std::io::Result::Ok(())
+        });
+        let found = fetch(&format!("http://{address}/"), TIMEOUT).await;
+        assert!(found.is_err(), "{found:?}");
+        serving.abort();
+        Ok(())
     }
 
     #[tokio::test]
