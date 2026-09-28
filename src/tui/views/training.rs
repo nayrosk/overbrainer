@@ -21,7 +21,7 @@ use crate::tui::format::duration;
 use crate::tui::motion::Bar;
 use crate::tui::theme::Theme;
 use crate::tui::training::{
-    Ended, Follow, RunActivity, RunRow, float, live_spend, pod_rate, progress,
+    Ended, Follow, RunActivity, RunRow, float, pod_rate, pod_spend, progress,
 };
 use crate::tui::views::dataset::failed;
 use crate::tui::widgets::bar::bar;
@@ -305,21 +305,11 @@ fn pod_line(record: &PodRecord, latest: Option<&PodStatus>, app: &App) -> Line<'
         .pod_id
         .as_ref()
         .map_or_else(|| "(no pod yet)".to_string(), ToString::to_string);
+    let spend = pod_spend(record, latest, app.now);
     let text = match latest {
-        Some(PodStatus::Deleted {
-            estimated_spend,
-            uptime,
-            ..
-        }) => deleted_line(
-            &id,
-            estimated_spend.or(record.estimated_spend),
-            *uptime,
-            record,
-        ),
-        _ if record.state == PodState::Deleted => {
-            deleted_line(&id, record.estimated_spend, None, record)
-        },
-        _ => live_line(&id, record, latest, app),
+        Some(PodStatus::Deleted { uptime, .. }) => deleted_line(&id, spend, *uptime, record),
+        _ if record.state == PodState::Deleted => deleted_line(&id, spend, None, record),
+        _ => live_line(&id, record, latest, spend, app),
     };
     Line::from(Span::styled(text, app.theme.dim))
 }
@@ -347,16 +337,20 @@ fn deleted_line(
 
 /// The pod line of a pod that exists: its state, rate, uptime and spend so far,
 /// and the watchdog's deadline, or no time limit for a kept pod.
-fn live_line(id: &str, record: &PodRecord, latest: Option<&PodStatus>, app: &App) -> String {
+fn live_line(
+    id: &str,
+    record: &PodRecord,
+    latest: Option<&PodStatus>,
+    spend: Option<f64>,
+    app: &App,
+) -> String {
     let state = latest.map_or_else(|| record.state.name(), status_name);
-    let rate = pod_rate(record, latest);
     let mut text = format!("pod {id} {state}");
-    if let Some(rate) = rate {
+    if let Some(rate) = pod_rate(record, latest) {
         write!(text, " ${rate:.2}/h").ok();
     }
     if let Some(up) = record.uptime(app.now) {
-        let spend = live_spend(record, rate, app.now)
-            .map_or_else(String::new, |spend| format!(" (about ${spend:.2})"));
+        let spend = spend.map_or_else(String::new, |spend| format!(" (about ${spend:.2})"));
         write!(text, "  up {}{spend}", duration(up)).ok();
     }
     // `--keep-pod` holds only once the job started: until then a failed start

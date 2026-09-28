@@ -22,7 +22,7 @@ pub(super) struct RunRow {
 
 /// What the pod of `record` spent by `now` at `rate` USD per hour, while it
 /// exists; `None` when the rate or its creation time is unknown.
-pub(super) fn live_spend(record: &PodRecord, rate: Option<f64>, now: SystemTime) -> Option<f64> {
+fn live_spend(record: &PodRecord, rate: Option<f64>, now: SystemTime) -> Option<f64> {
     Some(rate? * record.uptime(now)?.as_secs_f64() / 3600.0)
 }
 
@@ -35,19 +35,20 @@ pub(super) fn pod_rate(record: &PodRecord, latest: Option<&PodStatus>) -> Option
     })
 }
 
-/// What the pod of `row` spent by `now`: as recorded once deleted, else its rate
-/// (see [`pod_rate`]) times its uptime. `None` for a run without a pod, or when
-/// unknown.
-pub(super) fn estimated_spend(
-    row: &RunRow,
+/// What the pod of `record` spent by `now`: as its `latest` status or its
+/// record gave it once deleted, else its rate (see [`pod_rate`]) times its
+/// uptime. `None` when unknown.
+pub(super) fn pod_spend(
+    record: &PodRecord,
     latest: Option<&PodStatus>,
     now: SystemTime,
 ) -> Option<f64> {
-    let pod = row.pod.as_ref()?;
-    if pod.state == PodState::Deleted {
-        pod.estimated_spend
-    } else {
-        live_spend(pod, pod_rate(pod, latest), now)
+    match latest {
+        Some(PodStatus::Deleted {
+            estimated_spend, ..
+        }) => estimated_spend.or(record.estimated_spend),
+        _ if record.state == PodState::Deleted => record.estimated_spend,
+        _ => live_spend(record, pod_rate(record, latest), now),
     }
 }
 

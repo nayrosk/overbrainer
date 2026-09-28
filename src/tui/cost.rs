@@ -3,7 +3,7 @@
 
 use super::app::App;
 use super::pipeline::{Row, StageState};
-use super::training::estimated_spend;
+use super::training::pod_spend;
 use crate::history::{self, Cost, Entry};
 use crate::llm::Usage;
 
@@ -48,12 +48,12 @@ pub(super) fn project_cost(app: &App) -> Cost {
     }
     for run in &app.training.runs {
         // A pod never created spent nothing.
-        if run.pod.as_ref().is_some_and(|pod| pod.pod_id.is_some()) {
+        if let Some(pod) = run.pod.as_ref().filter(|pod| pod.pod_id.is_some()) {
             let latest = app
                 .training
                 .task_of(&run.record.id)
                 .and_then(|(_, follow)| follow.pod.as_ref());
-            total = Some(add(total, estimated_spend(run, latest, app.now)));
+            total = Some(add(total, pod_spend(pod, latest, app.now)));
         }
     }
     total.unwrap_or_default()
@@ -249,6 +249,25 @@ mod tests {
             return Err("the spend is not known".into());
         };
         assert!((spend - 0.53 * 41.0 / 60.0).abs() < 1e-9, "{spend}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_pod_deleted_live_adds_the_spend_of_its_deleted_status() -> TestResult {
+        let mut app = app();
+        // `pod.json` not reloaded yet: still running, as far as it says.
+        app.training.runs = vec![RunRow {
+            record: run("r1", "gpu_cloud", RunState::Running),
+            pod: Some(pod("r1")?),
+        }];
+        let mut follow = Follow::new(Job::Attach, "r1");
+        follow.pod = Some(PodStatus::Deleted {
+            pod_id: PodId::new("k3x9abc")?,
+            uptime: None,
+            estimated_spend: Some(0.2),
+        });
+        app.training.tasks.insert(TaskId(4), follow);
+        assert_eq!(project_cost(&app), Cost::Known(0.2));
         Ok(())
     }
 
