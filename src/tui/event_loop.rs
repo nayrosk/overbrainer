@@ -882,7 +882,7 @@ mod tests {
             message: "kept".into(),
         });
         let (events, input) = mpsc::unbounded_channel();
-        for code in ['4', 'x', 'q'] {
+        for code in ['5', 'x', 'q'] {
             events.send(Ok(key(KeyCode::Char(code))))?;
         }
         tokio::time::timeout(LIMIT, drive(&mut terminal, &mut app, input, None)).await??;
