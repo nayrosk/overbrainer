@@ -418,7 +418,7 @@ pub(super) struct App {
     pub(super) prepare: Option<TaskId>,
     /// The task reading the GPU catalog of the start dialog, if any; an
     /// earlier one's result is ignored.
-    pub(super) prices: Option<TaskId>,
+    pub(super) start_catalog: Option<TaskId>,
     /// The GPU catalog of the start dialog, while it or its picker is open.
     pub(super) start_gpus: Option<Gpus>,
     /// The plan of the start dialog while its picker is open.
@@ -491,7 +491,7 @@ impl App {
             training: TrainingView::default(),
             refreshed: Self::never(),
             prepare: None,
-            prices: None,
+            start_catalog: None,
             start_gpus: None,
             start_held: None,
             start_after_save: None,
@@ -587,7 +587,7 @@ impl App {
         if self.edit.is_some() || self.project_view.save.is_some() {
             work.push("saving".to_string());
         }
-        if self.prepare.is_some() || self.prices.is_some() {
+        if self.prepare.is_some() || self.start_catalog.is_some() {
             work.push("preparing a run".to_string());
         }
         if let Some(Overlay::Picker(picking)) = &self.overlay
@@ -654,8 +654,8 @@ impl App {
             Ok(Done::Runs(listing)) => self.listed(id, listing),
             Ok(Done::Series { run, series }) => self.series_read(id, run, series),
             Ok(Done::Prepared(plan)) if self.prepare == Some(id) => self.prepared(plan),
-            Ok(Done::Prices(gpus)) if self.prices == Some(id) => {
-                self.priced(gpus);
+            Ok(Done::StartCatalog(gpus)) if self.start_catalog == Some(id) => {
+                self.start_catalog_read(gpus);
                 Vec::new()
             },
             Ok(Done::ConfigSaved(saved)) if self.project_view.save == Some(id) => {
@@ -665,7 +665,7 @@ impl App {
                 self.listed_catalog(id, listed);
                 Vec::new()
             },
-            Ok(Done::Prepared(_) | Done::Prices(_) | Done::ConfigSaved(_)) => Vec::new(),
+            Ok(Done::Prepared(_) | Done::StartCatalog(_) | Done::ConfigSaved(_)) => Vec::new(),
             Err(error) => self.failed(id, error),
         }
     }
@@ -734,9 +734,9 @@ impl App {
         if self.prepare == Some(id) {
             return self.prepared(Err(error));
         }
-        if self.prices == Some(id) {
+        if self.start_catalog == Some(id) {
             // The dialog never keeps waiting.
-            self.priced(Err(error));
+            self.start_catalog_read(Err(error));
             return Vec::new();
         }
         if self.catalog_reads.iter().any(|(read, _)| *read == id) {
@@ -1293,7 +1293,7 @@ impl App {
             _ => false,
         };
         if start {
-            self.prices = None;
+            self.start_catalog = None;
             self.start_gpus = None;
             self.start_held = None;
         }
@@ -4320,7 +4320,7 @@ mod tests {
     }
 
     #[test]
-    fn t_prepares_asks_with_list_prices_then_starts_one_run() -> Result<(), String> {
+    fn t_prepares_asks_with_the_gpu_catalog_then_starts_one_run() -> Result<(), String> {
         let mut app = app();
         press(&mut app, &[KeyCode::Char('4')]);
         let effects = press(&mut app, &[KeyCode::Char('t')]);
@@ -4331,11 +4331,11 @@ mod tests {
             *prepare,
             Ok(Done::Prepared(Ok(crate::tui::snapshots::runpod_plan()))),
         );
-        let [Effect::Spawn(prices, Task::Prices(1))] = effects.as_slice() else {
+        let [Effect::Spawn(catalog, Task::StartCatalog(1))] = effects.as_slice() else {
             return Err(format!("{effects:?}"));
         };
         let listed = crate::tui::snapshots::gpu_types().map_err(|error| error.to_string())?;
-        app.on_done(*prices, Ok(Done::Prices(Ok(listed))));
+        app.on_done(*catalog, Ok(Done::StartCatalog(Ok(listed))));
         let Some(Overlay::Confirm(confirm)) = &app.overlay else {
             return Err("no dialog".into());
         };
@@ -4538,7 +4538,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_or_failed_price_lookups_never_leave_the_dialog_waiting() -> Result<(), String> {
+    fn stale_or_failed_catalog_lookups_never_leave_the_dialog_waiting() -> Result<(), String> {
         let mut app = app();
         let plan = crate::tui::snapshots::runpod_plan();
         let first = app.prepared(Ok(plan.clone()));
@@ -4550,13 +4550,13 @@ mod tests {
             return Err(format!("{first:?} {second:?}"));
         };
         let listed = crate::tui::snapshots::gpu_types().map_err(|error| error.to_string())?;
-        app.on_done(*old, Ok(Done::Prices(Ok(listed))));
+        app.on_done(*old, Ok(Done::StartCatalog(Ok(listed))));
         assert!(dialog(&app).contains("looking up the catalog..."), "stale");
         app.on_done(*new, Err("a background task failed: cancelled".into()));
         assert!(!dialog(&app).contains("looking up"), "{}", dialog(&app));
         assert!(dialog(&app).contains("NVIDIA A40                 catalog unread"));
         assert!(dialog(&app).contains("catalog     a background task failed: cancelled"));
-        assert_eq!(app.prices, None);
+        assert_eq!(app.start_catalog, None);
         Ok(())
     }
 
@@ -4633,23 +4633,23 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_start_dialog_forgets_its_price_lookup() -> Result<(), String> {
+    fn closing_the_start_dialog_forgets_its_catalog_lookup() -> Result<(), String> {
         for code in [KeyCode::Char('n'), KeyCode::Char('y'), KeyCode::Esc] {
             let mut app = app();
             let effects = app.prepared(Ok(crate::tui::snapshots::runpod_plan()));
-            let [Effect::Spawn(lookup, Task::Prices(_))] = effects.as_slice() else {
+            let [Effect::Spawn(lookup, Task::StartCatalog(_))] = effects.as_slice() else {
                 return Err(format!("{effects:?}"));
             };
             assert!(app.work().contains(&"preparing a run".to_string()));
             press(&mut app, &[code]);
-            assert_eq!(app.prices, None, "{code:?}");
+            assert_eq!(app.start_catalog, None, "{code:?}");
             assert!(!app.work().contains(&"preparing a run".to_string()));
-            app.on_done(*lookup, Ok(Done::Prices(Ok(Vec::new()))));
+            app.on_done(*lookup, Ok(Done::StartCatalog(Ok(Vec::new()))));
         }
         let mut app = app();
         app.prepared(Ok(crate::tui::snapshots::runpod_plan()));
         app.on_input(&ctrl_c());
-        assert_eq!(app.prices, None, "Ctrl-C");
+        assert_eq!(app.start_catalog, None, "Ctrl-C");
         Ok(())
     }
 

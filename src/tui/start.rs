@@ -14,7 +14,7 @@ use crate::runpod::{Availability, GpuType, RunpodTarget, resolve};
 use crate::train::reasoning_template_warning;
 
 /// Total time the GPU catalog may take; the dialog never waits for it.
-pub(super) const PRICES_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const START_CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a training run started now would use.
 #[derive(Debug, Clone, PartialEq)]
@@ -150,10 +150,10 @@ fn kind(target: &Target) -> String {
 
 /// The Secure Cloud GPU types for `gpu_count` GPUs on the Runpod account of
 /// the project in `dir` (its settings read with `env`), giving up after
-/// [`PRICES_TIMEOUT`]. Why they cannot be read is logged too, with only the
+/// [`START_CATALOG_TIMEOUT`]. Why they cannot be read is logged too, with only the
 /// client's fixed messages.
 pub(super) async fn list_gpus(dir: &Path, env: EnvSource, gpu_count: u32) -> Gpus {
-    let gpus = lookup_gpus(dir, env, gpu_count, PRICES_TIMEOUT).await;
+    let gpus = lookup_gpus(dir, env, gpu_count, START_CATALOG_TIMEOUT).await;
     if let Err(error) = &gpus {
         tracing::warn!("{error}");
     }
@@ -740,7 +740,7 @@ mod tests {
             .mount(&server)
             .await;
         let (dir, env) = runpod_project(Some(&server))?;
-        let error = lookup_gpus(dir.path(), env, 2, PRICES_TIMEOUT)
+        let error = lookup_gpus(dir.path(), env, 2, START_CATALOG_TIMEOUT)
             .await
             .err()
             .ok_or("read")?;

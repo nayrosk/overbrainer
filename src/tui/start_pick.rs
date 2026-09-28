@@ -45,14 +45,6 @@ fn saved_text(base: &str, target: &str, runpod: &RunpodPlan) -> Result<String, S
     Ok(doc.text())
 }
 
-/// `list` as a picker's choice.
-fn choice(list: &ListOrAuto) -> Choice {
-    match list {
-        ListOrAuto::Auto => Choice::Auto,
-        ListOrAuto::List(ids) => Choice::List(ids.clone()),
-    }
-}
-
 impl App {
     /// `g` (`gpus`) or `c` in the start dialog of a Runpod run: opens the GPU
     /// type or data center picker on what the run would use, unless the
@@ -82,9 +74,12 @@ impl App {
         self.start_held = Some(plan);
         let spec = &runpod.spec;
         let (kind, preselected) = if gpus {
-            (CatalogKind::Gpus, choice(&spec.gpu_types))
+            (CatalogKind::Gpus, Choice::from(&spec.gpu_types))
         } else {
-            (CatalogKind::DataCenters, choice(&spec.data_center_ids))
+            (
+                CatalogKind::DataCenters,
+                Choice::from(&spec.data_center_ids),
+            )
         };
         let query = Query {
             kind,
@@ -282,10 +277,10 @@ mod tests {
             ..runpod_plan()
         };
         let effects = app.prepared(Ok(plan));
-        let [Effect::Spawn(lookup, Task::Prices(1))] = effects.as_slice() else {
+        let [Effect::Spawn(lookup, Task::StartCatalog(1))] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
         };
-        app.on_done(*lookup, Ok(Done::Prices(Ok(gpu_types()?))));
+        app.on_done(*lookup, Ok(Done::StartCatalog(Ok(gpu_types()?))));
         Ok((dir, app))
     }
 

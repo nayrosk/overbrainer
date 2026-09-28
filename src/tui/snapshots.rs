@@ -1225,7 +1225,7 @@ fn the_start_dialog_of_a_runpod_run_before_and_with_its_prices() -> TestResult {
     snapshot("start_runpod_looking_up", &mut app)?;
     let mut gpus = gpu_types()?;
     gpus.retain(|gpu| gpu.id != "NVIDIA A40");
-    app.priced(Ok(gpus));
+    app.start_catalog_read(Ok(gpus));
     snapshot("start_runpod", &mut app)?;
     Ok(())
 }
@@ -1299,7 +1299,7 @@ fn a_tall_dialog_keeps_its_keys_and_its_cost_at_80x24() -> TestResult {
         .iter()
         .map(|gpu| serde_json::json!({"id": gpu, "memory": 48, "price": {"secure": 0.5}}))
         .collect();
-    app.priced(Ok(serde_json::from_value(serde_json::Value::Array(
+    app.start_catalog_read(Ok(serde_json::from_value(serde_json::Value::Array(
         listed,
     ))?));
     let rows = text(&draw(&mut app, 80, 24)?).join("\n");

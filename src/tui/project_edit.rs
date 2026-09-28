@@ -392,10 +392,7 @@ impl App {
         sizing: &Sizing,
     ) -> Vec<Effect> {
         let preselected = match kind {
-            CatalogKind::Gpus | CatalogKind::DataCenters => match parse_list(shown) {
-                ListOrAuto::Auto => Choice::Auto,
-                ListOrAuto::List(ids) => Choice::List(ids),
-            },
+            CatalogKind::Gpus | CatalogKind::DataCenters => Choice::from(&parse_list(shown)),
             // Unset: the `none` or `default` entry is the one chosen.
             CatalogKind::Volumes | CatalogKind::Templates => Choice::List(vec![shown.to_string()]),
         };

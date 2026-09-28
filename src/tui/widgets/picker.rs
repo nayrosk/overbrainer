@@ -11,6 +11,7 @@ use ratatui::widgets::{Cell, Padding, Paragraph, Row as TableRow, Table, TableSt
 
 use super::form::{Input, InputOutcome};
 use super::{centered, overlay};
+use crate::config::ListOrAuto;
 use crate::tui::app::PAGE;
 use crate::tui::theme::Theme;
 
@@ -50,6 +51,16 @@ pub(in crate::tui) enum Choice {
     Auto,
     /// These IDs, in order; one at most in [`Mode::Single`].
     List(Vec<String>),
+}
+
+impl From<&ListOrAuto> for Choice {
+    /// `auto` as the `auto` entry, a list as its IDs.
+    fn from(value: &ListOrAuto) -> Self {
+        match value {
+            ListOrAuto::Auto => Self::Auto,
+            ListOrAuto::List(ids) => Self::List(ids.clone()),
+        }
+    }
 }
 
 /// What a key did to a picker.

@@ -224,20 +224,20 @@ impl App {
         }
         let gpu_count = plan.runpod.as_ref().map(|runpod| runpod.spec.gpu_count);
         self.overlay = Some(Overlay::Confirm(start_dialog(Box::new(plan), None)));
-        self.prices = None;
+        self.start_catalog = None;
         self.start_gpus = None;
         let Some(gpu_count) = gpu_count else {
             return Vec::new();
         };
         let id = self.task_id();
-        self.prices = Some(id);
-        vec![Effect::Spawn(id, Task::Prices(gpu_count))]
+        self.start_catalog = Some(id);
+        vec![Effect::Spawn(id, Task::StartCatalog(gpu_count))]
     }
 
     /// The GPU catalog of the start dialog arrived: kept while the dialog or
     /// its picker is open, and shown in the dialog.
-    pub(super) fn priced(&mut self, gpus: Gpus) {
-        self.prices = None;
+    pub(super) fn start_catalog_read(&mut self, gpus: Gpus) {
+        self.start_catalog = None;
         self.start_gpus = Some(gpus);
         if let Some(Overlay::Confirm(confirm)) = &mut self.overlay
             && let Action::Start(plan) = &confirm.action

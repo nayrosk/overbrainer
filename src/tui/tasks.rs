@@ -67,7 +67,7 @@ pub(super) enum Task {
     Prepare,
     /// The Runpod GPU catalog for this many GPUs per pod, for the start
     /// dialog: list prices, VRAM and stock.
-    Prices(u32),
+    StartCatalog(u32),
     /// What a picker lists, or the GPU types a field hint needs.
     Catalog(Query),
     /// Validates `text` with `env` and writes it to `overbrainer.toml`,
@@ -185,7 +185,7 @@ pub(super) enum Done {
     /// What a training run started now would use, or why none can start.
     Prepared(Result<StartPlan, String>),
     /// The GPU catalog of the start dialog, or why it cannot be read.
-    Prices(Gpus),
+    StartCatalog(Gpus),
     /// A picker's entries, or why they cannot be read.
     Catalog(Result<Listed, String>),
     /// The configuration written to `overbrainer.toml`, or why nothing was.
@@ -328,7 +328,7 @@ pub(super) struct Tasks {
     ids: HashMap<tokio::task::Id, TaskId>,
     tokens: HashMap<TaskId, CancellationToken>,
     abandons: HashMap<TaskId, Arc<AtomicBool>>,
-    /// The list price and catalog lookups running: only reads, aborted when
+    /// The catalog lookups running: only reads, aborted when
     /// the TUI ends.
     lookups: HashMap<TaskId, AbortHandle>,
 }
@@ -353,7 +353,7 @@ impl Tasks {
         &self.project_dir
     }
 
-    /// Aborts the list price and catalog lookups: they only read, so the TUI
+    /// Aborts the catalog lookups: they only read, so the TUI
     /// never waits for them to end.
     pub(super) fn abort_lookups(&mut self) {
         for (_, lookup) in self.lookups.drain() {
@@ -470,10 +470,10 @@ impl Tasks {
                     })
                 })
             },
-            Task::Prices(gpu_count) => {
+            Task::StartCatalog(gpu_count) => {
                 let dir = self.project_dir.clone();
                 self.spawn_lookup(id, async move {
-                    Done::Prices(list_gpus(&dir, EnvSource::Process, gpu_count).await)
+                    Done::StartCatalog(list_gpus(&dir, EnvSource::Process, gpu_count).await)
                 })
             },
             Task::Catalog(query) => {
@@ -1021,9 +1021,9 @@ exit 0
         Ok(())
     }
 
-    /// A list price lookup is aborted when the TUI ends: it ends at once.
+    /// A start catalog lookup is aborted when the TUI ends: it ends at once.
     #[tokio::test]
-    async fn a_price_lookup_is_aborted_when_the_tui_ends() -> TestResult {
+    async fn a_catalog_lookup_is_aborted_when_the_tui_ends() -> TestResult {
         let dir = tempfile::tempdir()?;
         let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
         let handle = tasks.set.spawn(std::future::pending::<Done>());

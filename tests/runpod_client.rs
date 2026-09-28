@@ -793,4 +793,3 @@ fn the_client_debug_output_hides_the_key() -> TestResult {
     ));
     Ok(())
 }
-
