@@ -70,7 +70,8 @@ fn short_target(target: &str) -> &str {
     target.strip_prefix("overbrainer::").unwrap_or(target)
 }
 
-/// The level in upper case.
+/// Maps a tracing [`Level`] to its upper-case name (`ERROR`, `WARN`, `INFO`,
+/// `DEBUG`, `TRACE`).
 pub(in crate::tui) fn level_name(level: Level) -> &'static str {
     match level {
         Level::ERROR => "ERROR",
