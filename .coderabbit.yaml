@@ -12,6 +12,9 @@ reviews:
       - "WIP"
       - "Draft"
       - "DO NOT MERGE"
+      # Documentation-only pull requests carry a Conventional Commits `docs` title.
+      - "docs:"
+      - "docs("
     # Release pull requests carry the release label; they only bump versions and the changelog.
     labels:
       - "!release"
