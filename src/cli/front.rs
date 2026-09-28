@@ -14,12 +14,13 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::events::EventBus;
+use crate::events::{EventBus, Observer};
 
 /// A front end of the flows in `cli::data` and `cli::train`.
 pub(crate) enum Frontend {
-    /// The command line: a new bus rendered to stderr, Ctrl-C (SIGINT), stdout.
-    Cli,
+    /// The command line: a new bus rendered to stderr and seen by the observer
+    /// if any, Ctrl-C (SIGINT), stdout.
+    Cli(Option<Arc<dyn Observer>>),
     /// The terminal UI: the task's own bus, the token that detaches it, the flag
     /// that abandons a Runpod provisioning, and a sink into the app.
     Tui {
@@ -47,8 +48,8 @@ impl Frontend {
     /// The bus a flow publishes on, with what renders it.
     pub(crate) fn open_bus(&self) -> BusGuard {
         match self {
-            Self::Cli => {
-                let bus = EventBus::new();
+            Self::Cli(observer) => {
+                let bus = EventBus::observed(EventBus::CAPACITY, observer.clone());
                 let renderer = tokio::spawn(super::progress::render(bus.subscribe()));
                 BusGuard {
                     bus,
@@ -79,7 +80,7 @@ impl Frontend {
     /// What stops a raced flow and is noted by a shielded one, caught from now on.
     pub(crate) fn interrupt(&self) -> Interrupt {
         match self {
-            Self::Cli => Interrupt::catch(),
+            Self::Cli(_) => Interrupt::catch(),
             Self::Tui { detach, .. } => {
                 let detach = detach.clone();
                 Interrupt::on(Box::pin(async move {
@@ -97,7 +98,7 @@ impl Frontend {
     /// Returns an error when the Ctrl-C handler cannot be installed.
     pub(crate) fn provisioning_flag(&self) -> anyhow::Result<Flag> {
         match self {
-            Self::Cli => {
+            Self::Cli(_) => {
                 let mut sigint = signal(SignalKind::interrupt()).context("cannot catch Ctrl-C")?;
                 let interrupted = Arc::new(AtomicBool::new(false));
                 let seen = Arc::clone(&interrupted);
@@ -122,7 +123,7 @@ impl Frontend {
     /// it as a [`Report::Line`].
     pub(crate) fn line(&self, line: &str) {
         match self {
-            Self::Cli => println!("{line}"),
+            Self::Cli(_) => println!("{line}"),
             Self::Tui { report, .. } => report(Report::Line(line.to_string())),
         }
     }
@@ -130,7 +131,7 @@ impl Frontend {
     /// Says that training run `id` was created: the TUI binds its task to it.
     pub(crate) fn run_created(&self, id: &str) {
         match self {
-            Self::Cli => {},
+            Self::Cli(_) => {},
             Self::Tui { report, .. } => report(Report::RunCreated(id.to_string())),
         }
     }
@@ -328,7 +329,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let _signals = crate::test_support::SIGNALS.lock().await;
         let limit = Duration::from_secs(10);
-        let mut interrupt = Frontend::Cli.interrupt();
+        let mut interrupt = Frontend::Cli(None).interrupt();
         assert!(matches!(interrupt, Interrupt::Listening(_)));
         // Ctrl-C arrives while the flow waits: it still ends, and Ctrl-C is noted.
         let mut received = signal(SignalKind::interrupt())?;
@@ -344,7 +345,7 @@ mod tests {
         // Once Ctrl-C was pressed, a race does not even start its flow.
         assert_eq!(interrupt.race(std::future::ready(())).await, None);
 
-        let mut interrupt = Frontend::Cli.interrupt();
+        let mut interrupt = Frontend::Cli(None).interrupt();
         let raced = async {
             ctrl_c().await?;
             std::future::pending::<()>().await;
@@ -442,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cli_bus_is_rendered_until_it_is_closed() -> Result<(), tokio::time::error::Elapsed> {
-        let guard = Frontend::Cli.open_bus();
+        let guard = Frontend::Cli(None).open_bus();
         let mut extra = guard.bus.subscribe();
         guard.bus.publish(Event::StageStarted {
             stage: Stage::Split,
@@ -466,7 +467,7 @@ mod tests {
     async fn a_cli_flag_dropped_without_close_stops_its_watcher() -> anyhow::Result<()> {
         // No other test may send Ctrl-C meanwhile: it would end the watcher too.
         let _signals = crate::test_support::SIGNALS.lock().await;
-        let flag = Frontend::Cli.provisioning_flag()?;
+        let flag = Frontend::Cli(None).provisioning_flag()?;
         let interrupted = Arc::clone(&flag.interrupted);
         assert_eq!(
             Arc::strong_count(&interrupted),
@@ -482,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn a_bus_guard_dropped_without_close_stops_its_renderer() -> anyhow::Result<()> {
         // The command line: a clone keeps the bus open, so only the guard ends it.
-        let guard = Frontend::Cli.open_bus();
+        let guard = Frontend::Cli(None).open_bus();
         let bus = guard.bus.clone();
         assert_eq!(bus.receiver_count(), 1, "the renderer");
         drop(guard);
@@ -502,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cli_provisioning_flag_starts_clear() -> anyhow::Result<()> {
-        let flag = Frontend::Cli.provisioning_flag()?;
+        let flag = Frontend::Cli(None).provisioning_flag()?;
         assert!(!flag.interrupted.load(Ordering::SeqCst));
         flag.close();
         Ok(())

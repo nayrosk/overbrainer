@@ -1,6 +1,6 @@
 //! Prometheus metrics of a project, served at `GET /metrics` while a command holds
 //! the project. Counters start from the stage history, then follow the events of
-//! every bus of the process through the [`tap`](crate::events::tap), so they are
+//! every bus the command builds with them as its [`Observer`], so they are
 //! cumulative per project. Retries are not in the history: they restart at zero
 //! with each process.
 
@@ -25,11 +25,9 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast::Receiver;
-use tokio::sync::broadcast::error::RecvError;
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::events::{Event, Stage, Tap};
+use crate::events::{Event, Observer, Stage};
 use crate::history::Entry;
 use crate::llm::Usage;
 use crate::runpod::{PodRecord, PodState};
@@ -110,7 +108,7 @@ pub struct Metrics {
     /// Where the Runpod spend is read at each scrape; none leaves it out.
     runs: Option<Runs>,
     /// Per bus ID.
-    buses: Mutex<BTreeMap<u64, Followed>>,
+    buses: Mutex<BTreeMap<usize, Followed>>,
 }
 
 impl Metrics {
@@ -265,21 +263,7 @@ impl Metrics {
         }
     }
 
-    /// Counts what the tap received.
-    pub fn observe(&self, tap: &Tap) {
-        let mut buses = self.buses.lock().unwrap_or_else(PoisonError::into_inner);
-        match tap {
-            Tap::Event { bus, event } => self.event(buses.entry(*bus).or_default(), event),
-            Tap::Closed { bus } => {
-                // A stage that failed or was interrupted never finished.
-                for stage in buses.remove(bus).unwrap_or_default().running {
-                    self.stage_running(stage).dec();
-                }
-            },
-        }
-    }
-
-    fn event(&self, followed: &mut Followed, event: &Event) {
+    fn follow(&self, followed: &mut Followed, event: &Event) {
         match event {
             Event::StageStarted { stage, .. } => {
                 self.stage_running(*stage).inc();
@@ -380,6 +364,21 @@ impl Metrics {
     }
 }
 
+impl Observer for Metrics {
+    fn event(&self, bus: usize, event: &Event) {
+        let mut buses = self.buses.lock().unwrap_or_else(PoisonError::into_inner);
+        self.follow(buses.entry(bus).or_default(), event);
+    }
+
+    fn closed(&self, bus: usize) {
+        let mut buses = self.buses.lock().unwrap_or_else(PoisonError::into_inner);
+        // A stage that failed or was interrupted never finished.
+        for stage in buses.remove(&bus).unwrap_or_default().running {
+            self.stage_running(stage).dec();
+        }
+    }
+}
+
 /// The Runpod spend at `now` of each run of `runs` with a pod record. A record
 /// that cannot be read is skipped.
 fn pod_spends(runs: &Runs, now: SystemTime) -> Vec<(String, f64)> {
@@ -410,12 +409,11 @@ fn spend(pod: &PodRecord, now: SystemTime) -> Option<f64> {
     Some(pod.cost_per_hour? * pod.uptime(now)?.as_secs_f64() / 3600.0)
 }
 
-/// The running endpoint. Dropping it stops the server and the counting.
+/// The running endpoint. Dropping it stops the server and closes its connections.
 #[derive(Debug)]
 pub struct MetricsServer {
     address: SocketAddr,
     server: JoinHandle<()>,
-    counter: JoinHandle<()>,
 }
 
 impl MetricsServer {
@@ -429,42 +427,20 @@ impl MetricsServer {
 impl Drop for MetricsServer {
     fn drop(&mut self) {
         self.server.abort();
-        self.counter.abort();
     }
 }
 
-/// Serves `metrics` at `GET /metrics` on `address`, counting what `events` receives
-/// (the [`tap`](crate::events::tap) of the process).
+/// Serves `metrics` at `GET /metrics` on `address`. The metrics count what the
+/// buses observed by them publish.
 ///
 /// # Errors
 ///
 /// Returns an error when `address` cannot be bound.
-pub async fn serve(
-    address: SocketAddr,
-    metrics: Arc<Metrics>,
-    events: Receiver<Tap>,
-) -> io::Result<MetricsServer> {
+pub async fn serve(address: SocketAddr, metrics: Arc<Metrics>) -> io::Result<MetricsServer> {
     let listener = TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
-    let counter = tokio::spawn(count(Arc::clone(&metrics), events));
     let server = tokio::spawn(accept(listener, metrics));
-    Ok(MetricsServer {
-        address,
-        server,
-        counter,
-    })
-}
-
-async fn count(metrics: Arc<Metrics>, mut events: Receiver<Tap>) {
-    loop {
-        match events.recv().await {
-            Ok(tap) => metrics.observe(&tap),
-            Err(RecvError::Lagged(skipped)) => {
-                tracing::debug!("the metrics missed {skipped} event(s); their counts are low");
-            },
-            Err(RecvError::Closed) => return,
-        }
-    }
+    Ok(MetricsServer { address, server })
 }
 
 /// Serves each connection in its own task, all of them dropped with this one.
@@ -531,10 +507,8 @@ fn status(code: StatusCode, text: &str) -> Response<String> {
 mod tests {
     use std::time::UNIX_EPOCH;
 
-    use tokio::sync::broadcast;
-
     use super::*;
-    use crate::events::StageStats;
+    use crate::events::{EventBus, StageStats};
     use crate::history::Status;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -571,10 +545,6 @@ mod tests {
             cost,
             split: None,
         }
-    }
-
-    fn on(bus: u64, event: Event) -> Tap {
-        Tap::Event { bus, event }
     }
 
     fn metric(step: u64, loss: Option<f64>, eval_loss: Option<f64>) -> TrainMetric {
@@ -701,7 +671,7 @@ mod tests {
                 retryable: false,
             },
         ] {
-            metrics.observe(&on(1, event));
+            metrics.event(1, &event);
         }
         let text = metrics.encode()?;
         assert_value(&text, r#"overbrainer_stage_running{stage="answers"}"#, 1.0);
@@ -727,16 +697,16 @@ mod tests {
             r#"overbrainer_item_retries_total{stage="answers"}"#,
             1.0,
         );
-        metrics.observe(&on(
+        metrics.event(
             1,
-            Event::StageFinished {
+            &Event::StageFinished {
                 stage: Stage::Answers,
                 stats: StageStats {
                     excluded: 2,
                     ..StageStats::default()
                 },
             },
-        ));
+        );
         let text = metrics.encode()?;
         assert_value(&text, r#"overbrainer_stage_running{stage="answers"}"#, 0.0);
         assert_value(
@@ -751,17 +721,17 @@ mod tests {
     fn training_metrics_carry_the_run_their_bus_watches() -> TestResult {
         let metrics = Metrics::new(&[]);
         // Before its bus names the run, a metric has no run to go to.
-        metrics.observe(&on(2, Event::Metric(metric(1, Some(9.0), None))));
-        metrics.observe(&on(
+        metrics.event(2, &Event::Metric(metric(1, Some(9.0), None)));
+        metrics.event(
             2,
-            Event::RunWatched {
+            &Event::RunWatched {
                 run_id: "20260928-100000-a1b2".into(),
             },
-        ));
-        metrics.observe(&on(2, Event::Metric(metric(5, Some(1.5), None))));
-        metrics.observe(&on(2, Event::Metric(metric(6, None, Some(1.25)))));
+        );
+        metrics.event(2, &Event::Metric(metric(5, Some(1.5), None)));
+        metrics.event(2, &Event::Metric(metric(6, None, Some(1.25))));
         // Another bus watches no run.
-        metrics.observe(&on(3, Event::Metric(metric(7, Some(9.0), None))));
+        metrics.event(3, &Event::Metric(metric(7, Some(9.0), None)));
         let text = metrics.encode()?;
         let run = r#"{run_id="20260928-100000-a1b2"}"#;
         assert_value(&text, &format!("overbrainer_train_step{run}"), 6.0);
@@ -773,22 +743,45 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_far_larger_than_any_channel_is_fully_counted() -> TestResult {
+        const BURST: usize = 30_000;
+        let metrics = Arc::new(Metrics::new(&[]));
+        let bus = EventBus::observed(8, Some(Arc::clone(&metrics) as Arc<dyn Observer>));
+        let _behind = bus.subscribe();
+        for index in 0..BURST {
+            bus.publish(Event::ItemDone {
+                stage: Stage::Answers,
+                id: index.to_string(),
+                usage: None,
+                cost: None,
+            });
+        }
+        let text = metrics.encode()?;
+        assert_value(
+            &text,
+            r#"overbrainer_stage_items_total{stage="answers",result="skipped"}"#,
+            30_000.0,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_bus_that_ends_mid_stage_stops_it_running() -> TestResult {
         let metrics = Metrics::new(&[]);
         let started = Event::StageStarted {
             stage: Stage::Questions,
             total: 1,
         };
-        metrics.observe(&on(1, started.clone()));
-        metrics.observe(&on(2, started));
-        metrics.observe(&Tap::Closed { bus: 1 });
+        metrics.event(1, &started);
+        metrics.event(2, &started);
+        metrics.closed(1);
         assert_value(
             &metrics.encode()?,
             r#"overbrainer_stage_running{stage="questions"}"#,
             1.0,
         );
-        metrics.observe(&Tap::Closed { bus: 2 });
-        metrics.observe(&Tap::Closed { bus: 2 });
+        metrics.closed(2);
+        metrics.closed(2);
         assert_value(
             &metrics.encode()?,
             r#"overbrainer_stage_running{stage="questions"}"#,
@@ -828,13 +821,8 @@ mod tests {
     #[tokio::test]
     async fn the_endpoint_serves_the_families_and_nothing_else() -> TestResult {
         let history = [entry(Stage::Answers, Some("parent"), Some(0.5))];
-        let (sender, events) = broadcast::channel(16);
-        let server = serve(
-            "127.0.0.1:0".parse()?,
-            Arc::new(Metrics::new(&history)),
-            events,
-        )
-        .await?;
+        let metrics = Arc::new(Metrics::new(&history));
+        let server = serve("127.0.0.1:0".parse()?, Arc::clone(&metrics)).await?;
         let base = format!("http://{}", server.address());
         let client = reqwest::Client::new();
         let response = client.get(format!("{base}/metrics")).send().await?;
@@ -868,38 +856,27 @@ mod tests {
         ] {
             assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
         }
-        // The events it receives show at the next scrape.
-        sender.send(on(
-            1,
-            Event::StageStarted {
-                stage: Stage::Split,
-                total: 0,
-            },
-        ))?;
+        // What an observed bus publishes shows at the next scrape.
         let running = r#"overbrainer_stage_running{stage="split"}"#;
         assert_value(&text, running, 0.0);
-        let mut seen = None;
-        for _ in 0..100 {
-            let text = client
-                .get(format!("{base}/metrics"))
-                .send()
-                .await?
-                .text()
-                .await?;
-            seen = value(&text, running);
-            if seen == Some(1.0) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(seen, Some(1.0));
+        let bus = EventBus::observed(1, Some(metrics));
+        bus.publish(Event::StageStarted {
+            stage: Stage::Split,
+            total: 0,
+        });
+        let text = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await?
+            .text()
+            .await?;
+        assert_value(&text, running, 1.0);
         Ok(())
     }
 
     #[tokio::test]
     async fn dropping_the_server_frees_its_port() -> TestResult {
-        let (_sender, events) = broadcast::channel(1);
-        let server = serve("127.0.0.1:0".parse()?, Arc::new(Metrics::new(&[])), events).await?;
+        let server = serve("127.0.0.1:0".parse()?, Arc::new(Metrics::new(&[]))).await?;
         let address = server.address();
         assert!(
             TcpListener::bind(address).await.is_err(),

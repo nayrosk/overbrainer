@@ -2,8 +2,7 @@
 //! renders: the CLI turns events into log lines, the TUI (later) into views.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
@@ -149,12 +148,23 @@ pub enum Event {
     PodStatus(PodStatus),
 }
 
+/// Sees every event of the buses built with it, as they are published: nothing is
+/// ever skipped, however many come at once.
+pub trait Observer: Send + Sync {
+    /// `event` was published on bus `bus`, an ID unique among the open buses.
+    fn event(&self, bus: usize, event: &Event);
+    /// Every handle of bus `bus` was dropped: nothing more comes from it, and a
+    /// later bus may get its ID.
+    fn closed(&self, bus: usize);
+}
+
 /// Broadcast channel of [`Event`]s. Publishing never blocks and never fails: events
-/// without subscribers are dropped, and a slow subscriber skips old events.
+/// without subscribers are dropped, and a slow subscriber skips old events. An
+/// [`Observer`] given at creation sees each event before the subscribers.
 #[derive(Debug, Clone)]
 pub struct EventBus {
     sender: broadcast::Sender<Event>,
-    /// Shared by the clones: the last one dropped tells the [`tap`] the bus ended.
+    /// Shared by the clones: the last one dropped tells the observer.
     id: Arc<BusId>,
 }
 
@@ -172,21 +182,23 @@ impl EventBus {
     /// subscriber that falls behind.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::observed(capacity, None)
+    }
+
+    /// [`EventBus::with_capacity`], whose events `observer` also sees.
+    #[must_use]
+    pub fn observed(capacity: usize, observer: Option<Arc<dyn Observer>>) -> Self {
         let (sender, _) = broadcast::channel(capacity.max(1));
         Self {
             sender,
-            id: Arc::new(BusId::next()),
+            id: Arc::new(BusId { observer }),
         }
     }
 
-    /// Sends `event` to every current subscriber, and a copy to the [`tap`].
+    /// Sends `event` to the observer, then to every current subscriber.
     pub fn publish(&self, event: Event) {
-        if let Some(tap) = listened_tap() {
-            tap.send(Tap::Event {
-                bus: self.id.0,
-                event: event.clone(),
-            })
-            .ok();
+        if let Some(observer) = &self.id.observer {
+            observer.event(self.id.key(), &event);
         }
         self.sender.send(event).ok();
     }
@@ -202,64 +214,31 @@ impl EventBus {
     pub(crate) fn receiver_count(&self) -> usize {
         self.sender.receiver_count()
     }
+}
 
-    /// The ID the [`tap`] gives this bus.
-    #[cfg(test)]
-    pub(crate) fn id(&self) -> u64 {
-        self.id.0
+/// The identity of a bus and its clones: its address, while it lives.
+struct BusId {
+    observer: Option<Arc<dyn Observer>>,
+}
+
+impl BusId {
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self).addr()
     }
 }
 
-/// What the [`tap`] receives from the buses of the process.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Tap {
-    /// `event` was published on bus `bus`.
-    Event {
-        /// ID of the bus, unique in the process.
-        bus: u64,
-        /// The event.
-        event: Event,
-    },
-    /// Every handle of bus `bus` was dropped: nothing more comes from it.
-    Closed {
-        /// ID of the bus.
-        bus: u64,
-    },
-}
-
-/// The tap's channel, created by the first [`tap`] call.
-static TAP: OnceLock<broadcast::Sender<Tap>> = OnceLock::new();
-
-/// Receives a copy of every event any bus of the process publishes from now on,
-/// with the ID of its bus, and the end of each bus. Keeps [`EventBus::CAPACITY`]
-/// of them for a receiver that falls behind. Buses cost nothing more while no
-/// receiver listens.
-#[must_use]
-pub fn tap() -> broadcast::Receiver<Tap> {
-    TAP.get_or_init(|| broadcast::channel(EventBus::CAPACITY).0)
-        .subscribe()
-}
-
-/// The tap, when someone listens to it.
-fn listened_tap() -> Option<&'static broadcast::Sender<Tap>> {
-    TAP.get().filter(|tap| tap.receiver_count() > 0)
-}
-
-/// The identity of a bus and its clones.
-#[derive(Debug)]
-struct BusId(u64);
-
-impl BusId {
-    fn next() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+impl fmt::Debug for BusId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BusId")
+            .field("observed", &self.observer.is_some())
+            .finish()
     }
 }
 
 impl Drop for BusId {
     fn drop(&mut self) {
-        if let Some(tap) = listened_tap() {
-            tap.send(Tap::Closed { bus: self.0 }).ok();
+        if let Some(observer) = &self.observer {
+            observer.closed(self.key());
         }
     }
 }
@@ -296,64 +275,57 @@ mod tests {
         Ok(())
     }
 
-    /// What the tap gave for two buses of this test, the second one still open;
-    /// `None` when other tests of this process, which publish on the tap too,
-    /// made it skip some.
-    async fn tapped() -> Option<(u64, u64, Vec<Tap>)> {
-        let mut tap = tap();
-        let (first, second) = (EventBus::new(), EventBus::new());
-        let clone = first.clone();
-        let (a, b) = (first.id(), second.id());
-        clone.publish(Event::StageStarted {
-            stage: Stage::Answers,
-            total: 1,
-        });
-        second.publish(Event::StageStarted {
-            stage: Stage::Split,
-            total: 2,
-        });
-        drop(first);
-        drop(clone);
-        let mut seen = Vec::new();
-        while seen.len() < 3 {
-            match tap.recv().await.ok()? {
-                Tap::Event { bus, .. } | Tap::Closed { bus } if bus != a && bus != b => {},
-                tapped => seen.push(tapped),
+    /// What an observer saw: `Ok` events and `Err` ends, by bus.
+    #[derive(Default)]
+    struct Seen(std::sync::Mutex<Vec<Result<(usize, Event), usize>>>);
+
+    impl Observer for Seen {
+        fn event(&self, bus: usize, event: &Event) {
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(Ok((bus, event.clone())));
             }
         }
-        Some((a, b, seen))
+
+        fn closed(&self, bus: usize) {
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(Err(bus));
+            }
+        }
     }
 
-    #[tokio::test]
-    async fn the_tap_gets_every_bus_and_their_end() -> Result<(), String> {
-        for _ in 0..20 {
-            let Some((a, b, seen)) = tapped().await else {
-                continue;
-            };
-            assert_ne!(a, b);
-            assert_eq!(
-                seen,
-                [
-                    Tap::Event {
-                        bus: a,
-                        event: Event::StageStarted {
-                            stage: Stage::Answers,
-                            total: 1
-                        }
-                    },
-                    Tap::Event {
-                        bus: b,
-                        event: Event::StageStarted {
-                            stage: Stage::Split,
-                            total: 2
-                        }
-                    },
-                    Tap::Closed { bus: a },
-                ]
-            );
-            return Ok(());
+    #[test]
+    fn an_observer_sees_every_event_of_its_buses_and_their_end() -> Result<(), String> {
+        let seen = Arc::new(Seen::default());
+        let observer: Arc<dyn Observer> = seen.clone();
+        let first = EventBus::observed(1, Some(Arc::clone(&observer)));
+        let second = EventBus::observed(1, Some(observer));
+        let clone = first.clone();
+        let (a, b) = (first.id.key(), second.id.key());
+        assert_ne!(a, b);
+        let started = |total| Event::StageStarted {
+            stage: Stage::Answers,
+            total,
+        };
+        // Far more than the channel keeps, with no subscriber at all.
+        for total in 0..3 {
+            clone.publish(started(total));
         }
-        Err("the tap lagged on every try".to_string())
+        second.publish(started(9));
+        EventBus::new().publish(started(5));
+        drop(first);
+        drop(clone);
+        let seen = seen.0.lock().map_err(|e| e.to_string())?;
+        assert_eq!(
+            *seen,
+            [
+                Ok((a, started(0))),
+                Ok((a, started(1))),
+                Ok((a, started(2))),
+                Ok((b, started(9))),
+                Err(a),
+            ]
+        );
+        Ok(())
     }
 
     #[test]

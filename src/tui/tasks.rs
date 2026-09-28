@@ -27,7 +27,7 @@ use crate::cli::front::{Frontend, Report};
 use crate::cli::{StageArgs, TrainArgs, TrainCommand};
 use crate::config::{DotenvKeys, EnvSource, ReloadError, Source, Stamp, reload, stamp};
 use crate::dataset::{Counts, DataFiles, Dataset, Deletion};
-use crate::events::{Event, EventBus, Stage};
+use crate::events::{Event, EventBus, Observer, Stage};
 use crate::history::{self, Cost, Entry, Total};
 use crate::pipeline::{Ctx, SplitReport};
 use crate::prompts::Prompts;
@@ -311,16 +311,17 @@ async fn forwarded(front: Frontend, forwarder: JoinHandle<()>, what: &str) {
     }
 }
 
-/// A TUI front end for task `id`: its own bus, forwarded to `messages` by the
-/// task returned with it, its detach token and abandon flag, and its reports
-/// sent as messages.
+/// A TUI front end for task `id`: its own bus, seen by `observer` if any and
+/// forwarded to `messages` by the task returned with it, its detach token and
+/// abandon flag, and its reports sent as messages.
 fn front_end(
     id: TaskId,
     messages: &UnboundedSender<Msg>,
     detach: &CancellationToken,
     abandon: &Arc<AtomicBool>,
+    observer: Option<Arc<dyn Observer>>,
 ) -> (Frontend, JoinHandle<()>) {
-    let bus = EventBus::with_capacity(BUS_CAPACITY);
+    let bus = EventBus::observed(BUS_CAPACITY, observer);
     let forwarder = forward(id, bus.subscribe(), messages.clone());
     let sink = messages.clone();
     let front = Frontend::Tui {
@@ -388,6 +389,8 @@ pub(super) struct Tasks {
     /// Where the tasks started from now read the settings: the configuration
     /// the app keeps, never a file it has not validated.
     source: Source,
+    /// Sees the events of every pipeline and training task.
+    observer: Option<Arc<dyn Observer>>,
 }
 
 impl Tasks {
@@ -403,6 +406,7 @@ impl Tasks {
             abandons: HashMap::new(),
             lookups: HashMap::new(),
             source: Source::from(EnvSource::Process),
+            observer: None,
         }
     }
 
@@ -410,6 +414,11 @@ impl Tasks {
     /// running keep the settings they read.
     pub(super) fn use_config(&mut self, source: Source) {
         self.source = source;
+    }
+
+    /// Has `observer` see the events of the tasks started from now on.
+    pub(super) fn observe(&mut self, observer: Option<Arc<dyn Observer>>) {
+        self.observer = observer;
     }
 
     /// The project directory tasks are spawned for.
@@ -591,7 +600,8 @@ impl Tasks {
         let source = self.source.clone();
         let token = CancellationToken::new();
         let abandon = Arc::new(AtomicBool::new(false));
-        let (front, forwarder) = front_end(id, &self.messages, &token, &abandon);
+        let (front, forwarder) =
+            front_end(id, &self.messages, &token, &abandon, self.observer.clone());
         self.tokens.insert(id, token.clone());
         self.set.spawn(async move {
             let args = StageArgs::default();
@@ -612,7 +622,8 @@ impl Tasks {
         let source = self.source.clone();
         let token = CancellationToken::new();
         let abandon = Arc::new(AtomicBool::new(false));
-        let (front, forwarder) = front_end(id, &self.messages, &token, &abandon);
+        let (front, forwarder) =
+            front_end(id, &self.messages, &token, &abandon, self.observer.clone());
         self.tokens.insert(id, token);
         self.abandons.insert(id, abandon);
         self.set.spawn(async move {
