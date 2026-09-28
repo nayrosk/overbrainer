@@ -177,7 +177,7 @@ fn form_lines(form: &Form, width: u16, theme: &Theme) -> Vec<Line<'static>> {
             let mut line = vec![prompt];
             line.extend(input.line(room, Style::new()).spans);
             let hint = match what {
-                Addable::Topic => "a name no topic has",
+                Addable::Topic => "a-z, 0-9 and _, not already used",
                 Addable::Provider | Addable::Target => "a-z, 0-9 and _",
             };
             vec![Line::from(line), note(error, hint.to_string())]

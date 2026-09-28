@@ -1488,6 +1488,12 @@ mod tests {
         assert!(rows.contains("subtopics = 2x"), "{rows}");
         assert!(rows.contains("at least 1"), "{rows}");
         assert!(rows.contains("Enter keep"), "{rows}");
+        press(
+            &mut app,
+            &[KeyCode::Esc, KeyCode::Char('a'), KeyCode::Enter],
+        );
+        let rows = screen(&draw(&mut app, 80, 24)?).join("\n");
+        assert!(rows.contains("a-z, 0-9 and _, not already used"), "{rows}");
         Ok(())
     }
 
