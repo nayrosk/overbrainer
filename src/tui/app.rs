@@ -462,6 +462,18 @@ pub(super) struct App {
     pub(super) exit: Option<Exit>,
     /// The log sequence number last looked at.
     seen_log: u64,
+    /// What the TUI opens with.
+    pub(super) opening: Opening,
+}
+
+/// What the TUI opens with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Opening {
+    /// The Project view.
+    Project,
+    /// Auto mode's confirmation, over the Project view: the init wizard was
+    /// answered yes.
+    Auto,
 }
 
 impl App {
@@ -525,6 +537,7 @@ impl App {
             },
             dirty: true,
             exit: None,
+            opening: Opening::Project,
         }
     }
 

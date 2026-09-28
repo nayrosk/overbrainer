@@ -3,15 +3,111 @@
 //! the state alone: the screens, their fields, what a key does, and what a
 //! screen refuses before the next one. Nothing here draws or writes a file.
 
+mod view;
 mod write;
 
 use std::fmt;
+use std::io;
+use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use anyhow::Context as _;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::Terminal;
+use ratatui::backend::Backend;
 
+use super::terminal::{self, TerminalGuard};
+use super::theme::{ColorLevel, LookEnv, Theme};
 use super::widgets::form::{Input, InputOutcome};
 use crate::config::{Adapter, ListOrAuto, Protocol, Runtime, is_valid_name};
 use crate::secrets::{is_reference, parse_reference};
+
+/// How the wizard ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// Ctrl-C: before the files were written, nothing was.
+    Quit {
+        /// Whether the files were written first.
+        written: bool,
+    },
+    /// The files are written: the TUI opens, in auto mode when `auto`.
+    Open {
+        /// Start auto mode now.
+        auto: bool,
+    },
+}
+
+/// Runs the wizard on the real terminal for the project in `dir`. It reads
+/// the terminal on this thread alone, starting none: the caller loads `.env`
+/// after it, while the process still has a single thread.
+///
+/// # Errors
+///
+/// Returns an error when the terminal cannot be set up, read or drawn on.
+pub(super) fn run(dir: &Path) -> anyhow::Result<Ended> {
+    let name = dir
+        .canonicalize()
+        .ok()
+        .and_then(|dir| {
+            dir.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    let theme = Theme::new(ColorLevel::detect(&LookEnv::from_process()));
+    let guard = TerminalGuard::enter();
+    let mut terminal = terminal::init().context("cannot set up the terminal")?;
+    let result = drive(
+        &mut *terminal,
+        &mut Wizard::new(&name),
+        dir,
+        &theme,
+        event::read,
+    );
+    drop(guard);
+    result
+}
+
+/// The wizard's loop on any backend: draws, then hands `next`'s event to the
+/// wizard, until it ends. Enter on the summary writes the files into `dir`.
+///
+/// # Errors
+///
+/// Returns an error when drawing fails or `next` cannot read an event.
+fn drive<B>(
+    terminal: &mut Terminal<B>,
+    wizard: &mut Wizard,
+    dir: &Path,
+    theme: &Theme,
+    mut next: impl FnMut() -> io::Result<Event>,
+) -> anyhow::Result<Ended>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+{
+    loop {
+        terminal.draw(|frame| view::render(frame, wizard, theme))?;
+        let key = match next().context("cannot read the terminal")? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => key,
+            Event::Paste(text) => {
+                wizard.on_paste(&text);
+                continue;
+            },
+            _ => continue,
+        };
+        match wizard.on_key(key) {
+            Step::Stay => {},
+            Step::Write => match write::write(dir, &wizard.answers()) {
+                Ok(()) => wizard.written(),
+                Err(error) => wizard.write_failed(error),
+            },
+            Step::Quit => {
+                return Ok(Ended::Quit {
+                    written: wizard.screen() == Screen::Start,
+                });
+            },
+            Step::Done { auto } => return Ok(Ended::Open { auto }),
+        }
+    }
+}
 
 /// A provider the wizard knows: its table name, protocol and base URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,23 +337,23 @@ impl Field {
     pub(super) fn hint(self) -> &'static str {
         match self {
             Self::Name => "the name of the project",
-            Self::Provider => "← → to choose; presets fill the protocol and the base URL",
+            Self::Provider => "← → choose; a preset fills protocol and base URL",
             Self::CustomName => "the [providers.<name>] table: a-z, 0-9 and _",
-            Self::Protocol => "← → to choose: openai (chat completions) or anthropic (messages)",
-            Self::BaseUrl => "the URL the protocol's paths are appended to",
+            Self::Protocol => "← → choose: openai or anthropic",
+            Self::BaseUrl => "the URL the protocol's paths go after",
             Self::ApiKey | Self::RunpodKey => {
-                "a key, a vault:<mount>/<path>#<field> reference, or empty to fill .env later"
+                "a key, vault:<mount>/<path>#<field>, or empty for later"
             },
             Self::Generator => "the model writing subtopics and questions",
             Self::Parent => "the model whose answers the child learns",
-            Self::Reasoning => "← → to choose: ask the parent for its reasoning",
+            Self::Reasoning => "← → choose: ask the parent for its reasoning",
             Self::Embedder => "optional: an embedding model for duplicate detection",
-            Self::Training => "← → to choose; skip stops auto mode after split",
-            Self::Runtime => "← → to choose: native (a venv) or docker (a container)",
+            Self::Training => "← → choose; skip stops auto mode after split",
+            Self::Runtime => "← → choose: native (a venv) or docker (a container)",
             Self::Host => "the SSH destination, for example user@gpu-box",
-            Self::GpuTypes => "auto (cheapest in stock) or GPU types separated by commas",
+            Self::GpuTypes => "auto (cheapest in stock) or GPU types, comma-separated",
             Self::BaseModel => "a Hugging Face repo ID or a path on the target",
-            Self::Adapter => "← → to choose: lora, qlora or full",
+            Self::Adapter => "← → choose: lora, qlora or full",
         }
     }
 
@@ -272,11 +368,6 @@ impl Field {
                 | Self::Runtime
                 | Self::Adapter
         )
-    }
-
-    /// Whether it holds a secret.
-    pub(super) fn is_secret(self) -> bool {
-        matches!(self, Self::ApiKey | Self::RunpodKey)
     }
 }
 
@@ -1195,6 +1286,8 @@ fn secret_summary(kind: SecretKind) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::backend::TestBackend;
+
     use super::*;
 
     const SECRET: &str = "sk-placeholder-secret";
@@ -1511,6 +1604,76 @@ mod tests {
             Step::Quit,
             "written: nothing to lose"
         );
+    }
+
+    /// Runs the loop on `events`, in a new directory; returns how it ended
+    /// and the names of the files it holds then.
+    fn drove(events: Vec<Event>) -> Result<(Ended, Vec<String>), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let mut events = events.into_iter();
+        let theme = Theme::mono();
+        let mut wizard = Wizard::new("demo");
+        let ended = drive(&mut terminal, &mut wizard, dir.path(), &theme, || {
+            events
+                .next()
+                .ok_or_else(|| io::Error::other("no more events"))
+        })?;
+        let mut files: Vec<String> = std::fs::read_dir(dir.path())?
+            .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, _>>()?;
+        files.sort();
+        Ok((ended, files))
+    }
+
+    fn keys(codes: &[KeyCode]) -> Vec<Event> {
+        codes.iter().map(|code| Event::Key(key(*code))).collect()
+    }
+
+    #[test]
+    fn ctrl_c_then_y_quits_the_loop_writing_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let mut events = keys(&[KeyCode::Enter]);
+        events.push(Event::Key(ctrl_c()));
+        events.extend(keys(&[KeyCode::Char('y')]));
+        assert_eq!(drove(events)?, (Ended::Quit { written: false }, Vec::new()));
+        Ok(())
+    }
+
+    #[test]
+    fn the_loop_writes_the_files_then_opens_the_tui_as_answered()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (answer, auto) in [(KeyCode::Char('y'), true), (KeyCode::Char('n'), false)] {
+            let mut events = keys(&[KeyCode::Enter, KeyCode::Enter]);
+            events.push(Event::Paste(SECRET.to_string()));
+            events.extend(keys(&[KeyCode::Enter]));
+            events.extend("gen".chars().map(|c| Event::Key(key(KeyCode::Char(c)))));
+            events.extend(keys(&[KeyCode::Down]));
+            events.extend("par".chars().map(|c| Event::Key(key(KeyCode::Char(c)))));
+            events.extend(keys(&[KeyCode::Enter, KeyCode::Char('a')]));
+            events.push(Event::Paste("ownership".to_string()));
+            // Topic kept, Training, Model, Summary, write, then the answer.
+            events.extend(keys(&[
+                KeyCode::Enter,
+                KeyCode::Enter,
+                KeyCode::Enter,
+                KeyCode::Enter,
+                KeyCode::Enter,
+                answer,
+            ]));
+            let (ended, files) = drove(events)?;
+            assert_eq!(ended, Ended::Open { auto });
+            assert_eq!(
+                files,
+                [
+                    ".env",
+                    ".env.example",
+                    ".gitignore",
+                    "overbrainer.toml",
+                    "prompts"
+                ]
+            );
+        }
+        Ok(())
     }
 
     #[test]

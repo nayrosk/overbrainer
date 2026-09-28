@@ -48,6 +48,11 @@ pub struct Cli {
     /// The subcommand to run.
     #[command(subcommand)]
     pub command: Command,
+
+    /// Whether `tui` starts in auto mode: set by the init wizard, never
+    /// parsed.
+    #[arg(skip)]
+    pub auto: bool,
 }
 
 /// Top-level subcommands.
@@ -294,6 +299,38 @@ pub enum ConfigCommand {
     },
 }
 
+/// Runs the init wizard when `cli` is `tui` on a terminal and the project
+/// has no `overbrainer.toml`, before anything else: `.env` is loaded after
+/// it, which it may write, and the project lock is taken once the files
+/// exist. Returns whether the command goes on: not when the wizard was quit.
+///
+/// # Errors
+///
+/// Returns an error when the wizard cannot use the terminal.
+pub fn wizard(cli: &mut Cli) -> anyhow::Result<bool> {
+    let config = cli.project_dir.join(crate::config::CONFIG_FILE);
+    let wanted = matches!(cli.command, Command::Tui)
+        && std::io::stdout().is_terminal()
+        && config.symlink_metadata().is_err();
+    if !wanted {
+        return Ok(true);
+    }
+    match crate::tui::wizard(&cli.project_dir)? {
+        crate::tui::WizardEnded::Open { auto } => {
+            cli.auto = auto;
+            Ok(true)
+        },
+        crate::tui::WizardEnded::Quit { written: false } => {
+            eprintln!("init wizard quit: nothing was written");
+            Ok(false)
+        },
+        crate::tui::WizardEnded::Quit { written: true } => {
+            eprintln!("the project is written: `overbrainer tui` opens it");
+            Ok(false)
+        },
+    }
+}
+
 /// Runs the parsed command line, whose logs were set up with `logs` (see
 /// [`Command::log_mode`]); `dotenv` are the keys `.env` set at start, which a
 /// reload of the configuration replaces (`tui`, and `run` between stages). Meanwhile it looks for a newer release, told on
@@ -359,6 +396,7 @@ async fn dispatch(
     dotenv: DotenvKeys,
 ) -> anyhow::Result<()> {
     let dir = &cli.project_dir;
+    let auto = cli.auto;
     // Only a project takes the lock: without `overbrainer.toml` the command fails
     // with its usual error and leaves nothing behind.
     let lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
@@ -410,7 +448,8 @@ async fn dispatch(
         Command::Skill { command } => skill::run(dir, &command),
         Command::Tui => match logs {
             LogMode::Tui(buffer) => {
-                crate::tui::run(dir, buffer, check.take(), dotenv, observer).await
+                let start = crate::tui::Start { dotenv, auto };
+                crate::tui::run(dir, buffer, check.take(), start, observer).await
             },
             LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),
         },

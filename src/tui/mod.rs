@@ -50,10 +50,38 @@ use crate::events::Observer;
 use crate::logging::LogBuffer;
 use crate::update::Newer;
 
+pub use self::wizard::Ended as WizardEnded;
+
+/// How [`run`] starts the TUI.
+#[derive(Debug, Default)]
+pub struct Start {
+    /// The keys `.env` set at start, which a reload replaces.
+    pub dotenv: DotenvKeys,
+    /// Whether auto mode's confirmation opens at once: the init wizard was
+    /// answered yes.
+    pub auto: bool,
+}
+
+/// Runs the init wizard for the project in `project_dir`, which has no
+/// `overbrainer.toml`: it asks what the project needs, screen by screen, then
+/// writes it. It starts no thread, so `.env` can be loaded after it.
+///
+/// # Errors
+///
+/// Returns an error when stdout is not a terminal, or the terminal cannot be
+/// set up, read or drawn on.
+pub fn wizard(project_dir: &Path) -> anyhow::Result<WizardEnded> {
+    if !std::io::stdout().is_terminal() {
+        bail!("overbrainer tui needs a terminal: stdout is not a TTY");
+    }
+    wizard::run(project_dir)
+}
+
 /// Runs the terminal UI on the project in `project_dir`; `logs` holds the log
 /// lines the Logs view shows; the answer of `check`, when newer, shows in the
-/// footer; `dotenv` are the keys `.env` set at start; `observer` sees the
-/// events of the stages and trainings it runs.
+/// footer; `start` holds the keys `.env` set at start and whether auto
+/// mode's confirmation opens at once; `observer` sees the events of the
+/// stages and trainings it runs, auto mode's included.
 ///
 /// # Errors
 ///
@@ -63,7 +91,7 @@ pub async fn run(
     project_dir: &Path,
     logs: LogBuffer,
     check: Option<JoinHandle<Option<Newer>>>,
-    dotenv: DotenvKeys,
+    start: Start,
     observer: Option<Arc<dyn Observer>>,
 ) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() {
@@ -82,7 +110,10 @@ pub async fn run(
     let theme = Theme::new(color);
     let mut app = App::new(project, logs, &theme, SystemTime::now());
     app.set_config(config);
-    app.watch = Some(ConfigWatch::new(dotenv, read_at));
+    app.watch = Some(ConfigWatch::new(start.dotenv, read_at));
+    if start.auto {
+        app.opening = app::Opening::Auto;
+    }
     app.motion = Motion::new(MotionLevel::detect(&env, color)).colored(&theme);
     for warning in env.warnings() {
         tracing::warn!("{warning}");

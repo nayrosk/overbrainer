@@ -1,6 +1,5 @@
 ---
 source: src/tui/wizard/write.rs
-assertion_line: 396
 ---
 --- overbrainer.toml
 # overbrainer project configuration.
