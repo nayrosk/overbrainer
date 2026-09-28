@@ -741,7 +741,6 @@ impl App {
     /// end); those of any other task are dropped.
     pub(super) fn on_message(&mut self, message: Msg) -> Vec<Effect> {
         self.dirty = true;
-
         let id = match &message {
             Msg::Event(id, _) | Msg::Lagged(id, _) | Msg::Report(id, _) => *id,
             Msg::EditorExited(_) => return Vec::new(),
@@ -1445,12 +1444,19 @@ impl App {
         effects
     }
 
-    /// What the TUI waits for once its loop ended, one line each: an edit being
-    /// saved, the stage stopping, and each training task.
+    /// What the TUI waits for once its loop ended, one line each: an edit or
+    /// `overbrainer.toml` being saved, the stage stopping, and each training
+    /// task.
     pub(super) fn waiting_for(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if self.edit.is_some() {
             lines.push("waiting for an edit to be saved...".to_string());
+        }
+        if self.project_view.save.is_some() {
+            lines.push(format!(
+                "waiting for {} to be saved...",
+                crate::config::CONFIG_FILE
+            ));
         }
         if self.pipeline_task.is_some() {
             let name = self.pipeline.command.map_or("stage", command_name);
@@ -3313,6 +3319,16 @@ mod tests {
         app.on_done(TaskId(7), Ok(Done::Pipeline(Err("interrupted".into()))));
         assert_eq!(app.exit, Some(Exit::Quit));
         assert_eq!(app.exit_notes, ["run: interrupted"]);
+    }
+
+    #[test]
+    fn a_save_in_flight_is_waited_for() {
+        let mut app = app();
+        app.project_view.save = Some(TaskId(12));
+        assert_eq!(
+            app.waiting_for(),
+            ["waiting for overbrainer.toml to be saved..."]
+        );
     }
 
     /// The loop ended with a Runpod run still provisioning: it is never
