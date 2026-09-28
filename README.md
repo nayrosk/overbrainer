@@ -162,6 +162,32 @@ Runpod: [runpod.io](https://runpod.io?ref=ym24z23f) (referral link). A run's LoR
 
 The TUI draws its own crimson theme in 24-bit or 256 colors, and falls back to the terminal's 16 colors. `OVERBRAINER_TUI_COLOR` (`truecolor`, `256` or `16`) and `OVERBRAINER_TUI_MOTION` (`on`, `reduced` or `off`) override the detection, and `NO_COLOR` turns it monochrome. [The TUI page](docs/tui.md) has every key and behavior.
 
+## Metrics
+
+With `[metrics] listen = "127.0.0.1:9464"` in `overbrainer.toml` (or `OVERBRAINER_METRICS__LISTEN`), a command that writes to the project, `tui` included, serves Prometheus metrics at `GET /metrics` for as long as it runs. The counters are cumulative per project: they start from the stage history.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `overbrainer_stage_items_total` | counter | `stage`, `result` (`done`, `skipped`, `failed`, `excluded`) |
+| `overbrainer_tokens_total` | counter | `stage`, `model`, `direction` (`in`, `out`) |
+| `overbrainer_cost_usd_total` | counter | `stage`, `model` |
+| `overbrainer_stage_running` | gauge | `stage` |
+| `overbrainer_item_retries_total` | counter | `stage` |
+| `overbrainer_train_step`, `overbrainer_train_loss`, `overbrainer_eval_loss`, `overbrainer_learning_rate` | gauge | `run_id` |
+| `overbrainer_runpod_spend_usd` | gauge | `run_id` |
+| `overbrainer_build_info` | gauge | `version` |
+
+A Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: overbrainer
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
+```
+
+The endpoint has no authentication: keep it on a loopback address. [Configuration](docs/configuration.md#metrics) describes each metric.
+
 ## AI agents
 
 overbrainer ships an [agent skill](https://agentskills.io) that teaches AI coding agents to drive it: set up a project, run the stages and training, read the results, and keep to a few rules (never read `.env`, ask before spending money, clean up Runpod pods). It matches the installed version of overbrainer.
@@ -182,7 +208,7 @@ An installed skill that was edited is only replaced with `--force`. In Claude Co
 ## Documentation
 
 - [The dataset pipeline](docs/pipeline.md): stages, resuming, deduplication, the split, the answer format, reasoning, prompt templates, and the project state (`history.jsonl` and the lock).
-- [Configuration](docs/configuration.md): `overbrainer.toml`, environment variables, providers, roles, pipeline settings, Vault and logs.
+- [Configuration](docs/configuration.md): `overbrainer.toml`, environment variables, providers, roles, pipeline settings, Prometheus metrics, Vault and logs.
 - [Training](docs/training.md): runs, local and SSH targets, the Hugging Face token, chat templates and training settings.
 - [Runpod](docs/runpod.md): pods, the watchdog, `--keep-pod`, stray pods and custom images.
 - [Terminal UI](docs/tui.md): views, keys, editing, quitting, color and motion.
