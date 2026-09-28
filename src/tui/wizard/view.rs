@@ -16,6 +16,8 @@ use crate::tui::widgets::{centered, dialog, too_small};
 
 /// The widest the screen's box gets.
 const MAX_WIDTH: u16 = 84;
+/// The row of the topic list's first topic.
+const TOPICS_FROM: usize = 2;
 /// Columns of a label, before its value.
 const LABEL: usize = 12;
 
@@ -63,12 +65,7 @@ pub(super) fn render(frame: &mut Frame, wizard: &Wizard, theme: &Theme) {
         Screen::Start => start(wizard, theme),
         _ => fields(wizard, inner.width, theme),
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(theme.text_hi)
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
+    frame.render_widget(scrolled(wizard, lines, inner, theme), inner);
     frame.render_widget(
         Paragraph::new(Line::styled(keys(wizard), theme.dim)),
         footer,
@@ -76,6 +73,31 @@ pub(super) fn render(frame: &mut Frame, wizard: &Wizard, theme: &Theme) {
     if wizard.quitting() {
         quit_dialog(frame, area, theme);
     }
+}
+
+/// `lines` as drawn in `area`, scrolled so what matters stays in view: the
+/// selected topic of a long list (one row each, never wrapped), the end of
+/// a long summary (what Enter writes, and why it was refused).
+fn scrolled<'a>(wizard: &Wizard, lines: Vec<Line<'a>>, area: Rect, theme: &Theme) -> Paragraph<'a> {
+    let height = usize::from(area.height);
+    let paragraph = Paragraph::new(lines).style(theme.text_hi);
+    let (paragraph, scroll) = match wizard.screen() {
+        Screen::Topics if wizard.topic_form().is_none() => {
+            // The topics come after the intro and a blank line.
+            let row = TOPICS_FROM + wizard.selected() + 1;
+            (paragraph, row.saturating_sub(height))
+        },
+        screen => {
+            let paragraph = paragraph.wrap(Wrap { trim: false });
+            let scroll = if screen == Screen::Summary {
+                paragraph.line_count(area.width).saturating_sub(height)
+            } else {
+                0
+            };
+            (paragraph, scroll)
+        },
+    };
+    paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
 }
 
 /// The keys the screen shown takes.
@@ -380,6 +402,36 @@ mod tests {
         ] {
             snapshot(name, &filled(screen))?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_long_topic_list_and_its_summary_keep_what_matters_in_view() -> TestResult {
+        let mut wizard = filled(Screen::Topics);
+        wizard.topics = (0..40)
+            .map(|at| TopicDraft {
+                name: format!("topic_{at:02}"),
+                description: String::new(),
+                subtopics: 1,
+                questions_per_subtopic: 1,
+            })
+            .collect();
+        for selected in [0, 17, 39] {
+            wizard.selected = selected;
+            let screen = draw(&wizard, 80, 24)?;
+            assert!(
+                screen.contains(&format!("▶ topic_{selected:02}")),
+                "{screen}"
+            );
+        }
+        wizard.screen = Screen::Summary;
+        wizard.error = Some("overbrainer.toml already exists: nothing was written".into());
+        let screen = draw(&wizard, 80, 24)?;
+        assert!(screen.contains("No file is overwritten."), "{screen}");
+        assert!(
+            screen.contains("already exists: nothing was written"),
+            "{screen}"
+        );
         Ok(())
     }
 
