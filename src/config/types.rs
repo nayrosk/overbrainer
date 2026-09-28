@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 use secrecy::SecretString;
@@ -32,6 +33,9 @@ pub struct Settings {
     /// Credentials for the Runpod API.
     #[serde(default)]
     pub runpod: Runpod,
+    /// The Prometheus endpoint, off unless `metrics.listen` is set.
+    #[serde(default)]
+    pub metrics: Metrics,
     /// Hugging Face access token. Env only.
     pub hf_token: Option<SecretString>,
     /// Log filter. Env only. Read directly from `OVERBRAINER_LOG` at startup; declared
@@ -646,4 +650,13 @@ pub struct Runpod {
     /// Env only. Base URL of the REST API, [`DEFAULT_RUNPOD_BASE_URL`] when unset.
     /// Must be `https`, or `http` on a loopback host (a test stub).
     pub base_url: Option<String>,
+}
+
+/// The Prometheus endpoint.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metrics {
+    /// Address `GET /metrics` listens on while a command holds the project, such
+    /// as `127.0.0.1:9464`. No endpoint when unset.
+    pub listen: Option<SocketAddr>,
 }
