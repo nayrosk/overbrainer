@@ -268,7 +268,7 @@ impl Availability {
     }
 }
 
-/// A GPU type of the catalog (`GET /catalog/gpus` and `/catalog/gpus/{id}`).
+/// A GPU type of the catalog (`GET /catalog/gpus`).
 /// Only the fields overbrainer uses are read; every one tolerates `null`.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
