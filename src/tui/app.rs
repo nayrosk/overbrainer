@@ -328,6 +328,8 @@ pub(super) struct App {
     /// The cost of the stages the history recorded at the last load, `None`
     /// while none spent anything.
     pub(super) history_cost: Option<crate::history::Cost>,
+    /// The last error reading the history, warned once, until a read works.
+    history_error: Option<String>,
     /// The Pipeline view's state.
     pub(super) pipeline: PipelineView,
     /// The pipeline task running, if any.
@@ -388,6 +390,7 @@ impl App {
             editing: None,
             editor: vec!["vi".to_string()],
             history_cost: None,
+            history_error: None,
             pipeline: PipelineView::default(),
             pipeline_task: None,
             pipeline_last: None,
@@ -551,7 +554,7 @@ impl App {
 
     /// Load `id` read `loaded` and the cost in the history: shown when it is the
     /// load running, else ignored. A history that cannot be read keeps the cost
-    /// known so far.
+    /// known so far; its error is warned once, not at every quiet reload.
     fn on_loaded(
         &mut self,
         id: TaskId,
@@ -564,8 +567,16 @@ impl App {
         self.load = None;
         self.reloaded = self.now;
         match history {
-            Ok(cost) => self.history_cost = cost,
-            Err(error) => tracing::warn!("{error}"),
+            Ok(cost) => {
+                self.history_cost = cost;
+                self.history_error = None;
+            },
+            // Every quiet reload reads it again: warn once per new error.
+            Err(error) if self.history_error.as_ref() != Some(&error) => {
+                tracing::warn!("{error}");
+                self.history_error = Some(error);
+            },
+            Err(_) => {},
         }
         match loaded {
             Ok(data) => self.dataset.loaded(data, &self.project.topics),
@@ -2051,6 +2062,35 @@ mod tests {
             Ok(Done::Loaded(Ok(dataset()), Err("permission denied".into()))),
         );
         assert_eq!(app.history_cost, Some(crate::history::Cost::Known(1.5)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_history_read_error_is_warned_once_until_it_changes() -> TestResult {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = crate::logging::LogBuffer::new(10);
+        let subscriber = tracing_subscriber::registry().with(buffer.layer());
+        let mut app = app();
+        tracing::subscriber::with_default(subscriber, || -> TestResult {
+            let mut id = only_load(&app.start())?;
+            // A read that works again forgets the error.
+            for history in ["denied", "denied", "gone", "gone"]
+                .map(|error| Err(error.to_string()))
+                .into_iter()
+                .chain([Ok(None), Err("gone".to_string())])
+            {
+                app.on_done(id, Ok(Done::Loaded(Ok(dataset()), history)));
+                id = only_load(&but_runs(press(&mut app, &[KeyCode::Char('R')])))?;
+            }
+            Ok(())
+        })?;
+        let warned: Vec<String> = buffer
+            .since(tracing::Level::WARN, 0)
+            .into_iter()
+            .map(|line| line.message)
+            .collect();
+        assert_eq!(warned, ["denied", "gone", "gone"]);
         Ok(())
     }
 
