@@ -487,7 +487,7 @@ where
             Effect::Abandon(id) => self.tasks.abandon(id),
             Effect::OpenEditor { command, path } => self.open_editor(&command, path).await?,
             Effect::OpenUrl(url) => self.open_url(url),
-            Effect::ExportLogs { name, lines } => self.export_logs(name, lines).await,
+            Effect::ExportLogs { name, lines } => self.export_logs(name, lines),
         }
         Ok(())
     }
@@ -519,20 +519,25 @@ where
         }
     }
 
-    /// Writes `lines` to `.overbrainer/<name>`, off the UI thread, never
-    /// overwriting an existing file. Reports the outcome as
-    /// [`Msg::LogsExported`].
-    async fn export_logs(&self, name: String, lines: Vec<String>) {
+    /// Writes `lines` to `.overbrainer/<name>`, off the UI thread and off the
+    /// event loop: the write runs in its own spawned task, so `Loop::run` keeps
+    /// handling events while it happens, never overwriting an existing file.
+    /// Reports the outcome as [`Msg::LogsExported`], dropped once the loop has
+    /// ended.
+    fn export_logs(&self, name: String, lines: Vec<String>) {
         let dir = self.tasks.project_dir().to_path_buf();
         let count = lines.len();
         let file_name = name.clone();
-        let written =
-            tokio::task::spawn_blocking(move || write_log_export(&dir, &name, &lines)).await;
-        let message = match written {
-            Ok(written) => exported(file_name, count, written),
-            Err(error) => Msg::LogsExported(Err(format!("export task panicked: {error}"))),
-        };
-        self.messages.send(message).ok();
+        let messages = self.messages.clone();
+        tokio::spawn(async move {
+            let written =
+                tokio::task::spawn_blocking(move || write_log_export(&dir, &name, &lines)).await;
+            let message = match written {
+                Ok(written) => exported(file_name, count, written),
+                Err(error) => Msg::LogsExported(Err(format!("export task panicked: {error}"))),
+            };
+            messages.send(message).ok();
+        });
     }
 
     /// Hands the terminal to the editor: stops reading input, drops the keys
@@ -625,7 +630,10 @@ fn exported(name: String, count: usize, written: io::Result<()>) -> Msg {
 }
 
 /// Writes `lines`, one per line, to `.overbrainer/<name>` in `project_dir`, in
-/// one `write_all`. Refuses to overwrite an existing file.
+/// one `write_all`. Refuses to overwrite an existing file. A failed write
+/// removes the partial file it created, so a later export can try `name`
+/// again; a failure removing it is ignored, the write error is what is
+/// returned.
 ///
 /// # Errors
 ///
@@ -642,7 +650,11 @@ fn write_log_export(project_dir: &Path, name: &str, lines: &[String]) -> io::Res
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
         true,
     )?;
-    file.write_all(content.as_bytes())
+    if let Err(error) = file.write_all(content.as_bytes()) {
+        let _ = crate::project_lock::remove_state_file(project_dir, name);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// SIGINT, SIGTERM and SIGHUP: in raw mode they only come from outside (`kill`, a
