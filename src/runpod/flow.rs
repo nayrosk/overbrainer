@@ -3,7 +3,9 @@
 //! results are retrieved. The CLI drives them and decides what Ctrl-C does.
 
 use std::fs;
+use std::future::Future;
 use std::io;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use secrecy::SecretString;
@@ -11,7 +13,7 @@ use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::events::Event;
-use crate::exec::{Executor, SshExecutor};
+use crate::exec::{ExecError, Executor, LocalExecutor, SshExecutor};
 use crate::runs::{Outcome, RunCtx, RunError, RunRecord, RunState, Runs, watch};
 use crate::train::{Pace, Trainer};
 
@@ -33,6 +35,25 @@ pub const RETRIEVED_MARKER: &str = ".pod/retrieved";
 /// Why a run fails when its pod was deleted on `max_hours`, by the client's own
 /// guard or by the pod's watchdog.
 pub const MAX_HOURS_REACHED: &str = "max_hours reached: the pod was deleted before the job ended";
+
+/// The lease a client following a job keeps on its pod, in the run directory:
+/// the watchdog skips its `max_hours` deadline while the file was touched less
+/// than [`LEASE_TTL`] ago.
+pub const LEASE_FILE: &str = ".pod/lease";
+
+/// How long a renewed lease holds the deadline off; the watchdog's
+/// `OVERBRAINER_LEASE_TTL` default.
+pub const LEASE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// How often the following client renews the lease.
+const LEASE_RENEW: Duration = Duration::from_secs(5 * 60);
+
+/// A job with no new metric for this long counts as stalled: its lease is no
+/// longer renewed, so `max_hours` applies again.
+const STALL: Duration = Duration::from_secs(30 * 60);
+
+/// How often the lease holder looks at the time.
+const LEASE_TICK: Duration = Duration::from_secs(60);
 
 /// Looks in a row that must answer Runpod's 404 before a pod is declared gone.
 const GONE_LOOKS: u32 = 3;
@@ -192,6 +213,150 @@ pub async fn watch_on_pod<E: Executor, T: Trainer>(
     }
 }
 
+/// A target that can renew the lease of the pod it reaches.
+pub trait Lessee: Executor {
+    /// Creates `path` on the target, or updates its modification time.
+    fn touch(&self, path: &str) -> impl Future<Output = Result<(), ExecError>> + Send;
+}
+
+impl Lessee for SshExecutor {
+    async fn touch(&self, path: &str) -> Result<(), ExecError> {
+        self.write_marker(path).await
+    }
+}
+
+impl Lessee for LocalExecutor {
+    async fn touch(&self, path: &str) -> Result<(), ExecError> {
+        let path = Path::new(path);
+        let io = |source| ExecError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(io)?;
+        }
+        fs::write(path, b"").map_err(io)
+    }
+}
+
+/// [`watch_on_pod`] for a client that stays with the job: while the job keeps
+/// making progress (a metric in the last 30 minutes), it renews the pod's lease
+/// ([`LEASE_FILE`]) every few minutes, so `max_hours` deletes nothing, neither
+/// the watchdog nor the client's own guard. Once the job stalls or the lease
+/// cannot be renewed, the lease runs out after [`LEASE_TTL`] and the deadline
+/// applies again. It warns once, as information, when the job ends after the
+/// deadline. A kept pod has no deadline and needs no lease.
+pub async fn watch_leased<E: Lessee, T: Trainer>(
+    run_ctx: &RunCtx<'_, E>,
+    trainer: &T,
+    record: RunRecord,
+    pod: &PodRecord,
+) -> Watched {
+    if until_deadline(pod).is_none() {
+        return Watched::Ended(Box::new(watch(run_ctx, trainer, record).await));
+    }
+    let events = run_ctx.bus.subscribe();
+    let lease = format!("{}/{LEASE_FILE}", record.remote_dir);
+    tokio::select! {
+        outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
+        // Boxed: its state would otherwise weigh on every caller's future.
+        () = Box::pin(hold_lease(run_ctx.executor, &lease, events, pod)) => Watched::DeadlinePassed,
+    }
+}
+
+/// Renews the lease at `path` while the job progresses, warns once when it
+/// ends after the deadline, and returns once the client's own deadline passed
+/// with no lease held.
+async fn hold_lease<E: Lessee>(
+    executor: &E,
+    path: &str,
+    mut events: Receiver<Event>,
+    pod: &PodRecord,
+) {
+    let mut lease = Lease::new(pod);
+    let mut open = true;
+    let mut tick = tokio::time::interval(LEASE_TICK);
+    loop {
+        tokio::select! {
+            event = events.recv(), if open => match event {
+                Ok(event) => lease.saw(&event),
+                Err(RecvError::Lagged(_)) => {},
+                Err(RecvError::Closed) => open = false,
+            },
+            _ = tick.tick() => {
+                if lease.tick(executor, path).await {
+                    return;
+                }
+            },
+        }
+    }
+}
+
+/// What [`hold_lease`] knows of the followed job and of its lease.
+struct Lease<'a> {
+    pod: &'a PodRecord,
+    pace: Pace,
+    last_metric: SystemTime,
+    renewed: Option<SystemTime>,
+    warned: bool,
+}
+
+impl<'a> Lease<'a> {
+    fn new(pod: &'a PodRecord) -> Self {
+        Self {
+            pod,
+            pace: Pace::default(),
+            last_metric: SystemTime::now(),
+            renewed: None,
+            warned: false,
+        }
+    }
+
+    /// Takes a training metric into account, and warns once when the job
+    /// ends after the deadline.
+    fn saw(&mut self, event: &Event) {
+        let Event::Metric(metric) = event else {
+            return;
+        };
+        self.pace.add(metric);
+        self.last_metric = SystemTime::now();
+        if self.warned {
+            return;
+        }
+        if let Some(note) = overrun(&self.pace, self.pod, self.last_metric, true) {
+            tracing::warn!("{note}");
+            self.warned = true;
+        }
+    }
+
+    /// Renews the lease at `path` when due; whether the client's guard fires.
+    async fn tick<E: Lessee>(&mut self, executor: &E, path: &str) -> bool {
+        let now = SystemTime::now();
+        if renewal_due(self.renewed, self.last_metric, now) {
+            match executor.touch(path).await {
+                Ok(()) => self.renewed = Some(now),
+                Err(error) => tracing::debug!("cannot renew the pod's lease: {error}"),
+            }
+        }
+        guard_fires(self.pod, self.renewed, now)
+    }
+}
+
+/// Whether the lease, last renewed at `renewed`, should be renewed at `now`:
+/// once [`LEASE_RENEW`] passed, and only while the job made progress (its last
+/// metric at `last_metric`) within [`STALL`].
+fn renewal_due(renewed: Option<SystemTime>, last_metric: SystemTime, now: SystemTime) -> bool {
+    let since = |at: SystemTime| now.duration_since(at).unwrap_or_default();
+    since(last_metric) < STALL && renewed.is_none_or(|at| since(at) >= LEASE_RENEW)
+}
+
+/// Whether the client's own guard deletes `pod` at `now`: its deadline plus
+/// [`DEADLINE_MARGIN`] passed, and no lease renewed within [`LEASE_TTL`].
+fn guard_fires(pod: &PodRecord, renewed: Option<SystemTime>, now: SystemTime) -> bool {
+    let held = renewed.is_some_and(|at| now.duration_since(at).unwrap_or_default() < LEASE_TTL);
+    !held && until_deadline_at(pod, now).is_some_and(|left| left.is_zero())
+}
+
 /// Warns once, from the training metrics on the bus, when the job of `pod`
 /// would need longer than its watchdog's deadline; then waits forever, so it
 /// never ends the watch.
@@ -201,7 +366,7 @@ async fn warn_overrun(mut events: Receiver<Event>, pod: &PodRecord) {
         match events.recv().await {
             Ok(Event::Metric(metric)) => {
                 pace.add(&metric);
-                if let Some(warning) = overrun(&pace, pod, SystemTime::now()) {
+                if let Some(warning) = overrun(&pace, pod, SystemTime::now(), false) {
                     tracing::warn!("{warning}");
                     break;
                 }
@@ -215,8 +380,9 @@ async fn warn_overrun(mut events: Receiver<Event>, pod: &PodRecord) {
 
 /// The warning when, at `pace`, the job of `pod` still running at `now` would
 /// end after its watchdog's deadline; `None` when it ends in time, for a kept
-/// pod, or while the pace is unknown.
-fn overrun(pace: &Pace, pod: &PodRecord, now: SystemTime) -> Option<String> {
+/// pod, or while the pace is unknown. With a `leased` pod the deadline only
+/// applies once the client stops following the job.
+fn overrun(pace: &Pace, pod: &PodRecord, now: SystemTime, leased: bool) -> Option<String> {
     if pod.keep {
         return None;
     }
@@ -228,6 +394,13 @@ fn overrun(pace: &Pace, pod: &PodRecord, now: SystemTime) -> Option<String> {
     }
     let hours = left.as_secs_f64() / 3600.0;
     let at = pod.deadline.as_deref().unwrap_or("its deadline");
+    if leased {
+        return Some(format!(
+            "at this pace the job needs about {hours:.1}h more, past max_hours ({at}): \
+             the pod stays while overbrainer follows the job; if it stops following, \
+             the pod's watchdog deletes the pod"
+        ));
+    }
     Some(format!(
         "at this pace the job needs about {hours:.1}h more, but the pod's watchdog deletes it by {at} (max_hours): \
          raise the target's max_hours, or train with --keep-pod, to let it finish"
@@ -737,7 +910,7 @@ mod tests {
     fn a_job_that_cannot_end_before_the_deadline_is_warned_about() {
         let now = SystemTime::now();
         assert_eq!(
-            overrun(&slow_pace(), &pod_due_in(6, false, now), now).as_deref(),
+            overrun(&slow_pace(), &pod_due_in(6, false, now), now, false).as_deref(),
             Some(
                 "at this pace the job needs about 20.0h more, but the pod's watchdog deletes it by \
                  2026-09-29T19:54:50Z (max_hours): raise the target's max_hours, or train with \
@@ -747,15 +920,69 @@ mod tests {
     }
 
     #[test]
+    fn a_followed_job_past_the_deadline_is_only_noted() {
+        let now = SystemTime::now();
+        let note = overrun(&slow_pace(), &pod_due_in(6, false, now), now, true);
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "at this pace the job needs about 20.0h more, past max_hours \
+                 (2026-09-29T19:54:50Z): the pod stays while overbrainer follows the job; \
+                 if it stops following, the pod's watchdog deletes the pod"
+            )
+        );
+    }
+
+    #[test]
+    fn the_watchdog_holds_the_lease_as_long_as_the_client_counts_on() {
+        let default = format!("OVERBRAINER_LEASE_TTL:-{}}}", LEASE_TTL.as_secs());
+        assert!(super::super::watchdog_script().contains(&default));
+    }
+
+    #[test]
+    fn the_lease_is_renewed_every_few_minutes_while_the_job_progresses() {
+        let now = SystemTime::now();
+        let ago = |minutes: u64| now - Duration::from_secs(minutes * 60);
+        assert!(renewal_due(None, now, now));
+        assert!(!renewal_due(Some(ago(1)), ago(1), now));
+        assert!(renewal_due(Some(ago(5)), ago(1), now));
+        // A job with no new metric for 30 minutes stalled: no renewal.
+        assert!(!renewal_due(Some(ago(5)), ago(30), now));
+        assert!(!renewal_due(None, ago(31), now));
+    }
+
+    #[test]
+    fn the_client_guard_waits_for_the_lease_to_run_out() {
+        let now = SystemTime::now();
+        let ago = |minutes: u64| Some(now - Duration::from_secs(minutes * 60));
+        // Deadline passed an hour ago, well beyond the margin.
+        let late = pod_due_in(0, false, now - Duration::from_secs(3600));
+        assert!(!guard_fires(&late, ago(1), now));
+        assert!(!guard_fires(&late, ago(14), now));
+        assert!(guard_fires(&late, ago(15), now));
+        assert!(guard_fires(&late, None, now));
+        // Before the deadline, or kept: never.
+        assert!(!guard_fires(&pod_due_in(1, false, now), None, now));
+        assert!(!guard_fires(
+            &pod_due_in(0, true, now - Duration::from_secs(3600)),
+            None,
+            now
+        ));
+    }
+
+    #[test]
     fn no_overrun_in_time_for_a_kept_pod_or_without_a_pace() {
         let now = SystemTime::now();
         assert_eq!(
-            overrun(&slow_pace(), &pod_due_in(21, false, now), now),
+            overrun(&slow_pace(), &pod_due_in(21, false, now), now, false),
             None
         );
-        assert_eq!(overrun(&slow_pace(), &pod_due_in(6, true, now), now), None);
         assert_eq!(
-            overrun(&Pace::default(), &pod_due_in(6, false, now), now),
+            overrun(&slow_pace(), &pod_due_in(6, true, now), now, false),
+            None
+        );
+        assert_eq!(
+            overrun(&Pace::default(), &pod_due_in(6, false, now), now, false),
             None
         );
     }

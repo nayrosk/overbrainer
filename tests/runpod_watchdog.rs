@@ -353,6 +353,42 @@ async fn a_past_deadline_deletes_at_once_and_the_watchdog_exits() -> TestResult 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_lease_holds_the_deadline_until_it_expires() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        // Renewed just now by a client following the job, valid 3 s.
+        fs::write(pod.file(".pod/lease"), "")?;
+        let child = pod.start(
+            shell,
+            &server,
+            &[
+                ("OVERBRAINER_DEADLINE", (unix_now() - 1).to_string()),
+                ("OVERBRAINER_LEASE_TTL", "3".to_string()),
+            ],
+        )?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            deletes(&server).await,
+            0,
+            "{shell}: deleted under a fresh lease"
+        );
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert_eq!(deletes(&server).await, 1, "{shell}");
+        assert!(
+            output.contains("delete reason=deadline"),
+            "{shell}: {output}"
+        );
+        assert!(output.contains("lease held"), "{shell}: {output}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_job_that_never_starts_is_deleted_after_the_boot_grace() -> TestResult {
     if !curl_available() {
         return Ok(());

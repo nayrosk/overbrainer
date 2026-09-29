@@ -631,7 +631,7 @@ const RUNPOD: &[FieldSpec] = &[
         "max_hours",
         floats(Bound::Excl(0.0), Bound::Incl(MAX_RUNPOD_HOURS)),
         false,
-        "Hours before the watchdog deletes the pod",
+        "Hours before the watchdog deletes a pod nothing follows",
     ),
     spec(
         "boot_grace_minutes",

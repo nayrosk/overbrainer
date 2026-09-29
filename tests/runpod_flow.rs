@@ -15,8 +15,9 @@ use overbrainer::events::EventBus;
 use overbrainer::exec::{Executor, JobCommand, LocalExecutor};
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
-    AttemptResult, DeletedBy, PodCtx, PodError, PodRecord, PodState, RunpodClient, RunpodTarget,
-    Timing, Watched, follow, reconnect, settle_watch, start_pod, watch_on_pod,
+    AttemptResult, DeletedBy, LEASE_FILE, PodCtx, PodError, PodRecord, PodState, RunpodClient,
+    RunpodTarget, Timing, Watched, follow, reconnect, settle_watch, start_pod, watch_leased,
+    watch_on_pod,
 };
 use overbrainer::runs::{RunCtx, RunRecord, RunState, Runs, create};
 use overbrainer::train::{Artifacts, TrainError, Trainer};
@@ -737,6 +738,42 @@ async fn reconnect_records_a_pod_confirmed_gone_without_deleting_it() -> TestRes
     );
     assert_eq!(pod.state, PodState::Provisioning);
     assert_eq!(deletes(&flaky.server).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_followed_job_holds_its_pod_past_the_deadline_with_a_lease() -> TestResult {
+    let harness = Harness::new().await?;
+    serve_p1(&harness.server, false).await;
+    let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
+    let mut run = create(&harness.runs, executor.workdir(), "gpu_cloud")?;
+    let job = executor
+        .spawn(&JobCommand {
+            dir: run.remote_dir.clone(),
+            script: r#"sleep 1; printf '{"event": "log", "time": 1, "step": 1, "epoch": 1, "max_steps": 1, "loss": 1.5, "learning_rate": 0.0002}\n' >> metrics.jsonl"#.into(),
+            secrets: Vec::new(),
+            container: None,
+        })
+        .await?;
+    run.job = Some(job);
+    run.state = RunState::Running;
+    harness.runs.save(&run)?;
+    // The client's own deadline (the watchdog's plus the margin) passed already:
+    // without a lease, the guard would fire at once.
+    let pod = pod_record(&run.id, false, Duration::from_secs(600))?;
+    let run_ctx = RunCtx {
+        runs: &harness.runs,
+        executor: &executor,
+        bus: &harness.bus,
+        poll: Duration::from_millis(50),
+    };
+    let watched = watch_leased(&run_ctx, &Nothing, run.clone(), &pod).await;
+    let Watched::Ended(ended) = watched else {
+        return Err("the guard fired under a fresh lease".into());
+    };
+    assert_eq!((*ended)?.record.state, RunState::Succeeded);
+    assert!(Path::new(&run.remote_dir).join(LEASE_FILE).is_file());
+    assert_eq!(deletes(&harness.server).await, 0);
     Ok(())
 }
 

@@ -29,9 +29,9 @@ pub use catalog::{
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
 pub use flow::{
-    DEADLINE_MARGIN, Ending, MAX_HOURS_REACHED, RETRIEVED_MARKER, WATCHDOG_LOG, Watched, end_pod,
-    follow, forget_client_key, job_started, past_deadline, reconnect, settle_watch, ssh_command,
-    start_pod, watch_on_pod,
+    DEADLINE_MARGIN, Ending, LEASE_FILE, LEASE_TTL, Lessee, MAX_HOURS_REACHED, RETRIEVED_MARKER,
+    WATCHDOG_LOG, Watched, end_pod, follow, forget_client_key, job_started, past_deadline,
+    reconnect, settle_watch, ssh_command, start_pod, watch_leased, watch_on_pod,
 };
 pub use keys::{
     CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,

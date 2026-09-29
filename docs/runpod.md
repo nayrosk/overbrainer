@@ -16,7 +16,7 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 | `gpu_types` | required | Runpod GPU type IDs, tried in order until one can be placed, or `"auto"` to try every GPU type in stock, cheapest first, when the run starts (see [`"auto"`](#auto) below). From the environment, one comma-separated value, or `auto`: `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES="NVIDIA GeForce RTX 4090,NVIDIA A40"` or `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. |
 | `min_vram_gb` | none | Least VRAM per GPU, in GB. Only with `gpu_types = "auto"`. At least 1. |
 | `max_price_per_hour` | none | Highest Secure Cloud list price of one GPU, in USD per hour. Only with `gpu_types = "auto"`. Greater than 0. |
-| `max_hours` | required | The pod's watchdog deletes the pod this long after it was created, whatever it is doing. At most 720. |
+| `max_hours` | required | The pod's watchdog deletes the pod this long after it was created, unless overbrainer is following a job that still makes progress ([the watchdog](#the-watchdog)). At most 720. |
 | `gpu_count` | `1` | GPUs per pod. |
 | `image` | `axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1`, pinned by digest | Pod image (CUDA 13, driver 580 or newer). |
 | `venv` | `/workspace/axolotl-venv` | Virtual environment holding `bin/axolotl` on the pod. Absolute. |
@@ -112,10 +112,12 @@ Each run gets its own client key and its own pod host key in `runs/<run-id>/ssh/
 
 The pod's command starts a small shell watchdog as its first process. At startup it checks that the pod's own Runpod key can read the pod, and overbrainer refuses to train (and deletes the pod) when it cannot. The watchdog then deletes the pod:
 
-- at `max_hours`;
+- at `max_hours`, unless overbrainer is following the job (see below);
 - `boot_grace_minutes` after the pod started, if no job ever did;
 - `retrieve_grace_minutes` after the job ended, if its results were not retrieved;
 - at once, when overbrainer marks the results retrieved.
+
+While overbrainer follows a job (`train`, `train attach` or the TUI stays open) and the job keeps making progress, `max_hours` deletes nothing: overbrainer renews a lease on the pod (`.pod/lease`) every 5 minutes, and the watchdog skips its deadline while that lease is less than 15 minutes old. The lease is only renewed while metrics keep arriving; a job with no new metric for 30 minutes stops renewing it. Once overbrainer stops following (Ctrl-C, closed, crashed, network lost) or the job stalls, the lease runs out after 15 minutes and a pod past its deadline is deleted.
 
 A pod whose bootstrap failed (for example sshd could not start) is deleted at once too, once the watchdog's own proof runs. The watchdog writes its log to `.pod/watchdog.log` in the run directory on the pod, and to the pod's Runpod logs.
 
@@ -153,14 +155,14 @@ The usual cause is a wrapper around `ssh` on `PATH` that kills background proces
 
 ### `max_hours reached: the pod was deleted before the job ended`
 
-The job needed longer than `max_hours`, and the pod was deleted at its deadline. The watchdog checks the deadline once a minute and deletes the pod itself; overbrainer's own guard deletes it 5 minutes later if it is still there. Either way the run fails with this message and `pod.json` says who deleted the pod (`watchdog` or `client`). Runpod keeps nothing of a deleted pod, its logs included, so this message is the only trace of why it stopped.
+The job needed longer than `max_hours` while nothing followed it (overbrainer was closed or detached, or the job stopped making progress), and the pod was deleted at its deadline. The watchdog checks the deadline once a minute and deletes the pod itself; overbrainer's own guard deletes it 5 minutes later if it is still there and no lease holds it. Either way the run fails with this message and `pod.json` says who deleted the pod (`watchdog` or `client`). Runpod keeps nothing of a deleted pod, its logs included, so this message is the only trace of why it stopped.
 
-While following a job, overbrainer warns once when the training pace cannot end it before the deadline:
+While following a job, overbrainer says once when the training pace ends it after the deadline:
 
 ```
-at this pace the job needs about 20.4h more, but the pod's watchdog deletes it by 2026-09-29T19:54:50Z (max_hours): raise the target's max_hours, or train with --keep-pod, to let it finish
+at this pace the job needs about 20.4h more, past max_hours (2026-09-29T19:54:50Z): the pod stays while overbrainer follows the job; if it stops following, the pod's watchdog deletes the pod
 ```
 
-Raise `max_hours` above the time the run needs (the TUI shows its ETA), or train with `--keep-pod` and remove the pod with `overbrainer pod rm RUN_ID` once done. A run stopped this way starts over from the beginning.
+Keep overbrainer following the job until it ends, raise `max_hours` above the time the run needs (the TUI shows its ETA), or train with `--keep-pod` and remove the pod with `overbrainer pod rm RUN_ID` once done. A run stopped this way starts over from the beginning.
 
 When the connection to the pod fails for another reason, the warnings name it, for example `cannot reach the job (1/5): ssh failed: the connection was terminated`.
