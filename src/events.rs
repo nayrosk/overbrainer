@@ -197,6 +197,10 @@ impl Event {
 
 /// Sees every event of the buses built with it, as they are published: nothing is
 /// ever skipped, however many come at once.
+///
+/// A swap point: the events sit below everything that counts them, so they
+/// cannot name the Prometheus metrics (`crate::metrics::Metrics`, the one
+/// implementation), and tests put their own recorder in its place.
 pub trait Observer: Send + Sync {
     /// `event` was published on bus `bus`, an ID unique among the open buses.
     fn event(&self, bus: usize, event: &Event);
