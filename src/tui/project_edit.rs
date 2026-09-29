@@ -150,6 +150,30 @@ fn sizing(listing: &Listing, name: &str) -> Sizing {
     }
 }
 
+/// What a volume listing's reconciliation says: nothing when nothing
+/// changed, a warning listing `failed` first when some change could not be
+/// made, otherwise `done`.
+fn reconciled(failed: &[String], done: &[String]) -> Option<(Severity, String)> {
+    let done = match done.len() {
+        0 => None,
+        1 => Some(format!("{}, {VOLUME_CENTER}", done.join(""))),
+        _ => Some(format!(
+            "{}, the network volumes' data centers",
+            done.join(", ")
+        )),
+    };
+    let severity = if failed.is_empty() {
+        Severity::Info
+    } else {
+        Severity::Warn
+    };
+    let parts: Vec<String> = failed.iter().cloned().chain(done).collect();
+    (!parts.is_empty()).then(|| (severity, parts.join("; ")))
+}
+
+/// What a reconciled `data_center_ids` is.
+const VOLUME_CENTER: &str = "the network volume's data center";
+
 /// The first of `problems`, with how many more there are.
 fn first_of(problems: &[String]) -> String {
     let first = problems.first().cloned().unwrap_or_default();
@@ -538,8 +562,9 @@ impl App {
 
     /// A volume listing was read: each Runpod target whose network volume it
     /// lists in another data center than `data_center_ids` gets that data
-    /// center as a pending change, and the status line says so. A field the
-    /// environment sets or a task locks is left as is.
+    /// center as a pending change. One status line says what changed, a
+    /// warning listing first what could not (a field the environment sets or
+    /// a task locks, or a refused edit).
     pub(super) fn reconcile_volume_centers(&mut self) {
         if self.config.is_none() || self.project_view.save.is_some() {
             return;
@@ -554,6 +579,7 @@ impl App {
             .collect();
         let listing = self.project_listing();
         let mut changes = Vec::new();
+        let mut failed = Vec::new();
         for name in names {
             let Some(center) = shown_value(&listing, &format!("targets.{name}.network_volume_id"))
                 .filter(|volume| !volume.is_empty())
@@ -563,26 +589,37 @@ impl App {
             };
             let key = format!("targets.{name}.data_center_ids");
             let now = shown_value(&listing, &key).map(|text| ListOrAuto::from_form_text(&text));
-            let free = listing
-                .find(&key)
-                .and_then(|index| listing.field(index))
-                .is_some_and(|field| field.lock.is_none() && field.env_note().is_none());
-            if free && now != Some(ListOrAuto::List(vec![center.clone()])) {
-                changes.push((name, center));
+            if now == Some(ListOrAuto::List(vec![center.clone()])) {
+                continue;
+            }
+            let field = listing.find(&key).and_then(|index| listing.field(index));
+            let held = match field {
+                Some(field) if field.env => Some("set by the environment".to_string()),
+                Some(field) => field.lock.as_ref().map(|user| format!("used by {user}")),
+                None => Some("not found".to_string()),
+            };
+            match held {
+                Some(why) => {
+                    failed.push(format!("{key} not set to {center}, {VOLUME_CENTER}: {why}"));
+                },
+                None => changes.push((name, center)),
             }
         }
+        let mut done = Vec::new();
         for (name, center) in changes {
             let path = FieldPath::Target {
                 name,
                 field: "data_center_ids",
             };
             match self.apply(&path, Some(&FieldValue::List(vec![center.clone()]))) {
-                Ok(()) => self.say(
-                    Severity::Info,
-                    format!("{path} = {center}, the network volume's data center"),
-                ),
-                Err(error) => self.say(Severity::Warn, error),
+                Ok(()) => done.push(format!("{path} = {center}")),
+                Err(error) => failed.push(format!(
+                    "{path} not set to {center}, {VOLUME_CENTER}: {error}"
+                )),
             }
+        }
+        if let Some((severity, text)) = reconciled(&failed, &done) {
+            self.say(severity, text);
         }
     }
 
@@ -2478,6 +2515,57 @@ mod tests {
         press(&mut app, &[KeyCode::Esc]);
         assert!(!type_in(&mut app, key, "EU-RO-1")?, "refused now");
         assert_eq!(shown(&mut app, key)?, "US-KS-2");
+        Ok(())
+    }
+
+    #[test]
+    fn a_listing_reconciles_every_target_and_says_it_once() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let config = PROJECT_CONFIG.replace(
+            "max_hours = 6\n",
+            "max_hours = 6\nnetwork_volume_id = \"voleu\"\ndata_center_ids = [\"US-KS-2\"]\n\n\
+             [targets.gpu_two]\nkind = \"runpod\"\ngpu_types = [\"NVIDIA A40\"]\n\
+             max_hours = 6\nnetwork_volume_id = \"volus\"\ndata_center_ids = [\"EU-RO-1\"]\n",
+        );
+        let read = crate::tui::project::ProjectConfig::new(&config, &app.env)?;
+        app.set_config(read);
+        let mut follow =
+            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, "20260921-a1");
+        follow.watching = true;
+        app.training.tasks.insert(TaskId(90), follow);
+        let volumes = volume_entries(&[
+            NetworkVolume {
+                id: "voleu".into(),
+                name: "alpha".into(),
+                size: 100,
+                data_center: "EU-RO-1".into(),
+            },
+            NetworkVolume {
+                id: "volus".into(),
+                name: "zeta".into(),
+                size: 50,
+                data_center: "US-KS-2".into(),
+            },
+        ]);
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_two.network_volume_id")?;
+        listed(&mut app, id, volumes, Vec::new());
+        assert_eq!(
+            shown(&mut app, "targets.gpu_two.data_center_ids")?,
+            "US-KS-2"
+        );
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "US-KS-2",
+            "locked by the run"
+        );
+        let said = app.status.as_ref().ok_or("nothing said")?;
+        assert_eq!(said.severity, Severity::Warn);
+        assert_eq!(
+            said.text,
+            "targets.gpu_cloud.data_center_ids not set to EU-RO-1, the network volume's data \
+             center: used by run 20260921-a1; targets.gpu_two.data_center_ids = US-KS-2, the \
+             network volume's data center"
+        );
         Ok(())
     }
 
