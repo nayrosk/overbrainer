@@ -10,9 +10,15 @@ use super::{Settings, validate};
 pub const CONFIG_FILE: &str = "overbrainer.toml";
 /// Prefix required on every environment variable read into the configuration.
 pub const ENV_PREFIX: &str = "OVERBRAINER";
-/// Prefix of the variables the terminal UI reads itself (`OVERBRAINER_TUI_COLOR`,
-/// `OVERBRAINER_TUI_MOTION`): they are not configuration keys, so [`load`] skips them.
-pub const TUI_ENV_PREFIX: &str = "OVERBRAINER_TUI_";
+/// The `OVERBRAINER_*` variables read outside the configuration, which [`load`]
+/// skips: the terminal UI's own (`OVERBRAINER_TUI_COLOR`, `OVERBRAINER_TUI_MOTION`),
+/// the test suite's (`OVERBRAINER_TEST_SSH_HOST`, `OVERBRAINER_TEST_SSH_CONFIG`) and
+/// the update check's switch. A name ending in `_` is a prefix, any other is exact.
+const NOT_CONFIG_VARIABLES: [&str; 3] = [
+    "OVERBRAINER_TUI_",
+    "OVERBRAINER_TEST_",
+    crate::update::NO_UPDATE_CHECK_ENV,
+];
 
 /// Where [`load`] reads `OVERBRAINER_*` environment variable overrides from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,7 +175,7 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
 pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> {
     let env: config::Map<String, String> = env_pairs(env)
         .into_iter()
-        .filter(|(key, _)| !is_tui_variable(key))
+        .filter(|(key, _)| !is_not_config(key))
         .collect();
 
     let file_only = Config::builder()
@@ -207,10 +213,11 @@ pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> 
 /// variables, with the same prefix and separators [`load`] and [`load_str`] use.
 ///
 /// `OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY` gives `providers.openrouter.api_key`;
-/// `OVERBRAINER_LOG` gives `log`. Variables under `OVERBRAINER_TUI_` are not
+/// `OVERBRAINER_LOG` gives `log`. The variables read outside the configuration
+/// (`OVERBRAINER_TUI_*`, `OVERBRAINER_TEST_*`, `OVERBRAINER_NO_UPDATE_CHECK`) are not
 /// configuration keys ([`load_str`] skips them too) and are left out.
 ///
-/// The prefix and `TUI_ENV_PREFIX` are matched case-insensitively, on a lower-cased
+/// The prefix and those names are matched case-insensitively, on a lower-cased
 /// copy of each key: this mirrors what `config::Environment` itself does inside
 /// [`load_str`] (it lower-cases every key before comparing it to its own lower-cased
 /// prefix pattern), so a variable such as `overbrainer_log` or `Overbrainer_Log`,
@@ -220,7 +227,7 @@ pub fn env_keys(env: &EnvSource) -> BTreeSet<String> {
     let prefix = format!("{ENV_PREFIX}_").to_lowercase();
     env_pairs(env.clone())
         .into_iter()
-        .filter(|(key, _)| !is_tui_variable(key))
+        .filter(|(key, _)| !is_not_config(key))
         .map(|(key, _)| key.to_lowercase())
         .filter_map(|key| {
             let rest = key.strip_prefix(&prefix)?;
@@ -229,11 +236,18 @@ pub fn env_keys(env: &EnvSource) -> BTreeSet<String> {
         .collect()
 }
 
-/// Whether `key` is under [`TUI_ENV_PREFIX`] once lower-cased, as `config::Environment`
-/// lower-cases keys before matching.
-fn is_tui_variable(key: &str) -> bool {
-    key.to_lowercase()
-        .starts_with(&TUI_ENV_PREFIX.to_lowercase())
+/// Whether `key` is one of [`NOT_CONFIG_VARIABLES`] once lower-cased, as
+/// `config::Environment` lower-cases keys before matching.
+fn is_not_config(key: &str) -> bool {
+    let key = key.to_lowercase();
+    NOT_CONFIG_VARIABLES.iter().any(|name| {
+        let name = name.to_lowercase();
+        if name.ends_with('_') {
+            key.starts_with(&name)
+        } else {
+            key == name
+        }
+    })
 }
 
 /// The key-value pairs `env` provides: the process environment, or an explicit list.
@@ -431,6 +445,16 @@ mod tests {
             ("OVERBRAINER_TUI_MOTION", "off"),
             ("PATH", "/usr/bin"),
             ("OVERBRAINERX", "not us"),
+        ]);
+        assert!(env_keys(&env).is_empty());
+    }
+
+    #[test]
+    fn env_keys_skips_the_variables_read_outside_the_configuration() {
+        let env = vars(&[
+            ("OVERBRAINER_NO_UPDATE_CHECK", "1"),
+            ("overbrainer_no_update_check", "1"),
+            ("OVERBRAINER_TEST_SSH_HOST", "overbrainer-test"),
         ]);
         assert!(env_keys(&env).is_empty());
     }
