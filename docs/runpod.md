@@ -150,3 +150,17 @@ A custom `image` must keep an entrypoint that ends with `exec "$@"`, and provide
 overbrainer opens one `ssh` master connection per pod and runs every command through it: `ssh -M -f` authenticates, then leaves a background process holding the connection. When the pod's sshd answers (its `SSH-2.0-` banner is readable) but that background process ends right after it started, twice in a row, the cause is on this machine: overbrainer deletes the pod at once and stops, without trying other GPU types, since every pod would fail the same way. The error ends with the last lines of ssh's own log (`ssh log: ...`), or `empty` when it wrote none.
 
 The usual cause is a wrapper around `ssh` on `PATH` that kills background processes when the command in the foreground exits, for example a firejail symlink (`/usr/local/bin/ssh -> firejail`). Check with `command -v ssh`, then put the real `ssh` first on `PATH` for overbrainer, for example `PATH=/usr/bin:$PATH overbrainer train`.
+
+### `max_hours reached: the pod was deleted before the job ended`
+
+The job needed longer than `max_hours`, and the pod was deleted at its deadline. The watchdog checks the deadline once a minute and deletes the pod itself; overbrainer's own guard deletes it 5 minutes later if it is still there. Either way the run fails with this message and `pod.json` says who deleted the pod (`watchdog` or `client`). Runpod keeps nothing of a deleted pod, its logs included, so this message is the only trace of why it stopped.
+
+While following a job, overbrainer warns once when the training pace cannot end it before the deadline:
+
+```
+at this pace the job needs about 20.4h more, but the pod's watchdog deletes it by 2026-09-29T19:54:50Z (max_hours): raise the target's max_hours, or train with --keep-pod, to let it finish
+```
+
+Raise `max_hours` above the time the run needs (the TUI shows its ETA), or train with `--keep-pod` and remove the pod with `overbrainer pod rm RUN_ID` once done. A run stopped this way starts over from the beginning.
+
+When the connection to the pod fails for another reason, the warnings name it, for example `cannot reach the job (1/5): ssh failed: the connection was terminated`.
