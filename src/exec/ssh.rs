@@ -70,8 +70,9 @@ impl SshExecutor {
         if let Some(config_file) = config_file {
             builder.config_file(config_file);
         }
-        // What `connect_mux` does, keeping the master's `-E` log path, which the
-        // crate names `log` in its control directory (see `Session::detach`).
+        // What `connect_mux` does, keeping the master's `-E` log path: `log` in
+        // the control directory, the path `Session::detach` documents as the
+        // "ssh multiplex output log".
         let (builder, destination) = builder.resolve(destination);
         let control = builder
             .launch_master(destination)
@@ -86,12 +87,7 @@ impl SshExecutor {
             "create the work directory",
         )
         .await
-        .map_err(|error| match error {
-            ExecError::Ssh(openssh::Error::Disconnected) => ExecError::MasterDied {
-                log: master_log(&log),
-            },
-            other => other,
-        })?;
+        .map_err(|error| master_died(error, &log))?;
         let workdir = String::from_utf8_lossy(&resolved).trim().to_string();
         if !workdir.starts_with('/') {
             return Err(ExecError::Protocol(format!(
@@ -429,6 +425,17 @@ fn download_outcome(
     }
 }
 
+/// `error` of the first command on a new session, as [`ExecError::MasterDied`]
+/// with the tail of the master's log at `log` when the master was gone.
+fn master_died(error: ExecError, log: &Path) -> ExecError {
+    match error {
+        ExecError::Ssh(openssh::Error::Disconnected) => ExecError::MasterDied {
+            log: master_log(log),
+        },
+        other => other,
+    }
+}
+
 /// Bytes read from the end of the master's log.
 const LOG_READ: u64 = 4096;
 /// Lines kept of the master's log.
@@ -542,6 +549,21 @@ mod tests {
         let path = dir.path().join("log");
         fs::write(&path, format!("{}\nlast words\n", "y".repeat(12_000)))?;
         assert!(master_log(&path).ends_with("last words"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_gone_at_its_first_command_is_a_dead_master() -> TestResult {
+        let dir = tempdir()?;
+        let log = dir.path().join("log");
+        fs::write(&log, "debug1: forking\r\nkilled\u{1b}[0m\n")?;
+        let error = master_died(ExecError::Ssh(openssh::Error::Disconnected), &log);
+        assert!(
+            matches!(&error, ExecError::MasterDied { log } if log == "debug1: forking | killed[0m"),
+            "{error:?}"
+        );
+        let error = master_died(ExecError::Protocol("x".into()), &log);
+        assert!(matches!(error, ExecError::Protocol(_)), "{error:?}");
         Ok(())
     }
 

@@ -91,7 +91,7 @@ pub enum ExecError {
     #[error("ssh failed")]
     Ssh(#[source] openssh::Error),
     /// `ssh` connected, then its background master connection ended before the
-    /// first command: something on this machine stopped it. `log` is the tail of
+    /// first command (killed locally, or the server dropped it). `log` is the tail of
     /// the master's own log on one bounded line, control characters dropped, empty
     /// when it wrote nothing.
     #[error("the ssh master connection ended right after it started (ssh log: {})", or_empty(.log))]
