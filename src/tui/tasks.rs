@@ -982,6 +982,47 @@ mod tests {
         }
     }
 
+    /// Records the events it sees.
+    #[derive(Default)]
+    struct Seen(std::sync::Mutex<Vec<Event>>);
+
+    impl Observer for Seen {
+        fn event(&self, _bus: usize, event: &Event) {
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(event.clone());
+            }
+        }
+
+        fn closed(&self, _bus: usize) {}
+    }
+
+    /// The metrics see the tasks started after the configuration was reloaded.
+    #[tokio::test]
+    async fn the_observer_sees_tasks_started_with_a_reloaded_configuration() -> TestResult {
+        let dir = project()?;
+        let seen = Arc::new(Seen::default());
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
+        tasks.observe(Some(Arc::clone(&seen) as Arc<dyn Observer>));
+        tasks.use_config(Source::from(EnvSource::Vars(Vec::new())));
+        tasks.spawn(TaskId(1), Task::Pipeline(Command::Split));
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        let Some((TaskId(1), Ok(Done::Pipeline(Ok(()))))) = next else {
+            return Err(format!("unexpected end: {next:?}").into());
+        };
+        let seen = seen.0.lock().map_err(|e| e.to_string())?;
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                Event::StageFinished {
+                    stage: Stage::Split,
+                    ..
+                }
+            )),
+            "{seen:?}"
+        );
+        Ok(())
+    }
+
     /// A real `split` task: every message is sent before it ends, and the app
     /// keeps them whether they are handled before or after its end.
     #[tokio::test]
