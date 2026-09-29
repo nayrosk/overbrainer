@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use secrecy::ExposeSecret as _;
+
 use super::{Answers, TrainingKind};
 use crate::cli::init::{
     CONFIG_TEMPLATE, ENV_EXAMPLE_FILE, ENV_FILE, GITIGNORE, create_new, create_private,
@@ -361,7 +363,8 @@ fn text(value: &str) -> FieldValue {
 
 /// The variables the choices need: the provider's base URL and key, the SSH
 /// host, the Runpod key. Keys and a host are written even when empty, so
-/// `.env` shows what to fill.
+/// `.env` shows what to fill. The keys are exposed here only: their values
+/// are the text of `.env` and what the configuration is validated with.
 fn variables(answers: &Answers) -> Vec<Variable> {
     let provider = answers.provider.to_uppercase();
     let mut variables = vec![
@@ -372,7 +375,7 @@ fn variables(answers: &Answers) -> Vec<Variable> {
         },
         Variable {
             name: format!("{ENV_PREFIX}_PROVIDERS__{provider}__API_KEY"),
-            value: answers.api_key.to_string(),
+            value: answers.api_key.expose_secret().to_string(),
             public: false,
         },
     ];
@@ -384,7 +387,7 @@ fn variables(answers: &Answers) -> Vec<Variable> {
         }),
         TrainingKind::Runpod => variables.push(Variable {
             name: format!("{ENV_PREFIX}_RUNPOD__API_KEY"),
-            value: answers.runpod_key.to_string(),
+            value: answers.runpod_key.expose_secret().to_string(),
             public: false,
         }),
         TrainingKind::Skip | TrainingKind::Local => {},
@@ -436,6 +439,10 @@ fn quoted(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::{TopicDraft, Wizard};
+    use std::sync::LazyLock;
+
+    use secrecy::SecretString;
+
     use super::*;
     use crate::config::{Adapter, Protocol, Runtime};
 
@@ -443,6 +450,8 @@ mod tests {
 
     const KEY: &str = "sk-placeholder-provider-key";
     const RUNPOD_KEY: &str = "rp-placeholder-runpod-key";
+    static KEY_SECRET: LazyLock<SecretString> = LazyLock::new(|| SecretString::from(KEY));
+    static RUNPOD_SECRET: LazyLock<SecretString> = LazyLock::new(|| SecretString::from(RUNPOD_KEY));
 
     /// Where the snapshots of the written files are kept.
     const SNAPSHOTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/wizard");
@@ -470,7 +479,7 @@ mod tests {
             provider: "nanogpt".into(),
             protocol: Protocol::Openai,
             base_url: "https://nano-gpt.com/api/v1".into(),
-            api_key: KEY,
+            api_key: &KEY_SECRET,
             generator: "qwen/qwen3-235b-a22b",
             parent: "deepseek/deepseek-r1",
             reasoning: true,
@@ -479,7 +488,7 @@ mod tests {
             training,
             runtime: Runtime::Docker,
             host: "user@gpu-box",
-            runpod_key: RUNPOD_KEY,
+            runpod_key: &RUNPOD_SECRET,
             gpu_types: ListOrAuto::Auto,
             base_model: "Qwen/Qwen3-8B",
             adapter: Adapter::Lora,

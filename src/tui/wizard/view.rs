@@ -364,7 +364,7 @@ mod tests {
     fn filled(screen: Screen) -> Wizard {
         let mut wizard = Wizard::new("rust_expert");
         wizard.provider = 1;
-        wizard.api_key = Secret(Input::new(SECRET));
+        wizard.api_key = Secret::sealed(SECRET);
         wizard.generator = Input::new("qwen/qwen3-235b-a22b");
         wizard.parent = Input::new("deepseek/deepseek-r1");
         wizard.topics = vec![
@@ -382,7 +382,7 @@ mod tests {
             },
         ];
         wizard.training = super::super::TrainingKind::Runpod;
-        wizard.runpod_key = Secret(Input::new(SECRET));
+        wizard.runpod_key = Secret::sealed(SECRET);
         wizard.screen = screen;
         wizard
     }

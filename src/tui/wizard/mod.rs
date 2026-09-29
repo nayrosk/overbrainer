@@ -16,6 +16,7 @@ use anyhow::Context as _;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
+use secrecy::{ExposeSecret as _, SecretString};
 
 use super::terminal::{self, TerminalGuard};
 use super::theme::{ColorLevel, LookEnv, Theme};
@@ -373,10 +374,15 @@ impl Field {
     }
 }
 
-/// A secret being typed. Its text is never shown, and its `Debug` never
-/// prints it.
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct Secret(Input);
+/// A secret field, never shown and never in its `Debug`. While its screen
+/// is shown, it is typed into an [`Input`], which edits a plain `String` like
+/// every form input; leaving the screen seals it into a [`SecretString`] and
+/// drops the input. Typing into it again opens a new input holding the
+/// sealed value: the one copy editing it needs.
+pub(super) struct Secret {
+    typing: Option<Input>,
+    sealed: SecretString,
+}
 
 impl fmt::Debug for Secret {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -397,22 +403,55 @@ pub(super) enum SecretKind {
 
 impl Secret {
     fn new() -> Self {
-        Self(Input::new(""))
+        Self::sealed("")
     }
 
-    /// The text typed, trimmed: only for the file it goes to.
-    pub(super) fn value(&self) -> &str {
-        self.0.text().trim()
+    /// A secret sealed with `value`.
+    fn sealed(value: &str) -> Self {
+        Self {
+            typing: None,
+            sealed: SecretString::from(value.to_string()),
+        }
+    }
+
+    /// The input to type into, opened on the sealed value when closed.
+    fn input_mut(&mut self) -> &mut Input {
+        let sealed = &self.sealed;
+        self.typing
+            .get_or_insert_with(|| Input::new(sealed.expose_secret()))
+    }
+
+    /// Seals what was typed, trimmed, and drops the input.
+    fn seal(&mut self) {
+        if let Some(input) = self.typing.take() {
+            self.sealed = SecretString::from(input.text().trim().to_string());
+        }
+    }
+
+    /// What it holds, typed or sealed, trimmed: for the checks alone.
+    fn text(&self) -> &str {
+        match &self.typing {
+            Some(input) => input.text().trim(),
+            None => self.sealed.expose_secret(),
+        }
+    }
+
+    /// The sealed value, for the file it goes to.
+    pub(super) fn value(&self) -> &SecretString {
+        &self.sealed
     }
 
     /// The input with every char masked.
     pub(super) fn masked(&self) -> Input {
-        self.0.masked()
+        match &self.typing {
+            Some(input) => input.masked(),
+            None => Input::new("•".repeat(self.sealed.expose_secret().chars().count())),
+        }
     }
 
     /// What it holds.
     pub(super) fn kind(&self) -> SecretKind {
-        match self.value() {
+        match self.text() {
             "" => SecretKind::Empty,
             value if is_reference(value) => SecretKind::Reference,
             _ => SecretKind::Typed,
@@ -422,7 +461,7 @@ impl Secret {
     /// Why it is refused: a malformed `vault:` reference. The message never
     /// quotes it.
     fn check(&self) -> Result<(), String> {
-        parse_reference(self.value())
+        parse_reference(self.text())
             .map(drop)
             .map_err(|_| "expected vault:<mount>/<path>#<field>".to_string())
     }
@@ -499,8 +538,9 @@ pub(super) enum Step {
     },
 }
 
-/// The whole state of the wizard.
-#[derive(Debug, Clone, PartialEq)]
+/// The whole state of the wizard. Neither `Clone` nor `PartialEq`: it holds
+/// secrets.
+#[derive(Debug)]
 pub(super) struct Wizard {
     screen: Screen,
     /// The field focused, in [`Wizard::fields`].
@@ -703,8 +743,8 @@ impl Wizard {
             Field::Host => Some(&mut self.host),
             Field::GpuTypes => Some(&mut self.gpu_types),
             Field::BaseModel => Some(&mut self.base_model),
-            Field::ApiKey => Some(&mut self.api_key.0),
-            Field::RunpodKey => Some(&mut self.runpod_key.0),
+            Field::ApiKey => Some(self.api_key.input_mut()),
+            Field::RunpodKey => Some(self.runpod_key.input_mut()),
             Field::Provider
             | Field::Protocol
             | Field::Reasoning
@@ -841,15 +881,23 @@ impl Wizard {
             return Step::Write;
         }
         if let Some(next) = self.screen.after(self.training) {
+            self.seal();
             self.screen = next;
             self.focus = 0;
         }
         Step::Stay
     }
 
+    /// The screen is left: its secrets are sealed.
+    fn seal(&mut self) {
+        self.api_key.seal();
+        self.runpod_key.seal();
+    }
+
     /// Shift-Tab or Esc: the screen before, every value kept.
     fn previous(&mut self) {
         if let Some(before) = self.screen.before(self.training) {
+            self.seal();
             self.screen = before;
             self.focus = 0;
             self.error = None;
@@ -1166,7 +1214,7 @@ impl Wizard {
 
 /// What the wizard was told, trimmed, for the files it writes. Its `Debug`
 /// never prints the secrets.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub(super) struct Answers<'a> {
     /// `project.name`.
     pub(super) name: &'a str,
@@ -1177,7 +1225,7 @@ pub(super) struct Answers<'a> {
     /// Its base URL.
     pub(super) base_url: String,
     /// Its API key: a key, a reference, or empty.
-    pub(super) api_key: &'a str,
+    pub(super) api_key: &'a SecretString,
     /// The generator's model.
     pub(super) generator: &'a str,
     /// The parent's model.
@@ -1195,7 +1243,7 @@ pub(super) struct Answers<'a> {
     /// The SSH host.
     pub(super) host: &'a str,
     /// The Runpod API key: a key, a reference, or empty.
-    pub(super) runpod_key: &'a str,
+    pub(super) runpod_key: &'a SecretString,
     /// The Runpod GPU types.
     pub(super) gpu_types: ListOrAuto,
     /// `training.base_model`.
@@ -1447,7 +1495,23 @@ mod tests {
         typed(&mut wizard, SECRET);
         let shown = wizard.display(Field::ApiKey);
         assert_eq!(shown, "•".repeat(SECRET.chars().count()));
-        assert_eq!(wizard.api_key.value(), SECRET);
+        assert_eq!(wizard.api_key.text(), SECRET);
+        press(&mut wizard, &[KeyCode::Enter]);
+        assert!(
+            wizard.api_key.typing.is_none(),
+            "sealed once the screen is left"
+        );
+        assert_eq!(wizard.api_key.value().expose_secret(), SECRET);
+        assert_eq!(
+            wizard.display(Field::ApiKey),
+            "•".repeat(SECRET.chars().count())
+        );
+        // Back on its screen, typing edits the sealed value.
+        press(
+            &mut wizard,
+            &[KeyCode::Esc, KeyCode::Char('x'), KeyCode::Enter],
+        );
+        assert_eq!(wizard.api_key.value().expose_secret(), format!("{SECRET}x"));
         let debug = format!("{wizard:?} {:?}", wizard.answers());
         assert!(!debug.contains(SECRET));
         let summary = format!("{:?}", wizard.summary());
@@ -1466,7 +1530,7 @@ mod tests {
             wizard.error(),
             Some("expected vault:<mount>/<path>#<field>")
         );
-        wizard.api_key = Secret(Input::new("vault:secret/demo#api_key"));
+        wizard.api_key = Secret::sealed("vault:secret/demo#api_key");
         press(&mut wizard, &[KeyCode::Enter]);
         assert_eq!(wizard.screen(), Screen::Roles);
         assert_eq!(wizard.api_key.kind(), SecretKind::Reference);
