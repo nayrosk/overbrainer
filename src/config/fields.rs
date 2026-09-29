@@ -663,7 +663,7 @@ const METRICS: &[FieldSpec] = &[spec(
     "listen",
     TEXT,
     true,
-    "Address of the Prometheus endpoint, such as 127.0.0.1:9464 (off when empty)",
+    "Address of the Prometheus endpoint, such as 127.0.0.1:9464; unset it to turn it off",
 )];
 
 /// The editable fields of `section`, in file order.
