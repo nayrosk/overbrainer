@@ -121,6 +121,52 @@ pub fn gpu_table(gpus: &[GpuType], data_center: Option<&str>) -> Vec<String> {
     )
 }
 
+/// `text`, from the Runpod API, without what could move the cursor or change
+/// the terminal's state: ANSI escape sequences (CSI, string controls such as
+/// OSC or DCS through their terminator, and two-character ones) are dropped, a control character that is whitespace (newline, tab,
+/// CR...) becomes a space, and every other one (C0, DEL, C1) is dropped.
+#[must_use]
+pub fn printable(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => skip_csi(&mut chars),
+                Some(']' | 'P' | 'X' | '^' | '_') => skip_string(&mut chars),
+                _ => {},
+            },
+            '\u{9b}' => skip_csi(&mut chars),
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars),
+            c if c.is_control() && c.is_whitespace() => kept.push(' '),
+            c if c.is_control() => {},
+            c => kept.push(c),
+        }
+    }
+    kept
+}
+
+/// Skips a CSI sequence's parameters and intermediates, then its final byte.
+fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars.next_if(|c| matches!(c, ' '..='?')).is_some() {}
+    chars.next_if(|c| matches!(c, '@'..='~'));
+}
+
+/// Skips a string control (OSC, DCS, SOS, PM or APC) up to its terminator:
+/// BEL, ST or `ESC \`; an unterminated one takes the rest of the text.
+fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{7}' | '\u{9c}' => return,
+            '\u{1b}' => {
+                chars.next_if_eq(&'\\');
+                return;
+            },
+            _ => {},
+        }
+    }
+}
+
 /// Whether a [`columns`] column is aligned to the left or the right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Align {
@@ -130,10 +176,14 @@ enum Align {
 
 /// `header` and `rows` laid out in columns two spaces apart, each as wide as
 /// its longest value, `align` giving each column's side; the last column is
-/// never padded.
+/// never padded. Each cell is [`printable`].
 fn columns(header: &[&str], align: &[Align], rows: &[Vec<String>]) -> Vec<String> {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| printable(cell)).collect())
+        .collect();
     let mut widths: Vec<usize> = header.iter().map(|title| title.chars().count()).collect();
-    for row in rows {
+    for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
         }
@@ -1051,5 +1101,92 @@ mod tests {
         for line in &lines[1..] {
             assert_eq!(at(line, "img/"), at(&lines[0], "IMAGE"), "{lines:#?}");
         }
+    }
+
+    #[test]
+    fn printable_strips_control_characters_and_escape_sequences() {
+        assert_eq!(printable("A40\u{1b}[2J\nname"), "A40 name");
+        assert_eq!(printable("a\nb\tc\r\nd  e"), "a b c  d  e", "no collapsing");
+        assert_eq!(
+            printable("a\u{1b}]0;title\u{7}b\u{1b}]8;;x\u{1b}\\c"),
+            "abc"
+        );
+        assert_eq!(printable("a\u{1b}Mb\u{7f}c\u{9b}31md\te"), "abcd e");
+        assert_eq!(
+            printable("RTX 4090 é"),
+            "RTX 4090 é",
+            "printable text stays"
+        );
+    }
+
+    #[test]
+    fn string_controls_are_skipped_through_their_terminator() {
+        for introducer in ['P', 'X', '^', '_'] {
+            let st = format!("a\u{1b}{introducer}bad\u{1b}\\b");
+            assert_eq!(printable(&st), "ab", "ESC {introducer}");
+            let bel = format!("a\u{1b}{introducer}bad\u{7}b");
+            assert_eq!(printable(&bel), "ab", "ESC {introducer} ended by BEL");
+            let open = format!("a\u{1b}{introducer}bad and more");
+            assert_eq!(printable(&open), "a", "ESC {introducer} unterminated");
+        }
+        for introducer in ['\u{90}', '\u{98}', '\u{9e}', '\u{9f}'] {
+            let st = format!("a{introducer}bad\u{9c}b");
+            assert_eq!(printable(&st), "ab", "{introducer:?}");
+            let open = format!("a{introducer}bad and more");
+            assert_eq!(printable(&open), "a", "{introducer:?} unterminated");
+        }
+    }
+
+    #[test]
+    fn every_table_prints_api_strings_without_control_characters() {
+        let odd = "odd\u{1b}[2J\nname";
+        let mut named = center("EU-RO-1", Vec::new());
+        named.name = odd.to_string();
+        let volume = NetworkVolume {
+            id: "v1".to_string(),
+            name: odd.to_string(),
+            size: 50,
+            data_center: "EU-RO-1".to_string(),
+        };
+        let template = Template {
+            id: "t1".to_string(),
+            name: odd.to_string(),
+            image: "img\u{1b}[31m:1".to_string(),
+            serverless: false,
+        };
+        let tables = [
+            gpu_table(&[gpu(odd, 48, Some(0.4))], None),
+            data_center_table(&[named]),
+            volume_table(&[volume]),
+            template_table(&[template]),
+        ];
+        for lines in tables {
+            let text = lines.join("\n");
+            assert!(text.contains("odd name"), "{text:?}");
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(
+                !text.chars().any(|c| c.is_control() && c != '\n'),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gpu_id_from_the_api_reaches_a_resolve_error_clean() -> Result<(), serde_json::Error> {
+        let gpus: Vec<GpuType> = serde_json::from_value(serde_json::json!([
+            {"id": "odd\u{1b}[2J\ngpu", "memory": 48, "price": {"secure": 0.3},
+             "maxCount": {"secure": 8}, "availability": "HIGH",
+             "dataCenters": [{"id": "EU\u{1b}[31m-RO-1", "availability": "NONE"}]}
+        ]))?;
+        assert_eq!(gpus[0].id, "odd gpu", "cleaned when parsed");
+        assert_eq!(gpus[0].data_centers[0].id, "EU-RO-1");
+        let error = resolve(&target(list(&["odd gpu"]), ListOrAuto::Auto), &gpus).err();
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                "no data center has odd gpu in stock for data_center_ids = \"auto\" (gpu_count = 1)"
+            )
+        );
+        Ok(())
     }
 }

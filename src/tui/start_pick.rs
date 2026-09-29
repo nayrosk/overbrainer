@@ -336,6 +336,7 @@ mod tests {
             id: id.into(),
             columns: vec![id.into(), String::new(), String::new(), "HIGH".into()],
             selectable: true,
+            ranks: Vec::new(),
         }
     }
 
@@ -412,6 +413,25 @@ mod tests {
         let (_, query) = open(&mut app, 'c')?;
         assert_eq!(query.kind, CatalogKind::DataCenters);
         assert_eq!(query.gpu_types, ["NVIDIA A40"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_gpu_id_from_the_api_reaches_the_dialog_without_control_characters() -> TestResult {
+        let (_dir, mut app) = starting(PROJECT_CONFIG)?;
+        let gpus: Vec<crate::runpod::GpuType> = serde_json::from_value(serde_json::json!([
+            {"id": "odd\u{1b}[2J\ngpu", "memory": 48, "price": {"secure": 0.3},
+             "maxCount": {"secure": 8}, "availability": "HIGH"}
+        ]))?;
+        let (id, _) = open(&mut app, 'g')?;
+        listed(&mut app, id, crate::tui::catalog::gpu_entries(&gpus, 1));
+        press(
+            &mut app,
+            &[KeyCode::End, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        let shown = dialog(&app);
+        assert!(shown.contains("odd gpu"), "{shown}");
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
         Ok(())
     }
 

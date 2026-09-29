@@ -150,6 +150,30 @@ fn sizing(listing: &Listing, name: &str) -> Sizing {
     }
 }
 
+/// What a volume listing's reconciliation says: nothing when nothing
+/// changed, a warning listing `failed` first when some change could not be
+/// made, otherwise `done`.
+fn reconciled(failed: &[String], done: &[String]) -> Option<(Severity, String)> {
+    let done = match done.len() {
+        0 => None,
+        1 => Some(format!("{}, {VOLUME_CENTER}", done.join(""))),
+        _ => Some(format!(
+            "{}, the network volumes' data centers",
+            done.join(", ")
+        )),
+    };
+    let severity = if failed.is_empty() {
+        Severity::Info
+    } else {
+        Severity::Warn
+    };
+    let parts: Vec<String> = failed.iter().cloned().chain(done).collect();
+    (!parts.is_empty()).then(|| (severity, parts.join("; ")))
+}
+
+/// What a reconciled `data_center_ids` is.
+const VOLUME_CENTER: &str = "the network volume's data center";
+
 /// The first of `problems`, with how many more there are.
 fn first_of(problems: &[String]) -> String {
     let first = problems.first().cloned().unwrap_or_default();
@@ -448,6 +472,17 @@ impl App {
         if self.refuse_change() || self.refuse_locked(path) {
             return;
         }
+        if picked.kind == CatalogKind::DataCenters {
+            let value = match &picked.choice {
+                Choice::Auto => Some(FieldValue::Text(ListOrAuto::AUTO.to_string())),
+                Choice::List(ids) if ids.is_empty() => None,
+                Choice::List(ids) => Some(FieldValue::List(ids.clone())),
+            };
+            if let Some(refusal) = self.volume_centers_refusal(path, value.as_ref()) {
+                self.say(Severity::Warn, refusal);
+                return;
+            }
+        }
         let ids = match picked.choice {
             Choice::Auto => {
                 let auto = FieldValue::Text(ListOrAuto::AUTO.to_string());
@@ -479,6 +514,117 @@ impl App {
         if let Err(error) = applied {
             self.say(Severity::Warn, error);
         }
+    }
+
+    /// Why `value` cannot be set on the field `path`, when it is the
+    /// `data_center_ids` of a Runpod target whose network volume the volume
+    /// listing read last has: its one data center is the volume's, so it only
+    /// changes with the volume. A volume not listed, or no listing, holds
+    /// nothing.
+    fn volume_centers_refusal(
+        &mut self,
+        path: &FieldPath,
+        value: Option<&FieldValue>,
+    ) -> Option<String> {
+        let FieldPath::Target { name, field } = path else {
+            return None;
+        };
+        if *field != "data_center_ids" {
+            return None;
+        }
+        let listing = self.project_listing();
+        let volume = shown_value(&listing, &format!("targets.{name}.network_volume_id"))
+            .filter(|volume| !volume.is_empty())?;
+        let center = self.volume_center(&volume)?;
+        let new = match value {
+            Some(FieldValue::List(ids)) => Some(ListOrAuto::List(ids.clone())),
+            Some(FieldValue::Text(text)) => Some(ListOrAuto::from_form_text(text)),
+            _ => None,
+        };
+        (new != Some(ListOrAuto::List(vec![center]))).then(|| {
+            format!(
+                "refused: {path} is the network volume's data center; pick another \
+                 network_volume_id to change it"
+            )
+        })
+    }
+
+    /// The data center of the network volume `volume`, when the volume
+    /// listing read last has it.
+    fn volume_center(&self, volume: &str) -> Option<String> {
+        self.volume_catalog
+            .as_ref()?
+            .iter()
+            .find(|entry| entry.id == volume)
+            .and_then(volume_data_center)
+            .map(str::to_string)
+    }
+
+    /// A volume listing was read: each Runpod target whose network volume it
+    /// lists in another data center than `data_center_ids` gets that data
+    /// center as a pending change. One status line says what changed, a
+    /// warning listing first what could not (a field the environment sets or
+    /// a task locks, or a refused edit). Nothing while `overbrainer.toml` is
+    /// open in the editor: it runs once the file is read again.
+    pub(super) fn reconcile_volume_centers(&mut self) {
+        if let Some((severity, text)) = self.volume_centers_reconciled() {
+            self.say(severity, text);
+        }
+    }
+
+    /// [`Self::reconcile_volume_centers`], what it would say returned.
+    fn volume_centers_reconciled(&mut self) -> Option<(Severity, String)> {
+        if self.config.is_none() || self.project_view.save.is_some() || self.project_view.editing {
+            return None;
+        }
+        let doc = self.shown_doc()?;
+        let names: Vec<String> = doc
+            .names(Collection::Targets)
+            .into_iter()
+            .filter(|name| doc.target_kind(name) == Some(TargetKind::Runpod))
+            .collect();
+        let listing = self.project_listing();
+        let mut changes = Vec::new();
+        let mut failed = Vec::new();
+        for name in names {
+            let Some(center) = shown_value(&listing, &format!("targets.{name}.network_volume_id"))
+                .filter(|volume| !volume.is_empty())
+                .and_then(|volume| self.volume_center(&volume))
+            else {
+                continue;
+            };
+            let key = format!("targets.{name}.data_center_ids");
+            let now = shown_value(&listing, &key).map(|text| ListOrAuto::from_form_text(&text));
+            if now == Some(ListOrAuto::List(vec![center.clone()])) {
+                continue;
+            }
+            let field = listing.find(&key).and_then(|index| listing.field(index));
+            let held = match field {
+                Some(field) if field.env => Some("set by the environment".to_string()),
+                Some(field) => field.lock.as_ref().map(|user| format!("used by {user}")),
+                None => Some("not found".to_string()),
+            };
+            match held {
+                Some(why) => {
+                    failed.push(format!("{key} not set to {center}, {VOLUME_CENTER}: {why}"));
+                },
+                None => changes.push((name, center)),
+            }
+        }
+        let mut done = Vec::new();
+        for (name, center) in changes {
+            let path = FieldPath::Target {
+                name,
+                field: "data_center_ids",
+            };
+            match self.apply(&path, Some(&FieldValue::List(vec![center.clone()]))) {
+                Ok(()) => done.push(format!("{path} = {center}")),
+                Err(error) => failed.push(format!(
+                    "{path} not set to {center}, {VOLUME_CENTER}: {error}"
+                )),
+            }
+        }
+        reconciled(&failed, &done)
     }
 
     /// Refuses a change of the field `path` while something uses it, as the
@@ -521,6 +667,22 @@ impl App {
             input: Input::new(text),
             error: None,
         });
+    }
+
+    /// The volume `volume` typed for the field `path`: as if picked when the
+    /// volume listing read last has it, so its data center is set too;
+    /// otherwise set alone, `data_center_ids` left as is.
+    fn typed_volume(&mut self, path: &FieldPath, volume: &str) -> Result<(), String> {
+        let known = self.volume_catalog.as_ref().and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.id == volume && volume_data_center(entry).is_some())
+                .cloned()
+        });
+        if let Some(entry) = known {
+            return self.picked_volume(path, volume, &[entry]);
+        }
+        self.apply(path, Some(&FieldValue::Text(volume.to_string())))
     }
 
     /// The volume `id` picked for the field `path`: it is set, and its
@@ -678,6 +840,14 @@ impl App {
             (true, false) => return Err("is required".to_string()),
             (false, _) => Some(kind.parse(text).map_err(|error| error.to_string())?),
         };
+        if let Some(refusal) = self.volume_centers_refusal(path, value.as_ref()) {
+            return Err(refusal);
+        }
+        if let (FieldPath::Target { field, .. }, Some(FieldValue::Text(volume))) = (path, &value)
+            && *field == "network_volume_id"
+        {
+            return self.typed_volume(path, volume);
+        }
         if let (FieldPath::Topic { index, field, .. }, Some(FieldValue::Text(new))) = (path, &value)
             && *field == "name"
         {
@@ -1087,7 +1257,8 @@ impl App {
     }
 
     /// The editor on `overbrainer.toml` ended with `status`: the file is read
-    /// again; one that does not load leaves the view as it was.
+    /// again, and the volume listing read last reconciled with it; one that
+    /// does not load leaves the view as it was.
     pub(super) fn config_edited(&mut self, status: io::Result<ExitStatus>) -> Vec<Effect> {
         let failed = editor_failure(status);
         let path = self.project.dir.join(CONFIG_FILE);
@@ -1120,10 +1291,18 @@ impl App {
         } else {
             format!("{CONFIG_FILE} read again")
         };
-        match failed {
-            Some(failed) => self.say(Severity::Warn, format!("{failed}; {what}")),
-            None => self.say(Severity::Info, what),
+        let (mut severity, mut said) = match failed {
+            Some(failed) => (Severity::Warn, format!("{failed}; {what}")),
+            None => (Severity::Info, what),
+        };
+        // A volume listing read while the file was edited applies to it now.
+        if let Some((reconciled, text)) = self.volume_centers_reconciled() {
+            if reconciled != Severity::Info {
+                severity = reconciled;
+            }
+            said = format!("{said}; {text}");
         }
+        self.say(severity, said);
         self.reload()
     }
 }
@@ -1697,6 +1876,61 @@ mod tests {
     }
 
     #[test]
+    fn a_volume_listing_read_while_the_file_is_edited_reconciles_after() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        let with_volume = |volume: &str, center: &str| {
+            PROJECT_CONFIG.replace(
+                "max_hours = 6\n",
+                &format!(
+                    "max_hours = 6\nnetwork_volume_id = \"{volume}\"\n\
+                     data_center_ids = [\"{center}\"]\n"
+                ),
+            )
+        };
+        let before = with_volume("voleu", "US-KS-2");
+        std::fs::write(dir.path().join(CONFIG_FILE), &before)?;
+        app.set_config(crate::tui::project::ProjectConfig::new(&before, &app.env)?);
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        press(&mut app, &[KeyCode::Esc]);
+        press(&mut app, &[KeyCode::Char('E')]);
+        assert!(app.project_view.editing);
+        let volumes = volume_entries(&[
+            NetworkVolume {
+                id: "voleu".into(),
+                name: "alpha".into(),
+                size: 100,
+                data_center: "EU-RO-1".into(),
+            },
+            NetworkVolume {
+                id: "volus".into(),
+                name: "zeta".into(),
+                size: 50,
+                data_center: "US-KS-2".into(),
+            },
+        ]);
+        listed(&mut app, id, volumes, Vec::new());
+        assert!(app.project_view.pending.is_none(), "nothing while edited");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            with_volume("volus", "EU-RO-1"),
+        )?;
+        app.on_editor_exit(Ok(ExitStatus::from_raw(0)));
+        let key = "targets.gpu_cloud.data_center_ids";
+        assert_eq!(
+            shown(&mut app, key)?,
+            "US-KS-2",
+            "reconciled on the new file"
+        );
+        assert!(field(&mut app, key)?.changed);
+        assert_eq!(
+            status(&app),
+            "overbrainer.toml read again; targets.gpu_cloud.data_center_ids = US-KS-2, the \
+             network volume's data center"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn e_is_refused_with_pending_changes_or_while_a_stage_runs() -> TestResult {
         let (_dir, mut app) = editing_app()?;
         set(&mut app, "project.name", "rust_pro")?;
@@ -2018,6 +2252,7 @@ mod tests {
             id: id.into(),
             columns: vec![id.into(), String::new(), String::new(), "1 GPU type".into()],
             selectable: true,
+            ranks: Vec::new(),
         };
         listed(
             &mut app,
@@ -2149,6 +2384,255 @@ mod tests {
         assert_eq!(
             shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
             "EU-RO-1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_a_volume_the_data_centers_change_only_with_the_volume() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
+        let key = "targets.gpu_cloud.data_center_ids";
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1");
+        let centers = || {
+            ["EU-RO-1", "US-KS-2"]
+                .map(|id| Entry {
+                    id: id.into(),
+                    columns: vec![id.into(), String::new(), String::new(), "HIGH".into()],
+                    selectable: true,
+                    ranks: Vec::new(),
+                })
+                .to_vec()
+        };
+        let refused = "refused: targets.gpu_cloud.data_center_ids is the network volume's data \
+                       center; pick another network_volume_id to change it";
+        // Another data center, none, then auto: each refused.
+        for codes in [
+            &[KeyCode::End, KeyCode::Char(' '), KeyCode::Enter][..],
+            &[KeyCode::Char(' '), KeyCode::Enter],
+            &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
+        ] {
+            app.status = None;
+            let (id, _) = open_picker_on(&mut app, key)?;
+            listed(&mut app, id, centers(), Vec::new());
+            press(&mut app, codes);
+            assert!(!picker_open(&app), "{codes:?}");
+            assert_eq!(shown(&mut app, key)?, "EU-RO-1", "{codes:?}");
+            assert_eq!(status(&app), refused, "{codes:?}");
+        }
+        // Keeping the volume's own data center is no change.
+        app.status = None;
+        let (id, _) = open_picker_on(&mut app, key)?;
+        listed(&mut app, id, centers(), Vec::new());
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(status(&app), "");
+        // Typed instead: refused in the form.
+        open_picker_on(&mut app, key)?;
+        press(&mut app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        chars(&mut app, "US-KS-2");
+        press(&mut app, &[KeyCode::Enter]);
+        let Some(Form::Value { error, .. }) = &app.project_view.form else {
+            return Err("the form closed".into());
+        };
+        assert_eq!(error.as_deref(), Some(refused));
+        press(&mut app, &[KeyCode::Esc]);
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1");
+        // Without a volume, the data centers change again.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        press(&mut app, &[KeyCode::Home, KeyCode::Enter]);
+        let (id, _) = open_picker_on(&mut app, key)?;
+        listed(&mut app, id, centers(), Vec::new());
+        press(
+            &mut app,
+            &[KeyCode::End, KeyCode::Char(' '), KeyCode::Enter],
+        );
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1, US-KS-2");
+        Ok(())
+    }
+
+    /// `t` in the volume picker, `volume` typed, then Enter.
+    fn type_volume(app: &mut App, volume: &str, catalog: Option<Vec<Entry>>) -> TestResult {
+        let (id, _) = open_picker_on(app, "targets.gpu_cloud.network_volume_id")?;
+        if let Some(entries) = catalog {
+            listed(app, id, entries, Vec::new());
+        }
+        press(app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(app, &[KeyCode::Backspace; 20]);
+        chars(app, volume);
+        press(app, &[KeyCode::Enter]);
+        assert_eq!(app.project_view.form, None, "{}", status(app));
+        Ok(())
+    }
+
+    #[test]
+    fn a_typed_volume_the_catalog_lists_sets_its_data_center() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        type_volume(&mut app, "vol-eu", Some(volumes()))?;
+        let key = "targets.gpu_cloud.data_center_ids";
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1");
+        // Typed again, while the listing is still read: the one read is used.
+        type_volume(&mut app, "vol-us", None)?;
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.network_volume_id")?,
+            "vol-us"
+        );
+        assert_eq!(shown(&mut app, key)?, "US-KS-2");
+        assert_eq!(
+            status(&app),
+            "targets.gpu_cloud.data_center_ids = US-KS-2, the volume's data center"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_typed_volume_the_catalog_lacks_leaves_the_data_centers_free() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        type_volume(&mut app, "vol-eu", Some(volumes()))?;
+        type_volume(&mut app, "volnew", Some(volumes()))?;
+        let key = "targets.gpu_cloud.data_center_ids";
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1", "unchanged");
+        app.status = None;
+        open_picker_on(&mut app, key)?;
+        press(&mut app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        chars(&mut app, "US-KS-2");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.project_view.form, None, "not refused: {}", status(&app));
+        assert_eq!(shown(&mut app, key)?, "US-KS-2");
+        // Picking a listed volume makes its data center known again.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        press(&mut app, &[KeyCode::Home, KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(shown(&mut app, key)?, "EU-RO-1");
+        let (id, _) = open_picker_on(&mut app, key)?;
+        listed(&mut app, id, Vec::new(), Vec::new());
+        press(&mut app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        chars(&mut app, "US-KS-2");
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.project_view.form.is_some(), "refused again");
+        Ok(())
+    }
+
+    /// `t` on the field `key` (a picker), `value` typed, then Enter; whether
+    /// the form closed, that is the value was taken.
+    fn type_in(app: &mut App, key: &str, value: &str) -> Result<bool, String> {
+        open_picker_on(app, key)?;
+        press(app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(app, &[KeyCode::Backspace; 20]);
+        chars(app, value);
+        press(app, &[KeyCode::Enter]);
+        let taken = app.project_view.form.is_none();
+        press(app, &[KeyCode::Esc]);
+        Ok(taken)
+    }
+
+    #[test]
+    fn an_unlisted_volume_kept_in_its_picker_holds_no_data_center() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let target = |field| FieldPath::Target {
+            name: "gpu_cloud".into(),
+            field,
+        };
+        app.apply(
+            &target("network_volume_id"),
+            Some(&FieldValue::Text("volnew".into())),
+        )?;
+        app.apply(
+            &target("data_center_ids"),
+            Some(&FieldValue::List(vec!["EU-RO-1".into()])),
+        )?;
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.network_volume_id")?,
+            "volnew"
+        );
+        let key = "targets.gpu_cloud.data_center_ids";
+        assert!(type_in(&mut app, key, "US-KS-2")?, "{}", status(&app));
+        assert_eq!(shown(&mut app, key)?, "US-KS-2");
+        Ok(())
+    }
+
+    #[test]
+    fn a_typed_volume_listed_later_gets_its_data_center() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let key = "targets.gpu_cloud.data_center_ids";
+        assert!(type_in(
+            &mut app,
+            "targets.gpu_cloud.network_volume_id",
+            "vol-us"
+        )?);
+        assert!(
+            type_in(&mut app, key, "EU-RO-1")?,
+            "not listed yet: allowed"
+        );
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        listed(&mut app, id, volumes(), Vec::new());
+        assert_eq!(shown(&mut app, key)?, "US-KS-2", "reconciled");
+        assert_eq!(
+            status(&app),
+            "targets.gpu_cloud.data_center_ids = US-KS-2, the network volume's data center"
+        );
+        assert!(field(&mut app, key)?.changed, "a pending change");
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(!type_in(&mut app, key, "EU-RO-1")?, "refused now");
+        assert_eq!(shown(&mut app, key)?, "US-KS-2");
+        Ok(())
+    }
+
+    #[test]
+    fn a_listing_reconciles_every_target_and_says_it_once() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
+        let config = PROJECT_CONFIG.replace(
+            "max_hours = 6\n",
+            "max_hours = 6\nnetwork_volume_id = \"voleu\"\ndata_center_ids = [\"US-KS-2\"]\n\n\
+             [targets.gpu_two]\nkind = \"runpod\"\ngpu_types = [\"NVIDIA A40\"]\n\
+             max_hours = 6\nnetwork_volume_id = \"volus\"\ndata_center_ids = [\"EU-RO-1\"]\n",
+        );
+        let read = crate::tui::project::ProjectConfig::new(&config, &app.env)?;
+        app.set_config(read);
+        let mut follow =
+            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, "20260921-a1");
+        follow.watching = true;
+        app.training.tasks.insert(TaskId(90), follow);
+        let volumes = volume_entries(&[
+            NetworkVolume {
+                id: "voleu".into(),
+                name: "alpha".into(),
+                size: 100,
+                data_center: "EU-RO-1".into(),
+            },
+            NetworkVolume {
+                id: "volus".into(),
+                name: "zeta".into(),
+                size: 50,
+                data_center: "US-KS-2".into(),
+            },
+        ]);
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_two.network_volume_id")?;
+        listed(&mut app, id, volumes, Vec::new());
+        assert_eq!(
+            shown(&mut app, "targets.gpu_two.data_center_ids")?,
+            "US-KS-2"
+        );
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "US-KS-2",
+            "locked by the run"
+        );
+        let said = app.status.as_ref().ok_or("nothing said")?;
+        assert_eq!(said.severity, Severity::Warn);
+        assert_eq!(
+            said.text,
+            "targets.gpu_cloud.data_center_ids not set to EU-RO-1, the network volume's data \
+             center: used by run 20260921-a1; targets.gpu_two.data_center_ids = US-KS-2, the \
+             network volume's data center"
         );
         Ok(())
     }

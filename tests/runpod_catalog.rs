@@ -234,6 +234,38 @@ async fn templates_follow_every_page_and_keep_pod_templates_only() -> TestResult
 }
 
 #[tokio::test]
+async fn a_template_listed_twice_keeps_its_first_occurrence() -> TestResult {
+    let server = MockServer::start().await;
+    let mut later = template("t1", false);
+    later["name"] = json!("tpl t1 again");
+    Mock::given(method("GET"))
+        .and(path("/v2/templates"))
+        .and(query_param("cursor", "c2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "templates": [later, template("t3", false)],
+            "pagination": {"hasNextPage": false, "nextCursor": null}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/templates"))
+        .and(query_param_is_missing("cursor"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "templates": [template("t1", false), template("t2", false), template("t2", false)],
+            "pagination": {"hasNextPage": true, "nextCursor": "c2"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let templates = client(&server)?.list_templates().await?;
+    let ids: Vec<&str> = templates.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["t1", "t2", "t3"], "across pages and within one");
+    assert_eq!(templates[0].name, "tpl t1", "the first occurrence is kept");
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_repeated_template_cursor_is_an_error() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

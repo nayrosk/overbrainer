@@ -229,6 +229,12 @@ where
     Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
+/// Deserializes a catalog string that may be `null` (as [`nullable`]), made
+/// [`printable`](super::printable) at once, so every use of it is clean.
+fn clean<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    nullable::<D, String>(deserializer).map(|text| super::printable(&text))
+}
+
 /// A catalog stock band, as Runpod writes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -274,13 +280,13 @@ impl Availability {
 #[serde(rename_all = "camelCase")]
 pub struct GpuType {
     /// GPU type ID, as a pod create asks for it.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub id: String,
     /// Display name.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub name: String,
     /// `NVIDIA`, `AMD` or `UNKNOWN`.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub manufacturer: String,
     /// VRAM of one GPU, in GB.
     #[serde(default, deserialize_with = "nullable")]
@@ -359,10 +365,10 @@ pub struct GpuMaxCount {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct Stock {
     /// The entry's ID.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub id: String,
     /// Its display name.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub name: String,
     /// Its stock band.
     #[serde(default, deserialize_with = "nullable")]
@@ -373,7 +379,7 @@ pub struct Stock {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct CudaVersion {
     /// `major.minor`.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub version: String,
     /// Whether a machine on it has free capacity now.
     #[serde(default, deserialize_with = "nullable")]
@@ -393,13 +399,13 @@ pub struct GpuTypeList {
 #[serde(rename_all = "camelCase")]
 pub struct DataCenter {
     /// Its ID, as `data_center_ids` names it.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub id: String,
     /// Display name.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub name: String,
     /// Continental region, such as `EUROPE`.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub region: String,
     /// Stock of each GPU type it offers.
     #[serde(default, deserialize_with = "nullable")]
@@ -420,16 +426,16 @@ pub struct DataCenterList {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkVolume {
     /// Its ID, as `network_volume_id` names it.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub id: String,
     /// Its name.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub name: String,
     /// Size in GB.
     #[serde(default, deserialize_with = "nullable")]
     pub size: u32,
     /// The data center it lives in.
-    #[serde(default, alias = "dataCenterId", deserialize_with = "nullable")]
+    #[serde(default, alias = "dataCenterId", deserialize_with = "clean")]
     pub data_center: String,
 }
 
@@ -447,13 +453,13 @@ pub struct NetworkVolumeList {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct Template {
     /// Its ID.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub id: String,
     /// Its name.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub name: String,
     /// Its container image.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "clean")]
     pub image: String,
     /// Whether it is for serverless workers rather than pods.
     #[serde(default, deserialize_with = "nullable")]

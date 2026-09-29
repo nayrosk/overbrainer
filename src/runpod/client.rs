@@ -381,7 +381,8 @@ impl RunpodClient {
     }
 
     /// The account's pod templates (serverless ones are left out), following
-    /// the pagination of `GET /templates` up to a fixed page limit.
+    /// the pagination of `GET /templates` up to a fixed page limit; an ID
+    /// listed twice keeps its first occurrence.
     ///
     /// # Errors
     ///
@@ -393,9 +394,10 @@ impl RunpodClient {
                 (page.templates, page.pagination)
             })
             .await?;
+        let mut ids = HashSet::new();
         Ok(templates
             .into_iter()
-            .filter(|template| !template.serverless)
+            .filter(|template| !template.serverless && ids.insert(template.id.clone()))
             .collect())
     }
 

@@ -1040,6 +1040,16 @@ fn the_gpu_picker_on_a_fixture_catalog() -> TestResult {
     Ok(())
 }
 
+/// `o` sorts the GPU picker by VRAM, most first; the title says so.
+#[test]
+fn the_gpu_picker_sorted_by_vram() -> TestResult {
+    let (mut app, id) = picker_app(super::catalog::CatalogKind::Gpus, &["NVIDIA A40"])?;
+    app.on_done(id, Ok(Done::Catalog(Ok(listed(gpu_catalog(2)?)))));
+    app.on_input(&key(KeyCode::Char('o')));
+    snapshot_at("picker_gpus_by_vram_80x24", &mut app, 80, 24)?;
+    Ok(())
+}
+
 #[test]
 fn a_picker_filtered_while_typed() -> TestResult {
     let (mut app, id) = picker_app(super::catalog::CatalogKind::Gpus, &[])?;

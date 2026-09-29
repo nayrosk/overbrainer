@@ -1,6 +1,6 @@
 //! The picker overlay: entries in columns, several chosen in order (Space
 //! toggles, `J`/`K` move the entry under the cursor in that order) or one
-//! picked with Enter, filtered with `/`. The entries arrive later: a spinner
+//! picked with Enter, filtered with `/`, sorted another way with `o`. The entries arrive later: a spinner
 //! shows until then, and an error in their place when they cannot be read.
 
 use crossterm::event::KeyCode;
@@ -12,6 +12,7 @@ use ratatui::widgets::{Cell, Padding, Paragraph, Row as TableRow, Table, TableSt
 use super::form::{Input, InputOutcome};
 use super::{centered, overlay};
 use crate::config::ListOrAuto;
+use crate::runpod::printable;
 use crate::tui::app::PAGE;
 use crate::tui::theme::Theme;
 
@@ -42,6 +43,9 @@ pub(in crate::tui) struct Entry {
     pub(in crate::tui) columns: Vec<String>,
     /// Whether it can be chosen; drawn dim when not.
     pub(in crate::tui) selectable: bool,
+    /// Its place in each order of [`Spec::orders`] after the first, which is
+    /// the order entries come in; an entry without one comes last.
+    pub(in crate::tui) ranks: Vec<usize>,
 }
 
 /// What a picker holds chosen, or kept.
@@ -92,6 +96,9 @@ pub(in crate::tui) struct Spec {
     pub(in crate::tui) auto: Option<&'static str>,
     /// What shows when there is no entry at all.
     pub(in crate::tui) empty: &'static str,
+    /// The names of the orders `o` cycles through, the first being the order
+    /// entries come in; with fewer than two, `o` does nothing.
+    pub(in crate::tui) orders: &'static [&'static str],
 }
 
 /// The entries: being read, read, or why they cannot be.
@@ -111,7 +118,8 @@ enum Row {
 
 /// A picker's state. Its rows are the `auto` entry, then in
 /// [`Mode::Multi`] the chosen entries in their order, then the others in the
-/// order they came in, each kept only when it matches the filter.
+/// order shown (see [`Spec::orders`]), each kept only when it matches the
+/// filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::tui) struct Picker {
     spec: Spec,
@@ -128,6 +136,8 @@ pub(in crate::tui) struct Picker {
     typing: bool,
     /// Whether `t` asks to type the value instead.
     typed: bool,
+    /// The order shown, an index into [`Spec::orders`].
+    order: usize,
 }
 
 impl Picker {
@@ -157,6 +167,7 @@ impl Picker {
             filter: None,
             typing: false,
             typed: true,
+            order: 0,
         }
     }
 
@@ -171,12 +182,18 @@ impl Picker {
         self.typed
     }
 
-    /// Shows the entries read, or why they cannot be. A chosen ID no entry
-    /// has gets an entry of its own, so it stays in view and can be taken out.
-    /// The cursor goes to the first chosen row.
+    /// Shows the entries read, or why they cannot be; their cells, from the
+    /// Runpod API, are made [`printable`]. A chosen ID no entry has gets an
+    /// entry of its own, so it stays in view and can be taken out. The cursor
+    /// goes to the first chosen row.
     pub(in crate::tui) fn loaded(&mut self, entries: Result<Vec<Entry>, String>) {
         let mut entries = match entries {
-            Ok(entries) => entries,
+            Ok(mut entries) => {
+                for cell in entries.iter_mut().flat_map(|entry| &mut entry.columns) {
+                    *cell = printable(cell);
+                }
+                entries
+            },
             Err(error) => {
                 self.load = Load::Failed(error);
                 return;
@@ -193,6 +210,7 @@ impl Picker {
                     id: id.clone(),
                     columns,
                     selectable: true,
+                    ranks: Vec::new(),
                 });
             }
         }
@@ -241,7 +259,21 @@ impl Picker {
         self.entries().iter().find(|entry| entry.id == id)
     }
 
-    /// Handles `code`: moves, toggles, reorders, filters, keeps or cancels;
+    /// Whether `o` sorts the entries another way.
+    pub(in crate::tui) fn sortable(&self) -> bool {
+        self.spec.orders.len() > 1
+    }
+
+    /// The name of the order shown, when there are several.
+    fn order_name(&self) -> Option<&'static str> {
+        self.spec
+            .orders
+            .get(self.order)
+            .copied()
+            .filter(|_| self.sortable())
+    }
+
+    /// Handles `code`: moves, toggles, reorders, sorts, filters, keeps or cancels;
     /// `t` asks to type the value instead, unless [`Self::untyped`]. Until
     /// the entries are read, only Esc and `t` do something.
     pub(in crate::tui) fn on_key(&mut self, code: KeyCode) -> PickerOutcome {
@@ -269,6 +301,7 @@ impl Picker {
             KeyCode::Char(' ') if self.spec.mode == Mode::Multi => self.toggle(),
             KeyCode::Char('J') if self.spec.mode == Mode::Multi => self.shift(true),
             KeyCode::Char('K') if self.spec.mode == Mode::Multi => self.shift(false),
+            KeyCode::Char('o') if self.sortable() => self.sort(),
             KeyCode::Char('/') => {
                 self.typing = true;
                 self.filter.get_or_insert_with(|| Input::new(""));
@@ -389,6 +422,34 @@ impl Picker {
         }
     }
 
+    /// `o`: shows the next order, after the last the first; the cursor stays
+    /// on its row.
+    fn sort(&mut self) {
+        let row = self.rows().get(self.cursor).copied();
+        self.order = (self.order + 1) % self.spec.orders.len();
+        if let Some(row) = row {
+            self.follow(row);
+        }
+    }
+
+    /// The indices of the entries in the order shown: by their rank there,
+    /// ties (and the first order) in the order they came in.
+    fn sorted(&self) -> Vec<usize> {
+        let entries = self.entries();
+        let mut indices: Vec<usize> = (0..entries.len()).collect();
+        if let Some(at) = self.order.checked_sub(1) {
+            let rank = |index: usize| {
+                entries
+                    .get(index)
+                    .and_then(|entry| entry.ranks.get(at))
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            };
+            indices.sort_by_key(|index| (rank(*index), *index));
+        }
+        indices
+    }
+
     /// Puts the cursor on `row`, wherever it is now.
     fn follow(&mut self, row: Row) {
         if let Some(at) = self.rows().iter().position(|shown| *shown == row) {
@@ -445,11 +506,10 @@ impl Picker {
         }
         rows.extend(first.iter().map(|index| Row::Entry(*index)));
         rows.extend(
-            entries
-                .iter()
-                .enumerate()
-                .filter(|(index, entry)| !first.contains(index) && shown(entry))
-                .map(|(index, _)| Row::Entry(index)),
+            self.sorted()
+                .into_iter()
+                .filter(|index| !first.contains(index) && entries.get(*index).is_some_and(shown))
+                .map(Row::Entry),
         );
         rows
     }
@@ -503,20 +563,8 @@ pub(in crate::tui) fn render(
         .min(room)
         .saturating_add(2);
     let popup = centered(area, width, height);
-    let chosen = picker.chosen.len();
-    let title = match (picker.spec.mode, picker.auto) {
-        (Mode::Multi, true) => format!(" {}: {AUTO} ", picker.spec.title),
-        (Mode::Multi, false) if chosen > 0 => format!(" {}: {chosen} chosen ", picker.spec.title),
-        _ => format!(" {} ", picker.spec.title),
-    };
-    let keys = match (&picker.load, picker.spec.mode, picker.typed) {
-        (Load::Ready(_), Mode::Multi, true) => " Space toggles, Enter keeps, t types, Esc cancels ",
-        (Load::Ready(_), Mode::Multi, false) => " Space toggles, Enter keeps, Esc cancels ",
-        (Load::Ready(_), Mode::Single, true) => " Enter picks, t types, Esc cancels ",
-        (Load::Ready(_), Mode::Single, false) => " Enter picks, Esc cancels ",
-        (_, _, true) => " t types the value, Esc closes ",
-        (_, _, false) => " Esc closes ",
-    };
+    let title = title(picker);
+    let keys = keys(picker);
     let block = overlay(frame, popup, theme)
         .title(Span::styled(title, theme.title))
         .title_bottom(Span::styled(keys, theme.dim))
@@ -562,6 +610,45 @@ pub(in crate::tui) fn render(
         }
     }
     popup
+}
+
+/// The title of `picker`: its name, the order shown when there are several,
+/// and what is chosen in [`Mode::Multi`].
+fn title(picker: &Picker) -> String {
+    let name = match picker.order_name() {
+        Some(order) => format!("{} by {order}", picker.spec.title),
+        None => picker.spec.title.to_string(),
+    };
+    let chosen = picker.chosen.len();
+    match (picker.spec.mode, picker.auto) {
+        (Mode::Multi, true) => format!(" {name}: {AUTO} "),
+        (Mode::Multi, false) if chosen > 0 => format!(" {name}: {chosen} chosen "),
+        _ => format!(" {name} "),
+    }
+}
+
+/// The keys of `picker` in its state, for its bottom border.
+fn keys(picker: &Picker) -> String {
+    let mut keys: Vec<&str> = Vec::new();
+    if matches!(picker.load, Load::Ready(_)) {
+        keys.push(match picker.spec.mode {
+            Mode::Multi => "Space toggles, Enter keeps",
+            Mode::Single => "Enter picks",
+        });
+        if picker.sortable() {
+            keys.push("o sorts");
+        }
+        if picker.typed {
+            keys.push("t types");
+        }
+        keys.push("Esc cancels");
+    } else {
+        if picker.typed {
+            keys.push("t types the value");
+        }
+        keys.push("Esc closes");
+    }
+    format!(" {} ", keys.join(", "))
 }
 
 /// Draws `rows` of `picker` as a table in `area`, columns as wide as their
@@ -644,6 +731,7 @@ mod tests {
             mode,
             auto: auto.then_some("chosen at start"),
             empty: "nothing listed",
+            orders: &[],
         }
     }
 
@@ -652,6 +740,7 @@ mod tests {
             id: id.into(),
             columns: vec![id.into(), "48".into()],
             selectable,
+            ranks: Vec::new(),
         }
     }
 
@@ -890,5 +979,93 @@ mod tests {
         );
         keys(&mut picker, &[KeyCode::Char(' ')]);
         assert_eq!(picker.choice(), list(&["a"]));
+    }
+
+    #[test]
+    fn entries_are_drawn_without_control_characters() -> Result<(), Box<dyn std::error::Error>> {
+        let mut picker = Picker::new(spec(Mode::Single, false), list(&[]));
+        picker.loaded(Ok(vec![Entry {
+            id: "odd".into(),
+            columns: vec!["odd\u{1b}[2J\nname".into(), "48".into()],
+            selectable: true,
+            ranks: Vec::new(),
+        }]));
+        assert_eq!(
+            picker.entry("odd").map(|entry| entry.columns.clone()),
+            Some(vec!["odd name".to_string(), "48".to_string()])
+        );
+        let theme = Theme::mono();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))?;
+        terminal.draw(|frame| {
+            render(frame, frame.area(), &picker, &theme, "*");
+        })?;
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("odd name"), "{screen}");
+        Ok(())
+    }
+
+    /// A picker on `a`, `b`, `c` ordered by name, `c`, `a`, `b` by size, with
+    /// `chosen` preselected.
+    fn sortable(mode: Mode, chosen: Choice) -> Picker {
+        let mut spec = spec(mode, false);
+        spec.orders = &["name", "size"];
+        let mut picker = Picker::new(spec, chosen);
+        let ranked = |id: &str, rank: usize| Entry {
+            ranks: vec![rank],
+            ..entry(id, true)
+        };
+        picker.loaded(Ok(vec![ranked("a", 1), ranked("b", 2), ranked("c", 0)]));
+        picker
+    }
+
+    #[test]
+    fn o_cycles_the_orders_and_the_cursor_stays_on_its_row() {
+        let mut picker = sortable(Mode::Single, list(&["b"]));
+        assert_eq!(picker.order_name(), Some("name"));
+        assert_eq!(title(&picker), " GPU types by name ");
+        assert_eq!(ids(&picker), ["a", "b", "c"]);
+        keys(&mut picker, &[KeyCode::Char('o')]);
+        assert_eq!(ids(&picker), ["c", "a", "b"]);
+        assert_eq!(title(&picker), " GPU types by size ");
+        assert_eq!(picker.cursor, 2, "still on b");
+        keys(&mut picker, &[KeyCode::Char('o')]);
+        assert_eq!(ids(&picker), ["a", "b", "c"], "back to the first order");
+        assert!(self::keys_hint(&picker).contains("o sorts"));
+    }
+
+    fn keys_hint(picker: &Picker) -> String {
+        super::keys(picker)
+    }
+
+    #[test]
+    fn chosen_entries_stay_first_in_any_order() {
+        let mut picker = sortable(Mode::Multi, list(&["b"]));
+        keys(&mut picker, &[KeyCode::Char('o')]);
+        assert_eq!(ids(&picker), ["b", "c", "a"]);
+        assert_eq!(title(&picker), " GPU types by size: 1 chosen ");
+    }
+
+    #[test]
+    fn o_does_nothing_with_one_order_and_is_typed_in_the_filter() {
+        let mut plain = picker(Mode::Single, false, list(&[]));
+        keys(&mut plain, &[KeyCode::Char('o')]);
+        assert_eq!(ids(&plain), ["a", "b", "c"]);
+        assert_eq!(title(&plain), " GPU types ");
+        assert!(!keys_hint(&plain).contains("o sorts"));
+        let mut filtered = sortable(Mode::Single, list(&[]));
+        keys(&mut filtered, &[KeyCode::Char('/'), KeyCode::Char('o')]);
+        assert_eq!(filtered.filter_text(), "o");
+        assert_eq!(filtered.order, 0);
+    }
+
+    #[test]
+    fn an_entry_without_a_rank_comes_last() {
+        let mut picker = sortable(Mode::Multi, list(&[]));
+        if let Load::Ready(entries) = &mut picker.load {
+            entries.push(entry("d", true));
+            entries.swap(0, 3);
+        }
+        keys(&mut picker, &[KeyCode::Char('o')]);
+        assert_eq!(ids(&picker), ["c", "a", "b", "d"]);
     }
 }

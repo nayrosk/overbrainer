@@ -53,8 +53,8 @@ const PROJECT: &[KeyHelp] = &[
     ),
     row("Enter", "edit the field; toggles a bool, cycles a choice"),
     row(
-        "t, in a Runpod picker",
-        "type the value instead of picking it",
+        "t o, in a Runpod picker",
+        "type the value instead, sort another way",
     ),
     row("a", "add a topic, a provider or a target"),
     row("d", "delete the selected topic, provider or target"),

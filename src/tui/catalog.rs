@@ -68,6 +68,7 @@ impl CatalogKind {
                 mode: Mode::Multi,
                 auto: Some("cheapest in stock"),
                 empty: "no GPU type on Runpod's Secure Cloud",
+                orders: &["price", "VRAM", "data centers"],
             },
             Self::DataCenters => Spec {
                 title: "Data centers",
@@ -76,6 +77,7 @@ impl CatalogKind {
                 mode: Mode::Multi,
                 auto: Some("GPUs in stock"),
                 empty: "no data center in the catalog",
+                orders: &["ID", "region"],
             },
             Self::Volumes => Spec {
                 title: "Network volume",
@@ -84,6 +86,7 @@ impl CatalogKind {
                 mode: Mode::Single,
                 auto: None,
                 empty: "no network volume on this account",
+                orders: &[],
             },
             Self::Templates => Spec {
                 title: "Template image",
@@ -92,6 +95,7 @@ impl CatalogKind {
                 mode: Mode::Single,
                 auto: None,
                 empty: "no pod template on this account",
+                orders: &[],
             },
         }
     }
@@ -155,12 +159,41 @@ async fn read(client: &RunpodClient, query: &Query) -> Result<Listed, ApiError> 
     })
 }
 
-/// The Secure Cloud GPU types, cheapest first; one whose pod maximum is below
-/// `gpu_count` cannot be chosen.
+/// The place of each of `count` items once sorted by `key`, ties in the order
+/// they came in.
+fn ranks<K: Ord>(count: usize, key: impl Fn(usize) -> K) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by_key(|index| (key(*index), *index));
+    let mut ranks = vec![0; count];
+    for (rank, index) in order.into_iter().enumerate() {
+        if let Some(slot) = ranks.get_mut(index) {
+            *slot = rank;
+        }
+    }
+    ranks
+}
+
+/// The Secure Cloud GPU types, cheapest first, ranked also by VRAM (most
+/// first) and by how many data centers have them in stock (most first), ties
+/// cheapest first; one whose pod maximum is below `gpu_count` cannot be
+/// chosen.
 pub(super) fn gpu_entries(gpus: &[GpuType], gpu_count: u32) -> Vec<Entry> {
-    select_gpus(gpus, &GpuFilter::default())
-        .into_iter()
-        .map(|gpu| Entry {
+    let gpus = select_gpus(gpus, &GpuFilter::default());
+    let stocked = |gpu: &GpuType| {
+        gpu.data_centers
+            .iter()
+            .filter(|entry| entry.availability.is_in_stock())
+            .count()
+    };
+    let by_vram = ranks(gpus.len(), |at| {
+        std::cmp::Reverse(gpus.get(at).map_or(0, |gpu| gpu.memory))
+    });
+    let by_centers = ranks(gpus.len(), |at| {
+        std::cmp::Reverse(gpus.get(at).map_or(0, stocked))
+    });
+    gpus.into_iter()
+        .zip(by_vram.into_iter().zip(by_centers))
+        .map(|(gpu, (vram, centers))| Entry {
             columns: vec![
                 gpu.id.clone(),
                 gpu.memory.to_string(),
@@ -170,12 +203,13 @@ pub(super) fn gpu_entries(gpus: &[GpuType], gpu_count: u32) -> Vec<Entry> {
                 gpu.availability.name().to_string(),
             ],
             selectable: gpu.max_count.secure >= gpu_count,
+            ranks: vec![vram, centers],
             id: gpu.id,
         })
         .collect()
 }
 
-/// The data centers, by ID, with the stock of each `chosen` GPU type there in
+/// The data centers, by ID, ranked also by region, with the stock of each `chosen` GPU type there in
 /// chosen order (`NONE / LOW`), or without any, how many GPU types are in
 /// stock there. Stock is each GPU's own, as `gpus` was listed for the pod's
 /// GPU count, never the data center listing's, which ignores the count.
@@ -186,8 +220,10 @@ pub(super) fn data_center_entries(
 ) -> Vec<Entry> {
     let mut rows: Vec<&DataCenter> = data_centers.iter().collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
-    rows.into_iter()
-        .map(|center| {
+    let by_region = ranks(rows.len(), |at| rows.get(at).map(|center| &center.region));
+    rows.iter()
+        .zip(by_region)
+        .map(|(center, region)| {
             let stock = if chosen.is_empty() {
                 let count = gpus
                     .iter()
@@ -219,6 +255,7 @@ pub(super) fn data_center_entries(
                     stock,
                 ],
                 selectable: true,
+                ranks: vec![region],
             }
         })
         .collect()
@@ -237,6 +274,7 @@ pub(super) fn volume_entries(volumes: &[NetworkVolume]) -> Vec<Entry> {
             String::new(),
         ],
         selectable: true,
+        ranks: Vec::new(),
     };
     std::iter::once(none)
         .chain(rows.into_iter().map(|volume| Entry {
@@ -248,6 +286,7 @@ pub(super) fn volume_entries(volumes: &[NetworkVolume]) -> Vec<Entry> {
                 volume.data_center.clone(),
             ],
             selectable: true,
+            ranks: Vec::new(),
         }))
         .collect()
 }
@@ -276,6 +315,7 @@ pub(super) fn template_entries(templates: &[Template]) -> Vec<Entry> {
             DEFAULT_RUNPOD_IMAGE.to_string(),
         ],
         selectable: true,
+        ranks: Vec::new(),
     };
     std::iter::once(default)
         .chain(rows.into_iter().map(|template| Entry {
@@ -290,6 +330,7 @@ pub(super) fn template_entries(templates: &[Template]) -> Vec<Entry> {
                 template.image.clone(),
             ],
             selectable: !template.image.is_empty(),
+            ranks: Vec::new(),
         }))
         .collect()
 }
@@ -608,6 +649,44 @@ mod tests {
             .entries;
         assert_eq!(centers[0].columns[3], "1 GPU type");
         assert_eq!(centers[1].columns[3], "1 GPU type", "L4 has none for 2");
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_entries_are_ranked_by_vram_and_by_data_centers_in_stock() -> TestResult {
+        let gpus: Vec<GpuType> = serde_json::from_value(json!([
+            {"id": "cheap", "memory": 24, "price": {"secure": 0.2}, "maxCount": {"secure": 8},
+             "dataCenters": [{"id": "A", "availability": "HIGH"}]},
+            {"id": "big", "memory": 80, "price": {"secure": 2.0}, "maxCount": {"secure": 8},
+             "dataCenters": [{"id": "A", "availability": "LOW"}, {"id": "B", "availability": "HIGH"}]},
+            {"id": "mid", "memory": 48, "price": {"secure": 0.5}, "maxCount": {"secure": 8},
+             "dataCenters": [{"id": "A", "availability": "NONE"}]}
+        ]))?;
+        let entries = gpu_entries(&gpus, 1);
+        assert_eq!(ids(&entries), ["cheap", "mid", "big"], "cheapest first");
+        let ranks: Vec<&[usize]> = entries.iter().map(|entry| entry.ranks.as_slice()).collect();
+        // VRAM: big, mid, cheap; data centers in stock: big (2), cheap (1), mid (0).
+        assert_eq!(ranks, [&[2, 1][..], &[1, 2], &[0, 0]]);
+        assert_eq!(
+            CatalogKind::Gpus.spec().orders,
+            ["price", "VRAM", "data centers"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn data_center_entries_are_ranked_by_region() -> TestResult {
+        let centers: Vec<DataCenter> = serde_json::from_value(json!([
+            {"id": "US-KS-2", "name": "", "region": "NORTH_AMERICA"},
+            {"id": "EU-RO-1", "name": "", "region": "EUROPE"},
+            {"id": "CA-MTL-1", "name": "", "region": "NORTH_AMERICA"}
+        ]))?;
+        let entries = data_center_entries(&centers, &[], &[]);
+        assert_eq!(ids(&entries), ["CA-MTL-1", "EU-RO-1", "US-KS-2"]);
+        let ranks: Vec<&[usize]> = entries.iter().map(|entry| entry.ranks.as_slice()).collect();
+        assert_eq!(ranks, [&[1][..], &[0], &[2]]);
+        assert_eq!(CatalogKind::DataCenters.spec().orders, ["ID", "region"]);
+        assert!(CatalogKind::Volumes.spec().orders.is_empty());
         Ok(())
     }
 

@@ -431,6 +431,12 @@ pub(super) struct App {
     /// The GPU types a catalog listing read last, for the hints of the Runpod
     /// target fields.
     pub(super) gpu_catalog: Option<Vec<crate::runpod::GpuType>>,
+    /// The network volumes a catalog listing read last, for a volume typed
+    /// instead of picked.
+    pub(super) volume_catalog: Option<Vec<Entry>>,
+    /// The volume listing started last: only its result is kept, so an older
+    /// one finishing later never replaces it.
+    volume_read: Option<TaskId>,
     /// The release on crates.io, when newer than the one running.
     pub(super) newer: Option<String>,
     /// Lines printed on stderr once the terminal is restored.
@@ -497,6 +503,8 @@ impl App {
             start_after_save: None,
             catalog_reads: Vec::new(),
             gpu_catalog: None,
+            volume_catalog: None,
+            volume_read: None,
             newer: None,
             exit_notes: Vec::new(),
             leaving_notes: Vec::new(),
@@ -886,6 +894,9 @@ impl App {
             picker,
         })));
         self.catalog_reads.push((task, kind));
+        if kind == CatalogKind::Volumes {
+            self.volume_read = Some(task);
+        }
         vec![Effect::Spawn(task, Task::Catalog(query))]
     }
 
@@ -910,19 +921,28 @@ impl App {
     }
 
     /// Listing `id` read `listed`: its GPU types kept for the hints, its
-    /// entries shown when it fills the picker open. Its failure shows in that
-    /// picker only: once the picker is closed, nothing is said.
+    /// volumes (from the volume listing started last only) for a volume typed
+    /// and the data centers they hold, its entries shown when it fills the
+    /// picker open. Its failure shows in that picker only: once the picker is
+    /// closed, nothing is said.
     fn listed_catalog(&mut self, id: TaskId, listed: Result<Listed, String>) {
         let Some(at) = self.catalog_reads.iter().position(|(read, _)| *read == id) else {
             return;
         };
-        self.catalog_reads.remove(at);
+        let (_, kind) = self.catalog_reads.remove(at);
+        let volumes = kind == CatalogKind::Volumes && self.volume_read == Some(id);
         let entries = listed.map(|listed| {
             if !listed.gpus.is_empty() {
                 self.gpu_catalog = Some(listed.gpus);
             }
+            if volumes {
+                self.volume_catalog = Some(listed.entries.clone());
+            }
             listed.entries
         });
+        if volumes && entries.is_ok() {
+            self.reconcile_volume_centers();
+        }
         if let Some(Overlay::Picker(picking)) = &mut self.overlay
             && picking.task == id
         {
@@ -4955,6 +4975,45 @@ mod tests {
         assert_eq!(app.view, view);
         assert_eq!(app.exit, None);
         assert!(picker_of(&app).is_some());
+        Ok(())
+    }
+    #[test]
+    fn an_older_volume_listing_finishing_last_is_ignored() -> Result<(), String> {
+        let mut app = app();
+        let query = Query {
+            kind: CatalogKind::Volumes,
+            gpu_count: 1,
+            gpu_types: Vec::new(),
+        };
+        let origin = Origin::Field(crate::config::edit::FieldPath::Target {
+            name: "gpu_cloud".into(),
+            field: "network_volume_id",
+        });
+        let spawned = |effects: Vec<Effect>| match effects.as_slice() {
+            [Effect::Spawn(id, _)] => Ok(*id),
+            _ => Err(format!("{effects:?}")),
+        };
+        let older =
+            spawned(app.open_picker(query.clone(), Choice::List(Vec::new()), origin.clone()))?;
+        app.overlay = None;
+        let newer = spawned(app.open_picker(query, Choice::List(Vec::new()), origin))?;
+        let volumes = |center: &str| Listed {
+            entries: crate::tui::catalog::volume_entries(&[crate::runpod::NetworkVolume {
+                id: "vol1".into(),
+                name: "data".into(),
+                size: 10,
+                data_center: center.into(),
+            }]),
+            gpus: Vec::new(),
+        };
+        app.on_done(newer, Ok(Done::Catalog(Ok(volumes("EU-RO-1")))));
+        app.on_done(older, Ok(Done::Catalog(Ok(volumes("US-KS-2")))));
+        let kept = app
+            .volume_catalog
+            .as_ref()
+            .and_then(|entries| entries.iter().find(|entry| entry.id == "vol1"))
+            .map(|entry| entry.columns[3].clone());
+        assert_eq!(kept.as_deref(), Some("EU-RO-1"));
         Ok(())
     }
 }
