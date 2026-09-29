@@ -15,8 +15,9 @@ use overbrainer::events::EventBus;
 use overbrainer::exec::{Executor, JobCommand, LocalExecutor};
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
-    AttemptResult, DeletedBy, PodCtx, PodError, PodRecord, PodState, RunpodClient, RunpodTarget,
-    Timing, Watched, follow, reconnect, settle_watch, start_pod, watch_on_pod,
+    AttemptResult, DeletedBy, LEASE_FILE, PodCtx, PodError, PodRecord, PodState, RunpodClient,
+    RunpodTarget, Timing, Watched, follow, reconnect, settle_watch, start_pod, watch_leased,
+    watch_on_pod,
 };
 use overbrainer::runs::{RunCtx, RunRecord, RunState, Runs, create};
 use overbrainer::train::{Artifacts, TrainError, Trainer};
@@ -556,6 +557,60 @@ async fn a_watch_that_loses_a_deleted_pod_fails_the_run() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_pod_gone_past_its_watchdog_deadline_fails_the_run_on_max_hours() -> TestResult {
+    let harness = Harness::new().await?;
+    serve_p1(&harness.server, true).await;
+    let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
+    let run = broken_run(&harness.runs)?;
+    // The watchdog's deadline passed a minute ago: the client's own guard, five
+    // minutes later, has not fired yet.
+    let mut pod = pod_record(&run.id, false, Duration::from_secs(60))?;
+    let run_ctx = RunCtx {
+        runs: &harness.runs,
+        executor: &executor,
+        bus: &harness.bus,
+        poll: Duration::from_millis(5),
+    };
+    let result = follow(&harness.ctx(), &run_ctx, &Nothing, run.clone(), &mut pod).await;
+    assert!(
+        matches!(result, Err(PodError::DeadlineReached)),
+        "{result:?}"
+    );
+    assert_eq!(pod.state, PodState::Deleted);
+    assert_eq!(pod.deleted_by, Some(DeletedBy::Watchdog));
+    let saved = harness.runs.load(&run.id)?;
+    assert_eq!(saved.state, RunState::Failed);
+    assert_eq!(
+        saved.message.as_deref(),
+        Some("max_hours reached: the pod was deleted before the job ended")
+    );
+    assert_eq!(deletes(&harness.server).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pod_gone_before_its_watchdog_deadline_is_gone_for_no_known_reason() -> TestResult {
+    let harness = Harness::new().await?;
+    serve_p1(&harness.server, true).await;
+    let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
+    let run = broken_run(&harness.runs)?;
+    let mut pod = pod_record(&run.id, false, Duration::ZERO)?;
+    pod.deadline_unix = pod.deadline_unix.map(|deadline| deadline + 3600);
+    let run_ctx = RunCtx {
+        runs: &harness.runs,
+        executor: &executor,
+        bus: &harness.bus,
+        poll: Duration::from_millis(5),
+    };
+    let result = follow(&harness.ctx(), &run_ctx, &Nothing, run.clone(), &mut pod).await;
+    assert!(matches!(result, Err(PodError::PodGone(_))), "{result:?}");
+    assert_eq!(pod.deleted_by, Some(DeletedBy::Unknown));
+    let saved = harness.runs.load(&run.id)?;
+    assert_eq!(saved.message.as_deref(), Some("pod p1 no longer exists"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_pod_that_only_looks_gone_once_is_not_gone() -> TestResult {
     let executor = LocalExecutor::new(&tempfile::tempdir()?.path().join("pod"))?;
     // A 404 then the pod; 404s only, but the pod is still listed.
@@ -662,6 +717,15 @@ async fn reconnect_records_a_pod_confirmed_gone_without_deleting_it() -> TestRes
     assert_eq!(deletes(&harness.server).await, 0);
     assert_eq!(gets(&harness.server).await, 3);
 
+    // Gone once its watchdog deadline passed: the watchdog deleted it.
+    let late = Harness::new().await?;
+    serve_sequence(&late.server, vec![false], false).await;
+    let run = broken_run(&late.runs)?;
+    let mut pod = pod_record(&run.id, false, Duration::from_secs(60))?;
+    assert!(reconnect(&late.ctx(), &mut pod, &run).await?.is_none());
+    assert_eq!(pod.deleted_by, Some(DeletedBy::Watchdog));
+    assert_eq!(deletes(&late.server).await, 0);
+
     // A single 404, then the pod (without an SSH endpoint): not gone.
     let flaky = Harness::new().await?;
     serve_sequence(&flaky.server, vec![false, true], false).await;
@@ -674,6 +738,42 @@ async fn reconnect_records_a_pod_confirmed_gone_without_deleting_it() -> TestRes
     );
     assert_eq!(pod.state, PodState::Provisioning);
     assert_eq!(deletes(&flaky.server).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_followed_job_holds_its_pod_past_the_deadline_with_a_lease() -> TestResult {
+    let harness = Harness::new().await?;
+    serve_p1(&harness.server, false).await;
+    let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
+    let mut run = create(&harness.runs, executor.workdir(), "gpu_cloud")?;
+    let job = executor
+        .spawn(&JobCommand {
+            dir: run.remote_dir.clone(),
+            script: r#"sleep 1; printf '{"event": "log", "time": 1, "step": 1, "epoch": 1, "max_steps": 1, "loss": 1.5, "learning_rate": 0.0002}\n' >> metrics.jsonl"#.into(),
+            secrets: Vec::new(),
+            container: None,
+        })
+        .await?;
+    run.job = Some(job);
+    run.state = RunState::Running;
+    harness.runs.save(&run)?;
+    // The client's own deadline (the watchdog's plus the margin) passed already:
+    // without a lease, the guard would fire at once.
+    let pod = pod_record(&run.id, false, Duration::from_secs(600))?;
+    let run_ctx = RunCtx {
+        runs: &harness.runs,
+        executor: &executor,
+        bus: &harness.bus,
+        poll: Duration::from_millis(50),
+    };
+    let watched = watch_leased(&run_ctx, &Nothing, run.clone(), &pod).await;
+    let Watched::Ended(ended) = watched else {
+        return Err("the guard fired under a fresh lease".into());
+    };
+    assert_eq!((*ended)?.record.state, RunState::Succeeded);
+    assert!(Path::new(&run.remote_dir).join(LEASE_FILE).is_file());
+    assert_eq!(deletes(&harness.server).await, 0);
     Ok(())
 }
 

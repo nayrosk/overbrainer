@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
 
 use anyhow::{Context, bail};
 
@@ -16,9 +17,10 @@ use crate::config::Settings;
 use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{
-    DeleteReason, DeletedBy, Ending, PodCtx, PodError, PodRecord, PodState, RunpodClient,
-    RunpodTarget, Timing, chain, end_pod, forget_client_key, job_started, listed_rows,
-    orphan_warnings, reconnect, remove, settle_watch, ssh_command, start_pod, watch_on_pod,
+    DeleteReason, DeletedBy, Ending, LEASE_TTL, MAX_HOURS_REACHED, PodCtx, PodError, PodRecord,
+    PodState, RunpodClient, RunpodTarget, Timing, chain, end_pod, forget_client_key, job_started,
+    listed_rows, orphan_warnings, past_deadline, reconnect, remove, settle_watch, ssh_command,
+    start_pod, watch_leased,
 };
 use crate::runs::{
     Launch, Outcome, RunCtx, RunRecord, RunState, Runs, artifacts_missing, cancel as cancel_job,
@@ -235,7 +237,7 @@ impl Job<'_> {
         // nothing half done. Acting on it (deleting the pod past the deadline)
         // is shielded.
         let watched = interrupt
-            .race(watch_on_pod(
+            .race(watch_leased(
                 &self.run_ctx(executor),
                 self.trainer,
                 record,
@@ -479,9 +481,10 @@ fn detached(pod: &PodRecord, id: &str, spec: &RunpodTarget) -> String {
         )
     } else {
         format!(
-            "The watchdog deletes the pod {} min after the job ends if its results are not retrieved, and by {} in any case.",
+            "The watchdog deletes the pod {} min after the job ends if its results are not retrieved, and at {} or {} min from now (once the lease this command held runs out), whichever is later.",
             spec.retrieve_grace.as_secs() / 60,
-            pod.deadline.as_deref().unwrap_or("its deadline")
+            pod.deadline.as_deref().unwrap_or("its deadline"),
+            LEASE_TTL.as_secs() / 60
         )
     };
     format!(
@@ -560,7 +563,12 @@ async fn from_local_files(
     tracing::info!("pod: {} already deleted", pod_name(pod));
     if record.state == RunState::Running {
         record.state = RunState::Failed;
-        record.message = Some(format!("pod {} no longer exists", pod_name(pod)));
+        // Its watchdog deleted it on `max_hours` once the deadline passed.
+        record.message = Some(if past_deadline(pod, SystemTime::now()) {
+            MAX_HOURS_REACHED.to_string()
+        } else {
+            format!("pod {} no longer exists", pod_name(pod))
+        });
         session.runs.save(&record)?;
     }
     let id = record.id.clone();
@@ -674,7 +682,8 @@ mod tests {
                 "interrupted: run r1 keeps running on pod k3x9abc ($0.53/h); follow it again \
                  with `overbrainer train attach r1`, or delete the pod with `overbrainer pod rm \
                  r1`. The watchdog deletes the pod 60 min after the job ends if its results are \
-                 not retrieved, and by {deadline} in any case."
+                 not retrieved, and at {deadline} or 15 min from now (once the lease this command held \
+                 runs out), whichever is later."
             )
         );
         assert!(detached(&pod(true)?, "r1", &target()).ends_with(

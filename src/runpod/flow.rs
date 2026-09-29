@@ -3,15 +3,19 @@
 //! results are retrieved. The CLI drives them and decides what Ctrl-C does.
 
 use std::fs;
+use std::future::Future;
 use std::io;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use secrecy::SecretString;
+use tokio::sync::broadcast::Receiver;
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::events::Event;
-use crate::exec::{Executor, SshExecutor};
+use crate::exec::{ExecError, Executor, LocalExecutor, SshExecutor};
 use crate::runs::{Outcome, RunCtx, RunError, RunRecord, RunState, Runs, watch};
-use crate::train::Trainer;
+use crate::train::{Pace, Trainer};
 
 use super::provision::note_strays;
 use super::{
@@ -27,6 +31,29 @@ pub const DEADLINE_MARGIN: Duration = Duration::from_secs(5 * 60);
 /// Where the watchdog looks for the client's "retrieved" marker, in a run
 /// directory on the pod.
 pub const RETRIEVED_MARKER: &str = ".pod/retrieved";
+
+/// Why a run fails when its pod was deleted on `max_hours`, by the client's own
+/// guard or by the pod's watchdog.
+pub const MAX_HOURS_REACHED: &str = "max_hours reached: the pod was deleted before the job ended";
+
+/// The lease a client following a job keeps on its pod, in the run directory:
+/// the watchdog skips its `max_hours` deadline while the file was touched less
+/// than [`LEASE_TTL`] ago.
+pub const LEASE_FILE: &str = ".pod/lease";
+
+/// How long a renewed lease holds the deadline off; the watchdog's
+/// `OVERBRAINER_LEASE_TTL` default.
+pub const LEASE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// How often the following client renews the lease.
+const LEASE_RENEW: Duration = Duration::from_secs(5 * 60);
+
+/// A job with no new metric for this long counts as stalled: its lease is no
+/// longer renewed, so `max_hours` applies again.
+const STALL: Duration = Duration::from_secs(30 * 60);
+
+/// How often the lease holder looks at the time.
+const LEASE_TICK: Duration = Duration::from_secs(60);
 
 /// Looks in a row that must answer Runpod's 404 before a pod is declared gone.
 const GONE_LOOKS: u32 = 3;
@@ -134,10 +161,12 @@ pub fn job_started(runs: &Runs, pod: &mut PodRecord) -> Result<(), PodError> {
 ///
 /// # Errors
 ///
-/// Returns [`PodError::DeadlineReached`] after that guard fired,
-/// [`PodError::PodGone`] when the target stays unreachable because the pod no
-/// longer exists (the run is then saved `Failed`), and [`PodError::Run`] for any
-/// other failure of the watch (the job may keep running: attach again).
+/// Returns [`PodError::DeadlineReached`] after that guard fired, or when the
+/// target stays unreachable because the watchdog deleted the pod at its
+/// deadline, [`PodError::PodGone`] when it stays unreachable because the pod no
+/// longer exists for another reason (the run is saved `Failed` in both cases),
+/// and [`PodError::Run`] for any other failure of the watch (the job may keep
+/// running: attach again).
 pub async fn follow<E: Executor, T: Trainer>(
     ctx: &PodCtx<'_>,
     run_ctx: &RunCtx<'_, E>,
@@ -160,9 +189,10 @@ pub enum Watched {
 }
 
 /// Watches the started run `record` until its job ends or the client's deadline
-/// (the watchdog's plus [`DEADLINE_MARGIN`]; none for a kept pod) passes. It
-/// never calls the Runpod API, so dropping it (on Ctrl-C) loses nothing: what
-/// it found is acted on by [`settle_watch`].
+/// (the watchdog's plus [`DEADLINE_MARGIN`]; none for a kept pod) passes, and
+/// warns once when the job's pace cannot end it before the watchdog's deadline.
+/// It never calls the Runpod API, so dropping it (on Ctrl-C) loses nothing:
+/// what it found is acted on by [`settle_watch`].
 pub async fn watch_on_pod<E: Executor, T: Trainer>(
     run_ctx: &RunCtx<'_, E>,
     trainer: &T,
@@ -170,12 +200,215 @@ pub async fn watch_on_pod<E: Executor, T: Trainer>(
     pod: &PodRecord,
 ) -> Watched {
     match until_deadline(pod) {
-        Some(wait) => tokio::select! {
-            outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
-            () = tokio::time::sleep(wait) => Watched::DeadlinePassed,
+        Some(wait) => {
+            let events = run_ctx.bus.subscribe();
+            tokio::select! {
+                outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
+                () = tokio::time::sleep(wait) => Watched::DeadlinePassed,
+                // Never ends: it only warns.
+                () = warn_overrun(events, pod) => Watched::DeadlinePassed,
+            }
         },
         None => Watched::Ended(Box::new(watch(run_ctx, trainer, record).await)),
     }
+}
+
+/// A target that can renew the lease of the pod it reaches.
+pub trait Lessee: Executor {
+    /// Creates `path` on the target, or updates its modification time.
+    fn touch(&self, path: &str) -> impl Future<Output = Result<(), ExecError>> + Send;
+}
+
+impl Lessee for SshExecutor {
+    async fn touch(&self, path: &str) -> Result<(), ExecError> {
+        self.write_marker(path).await
+    }
+}
+
+impl Lessee for LocalExecutor {
+    fn touch(&self, path: &str) -> impl Future<Output = Result<(), ExecError>> + Send {
+        std::future::ready(touch_local(Path::new(path)))
+    }
+}
+
+/// Creates or rewrites the empty file `path`, with its directory.
+fn touch_local(path: &Path) -> Result<(), ExecError> {
+    let io = |source| ExecError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(io)?;
+    }
+    fs::write(path, b"").map_err(io)
+}
+
+/// [`watch_on_pod`] for a client that stays with the job: while the job keeps
+/// making progress (a metric in the last 30 minutes), it renews the pod's lease
+/// ([`LEASE_FILE`]) every few minutes, so `max_hours` deletes nothing, neither
+/// the watchdog nor the client's own guard. Once the job stalls or the lease
+/// cannot be renewed, the lease runs out after [`LEASE_TTL`] and the deadline
+/// applies again. It warns once, as information, when the job ends after the
+/// deadline. A kept pod has no deadline and needs no lease.
+pub async fn watch_leased<E: Lessee, T: Trainer>(
+    run_ctx: &RunCtx<'_, E>,
+    trainer: &T,
+    record: RunRecord,
+    pod: &PodRecord,
+) -> Watched {
+    if until_deadline(pod).is_none() {
+        return Watched::Ended(Box::new(watch(run_ctx, trainer, record).await));
+    }
+    let events = run_ctx.bus.subscribe();
+    let lease = format!("{}/{LEASE_FILE}", record.remote_dir);
+    tokio::select! {
+        outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
+        // Boxed: its state would otherwise weigh on every caller's future.
+        () = Box::pin(hold_lease(run_ctx.executor, &lease, events, pod)) => Watched::DeadlinePassed,
+    }
+}
+
+/// Renews the lease at `path` while the job progresses, warns once when it
+/// ends after the deadline, and returns once the client's own deadline passed
+/// with no lease held.
+async fn hold_lease<E: Lessee>(
+    executor: &E,
+    path: &str,
+    mut events: Receiver<Event>,
+    pod: &PodRecord,
+) {
+    let mut lease = Lease::new(pod);
+    let mut open = true;
+    let mut tick = tokio::time::interval(LEASE_TICK);
+    loop {
+        tokio::select! {
+            event = events.recv(), if open => match event {
+                Ok(event) => lease.saw(&event),
+                Err(RecvError::Lagged(_)) => {},
+                Err(RecvError::Closed) => open = false,
+            },
+            _ = tick.tick() => {
+                if lease.tick(executor, path).await {
+                    return;
+                }
+            },
+        }
+    }
+}
+
+/// What [`hold_lease`] knows of the followed job and of its lease.
+struct Lease<'a> {
+    pod: &'a PodRecord,
+    pace: Pace,
+    last_metric: SystemTime,
+    renewed: Option<SystemTime>,
+    warned: bool,
+}
+
+impl<'a> Lease<'a> {
+    fn new(pod: &'a PodRecord) -> Self {
+        Self {
+            pod,
+            pace: Pace::default(),
+            last_metric: SystemTime::now(),
+            renewed: None,
+            warned: false,
+        }
+    }
+
+    /// Takes a training metric into account, and warns once when the job
+    /// ends after the deadline.
+    fn saw(&mut self, event: &Event) {
+        let Event::Metric(metric) = event else {
+            return;
+        };
+        self.pace.add(metric);
+        self.last_metric = SystemTime::now();
+        if self.warned {
+            return;
+        }
+        if let Some(note) = overrun(&self.pace, self.pod, self.last_metric, true) {
+            tracing::warn!("{note}");
+            self.warned = true;
+        }
+    }
+
+    /// Renews the lease at `path` when due; whether the client's guard fires.
+    async fn tick<E: Lessee>(&mut self, executor: &E, path: &str) -> bool {
+        let now = SystemTime::now();
+        if renewal_due(self.renewed, self.last_metric, now) {
+            match executor.touch(path).await {
+                Ok(()) => self.renewed = Some(now),
+                Err(error) => tracing::debug!("cannot renew the pod's lease: {error}"),
+            }
+        }
+        guard_fires(self.pod, self.renewed, now)
+    }
+}
+
+/// Whether the lease, last renewed at `renewed`, should be renewed at `now`:
+/// once [`LEASE_RENEW`] passed, and only while the job made progress (its last
+/// metric at `last_metric`) within [`STALL`].
+fn renewal_due(renewed: Option<SystemTime>, last_metric: SystemTime, now: SystemTime) -> bool {
+    let since = |at: SystemTime| now.duration_since(at).unwrap_or_default();
+    since(last_metric) < STALL && renewed.is_none_or(|at| since(at) >= LEASE_RENEW)
+}
+
+/// Whether the client's own guard deletes `pod` at `now`: its deadline plus
+/// [`DEADLINE_MARGIN`] passed, and no lease renewed within [`LEASE_TTL`].
+fn guard_fires(pod: &PodRecord, renewed: Option<SystemTime>, now: SystemTime) -> bool {
+    let held = renewed.is_some_and(|at| now.duration_since(at).unwrap_or_default() < LEASE_TTL);
+    !held && until_deadline_at(pod, now).is_some_and(|left| left.is_zero())
+}
+
+/// Warns once, from the training metrics on the bus, when the job of `pod`
+/// would need longer than its watchdog's deadline; then waits forever, so it
+/// never ends the watch.
+async fn warn_overrun(mut events: Receiver<Event>, pod: &PodRecord) {
+    let mut pace = Pace::default();
+    loop {
+        match events.recv().await {
+            Ok(Event::Metric(metric)) => {
+                pace.add(&metric);
+                if let Some(warning) = overrun(&pace, pod, SystemTime::now(), false) {
+                    tracing::warn!("{warning}");
+                    break;
+                }
+            },
+            Ok(_) | Err(RecvError::Lagged(_)) => {},
+            Err(RecvError::Closed) => break,
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+/// The warning when, at `pace`, the job of `pod` still running at `now` would
+/// end after its watchdog's deadline; `None` when it ends in time, for a kept
+/// pod, or while the pace is unknown. With a `leased` pod the deadline only
+/// applies once the client stops following the job.
+fn overrun(pace: &Pace, pod: &PodRecord, now: SystemTime, leased: bool) -> Option<String> {
+    if pod.keep {
+        return None;
+    }
+    let deadline = pod.deadline_unix?;
+    let left = pace.eta()?;
+    let end = now.checked_add(left)?.duration_since(UNIX_EPOCH).ok()?;
+    if end.as_secs() <= deadline {
+        return None;
+    }
+    let hours = left.as_secs_f64() / 3600.0;
+    let at = pod.deadline.as_deref().unwrap_or("its deadline");
+    if leased {
+        return Some(format!(
+            "at this pace the job needs about {hours:.1}h more, past max_hours ({at}): \
+             the pod stays while overbrainer follows the job; if it stops following, \
+             the pod's watchdog deletes the pod"
+        ));
+    }
+    Some(format!(
+        "at this pace the job needs about {hours:.1}h more, but the pod's watchdog deletes it by {at} (max_hours): \
+         raise the target's max_hours, or train with --keep-pod, to let it finish"
+    ))
 }
 
 /// Acts on what [`watch_on_pod`] found for the run `run_id`: past the deadline,
@@ -226,16 +459,14 @@ async fn deadline_reached(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -
     if let Err(error) = remove(ctx, pod, DeleteReason::Deadline, DeletedBy::Client).await {
         return error;
     }
-    fail_run(
-        ctx.runs,
-        run_id,
-        "max_hours reached: the pod was deleted before the job ended",
-    );
+    fail_run(ctx.runs, run_id, MAX_HOURS_REACHED);
     PodError::DeadlineReached
 }
 
 /// The watch failed with `error`: when the pod is gone, the run is failed with
-/// that reason instead.
+/// that reason instead. A pod gone once its watchdog's deadline passed was
+/// deleted by that watchdog: the run failed on `max_hours`, before the client's
+/// own guard (the deadline plus [`DEADLINE_MARGIN`]) could fire.
 async fn unreachable(
     ctx: &PodCtx<'_>,
     pod: &mut PodRecord,
@@ -243,6 +474,10 @@ async fn unreachable(
     error: PodError,
 ) -> PodError {
     match gone(ctx, pod).await {
+        Ok(true) if past_deadline(pod, SystemTime::now()) => {
+            fail_run(ctx.runs, run_id, MAX_HOURS_REACHED);
+            PodError::DeadlineReached
+        },
         Ok(true) => {
             let id = pod.pod_id.clone();
             if let Some(id) = &id {
@@ -259,7 +494,7 @@ async fn unreachable(
 }
 
 /// Whether the run's pod no longer exists; if so, `pod.json` records it deleted
-/// by [`DeletedBy::Unknown`]. Nothing is ever deleted here: see [`look_again`].
+/// by [`gone_by`]. Nothing is ever deleted here: see [`look_again`].
 async fn gone(ctx: &PodCtx<'_>, pod: &mut PodRecord) -> Result<bool, PodError> {
     let Some(id) = pod.pod_id.clone() else {
         return Ok(true);
@@ -270,8 +505,29 @@ async fn gone(ctx: &PodCtx<'_>, pod: &mut PodRecord) -> Result<bool, PodError> {
     if ctx.client.get_pod(&id).await?.is_some() || look_again(ctx, &id).await?.is_some() {
         return Ok(false);
     }
-    mark_gone(ctx, pod, id, DeletedBy::Unknown)?;
+    mark_gone(ctx, pod, id, gone_by(pod, SystemTime::now()))?;
     Ok(true)
+}
+
+/// Whether the watchdog's own deadline for `pod` has passed at `now`; never for
+/// a kept pod, or one without a deadline. A pod found gone then was deleted by
+/// its watchdog on `max_hours`.
+#[must_use]
+pub fn past_deadline(pod: &PodRecord, now: SystemTime) -> bool {
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    !pod.keep && pod.deadline_unix.is_some_and(|deadline| now >= deadline)
+}
+
+/// Who deleted `pod`, found gone at `now` without overbrainer deleting it: its
+/// watchdog once its deadline passed, otherwise nobody known.
+fn gone_by(pod: &PodRecord, now: SystemTime) -> DeletedBy {
+    if past_deadline(pod, now) {
+        DeletedBy::Watchdog
+    } else {
+        DeletedBy::Unknown
+    }
 }
 
 /// The pod `id` as the API shows it, or `None` when it is really gone: a 404
@@ -572,7 +828,7 @@ pub async fn reconnect(
         return Ok(None);
     }
     let Some(remote) = look_up(ctx, &id).await? else {
-        mark_gone(ctx, pod, id, DeletedBy::Unknown)?;
+        mark_gone(ctx, pod, id, gone_by(pod, SystemTime::now()))?;
         return Ok(None);
     };
     if remote.status == RemoteStatus::Exited {
@@ -622,6 +878,118 @@ pub fn ssh_command(run_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::runpod::ApiError;
+    use crate::train::TrainMetric;
+
+    /// A pace of 1 step per 10 s at step 100 of 7300: 20 hours left.
+    fn slow_pace() -> Pace {
+        let mut pace = Pace::default();
+        for (time, step) in [(0.0, 90), (100.0, 100)] {
+            pace.add(&TrainMetric {
+                time,
+                step,
+                epoch: None,
+                max_steps: Some(7300),
+                loss: Some(1.0),
+                eval_loss: None,
+                learning_rate: None,
+                grad_norm: None,
+            });
+        }
+        pace
+    }
+
+    /// A pod whose watchdog deletes it `hours` after `now`.
+    fn pod_due_in(hours: u64, keep: bool, now: SystemTime) -> PodRecord {
+        let mut pod = PodRecord::new("r1", keep, 1, "ssh-ed25519 AAAAhost");
+        let deadline = now + Duration::from_secs(hours * 3600);
+        pod.deadline_unix = deadline
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|since| since.as_secs());
+        pod.deadline = Some("2026-09-29T19:54:50Z".into());
+        pod
+    }
+
+    #[test]
+    fn a_job_that_cannot_end_before_the_deadline_is_warned_about() {
+        let now = SystemTime::now();
+        assert_eq!(
+            overrun(&slow_pace(), &pod_due_in(6, false, now), now, false).as_deref(),
+            Some(
+                "at this pace the job needs about 20.0h more, but the pod's watchdog deletes it by \
+                 2026-09-29T19:54:50Z (max_hours): raise the target's max_hours, or train with \
+                 --keep-pod, to let it finish"
+            )
+        );
+    }
+
+    #[test]
+    fn a_followed_job_past_the_deadline_is_only_noted() {
+        let now = SystemTime::now();
+        let note = overrun(&slow_pace(), &pod_due_in(6, false, now), now, true);
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "at this pace the job needs about 20.0h more, past max_hours \
+                 (2026-09-29T19:54:50Z): the pod stays while overbrainer follows the job; \
+                 if it stops following, the pod's watchdog deletes the pod"
+            )
+        );
+    }
+
+    #[test]
+    fn the_watchdog_holds_the_lease_as_long_as_the_client_counts_on() {
+        let default = format!("OVERBRAINER_LEASE_TTL:-{}}}", LEASE_TTL.as_secs());
+        assert!(super::super::watchdog_script().contains(&default));
+    }
+
+    #[test]
+    fn the_lease_is_renewed_every_few_minutes_while_the_job_progresses() {
+        let now = SystemTime::now();
+        let ago = |minutes: u64| now - Duration::from_secs(minutes * 60);
+        assert!(renewal_due(None, now, now));
+        assert!(!renewal_due(Some(ago(1)), ago(1), now));
+        assert!(renewal_due(Some(ago(5)), ago(1), now));
+        // A job with no new metric for 30 minutes stalled: no renewal.
+        assert!(!renewal_due(Some(ago(5)), ago(30), now));
+        assert!(!renewal_due(None, ago(31), now));
+    }
+
+    #[test]
+    fn the_client_guard_waits_for_the_lease_to_run_out() {
+        let now = SystemTime::now();
+        let ago = |minutes: u64| Some(now - Duration::from_secs(minutes * 60));
+        // Deadline passed an hour ago, well beyond the margin.
+        let late = pod_due_in(0, false, now - Duration::from_secs(3600));
+        assert!(!guard_fires(&late, ago(1), now));
+        assert!(!guard_fires(&late, ago(14), now));
+        assert!(guard_fires(&late, ago(15), now));
+        assert!(guard_fires(&late, None, now));
+        // Before the deadline, or kept: never.
+        assert!(!guard_fires(&pod_due_in(1, false, now), None, now));
+        assert!(!guard_fires(
+            &pod_due_in(0, true, now - Duration::from_secs(3600)),
+            None,
+            now
+        ));
+    }
+
+    #[test]
+    fn no_overrun_in_time_for_a_kept_pod_or_without_a_pace() {
+        let now = SystemTime::now();
+        assert_eq!(
+            overrun(&slow_pace(), &pod_due_in(21, false, now), now, false),
+            None
+        );
+        assert_eq!(
+            overrun(&slow_pace(), &pod_due_in(6, true, now), now, false),
+            None
+        );
+        assert_eq!(
+            overrun(&Pace::default(), &pod_due_in(6, false, now), now, false),
+            None
+        );
+    }
 
     #[test]
     fn a_failed_run_keeps_only_the_status_of_an_api_answer() {

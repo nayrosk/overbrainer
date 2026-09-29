@@ -15,6 +15,10 @@
 # not: no job will ever start on it. This is what stops a pod that failed early,
 # before sshd even started, from sitting unguarded and billing for nothing.
 #
+# The deadline (max_hours) is held off while a client following the job keeps its
+# lease fresh: overbrainer touches .pod/lease every few minutes while the job makes
+# progress, and the deadline applies again once the lease is LEASE_TTL old.
+#
 # POSIX sh: it runs under bash on the pod and is tested under sh, dash and busybox.
 # group_signal comes from overbrainer's job scripts and is prepended to this file.
 
@@ -27,11 +31,19 @@ BOOT_GRACE=${OVERBRAINER_BOOT_GRACE:-1800}
 RETRIEVE_GRACE=${OVERBRAINER_RETRIEVE_GRACE:-3600}
 KEEP=${OVERBRAINER_KEEP_POD:-0}
 DEADLINE=${OVERBRAINER_DEADLINE:-}
+LEASE_TTL=${OVERBRAINER_LEASE_TTL:-900}
 BOOT_FAILED=${OVERBRAINER_BOOT_FAILED:-0}
 API=${OVERBRAINER_API_URL:-https://api.runpod.io/v2}
 AGENT="overbrainer-watchdog/${OVERBRAINER_VERSION:-unknown}"
 
 now() { date +%s; }
+
+# Succeeds while the client following the job renewed its lease (touched
+# .pod/lease, on the pod's own clock) less than LEASE_TTL seconds before $1.
+lease_fresh() {
+  touched=$(stat -c %Y "$POD_DIR/lease" 2>/dev/null) || return 1
+  [ $(($1 - touched)) -lt "$LEASE_TTL" ]
+}
 
 log() {
   line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
@@ -157,6 +169,10 @@ while :; do
     retrieved=1
     log "retrieved marker seen"
   fi
+  if [ -n "$DEADLINE" ] && [ "$n" -ge "$DEADLINE" ] && [ -z "${held:-}" ] && lease_fresh "$n"; then
+    held=1
+    log "deadline passed, lease held by the client"
+  fi
   # Keep mode stays the deadline, retrieved and abandoned rules only once the
   # job started; a failed bootstrap deletes the pod whatever the mode.
   reason=
@@ -164,7 +180,7 @@ while :; do
     reason=bootstrap_failed
   elif [ "$KEEP" = 1 ] && [ "$started" = 1 ]; then
     :
-  elif [ -n "$DEADLINE" ] && [ "$n" -ge "$DEADLINE" ]; then
+  elif [ -n "$DEADLINE" ] && [ "$n" -ge "$DEADLINE" ] && ! lease_fresh "$n"; then
     reason=deadline
   elif [ "$retrieved" = 1 ]; then
     reason=retrieved

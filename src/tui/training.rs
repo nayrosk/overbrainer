@@ -9,7 +9,7 @@ use super::tasks::TaskId;
 use crate::events::Event;
 use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, Runs};
-use crate::train::{METRICS_FILE, MetricLine, TrainMetric, parse_line};
+use crate::train::{METRICS_FILE, MetricLine, Pace, TrainMetric, parse_line};
 
 /// A run of `runs/`, with its pod record when it has one.
 #[derive(Debug, Clone, PartialEq)]
@@ -293,27 +293,19 @@ pub(super) struct Progress {
     pub(super) eta: Option<Duration>,
 }
 
-/// The progress of `series`: from its latest metric, with an ETA from the steps
-/// per second between the first and the latest training log, measured on the
-/// plugin's own clock.
+/// The progress of `series`: from its latest metric, with an ETA at its
+/// [`Pace`].
 pub(super) fn progress(series: &[TrainMetric]) -> Option<Progress> {
     let latest = series.last()?;
-    let logs: Vec<&TrainMetric> = series.iter().filter(|m| m.loss.is_some()).collect();
-    let max_steps = series.iter().rev().find_map(|m| m.max_steps);
-    let eta = match (logs.first(), logs.last(), max_steps) {
-        (Some(first), Some(last), Some(max))
-            if last.step > first.step && last.time > first.time =>
-        {
-            let rate = float(last.step - first.step) / (last.time - first.time);
-            Duration::try_from_secs_f64(float(max.saturating_sub(latest.step)) / rate).ok()
-        },
-        _ => None,
-    };
+    let mut pace = Pace::default();
+    for metric in series {
+        pace.add(metric);
+    }
     Some(Progress {
         step: latest.step,
-        max_steps,
+        max_steps: pace.max_steps(),
         epoch: series.iter().rev().find_map(|m| m.epoch),
-        eta,
+        eta: pace.eta(),
     })
 }
 

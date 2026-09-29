@@ -256,6 +256,36 @@ async fn keep_pod_is_refused_off_runpod_and_a_missing_key_is_named() -> TestResu
     Ok(())
 }
 
+/// A run whose pod was deleted by its watchdog at `max_hours` says so on attach.
+#[tokio::test]
+async fn attaching_a_run_whose_pod_outlived_max_hours_says_so() -> TestResult {
+    let server = MockServer::start().await;
+    let dir = project()?;
+    recorded_run(dir.path(), RUN, RunState::Running, "p1", PodState::Deleted)?;
+    let runs = Runs::new(dir.path());
+    let mut pod = PodRecord::load(&runs, RUN)?.ok_or("no pod.json")?;
+    let past = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs()
+        .saturating_sub(60);
+    pod.deadline_unix = Some(past);
+    pod.save(&runs)?;
+    let mut cmd = overbrainer(dir.path(), &server)?;
+    cmd.args(["train", "attach", RUN]);
+    let attached = output(cmd).await?;
+    let stderr = String::from_utf8_lossy(&attached.stderr);
+    assert!(!attached.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("error: max_hours reached: the pod was deleted before the job ended"),
+        "{stderr}"
+    );
+    assert_eq!(
+        runs.load(RUN)?.message.as_deref(),
+        Some("max_hours reached: the pod was deleted before the job ended")
+    );
+    Ok(())
+}
+
 /// A pod recorded deleted is never looked up again: finding a pod gone (three
 /// 404s in a row and a list without it) is covered by `tests/runpod_flow.rs`.
 #[tokio::test]
