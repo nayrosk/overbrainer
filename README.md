@@ -99,6 +99,8 @@ Or let the TUI ask: `overbrainer tui` in an empty directory opens a wizard that 
 
 `init` writes `overbrainer.toml`, `.env.example`, the prompt templates in `prompts/` and a `.gitignore`. Edit the topics in `overbrainer.toml` before `run`. `run` trains only when `overbrainer.toml` has a `[training]` section; otherwise it stops after `split`. After training, it prints where the adapter is, and the merged model with `merge = true`. Each stage also runs on its own (`subtopics`, `questions`, `answers`, `split`, `train`) and resumes where it stopped: see [the dataset pipeline](docs/pipeline.md). Only one overbrainer process writes to a project at a time; a second one fails at once, naming the first one's PID. Changes to `overbrainer.toml` and `.env` apply without a restart: the TUI reloads them within 2 seconds, and `run` between stages (see [reloading](docs/configuration.md#reloading-while-overbrainer-runs)).
 
+A project made before overbrainer 0.4.0 makes every command say `this project predates overbrainer 0.4.0: run overbrainer migrate`. `overbrainer migrate` (or `overbrainer migrate --dry-run` to see the changes first) brings it up to date once; see [migrating a project](docs/pipeline.md#migrating-a-project).
+
 ## Providers
 
 A provider is any API that speaks the OpenAI chat completions protocol or the Anthropic Messages API. `overbrainer.toml` names it and its protocol; the URL and the key come from the environment. OpenRouter and NanoGPT both work, and both publish prices, so every stage prints what it cost.

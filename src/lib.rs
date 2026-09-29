@@ -12,6 +12,7 @@ pub mod logging;
 pub mod metrics;
 pub mod pipeline;
 pub mod pricing;
+pub mod project_format;
 pub mod project_lock;
 pub mod prompts;
 pub mod retry;

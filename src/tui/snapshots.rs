@@ -1501,6 +1501,7 @@ fn history_entry(
         output_tokens,
         cost,
         split: None,
+        backfilled: false,
     }
 }
 

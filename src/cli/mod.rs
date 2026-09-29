@@ -6,6 +6,7 @@ pub(crate) mod data;
 pub(crate) mod front;
 mod history;
 pub(crate) mod init;
+pub(crate) mod migrate;
 pub(crate) mod pod;
 mod progress;
 mod record;
@@ -107,6 +108,13 @@ pub enum Command {
     },
     /// Show what the pipeline stages did and spent, from .overbrainer/history.jsonl.
     History(HistoryArgs),
+    /// Bring a project from an older overbrainer up to this one's format.
+    ///
+    /// Adds /.overbrainer/ to .gitignore, rebuilds the answers history from
+    /// data/answers.jsonl (tokens per model, cost unknown) unless the history
+    /// already has answers, and writes .overbrainer/version. Running it again
+    /// changes nothing.
+    Migrate(MigrateArgs),
     /// Find and remove the Runpod pods overbrainer created.
     Pod {
         /// The pod subcommand to run.
@@ -134,6 +142,13 @@ impl Command {
         }
     }
 
+    /// Whether this command serves the metrics while it holds the project lock:
+    /// every command that writes, but `migrate`, which spends nothing.
+    #[must_use]
+    pub fn serves_metrics(&self) -> bool {
+        self.writes_project() && !matches!(self, Self::Migrate(_))
+    }
+
     /// Whether this command writes to the project, and so must hold the project
     /// lock: at most one such overbrainer process per project.
     #[must_use]
@@ -145,6 +160,7 @@ impl Command {
             | Self::Answers(_)
             | Self::Split(_)
             | Self::Run
+            | Self::Migrate(_)
             | Self::Train(_) => true,
             Self::Pod { command } => matches!(command, PodCommand::Rm { .. }),
             Self::Init { .. }
@@ -269,6 +285,15 @@ pub struct HistoryArgs {
     pub all: bool,
 }
 
+/// Options of `overbrainer migrate`.
+#[derive(Debug, Default, Args)]
+pub struct MigrateArgs {
+    /// Print what would change, and change no project file (the lock is still
+    /// taken).
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Options shared by the pipeline stage commands.
 #[derive(Debug, Default, Args)]
 pub struct StageArgs {
@@ -348,7 +373,8 @@ fn wants_wizard(cli: &Cli, stdout_is_terminal: bool) -> bool {
 /// Runs the parsed command line, whose logs were set up with `logs` (see
 /// [`Command::log_mode`]); `dotenv` are the keys `.env` set at start, which a
 /// reload of the configuration replaces (`tui`, and `run` between stages). Meanwhile it looks for a newer release, told on
-/// stderr once the command ended, even with an error (`tui` shows it itself).
+/// stderr once the command ended, even with an error (`tui` shows it itself),
+/// as is the need to run `overbrainer migrate` on a project from before 0.4.0.
 ///
 /// # Errors
 ///
@@ -366,7 +392,11 @@ pub async fn run(cli: Cli, logs: LogMode, dotenv: DotenvKeys) -> anyhow::Result<
                 update::check(&env, update::CRATES_IO_URL, SystemTime::now()).await
             })
         });
+    let hint = migrate::hints(&cli.command, &cli.project_dir);
     let result = dispatch(cli, logs, &mut check, dotenv).await;
+    if hint {
+        eprintln!("{}", migrate::HINT);
+    }
     // `tui` took the check, and shows its answer itself.
     if let Some(check) = check
         && let Some(newer) = settle(check).await
@@ -419,10 +449,7 @@ async fn dispatch(
         None
     };
     // Served while the lock is held: dropped before it.
-    let served = match &lock {
-        Some(_) => serve_metrics(dir).await,
-        None => None,
-    };
+    let served = served_metrics(&cli.command, dir, lock.is_some()).await;
     // The buses of the command count into the served metrics, if any.
     let observer = served
         .as_ref()
@@ -458,6 +485,7 @@ async fn dispatch(
             command: RunsCommand::Ls,
         } => train::list(dir),
         Command::History(args) => history::run(dir, &args),
+        Command::Migrate(args) => migrate::run(dir, args.dry_run),
         Command::Pod { command } => pod::run(dir, &command).await,
         Command::Skill { command } => skill::run(dir, &command),
         Command::Tui => match logs {
@@ -479,6 +507,19 @@ async fn stage(
 ) -> anyhow::Result<()> {
     let load = data::Load::Source(&Source::from(EnvSource::Process));
     data::run(dir, command, args, front, load).await
+}
+
+/// [`serve_metrics`] when `command` holds the lock (`locked`) and serves them.
+async fn served_metrics(
+    command: &Command,
+    dir: &Path,
+    locked: bool,
+) -> Option<(MetricsServer, Arc<Metrics>)> {
+    if locked && command.serves_metrics() {
+        serve_metrics(dir).await
+    } else {
+        None
+    }
 }
 
 /// Serves the Prometheus metrics of the project in `dir` when `metrics.listen` is
@@ -653,9 +694,18 @@ mod tests {
             &["train", "attach", "x"],
             &["train", "cancel", "x"],
             &["pod", "rm", "x"],
+            &["migrate"],
+            &["migrate", "--dry-run"],
         ] {
             assert!(writes(args)?, "{args:?} should lock");
         }
+        let serves = |args: &[&str]| -> Result<bool, clap::Error> {
+            let cli =
+                Cli::try_parse_from(std::iter::once("overbrainer").chain(args.iter().copied()))?;
+            Ok(cli.command.serves_metrics())
+        };
+        assert!(serves(&["run"])? && serves(&["tui"])?);
+        assert!(!serves(&["migrate"])? && !serves(&["history"])?);
         for args in [
             &["init"][..],
             &["config", "check"],

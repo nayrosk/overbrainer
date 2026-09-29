@@ -90,6 +90,10 @@ pub struct Entry {
     /// What `split` wrote; only on `split` lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split: Option<SplitCounts>,
+    /// Rebuilt by `overbrainer migrate` from the data files instead of recorded
+    /// when the stage ran; only on those lines.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backfilled: bool,
 }
 
 /// When a stage execution ran.
@@ -126,6 +130,7 @@ impl Entry {
             output_tokens: stats.usage.output_tokens,
             cost: stats.cost,
             split: None,
+            backfilled: false,
         }
     }
 }
@@ -138,6 +143,17 @@ impl Entry {
 /// `.overbrainer` or the history file is not a safe path to write to (a symbolic
 /// link, a hard link to another file, or swapped for one of those).
 pub fn append(project_dir: &Path, entry: &Entry) -> io::Result<()> {
+    append_all(project_dir, std::slice::from_ref(entry))
+}
+
+/// Appends `entries` to the history of `project_dir` in one write, creating it
+/// when needed: a crash leaves all of them or none (at most a truncated last
+/// line, skipped when read).
+///
+/// # Errors
+///
+/// As [`append`].
+pub fn append_all(project_dir: &Path, entries: &[Entry]) -> io::Result<()> {
     // Opened relative to `project_dir`, so a swapped `.overbrainer` or history
     // file cannot redirect the write.
     let mut file = open_state_file(
@@ -152,9 +168,11 @@ pub fn append(project_dir: &Path, entry: &Entry) -> io::Result<()> {
     if !ends_a_line(&mut file)? {
         line.push('\n');
     }
-    line.push_str(&serde_json::to_string(entry).map_err(io::Error::other)?);
-    line.push('\n');
-    // One write per line, so a crash leaves at most a truncated last line.
+    for entry in entries {
+        line.push_str(&serde_json::to_string(entry).map_err(io::Error::other)?);
+        line.push('\n');
+    }
+    // One write for every line, so a crash leaves at most a truncated last line.
     file.write_all(line.as_bytes())
 }
 
@@ -390,6 +408,15 @@ mod tests {
     }
 
     #[test]
+    fn append_all_writes_every_entry_in_order() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let entries = [entry(Stage::Answers, None), entry(Stage::Split, None)];
+        append_all(dir.path(), &entries)?;
+        assert_eq!(read(dir.path())?, entries);
+        Ok(())
+    }
+
+    #[test]
     fn a_malformed_line_is_skipped() -> TestResult {
         let dir = tempfile::tempdir()?;
         let good = entry(Stage::Questions, Some(1.0));
@@ -522,6 +549,23 @@ mod tests {
         assert_eq!(models["parent"].input_tokens, 20);
         assert_eq!(models["parent"].cost, Cost::Known(1.25));
         assert_eq!(models["gen"].runs, 1);
+    }
+
+    #[test]
+    fn only_backfilled_entries_carry_the_mark() -> Result<(), serde_json::Error> {
+        let normal = entry(Stage::Answers, Some(1.0));
+        let line = serde_json::to_string(&normal)?;
+        assert!(!line.contains("backfilled"), "{line}");
+        let back: Entry = serde_json::from_str(&line)?;
+        assert!(!back.backfilled);
+        let backfilled = Entry {
+            backfilled: true,
+            ..normal
+        };
+        let line = serde_json::to_string(&backfilled)?;
+        assert!(line.contains("\"backfilled\":true"), "{line}");
+        assert_eq!(serde_json::from_str::<Entry>(&line)?, backfilled);
+        Ok(())
     }
 
     #[test]

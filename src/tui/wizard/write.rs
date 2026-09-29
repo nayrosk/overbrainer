@@ -1,8 +1,9 @@
 //! The files the init wizard writes: `overbrainer.toml`, edited from the
 //! template `overbrainer init` writes (its comments kept) and validated with
 //! the `.env` values about to be written, then `.env` (mode 600),
-//! `.env.example`, the prompt templates and `.gitignore`. Nothing is ever
-//! overwritten, and nothing is written when a file exists.
+//! `.env.example`, the prompt templates and `.gitignore`, and last
+//! `.overbrainer/version`, so the project is never taken for an old one.
+//! Nothing is ever overwritten, and nothing is written when a file exists.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,8 @@ use crate::cli::init::{
 use crate::config::edit::{Collection, ConfigDoc, FieldPath, Role};
 use crate::config::fields::FieldValue;
 use crate::config::{CONFIG_FILE, ENV_PREFIX, EnvSource, ListOrAuto, load_str};
+use crate::project_format::{self, VERSION_FILE};
+use crate::project_lock::STATE_DIR;
 use crate::prompts;
 
 /// The provider of the template, replaced by the one chosen.
@@ -127,7 +130,8 @@ pub(super) fn build(answers: &Answers) -> Result<Files, String> {
 }
 
 /// Writes the files of `answers` into `dir`: `.env` first, `overbrainer.toml`
-/// last, so a failure never leaves a configuration without its `.env`.
+/// after the others, so a failure never leaves a configuration without its
+/// `.env`, then the project format.
 ///
 /// # Errors
 ///
@@ -151,6 +155,10 @@ pub(super) fn write(dir: &Path, answers: &Answers) -> Result<(), String> {
     let prompts_dir = dir.join(prompts::DIR);
     let new_gitignore = gitignore.symlink_metadata().is_err();
     let new_prompts_dir = prompts_dir.symlink_metadata().is_err();
+    let state_dir = dir.join(STATE_DIR);
+    let new_state_dir = state_dir.symlink_metadata().is_err();
+    let version = state_dir.join(VERSION_FILE);
+    let new_version = version.symlink_metadata().is_err();
     let mut created = Vec::new();
     // `.gitignore` first: `.env` never exists without its entry.
     let mut written = || -> anyhow::Result<()> {
@@ -168,6 +176,7 @@ pub(super) fn write(dir: &Path, answers: &Answers) -> Result<(), String> {
             }
             created.push(path);
         }
+        project_format::write_current(dir)?;
         Ok(())
     };
     let Err(error) = written() else {
@@ -179,6 +188,13 @@ pub(super) fn write(dir: &Path, answers: &Answers) -> Result<(), String> {
     }
     if new_prompts_dir {
         std::fs::remove_dir(&prompts_dir).ok();
+    }
+    if new_version {
+        std::fs::remove_file(&version).ok();
+    }
+    if new_state_dir {
+        std::fs::remove_file(state_dir.join(format!("{VERSION_FILE}.tmp"))).ok();
+        std::fs::remove_dir(&state_dir).ok();
     }
     Err(format!("{error:#}; nothing was kept"))
 }
@@ -620,6 +636,31 @@ mod tests {
         for (path, _) in prompt_files() {
             assert!(dir.path().join(path).is_file());
         }
+        assert_eq!(
+            project_format::read(dir.path())?,
+            Some(project_format::CURRENT)
+        );
+        assert!(!crate::project_format::predates_versions(dir.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_version_write_keeps_nothing_it_created() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        // `.overbrainer` is a file: the version cannot be written, last.
+        std::fs::write(dir.path().join(STATE_DIR), "keep me")?;
+        let topics = topics();
+        let error = write(dir.path(), &answers(TrainingKind::Local, &topics))
+            .err()
+            .ok_or("the write did not fail")?;
+        assert!(error.ends_with("; nothing was kept"), "{error}");
+        for file in [ENV_FILE, ENV_EXAMPLE_FILE, CONFIG_FILE] {
+            assert!(!dir.path().join(file).exists(), "{file} was kept");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(STATE_DIR))?,
+            "keep me"
+        );
         Ok(())
     }
 
