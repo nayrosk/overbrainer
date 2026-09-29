@@ -142,6 +142,13 @@ impl Command {
         }
     }
 
+    /// Whether this command serves the metrics while it holds the project lock:
+    /// every command that writes, but `migrate`, which spends nothing.
+    #[must_use]
+    pub fn serves_metrics(&self) -> bool {
+        self.writes_project() && !matches!(self, Self::Migrate(_))
+    }
+
     /// Whether this command writes to the project, and so must hold the project
     /// lock: at most one such overbrainer process per project.
     #[must_use]
@@ -442,10 +449,7 @@ async fn dispatch(
         None
     };
     // Served while the lock is held: dropped before it.
-    let served = match &lock {
-        Some(_) => serve_metrics(dir).await,
-        None => None,
-    };
+    let served = served_metrics(&cli.command, dir, lock.is_some()).await;
     // The buses of the command count into the served metrics, if any.
     let observer = served
         .as_ref()
@@ -503,6 +507,19 @@ async fn stage(
 ) -> anyhow::Result<()> {
     let load = data::Load::Source(&Source::from(EnvSource::Process));
     data::run(dir, command, args, front, load).await
+}
+
+/// [`serve_metrics`] when `command` holds the lock (`locked`) and serves them.
+async fn served_metrics(
+    command: &Command,
+    dir: &Path,
+    locked: bool,
+) -> Option<(MetricsServer, Arc<Metrics>)> {
+    if locked && command.serves_metrics() {
+        serve_metrics(dir).await
+    } else {
+        None
+    }
 }
 
 /// Serves the Prometheus metrics of the project in `dir` when `metrics.listen` is
@@ -682,6 +699,13 @@ mod tests {
         ] {
             assert!(writes(args)?, "{args:?} should lock");
         }
+        let serves = |args: &[&str]| -> Result<bool, clap::Error> {
+            let cli =
+                Cli::try_parse_from(std::iter::once("overbrainer").chain(args.iter().copied()))?;
+            Ok(cli.command.serves_metrics())
+        };
+        assert!(serves(&["run"])? && serves(&["tui"])?);
+        assert!(!serves(&["migrate"])? && !serves(&["history"])?);
         for args in [
             &["init"][..],
             &["config", "check"],

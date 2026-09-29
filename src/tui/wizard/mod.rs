@@ -1734,6 +1734,7 @@ mod tests {
                     ".env",
                     ".env.example",
                     ".gitignore",
+                    ".overbrainer",
                     "overbrainer.toml",
                     "prompts"
                 ]

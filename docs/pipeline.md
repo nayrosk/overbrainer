@@ -30,7 +30,7 @@ A stage that could not process some items exits with an error after writing ever
 
 overbrainer keeps its own state in `.overbrainer/`, next to `overbrainer.toml` (`init` adds it to `.gitignore`).
 
-- `version`: the project format, one integer line (`1` since 0.4.0), written by `init` and `migrate`. A project without it predates 0.4.0: see [migrating a project](#migrating-a-project).
+- `version`: the project format, one integer line (`1` since 0.4.0), written by `init`, the TUI init wizard and `migrate`. A project without it predates 0.4.0: see [migrating a project](#migrating-a-project).
 
 - `history.jsonl`: one line per stage execution, appended when the stage ends, whether it succeeded (`ok`), had failed items or was stopped by a provider error (`failed`), or was stopped by Ctrl-C or the TUI (`interrupted`). Each line holds the stage, start and end times (UTC), provider and model, the counts, tokens and cost (`null` when the price is unknown). `split` lines hold the train, eval and orphaned counts instead of a model. The file is never rewritten; deleting it resets the totals. The counts of an interrupted line come from progress events: they can miss the last items, and for `answers` its `done` also counts answers excluded from training. Lines rebuilt by `migrate` carry `"backfilled": true`.
 - `logs-<YYYYMMDDTHHMMSSZ>.log`: written by the [TUI](tui.md)'s `x` key in the Logs view, one such file per export; nothing else creates or reads these.
