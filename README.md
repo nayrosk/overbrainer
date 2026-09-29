@@ -6,8 +6,9 @@ Distill a large "parent" LLM into a smaller open-weights "child" model, from the
 [![CI](https://github.com/nayrosk/overbrainer/actions/workflows/ci.yml/badge.svg)](https://github.com/nayrosk/overbrainer/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Latest release](https://img.shields.io/github/v/release/nayrosk/overbrainer?sort=semver)](https://github.com/nayrosk/overbrainer/releases)
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/nayrosk/overbrainer?utm_source=oss&utm_medium=github&utm_campaign=nayrosk%2Foverbrainer&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 
-![overbrainer tui: the dataset tree with an answer's reasoning, the topic stats, the help, a training run's loss chart and a dialog](docs/assets/tui-tour.gif)
+![overbrainer tui: the Project view and its stats, the dataset tree with a question's answer, a filter, the help, a training run's loss chart, the logs and a dialog](docs/assets/tui-tour.gif)
 
 overbrainer asks an LLM for questions on your topics, collects answers and their reasoning from a parent model, then fine-tunes a child model with Axolotl on this machine, over SSH or on Runpod. A terminal UI shows the dataset and the training runs as they progress.
 
@@ -87,7 +88,7 @@ overbrainer also checks crates.io once a day for a newer release, and prints a n
 
 ## Quickstart
 
-![overbrainer init, config check and runs ls in a terminal](docs/assets/cli.gif)
+![overbrainer init, config check, runs ls and history in a terminal](docs/assets/cli.gif)
 
 ```bash
 overbrainer init my-project && cd my-project
@@ -141,7 +142,11 @@ Runpod: [runpod.io](https://runpod.io?ref=ym24z23f) (referral link). A run's LoR
 
 ## Terminal UI
 
-`overbrainer tui` has five views, and opens on Project (in a directory without `overbrainer.toml`, on the init wizard first):
+In a directory without `overbrainer.toml`, `overbrainer tui` opens an init wizard first: it asks for the project name, a provider preset and its key, the roles, the topics and the training target, then writes the project and opens it.
+
+![overbrainer tui's init wizard: naming a project, picking the NanoGPT preset, the masked API key, the roles, a topic, skipping training, the summary and its write, then opening the Project view](docs/assets/wizard.gif)
+
+`overbrainer tui` has five views, and opens on Project:
 
 - Project (`1`): the effective configuration by section, with env-set and secret values marked, next to the project's stats. Edit a field, add or delete a topic, provider or target, and save to `overbrainer.toml` with its comments kept.
 - Dataset (`2`): the topics, subtopics and questions as a tree, with a question's answer, reasoning, stats and a filter in a detail pane. Edit or delete a question, its answer or a subtopic in place.

@@ -1,6 +1,7 @@
-# A short CLI demo: init a project, check a configured one, list its runs.
-# Render with docs/assets/record.sh, which mounts the demo project at /demo.
-# The keys below are placeholders set in the hidden setup, never real ones.
+# A short CLI demo: init a project, check a configured one, list its runs and
+# its history. Render with docs/assets/record.sh, which mounts the demo
+# project at /demo. The keys below are placeholders set in the hidden setup,
+# never real ones.
 
 Output cli.gif
 
@@ -29,4 +30,7 @@ Type "overbrainer config check" Sleep 300ms Enter
 Sleep 5s
 Type "clear" Enter
 Type "overbrainer runs ls" Sleep 300ms Enter
+Sleep 4s
+Type "clear" Enter
+Type "overbrainer history" Sleep 300ms Enter
 Sleep 4s
