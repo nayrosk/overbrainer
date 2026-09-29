@@ -564,14 +564,20 @@ impl App {
     /// lists in another data center than `data_center_ids` gets that data
     /// center as a pending change. One status line says what changed, a
     /// warning listing first what could not (a field the environment sets or
-    /// a task locks, or a refused edit).
+    /// a task locks, or a refused edit). Nothing while `overbrainer.toml` is
+    /// open in the editor: it runs once the file is read again.
     pub(super) fn reconcile_volume_centers(&mut self) {
-        if self.config.is_none() || self.project_view.save.is_some() {
-            return;
+        if let Some((severity, text)) = self.volume_centers_reconciled() {
+            self.say(severity, text);
         }
-        let Some(doc) = self.shown_doc() else {
-            return;
-        };
+    }
+
+    /// [`Self::reconcile_volume_centers`], what it would say returned.
+    fn volume_centers_reconciled(&mut self) -> Option<(Severity, String)> {
+        if self.config.is_none() || self.project_view.save.is_some() || self.project_view.editing {
+            return None;
+        }
+        let doc = self.shown_doc()?;
         let names: Vec<String> = doc
             .names(Collection::Targets)
             .into_iter()
@@ -618,9 +624,7 @@ impl App {
                 )),
             }
         }
-        if let Some((severity, text)) = reconciled(&failed, &done) {
-            self.say(severity, text);
-        }
+        reconciled(&failed, &done)
     }
 
     /// Refuses a change of the field `path` while something uses it, as the
@@ -1253,7 +1257,8 @@ impl App {
     }
 
     /// The editor on `overbrainer.toml` ended with `status`: the file is read
-    /// again; one that does not load leaves the view as it was.
+    /// again, and the volume listing read last reconciled with it; one that
+    /// does not load leaves the view as it was.
     pub(super) fn config_edited(&mut self, status: io::Result<ExitStatus>) -> Vec<Effect> {
         let failed = editor_failure(status);
         let path = self.project.dir.join(CONFIG_FILE);
@@ -1286,10 +1291,18 @@ impl App {
         } else {
             format!("{CONFIG_FILE} read again")
         };
-        match failed {
-            Some(failed) => self.say(Severity::Warn, format!("{failed}; {what}")),
-            None => self.say(Severity::Info, what),
+        let (mut severity, mut said) = match failed {
+            Some(failed) => (Severity::Warn, format!("{failed}; {what}")),
+            None => (Severity::Info, what),
+        };
+        // A volume listing read while the file was edited applies to it now.
+        if let Some((reconciled, text)) = self.volume_centers_reconciled() {
+            if reconciled != Severity::Info {
+                severity = reconciled;
+            }
+            said = format!("{said}; {text}");
         }
+        self.say(severity, said);
         self.reload()
     }
 }
@@ -1859,6 +1872,61 @@ mod tests {
             status(&app)
         );
         assert_eq!(field(&mut app, "project.name")?.shown.text(), "renamed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_volume_listing_read_while_the_file_is_edited_reconciles_after() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        let with_volume = |volume: &str, center: &str| {
+            PROJECT_CONFIG.replace(
+                "max_hours = 6\n",
+                &format!(
+                    "max_hours = 6\nnetwork_volume_id = \"{volume}\"\n\
+                     data_center_ids = [\"{center}\"]\n"
+                ),
+            )
+        };
+        let before = with_volume("voleu", "US-KS-2");
+        std::fs::write(dir.path().join(CONFIG_FILE), &before)?;
+        app.set_config(crate::tui::project::ProjectConfig::new(&before, &app.env)?);
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        press(&mut app, &[KeyCode::Esc]);
+        press(&mut app, &[KeyCode::Char('E')]);
+        assert!(app.project_view.editing);
+        let volumes = volume_entries(&[
+            NetworkVolume {
+                id: "voleu".into(),
+                name: "alpha".into(),
+                size: 100,
+                data_center: "EU-RO-1".into(),
+            },
+            NetworkVolume {
+                id: "volus".into(),
+                name: "zeta".into(),
+                size: 50,
+                data_center: "US-KS-2".into(),
+            },
+        ]);
+        listed(&mut app, id, volumes, Vec::new());
+        assert!(app.project_view.pending.is_none(), "nothing while edited");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            with_volume("volus", "EU-RO-1"),
+        )?;
+        app.on_editor_exit(Ok(ExitStatus::from_raw(0)));
+        let key = "targets.gpu_cloud.data_center_ids";
+        assert_eq!(
+            shown(&mut app, key)?,
+            "US-KS-2",
+            "reconciled on the new file"
+        );
+        assert!(field(&mut app, key)?.changed);
+        assert_eq!(
+            status(&app),
+            "overbrainer.toml read again; targets.gpu_cloud.data_center_ids = US-KS-2, the \
+             network volume's data center"
+        );
         Ok(())
     }
 
