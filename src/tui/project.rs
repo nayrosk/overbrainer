@@ -18,7 +18,7 @@ use crate::config::edit::{Collection, ConfigDoc, EditError, FieldPath, Role};
 use crate::config::fields::{self, FieldKind, FieldSpec, Section, TargetKind};
 use crate::config::{
     Adapter, ConfigError, ENV_PREFIX, Engine, EnvSource, Pipeline, Protocol, RoleModel, Runtime,
-    Settings, Target, Topic, Training, env_keys, load_str,
+    Settings, Stamp, Target, Topic, Training, env_keys, load_str,
 };
 use crate::history::{Cost, Total};
 use crate::runs::RunState;
@@ -39,6 +39,9 @@ pub(super) struct ProjectConfig {
     /// The text it was read from: a save refuses to overwrite a file that no
     /// longer holds it.
     pub(super) text: String,
+    /// The stamp of the files when it was read from them, `None` when it was
+    /// not: a look at the files that finds this stamp reads nothing again.
+    pub(super) stamp: Option<Stamp>,
 }
 
 impl ProjectConfig {
@@ -57,6 +60,7 @@ impl ProjectConfig {
             env: env_keys(env),
             vault: vault_keys(env),
             text: content.to_string(),
+            stamp: None,
         })
     }
 }
@@ -270,6 +274,12 @@ fn roles_of(command: Command) -> Vec<Role> {
 pub(super) struct Pending {
     /// `overbrainer.toml` as edited.
     pub(super) doc: ConfigDoc,
+    /// The file's document the changes were made to: a reload of the file
+    /// leaves it, so the marks stay those of the changes made.
+    pub(super) original: ConfigDoc,
+    /// The text of the file they were made to: a save refuses a file that no
+    /// longer holds it, even once it was read again.
+    pub(super) base: String,
     /// What changed: `pipeline.seed`, `providers.local`.
     pub(super) changed: BTreeSet<String>,
     /// For each topic of `doc`, its position in the file's document; `None`
@@ -278,23 +288,26 @@ pub(super) struct Pending {
 }
 
 impl Pending {
-    /// No change yet to `doc`.
-    pub(super) fn new(doc: &ConfigDoc) -> Self {
+    /// No change yet to the document of `config`.
+    pub(super) fn new(config: &ProjectConfig) -> Self {
+        let doc = &config.doc;
         Self {
             doc: doc.clone(),
+            original: doc.clone(),
+            base: config.text.clone(),
             changed: BTreeSet::new(),
             origins: (0..doc.topic_names().len()).map(Some).collect(),
         }
     }
 
-    /// Where the field `path` of the edited document was in `original`, the
-    /// file's document: `None` for a field of a topic added.
-    fn original_path(&self, path: &FieldPath, original: &ConfigDoc) -> Option<FieldPath> {
+    /// Where the field `path` of the edited document was in the file's
+    /// document: `None` for a field of a topic added.
+    fn original_path(&self, path: &FieldPath) -> Option<FieldPath> {
         let FieldPath::Topic { index, field, .. } = path else {
             return Some(path.clone());
         };
         let at = self.origins.get(*index).copied().flatten()?;
-        let name = original.topic_names().get(at)?.clone();
+        let name = self.original.topic_names().get(at)?.clone();
         Some(FieldPath::Topic {
             index: at,
             name,
@@ -303,11 +316,9 @@ impl Pending {
     }
 
     /// Marks the field `path` changed when its value differs from the one it
-    /// has in `original`, the file's document, and unmarks it otherwise.
-    pub(super) fn mark(&mut self, path: &FieldPath, original: &ConfigDoc) {
-        let before = self
-            .original_path(path, original)
-            .map(|at| original.get(&at));
+    /// has in the file's document, and unmarks it otherwise.
+    pub(super) fn mark(&mut self, path: &FieldPath) {
+        let before = self.original_path(path).map(|at| self.original.get(&at));
         let key = path.to_string();
         if before == Some(self.doc.get(path)) {
             self.changed.remove(&key);

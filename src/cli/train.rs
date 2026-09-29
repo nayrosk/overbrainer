@@ -7,9 +7,10 @@ use anyhow::{Context, anyhow, bail};
 
 use super::front::{Frontend, Interrupt};
 use super::progress::status_name;
+use super::reload::Reloader;
 use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
-use crate::config::{DEFAULT_WORKDIR, EnvSource, Settings, Target, Training};
+use crate::config::{DEFAULT_WORKDIR, Settings, Source, Target, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{PodRecord, RunpodTarget};
@@ -21,16 +22,22 @@ use crate::train::{Axolotl, OUTPUT_DIR, reasoning_template_warning};
 /// Time between two looks at a running job.
 pub(super) const POLL: Duration = Duration::from_secs(2);
 
-/// Runs `overbrainer train` or one of its subcommands, for `front`.
+/// Runs `overbrainer train` or one of its subcommands, for `front`, with the
+/// settings of `source`.
 ///
 /// # Errors
 ///
 /// Returns an error when the configuration or the target cannot be used, when the
 /// run fails, or when it is interrupted (the job keeps running).
-pub async fn run(project_dir: &Path, args: &TrainArgs, front: &Frontend) -> anyhow::Result<()> {
+pub async fn run(
+    project_dir: &Path,
+    args: &TrainArgs,
+    front: &Frontend,
+    source: &Source,
+) -> anyhow::Result<()> {
     match &args.command {
         None => {
-            let settings = crate::config::load(project_dir, EnvSource::Process)?;
+            let settings = source.load(project_dir)?;
             train(
                 project_dir,
                 &settings,
@@ -40,18 +47,29 @@ pub async fn run(project_dir: &Path, args: &TrainArgs, front: &Frontend) -> anyh
             )
             .await
         },
-        Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id, front).await,
-        Some(TrainCommand::Cancel { run_id }) => cancel_run(project_dir, run_id, front).await,
+        Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id, front, source).await,
+        Some(TrainCommand::Cancel { run_id }) => {
+            cancel_run(project_dir, run_id, front, source).await
+        },
     }
 }
 
-/// Trains after `overbrainer run` when `[training]` is set.
+/// Trains after `overbrainer run` when `[training]` is set, with the settings
+/// `reloader` reads again when their files changed since the last stage.
 ///
 /// # Errors
 ///
-/// Returns an error when training fails.
-pub async fn after_run(project_dir: &Path, front: &Frontend) -> anyhow::Result<()> {
-    let settings = crate::config::load(project_dir, EnvSource::Process)?;
+/// Returns an error when the changed configuration cannot be used or training
+/// fails.
+pub(crate) async fn after_run(
+    project_dir: &Path,
+    front: &Frontend,
+    reloader: &mut Reloader,
+) -> anyhow::Result<()> {
+    let settings = match reloader.changed()? {
+        Some(settings) => settings,
+        None => crate::config::load(project_dir, reloader.env().clone())?,
+    };
     if settings.training.is_none() {
         no_training();
         return Ok(());
@@ -139,8 +157,13 @@ async fn train(
     finish(&runs, &id, result, front)
 }
 
-async fn attach(project_dir: &Path, run_id: &str, front: &Frontend) -> anyhow::Result<()> {
-    let settings = crate::config::load(project_dir, EnvSource::Process)?;
+async fn attach(
+    project_dir: &Path,
+    run_id: &str,
+    front: &Frontend,
+    source: &Source,
+) -> anyhow::Result<()> {
+    let settings = source.load(project_dir)?;
     let training = training(&settings)?;
     let runs = Runs::new(project_dir);
     let record = runs.load(run_id)?;
@@ -166,8 +189,13 @@ async fn attach(project_dir: &Path, run_id: &str, front: &Frontend) -> anyhow::R
     finish(&runs, run_id, result, front)
 }
 
-async fn cancel_run(project_dir: &Path, run_id: &str, front: &Frontend) -> anyhow::Result<()> {
-    let settings = crate::config::load(project_dir, EnvSource::Process)?;
+async fn cancel_run(
+    project_dir: &Path,
+    run_id: &str,
+    front: &Frontend,
+    source: &Source,
+) -> anyhow::Result<()> {
+    let settings = source.load(project_dir)?;
     let runs = Runs::new(project_dir);
     let record = runs.load(run_id)?;
     match (record.state, record.job.is_some()) {

@@ -24,6 +24,39 @@ pub enum EnvSource {
     Vars(Vec<(String, String)>),
 }
 
+/// Where a command reads its settings: `overbrainer.toml` on disk, or a text
+/// already read and validated (the configuration the TUI keeps), layered with
+/// the variables of `env`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    /// The text of `overbrainer.toml`; `None` reads the file.
+    pub text: Option<String>,
+    /// Where the `OVERBRAINER_*` variables come from.
+    pub env: EnvSource,
+}
+
+impl Source {
+    /// The settings of `project_dir` from this source.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`load`] returns without a text, else what [`load_str`]
+    /// returns.
+    pub fn load(&self, project_dir: &Path) -> Result<Settings, ConfigError> {
+        match &self.text {
+            Some(text) => load_str(text, self.env.clone()),
+            None => load(project_dir, self.env.clone()),
+        }
+    }
+}
+
+impl From<EnvSource> for Source {
+    /// The file on disk, with `env`.
+    fn from(env: EnvSource) -> Self {
+        Self { text: None, env }
+    }
+}
+
 /// Everything that can go wrong while loading configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {

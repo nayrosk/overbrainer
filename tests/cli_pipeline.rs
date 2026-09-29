@@ -46,7 +46,10 @@ impl Respond for Script {
             .pointer("/messages/0/content")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let message = if body["model"] == "parent" {
+        let parent = body["model"]
+            .as_str()
+            .is_some_and(|model| model.starts_with("parent"));
+        let message = if parent {
             json!({"content": "Borrow it.", "reasoning": "The caller keeps ownership."})
         } else if prompt.contains("subtopics that together cover") {
             json!({"content": r#"["Borrowing", "Lifetimes"]"#})
@@ -61,6 +64,14 @@ impl Respond for Script {
 }
 
 async fn provider() -> MockServer {
+    provider_with(Script {
+        calls: AtomicUsize::new(0),
+    })
+    .await
+}
+
+/// A provider that answers with `script`.
+async fn provider_with(script: impl Respond + 'static) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -72,12 +83,43 @@ async fn provider() -> MockServer {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(Script {
-            calls: AtomicUsize::new(0),
-        })
+        .respond_with(script)
         .mount(&server)
         .await;
     server
+}
+
+/// [`Script`], which writes `files` at its first answer: during the first
+/// stage of a run.
+struct Rewriting {
+    script: Script,
+    files: Vec<(std::path::PathBuf, String)>,
+    written: std::sync::atomic::AtomicBool,
+}
+
+impl Rewriting {
+    fn new(files: Vec<(std::path::PathBuf, String)>) -> Self {
+        Self {
+            script: Script {
+                calls: AtomicUsize::new(0),
+            },
+            files,
+            written: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl Respond for Rewriting {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if !self.written.swap(true, Ordering::SeqCst) {
+            for (path, text) in &self.files {
+                if let Err(error) = std::fs::write(path, text) {
+                    return ResponseTemplate::new(500).set_body_string(error.to_string());
+                }
+            }
+        }
+        self.script.respond(request)
+    }
 }
 
 fn overbrainer(
@@ -123,6 +165,7 @@ async fn run_chains_the_data_stages_and_prints_costs() -> TestResult {
         .stdout(predicate::str::contains("cost $"))
         .stdout(predicate::str::contains(KEY).not())
         .stderr(predicate::str::contains("run stops after split"))
+        .stderr(predicate::str::contains("config reloaded").not())
         .stderr(predicate::str::contains(KEY).not());
     for file in ["subtopics", "questions", "answers", "train", "eval"] {
         assert!(
@@ -174,6 +217,66 @@ async fn run_records_each_stage_in_the_history() -> TestResult {
     assert!(lines[2]["cost"].is_number() || lines[2]["cost"].is_null());
     assert_eq!(lines[3]["split"]["train"], 3);
     assert!(!text.contains(KEY));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_reads_a_changed_configuration_before_the_next_stage() -> TestResult {
+    let dir = project()?;
+    let server = provider_with(Rewriting::new(vec![
+        (
+            dir.path().join("overbrainer.toml"),
+            PROJECT.replace(r#"model = "gen""#, r#"model = "gen-2""#),
+        ),
+        (
+            dir.path().join(".env"),
+            "OVERBRAINER_ROLES__PARENT__MODEL=parent-from-env\n".to_string(),
+        ),
+    ]))
+    .await;
+    let output = overbrainer(dir.path(), &server)?.arg("run").output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr.matches("config reloaded").count(), 1, "{stderr}");
+    let models: Vec<Value> = history(dir.path())?
+        .iter()
+        .map(|line| line["model"].clone())
+        .collect();
+    assert_eq!(
+        models,
+        [
+            json!("gen"),
+            json!("gen-2"),
+            json!("parent-from-env"),
+            Value::Null
+        ],
+        "the stage running keeps its settings, the next ones read the new files"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_stops_when_the_changed_configuration_is_invalid() -> TestResult {
+    let dir = project()?;
+    let server = provider_with(Rewriting::new(vec![(
+        dir.path().join("overbrainer.toml"),
+        PROJECT.replace("subtopics = 2", "subtopics = 0"),
+    )]))
+    .await;
+    overbrainer(dir.path(), &server)?
+        .arg("run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "the configuration changed and cannot be used; the run stops",
+        ))
+        .stderr(predicate::str::contains("subtopics"))
+        .stderr(predicate::str::contains("config reloaded").not());
+    let stages: Vec<Value> = history(dir.path())?
+        .iter()
+        .map(|line| line["stage"].clone())
+        .collect();
+    assert_eq!(stages, [json!("subtopics")], "no stage after the change");
     Ok(())
 }
 

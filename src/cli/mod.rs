@@ -9,6 +9,7 @@ mod init;
 pub(crate) mod pod;
 mod progress;
 mod record;
+mod reload;
 mod runpod_train;
 mod skill;
 pub(crate) mod train;
@@ -24,6 +25,8 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 
 use self::front::Frontend;
+use self::reload::Reloader;
+use crate::config::{DotenvKeys, EnvSource, Source};
 use crate::logging::{LOG_LINES, LogBuffer, LogMode};
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
 use crate::update::{self, CheckEnv, Newer};
@@ -289,14 +292,15 @@ pub enum ConfigCommand {
 }
 
 /// Runs the parsed command line, whose logs were set up with `logs` (see
-/// [`Command::log_mode`]). Meanwhile it looks for a newer release, told on
+/// [`Command::log_mode`]); `dotenv` are the keys `.env` set at start, which a
+/// reload of the configuration replaces (`tui`, and `run` between stages). Meanwhile it looks for a newer release, told on
 /// stderr once the command ended, even with an error (`tui` shows it itself).
 ///
 /// # Errors
 ///
 /// Returns an error if the selected subcommand fails, or if `tui` is not given the
 /// [`LogMode::Tui`] its logs need.
-pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
+pub async fn run(cli: Cli, logs: LogMode, dotenv: DotenvKeys) -> anyhow::Result<()> {
     let stderr = std::io::stderr().is_terminal();
     let stdout = std::io::stdout().is_terminal();
     // `skill` never checks: it does not even read the environment.
@@ -308,7 +312,7 @@ pub async fn run(cli: Cli, logs: LogMode) -> anyhow::Result<()> {
                 update::check(&env, update::CRATES_IO_URL, SystemTime::now()).await
             })
         });
-    let result = dispatch(cli, logs, &mut check).await;
+    let result = dispatch(cli, logs, &mut check, dotenv).await;
     // `tui` took the check, and shows its answer itself.
     if let Some(check) = check
         && let Some(newer) = settle(check).await
@@ -349,6 +353,7 @@ async fn dispatch(
     cli: Cli,
     logs: LogMode,
     check: &mut Option<JoinHandle<Option<Newer>>>,
+    dotenv: DotenvKeys,
 ) -> anyhow::Result<()> {
     let dir = &cli.project_dir;
     // Only a project takes the lock: without `overbrainer.toml` the command fails
@@ -374,10 +379,16 @@ async fn dispatch(
             stage(dir, data::Command::Split, &args).await
         },
         Command::Run => {
-            stage(dir, data::Command::Run, &StageArgs::default()).await?;
-            train::after_run(dir, &Frontend::Cli).await
+            let mut reloader = Reloader::new(dir, dotenv);
+            let args = StageArgs::default();
+            let load = data::Load::Reload(&mut reloader);
+            data::run(dir, data::Command::Run, &args, &Frontend::Cli, load).await?;
+            train::after_run(dir, &Frontend::Cli, &mut reloader).await
         },
-        Command::Train(args) => train::run(dir, &args, &Frontend::Cli).await,
+        Command::Train(args) => {
+            let source = Source::from(EnvSource::Process);
+            train::run(dir, &args, &Frontend::Cli, &source).await
+        },
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
@@ -385,7 +396,7 @@ async fn dispatch(
         Command::Pod { command } => pod::run(dir, &command).await,
         Command::Skill { command } => skill::run(dir, &command),
         Command::Tui => match logs {
-            LogMode::Tui(buffer) => crate::tui::run(dir, buffer, check.take()).await,
+            LogMode::Tui(buffer) => crate::tui::run(dir, buffer, check.take(), dotenv).await,
             LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),
         },
     }
@@ -393,7 +404,8 @@ async fn dispatch(
 
 /// Runs a pipeline command on the command line.
 async fn stage(dir: &Path, command: data::Command, args: &StageArgs) -> anyhow::Result<()> {
-    data::run(dir, command, args, &Frontend::Cli).await
+    let load = data::Load::Source(&Source::from(EnvSource::Process));
+    data::run(dir, command, args, &Frontend::Cli, load).await
 }
 
 /// Secret resolver from `VAULT_ADDR`, `VAULT_TOKEN` and `~/.vault-token`. Vault is

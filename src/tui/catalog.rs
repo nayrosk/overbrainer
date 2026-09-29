@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::widgets::picker::{Entry, Mode, Spec};
-use crate::config::{DEFAULT_RUNPOD_IMAGE, EnvSource, ListOrAuto};
+use crate::config::{DEFAULT_RUNPOD_IMAGE, ListOrAuto, Source};
 use crate::runpod::{
     ApiError, Availability, DataCenter, GpuFilter, GpuType, NetworkVolume, RunpodClient, Template,
     select_gpus,
@@ -102,25 +102,25 @@ impl CatalogKind {
 }
 
 /// What `query` asks, read from the Runpod account of the project in `dir`
-/// (its settings read with `env`).
+/// (its settings from `source`).
 ///
 /// # Errors
 ///
 /// Returns why nothing can be listed: the settings, no API key, the API, or
 /// [`CATALOG_TIMEOUT`] passed. Only the client's fixed messages, never the key.
-pub(super) async fn fetch(dir: &Path, env: EnvSource, query: Query) -> Result<Listed, String> {
-    fetch_within(dir, env, query, CATALOG_TIMEOUT).await
+pub(super) async fn fetch(dir: &Path, source: Source, query: Query) -> Result<Listed, String> {
+    fetch_within(dir, source, query, CATALOG_TIMEOUT).await
 }
 
 /// [`fetch`], giving up after `limit`.
 async fn fetch_within(
     dir: &Path,
-    env: EnvSource,
+    source: Source,
     query: Query,
     limit: Duration,
 ) -> Result<Listed, String> {
     let lookup = async {
-        let settings = crate::config::load(dir, env)?;
+        let settings = source.load(dir)?;
         let client = crate::cli::pod::client(&settings).await?;
         Ok::<_, anyhow::Error>(read(&client, &query).await?)
     };
@@ -407,6 +407,7 @@ pub(super) fn cost_hint(gpus: &[GpuType], sizing: &Sizing) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::EnvSource;
     use serde_json::json;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -464,7 +465,12 @@ mod tests {
             .mount(&server)
             .await;
         let (dir, env) = project(Some(&server))?;
-        let listed = fetch(dir.path(), env, query(CatalogKind::Gpus, 2, &[])).await?;
+        let listed = fetch(
+            dir.path(),
+            env.clone().into(),
+            query(CatalogKind::Gpus, 2, &[]),
+        )
+        .await?;
         let entries = listed.entries;
         assert_eq!(ids(&entries), ["NVIDIA L4", "NVIDIA A40"]);
         assert_eq!(listed.gpus.len(), 3, "the GPU types are kept for the hints");
@@ -503,17 +509,25 @@ mod tests {
             .mount(&server)
             .await;
         let (dir, env) = project(Some(&server))?;
-        let volumes = fetch(dir.path(), env.clone(), query(CatalogKind::Volumes, 1, &[]))
-            .await?
-            .entries;
+        let volumes = fetch(
+            dir.path(),
+            env.clone().into(),
+            query(CatalogKind::Volumes, 1, &[]),
+        )
+        .await?
+        .entries;
         assert_eq!(ids(&volumes), [NO_VOLUME, "v1", "v2"], "none first");
         assert_eq!(volumes[0].columns, ["none", "no network volume", "", ""]);
         assert_eq!(volumes[1].columns, ["v1", "alpha", "100", "US-KS-2"]);
         assert_eq!(volume_data_center(&volumes[1]), Some("US-KS-2"));
         assert_eq!(volume_data_center(&volumes[0]), None);
-        let templates = fetch(dir.path(), env, query(CatalogKind::Templates, 1, &[]))
-            .await?
-            .entries;
+        let templates = fetch(
+            dir.path(),
+            env.clone().into(),
+            query(CatalogKind::Templates, 1, &[]),
+        )
+        .await?
+        .entries;
         assert_eq!(
             ids(&templates),
             [DEFAULT_IMAGE, "t1", "img/z:1"],
@@ -528,10 +542,14 @@ mod tests {
     #[tokio::test]
     async fn without_a_key_the_error_says_how_to_set_it() -> TestResult {
         let (dir, env) = project(None)?;
-        let error = fetch(dir.path(), env, query(CatalogKind::Volumes, 1, &[]))
-            .await
-            .err()
-            .ok_or("listed without a key")?;
+        let error = fetch(
+            dir.path(),
+            env.clone().into(),
+            query(CatalogKind::Volumes, 1, &[]),
+        )
+        .await
+        .err()
+        .ok_or("listed without a key")?;
         assert!(
             error.contains("no Runpod API key: set OVERBRAINER_RUNPOD__API_KEY"),
             "{error}"
@@ -550,10 +568,14 @@ mod tests {
             .mount(&server)
             .await;
         let (dir, env) = project(Some(&server))?;
-        let error = fetch(dir.path(), env, query(CatalogKind::Volumes, 1, &[]))
-            .await
-            .err()
-            .ok_or("listed on a 401")?;
+        let error = fetch(
+            dir.path(),
+            env.clone().into(),
+            query(CatalogKind::Volumes, 1, &[]),
+        )
+        .await
+        .err()
+        .ok_or("listed on a 401")?;
         assert!(error.starts_with("cannot read the Runpod catalog: "));
         assert!(!error.contains(KEY), "the key shows in the error");
         Ok(())
@@ -575,7 +597,7 @@ mod tests {
         let limit = Duration::from_millis(500);
         let error = fetch_within(
             dir.path(),
-            env,
+            env.into(),
             query(CatalogKind::DataCenters, 1, &[]),
             limit,
         )
@@ -627,7 +649,7 @@ mod tests {
         let server = data_center_server().await;
         let (dir, env) = project(Some(&server))?;
         let chosen = query(CatalogKind::DataCenters, 2, &["NVIDIA L4", "NVIDIA A40"]);
-        let listed = fetch(dir.path(), env, chosen).await?;
+        let listed = fetch(dir.path(), env.clone().into(), chosen).await?;
         let centers = listed.entries;
         assert_eq!(ids(&centers), ["EU-RO-1", "US-KS-2"]);
         // The GPU's own count-scoped stock, not the data center listing's.
@@ -644,9 +666,13 @@ mod tests {
     async fn without_chosen_gpus_data_centers_count_the_types_in_stock() -> TestResult {
         let server = data_center_server().await;
         let (dir, env) = project(Some(&server))?;
-        let centers = fetch(dir.path(), env, query(CatalogKind::DataCenters, 2, &[]))
-            .await?
-            .entries;
+        let centers = fetch(
+            dir.path(),
+            env.clone().into(),
+            query(CatalogKind::DataCenters, 2, &[]),
+        )
+        .await?
+        .entries;
         assert_eq!(centers[0].columns[3], "1 GPU type");
         assert_eq!(centers[1].columns[3], "1 GPU type", "L4 has none for 2");
         Ok(())

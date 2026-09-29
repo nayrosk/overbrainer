@@ -7,6 +7,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser};
 use clap_complete::env::{Bash, CompleteEnv, Fish, Shells, Zsh};
 use overbrainer::cli::{self, Cli};
+use overbrainer::config::{DOTENV_FILE, DotenvKeys};
 
 fn main() -> ExitCode {
     // Answer a shell's completion request (`COMPLETE=<shell>`) and exit, before
@@ -21,11 +22,24 @@ fn main() -> ExitCode {
     // Load .env before any thread exists: dotenvy writes to the process environment.
     // A missing .env is normal; any other error is reported. `skill` needs no
     // configuration, so a broken .env does not stop it.
+    // The keys it sets are recorded first: a reload of the configuration
+    // replaces them with what .env holds then.
     let needs_env = !matches!(cli.command, cli::Command::Skill { .. });
-    if needs_env && let Err(message) = load_dotenv(&cli.project_dir.join(".env")) {
-        eprintln!("error: {message}");
-        return ExitCode::FAILURE;
-    }
+    let dotenv = if needs_env {
+        let path = cli.project_dir.join(DOTENV_FILE);
+        let loaded = DotenvKeys::record(&path, process_vars())
+            .map_err(|error| error.to_string())
+            .and_then(|keys| load_dotenv(&path).map(|()| keys));
+        match loaded {
+            Ok(keys) => keys,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::FAILURE;
+            },
+        }
+    } else {
+        DotenvKeys::default()
+    };
 
     let logs = cli.command.log_mode();
     overbrainer::logging::init(&logs);
@@ -41,7 +55,7 @@ fn main() -> ExitCode {
         },
     };
 
-    let result = runtime.block_on(cli::run(cli, logs));
+    let result = runtime.block_on(cli::run(cli, logs, dotenv));
     shut_down(runtime);
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -63,18 +77,27 @@ fn shut_down(runtime: tokio::runtime::Runtime) {
     runtime.shutdown_timeout(SHUTDOWN_GRACE);
 }
 
+/// The names of the process environment, before .env is loaded; values that
+/// are not UTF-8 are kept lossily, only the names count.
+fn process_vars() -> impl Iterator<Item = (String, String)> {
+    std::env::vars_os().filter_map(|(key, value)| {
+        Some((
+            key.into_string().ok()?,
+            value.to_string_lossy().into_owned(),
+        ))
+    })
+}
+
 /// Loads `path` into the process environment. A missing file is not an error.
 ///
-/// The returned message never contains file content: dotenvy's parse error displays
-/// the whole offending line, which usually holds a secret, so only its position is
-/// reported. I/O errors carry no file content and are shown as is.
+/// A syntax error was already reported, with its line, by [`DotenvKeys::record`],
+/// which parses the file first. The returned message never contains file content:
+/// dotenvy's parse error displays the offending text, which usually holds a
+/// secret. I/O errors carry no file content and are shown as is.
 fn load_dotenv(path: &Path) -> Result<(), String> {
     match dotenvy::from_path(path) {
         Ok(()) => Ok(()),
         Err(dotenvy::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(dotenvy::Error::LineParse(_, index)) => {
-            Err(format!("cannot parse .env (syntax error at index {index})"))
-        },
         Err(dotenvy::Error::Io(e)) => Err(format!("cannot load .env: {e}")),
         Err(_) => Err("cannot load .env".to_string()),
     }

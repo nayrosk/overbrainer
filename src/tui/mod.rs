@@ -5,6 +5,7 @@
 
 mod app;
 mod catalog;
+mod config_watch;
 mod cost;
 mod dataset;
 mod editor;
@@ -37,17 +38,18 @@ use anyhow::{Context, bail};
 use tokio::task::JoinHandle;
 
 use self::app::{App, Project};
+use self::config_watch::ConfigWatch;
 use self::motion::{Motion, MotionLevel};
 use self::project::ProjectConfig;
 use self::terminal::TerminalGuard;
 use self::theme::{ColorLevel, LookEnv, Theme};
-use crate::config::{CONFIG_FILE, ConfigError, EnvSource};
+use crate::config::{CONFIG_FILE, ConfigError, DotenvKeys, EnvSource, stamp};
 use crate::logging::LogBuffer;
 use crate::update::Newer;
 
 /// Runs the terminal UI on the project in `project_dir`; `logs` holds the log
 /// lines the Logs view shows; the answer of `check`, when newer, shows in the
-/// footer.
+/// footer; `dotenv` are the keys `.env` set at start.
 ///
 /// # Errors
 ///
@@ -57,20 +59,25 @@ pub async fn run(
     project_dir: &Path,
     logs: LogBuffer,
     check: Option<JoinHandle<Option<Newer>>>,
+    dotenv: DotenvKeys,
 ) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() {
         bail!("overbrainer tui needs a terminal: stdout is not a TTY");
     }
-    // Read once: the Project view shows this text and the environment on it.
+    // The Project view shows this text and the environment on it; the files are
+    // read again once their stamp, taken first, changes.
     let path = project_dir.join(CONFIG_FILE);
+    let read_at = stamp(project_dir);
     let text = std::fs::read_to_string(&path).map_err(|error| ConfigError::Read { path, error })?;
-    let config = ProjectConfig::new(&text, &EnvSource::Process)?;
+    let mut config = ProjectConfig::new(&text, &EnvSource::Process)?;
+    config.stamp = Some(read_at);
     let project = Project::new(project_dir, &config.settings);
     let env = LookEnv::from_process();
     let color = ColorLevel::detect(&env);
     let theme = Theme::new(color);
     let mut app = App::new(project, logs, &theme, SystemTime::now());
     app.set_config(config);
+    app.watch = Some(ConfigWatch::new(dotenv, read_at));
     app.motion = Motion::new(MotionLevel::detect(&env, color)).colored(&theme);
     for warning in env.warnings() {
         tracing::warn!("{warning}");

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::de::IgnoredAny;
 
-use crate::config::{Adapter, CONFIG_FILE, EnvSource, ListOrAuto, Runtime, Target};
+use crate::config::{Adapter, CONFIG_FILE, ListOrAuto, Runtime, Source, Target};
 use crate::dataset::{DataFiles, read};
 use crate::runpod::{Availability, GpuType, RunpodTarget, resolve};
 use crate::train::reasoning_template_warning;
@@ -152,8 +152,8 @@ const CHANGED_LABEL: &str = "changed     ";
 ///
 /// Returns why no run can start: the settings cannot be loaded, there is no
 /// `[training]` section, its target is unknown, or the data cannot be read.
-pub(super) fn prepare(dir: &Path, env: EnvSource) -> Result<StartPlan, String> {
-    let settings = crate::config::load(dir, env).map_err(|error| format!("{error:#}"))?;
+pub(super) fn prepare(dir: &Path, source: &Source) -> Result<StartPlan, String> {
+    let settings = source.load(dir).map_err(|error| format!("{error:#}"))?;
     let training = settings
         .training
         .as_ref()
@@ -208,11 +208,11 @@ fn kind(target: &Target) -> String {
 }
 
 /// The Secure Cloud GPU types for `gpu_count` GPUs on the Runpod account of
-/// the project in `dir` (its settings read with `env`), giving up after
+/// the project in `dir` (its settings from `source`), giving up after
 /// [`START_CATALOG_TIMEOUT`]. Why they cannot be read is logged too, with only the
 /// client's fixed messages.
-pub(super) async fn list_gpus(dir: &Path, env: EnvSource, gpu_count: u32) -> Gpus {
-    let gpus = lookup_gpus(dir, env, gpu_count, START_CATALOG_TIMEOUT).await;
+pub(super) async fn list_gpus(dir: &Path, source: Source, gpu_count: u32) -> Gpus {
+    let gpus = lookup_gpus(dir, source, gpu_count, START_CATALOG_TIMEOUT).await;
     if let Err(error) = &gpus {
         tracing::warn!("{error}");
     }
@@ -220,9 +220,9 @@ pub(super) async fn list_gpus(dir: &Path, env: EnvSource, gpu_count: u32) -> Gpu
 }
 
 /// [`list_gpus`] without logging, giving up after `limit`.
-async fn lookup_gpus(dir: &Path, env: EnvSource, gpu_count: u32, limit: Duration) -> Gpus {
+async fn lookup_gpus(dir: &Path, source: Source, gpu_count: u32, limit: Duration) -> Gpus {
     let lookup = async {
-        let settings = crate::config::load(dir, env)?;
+        let settings = source.load(dir)?;
         let client = crate::cli::pod::client(&settings).await?;
         Ok::<_, anyhow::Error>(client.list_gpu_types(gpu_count).await?)
     };
@@ -466,6 +466,7 @@ pub(super) fn runpod_spec(gpus: ListOrAuto, count: u32) -> RunpodTarget {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::EnvSource;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -720,7 +721,7 @@ mod tests {
     fn a_plan_reads_the_training_section_and_the_split_files()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = crate::tui::snapshots::project()?;
-        let none = prepare(dir.path(), EnvSource::Vars(Vec::new()));
+        let none = prepare(dir.path(), &EnvSource::Vars(Vec::new()).into());
         assert_eq!(
             none,
             Err("no [training] section in overbrainer.toml".to_string())
@@ -737,7 +738,7 @@ mod tests {
             "OVERBRAINER_TARGETS__HOMELAB__HOST".into(),
             "gpu.example".into(),
         )]);
-        let plan = prepare(dir.path(), env)?;
+        let plan = prepare(dir.path(), &env.into())?;
         assert_eq!((plan.train, plan.eval), (2, 0));
         assert_eq!(plan.kind, "ssh, docker");
         assert_eq!(plan.model, "Qwen/Qwen3-4B, qlora, 3 epochs, lr 2e-4");
@@ -797,11 +798,11 @@ mod tests {
             .mount(&server)
             .await;
         let (dir, env) = runpod_project(Some(&server))?;
-        let plan = prepare(dir.path(), env.clone())?;
+        let plan = prepare(dir.path(), &env.clone().into())?;
         let runpod = plan.runpod.clone().ok_or("no Runpod plan")?;
         assert_eq!((runpod.spec.gpu_count, runpod.spec.max_hours), (2, 6.0));
         assert_eq!(runpod.changed(), Vec::<&str>::new());
-        let gpus = list_gpus(dir.path(), env, runpod.spec.gpu_count).await;
+        let gpus = list_gpus(dir.path(), env.into(), runpod.spec.gpu_count).await;
         let shown = text(&plan, Some(&gpus)).join("\n");
         assert!(
             shown.contains("- NVIDIA GeForce RTX 4090  $1.48/h        24 GB  LOW"),
@@ -825,7 +826,7 @@ mod tests {
             .mount(&server)
             .await;
         let (dir, env) = runpod_project(Some(&server))?;
-        let error = lookup_gpus(dir.path(), env, 2, START_CATALOG_TIMEOUT)
+        let error = lookup_gpus(dir.path(), env.into(), 2, START_CATALOG_TIMEOUT)
             .await
             .err()
             .ok_or("read")?;
@@ -851,7 +852,7 @@ mod tests {
             .await;
         let (dir, env) = runpod_project(Some(&server))?;
         let started = std::time::Instant::now();
-        let gpus = lookup_gpus(dir.path(), env, 2, Duration::from_secs(1)).await;
+        let gpus = lookup_gpus(dir.path(), env.into(), 2, Duration::from_secs(1)).await;
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "gave up in time"
@@ -866,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn without_an_api_key_the_catalog_is_unread() -> Result<(), Box<dyn std::error::Error>> {
         let (dir, env) = runpod_project(None)?;
-        let gpus = list_gpus(dir.path(), env, 1).await;
+        let gpus = list_gpus(dir.path(), env.into(), 1).await;
         assert!(
             gpus.as_ref()
                 .err()

@@ -23,7 +23,9 @@ use super::widgets::form::{Input, InputOutcome};
 use super::widgets::picker::Choice;
 use crate::config::edit::{Collection, ConfigDoc, FieldPath};
 use crate::config::fields::{FieldKind, FieldValue, TargetKind};
-use crate::config::{CONFIG_FILE, ConfigError, EnvSource, ListOrAuto, Protocol, is_valid_name};
+use crate::config::{
+    CONFIG_FILE, ConfigError, EnvSource, ListOrAuto, Protocol, is_valid_name, stamp,
+};
 
 /// What a confirmed `d` takes out of the pending document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +78,8 @@ pub(super) fn save_config(
         ConfigError::Read { .. } => SaveRefusal::Failed(error.to_string()),
     })?;
     super::project_save::stage(dir, text, base)?.commit()?;
+    let mut config = config;
+    config.stamp = Some(stamp(dir));
     Ok(config)
 }
 
@@ -175,7 +179,7 @@ fn reconciled(failed: &[String], done: &[String]) -> Option<(Severity, String)> 
 const VOLUME_CENTER: &str = "the network volume's data center";
 
 /// The first of `problems`, with how many more there are.
-fn first_of(problems: &[String]) -> String {
+pub(super) fn first_of(problems: &[String]) -> String {
     let first = problems.first().cloned().unwrap_or_default();
     match problems.len() {
         0 | 1 => first,
@@ -258,7 +262,7 @@ impl App {
         Some(
             self.project_view
                 .pending
-                .get_or_insert_with(|| Pending::new(&config.doc)),
+                .get_or_insert_with(|| Pending::new(config)),
         )
     }
 
@@ -273,10 +277,11 @@ impl App {
     /// Drops the pending changes when they leave the document as it was read,
     /// and has the rows built again.
     fn settle_pending(&mut self) {
-        let same = match (&self.config, &self.project_view.pending) {
-            (Some(config), Some(pending)) => pending.doc.text() == config.doc.text(),
-            _ => false,
-        };
+        let same = self
+            .project_view
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.doc.text() == pending.original.text());
         if same {
             self.project_view.pending = None;
         }
@@ -293,7 +298,7 @@ impl App {
         let pending = self
             .project_view
             .pending
-            .get_or_insert_with(|| Pending::new(&config.doc));
+            .get_or_insert_with(|| Pending::new(config));
         let applied = match value {
             Some(value) => pending.doc.set(path, value.clone()),
             None => pending.doc.unset(path).map(drop),
@@ -317,7 +322,7 @@ impl App {
             },
             _ => path.clone(),
         };
-        pending.mark(&path, &config.doc);
+        pending.mark(&path);
         self.settle_pending();
         if let (FieldPath::Target { name, field }, Some(FieldValue::List(_))) = (&path, value)
             && *field == GPU_TYPES
@@ -1081,12 +1086,12 @@ impl App {
             self.say(Severity::Warn, "refused: quitting; no save starts");
             return Vec::new();
         }
-        let (Some(config), Some(pending)) = (&self.config, &self.project_view.pending) else {
+        let Some(pending) = &self.project_view.pending else {
             return Vec::new();
         };
         let task = Task::SaveConfig {
             text: pending.doc.text(),
-            base: config.text.clone(),
+            base: pending.base.clone(),
             env: self.env.clone(),
         };
         let id = self.task_id();
@@ -1106,16 +1111,14 @@ impl App {
         let mut effects = Vec::new();
         match saved {
             Ok(config) => {
-                let dir = self.project.dir.clone();
-                self.project = Project::new(&dir, &config.settings);
                 self.project_view.pending = None;
-                self.project_view.errors.clear();
-                self.set_config(*config);
+                let used = self.adopt(*config);
                 if self.leaving.is_some() {
                     self.exit_notes.push(format!("{CONFIG_FILE} was saved"));
                 }
                 self.say(Severity::Info, format!("✓ saved {CONFIG_FILE}"));
-                effects = self.reload();
+                effects = vec![used];
+                effects.extend(self.reload());
                 match start {
                     Some(_) if self.leaving.is_some() => {
                         self.exit_notes.push(NOT_STARTED.to_string());
@@ -1158,8 +1161,38 @@ impl App {
         effects
     }
 
+    /// Makes `config`, just read from `overbrainer.toml`, the configuration:
+    /// the project follows it, the errors shown go, and the look at the files
+    /// takes its stamp, so it reads them again only once they change; the
+    /// returned effect has the next tasks read their settings from it, with
+    /// the environment of the app. A save, a reload and `E` all end here.
+    pub(super) fn adopt(&mut self, config: ProjectConfig) -> Effect {
+        let dir = self.project.dir.clone();
+        self.project = Project::new(&dir, &config.settings);
+        self.project_view.errors.clear();
+        if let (Some(watch), Some(stamp)) = (self.watch.as_mut(), config.stamp) {
+            watch.seen(stamp);
+        }
+        let used = self.use_config(&config);
+        self.set_config(config);
+        used
+    }
+
     /// Shows each of `problems` on the field it names, and selects the first.
     fn mark_errors(&mut self, problems: &[String]) {
+        self.note_errors(problems);
+        let listing = self.project_listing();
+        if let Some(index) = (0..listing.fields.len()).find(|index| {
+            listing
+                .field(*index)
+                .is_some_and(|field| field.error.is_some())
+        }) {
+            self.project_view.selected = index;
+        }
+    }
+
+    /// Shows each of `problems` on the field it names.
+    pub(super) fn note_errors(&mut self, problems: &[String]) {
         let topics = self
             .shown_doc()
             .map(ConfigDoc::topic_names)
@@ -1184,14 +1217,6 @@ impl App {
         }
         self.project_view.errors = errors;
         self.project_view.touch();
-        let listing = self.project_listing();
-        if let Some(index) = (0..listing.fields.len()).find(|index| {
-            listing
-                .field(*index)
-                .is_some_and(|field| field.error.is_some())
-        }) {
-            self.project_view.selected = index;
-        }
     }
 
     /// `u`: asks to drop the pending changes.
@@ -1262,15 +1287,23 @@ impl App {
     pub(super) fn config_edited(&mut self, status: io::Result<ExitStatus>) -> Vec<Effect> {
         let failed = editor_failure(status);
         let path = self.project.dir.join(CONFIG_FILE);
+        let read_at = stamp(&self.project.dir);
         let read = std::fs::read_to_string(&path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))
             .and_then(|text| {
                 ProjectConfig::new(&text, &self.env).map_err(|error| {
+                    if let ConfigError::Invalid(problems) = &error {
+                        self.note_errors(problems);
+                    }
                     let text = error.to_string();
                     text.lines().map(str::trim).collect::<Vec<_>>().join(" ")
                 })
             });
-        let config = match read {
+        // The file just read is not reported again by the look at the files.
+        if let Some(watch) = self.watch.as_mut() {
+            watch.seen(read_at);
+        }
+        let mut config = match read {
             Ok(config) => config,
             Err(error) => {
                 let said = format!("{error}; the view shows {CONFIG_FILE} as it was");
@@ -1282,10 +1315,8 @@ impl App {
             .config
             .as_ref()
             .is_some_and(|shown| shown.text == config.text);
-        let dir = self.project.dir.clone();
-        self.project = Project::new(&dir, &config.settings);
-        self.project_view.errors.clear();
-        self.set_config(config);
+        config.stamp = Some(read_at);
+        let used = self.adopt(config);
         let what = if unchanged {
             format!("{CONFIG_FILE} unchanged")
         } else {
@@ -1303,7 +1334,9 @@ impl App {
             said = format!("{said}; {text}");
         }
         self.say(severity, said);
-        self.reload()
+        let mut effects = vec![used];
+        effects.extend(self.reload());
+        effects
     }
 }
 
