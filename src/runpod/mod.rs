@@ -148,7 +148,8 @@ pub enum PodError {
     /// Following the run failed.
     #[error(transparent)]
     Run(#[from] crate::runs::RunError),
-    /// The client's own deadline fired: the pod was deleted before the job ended.
+    /// `max_hours` ran out: the client's own deadline fired, or the pod's watchdog
+    /// deleted the pod at its deadline, before the job ended.
     #[error("max_hours reached: the pod was deleted before the job ended")]
     DeadlineReached,
     /// The run's pod no longer exists.

@@ -10,7 +10,7 @@ use crate::exec::{
     ExecError, Executor, FileDigest, JOB_LOG, JobId, JobRuntime, JobSpec, JobStatus, LineStream,
     local_manifest,
 };
-use crate::runpod::{POD_FILE, SSH_DIR};
+use crate::runpod::{POD_FILE, SSH_DIR, chain};
 use crate::train::{TrainError, Trainer};
 
 /// Hugging Face cache on the target, under the executor's work directory. Shared
@@ -541,7 +541,16 @@ fn publish(bus: &EventBus, lines: Vec<String>, summary: &mut MetricsSummary) {
 }
 
 fn unreachable_target(error: &ExecError, failures: u32) {
-    tracing::warn!("cannot reach the job ({failures}/{MAX_FAILURES}): {error}");
+    tracing::warn!("{}", unreachable_line(error, failures));
+}
+
+/// The warning for the `failures`th failed poll: `error` with its sources, so an
+/// SSH failure says why (`ssh failed: the connection was terminated`).
+fn unreachable_line(error: &ExecError, failures: u32) -> String {
+    format!(
+        "cannot reach the job ({failures}/{MAX_FAILURES}): {}",
+        chain(error)
+    )
 }
 
 /// The final state of a run whose job ended with `status`.
@@ -668,6 +677,17 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
+
+    #[test]
+    fn an_unreachable_job_says_why_ssh_failed() {
+        let error = ExecError::Ssh(openssh::Error::Disconnected);
+        assert_eq!(
+            unreachable_line(&error, 2),
+            format!(
+                "cannot reach the job (2/{MAX_FAILURES}): ssh failed: the connection was terminated"
+            )
+        );
+    }
     use crate::exec::{FileDigest, JobCommand, MAX_TAIL_READ, Pid};
     use crate::runs::RECORD_FILE;
     use crate::train::Artifacts;

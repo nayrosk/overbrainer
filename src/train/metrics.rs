@@ -1,5 +1,7 @@
 //! The metrics plugin shipped with each run, and the lines it writes.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 /// Source of the Axolotl plugin that writes `metrics.jsonl`. It is uploaded as
@@ -58,6 +60,64 @@ pub enum MetricLine {
     Log(TrainMetric),
 }
 
+/// The pace of a training, from its logs in order: steps per second between
+/// the first and the latest training log (the ones with a loss), measured on the
+/// plugin's own clock, and the time left at that pace.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Pace {
+    /// Step and time of the first training log.
+    first: Option<(u64, f64)>,
+    /// Step and time of the latest training log.
+    last: Option<(u64, f64)>,
+    /// Latest step, of any log.
+    step: u64,
+    /// Total steps of the run, as last given.
+    max_steps: Option<u64>,
+}
+
+impl Pace {
+    /// Takes the next log `metric` into account.
+    pub fn add(&mut self, metric: &TrainMetric) {
+        self.step = metric.step;
+        self.max_steps = metric.max_steps.or(self.max_steps);
+        if metric.loss.is_some() {
+            let point = (metric.step, metric.time);
+            self.first.get_or_insert(point);
+            self.last = Some(point);
+        }
+    }
+
+    /// Latest step.
+    #[must_use]
+    pub const fn step(&self) -> u64 {
+        self.step
+    }
+
+    /// Total steps of the run, when known.
+    #[must_use]
+    pub const fn max_steps(&self) -> Option<u64> {
+        self.max_steps
+    }
+
+    /// Time left to reach the last step at the pace seen so far; `None` until
+    /// two training logs apart in steps and time, or without a step count.
+    #[must_use]
+    pub fn eta(&self) -> Option<Duration> {
+        let ((first_step, first_time), (last_step, last_time)) = self.first.zip(self.last)?;
+        if last_step <= first_step || last_time <= first_time {
+            return None;
+        }
+        let rate = float(last_step - first_step) / (last_time - first_time);
+        let left = float(self.max_steps?.saturating_sub(self.step));
+        Duration::try_from_secs_f64(left / rate).ok()
+    }
+}
+
+/// `count` as a float, saturating at `u32::MAX`.
+fn float(count: u64) -> f64 {
+    f64::from(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
 /// Parses one line of `metrics.jsonl`.
 ///
 /// # Errors
@@ -70,6 +130,43 @@ pub fn parse_line(line: &str) -> Result<MetricLine, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn log(time: f64, step: u64, loss: Option<f64>) -> TrainMetric {
+        TrainMetric {
+            time,
+            step,
+            epoch: None,
+            max_steps: Some(400),
+            loss,
+            eval_loss: loss.is_none().then_some(1.0),
+            learning_rate: None,
+            grad_norm: None,
+        }
+    }
+
+    #[test]
+    fn the_pace_follows_the_training_logs_only() {
+        let mut pace = Pace::default();
+        pace.add(&log(100.0, 10, Some(2.0)));
+        assert_eq!(pace.eta(), None);
+        pace.add(&log(150.0, 60, None));
+        assert_eq!(pace.eta(), None);
+        pace.add(&log(200.0, 110, Some(1.5)));
+        assert_eq!((pace.step(), pace.max_steps()), (110, Some(400)));
+        assert_eq!(pace.eta(), Some(Duration::from_secs(290)));
+    }
+
+    #[test]
+    fn the_pace_has_no_eta_without_a_step_count() {
+        let mut pace = Pace::default();
+        for (time, step) in [(0.0, 1), (10.0, 2)] {
+            pace.add(&TrainMetric {
+                max_steps: None,
+                ..log(time, step, Some(1.0))
+            });
+        }
+        assert_eq!(pace.eta(), None);
+    }
 
     #[test]
     fn log_lines_parse_with_missing_values() -> Result<(), serde_json::Error> {
