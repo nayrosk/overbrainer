@@ -3249,6 +3249,7 @@ mod tests {
                     output_tokens: 5,
                 }),
                 cost: Some(cost),
+                excluded: false,
             },
         ));
         if finish {

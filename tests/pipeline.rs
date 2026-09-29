@@ -942,8 +942,14 @@ async fn answers_run_concurrently_classify_and_resume() -> TestResult {
     }));
     fake.delay = Duration::from_millis(20);
     let parent = Arc::new(project.role(fake, true));
+    let mut receiver = project.bus.subscribe();
     let stats = pipeline::answers(&project.ctx(false), Arc::clone(&parent)).await?;
     assert_eq!((stats.done, stats.excluded, stats.failed), (4, 2, 0));
+    let flagged = drain(&mut receiver)
+        .iter()
+        .filter(|event| matches!(event, Event::ItemDone { excluded: true, .. }))
+        .count();
+    assert_eq!(flagged, 2, "each excluded answer says so");
     assert_eq!(stats.usage.input_tokens, 60);
     assert_eq!(stats.cost, None);
     let peak = parent.client.peak.load(Ordering::SeqCst);

@@ -71,6 +71,7 @@ pub async fn subtopics<C: LlmClient>(
                 id: topic.name.clone(),
                 usage: None,
                 cost: None,
+                excluded: false,
             });
             continue;
         }
@@ -99,6 +100,7 @@ pub async fn subtopics<C: LlmClient>(
                     id: plan.item.id,
                     usage: Some(usage),
                     cost: generator.price.as_ref().map(|price| price.cost(usage)),
+                    excluded: false,
                 });
             },
             Err(PipelineError::Llm { source, .. }) => {

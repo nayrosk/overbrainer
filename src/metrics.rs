@@ -307,7 +307,9 @@ impl Metrics {
                     .inc();
             },
             Event::StageFinished { stage, stats } => {
-                if stats.excluded > 0 {
+                // Split publishes no item events: its exclusions come with its end,
+                // as its history line has them. The other stages count them per item.
+                if *stage == Stage::Split && stats.excluded > 0 {
                     self.item(stage.name(), "excluded", stats.excluded);
                 }
                 if let Some(index) = followed.running.iter().position(|s| s == stage) {
@@ -676,18 +678,21 @@ mod tests {
                 id: "a".into(),
                 usage: Some(usage),
                 cost: Some(0.125),
+                excluded: false,
             },
             Event::ItemDone {
                 stage: Stage::Answers,
                 id: "b".into(),
                 usage: Some(usage),
                 cost: None,
+                excluded: false,
             },
             Event::ItemDone {
                 stage: Stage::Answers,
                 id: "c".into(),
                 usage: None,
                 cost: None,
+                excluded: false,
             },
             Event::ItemFailed {
                 stage: Stage::Answers,
@@ -740,11 +745,89 @@ mod tests {
         );
         let text = metrics.encode()?;
         assert_value(&text, r#"overbrainer_stage_running{stage="answers"}"#, 0.0);
-        assert_value(
-            &text,
-            r#"overbrainer_stage_items_total{stage="answers",result="excluded"}"#,
-            2.0,
+        // The end of a stage adds nothing: its items were counted one by one.
+        assert_eq!(
+            value(
+                &text,
+                r#"overbrainer_stage_items_total{stage="answers",result="excluded"}"#
+            ),
+            None,
+            "{text}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn live_counts_mean_what_the_history_seeds() -> TestResult {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 40,
+        };
+        let done = |excluded| Event::ItemDone {
+            stage: Stage::Answers,
+            id: "a".into(),
+            usage: Some(usage),
+            cost: None,
+            excluded,
+        };
+        let live = Metrics::new(&[]);
+        for event in [
+            done(false),
+            done(false),
+            done(false),
+            done(true),
+            done(true),
+        ] {
+            live.event(1, &event);
+        }
+        live.event(
+            1,
+            &Event::StageFinished {
+                stage: Stage::Answers,
+                stats: StageStats {
+                    done: 3,
+                    excluded: 2,
+                    ..StageStats::default()
+                },
+            },
+        );
+        // Split has no item events: its exclusions come with its end.
+        live.event(
+            1,
+            &Event::StageFinished {
+                stage: Stage::Split,
+                stats: StageStats {
+                    excluded: 4,
+                    ..StageStats::default()
+                },
+            },
+        );
+        let live = live.encode()?;
+        for (stage, result, count) in [
+            ("answers", "done", 3.0),
+            ("answers", "excluded", 2.0),
+            ("split", "excluded", 4.0),
+        ] {
+            assert_value(
+                &live,
+                &format!("overbrainer_stage_items_total{{stage=\"{stage}\",result=\"{result}\"}}"),
+                count,
+            );
+        }
+        // The same stage recorded in the history: done without the excluded.
+        let mut recorded = entry(Stage::Answers, Some("parent"), None);
+        (
+            recorded.done,
+            recorded.skipped,
+            recorded.failed,
+            recorded.excluded,
+        ) = (3, 0, 0, 2);
+        let seeded = Metrics::new(&[recorded]).encode()?;
+        for result in ["done", "excluded"] {
+            let series =
+                format!("overbrainer_stage_items_total{{stage=\"answers\",result=\"{result}\"}}");
+            assert_eq!(value(&live, &series), value(&seeded, &series), "{series}");
+        }
         Ok(())
     }
 
@@ -785,6 +868,7 @@ mod tests {
                 id: index.to_string(),
                 usage: None,
                 cost: None,
+                excluded: false,
             });
         }
         let text = metrics.encode()?;

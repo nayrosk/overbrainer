@@ -107,6 +107,9 @@ pub enum Event {
         usage: Option<Usage>,
         /// Cost of this item in USD, when the model price is known.
         cost: Option<f64>,
+        /// True for an item produced but not usable for training (an excluded
+        /// answer): counted as excluded, not done.
+        excluded: bool,
     },
     /// One attempt or one item failed.
     ItemFailed {
@@ -155,6 +158,8 @@ pub enum ItemResult {
     Done,
     /// Already present: an [`Event::ItemDone`] without usage.
     Skipped,
+    /// Produced but not usable for training: an excluded [`Event::ItemDone`].
+    Excluded,
     /// Failed for good: an [`Event::ItemFailed`] not retried.
     Failed,
 }
@@ -166,6 +171,7 @@ impl ItemResult {
         match self {
             Self::Done => "done",
             Self::Skipped => "skipped",
+            Self::Excluded => "excluded",
             Self::Failed => "failed",
         }
     }
@@ -177,6 +183,12 @@ impl Event {
     #[must_use]
     pub fn item_result(&self) -> Option<(Stage, ItemResult)> {
         match self {
+            Self::ItemDone {
+                stage,
+                usage: Some(_),
+                excluded: true,
+                ..
+            } => Some((*stage, ItemResult::Excluded)),
             Self::ItemDone {
                 stage,
                 usage: Some(_),
@@ -386,6 +398,7 @@ mod tests {
             id: "a".into(),
             usage,
             cost: None,
+            excluded: false,
         };
         let failed = |retryable| Event::ItemFailed {
             stage: Stage::Questions,
@@ -419,8 +432,14 @@ mod tests {
             None
         );
         assert_eq!(
-            [ItemResult::Done, ItemResult::Skipped, ItemResult::Failed].map(ItemResult::name),
-            ["done", "skipped", "failed"]
+            [
+                ItemResult::Done,
+                ItemResult::Skipped,
+                ItemResult::Excluded,
+                ItemResult::Failed
+            ]
+            .map(ItemResult::name),
+            ["done", "skipped", "excluded", "failed"]
         );
     }
 

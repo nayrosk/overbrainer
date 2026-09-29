@@ -113,6 +113,7 @@ where
                     id: slot.item.id,
                     usage: None,
                     cost: None,
+                    excluded: false,
                 });
             } else {
                 slots.push(slot);
@@ -262,6 +263,7 @@ impl<C: LlmClient> Filler<'_, C> {
             id: slot.item.id,
             usage: Some(usage),
             cost: self.generator.price.as_ref().map(|price| price.cost(usage)),
+            excluded: false,
         });
         Ok(())
     }

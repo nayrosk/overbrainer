@@ -1878,6 +1878,7 @@ mod tests {
                         id: format!("{burst}-{n}"),
                         usage: None,
                         cost: None,
+                        excluded: false,
                     });
                 }
                 while received.get() < 1 + (burst + 1) * 20_000 {
