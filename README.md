@@ -68,6 +68,9 @@ The latest code from `main` installs with `cargo install --locked --git https://
 - `ssh` for SSH targets, and `ssh` with `ssh-keygen` for Runpod targets.
 - For training on this machine: Axolotl 0.19 in a virtual environment or on `PATH`, or Docker or Podman with NVIDIA GPU access to run the Axolotl image.
 
+> [!WARNING]
+> SSH sandboxes such as firejail are not supported for now. overbrainer keeps one `ssh` connection open in the background for each SSH or Runpod target, and a sandbox that kills background processes when the foreground command exits breaks it. If `command -v ssh` points to a wrapper (for example `/usr/local/bin/ssh -> firejail`), put the real `ssh` first on `PATH` for overbrainer: `PATH=/usr/bin:$PATH overbrainer train`. See [Runpod troubleshooting](docs/runpod.md#troubleshooting).
+
 ### Shell completions
 
 overbrainer completes its commands and flags in bash, zsh and fish. It also completes run IDs (with their state and target), topic names and target names, read from the project in the current directory or the one given with `-C`. Add the line for your shell to its startup file:
