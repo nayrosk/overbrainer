@@ -142,3 +142,11 @@ Every `train` on a Runpod target first lists the account's pods and warns about 
 ## Custom images
 
 A custom `image` must keep an entrypoint that ends with `exec "$@"`, and provide `bash`, `sshd` (started with `service ssh`), `ssh-keygen`, `base64`, `curl`, `setsid`, `nohup`, `tar`, `find`, `sha256sum` and Axolotl in `venv`. Jobs on the pod start from `/etc/overbrainer/job.env`, which the pod writes with the image's `PATH`, its CUDA library path and `HF_HOME`, since an SSH session does not see the image's environment.
+
+## Troubleshooting
+
+### `the local ssh cannot keep its connection`
+
+overbrainer opens one `ssh` master connection per pod and runs every command through it: `ssh -M -f` authenticates, then leaves a background process holding the connection. When the pod's sshd answers (its `SSH-2.0-` banner is readable) but that background process ends right after it started, twice in a row, the cause is on this machine: overbrainer deletes the pod at once and stops, without trying other GPU types, since every pod would fail the same way. The error ends with the last lines of ssh's own log (`ssh log: ...`), or `empty` when it wrote none.
+
+The usual cause is a wrapper around `ssh` on `PATH` that kills background processes when the command in the foreground exits, for example a firejail symlink (`/usr/local/bin/ssh -> firejail`). Check with `command -v ssh`, then put the real `ssh` first on `PATH` for overbrainer, for example `PATH=/usr/bin:$PATH overbrainer train`.

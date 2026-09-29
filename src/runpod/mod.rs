@@ -127,6 +127,18 @@ pub enum PodError {
         /// What the bootstrap reported.
         reason: String,
     },
+    /// The pod's sshd answered, but the local `ssh` master connection kept ending
+    /// right after it started: the cause is on this machine, so no other GPU type
+    /// is tried. The pod was deleted.
+    #[error(
+        "pod {pod_id} answers SSH, but the local ssh cannot keep its connection ({reason}); a wrapper around `ssh` on PATH, such as firejail, may kill its background process: put the real ssh first on PATH. The pod was deleted and no other GPU type tried"
+    )]
+    LocalSsh {
+        /// The pod.
+        pod_id: PodId,
+        /// Why the connection failed, with the tail of ssh's log.
+        reason: String,
+    },
     /// Ctrl-C before the job started.
     #[error("interrupted before the job started")]
     Interrupted,

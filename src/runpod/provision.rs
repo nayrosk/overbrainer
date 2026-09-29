@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::events::{Event, EventBus};
-use crate::exec::{Executor, SshExecutor};
+use crate::exec::{ExecError, Executor, SshExecutor};
 use crate::runs::Runs;
 
 use super::{
@@ -30,6 +30,13 @@ const VERDICT_CHARS: usize = 200;
 /// Prefix of the watchdog's verdict reason when the bootstrap itself failed
 /// (`failed bootstrap: <reason>`).
 const BOOTSTRAP_FAILED: &str = "bootstrap: ";
+
+/// Handshakes in a row where the pod's sshd sent its banner but the local
+/// master connection died, after which the cause is taken to be local.
+const LOCAL_STRIKES: u32 = 2;
+
+/// Longest wait for the pod's sshd to send its banner.
+const BANNER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Least time between two warnings that the verdict cannot be read.
 const VERDICT_WARN_EVERY: Duration = Duration::from_secs(60);
@@ -163,6 +170,8 @@ enum Created {
 /// watchdog cannot delete its pod and [`PodError::BootstrapFailed`] when the
 /// pod's bootstrap failed (the pod is deleted in both cases),
 /// [`PodError::Interrupted`] after Ctrl-C (the pod, if any, is deleted),
+/// [`PodError::LocalSsh`] when the pod answers SSH but the local `ssh` cannot
+/// keep its master connection (the pod is deleted, no other GPU type tried),
 /// [`PodError::NotDeleted`] when a pod that did not become ready cannot be
 /// confirmed deleted (it stays in `record`), and another [`PodError`] when the
 /// API or a local file fails.
@@ -608,7 +617,9 @@ async fn ready(
 }
 
 /// Polls the pod until it has an SSH endpoint and a strict handshake with it
-/// succeeds, within [`Timing::ready_timeout`].
+/// succeeds, within [`Timing::ready_timeout`]. When the pod's sshd sends its
+/// banner but the local master connection dies, [`LOCAL_STRIKES`] times in a
+/// row, the wait stops with [`PodError::LocalSsh`]: no pod would do better.
 async fn reach(
     ctx: &PodCtx<'_>,
     plan: &PodPlan<'_>,
@@ -618,6 +629,7 @@ async fn reach(
     let started = Instant::now();
     let alias = alias(plan.run_id);
     let mut last = "no SSH endpoint yet".to_string();
+    let mut strikes = 0;
     loop {
         ctx.check().map_err(Wait::Failed)?;
         if started.elapsed() >= ctx.timing.ready_timeout {
@@ -638,11 +650,64 @@ async fn reach(
                 write_config(plan.ssh_dir, &alias, &endpoint, plan.keys).map_err(Wait::Failed)?;
             match SshExecutor::connect(&alias, plan.workdir, Some(&config)).await {
                 Ok(executor) => return Ok((executor, endpoint)),
-                Err(error) => last = chain(&error),
+                Err(error) => {
+                    let died = matches!(error, ExecError::MasterDied { .. });
+                    let banner =
+                        died && ssh_banner(&endpoint.host, endpoint.port, BANNER_TIMEOUT).await;
+                    strikes = strikes_after(strikes, banner, died);
+                    last = chain(&error);
+                    if strikes >= LOCAL_STRIKES {
+                        // Saved by the delete that follows.
+                        record.end_attempt(AttemptResult::NotReady, Some(last.clone()));
+                        return Err(Wait::Failed(PodError::LocalSsh {
+                            pod_id: id.clone(),
+                            reason: last,
+                        }));
+                    }
+                },
             }
+        } else {
+            strikes = 0;
         }
         tokio::time::sleep(ctx.timing.poll).await;
     }
+}
+
+/// The count of handshakes in a row blamed on this machine, `strikes` before
+/// this one: it grows when the pod's sshd sent its `banner` but the local master
+/// `died`, and restarts on any other outcome (no banner yet, a timeout, a
+/// refused key), which keeps waiting as before.
+fn strikes_after(strikes: u32, banner: bool, died: bool) -> u32 {
+    if banner && died { strikes + 1 } else { 0 }
+}
+
+/// Whether `host:port` answers with an SSH banner (a first line starting with
+/// `SSH-`) within `within`. Any failure reads as no banner.
+async fn ssh_banner(host: &str, port: u16, within: Duration) -> bool {
+    let host = host.to_string();
+    let probe = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+        use std::io::{BufRead, BufReader, Read};
+        use std::net::{TcpStream, ToSocketAddrs};
+        let mut last = std::io::Error::other("no address");
+        for addr in (host.as_str(), port).to_socket_addrs()? {
+            match TcpStream::connect_timeout(&addr, within) {
+                Ok(stream) => {
+                    stream.set_read_timeout(Some(within))?;
+                    let mut line = Vec::new();
+                    BufReader::new(stream.take(256)).read_until(b'\n', &mut line)?;
+                    return Ok(line.starts_with(b"SSH-"));
+                },
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    });
+    // The blocking probe is bounded by its own timeouts; this one also covers
+    // a slow name lookup.
+    matches!(
+        tokio::time::timeout(within.saturating_mul(3), probe).await,
+        Ok(Ok(Ok(true)))
+    )
 }
 
 /// The pod `id` as the API shows it, or [`Wait::NotReady`] at once when it is
@@ -926,6 +991,64 @@ mod tests {
         let long = format!("failed {}", "x".repeat(5000));
         assert_eq!(one_line(&long, VERDICT_CHARS).len(), VERDICT_CHARS);
         assert_eq!(one_line(&long, 64).len(), 64);
+    }
+
+    #[test]
+    fn only_a_banner_with_a_dead_master_counts_as_a_local_failure() {
+        assert_eq!(strikes_after(0, true, true), 1);
+        assert_eq!(strikes_after(1, true, true), LOCAL_STRIKES);
+        // No banner yet, or another failure: keep waiting from scratch.
+        assert_eq!(strikes_after(1, false, true), 0);
+        assert_eq!(strikes_after(1, true, false), 0);
+        assert_eq!(strikes_after(0, false, false), 0);
+    }
+
+    #[test]
+    fn a_local_ssh_failure_names_the_cause_and_the_fix() -> Result<(), crate::runpod::InvalidPodId>
+    {
+        let error = PodError::LocalSsh {
+            pod_id: PodId::new("p1")?,
+            reason: "the ssh master connection ended right after it started (ssh log: empty)"
+                .into(),
+        };
+        let text = error.to_string();
+        assert!(text.contains("pod p1"), "{text}");
+        assert!(text.contains("firejail"), "{text}");
+        assert!(text.contains("first on PATH"), "{text}");
+        assert!(text.contains("(ssh log: empty)"), "{text}");
+        Ok(())
+    }
+
+    /// A local server answering each connection with `answer`, then closing it.
+    fn server(answer: &'static [u8]) -> std::io::Result<u16> {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(answer);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+        Ok(port)
+    }
+
+    #[tokio::test]
+    async fn an_sshd_is_told_by_its_banner() -> std::io::Result<()> {
+        let within = Duration::from_millis(300);
+        let port = server(b"SSH-2.0-OpenSSH_9.6\r\n")?;
+        assert!(ssh_banner("127.0.0.1", port, within).await);
+        let port = server(b"HTTP/1.1 400 Bad Request\r\n")?;
+        assert!(!ssh_banner("127.0.0.1", port, within).await);
+        // Silent until the timeout.
+        let port = server(b"")?;
+        assert!(!ssh_banner("127.0.0.1", port, within).await);
+        // Nothing listening.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        assert!(!ssh_banner("127.0.0.1", closed, within).await);
+        Ok(())
     }
 
     #[test]
