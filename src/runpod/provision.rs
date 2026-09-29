@@ -2,7 +2,8 @@
 //! reconciliation of an ambiguous create, SSH readiness, the watchdog's verdict,
 //! and deletes confirmed by the API.
 
-use std::path::Path;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -141,6 +142,9 @@ enum Wait {
     NotReady(String),
     /// Its watchdog cannot delete it: refuse the run.
     Refused(String),
+    /// Its sshd answers but the local `ssh` cannot keep its connection: stop,
+    /// since no other pod would do better.
+    Local(String),
     /// Interrupted, or a failure that no other pod would fix.
     Failed(PodError),
 }
@@ -494,6 +498,7 @@ async fn settle(
             Ok(None)
         },
         Err(Wait::Refused(reason)) => Err(refuse(ctx, record, &pod.id, reason).await),
+        Err(Wait::Local(reason)) => Err(local_ssh(ctx, record, &pod.id, reason).await),
         Err(Wait::Failed(error)) => Err(abandon(ctx, record, error).await),
     }
 }
@@ -546,6 +551,27 @@ async fn refuse(ctx: &PodCtx<'_>, record: &mut PodRecord, id: &PodId, reason: St
         return error;
     }
     refusal
+}
+
+/// Deletes the pod `id` that answers SSH while the local `ssh` cannot keep its
+/// connection, and returns [`PodError::LocalSsh`], or the delete's error when
+/// the pod may still run.
+async fn local_ssh(
+    ctx: &PodCtx<'_>,
+    record: &mut PodRecord,
+    id: &PodId,
+    reason: String,
+) -> PodError {
+    record.end_attempt(AttemptResult::NotReady, Some(reason.clone()));
+    let saved = record.save(ctx.runs);
+    let removed = remove(ctx, record, DeleteReason::LocalSsh, DeletedBy::Client).await;
+    if let Err(error) = saved_then_removed(saved, removed) {
+        return error;
+    }
+    PodError::LocalSsh {
+        pod_id: id.clone(),
+        reason,
+    }
 }
 
 /// Why the pod `id`, refused by its watchdog's verdict `failed <reason>`, is
@@ -626,6 +652,25 @@ async fn reach(
     record: &mut PodRecord,
     id: &PodId,
 ) -> Result<(SshExecutor, SshEndpoint), Wait> {
+    let workdir = plan.workdir;
+    let connect = move |alias: String, config: PathBuf| async move {
+        SshExecutor::connect(&alias, workdir, Some(&config)).await
+    };
+    reach_with(ctx, plan, record, id, connect).await
+}
+
+/// [`reach`], connecting with `connect(alias, config)`: tests stand in for ssh.
+async fn reach_with<C, F>(
+    ctx: &PodCtx<'_>,
+    plan: &PodPlan<'_>,
+    record: &mut PodRecord,
+    id: &PodId,
+    connect: C,
+) -> Result<(SshExecutor, SshEndpoint), Wait>
+where
+    C: Fn(String, PathBuf) -> F,
+    F: Future<Output = Result<SshExecutor, ExecError>>,
+{
     let started = Instant::now();
     let alias = alias(plan.run_id);
     let mut last = "no SSH endpoint yet".to_string();
@@ -648,21 +693,17 @@ async fn reach(
             };
             let config =
                 write_config(plan.ssh_dir, &alias, &endpoint, plan.keys).map_err(Wait::Failed)?;
-            match SshExecutor::connect(&alias, plan.workdir, Some(&config)).await {
+            match connect(alias.clone(), config).await {
                 Ok(executor) => return Ok((executor, endpoint)),
                 Err(error) => {
-                    let died = matches!(error, ExecError::MasterDied { .. });
+                    let died =
+                        matches!(&error, ExecError::MasterDied { log } if !closed_remotely(log));
                     let banner =
                         died && ssh_banner(&endpoint.host, endpoint.port, BANNER_TIMEOUT).await;
                     strikes = strikes_after(strikes, banner, died);
                     last = chain(&error);
                     if strikes >= LOCAL_STRIKES {
-                        // Saved by the delete that follows.
-                        record.end_attempt(AttemptResult::NotReady, Some(last.clone()));
-                        return Err(Wait::Failed(PodError::LocalSsh {
-                            pod_id: id.clone(),
-                            reason: last,
-                        }));
+                        return Err(Wait::Local(last));
                     }
                 },
             }
@@ -671,6 +712,15 @@ async fn reach(
         }
         tokio::time::sleep(ctx.timing.poll).await;
     }
+}
+
+/// Whether the master's `log` tail says the server ended the connection: a pod
+/// dropping it is not a local failure.
+fn closed_remotely(log: &str) -> bool {
+    let log = log.to_ascii_lowercase();
+    ["closed by remote host", "connection reset", "broken pipe"]
+        .iter()
+        .any(|sign| log.contains(sign))
 }
 
 /// The count of handshakes in a row blamed on this machine, `strikes` before
@@ -1025,12 +1075,238 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let _ = stream.write_all(answer);
-                std::thread::sleep(Duration::from_millis(500));
+            for mut stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let _ = stream.write_all(answer);
+                    std::thread::sleep(Duration::from_millis(500));
+                });
             }
         });
         Ok(port)
+    }
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// A stub Runpod API, a project and the pod `p1` whose SSH endpoint is a
+    /// local server answering `SSH-2.0-...`.
+    struct Stub {
+        server: wiremock::MockServer,
+        project: tempfile::TempDir,
+        client: RunpodClient,
+        runs: Runs,
+        bus: EventBus,
+        timing: Timing,
+        interrupted: AtomicBool,
+        target: RunpodTarget,
+        keys: PodKeys,
+        pod: Pod,
+    }
+
+    impl Stub {
+        /// `deletable`: the pod disappears once deleted, else it stays listed.
+        async fn new(deletable: bool) -> Result<Self, Box<dyn std::error::Error>> {
+            use std::sync::Arc;
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+            struct Get(Arc<AtomicBool>, serde_json::Value);
+            impl Respond for Get {
+                fn respond(&self, _: &Request) -> ResponseTemplate {
+                    if self.0.load(Ordering::SeqCst) {
+                        ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                            "detail": "pod not found", "status": 404, "title": "Not Found"
+                        }))
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(&self.1)
+                    }
+                }
+            }
+            struct Delete(Arc<AtomicBool>, bool);
+            impl Respond for Delete {
+                fn respond(&self, _: &Request) -> ResponseTemplate {
+                    self.0.store(self.1, Ordering::SeqCst);
+                    ResponseTemplate::new(204)
+                }
+            }
+
+            let port = server(b"SSH-2.0-OpenSSH_9.6\r\n")?;
+            let body = serde_json::json!({
+                "id": "p1",
+                "name": "overbrainer-r1-1",
+                "status": "RUNNING",
+                "cost": 0.25,
+                "env": {"OVERBRAINER_RUN_ID": "r1"},
+                "ssh": {"direct": {"host": "127.0.0.1", "port": port, "username": "root"}}
+            });
+            let server = MockServer::start().await;
+            let deleted = Arc::new(AtomicBool::new(false));
+            Mock::given(method("GET"))
+                .and(path("/v2/pods/p1"))
+                .respond_with(Get(Arc::clone(&deleted), body))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/v2/pods/p1"))
+                .respond_with(Delete(deleted, deletable))
+                .mount(&server)
+                .await;
+            let client = RunpodClient::new(
+                &format!("{}/v2", server.uri()),
+                &secrecy::SecretString::from("rp_key"),
+            )?
+            .with_policy(crate::retry::RetryPolicy {
+                max_retries: 1,
+                base: Duration::from_millis(1),
+                cap: Duration::from_millis(2),
+            });
+            let pod = client
+                .get_pod(&PodId::new("p1")?)
+                .await?
+                .ok_or("no pod p1")?;
+            let project = tempfile::tempdir()?;
+            let runs = Runs::new(project.path());
+            Ok(Self {
+                server,
+                project,
+                client,
+                runs,
+                bus: EventBus::new(),
+                timing: Timing {
+                    poll: Duration::from_millis(5),
+                    ready_timeout: Duration::from_millis(400),
+                    preflight_timeout: Duration::from_millis(300),
+                    reconcile_waits: [Duration::from_millis(5); 2],
+                    delete_timeout: Duration::from_millis(200),
+                    gone_interval: Duration::from_millis(5),
+                },
+                interrupted: AtomicBool::new(false),
+                target: RunpodTarget {
+                    gpu_types: crate::config::ListOrAuto::List(vec!["A".into()]),
+                    min_vram_gb: None,
+                    max_price_per_hour: None,
+                    gpu_count: 1,
+                    image: "img@sha256:abc".into(),
+                    venv: "/workspace/axolotl-venv".into(),
+                    container_disk_gb: 50,
+                    max_hours: 6.0,
+                    boot_grace: Duration::from_secs(1800),
+                    retrieve_grace: Duration::from_secs(3600),
+                    data_center_ids: crate::config::ListOrAuto::default(),
+                    network_volume_id: None,
+                },
+                keys: PodKeys::new(
+                    std::path::PathBuf::from("/nonexistent/id_ed25519"),
+                    "ssh-ed25519 AAAAclient overbrainer".into(),
+                    "ssh-ed25519 AAAAhost".into(),
+                    secrecy::SecretString::from("aG9zdC1rZXk"),
+                ),
+                pod,
+            })
+        }
+
+        fn ctx(&self) -> PodCtx<'_> {
+            PodCtx {
+                client: &self.client,
+                runs: &self.runs,
+                bus: &self.bus,
+                timing: &self.timing,
+                interrupted: &self.interrupted,
+            }
+        }
+
+        fn plan(&self) -> PodPlan<'_> {
+            PodPlan {
+                run_id: "r1",
+                target: &self.target,
+                keys: &self.keys,
+                ssh_dir: self.project.path(),
+                workdir: "/workspace/overbrainer",
+                api_url: self.client.base_url(),
+            }
+        }
+
+        fn record(&self) -> PodRecord {
+            let mut record = PodRecord::new("r1", false, 1, "ssh-ed25519 AAAAhost");
+            record.created(&self.pod, AttemptResult::Created, SystemTime::now());
+            record
+        }
+
+        /// Waits for SSH on `p1` with every connection failing on a dead master
+        /// that logged `log`. Returns the outcome and the connection count.
+        async fn reach(&self, log: &str) -> (Result<(), Wait>, usize) {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let connect = |_: String, _: PathBuf| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(ExecError::MasterDied { log: log.into() }))
+            };
+            let mut record = self.record();
+            let outcome = reach_with(
+                &self.ctx(),
+                &self.plan(),
+                &mut record,
+                &self.pod.id,
+                connect,
+            )
+            .await
+            .map(drop);
+            (outcome, calls.load(Ordering::SeqCst))
+        }
+
+        async fn deletes(&self) -> usize {
+            self.server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.method.as_str() == "DELETE")
+                .count()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_banner_with_a_master_dying_twice_stops_the_wait() -> TestResult {
+        let stub = Stub::new(true).await?;
+        let (outcome, calls) = stub.reach("").await;
+        assert!(
+            matches!(&outcome, Err(Wait::Local(reason)) if reason.contains("ssh log: empty")),
+            "{:?}",
+            outcome.err().map(|wait| matches!(wait, Wait::NotReady(_)))
+        );
+        assert_eq!(calls, LOCAL_STRIKES as usize);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_master_dropped_by_the_server_keeps_the_wait() -> TestResult {
+        let stub = Stub::new(true).await?;
+        let (outcome, calls) = stub
+            .reach("Connection to 127.0.0.1 closed by remote host.")
+            .await;
+        assert!(matches!(outcome, Err(Wait::NotReady(_))));
+        assert!(calls > LOCAL_STRIKES as usize, "{calls}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_local_ssh_failure_deletes_the_pod() -> TestResult {
+        let stub = Stub::new(true).await?;
+        let mut record = stub.record();
+        let error = local_ssh(&stub.ctx(), &mut record, &stub.pod.id, "dead".into()).await;
+        assert!(matches!(error, PodError::LocalSsh { .. }), "{error}");
+        assert_eq!(stub.deletes().await, 1);
+        assert_eq!(record.state, super::super::PodState::Deleted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_local_ssh_failure_never_claims_an_undeleted_pod_gone() -> TestResult {
+        let stub = Stub::new(false).await?;
+        let mut record = stub.record();
+        let error = local_ssh(&stub.ctx(), &mut record, &stub.pod.id, "dead".into()).await;
+        assert!(matches!(error, PodError::NotDeleted(_)), "{error}");
+        assert!(!error.to_string().contains("was deleted"), "{error}");
+        assert_eq!(record.state, super::super::PodState::Deleting);
+        Ok(())
     }
 
     #[tokio::test]
