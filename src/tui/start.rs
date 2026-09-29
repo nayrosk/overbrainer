@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::de::IgnoredAny;
 
-use crate::config::{Adapter, CONFIG_FILE, ListOrAuto, Runtime, Source, Target};
+use crate::config::{Adapter, CONFIG_FILE, ListOrAuto, Runtime, Settings, Source, Target};
 use crate::dataset::{DataFiles, read};
 use crate::runpod::{Availability, GpuType, RunpodTarget, resolve};
 use crate::train::{Outputs, reasoning_template_warning};
@@ -146,7 +146,7 @@ const COST_LABEL: &str = "max_hours   ";
 const CHANGED_LABEL: &str = "changed     ";
 
 /// What a run started now in the project in `dir` would use, from its settings
-/// (read with `env`) and data files only.
+/// (read from `source`) and data files only.
 ///
 /// # Errors
 ///
@@ -154,6 +154,17 @@ const CHANGED_LABEL: &str = "changed     ";
 /// `[training]` section, its target is unknown, or the data cannot be read.
 pub(super) fn prepare(dir: &Path, source: &Source) -> Result<StartPlan, String> {
     let settings = source.load(dir).map_err(|error| format!("{error:#}"))?;
+    plan(dir, &settings)
+}
+
+/// What a run started now in the project in `dir` would use, from
+/// `settings` and its data files.
+///
+/// # Errors
+///
+/// Returns why no run can start: there is no `[training]` section, its
+/// target is unknown, or the data cannot be read.
+fn plan(dir: &Path, settings: &Settings) -> Result<StartPlan, String> {
     let training = settings
         .training
         .as_ref()
@@ -215,9 +226,9 @@ pub(super) fn prepare_auto(dir: &Path, source: &Source) -> Result<AutoPlan, Stri
         return Ok(AutoPlan { run: None });
     };
     let outputs = Outputs::of(training);
-    let plan = prepare(dir, source)?;
+    let run = plan(dir, &settings)?;
     Ok(AutoPlan {
-        run: Some((Box::new(plan), outputs)),
+        run: Some((Box::new(run), outputs)),
     })
 }
 
