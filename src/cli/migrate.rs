@@ -133,14 +133,22 @@ fn plan(project_dir: &Path) -> anyhow::Result<Plan> {
     if version.is_none() {
         let entries = history::read(project_dir)
             .with_context(|| format!("cannot read {}", history::path(project_dir).display()))?;
-        if entries.iter().any(|entry| entry.stage == Stage::Answers) {
+        let answers = entries.iter().filter(|entry| entry.stage == Stage::Answers);
+        if answers.clone().any(|entry| !entry.backfilled) {
             plan.notes.push(format!(
                 "not backfilling the answers history: {} already has answers entries",
                 history::path(project_dir).display()
             ));
         } else {
-            plan.changes
-                .extend(backfill(project_dir)?.into_iter().map(Change::Backfill));
+            // A migration that stopped part way left some models backfilled:
+            // only the others are.
+            let done: Vec<&str> = answers.filter_map(|entry| entry.model.as_deref()).collect();
+            plan.changes.extend(
+                backfill(project_dir)?
+                    .into_iter()
+                    .filter(|entry| !done.contains(&entry.model.as_deref().unwrap_or_default()))
+                    .map(Change::Backfill),
+            );
         }
         plan.changes.push(Change::Version);
     }
@@ -368,6 +376,37 @@ mod tests {
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert_eq!(history::read(dir.path())?, [recorded]);
         assert_eq!(project_format::read(dir.path())?, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn a_stopped_backfill_is_finished_with_the_missing_models_only() -> TestResult {
+        let dir = old_project()?;
+        let at = "2026-09-27T10:00:00Z";
+        history::append(dir.path(), &empty_entry("other", at))?;
+        // The line of the next model was cut by the crash.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(history::path(dir.path()))?;
+        std::io::Write::write_all(&mut file, b"{\"stage\": \"answ")?;
+        drop(file);
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            [
+                "added /.overbrainer/ to .gitignore",
+                "backfilled the answers history of parent: 1 answer(s), 1 excluded; tokens 30 in, 300 out",
+                "wrote .overbrainer/version: format 1",
+            ]
+        );
+        let models: Vec<_> = history::read(dir.path())?
+            .into_iter()
+            .map(|entry| (entry.model, entry.backfilled))
+            .collect();
+        assert_eq!(
+            models,
+            [(Some("other".into()), true), (Some("parent".into()), true)]
+        );
+        assert_eq!(migrate(dir.path(), false)?, ["nothing to migrate"]);
         Ok(())
     }
 

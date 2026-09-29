@@ -45,7 +45,7 @@ Every command on a project without `.overbrainer/version` (one made before 0.4.0
 `overbrainer migrate` takes the project lock and:
 
 - adds `/.overbrainer/` to `.gitignore` unless a line already ignores the directory (`.overbrainer`, `.overbrainer/`, `/.overbrainer` or `/.overbrainer/`), appending, never rewriting the file;
-- rebuilds the `answers` history from `data/answers.jsonl`: one `ok` line per model, whose `done` counts its answers kept for training, `excluded` the others, and the tokens are summed; all of them are written at once; the cost and provider are unknown, and both times are the file's modification time. It is skipped, saying why, when `history.jsonl` already has an `answers` line, so nothing is counted twice. Subtopics and questions keep no tokens, so they are not rebuilt;
+- rebuilds the `answers` history from `data/answers.jsonl`: one `ok` line per model, whose `done` counts its answers kept for training, `excluded` the others, and the tokens are summed; all of them are written at once; the cost and provider are unknown, and both times are the file's modification time. It is skipped, saying why, when `history.jsonl` already has an `answers` line recorded by a stage, so nothing is counted twice; after a migration that stopped part way, only the models not yet backfilled are. Subtopics and questions keep no tokens, so they are not rebuilt;
 - writes `.overbrainer/version`, last.
 
 It prints one line per change, or `nothing to migrate`: running it again changes nothing. `--dry-run` prints the same lines starting with `would`, and changes no project file; it still takes the lock, which creates `.overbrainer/lock`. A project whose format is newer than the one the running overbrainer knows is refused: upgrade overbrainer.
