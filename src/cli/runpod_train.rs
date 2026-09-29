@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
 
 use anyhow::{Context, bail};
 
@@ -16,9 +17,10 @@ use crate::config::Settings;
 use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{
-    DeleteReason, DeletedBy, Ending, PodCtx, PodError, PodRecord, PodState, RunpodClient,
-    RunpodTarget, Timing, chain, end_pod, forget_client_key, job_started, listed_rows,
-    orphan_warnings, reconnect, remove, settle_watch, ssh_command, start_pod, watch_on_pod,
+    DeleteReason, DeletedBy, Ending, MAX_HOURS_REACHED, PodCtx, PodError, PodRecord, PodState,
+    RunpodClient, RunpodTarget, Timing, chain, end_pod, forget_client_key, job_started,
+    listed_rows, orphan_warnings, past_deadline, reconnect, remove, settle_watch, ssh_command,
+    start_pod, watch_on_pod,
 };
 use crate::runs::{
     Launch, Outcome, RunCtx, RunRecord, RunState, Runs, artifacts_missing, cancel as cancel_job,
@@ -560,7 +562,12 @@ async fn from_local_files(
     tracing::info!("pod: {} already deleted", pod_name(pod));
     if record.state == RunState::Running {
         record.state = RunState::Failed;
-        record.message = Some(format!("pod {} no longer exists", pod_name(pod)));
+        // Its watchdog deleted it on `max_hours` once the deadline passed.
+        record.message = Some(if past_deadline(pod, SystemTime::now()) {
+            MAX_HOURS_REACHED.to_string()
+        } else {
+            format!("pod {} no longer exists", pod_name(pod))
+        });
         session.runs.save(&record)?;
     }
     let id = record.id.clone();

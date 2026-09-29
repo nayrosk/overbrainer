@@ -32,7 +32,7 @@ pub const RETRIEVED_MARKER: &str = ".pod/retrieved";
 
 /// Why a run fails when its pod was deleted on `max_hours`, by the client's own
 /// guard or by the pod's watchdog.
-const MAX_HOURS_REACHED: &str = "max_hours reached: the pod was deleted before the job ended";
+pub const MAX_HOURS_REACHED: &str = "max_hours reached: the pod was deleted before the job ended";
 
 /// Looks in a row that must answer Runpod's 404 before a pod is declared gone.
 const GONE_LOOKS: u32 = 3;
@@ -333,8 +333,10 @@ async fn gone(ctx: &PodCtx<'_>, pod: &mut PodRecord) -> Result<bool, PodError> {
 }
 
 /// Whether the watchdog's own deadline for `pod` has passed at `now`; never for
-/// a kept pod, or one without a deadline.
-fn past_deadline(pod: &PodRecord, now: SystemTime) -> bool {
+/// a kept pod, or one without a deadline. A pod found gone then was deleted by
+/// its watchdog on `max_hours`.
+#[must_use]
+pub fn past_deadline(pod: &PodRecord, now: SystemTime) -> bool {
     let now = now
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());

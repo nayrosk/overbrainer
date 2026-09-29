@@ -716,6 +716,15 @@ async fn reconnect_records_a_pod_confirmed_gone_without_deleting_it() -> TestRes
     assert_eq!(deletes(&harness.server).await, 0);
     assert_eq!(gets(&harness.server).await, 3);
 
+    // Gone once its watchdog deadline passed: the watchdog deleted it.
+    let late = Harness::new().await?;
+    serve_sequence(&late.server, vec![false], false).await;
+    let run = broken_run(&late.runs)?;
+    let mut pod = pod_record(&run.id, false, Duration::from_secs(60))?;
+    assert!(reconnect(&late.ctx(), &mut pod, &run).await?.is_none());
+    assert_eq!(pod.deleted_by, Some(DeletedBy::Watchdog));
+    assert_eq!(deletes(&late.server).await, 0);
+
     // A single 404, then the pod (without an SSH endpoint): not gone.
     let flaky = Harness::new().await?;
     serve_sequence(&flaky.server, vec![false, true], false).await;
