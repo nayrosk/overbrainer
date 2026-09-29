@@ -90,6 +90,15 @@ pub enum ExecError {
     /// The SSH connection failed or broke.
     #[error("ssh failed")]
     Ssh(#[source] openssh::Error),
+    /// `ssh` connected, then its background master connection ended before the
+    /// first command (killed locally, or the server dropped it). `log` is the tail of
+    /// the master's own log on one bounded line, control characters dropped, empty
+    /// when it wrote nothing.
+    #[error("the ssh master connection ended right after it started (ssh log: {})", or_empty(.log))]
+    MasterDied {
+        /// Tail of the master's log.
+        log: String,
+    },
     /// A secret cannot be passed to the job: its name is not an env variable name, or
     /// its value holds a line break or a NUL byte. The message names the variable
     /// only.
@@ -98,6 +107,11 @@ pub enum ExecError {
     /// The target answered something unexpected.
     #[error("unexpected answer from the target: {0}")]
     Protocol(String),
+}
+
+/// `text`, or `empty` when it is.
+fn or_empty(text: &str) -> &str {
+    if text.is_empty() { "empty" } else { text }
 }
 
 /// A container running the job, stopped by [`Executor::cancel`].

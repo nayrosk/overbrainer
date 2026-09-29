@@ -1,5 +1,6 @@
-use std::io;
-use std::path::Path;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 
@@ -53,7 +54,9 @@ impl SshExecutor {
     /// # Errors
     ///
     /// Returns [`ExecError::Ssh`] when the connection fails, for example on an
-    /// unknown host key, and [`ExecError::Command`] when `workdir` cannot be created.
+    /// unknown host key, [`ExecError::MasterDied`], with the tail of the master's
+    /// log, when the master connection ends right after it started, and
+    /// [`ExecError::Command`] when `workdir` cannot be created.
     pub async fn connect(
         destination: &str,
         workdir: &str,
@@ -67,17 +70,24 @@ impl SshExecutor {
         if let Some(config_file) = config_file {
             builder.config_file(config_file);
         }
-        let session = builder
-            .connect_mux(destination)
+        // What `connect_mux` does, keeping the master's `-E` log path: `log` in
+        // the control directory, the path `Session::detach` documents as the
+        // "ssh multiplex output log".
+        let (builder, destination) = builder.resolve(destination);
+        let control = builder
+            .launch_master(destination)
             .await
             .map_err(ExecError::Ssh)?;
+        let log: PathBuf = control.path().join("log");
+        let session = Session::new_native_mux(control);
         let dir = shell_path(workdir);
         let resolved = run(
             &session,
             &format!("mkdir -p -- {dir} && cd -- {dir} && pwd -P"),
             "create the work directory",
         )
-        .await?;
+        .await
+        .map_err(|error| master_died(error, &log))?;
         let workdir = String::from_utf8_lossy(&resolved).trim().to_string();
         if !workdir.starts_with('/') {
             return Err(ExecError::Protocol(format!(
@@ -415,6 +425,59 @@ fn download_outcome(
     }
 }
 
+/// `error` of the first command on a new session, as [`ExecError::MasterDied`]
+/// with the tail of the master's log at `log` when the master was gone.
+fn master_died(error: ExecError, log: &Path) -> ExecError {
+    match error {
+        ExecError::Ssh(openssh::Error::Disconnected) => ExecError::MasterDied {
+            log: master_log(log),
+        },
+        other => other,
+    }
+}
+
+/// Bytes read from the end of the master's log.
+const LOG_READ: u64 = 4096;
+/// Lines kept of the master's log.
+const LOG_LINES: usize = 5;
+/// Characters kept of the master's log, `...` included.
+const LOG_CHARS: usize = 300;
+
+/// The tail of the master's log at `path` (see [`log_tail`]), empty when it cannot
+/// be read. Only its last [`LOG_READ`] bytes are read.
+fn master_log(path: &Path) -> String {
+    let read = || -> io::Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(LOG_READ)))?;
+        let mut bytes = Vec::new();
+        file.take(LOG_READ).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    read().map_or_else(
+        |_| String::new(),
+        |bytes| log_tail(&String::from_utf8_lossy(&bytes)),
+    )
+}
+
+/// The last [`LOG_LINES`] non-blank lines of `text`, control characters dropped,
+/// joined with ` | ` and cut from the start to [`LOG_CHARS`] characters.
+fn log_tail(text: &str) -> String {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| line.chars().filter(|c| !c.is_control()).collect::<String>())
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let joined = lines[lines.len().saturating_sub(LOG_LINES)..].join(" | ");
+    let count = joined.chars().count();
+    if count <= LOG_CHARS {
+        return joined;
+    }
+    let kept: String = joined.chars().skip(count - (LOG_CHARS - 3)).collect();
+    format!("...{kept}")
+}
+
 /// Runs `script` with `sh` on the target and returns its stdout.
 async fn run(session: &Session, script: &str, action: &'static str) -> Result<Vec<u8>, ExecError> {
     let output = session
@@ -464,6 +527,60 @@ mod tests {
             secrets: vec![(name.into(), SecretString::from("v".to_string()))],
             ..job("v")
         }
+    }
+
+    #[test]
+    fn the_master_log_tail_is_its_last_lines_on_one_bounded_line() {
+        assert_eq!(log_tail(""), "");
+        assert_eq!(log_tail("\n \r\n"), "");
+        let log = "one\ntwo\nthree\nfour\nfive\nsix\u{1b}[31m\r\n\n";
+        assert_eq!(log_tail(log), "two | three | four | five | six[31m");
+        let lengthy = format!("start\n{}end", "x".repeat(5000));
+        let tail = log_tail(&lengthy);
+        assert_eq!(tail.chars().count(), LOG_CHARS);
+        assert!(tail.starts_with("...") && tail.ends_with("xend"), "{tail}");
+        assert_eq!(log_tail("caf\u{e9}\u{7}\n"), "caf\u{e9}");
+    }
+
+    #[test]
+    fn the_master_log_is_read_from_its_end() -> TestResult {
+        let dir = tempdir()?;
+        assert_eq!(master_log(&dir.path().join("log")), "");
+        let path = dir.path().join("log");
+        fs::write(&path, format!("{}\nlast words\n", "y".repeat(12_000)))?;
+        assert!(master_log(&path).ends_with("last words"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_gone_at_its_first_command_is_a_dead_master() -> TestResult {
+        let dir = tempdir()?;
+        let log = dir.path().join("log");
+        fs::write(&log, "debug1: forking\r\nkilled\u{1b}[0m\n")?;
+        let error = master_died(ExecError::Ssh(openssh::Error::Disconnected), &log);
+        assert!(
+            matches!(&error, ExecError::MasterDied { log } if log == "debug1: forking | killed[0m"),
+            "{error:?}"
+        );
+        let error = master_died(ExecError::Protocol("x".into()), &log);
+        assert!(matches!(error, ExecError::Protocol(_)), "{error:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_dead_master_names_its_log() {
+        let error = ExecError::MasterDied {
+            log: "Connection closed".into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "the ssh master connection ended right after it started (ssh log: Connection closed)"
+        );
+        let error = ExecError::MasterDied { log: String::new() };
+        assert_eq!(
+            error.to_string(),
+            "the ssh master connection ended right after it started (ssh log: empty)"
+        );
     }
 
     #[test]
