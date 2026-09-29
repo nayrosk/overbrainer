@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::{Pod, PodId};
-use crate::runs::{Runs, RunsError, rfc3339, write_atomic};
+use crate::runs::{Runs, RunsError, parse_rfc3339, rfc3339, write_atomic};
 
 /// The pod record of a run, in its local run directory.
 pub const POD_FILE: &str = "pod.json";
@@ -349,6 +349,17 @@ impl PodRecord {
         Some(Duration::from_secs(unix(now).saturating_sub(created)))
     }
 
+    /// How long the pod existed, once deleted: from its creation to when it
+    /// was found deleted. `None` while it exists, or when either time is
+    /// unknown.
+    #[must_use]
+    pub fn final_uptime(&self) -> Option<Duration> {
+        if self.state != PodState::Deleted {
+            return None;
+        }
+        self.uptime(parse_rfc3339(self.deleted_at.as_deref()?)?)
+    }
+
     /// What the pod has cost at `now`, in USD: its estimate once deleted, else
     /// its rate times its uptime so far.
     #[must_use]
@@ -483,8 +494,10 @@ mod tests {
         record.created(&pod()?, AttemptResult::Created, at(1_790_000_000));
         // An hour at its rate.
         assert_eq!(record.spend_at(at(1_790_003_600)), Some(0.53));
+        assert_eq!(record.final_uptime(), None, "not deleted yet");
         record.deleted(DeletedBy::Client, at(1_790_007_200));
         assert_eq!(record.estimated_spend, Some(1.06));
+        assert_eq!(record.final_uptime(), Some(Duration::from_secs(7_200)));
         // Once deleted, the estimate stays whatever the time.
         assert_eq!(record.spend_at(at(1_800_000_000)), Some(1.06));
         Ok(())

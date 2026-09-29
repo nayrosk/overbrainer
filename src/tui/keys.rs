@@ -83,6 +83,8 @@ const TRAINING: &[KeyHelp] = &[
     row("c", "cancel the selected run's job (asks first)"),
     row("c, Runpod run starting", "abandon it instead (asks first)"),
     row("t", "start a training run (asks first)"),
+    row("x", "hide the failed runs until restart (asks first)"),
+    row("p", "dismiss the selected run's pod, or show it"),
     row(
         "g c, starting on Runpod",
         "choose GPU types, data centers (saved on y)",
@@ -202,12 +204,16 @@ const FOOTER_TRAINING: &[Hint] = &[
     hint("a", "attach"),
     hint("c", "cancel"),
     locking("t", "start"),
+    hint("x", "clear failed"),
+    hint("p", "pod"),
 ];
 const FOOTER_ABANDON: &[Hint] = &[
     hint("j/k", "select"),
     hint("a", "attach"),
     hint("c", "abandon"),
     locking("t", "start"),
+    hint("x", "clear failed"),
+    hint("p", "pod"),
 ];
 const FOOTER_LOGS: &[Hint] = &[
     hint("j/k", "scroll"),

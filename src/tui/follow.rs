@@ -147,9 +147,86 @@ impl App {
                 return Vec::new();
             },
             KeyCode::Char('t') => return self.prepare_start(),
+            KeyCode::Char('x') => {
+                self.ask_clear_failed();
+                return Vec::new();
+            },
+            KeyCode::Char('p') => {
+                self.toggle_pod();
+                return Vec::new();
+            },
             _ => return Vec::new(),
         }
         self.read_selected()
+    }
+
+    /// `x`: asks to leave the failed runs no task is on out of the list until
+    /// the TUI restarts. Nothing is deleted.
+    fn ask_clear_failed(&mut self) {
+        let failed = self.training.failed_runs();
+        let (runs, no) = match failed.len() {
+            0 => {
+                self.say(Severity::Info, "no failed run to clear");
+                return;
+            },
+            1 => ("the failed run".to_string(), "keep it"),
+            count => (format!("the {count} failed runs"), "keep them"),
+        };
+        self.overlay = Some(Overlay::Confirm(Confirm {
+            title: " Clear failed runs? ".to_string(),
+            text: vec![format!(
+                "Hide {runs} from this list until the TUI restarts? Nothing is deleted: the \
+                 files stay in runs/, and `overbrainer runs ls` still lists every run."
+            )],
+            yes: "clear",
+            no,
+            action: Action::ClearFailed(failed),
+        }));
+    }
+
+    /// Leaves runs `runs`, failed, out of the list until the TUI restarts; the
+    /// metrics of the run then selected are read.
+    pub(super) fn clear_failed(&mut self, runs: &[String]) -> Vec<Effect> {
+        self.training.hide(runs);
+        let cleared = match runs.len() {
+            1 => "1 failed run cleared".to_string(),
+            count => format!("{count} failed runs cleared"),
+        };
+        self.say(
+            Severity::Info,
+            format!("{cleared} from the list until the TUI restarts"),
+        );
+        self.read_selected()
+    }
+
+    /// `p`: dismisses the selected run's pod, whose line and column then show
+    /// nothing, or shows it again. Refused while a task follows the run: its
+    /// pod is live.
+    fn toggle_pod(&mut self) {
+        let Some(row) = self.training.selected_run() else {
+            return;
+        };
+        let id = row.record.id.clone();
+        if row.pod.is_none() {
+            self.say(Severity::Info, format!("run {id} has no pod"));
+            return;
+        }
+        if self.training.dismissed.remove(&id) {
+            self.say(Severity::Info, format!("the pod of run {id} shows again"));
+            return;
+        }
+        if self.training.task_of(&id).is_some() {
+            self.say(
+                Severity::Info,
+                format!("run {id} is followed: its pod stays in view"),
+            );
+            return;
+        }
+        self.training.dismissed.insert(id.clone());
+        self.say(
+            Severity::Info,
+            format!("the pod of run {id} is dismissed; p shows it again"),
+        );
     }
 
     /// `a`: follows the selected run again, from its first metric; refused
@@ -283,6 +360,8 @@ impl App {
         }
         self.training.last.retain(|_, run| run != run_id);
         self.training.reading.remove(run_id);
+        // A followed run's pod is live: it shows again.
+        self.training.dismissed.remove(run_id);
         self.training.tasks.insert(id, Follow::new(job, run_id));
         vec![Effect::Spawn(id, Task::Train(task))]
     }

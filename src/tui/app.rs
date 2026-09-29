@@ -319,6 +319,9 @@ pub(super) enum Action {
     Abandon(Vec<TaskId>),
     /// Abandoning the Runpod start `0` still provisioning, asked for with `c`.
     AbandonStart(TaskId),
+    /// Leaving the failed runs `0` out of the Training view's list until the
+    /// TUI restarts, asked for with `x`.
+    ClearFailed(Vec<String>),
     /// Taking a topic, a provider or a target out of the pending changes.
     Remove(Removal),
     /// Dropping the pending changes to `overbrainer.toml`.
@@ -1462,6 +1465,7 @@ impl App {
             Action::CancelAuto => self.cancel_auto(),
             Action::Abandon(tasks) => self.abandon(&tasks),
             Action::AbandonStart(task) => self.abandon_start(task),
+            Action::ClearFailed(runs) => self.clear_failed(&runs),
             Action::Remove(removal) => {
                 self.remove(&removal);
                 Vec::new()
