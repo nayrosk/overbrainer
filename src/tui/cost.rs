@@ -110,6 +110,7 @@ mod tests {
                 output_tokens: 5,
             }),
             cost,
+            excluded: false,
         }
     }
 

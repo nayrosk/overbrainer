@@ -32,6 +32,7 @@ mod widgets;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, bail};
@@ -44,12 +45,14 @@ use self::project::ProjectConfig;
 use self::terminal::TerminalGuard;
 use self::theme::{ColorLevel, LookEnv, Theme};
 use crate::config::{CONFIG_FILE, ConfigError, DotenvKeys, EnvSource, stamp};
+use crate::events::Observer;
 use crate::logging::LogBuffer;
 use crate::update::Newer;
 
 /// Runs the terminal UI on the project in `project_dir`; `logs` holds the log
 /// lines the Logs view shows; the answer of `check`, when newer, shows in the
-/// footer; `dotenv` are the keys `.env` set at start.
+/// footer; `dotenv` are the keys `.env` set at start; `observer` sees the
+/// events of the stages and trainings it runs.
 ///
 /// # Errors
 ///
@@ -60,6 +63,7 @@ pub async fn run(
     logs: LogBuffer,
     check: Option<JoinHandle<Option<Newer>>>,
     dotenv: DotenvKeys,
+    observer: Option<Arc<dyn Observer>>,
 ) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() {
         bail!("overbrainer tui needs a terminal: stdout is not a TTY");
@@ -85,7 +89,7 @@ pub async fn run(
     app.editor = editor::command(std::env::var_os("VISUAL"), std::env::var_os("EDITOR"));
     let guard = TerminalGuard::enter();
     let mut terminal = terminal::init().context("cannot set up the terminal")?;
-    let result = event_loop::run(&mut terminal, &mut app, check).await;
+    let result = event_loop::run(&mut terminal, &mut app, check, observer).await;
     drop(guard);
     app.abandon_edit();
     if app.project_view.pending.is_some() {

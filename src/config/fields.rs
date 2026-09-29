@@ -24,6 +24,8 @@ pub enum Section {
     Training,
     /// One `[targets.<name>]` table of the given kind.
     Target(TargetKind),
+    /// `[metrics]`.
+    Metrics,
 }
 
 /// The `kind` of a training target.
@@ -657,6 +659,13 @@ const RUNPOD: &[FieldSpec] = &[
     ),
 ];
 
+const METRICS: &[FieldSpec] = &[spec(
+    "listen",
+    TEXT,
+    true,
+    "Address of the Prometheus endpoint, such as 127.0.0.1:9464; unset it to turn it off",
+)];
+
 /// The editable fields of `section`, in file order.
 #[must_use]
 pub fn for_section(section: Section) -> &'static [FieldSpec] {
@@ -670,6 +679,7 @@ pub fn for_section(section: Section) -> &'static [FieldSpec] {
         Section::Target(TargetKind::Local) => LOCAL,
         Section::Target(TargetKind::Ssh) => SSH,
         Section::Target(TargetKind::Runpod) => RUNPOD,
+        Section::Metrics => METRICS,
     }
 }
 
@@ -728,6 +738,8 @@ kind = "runpod"
 gpu_types = ["NVIDIA A40"]
 max_hours = 6
 #ZZ runpod
+[metrics]
+#ZZ metrics
 "#;
 
     /// Keys a form never writes: env-only secrets and hosts, and free-form tables.
@@ -741,7 +753,7 @@ max_hours = 6
         ("training", "axolotl_extra"),
     ];
 
-    const SECTIONS: [(&str, Section); 9] = [
+    const SECTIONS: [(&str, Section); 10] = [
         ("project", Section::Project),
         ("topic", Section::Topic),
         ("provider", Section::Provider),
@@ -751,6 +763,7 @@ max_hours = 6
         ("local", Section::Target(TargetKind::Local)),
         ("ssh", Section::Target(TargetKind::Ssh)),
         ("runpod", Section::Target(TargetKind::Runpod)),
+        ("metrics", Section::Metrics),
     ];
 
     /// The fields serde expects in `marker`'s table, read from its unknown-field error.
@@ -811,6 +824,7 @@ max_hours = 6
                 "pipeline",
                 "training",
                 "targets",
+                "metrics",
             ],
         ),
         ("roles", &["generator", "parent", "embedder"]),

@@ -76,6 +76,10 @@ where
         stage: Stage::Questions,
         total: selected_subtopics(&subtopics, &topics),
     });
+    ctx.bus.publish(Event::StageModel {
+        stage: Stage::Questions,
+        model: generator.model.model.clone(),
+    });
     // Seed every topic with something to fill, one after the other; a topic whose
     // seeding failed is left out with its subtopics.
     let mut stats = StageStats::default();
@@ -109,6 +113,7 @@ where
                     id: slot.item.id,
                     usage: None,
                     cost: None,
+                    excluded: false,
                 });
             } else {
                 slots.push(slot);
@@ -258,6 +263,7 @@ impl<C: LlmClient> Filler<'_, C> {
             id: slot.item.id,
             usage: Some(usage),
             cost: self.generator.price.as_ref().map(|price| price.cost(usage)),
+            excluded: false,
         });
         Ok(())
     }

@@ -93,6 +93,8 @@ impl Progress {
             },
             Event::JobStatus(status) => job(*status),
             Event::PodStatus(status) => tracing::info!("pod: {}", pod_line(status)),
+            // Only the metrics use them.
+            Event::StageModel { .. } | Event::RunWatched { .. } => {},
         }
     }
 

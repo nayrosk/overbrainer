@@ -2,6 +2,7 @@
 //! renders: the CLI turns events into log lines, the TUI (later) into views.
 
 use std::fmt;
+use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
@@ -106,6 +107,9 @@ pub enum Event {
         usage: Option<Usage>,
         /// Cost of this item in USD, when the model price is known.
         cost: Option<f64>,
+        /// True for an item produced but not usable for training (an excluded
+        /// answer): counted as excluded, not done.
+        excluded: bool,
     },
     /// One attempt or one item failed.
     ItemFailed {
@@ -118,12 +122,26 @@ pub enum Event {
         /// True when the item will be tried again in this run.
         retryable: bool,
     },
+    /// The model a stage asks, published right after its [`Event::StageStarted`];
+    /// never for `split`.
+    StageModel {
+        /// The stage.
+        stage: Stage,
+        /// The model of the stage's role.
+        model: String,
+    },
     /// A stage finished.
     StageFinished {
         /// The stage.
         stage: Stage,
         /// Final counters.
         stats: StageStats,
+    },
+    /// The flow follows the job of run `run_id`: the [`Event::Metric`]s that come
+    /// next on this bus are its own.
+    RunWatched {
+        /// ID of the run.
+        run_id: String,
     },
     /// A training or evaluation log of the running job.
     Metric(TrainMetric),
@@ -133,11 +151,84 @@ pub enum Event {
     PodStatus(PodStatus),
 }
 
+/// How an item ended, as its event says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemResult {
+    /// Produced: an [`Event::ItemDone`] with its usage.
+    Done,
+    /// Already present: an [`Event::ItemDone`] without usage.
+    Skipped,
+    /// Produced but not usable for training: an excluded [`Event::ItemDone`].
+    Excluded,
+    /// Failed for good: an [`Event::ItemFailed`] not retried.
+    Failed,
+}
+
+impl ItemResult {
+    /// Lowercase name, as the history counts it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Skipped => "skipped",
+            Self::Excluded => "excluded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl Event {
+    /// The stage and result of the item this event ends; `None` for any other
+    /// event, a failed attempt that is retried included.
+    #[must_use]
+    pub fn item_result(&self) -> Option<(Stage, ItemResult)> {
+        match self {
+            Self::ItemDone {
+                stage,
+                usage: Some(_),
+                excluded: true,
+                ..
+            } => Some((*stage, ItemResult::Excluded)),
+            Self::ItemDone {
+                stage,
+                usage: Some(_),
+                ..
+            } => Some((*stage, ItemResult::Done)),
+            Self::ItemDone {
+                stage, usage: None, ..
+            } => Some((*stage, ItemResult::Skipped)),
+            Self::ItemFailed {
+                stage,
+                retryable: false,
+                ..
+            } => Some((*stage, ItemResult::Failed)),
+            _ => None,
+        }
+    }
+}
+
+/// Sees every event of the buses built with it, as they are published: nothing is
+/// ever skipped, however many come at once.
+///
+/// A swap point: the events sit below everything that counts them, so they
+/// cannot name the Prometheus metrics (`crate::metrics::Metrics`, the one
+/// implementation), and tests put their own recorder in its place.
+pub trait Observer: Send + Sync {
+    /// `event` was published on bus `bus`, an ID unique among the open buses.
+    fn event(&self, bus: usize, event: &Event);
+    /// Every handle of bus `bus` was dropped: nothing more comes from it, and a
+    /// later bus may get its ID.
+    fn closed(&self, bus: usize);
+}
+
 /// Broadcast channel of [`Event`]s. Publishing never blocks and never fails: events
-/// without subscribers are dropped, and a slow subscriber skips old events.
+/// without subscribers are dropped, and a slow subscriber skips old events. An
+/// [`Observer`] given at creation sees each event before the subscribers.
 #[derive(Debug, Clone)]
 pub struct EventBus {
     sender: broadcast::Sender<Event>,
+    /// Shared by the clones: the last one dropped tells the observer.
+    id: Arc<BusId>,
 }
 
 impl EventBus {
@@ -154,12 +245,24 @@ impl EventBus {
     /// subscriber that falls behind.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        let (sender, _) = broadcast::channel(capacity.max(1));
-        Self { sender }
+        Self::observed(capacity, None)
     }
 
-    /// Sends `event` to every current subscriber.
+    /// [`EventBus::with_capacity`], whose events `observer` also sees.
+    #[must_use]
+    pub fn observed(capacity: usize, observer: Option<Arc<dyn Observer>>) -> Self {
+        let (sender, _) = broadcast::channel(capacity.max(1));
+        Self {
+            sender,
+            id: Arc::new(BusId { observer }),
+        }
+    }
+
+    /// Sends `event` to the observer, then to every current subscriber.
     pub fn publish(&self, event: Event) {
+        if let Some(observer) = &self.id.observer {
+            observer.event(self.id.key(), &event);
+        }
         self.sender.send(event).ok();
     }
 
@@ -173,6 +276,33 @@ impl EventBus {
     #[cfg(test)]
     pub(crate) fn receiver_count(&self) -> usize {
         self.sender.receiver_count()
+    }
+}
+
+/// The identity of a bus and its clones: its address, while it lives.
+struct BusId {
+    observer: Option<Arc<dyn Observer>>,
+}
+
+impl BusId {
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+}
+
+impl fmt::Debug for BusId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BusId")
+            .field("observed", &self.observer.is_some())
+            .finish()
+    }
+}
+
+impl Drop for BusId {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.observer {
+            observer.closed(self.key());
+        }
     }
 }
 
@@ -206,6 +336,111 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    /// What an observer saw: `Ok` events and `Err` ends, by bus.
+    #[derive(Default)]
+    struct Seen(std::sync::Mutex<Vec<Result<(usize, Event), usize>>>);
+
+    impl Observer for Seen {
+        fn event(&self, bus: usize, event: &Event) {
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(Ok((bus, event.clone())));
+            }
+        }
+
+        fn closed(&self, bus: usize) {
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(Err(bus));
+            }
+        }
+    }
+
+    #[test]
+    fn an_observer_sees_every_event_of_its_buses_and_their_end() -> Result<(), String> {
+        let seen = Arc::new(Seen::default());
+        let observer: Arc<dyn Observer> = seen.clone();
+        let first = EventBus::observed(1, Some(Arc::clone(&observer)));
+        let second = EventBus::observed(1, Some(observer));
+        let clone = first.clone();
+        let (a, b) = (first.id.key(), second.id.key());
+        assert_ne!(a, b);
+        let started = |total| Event::StageStarted {
+            stage: Stage::Answers,
+            total,
+        };
+        // Far more than the channel keeps, with no subscriber at all.
+        for total in 0..3 {
+            clone.publish(started(total));
+        }
+        second.publish(started(9));
+        EventBus::new().publish(started(5));
+        drop(first);
+        drop(clone);
+        let seen = seen.0.lock().map_err(|e| e.to_string())?;
+        assert_eq!(
+            *seen,
+            [
+                Ok((a, started(0))),
+                Ok((a, started(1))),
+                Ok((a, started(2))),
+                Ok((b, started(9))),
+                Err(a),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn item_events_say_how_their_item_ended() {
+        let done = |usage| Event::ItemDone {
+            stage: Stage::Answers,
+            id: "a".into(),
+            usage,
+            cost: None,
+            excluded: false,
+        };
+        let failed = |retryable| Event::ItemFailed {
+            stage: Stage::Questions,
+            id: "q".into(),
+            error: "no".into(),
+            retryable,
+        };
+        assert_eq!(
+            done(Some(Usage::default())).item_result(),
+            Some((Stage::Answers, ItemResult::Done))
+        );
+        assert_eq!(
+            done(None).item_result(),
+            Some((Stage::Answers, ItemResult::Skipped))
+        );
+        assert_eq!(
+            failed(false).item_result(),
+            Some((Stage::Questions, ItemResult::Failed))
+        );
+        assert_eq!(
+            failed(true).item_result(),
+            None,
+            "a retried attempt ends nothing"
+        );
+        assert_eq!(
+            Event::StageStarted {
+                stage: Stage::Split,
+                total: 1
+            }
+            .item_result(),
+            None
+        );
+        assert_eq!(
+            [
+                ItemResult::Done,
+                ItemResult::Skipped,
+                ItemResult::Excluded,
+                ItemResult::Failed
+            ]
+            .map(ItemResult::name),
+            ["done", "skipped", "excluded", "failed"]
+        );
     }
 
     #[test]

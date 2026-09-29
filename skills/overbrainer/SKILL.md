@@ -37,6 +37,7 @@ The user copies `.env.example` to `.env` and fills in the provider URLs and keys
 - `[roles]`: `generator` writes subtopics and questions, `parent` answers them, optional `embedder` drops near-duplicate questions. Each is `{ provider = "...", model = "..." }`, and `reasoning = true` asks the parent for its reasoning.
 - `[pipeline]`: `concurrency`, `max_retries`, `dedup_threshold`, `eval_ratio`, `seed` and more.
 - `[training]` and `[targets.NAME]`: see "Train" below.
+- `[metrics]`: optional `listen = "127.0.0.1:9464"` serves Prometheus metrics at `/metrics` while a command that writes to the project runs.
 
 Any key can also be set as `OVERBRAINER_<PATH>` with `__` between levels. Then check it:
 

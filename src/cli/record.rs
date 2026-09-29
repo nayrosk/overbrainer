@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::RoleModel;
-use crate::events::{Event, EventBus, Stage, StageStats};
+use crate::events::{Event, EventBus, ItemResult, Stage, StageStats};
 use crate::history::{self, Entry, Span, SplitCounts, Status};
 use crate::pipeline::SplitReport;
 use crate::runs::rfc3339;
@@ -185,29 +185,24 @@ impl Drop for Tally {
 }
 
 fn count(counts: &Counts, event: &Event) {
+    let Some((stage, result)) = event.item_result() else {
+        return;
+    };
     let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);
-    match event {
-        Event::ItemDone {
-            stage, usage, cost, ..
-        } => {
-            let stats = counts.entry(*stage).or_default();
-            match usage {
-                Some(usage) => {
-                    stats.done += 1;
-                    stats.usage += *usage;
-                },
-                None => stats.skipped += 1,
-            }
-            if let Some(cost) = cost {
-                *stats.cost.get_or_insert(0.0) += cost;
-            }
-        },
-        Event::ItemFailed {
-            stage,
-            retryable: false,
-            ..
-        } => counts.entry(*stage).or_default().failed += 1,
-        _ => {},
+    let stats = counts.entry(stage).or_default();
+    match result {
+        ItemResult::Done => stats.done += 1,
+        ItemResult::Skipped => stats.skipped += 1,
+        ItemResult::Excluded => stats.excluded += 1,
+        ItemResult::Failed => stats.failed += 1,
+    }
+    if let Event::ItemDone { usage, cost, .. } = event {
+        if let Some(usage) = usage {
+            stats.usage += *usage;
+        }
+        if let Some(cost) = cost {
+            *stats.cost.get_or_insert(0.0) += cost;
+        }
     }
 }
 
@@ -228,6 +223,7 @@ mod tests {
             id: "x".into(),
             usage,
             cost,
+            excluded: false,
         }
     }
 
@@ -280,6 +276,35 @@ mod tests {
         );
         assert_eq!((entry.input_tokens, entry.output_tokens), (20, 10));
         assert_eq!(entry.cost, Some(0.75));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_stage_keeps_its_excluded_items() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let bus = EventBus::new();
+        let mut recorder = Recorder::new(dir.path(), &bus);
+        recorder.begin(Stage::Answers, None);
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+        };
+        for excluded in [false, true, true] {
+            bus.publish(Event::ItemDone {
+                stage: Stage::Answers,
+                id: "x".into(),
+                usage: Some(usage),
+                cost: None,
+                excluded,
+            });
+        }
+        recorder.interrupted().await;
+        let entries = history::read(dir.path())?;
+        let [entry] = entries.as_slice() else {
+            return Err(format!("expected one entry, got {entries:?}").into());
+        };
+        assert_eq!((entry.done, entry.excluded), (1, 2));
+        assert_eq!(entry.input_tokens, 30, "an excluded answer still spent");
         Ok(())
     }
 

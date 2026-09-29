@@ -16,6 +16,7 @@ pub(crate) mod train;
 
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use clap::{Args, Parser, Subcommand, ValueHint};
@@ -27,7 +28,9 @@ use tokio::task::JoinHandle;
 use self::front::Frontend;
 use self::reload::Reloader;
 use crate::config::{DotenvKeys, EnvSource, Source};
+use crate::events::Observer;
 use crate::logging::{LOG_LINES, LogBuffer, LogMode};
+use crate::metrics::{Metrics, MetricsServer};
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
 use crate::update::{self, CheckEnv, Newer};
 
@@ -358,36 +361,46 @@ async fn dispatch(
     let dir = &cli.project_dir;
     // Only a project takes the lock: without `overbrainer.toml` the command fails
     // with its usual error and leaves nothing behind.
-    let _lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
+    let lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
         Some(crate::project_lock::ProjectLock::acquire(dir)?)
     } else {
         None
     };
+    // Served while the lock is held: dropped before it.
+    let served = match &lock {
+        Some(_) => serve_metrics(dir).await,
+        None => None,
+    };
+    // The buses of the command count into the served metrics, if any.
+    let observer = served
+        .as_ref()
+        .map(|(_, metrics)| Arc::clone(metrics) as Arc<dyn Observer>);
+    let front = Frontend::Cli(observer.clone());
     match cli.command {
         Command::Init { dir: target } => init::run(target.as_deref().unwrap_or(dir)),
         Command::Config {
             command: ConfigCommand::Check { resolve },
         } => config_check::run(dir, resolve).await,
-        Command::Subtopics(args) => stage(dir, data::Command::Subtopics, &args).await,
-        Command::Questions(args) => stage(dir, data::Command::Questions, &args).await,
-        Command::Answers(args) => stage(dir, data::Command::Answers, &args).await,
+        Command::Subtopics(args) => stage(dir, &front, data::Command::Subtopics, &args).await,
+        Command::Questions(args) => stage(dir, &front, data::Command::Questions, &args).await,
+        Command::Answers(args) => stage(dir, &front, data::Command::Answers, &args).await,
         Command::Split(SplitArgs { topic }) => {
             let args = StageArgs {
                 topic,
                 force: false,
             };
-            stage(dir, data::Command::Split, &args).await
+            stage(dir, &front, data::Command::Split, &args).await
         },
         Command::Run => {
             let mut reloader = Reloader::new(dir, dotenv);
             let args = StageArgs::default();
             let load = data::Load::Reload(&mut reloader);
-            data::run(dir, data::Command::Run, &args, &Frontend::Cli, load).await?;
-            train::after_run(dir, &Frontend::Cli, &mut reloader).await
+            data::run(dir, data::Command::Run, &args, &front, load).await?;
+            train::after_run(dir, &front, &mut reloader).await
         },
         Command::Train(args) => {
             let source = Source::from(EnvSource::Process);
-            train::run(dir, &args, &Frontend::Cli, &source).await
+            train::run(dir, &args, &front, &source).await
         },
         Command::Runs {
             command: RunsCommand::Ls,
@@ -396,16 +409,51 @@ async fn dispatch(
         Command::Pod { command } => pod::run(dir, &command).await,
         Command::Skill { command } => skill::run(dir, &command),
         Command::Tui => match logs {
-            LogMode::Tui(buffer) => crate::tui::run(dir, buffer, check.take(), dotenv).await,
+            LogMode::Tui(buffer) => {
+                crate::tui::run(dir, buffer, check.take(), dotenv, observer).await
+            },
             LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),
         },
     }
 }
 
-/// Runs a pipeline command on the command line.
-async fn stage(dir: &Path, command: data::Command, args: &StageArgs) -> anyhow::Result<()> {
+/// Runs a pipeline command on the command line, through `front`.
+async fn stage(
+    dir: &Path,
+    front: &Frontend,
+    command: data::Command,
+    args: &StageArgs,
+) -> anyhow::Result<()> {
     let load = data::Load::Source(&Source::from(EnvSource::Process));
-    data::run(dir, command, args, &Frontend::Cli, load).await
+    data::run(dir, command, args, front, load).await
+}
+
+/// Serves the Prometheus metrics of the project in `dir` when `metrics.listen` is
+/// set, with the metrics it serves. Nothing here fails the command: a
+/// configuration error is the command's to report, and an address that cannot be
+/// bound only warns.
+async fn serve_metrics(dir: &Path) -> Option<(MetricsServer, Arc<Metrics>)> {
+    let settings = crate::config::load(dir, EnvSource::Process).ok()?;
+    let address = settings.metrics.listen?;
+    if !address.ip().is_loopback() {
+        tracing::warn!("metrics on {address} have no authentication");
+    }
+    let metrics = Arc::new(project_metrics(dir));
+    crate::metrics::serve(address, Arc::clone(&metrics))
+        .await
+        .inspect(|server| tracing::info!("metrics at http://{}/metrics", server.address()))
+        .inspect_err(|error| tracing::warn!("cannot serve the metrics on {address}: {error}"))
+        .ok()
+        .map(|server| (server, metrics))
+}
+
+/// The metrics of the project in `dir`, from its stage history and its runs.
+fn project_metrics(dir: &Path) -> Metrics {
+    let history = crate::history::read(dir).unwrap_or_else(|error| {
+        tracing::warn!("cannot read the stage history, the metrics start from zero: {error}");
+        Vec::new()
+    });
+    Metrics::new(&history).with_runs(crate::runs::Runs::new(dir))
 }
 
 /// Secret resolver from `VAULT_ADDR`, `VAULT_TOKEN` and `~/.vault-token`. Vault is

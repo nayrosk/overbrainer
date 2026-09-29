@@ -56,6 +56,10 @@ pub async fn subtopics<C: LlmClient>(
         stage: Stage::Subtopics,
         total: topics.len(),
     });
+    ctx.bus.publish(Event::StageModel {
+        stage: Stage::Subtopics,
+        model: generator.model.model.clone(),
+    });
     let mut stats = StageStats::default();
     for topic in topics {
         let have = stored_count(&existing, &topic.name);
@@ -67,6 +71,7 @@ pub async fn subtopics<C: LlmClient>(
                 id: topic.name.clone(),
                 usage: None,
                 cost: None,
+                excluded: false,
             });
             continue;
         }
@@ -95,6 +100,7 @@ pub async fn subtopics<C: LlmClient>(
                     id: plan.item.id,
                     usage: Some(usage),
                     cost: generator.price.as_ref().map(|price| price.cost(usage)),
+                    excluded: false,
                 });
             },
             Err(PipelineError::Llm { source, .. }) => {

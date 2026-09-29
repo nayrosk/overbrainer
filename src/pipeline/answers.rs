@@ -67,6 +67,10 @@ pub async fn answers<C: LlmClient + 'static>(
         stage: Stage::Answers,
         total: selected.len(),
     });
+    ctx.bus.publish(Event::StageModel {
+        stage: Stage::Answers,
+        model: parent.model.model.clone(),
+    });
     for question in &selected {
         if answered.contains(&question.id) {
             ctx.bus.publish(Event::ItemDone {
@@ -74,6 +78,7 @@ pub async fn answers<C: LlmClient + 'static>(
                 id: question.id.to_string(),
                 usage: None,
                 cost: None,
+                excluded: false,
             });
         }
     }
@@ -315,6 +320,7 @@ fn record<C: LlmClient>(
         id: example.id.to_string(),
         usage: Some(usage),
         cost: parent.price.as_ref().map(|price| price.cost(usage)),
+        excluded: example.meta.excluded.is_some(),
     });
 }
 

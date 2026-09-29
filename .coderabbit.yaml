@@ -37,7 +37,7 @@ reviews:
         - Secrets are secrecy::SecretString and never reach stdout, stderr, logs, Debug or error messages
         - stdout only carries command output; logs and errors go to stderr
         - Every public item is documented; public functions returning Result have an "# Errors" section
-        - Traits only at swap points (LlmClient, SecretSource, Deduplicator, Trainer, Executor); flag overengineering
+        - Traits only at swap points (LlmClient, SecretSource, Deduplicator, Trainer, Executor, Observer); flag overengineering
         - Functions limited to 5 parameters
         - Code and comments in English only, no emoji, no em dashes
         - Prefer borrowing over ownership

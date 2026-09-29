@@ -131,6 +131,37 @@ Retries wait with exponential backoff and jitter, or as long as the provider's `
 
 The `[training]` section and the `[targets.*]` tables are described in [Training](training.md) and [Runpod](runpod.md). A Runpod target's `gpu_types` and `data_center_ids` take a TOML array, or `"auto"`; from the environment, a comma-separated value or `auto`, for example `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. `min_vram_gb` and `max_price_per_hour` narrow an `auto` choice of GPU types and are rejected otherwise; see [Runpod](runpod.md) for every field.
 
+## Metrics
+
+`[metrics]` turns on a Prometheus endpoint. It is off unless `listen` is set:
+
+```toml
+[metrics]
+listen = "127.0.0.1:9464"
+```
+
+or `OVERBRAINER_METRICS__LISTEN=127.0.0.1:9464`. `listen` is an IP address and a port (`[::1]:9464` for IPv6); a host name is refused. Port `0` takes a free port, which the log line `metrics at http://ADDRESS/metrics` names.
+
+The endpoint serves only while a command holds the project: the stage commands, `run`, `train` and its subcommands, `pod rm` and `tui`, for as long as they run. The read-only commands (`history`, `runs ls`, `pod ls`, `config check`) serve nothing. `GET /metrics` answers in the OpenMetrics text format (`application/openmetrics-text; version=1.0.0`); any other path or method gets a 404. The endpoint has no authentication, so keep it on a loopback address: any other address logs a warning. When the address cannot be bound (a port already in use), the command logs a warning and goes on without metrics.
+
+The counters are cumulative per project: they start from `.overbrainer/history.jsonl` (see [Project state](pipeline.md#project-state)), then follow the running command. `overbrainer_item_retries_total` is not in the history, so it restarts at zero with each command. The training gauges show the runs followed by the current command; the Runpod spend is read from every run's pod record at each scrape.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `overbrainer_stage_items_total` | counter | `stage`, `result` | Items by result: `done`, `skipped`, `failed`, `excluded`. |
+| `overbrainer_tokens_total` | counter | `stage`, `model`, `direction` | Tokens sent (`in`) and received (`out`), retries included. |
+| `overbrainer_cost_usd_total` | counter | `stage`, `model` | Cost in USD; an item whose price is unknown adds nothing. |
+| `overbrainer_stage_running` | gauge | `stage` | Stages running now. |
+| `overbrainer_item_retries_total` | counter | `stage` | Failed attempts retried, since the command started. |
+| `overbrainer_train_step` | gauge | `run_id` | Last optimizer step of a run. |
+| `overbrainer_train_loss` | gauge | `run_id` | Last training loss. |
+| `overbrainer_eval_loss` | gauge | `run_id` | Last evaluation loss. |
+| `overbrainer_learning_rate` | gauge | `run_id` | Last learning rate. |
+| `overbrainer_runpod_spend_usd` | gauge | `run_id` | Estimated Runpod spend: the pod's rate times its uptime, final once deleted. |
+| `overbrainer_build_info` | gauge | `version` | Always 1. |
+
+Labels only ever hold stage names, model names, run IDs and the version: never a prompt, an answer or a secret.
+
 ## Secrets and Vault
 
 Any secret value can be a literal or a reference to a Vault or OpenBao KV v2 secret, written `vault:<mount>/<path>#<field>`:

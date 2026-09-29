@@ -211,6 +211,7 @@ impl PipelineView {
                 id,
                 usage,
                 cost,
+                ..
             } => {
                 let row = &mut self.rows[index(*stage)];
                 row.finished = (row.finished + 1).min(row.total);
@@ -341,6 +342,7 @@ mod tests {
                 output_tokens,
             }),
             cost: None,
+            excluded: false,
         }
     }
 
@@ -363,6 +365,7 @@ mod tests {
             id: id.into(),
             usage: None,
             cost: None,
+            excluded: false,
         }
     }
 
@@ -592,6 +595,7 @@ mod tests {
                 id: "y".into(),
                 usage: None,
                 cost: Some(cost),
+                excluded: false,
             });
         }
         assert_eq!(view.row(Stage::Answers).cost, Some(0.75));

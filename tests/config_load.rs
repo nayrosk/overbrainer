@@ -767,3 +767,34 @@ fn only_lower_case_auto_is_auto() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+#[test]
+fn metrics_listen_comes_from_the_file_or_env() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(BASE)?;
+    assert_eq!(load(dir.path(), env(&[]))?.metrics.listen, None);
+    let dir = project(&format!("{BASE}\n[metrics]\nlisten = \"127.0.0.1:9464\"\n"))?;
+    let settings = load(dir.path(), env(&[]))?;
+    assert_eq!(settings.metrics.listen, Some("127.0.0.1:9464".parse()?));
+    let dir = project(BASE)?;
+    let settings = load(
+        dir.path(),
+        env(&[("OVERBRAINER_METRICS__LISTEN", "[::1]:9000")]),
+    )?;
+    assert_eq!(settings.metrics.listen, Some("[::1]:9000".parse()?));
+    Ok(())
+}
+
+#[test]
+fn an_invalid_metrics_address_is_refused_with_its_path() -> Result<(), Box<dyn std::error::Error>> {
+    for (file, vars) in [
+        ("\n[metrics]\nlisten = \"localhost\"\n", &[][..]),
+        ("", &[("OVERBRAINER_METRICS__LISTEN", "9464")][..]),
+    ] {
+        let dir = project(&format!("{BASE}{file}"))?;
+        let error = load(dir.path(), env(vars))
+            .err()
+            .ok_or("an invalid address was accepted")?;
+        assert!(error.to_string().contains("metrics.listen"), "{error}");
+    }
+    Ok(())
+}

@@ -630,6 +630,7 @@ mod tests {
                 id: format!("item{n}"),
                 usage: None,
                 cost: None,
+                excluded: false,
             });
         }
     }

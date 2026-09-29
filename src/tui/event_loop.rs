@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
@@ -26,6 +27,7 @@ use super::app::{App, Effect, Exit};
 use super::tasks::{Done, Msg, Task, TaskId, Tasks, TrainJob};
 use super::terminal::Screen;
 use super::ui;
+use crate::events::Observer;
 use crate::update::Newer;
 
 /// Time between two ticks of the app's clock.
@@ -41,6 +43,8 @@ pub(super) struct Real {
     signals: Signals,
     screen: Screen,
     check: Option<JoinHandle<Option<Newer>>>,
+    /// Sees the events of the tasks: the metrics, when served.
+    observer: Option<Arc<dyn Observer>>,
 }
 
 /// Runs the TUI on the real terminal until the app is done.
@@ -54,6 +58,7 @@ pub(super) async fn run(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     check: Option<JoinHandle<Option<Newer>>>,
+    observer: Option<Arc<dyn Observer>>,
 ) -> anyhow::Result<()> {
     let signals = Signals::new().context("cannot catch the process signals")?;
     let (events, input) = mpsc::unbounded_channel();
@@ -61,6 +66,7 @@ pub(super) async fn run(
         signals,
         screen: Screen::start(events),
         check,
+        observer,
     };
     drive(terminal, app, input, Some(real)).await
 }
@@ -89,6 +95,7 @@ where
     if let Some(real) = real {
         looping.signals = Some(real.signals);
         looping.screen = Some(real.screen);
+        looping.tasks.observe(real.observer);
         if let Some(check) = real.check {
             tokio::spawn(forward_check(check, looping.messages.clone()));
         }
@@ -1871,6 +1878,7 @@ mod tests {
                         id: format!("{burst}-{n}"),
                         usage: None,
                         cost: None,
+                        excluded: false,
                     });
                 }
                 while received.get() < 1 + (burst + 1) * 20_000 {

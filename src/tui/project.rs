@@ -422,6 +422,17 @@ pub(super) fn rows(config: &ProjectConfig, pending: Option<&Pending>, locks: &Lo
         lock: None,
     });
     training_and_targets(&mut rows, settings, locks);
+    rows.heading("metrics");
+    rows.fields(&Table {
+        section: Section::Metrics,
+        path: &|field| FieldPath::Metrics(field),
+        value: &|field| {
+            (field == "listen")
+                .then(|| settings.metrics.listen.map(|address| address.to_string()))
+                .flatten()
+        },
+        lock: None,
+    });
     rows.heading("runpod");
     rows.secret(
         ("runpod", "api_key", "Runpod API key"),
@@ -1211,6 +1222,7 @@ mod tests {
                 "pipeline",
                 "training",
                 "targets.gpu_cloud (runpod)",
+                "metrics",
                 "runpod",
                 "other",
             ]
