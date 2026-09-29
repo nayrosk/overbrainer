@@ -84,6 +84,9 @@ max_hours = 6                # the pod watchdog deletes the pod after this, what
 # kind = "ssh"                 # host comes from OVERBRAINER_TARGETS__HOMELAB__HOST
 # runtime = "docker"
 # workdir = "overbrainer"      # on the remote machine, relative to its home directory
+
+# [metrics]
+# listen = "127.0.0.1:9464"    # serve Prometheus metrics at /metrics while a command holds the project; no authentication
 --- .env
 # Written by the overbrainer init wizard: never commit it.
 # Values may be literals or Vault references: vault:<mount>/<path>#<field>
