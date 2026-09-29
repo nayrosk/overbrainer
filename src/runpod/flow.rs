@@ -226,17 +226,21 @@ impl Lessee for SshExecutor {
 }
 
 impl Lessee for LocalExecutor {
-    async fn touch(&self, path: &str) -> Result<(), ExecError> {
-        let path = Path::new(path);
-        let io = |source| ExecError::Io {
-            path: path.to_path_buf(),
-            source,
-        };
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).map_err(io)?;
-        }
-        fs::write(path, b"").map_err(io)
+    fn touch(&self, path: &str) -> impl Future<Output = Result<(), ExecError>> + Send {
+        std::future::ready(touch_local(Path::new(path)))
     }
+}
+
+/// Creates or rewrites the empty file `path`, with its directory.
+fn touch_local(path: &Path) -> Result<(), ExecError> {
+    let io = |source| ExecError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(io)?;
+    }
+    fs::write(path, b"").map_err(io)
 }
 
 /// [`watch_on_pod`] for a client that stays with the job: while the job keeps
