@@ -190,11 +190,18 @@ pub(crate) fn replace_state_file(project_dir: &Path, name: &str, content: &[u8])
     let dir_path = project_dir.join(STATE_DIR);
     let state = open_state_dir(&project).map_err(|e| unsafe_or_io_error(&dir_path, e))?;
     let tmp = format!("{name}.tmp");
+    // A stale temporary goes first, unwritten: it may be a hard link to a file
+    // this must not truncate. The new one is then created, never opened.
+    match rustix::fs::unlinkat(&state, tmp.as_str(), AtFlags::empty()) {
+        Ok(()) => {},
+        Err(e) if e == Errno::NOENT => {},
+        Err(e) => return Err(unsafe_or_io_error(&dir_path.join(&tmp), e)),
+    }
     let mut file = open_in_state(
         &state,
         &dir_path,
         &tmp,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
     )?;
     file.write_all(content)?;
     file.sync_all()?;
@@ -493,6 +500,21 @@ mod tests {
         replace_state_file(dir.path(), "version", b"1\n")?;
         assert_eq!(std::fs::read_to_string(&target)?, "keep me");
         assert!(!std::fs::symlink_metadata(&file)?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    fn replace_state_file_never_writes_through_a_hard_linked_stale_temporary() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("precious");
+        std::fs::write(&target, "keep me")?;
+        std::fs::create_dir(dir.path().join(STATE_DIR))?;
+        let state = dir.path().join(STATE_DIR);
+        std::fs::hard_link(&target, state.join("version.tmp"))?;
+        replace_state_file(dir.path(), "version", b"1\n")?;
+        assert_eq!(std::fs::read_to_string(&target)?, "keep me");
+        assert_eq!(std::fs::read_to_string(state.join("version"))?, "1\n");
+        assert!(!state.join("version.tmp").exists());
         Ok(())
     }
 
