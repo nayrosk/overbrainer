@@ -44,6 +44,11 @@ Type "]" Sleep 1.5s
 Type "]" Sleep 2s
 Type "[" Sleep 1.2s
 
+# A dialog on the selected question, answered with its default: nothing is
+# deleted.
+Type "d" Sleep 2.5s
+Type "n" Sleep 1.2s
+
 # Filter the tree, keep it, then clear it.
 Type "/" Sleep 400ms
 Type "borrow" Sleep 600ms
@@ -54,16 +59,6 @@ Escape Sleep 1s
 Type "?" Sleep 3.5s
 Escape Sleep 1s
 
-# A dialog on the selected question, answered with its default: nothing is
-# deleted.
-Type "d" Sleep 2.5s
-Type "n" Sleep 1.2s
-
-# Training: the succeeded run and its loss chart.
-Type "4" Sleep 1.5s
-Type "j" Sleep 500ms
-Type "j" Sleep 4.5s
-
-# Logs; the footer's version and live cost have been visible throughout.
-Type "5" Sleep 1.5s
-Sleep 4s
+# Training: the latest run, listed first and selected, with its 48-step loss
+# chart. The footer's version and live cost have been visible throughout.
+Type "4" Sleep 9s
