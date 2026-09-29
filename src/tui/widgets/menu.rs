@@ -7,7 +7,6 @@ use ratatui::widgets::{Padding, Row, Table, TableState};
 
 use super::{centered, overlay};
 use crate::tui::app::MENU;
-use crate::tui::pipeline::command_name;
 use crate::tui::theme::Theme;
 
 /// Width of the menu, borders included.
@@ -23,9 +22,9 @@ pub(in crate::tui) fn render(
 ) -> Rect {
     let rows: Vec<Row> = MENU
         .iter()
-        .map(|(command, what)| {
+        .map(|(entry, what)| {
             Row::new(vec![
-                Span::styled(command_name(*command), theme.key),
+                Span::styled(entry.name(), theme.key),
                 Span::raw(*what),
             ])
         })

@@ -654,6 +654,9 @@ if [ "$1" = train ]; then
   printf '{"event": "log", "time": 2, "step": 1, "epoch": 1.0, "max_steps": 1, "loss": 0.75}\n' >> "$OVERBRAINER_METRICS"
   mkdir -p output && echo adapter > output/adapter_model.safetensors
 fi
+if [ "$1" = merge-lora ]; then
+  mkdir -p output/merged && echo merged > output/merged/model.safetensors
+fi
 "#;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -685,7 +688,40 @@ async fn run_trains_after_split_when_training_is_configured() -> TestResult {
         .stdout(predicate::str::contains("split: 3 train, 1 eval"))
         .stdout(predicate::str::contains(
             "succeeded; step 1/1, epoch 1.00, loss 0.7500; output in runs/",
-        ));
+        ))
+        .stdout(predicate::str::is_match(
+            r"\ntrain: adapter in runs/[0-9a-f-]+/output\n",
+        )?)
+        .stdout(predicate::str::contains("merged model").not());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_prints_the_merged_model_when_merge_is_set() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = provider().await;
+    let dir = project()?;
+    let venv = dir.path().join("venv");
+    std::fs::create_dir_all(venv.join("bin"))?;
+    std::fs::write(venv.join("bin/axolotl"), FAKE_AXOLOTL)?;
+    std::fs::set_permissions(
+        venv.join("bin/axolotl"),
+        std::fs::Permissions::from_mode(0o755),
+    )?;
+    let config = format!(
+        "{PROJECT}\n[training]\ntarget = \"here\"\nbase_model = \"Qwen/Qwen3-4B\"\nadapter = \"lora\"\nmerge = true\n\n[targets.here]\nkind = \"local\"\nruntime = \"native\"\nvenv = \"{}\"\n",
+        venv.display()
+    );
+    std::fs::write(dir.path().join("overbrainer.toml"), config)?;
+    overbrainer(dir.path(), &server)?
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(
+            r"\ntrain: adapter in runs/[0-9a-f-]+/output\ntrain: merged model in runs/[0-9a-f-]+/output/merged\n",
+        )?);
     Ok(())
 }
 

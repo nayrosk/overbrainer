@@ -95,7 +95,9 @@ overbrainer history         # what each stage did and spent
 overbrainer tui             # browse the dataset and follow the runs
 ```
 
-`init` writes `overbrainer.toml`, `.env.example`, the prompt templates in `prompts/` and a `.gitignore`. Edit the topics in `overbrainer.toml` before `run`. `run` trains only when `overbrainer.toml` has a `[training]` section; otherwise it stops after `split`. Each stage also runs on its own (`subtopics`, `questions`, `answers`, `split`, `train`) and resumes where it stopped: see [the dataset pipeline](docs/pipeline.md). Only one overbrainer process writes to a project at a time; a second one fails at once, naming the first one's PID. Changes to `overbrainer.toml` and `.env` apply without a restart: the TUI reloads them within 2 seconds, and `run` between stages (see [reloading](docs/configuration.md#reloading-while-overbrainer-runs)).
+Or let the TUI ask: `overbrainer tui` in an empty directory opens a wizard that asks for the provider, its key, the models, the topics and where to train, writes `overbrainer.toml`, `.env` (mode 600), `.env.example`, `prompts/` and `.gitignore`, then offers to start auto mode, which runs every stage then training after one confirmation. See [the TUI page](docs/tui.md#the-init-wizard).
+
+`init` writes `overbrainer.toml`, `.env.example`, the prompt templates in `prompts/` and a `.gitignore`. Edit the topics in `overbrainer.toml` before `run`. `run` trains only when `overbrainer.toml` has a `[training]` section; otherwise it stops after `split`. After training, it prints where the adapter is, and the merged model with `merge = true`. Each stage also runs on its own (`subtopics`, `questions`, `answers`, `split`, `train`) and resumes where it stopped: see [the dataset pipeline](docs/pipeline.md). Only one overbrainer process writes to a project at a time; a second one fails at once, naming the first one's PID. Changes to `overbrainer.toml` and `.env` apply without a restart: the TUI reloads them within 2 seconds, and `run` between stages (see [reloading](docs/configuration.md#reloading-while-overbrainer-runs)).
 
 ## Providers
 
@@ -134,11 +136,11 @@ Runpod: [runpod.io](https://runpod.io?ref=ym24z23f) (referral link). A run's LoR
 
 ## Terminal UI
 
-`overbrainer tui` has five views, and opens on Project:
+`overbrainer tui` has five views, and opens on Project (in a directory without `overbrainer.toml`, on the init wizard first):
 
 - Project (`1`): the effective configuration by section, with env-set and secret values marked, next to the project's stats. Edit a field, add or delete a topic, provider or target, and save to `overbrainer.toml` with its comments kept.
 - Dataset (`2`): the topics, subtopics and questions as a tree, with a question's answer, reasoning, stats and a filter in a detail pane. Edit or delete a question, its answer or a subtopic in place.
-- Pipeline (`3`): run a stage and watch its progress, tokens and cost, live as it runs.
+- Pipeline (`3`): run a stage, or auto mode (every stage then training, `A`), and watch its progress, tokens and cost, live as it runs.
 - Training (`4`): the runs, with progress, pod, spend, a loss chart and learning rate and gradient norm sparklines. Start, follow or cancel a run.
 - Logs (`5`): the captured log lines, filtered by level, exportable to a file.
 
@@ -153,7 +155,8 @@ Runpod: [runpod.io](https://runpod.io?ref=ym24z23f) (referral link). A run's LoR
 | `E`, `D` | Edit or delete only a question's answer; in Project, `E` opens `overbrainer.toml` in `$EDITOR`. |
 | `a` | Attach to a training run; in Project, add a topic, a provider or a target. |
 | `u` | In Project, drop the pending changes (asks first). |
-| `r` | Run a pipeline stage. |
+| `r` | Run auto mode or a pipeline stage. |
+| `A` | Auto mode: every stage, then training (asks first). |
 | `t`, `c` | Start, or cancel a training run. |
 | `x` | Export the Logs view to a file. |
 | `R` | Reload from disk. |

@@ -15,7 +15,7 @@
 
 ## Runs
 
-A run gets an ID such as `20260922-143005-a1b2` and a directory `runs/<run-id>/`. It holds `axolotl.yaml`, copies of the train and eval files, the metrics plugin and `run.json` (target, job, state). Once the job has ended, it also holds `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. Intermediate `checkpoint-*` directories stay on the target.
+A run gets an ID such as `20260922-143005-a1b2` and a directory `runs/<run-id>/`. It holds `axolotl.yaml`, copies of the train and eval files, the metrics plugin and `run.json` (target, job, state). Once the job has ended, it also holds `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. After a run that succeeded, `train`, `train attach` and `run` print these paths (`train: adapter in runs/<run-id>/output`, then `train: merged model in runs/<run-id>/output/merged`). Intermediate `checkpoint-*` directories stay on the target.
 
 The job runs detached from overbrainer. Once it has started, Ctrl-C, a closed terminal or a lost SSH connection stop overbrainer from following it; the training goes on. Starting a run is never interrupted: a Ctrl-C pressed while a run is starting is only acted on once the job has actually started, so the command always finishes starting before it detaches. After Ctrl-C, overbrainer prints the `overbrainer train attach` command that follows the run again and exits with an error status. It does the same after six failed attempts in a row to reach the target.
 

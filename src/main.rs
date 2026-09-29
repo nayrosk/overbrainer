@@ -17,7 +17,19 @@ fn main() -> ExitCode {
         .shells(Shells(&[&Bash, &Zsh, &Fish]))
         .complete();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // `tui` in a directory without overbrainer.toml opens the init wizard
+    // first, which may write .env: before it is loaded, while this is the only
+    // thread (the wizard starts none).
+    match cli::wizard(&mut cli) {
+        Ok(true) => {},
+        Ok(false) => return ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            return ExitCode::FAILURE;
+        },
+    }
 
     // Load .env before any thread exists: dotenvy writes to the process environment.
     // A missing .env is normal; any other error is reported. `skill` needs no

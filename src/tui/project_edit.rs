@@ -1785,7 +1785,10 @@ mod tests {
             &[KeyCode::Tab, KeyCode::BackTab, KeyCode::Char('1')],
         );
         assert_eq!(field(&mut app, "project.name")?.shown.text(), "rust_pro");
-        let effects = press(&mut app, &[KeyCode::Char('r'), KeyCode::Enter]);
+        let effects = press(
+            &mut app,
+            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
+        );
         assert!(!effects.is_empty(), "a stage starts");
         assert_eq!(app.view, View::Pipeline);
         assert!(app.project_view.pending.is_some(), "kept");

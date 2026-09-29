@@ -17,7 +17,7 @@ use crate::runpod::{PodRecord, RunpodTarget};
 use crate::runs::{
     Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, cancel, create, start, watch,
 };
-use crate::train::{Axolotl, OUTPUT_DIR, reasoning_template_warning};
+use crate::train::{Axolotl, OUTPUT_DIR, Outputs, reasoning_template_warning};
 
 /// Time between two looks at a running job.
 pub(super) const POLL: Duration = Duration::from_secs(2);
@@ -358,8 +358,10 @@ async fn run_executor(
     executor(project_dir, &record.target, target).await
 }
 
-/// Emits the outcome through `front` (stdout on the command line), or explains how
-/// to follow an interrupted run.
+/// Emits the outcome through `front` (stdout on the command line), then, for a
+/// run that succeeded, where its model is, read from the run's own files (the
+/// settings may have changed since it started; nothing is said when they
+/// cannot be read); or explains how to follow an interrupted run.
 pub(super) fn finish(
     runs: &Runs,
     id: &str,
@@ -382,7 +384,16 @@ pub(super) fn finish(
         outcome.summary.describe()
     ));
     match record.state {
-        RunState::Succeeded => Ok(()),
+        RunState::Succeeded => {
+            let outputs = runs
+                .run_dir(&record.id)
+                .ok()
+                .and_then(|dir| Outputs::recorded(&dir));
+            for (what, path) in outputs.map(|o| o.paths(&record.id)).unwrap_or_default() {
+                front.line(&format!("train: {what} in {path}"));
+            }
+            Ok(())
+        },
         RunState::Cancelled => bail!("run {} was cancelled", record.id),
         _ => bail!(
             "{}",

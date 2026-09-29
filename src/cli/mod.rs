@@ -5,7 +5,7 @@ mod config_check;
 pub(crate) mod data;
 pub(crate) mod front;
 mod history;
-mod init;
+pub(crate) mod init;
 pub(crate) mod pod;
 mod progress;
 mod record;
@@ -48,6 +48,11 @@ pub struct Cli {
     /// The subcommand to run.
     #[command(subcommand)]
     pub command: Command,
+
+    /// Whether `tui` starts in auto mode: set by the init wizard, never
+    /// parsed.
+    #[arg(skip)]
+    pub auto: bool,
 }
 
 /// Top-level subcommands.
@@ -294,6 +299,52 @@ pub enum ConfigCommand {
     },
 }
 
+/// Runs the init wizard when `cli` is `tui` on a terminal and the project
+/// has no `overbrainer.toml`, before anything else: `.env` is loaded after
+/// it, which it may write, and the project lock is taken once the files
+/// exist. Returns whether the command goes on: not when the wizard was quit.
+///
+/// # Errors
+///
+/// Returns an error when the wizard cannot use the terminal.
+pub fn wizard(cli: &mut Cli) -> anyhow::Result<bool> {
+    if !wants_wizard(cli, std::io::stdout().is_terminal()) {
+        return Ok(true);
+    }
+    // Refused before the first screen, not after the seventh.
+    if let Some(refusal) = crate::tui::wizard_refusal(&cli.project_dir) {
+        anyhow::bail!(refusal);
+    }
+    match crate::tui::wizard(&cli.project_dir)? {
+        crate::tui::WizardEnded::Open { auto } => {
+            cli.auto = auto;
+            Ok(true)
+        },
+        crate::tui::WizardEnded::Quit { written: false } => {
+            eprintln!("init wizard quit: nothing was written");
+            Ok(false)
+        },
+        crate::tui::WizardEnded::Quit { written: true } => {
+            eprintln!("the project is written: `overbrainer tui` opens it");
+            Ok(false)
+        },
+    }
+}
+
+/// Whether `cli` opens the init wizard: `tui`, on a terminal, in a project
+/// directory that exists and has no `overbrainer.toml`. A missing directory
+/// fails as it did, never created.
+fn wants_wizard(cli: &Cli, stdout_is_terminal: bool) -> bool {
+    matches!(cli.command, Command::Tui)
+        && stdout_is_terminal
+        && cli.project_dir.is_dir()
+        && cli
+            .project_dir
+            .join(crate::config::CONFIG_FILE)
+            .symlink_metadata()
+            .is_err()
+}
+
 /// Runs the parsed command line, whose logs were set up with `logs` (see
 /// [`Command::log_mode`]); `dotenv` are the keys `.env` set at start, which a
 /// reload of the configuration replaces (`tui`, and `run` between stages). Meanwhile it looks for a newer release, told on
@@ -359,6 +410,7 @@ async fn dispatch(
     dotenv: DotenvKeys,
 ) -> anyhow::Result<()> {
     let dir = &cli.project_dir;
+    let auto = cli.auto;
     // Only a project takes the lock: without `overbrainer.toml` the command fails
     // with its usual error and leaves nothing behind.
     let lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
@@ -410,7 +462,8 @@ async fn dispatch(
         Command::Skill { command } => skill::run(dir, &command),
         Command::Tui => match logs {
             LogMode::Tui(buffer) => {
-                crate::tui::run(dir, buffer, check.take(), dotenv, observer).await
+                let start = crate::tui::Start { dotenv, auto };
+                crate::tui::run(dir, buffer, check.take(), start, observer).await
             },
             LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),
         },
@@ -548,6 +601,38 @@ mod tests {
         let answer = newer.clone();
         let check = tokio::spawn(async move { Some(answer) });
         assert_eq!(settle(check).await, Some(newer));
+    }
+
+    #[test]
+    fn the_wizard_opens_only_for_tui_in_an_existing_directory_without_a_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().to_string_lossy().into_owned();
+        let missing = dir.path().join("missing").to_string_lossy().into_owned();
+        let cli = |args: &[&str]| Cli::try_parse_from(args);
+        assert!(wants_wizard(
+            &cli(&["overbrainer", "-C", &path, "tui"])?,
+            true
+        ));
+        assert!(!wants_wizard(
+            &cli(&["overbrainer", "-C", &path, "tui"])?,
+            false
+        ));
+        assert!(!wants_wizard(
+            &cli(&["overbrainer", "-C", &path, "run"])?,
+            true
+        ));
+        assert!(!wants_wizard(
+            &cli(&["overbrainer", "-C", &missing, "tui"])?,
+            true
+        ));
+        assert!(!dir.path().join("missing").exists());
+        std::fs::write(dir.path().join(crate::config::CONFIG_FILE), "")?;
+        assert!(!wants_wizard(
+            &cli(&["overbrainer", "-C", &path, "tui"])?,
+            true
+        ));
+        Ok(())
     }
 
     #[test]
