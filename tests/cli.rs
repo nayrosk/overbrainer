@@ -71,6 +71,24 @@ fn config_check_masks_secrets() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn config_check_runs_with_the_update_check_turned_off() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .success();
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["config", "check"])
+        .env("OVERBRAINER_NO_UPDATE_CHECK", "1")
+        .assert()
+        .success();
+    Ok(())
+}
+
+#[test]
 fn config_check_shows_a_runpod_target_with_its_defaults() -> Result<(), Box<dyn std::error::Error>>
 {
     let dir = tempfile::tempdir()?;

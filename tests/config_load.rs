@@ -131,6 +131,21 @@ fn the_tui_variables_are_not_configuration_keys() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn the_variables_read_outside_the_configuration_are_not_keys()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(BASE)?;
+    load(
+        dir.path(),
+        env(&[
+            ("OVERBRAINER_NO_UPDATE_CHECK", "1"),
+            ("OVERBRAINER_TEST_SSH_HOST", "overbrainer-test"),
+            ("OVERBRAINER_TEST_SSH_CONFIG", "/tmp/ssh_config"),
+        ]),
+    )?;
+    Ok(())
+}
+
+#[test]
 fn a_lower_case_tui_variable_is_not_a_configuration_key() -> Result<(), Box<dyn std::error::Error>>
 {
     // `config::Environment` lower-cases keys, so the TUI prefix must match in any case.

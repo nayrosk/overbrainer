@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 
 /// The crates.io API entry for this crate.
 pub const CRATES_IO_URL: &str = "https://crates.io/api/v1/crates/overbrainer";
+/// Set and not empty, this variable turns the check off.
+pub const NO_UPDATE_CHECK_ENV: &str = "OVERBRAINER_NO_UPDATE_CHECK";
 
 /// crates.io asks every client for a contact.
 const USER_AGENT: &str = concat!(
@@ -78,7 +80,7 @@ impl CheckEnv {
             .filter(|dir| dir.is_absolute())
             .or_else(|| set("HOME").map(|home| PathBuf::from(home).join(".cache")));
         Self {
-            disabled: set("OVERBRAINER_NO_UPDATE_CHECK").is_some(),
+            disabled: set(NO_UPDATE_CHECK_ENV).is_some(),
             cache_dir: base.map(|dir| dir.join("overbrainer")),
         }
     }

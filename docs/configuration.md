@@ -33,6 +33,8 @@ These keys are accepted from the environment only, and `overbrainer.toml` is rej
 
 Provider and target names may only use lowercase letters, digits and `_`, so they map cleanly to variable names.
 
+Any other `OVERBRAINER_*` variable must name a key, or the command stops with `unknown field`. The exceptions are the variables read outside the configuration, which are never taken as keys: `OVERBRAINER_NO_UPDATE_CHECK` (see [Update check](#update-check)), `OVERBRAINER_TUI_COLOR` and `OVERBRAINER_TUI_MOTION` (see [Color and motion](tui.md#color-and-motion)), and the `OVERBRAINER_TEST_*` variables of the test suite.
+
 ## Reloading while overbrainer runs
 
 `overbrainer.toml` and `.env` are read again when they change, without restarting:
@@ -44,7 +46,7 @@ A stage or a training run already started keeps the settings it started with; th
 
 On a reload, the environment is the process one without the keys `.env` set when overbrainer started, plus what `.env` holds now. So a key changed in `.env` takes its new value, a key removed from `.env` is gone, a key added to `.env` is used, and a key exported in the shell keeps winning over `.env`. One exception: a `${VAR}` reference in `.env` expands with the process environment first, so a reference to a key `.env` itself set expands to its value at start, not to its new one; write the value out instead of referencing it.
 
-What reloads is the configuration: every key of `overbrainer.toml` and every `OVERBRAINER_*` variable. A few variables are read once at start and need a restart: `OVERBRAINER_LOG`, `OVERBRAINER_NO_UPDATE_CHECK`, `OVERBRAINER_TUI_COLOR`, `OVERBRAINER_TUI_MOTION`, `NO_COLOR`, `VISUAL` and `EDITOR`, and `VAULT_ADDR` and `VAULT_TOKEN` (for a `vault:` reference).
+What reloads is the configuration: every key of `overbrainer.toml` and every `OVERBRAINER_*` variable that sets one. A few variables are read once at start and need a restart: `OVERBRAINER_LOG`, `OVERBRAINER_NO_UPDATE_CHECK`, `OVERBRAINER_TUI_COLOR`, `OVERBRAINER_TUI_MOTION`, `NO_COLOR`, `VISUAL` and `EDITOR`, and `VAULT_ADDR` and `VAULT_TOKEN` (for a `vault:` reference).
 
 ## Providers
 
