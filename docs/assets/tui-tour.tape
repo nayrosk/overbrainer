@@ -1,6 +1,7 @@
 # The README hero: a tour of `overbrainer tui` on a finished demo project.
 # Render with docs/assets/record.sh, which mounts the demo project at /demo.
-# It starts no paid work: no r, no t, no a. The only dialog is answered n.
+# It starts no paid work: no r, t, A, a, s or E. The only dialog is answered
+# with its default, n.
 
 Output tui-tour.gif
 
@@ -18,20 +19,30 @@ Type "cd /demo && export COLORTERM=truecolor && clear" Enter
 Show
 
 Type "overbrainer tui" Sleep 300ms Enter
-Sleep 2s
+Sleep 3s
 
-# Dataset: open the topic, a subtopic, a question and its answer.
+# Project: it opens here. Move through a few fields; the stats pane on the
+# right is always shown, no key needed.
+Type "j" Sleep 400ms
+Type "j" Sleep 400ms
+Type "j" Sleep 400ms
+Type "k" Sleep 400ms
+Sleep 2.5s
+
+# Dataset: open a topic, a subtopic, a question and its answer.
+Type "2" Sleep 800ms
 Type "l" Sleep 500ms
 Type "j" Sleep 400ms
 Type "l" Sleep 600ms
 Type "j" Sleep 400ms
 Type "l" Sleep 500ms
-Type "j" Sleep 3s
-PageDown Sleep 1.5s
+Type "j" Sleep 1.5s
 
-# Stats of the topic, then back to the detail pane.
-Type "s" Sleep 2.5s
-Type "s" Sleep 500ms
+# The merged answer pane: jump the detail from the question to its reasoning,
+# then its answer, with [ and ].
+Type "]" Sleep 1.5s
+Type "]" Sleep 2s
+Type "[" Sleep 1.2s
 
 # Filter the tree, keep it, then clear it.
 Type "/" Sleep 400ms
@@ -40,20 +51,19 @@ Enter Sleep 2.5s
 Escape Sleep 1s
 
 # The help overlay.
-Type "?" Sleep 3s
+Type "?" Sleep 3.5s
 Escape Sleep 1s
 
+# A dialog on the selected question, answered with its default: nothing is
+# deleted.
+Type "d" Sleep 2.5s
+Type "n" Sleep 1.2s
+
 # Training: the succeeded run and its loss chart.
-Type "3" Sleep 1.5s
-Type "j" Sleep 500ms
-Type "j" Sleep 3.5s
-
-# Logs, then back to the dataset.
 Type "4" Sleep 1.5s
-Type "1" Sleep 1.2s
-Type "j" Sleep 400ms
-Type "j" Sleep 800ms
+Type "j" Sleep 500ms
+Type "j" Sleep 4.5s
 
-# A dialog on a question, answered with its default: nothing is deleted.
-Type "d" Sleep 3s
-Type "n" Sleep 1.5s
+# Logs; the footer's version and live cost have been visible throughout.
+Type "5" Sleep 1.5s
+Sleep 4s
