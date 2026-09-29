@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/nayrosk/overbrainer/compare/v0.3.1...v0.4.0) - 2026-09-29
+
+### Added
+
+- *(cli)* add overbrainer migrate for projects made before 0.4.0 ([#71](https://github.com/nayrosk/overbrainer/pull/71))
+- *(tui)* add an init wizard and an auto mode ([#67](https://github.com/nayrosk/overbrainer/pull/67))
+- *(metrics)* serve Prometheus metrics ([#66](https://github.com/nayrosk/overbrainer/pull/66))
+- *(config)* reload overbrainer.toml and .env while running ([#65](https://github.com/nayrosk/overbrainer/pull/65))
+- *(runpod)* choose GPUs, data centers, volumes and templates from the catalog ([#60](https://github.com/nayrosk/overbrainer/pull/60))
+- *(tui)* add a Project view that shows and edits the configuration ([#58](https://github.com/nayrosk/overbrainer/pull/58))
+- tell the user when a newer overbrainer is on crates.io ([#53](https://github.com/nayrosk/overbrainer/pull/53))
+- *(tui)* show the version, GitHub link and live cost, merge the question detail, export logs ([#47](https://github.com/nayrosk/overbrainer/pull/47))
+- record stage history and allow one overbrainer per project ([#44](https://github.com/nayrosk/overbrainer/pull/44))
+
+### Fixed
+
+- *(runpod)* fail fast and explain when the local ssh cannot keep its master ([#72](https://github.com/nayrosk/overbrainer/pull/72))
+- *(runpod)* clean catalog strings, drop duplicate templates, sort the pickers ([#69](https://github.com/nayrosk/overbrainer/pull/69))
+- *(tui)* count the items being retried, not every retry ([#50](https://github.com/nayrosk/overbrainer/pull/50))
+
 ## [0.3.1](https://github.com/nayrosk/overbrainer/compare/v0.3.0...v0.3.1) - 2026-09-27
 
 ### Changed
