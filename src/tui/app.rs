@@ -18,6 +18,7 @@ use super::editor::{self, Session, Target};
 use super::follow::REFRESH;
 use super::motion::{Motion, MotionLevel};
 use super::pipeline::{PipelineView, STAGES, command_name};
+use super::pod_logs::{LogSource, PodLogs, export_pod_line};
 use super::project::{ProjectConfig, ProjectView};
 use super::project_edit::{Removal, SaveRefusal, editor_failure};
 use super::start::{AutoPlan, Catalog, StartPlan};
@@ -343,7 +344,8 @@ pub(super) enum Exit {
     Signal,
 }
 
-/// The Logs view's state: the level shown and where it is scrolled.
+/// The Logs view's state: the log and the level shown, and where it is
+/// scrolled.
 ///
 /// Scrolling back pins the view on a line, so the lines on screen stay put while
 /// new ones arrive; `G` or End follows the tail again. `f` changes which lines
@@ -357,6 +359,8 @@ pub(super) struct LogView {
     pub(super) anchor: Option<u64>,
     /// Rows of lines the view showed at the last draw.
     pub(super) height: usize,
+    /// Which log is shown: `s` switches.
+    pub(super) source: LogSource,
 }
 
 impl LogView {
@@ -404,6 +408,8 @@ pub(super) struct App {
     pub(super) dataset: DatasetView,
     /// The Logs view's state.
     pub(super) log_view: LogView,
+    /// The pod's log of a run, for the Logs view's pod source.
+    pub(super) pod_logs: PodLogs,
     /// The load of the data files running, if any.
     pub(super) load: Option<TaskId>,
     /// When the last load started, by the motion clock.
@@ -575,7 +581,9 @@ impl App {
                 min: Level::INFO,
                 anchor: None,
                 height: 0,
+                source: LogSource::Overbrainer,
             },
+            pod_logs: PodLogs::default(),
             dirty: true,
             exit: None,
             opening: Opening::Project,
@@ -748,6 +756,7 @@ impl App {
             Ok(Done::Trained(result)) => self.trained(id, result),
             Ok(Done::Runs(listing)) => self.listed(id, listing),
             Ok(Done::Series { run, series }) => self.series_read(id, run, series),
+            Ok(Done::PodLog(read)) => self.pod_log_read(id, read),
             Ok(Done::Prepared(plan)) if self.prepare == Some(id) => self.prepared(plan),
             Ok(Done::PreparedAuto(plan)) if self.auto.prepare == Some(id) => {
                 self.auto_prepared(plan)
@@ -826,7 +835,7 @@ impl App {
         if self.project_view.save == Some(id) {
             return self.config_saved(Err(SaveRefusal::Failed(error)));
         }
-        if self.check_failed(id) {
+        if self.check_failed(id) || self.pod_log_failed(id, error.clone()) {
             return Vec::new();
         }
         if self.pipeline_task == Some(id) {
@@ -1682,36 +1691,70 @@ impl App {
             KeyCode::PageUp => self.scroll_logs(true, usize::from(PAGE)),
             KeyCode::PageDown => self.scroll_logs(false, usize::from(PAGE)),
             KeyCode::End | KeyCode::Char('G') => self.log_view.anchor = None,
-            KeyCode::Char('f') => {
+            KeyCode::Char('f') if self.log_view.source == LogSource::Overbrainer => {
                 self.log_view.min = LogView::next_level(self.log_view.min);
                 self.log_view.anchor = None;
             },
+            KeyCode::Char('s') => return self.toggle_log_source(),
             KeyCode::Char('x') => return self.export_logs(),
             _ => {},
         }
         Vec::new()
     }
 
-    /// `x`: exports every retained line at the shown level or more severe,
-    /// oldest first, to a new file under `.overbrainer/`; no file without one.
+    /// The log the Logs view shows, and the view as it applies to it: the pod's
+    /// log has no level, so all of it matches.
+    pub(super) fn shown_logs(&self) -> (&LogBuffer, LogView) {
+        match self.log_view.source {
+            LogSource::Overbrainer => (&self.logs, self.log_view),
+            LogSource::Pod => (
+                &self.pod_logs.lines,
+                LogView {
+                    min: Level::TRACE,
+                    ..self.log_view
+                },
+            ),
+        }
+    }
+
+    /// `x`: exports every retained line of the shown log (at the shown level
+    /// or more severe for overbrainer's), oldest first, to a new file under
+    /// `.overbrainer/`; no file without one.
     fn export_logs(&mut self) -> Vec<Effect> {
-        let window = self.logs.window(self.log_view.min, usize::MAX, 0);
+        let (logs, view) = self.shown_logs();
+        let window = logs.window(view.min, usize::MAX, 0);
+        let stamp = crate::runs::compact_utc(self.now);
+        let pod_run = match self.log_view.source {
+            LogSource::Pod => self.pod_logs.run.clone(),
+            LogSource::Overbrainer => None,
+        };
         if window.lines.is_empty() {
-            let level = level_name(self.log_view.min);
-            self.say(Severity::Warn, format!("nothing to export at {level}"));
+            let what = match &pod_run {
+                Some(run) => format!("nothing to export from the pod of run {run}"),
+                None => format!("nothing to export at {}", level_name(view.min)),
+            };
+            self.say(Severity::Warn, what);
             return Vec::new();
         }
-        let lines = window.lines.iter().map(export_line).collect();
-        let name = format!("logs-{}.log", crate::runs::compact_utc(self.now));
+        let (name, lines) = match pod_run {
+            Some(run) => (
+                format!("logs-pod-{run}-{stamp}.log"),
+                window.lines.iter().map(export_pod_line).collect(),
+            ),
+            None => (
+                format!("logs-{stamp}.log"),
+                window.lines.iter().map(export_line).collect(),
+            ),
+        };
         vec![Effect::ExportLogs { name, lines }]
     }
 
     /// Moves the Logs view `by` lines back (older) or forward, pinning it on the
     /// line then at its bottom. Scrolling forward while following does nothing.
     fn scroll_logs(&mut self, back: bool, by: usize) {
-        let view = self.log_view;
-        let offset = view.offset(&self.logs);
-        let matching = self.logs.window(view.min, 0, 0).matching;
+        let (logs, view) = self.shown_logs();
+        let offset = view.offset(logs);
+        let matching = logs.window(view.min, 0, 0).matching;
         let target = if back {
             offset.saturating_add(by)
         } else {
@@ -1721,8 +1764,7 @@ impl App {
         if view.anchor.is_none() && target == 0 {
             return;
         }
-        self.log_view.anchor = self
-            .logs
+        self.log_view.anchor = logs
             .window(view.min, 1, target)
             .lines
             .first()
@@ -1908,6 +1950,7 @@ impl App {
     pub(super) fn on_tick(&mut self, now: SystemTime) -> Vec<Effect> {
         self.now = now;
         let mut effects = self.refresh_when_due();
+        effects.extend(self.read_pod_log_when_due());
         effects.extend(self.reload_while_running(false));
         effects.extend(self.check_config());
         if self.status.as_ref().is_some_and(|status| {

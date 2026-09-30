@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::catalog::{Listed, Query, fetch};
 use super::cost::history_cost;
 use super::editor::Edited;
+use super::pod_logs::{PodLogRead, read_pod_log};
 use super::project::ProjectConfig;
 use super::project_edit::{SaveRefusal, save_config};
 use super::start::{AutoPlan, Catalog, StartPlan, look_up, prepare, prepare_auto};
@@ -64,6 +65,13 @@ pub(super) enum Task {
     Runs,
     /// Reads the local metrics file of a run.
     Series(String),
+    /// Reads the pod log kept for a run, from a byte offset.
+    PodLog {
+        /// The run.
+        run: String,
+        /// Where to start.
+        offset: u64,
+    },
     /// What a training run started now would use.
     Prepare,
     /// What auto mode run now would do after split.
@@ -204,6 +212,8 @@ pub(super) enum Done {
         /// Its metrics.
         series: Option<Vec<TrainMetric>>,
     },
+    /// What a read of a run's kept pod log found.
+    PodLog(PodLogRead),
     /// What a training run started now would use, or why none can start.
     Prepared(Result<StartPlan, String>),
     /// What auto mode would do after split, or why it cannot run.
@@ -556,6 +566,22 @@ impl Tasks {
                         run,
                         series: series.ok().flatten(),
                     }
+                })
+            },
+            Task::PodLog { run, offset } => {
+                let dir = self.project_dir.clone();
+                self.set.spawn(async move {
+                    let name = run.clone();
+                    let read =
+                        tokio::task::spawn_blocking(move || read_pod_log(&dir, &name, offset))
+                            .await;
+                    Done::PodLog(read.unwrap_or_else(|error| PodLogRead {
+                        run,
+                        offset,
+                        restarted: false,
+                        lines: Vec::new(),
+                        error: Some(format!("cannot read the pod log: {error}")),
+                    }))
                 })
             },
             Task::Prepare => self.spawn_prepare(false),

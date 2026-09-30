@@ -4,11 +4,12 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::{Method, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 
+use super::logs::LogQuery;
 use super::target::MIN_CUDA_VERSION;
 use super::types::{
     CreatePod, DataCenter, DataCenterList, GpuType, GpuTypeList, NetworkVolume, NetworkVolumeList,
@@ -29,6 +30,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest answer read, in bytes: a listing is far below it, so anything past
 /// it is refused instead of filling memory.
 const MAX_BODY: usize = 8 * 1024 * 1024;
+/// Largest error answer read from the pod log stream, in bytes.
+const MAX_STREAM_ERROR: usize = 64 * 1024;
+/// How often an idle log stream's connection is probed by TCP keepalives, so a
+/// dead connection ends instead of waiting forever.
+const STREAM_KEEPALIVE: Duration = Duration::from_secs(30);
+/// The media type of the pod log stream.
+const EVENT_STREAM: &str = "text/event-stream";
 /// Timeout of `POST /pods`, which answers once the pod is placed.
 const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Items asked for per page of `GET /pods` (the v2 maximum).
@@ -208,8 +216,13 @@ fn next_page(
 #[derive(Debug, Clone)]
 pub struct RunpodClient {
     http: reqwest::Client,
+    /// The client of the log streams, which never end by themselves: a
+    /// connection timeout only, no overall one.
+    stream: reqwest::Client,
     base_url: String,
     api_key: SecretString,
+    /// Other secrets the pod log redaction looks for (the job's).
+    secrets: Vec<SecretString>,
     policy: RetryPolicy,
 }
 
@@ -230,17 +243,27 @@ impl RunpodClient {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, bearer);
         let http = reqwest::Client::builder()
-            .default_headers(headers)
+            .default_headers(headers.clone())
             .user_agent(USER_AGENT)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(ApiError::Client)?;
+        let stream = reqwest::Client::builder()
+            .default_headers(headers)
+            .user_agent(USER_AGENT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .tcp_keepalive(STREAM_KEEPALIVE)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(ApiError::Client)?;
         Ok(Self {
             http,
+            stream,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.clone(),
+            secrets: Vec::new(),
             policy: RetryPolicy::new(5),
         })
     }
@@ -484,6 +507,85 @@ impl RunpodClient {
             log_retry,
         )
         .await
+    }
+
+    /// This client with `secrets` (the values the run's job gets, such as
+    /// its Hugging Face token), which the pod's logs never show.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: Vec<SecretString>) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    /// The secrets the pod log redaction looks for: the account API key,
+    /// then those of [`RunpodClient::with_secrets`].
+    pub(super) fn log_secrets(&self) -> Vec<SecretString> {
+        std::iter::once(self.api_key.clone())
+            .chain(self.secrets.iter().cloned())
+            .collect()
+    }
+
+    /// Opens the log stream of the pod `id` (`GET /pods/{id}/logs`, an event
+    /// stream that never ends by itself): `query`'s cursor goes in
+    /// `Last-Event-ID`, which Runpod reads before `tail`. Never retried: the
+    /// callers reconnect themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Status`] for a failed answer (its text cleaned of the
+    /// account key), [`ApiError::Transport`] when it cannot be sent, and
+    /// [`ApiError::InvalidResponse`] when a success answer is not an event
+    /// stream (a proxy answering for the API).
+    pub(super) async fn open_pod_logs(
+        &self,
+        id: &PodId,
+        query: &LogQuery,
+    ) -> Result<reqwest::Response, ApiError> {
+        let mut url = reqwest::Url::parse(&self.url(&format!("pods/{id}/logs")))
+            .map_err(|error| ApiError::InvalidResponse(error.to_string()))?;
+        let tail = query.tail.map(|tail| tail.to_string());
+        {
+            let mut pairs = url.query_pairs_mut();
+            if let Some(source) = query.source {
+                pairs.append_pair("source", source.name());
+            }
+            if let Some(tail) = &tail {
+                pairs.append_pair("tail", tail);
+            }
+            if let Some(since) = &query.since {
+                pairs.append_pair("since", since);
+            }
+        }
+        let mut request = self.stream.get(url).header(ACCEPT, EVENT_STREAM);
+        if let Some(cursor) = &query.cursor {
+            request = request.header("Last-Event-ID", cursor.as_str());
+        }
+        let mut response = request.send().await.map_err(ApiError::Transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = retry_after(response.headers());
+            let mut body = Vec::new();
+            while body.len() < MAX_STREAM_ERROR {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            body.truncate(MAX_STREAM_ERROR);
+            let body = String::from_utf8_lossy(&body);
+            return Err(self.status_error(status, &body, retry_after, false));
+        }
+        if let Some(kind) = response.headers().get(CONTENT_TYPE) {
+            let kind = kind.to_str().unwrap_or_default();
+            let media = kind.split(';').next().unwrap_or_default().trim();
+            if !media.eq_ignore_ascii_case(EVENT_STREAM) {
+                return Err(ApiError::InvalidResponse(format!(
+                    "the pod log stream answered {} instead of {EVENT_STREAM}",
+                    cap(media)
+                )));
+            }
+        }
+        Ok(response)
     }
 
     fn url(&self, path: &str) -> String {

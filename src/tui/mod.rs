@@ -16,6 +16,7 @@ mod format;
 mod keys;
 mod motion;
 mod pipeline;
+mod pod_logs;
 mod project;
 mod project_edit;
 mod project_save;

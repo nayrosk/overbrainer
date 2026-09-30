@@ -1,10 +1,13 @@
-//! Secret resolution: literal values or `vault:` references.
+//! Secret resolution (literal values or `vault:` references), and the redaction
+//! of log lines that come from outside overbrainer.
 
+mod redact;
 mod reference;
 mod vault;
 
 use secrecy::{ExposeSecret, SecretString};
 
+pub use redact::{Redactor, redact_line};
 pub use reference::{VaultRef, is_reference, parse_reference};
 pub use vault::{SecretSource, VaultSettings, VaultSource};
 

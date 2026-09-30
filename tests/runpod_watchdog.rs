@@ -921,6 +921,13 @@ async fn a_bootstrap_failure_still_deletes_a_guarded_pod() -> TestResult {
             "cannot install the authorized key\n",
             "{shell}: {output}"
         );
+        // Its log is kept in the run directory too, from its first line.
+        let log = setup.read(".pod/bootstrap.log");
+        assert!(log.contains("bootstrap: run r1\n"), "{shell}: {log}");
+        assert!(
+            log.contains("bootstrap: failed: cannot install the authorized key\n"),
+            "{shell}: {log}"
+        );
         assert_eq!(
             setup.read(".pod/watchdog"),
             "failed bootstrap: cannot install the authorized key\n",
@@ -969,6 +976,12 @@ async fn a_run_directory_another_run_owns_is_never_touched() -> TestResult {
             fs::read_to_string(setup.refused_dir.join(".pod/bootstrap_failed"))?,
             "the run directory belongs to another run\n",
             "{shell}: {output}"
+        );
+        // The bootstrap's own log goes to the pod's directory too.
+        let log = fs::read_to_string(setup.refused_dir.join(".pod/bootstrap.log"))?;
+        assert!(
+            log.contains("bootstrap: failed: the run directory belongs to another run"),
+            "{shell}: {log}"
         );
         assert!(
             output.contains("delete reason=bootstrap_failed"),

@@ -6,6 +6,7 @@ pub(crate) mod data;
 pub(crate) mod front;
 mod history;
 pub(crate) mod init;
+mod logs;
 pub(crate) mod migrate;
 pub(crate) mod pod;
 mod progress;
@@ -280,6 +281,33 @@ pub enum RunsCommand {
     /// List the runs in runs/, oldest first: ID, state, target, creation time, and
     /// the pod of a Runpod run.
     Ls,
+    /// Print the log of a run's job, or with --pod the logs of its Runpod pod.
+    ///
+    /// The pod's logs are kept in `runs/<run-id>/.pod/` while overbrainer follows
+    /// the run and before every delete, so they outlive the pod; while the pod
+    /// exists, the lines not kept yet are read from Runpod.
+    Logs(LogsArgs),
+}
+
+/// Options of `overbrainer runs logs`.
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    /// ID of the run, as shown by `overbrainer runs ls`.
+    #[arg(add = ArgValueCandidates::new(complete::run_ids))]
+    pub run_id: String,
+    /// Print the logs of the run's Runpod pod (container and system lines, and
+    /// the bootstrap's and watchdog's own logs) instead of the job's.
+    #[arg(long)]
+    pub pod: bool,
+    /// Only the pod's lines from this source.
+    #[arg(long, value_enum, requires = "pod")]
+    pub source: Option<crate::runpod::LogSource>,
+    /// Keep printing the pod's new lines until Ctrl-C.
+    #[arg(long, requires = "pod")]
+    pub follow: bool,
+    /// Only the last N lines of each log (at most 5000 from Runpod).
+    #[arg(long, value_name = "N")]
+    pub tail: Option<u32>,
 }
 
 /// Options of `overbrainer history`.
@@ -489,6 +517,9 @@ async fn dispatch(
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
+        Command::Runs {
+            command: RunsCommand::Logs(args),
+        } => logs::run(dir, &args).await,
         Command::History(args) => history::run(dir, &args),
         Command::Migrate(args) => migrate::run(dir, args.dry_run),
         Command::Pod { command } => pod::run(dir, &command).await,

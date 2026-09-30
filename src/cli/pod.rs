@@ -77,7 +77,8 @@ async fn with_pods(
     result
 }
 
-/// A client of the Runpod API with the account key, resolved only now.
+/// A client of the Runpod API with the account key, resolved only now, and
+/// the job's secrets, which the pod's logs never show.
 ///
 /// # Errors
 ///
@@ -97,7 +98,23 @@ pub(crate) async fn client(settings: &Settings) -> anyhow::Result<RunpodClient> 
         .base_url
         .as_deref()
         .unwrap_or(DEFAULT_RUNPOD_BASE_URL);
-    Ok(RunpodClient::new(base_url, &key)?)
+    Ok(RunpodClient::new(base_url, &key)?.with_secrets(job_secrets(settings).await))
+}
+
+/// The secrets a run's job may get, which its pod's logs must never show:
+/// the Hugging Face token, when set and resolvable. Best effort: one that
+/// cannot be resolved is only noted, since the job gets none then either.
+async fn job_secrets(settings: &Settings) -> Vec<secrecy::SecretString> {
+    let Some(token) = &settings.hf_token else {
+        return Vec::new();
+    };
+    match super::resolver().resolve(token).await {
+        Ok(token) => vec![token],
+        Err(error) => {
+            tracing::debug!("cannot resolve hf_token for the pod log redaction: {error}");
+            Vec::new()
+        },
+    }
 }
 
 async fn ls(ctx: &PodCtx<'_>) -> anyhow::Result<()> {
