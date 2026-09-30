@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -11,6 +12,7 @@ use crate::exec::{
     local_manifest,
 };
 use crate::runpod::{POD_FILE, SSH_DIR, chain};
+use crate::system::{self, SystemSample, probe_script};
 use crate::train::{TrainError, Trainer};
 
 /// Hugging Face cache on the target, under the executor's work directory. Shared
@@ -22,6 +24,15 @@ pub const HF_CACHE_DIR: &str = ".hf-cache";
 /// poll loop starts the count again; the drain that follows the job's end spends
 /// what is left of it.
 const MAX_FAILURES: u32 = 5;
+
+/// Time between two samples of the target's machine while a job is followed.
+pub const PROBE_EVERY: Duration = Duration::from_secs(10);
+
+/// How long one sample may take before it is given up: longer than the probe
+/// script's own bound (see [`probe_script`]), so a sample is only abandoned
+/// when the connection itself hangs, and the next one waits for it: probes
+/// never run side by side.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Start of the note added to a run's message when its artifacts could not be
 /// retrieved.
@@ -357,7 +368,14 @@ pub async fn watch<E: Executor, T: Trainer>(
     let metrics = format!("{}/{}", record.remote_dir, trainer.metrics_file());
     let mut stream = ctx.executor.tail(&metrics, 0);
     let mut summary = MetricsSummary::default();
-    let status = follow(ctx, &job, &mut stream, &mut summary).await?;
+    // The samples stop with the follow: they never end it, and their failures
+    // never count against its retries. Boxed, so the watch's own future stays
+    // small.
+    let sampler = Box::pin(sample(ctx, &record.remote_dir));
+    let status = tokio::select! {
+        status = follow(ctx, &job, &mut stream, &mut summary) => status?,
+        never = sampler => match never {},
+    };
     let (state, message) = outcome(status, &summary, &record.id);
     let succeeded = state == RunState::Succeeded;
     let (state, message, retrieved) =
@@ -612,6 +630,44 @@ async fn follow<E: Executor>(
     }
 }
 
+/// Samples the target's machine at once, then every [`PROBE_EVERY`], and
+/// publishes each sample as an [`Event::System`]; `run_dir` is the run
+/// directory on the target, whose file system is sampled first. A sample that
+/// fails or takes longer than [`PROBE_TIMEOUT`] is logged at debug level and
+/// skipped. Never ends: the caller drops it.
+async fn sample<E: Executor>(ctx: &RunCtx<'_, E>, run_dir: &str) -> Infallible {
+    let script = probe_script(run_dir);
+    let mut previous: Option<SystemSample> = None;
+    let mut every = tokio::time::interval(PROBE_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        match sample_once(ctx.executor, &script, previous.as_ref()).await {
+            Ok(sample) => {
+                ctx.bus.publish(Event::System(sample.clone()));
+                previous = Some(sample);
+            },
+            Err(error) => tracing::debug!("cannot sample the target: {error}"),
+        }
+    }
+}
+
+/// One sample of the target: `script` run there, its answer parsed with the
+/// counters of `previous`. Fails, saying why, when the target does not answer
+/// within [`PROBE_TIMEOUT`].
+async fn sample_once<E: Executor>(
+    executor: &E,
+    script: &str,
+    previous: Option<&SystemSample>,
+) -> Result<SystemSample, String> {
+    let output = tokio::time::timeout(PROBE_TIMEOUT, executor.probe(script))
+        .await
+        .map_err(|_| format!("no answer within {}s", PROBE_TIMEOUT.as_secs()))?
+        .map_err(|error| chain(&error))?;
+    let text = String::from_utf8_lossy(&output);
+    Ok(system::parse(&text, SystemTime::now(), previous))
+}
+
 /// Counts one more failure in a row to reach the job, and returns it as an error
 /// once [`MAX_FAILURES`] have been retried.
 fn retry(failures: &mut u32, error: ExecError) -> Result<(), RunError> {
@@ -838,6 +894,17 @@ mod tests {
     const METRICS: &str = "{\"event\": \"begin\", \"time\": 1}\n";
     const RUN_ID: &str = "20260922-143005-abcd";
 
+    /// How [`Fake`]'s probe answers.
+    #[derive(Debug, Clone)]
+    enum Probe {
+        /// It prints this.
+        Answers(Vec<u8>),
+        /// It fails at once.
+        Fails,
+        /// It never answers.
+        Hangs,
+    }
+
     /// A scripted target. Its job reads `status`, its metrics file holds
     /// `metrics`, and the read numbered `failing_read` (from 0) fails.
     struct Fake {
@@ -855,6 +922,12 @@ mod tests {
         manifest: Vec<FileDigest>,
         reads: AtomicU32,
         cancels: AtomicU32,
+        /// How the probe answers.
+        probe: Probe,
+        probes: AtomicU32,
+        /// Status polls answered `Running` before [`Fake::status`].
+        running_polls: u32,
+        polls: AtomicU32,
     }
 
     impl Fake {
@@ -870,6 +943,10 @@ mod tests {
                 manifest: Vec::new(),
                 reads: AtomicU32::new(0),
                 cancels: AtomicU32::new(0),
+                probe: Probe::Fails,
+                probes: AtomicU32::new(0),
+                running_polls: 0,
+                polls: AtomicU32::new(0),
             }
         }
     }
@@ -948,7 +1025,12 @@ mod tests {
             &self,
             _job: &JobId,
         ) -> impl Future<Output = Result<JobStatus, ExecError>> + Send {
-            ready(Ok(self.status))
+            let poll = self.polls.fetch_add(1, Ordering::SeqCst);
+            ready(Ok(if poll < self.running_polls {
+                JobStatus::Running
+            } else {
+                self.status
+            }))
         }
 
         fn cancel(&self, _job: &JobId) -> impl Future<Output = Result<(), ExecError>> + Send {
@@ -980,6 +1062,18 @@ mod tests {
             _exclude: &[String],
         ) -> impl Future<Output = Result<Vec<FileDigest>, ExecError>> + Send {
             ready(Ok(self.manifest.clone()))
+        }
+
+        fn probe(&self, _script: &str) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            let probe = self.probe.clone();
+            async move {
+                match probe {
+                    Probe::Answers(output) => Ok(output),
+                    Probe::Fails => Err(broken("probe")),
+                    Probe::Hangs => std::future::pending().await,
+                }
+            }
         }
     }
 
@@ -1117,6 +1211,90 @@ mod tests {
         assert_eq!(outcome.record.state, RunState::Succeeded);
         assert_eq!(outcome.summary.lines, 1);
         assert_eq!(fake.reads.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_target_is_sampled_while_the_job_is_followed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let df = "@df.run\nFilesystem 1024-blocks Used Available Capacity Mounted on\n\
+                  /dev/sda1 100 60 40 60% /workspace\n";
+        let fake = Fake {
+            probe: Probe::Answers(df.as_bytes().to_vec()),
+            running_polls: 3,
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        let record = running()?;
+        runs.save(&record)?;
+        let outcome = watch(&ctx(&runs, &fake, &bus), &NoFiles, record).await?;
+        assert_eq!(outcome.record.state, RunState::Succeeded);
+        // At once, then every ten seconds: once in a watch this short.
+        assert_eq!(fake.probes.load(Ordering::SeqCst), 1);
+        let mut samples = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::System(sample) = event {
+                samples.push(sample);
+            }
+        }
+        let [sample] = samples.as_slice() else {
+            return Err(format!("{samples:?}").into());
+        };
+        let disk = sample.run_disk().ok_or("no disk")?;
+        assert_eq!(
+            (disk.mount.as_str(), disk.used_bytes),
+            ("/workspace", 60 * 1024)
+        );
+        Ok(())
+    }
+
+    /// Watches a run whose job runs for 80 polls of a second each on `fake`,
+    /// on the paused clock: long enough for several samples.
+    async fn watch_long(fake: Fake) -> Result<(Outcome, Fake), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            running_polls: 80,
+            ..fake
+        };
+        let record = running()?;
+        runs.save(&record)?;
+        let ctx = RunCtx {
+            poll: Duration::from_secs(1),
+            ..ctx(&runs, &fake, &bus)
+        };
+        let outcome = watch(&ctx, &NoFiles, record).await?;
+        Ok((outcome, fake))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failing_samples_never_count_against_the_follow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (outcome, fake) = watch_long(Fake::new(JobStatus::Exited(0))).await?;
+        assert_eq!(outcome.record.state, RunState::Succeeded);
+        // Every sample failed, far more than the follow's retries allow.
+        let probes = fake.probes.load(Ordering::SeqCst);
+        assert!(probes > MAX_FAILURES + 2, "{probes}");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sample_that_never_answers_never_holds_the_follow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fake = Fake {
+            probe: Probe::Hangs,
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        let (outcome, fake) = watch_long(fake).await?;
+        assert_eq!(outcome.record.state, RunState::Succeeded);
+        // Each one given up after its timeout, the next started only then: at
+        // most one every 20 seconds over the job's 80, never side by side.
+        let probes = fake.probes.load(Ordering::SeqCst);
+        assert!((2..=5).contains(&probes), "{probes}");
         Ok(())
     }
 

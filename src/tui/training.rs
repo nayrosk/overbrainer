@@ -1,7 +1,7 @@
 //! The Training view's model: the runs of `runs/`, their metrics, and the
 //! training tasks the TUI follows.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -9,7 +9,12 @@ use super::tasks::TaskId;
 use crate::events::Event;
 use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, RunState, Runs};
+use crate::system::SystemSample;
 use crate::train::{METRICS_FILE, MetricLine, Pace, TrainMetric, parse_line};
+
+/// Samples of a run's machine kept for the system panel: ten minutes at one
+/// sample every 10 seconds.
+pub(super) const SYSTEM_SAMPLES: usize = 60;
 
 /// A run of `runs/`, with its pod record when it has one.
 #[derive(Debug, Clone, PartialEq)]
@@ -283,6 +288,9 @@ pub(super) struct TrainingView {
     pub(super) hidden: BTreeSet<String>,
     /// The runs whose pod is no longer shown, by run ID: dismissed with `p`.
     pub(super) dismissed: BTreeSet<String>,
+    /// The last [`SYSTEM_SAMPLES`] samples of each run's machine, oldest first,
+    /// by run ID. They stay once the task ends, until the TUI restarts.
+    pub(super) system: BTreeMap<String, VecDeque<SystemSample>>,
 }
 
 /// The progress a series of metrics shows.
@@ -470,6 +478,13 @@ impl TrainingView {
                 return true;
             },
             Event::PodStatus(status) => follow.pod = Some(status),
+            Event::System(sample) => {
+                let samples = self.system.entry(follow.run_id.clone()).or_default();
+                samples.push_back(sample);
+                while samples.len() > SYSTEM_SAMPLES {
+                    samples.pop_front();
+                }
+            },
             _ => {},
         }
         false
@@ -551,6 +566,32 @@ mod tests {
             labels,
             ["", "followed", "starting", "starting", "cancelling"]
         );
+    }
+
+    #[test]
+    fn the_machine_of_a_run_keeps_its_last_samples() {
+        let mut view = TrainingView::default();
+        view.tasks
+            .insert(TaskId(1), Follow::new(Job::Attach, "run-a"));
+        let sample = |seconds| SystemSample {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+            disks: Vec::new(),
+            cpu: None,
+            memory: None,
+            gpus: Vec::new(),
+        };
+        for seconds in 0..70 {
+            assert!(!view.event(TaskId(1), Event::System(sample(seconds))));
+        }
+        // An event of a task that is not running is dropped.
+        view.event(TaskId(2), Event::System(sample(99)));
+        let kept = view
+            .system
+            .get("run-a")
+            .map(|s| s.iter().map(|x| x.at).collect::<Vec<_>>());
+        let expected: Vec<SystemTime> = (10..70).map(sample).map(|s| s.at).collect();
+        assert_eq!(kept, Some(expected));
+        assert_eq!(view.system.len(), 1);
     }
 
     #[test]

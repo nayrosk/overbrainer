@@ -17,8 +17,8 @@ pub use id::{
 };
 pub use summary::MetricsSummary;
 pub use train::{
-    HF_CACHE_DIR, Launch, Outcome, RunCtx, RunError, artifacts_missing, cancel, collect, create,
-    create_on, reserve, start, watch,
+    HF_CACHE_DIR, Launch, Outcome, PROBE_EVERY, RunCtx, RunError, artifacts_missing, cancel,
+    collect, create, create_on, reserve, start, watch,
 };
 
 use crate::exec::JobId;

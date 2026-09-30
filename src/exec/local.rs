@@ -300,6 +300,11 @@ impl Executor for LocalExecutor {
             .await
             .map_err(|error| ExecError::Protocol(format!("the manifest task failed: {error}")))?
     }
+
+    async fn probe(&self, script: &str) -> Result<Vec<u8>, ExecError> {
+        let output = self.run_script(script.to_string(), "probe").await?;
+        Ok(output.stdout)
+    }
 }
 
 /// At most `limit` bytes of `path` from `offset`; a missing file reads as empty.

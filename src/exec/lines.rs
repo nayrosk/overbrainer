@@ -210,6 +210,10 @@ mod tests {
         ) -> impl Future<Output = Result<Vec<FileDigest>, ExecError>> + Send {
             std::future::ready(Ok(Vec::new()))
         }
+
+        fn probe(&self, _script: &str) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
+            std::future::ready(Err(ExecError::Protocol("unused".to_string())))
+        }
     }
 
     #[tokio::test]

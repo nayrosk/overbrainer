@@ -1,5 +1,6 @@
-//! The Training view: the runs of `runs/` on top, the selected run below with its
-//! progress, pod, loss chart and sparklines.
+//! The Training view: the runs of `runs/` on top, with the system panel of the
+//! selected run on their right on a wide terminal, the selected run below with
+//! its progress, pod, loss chart and sparklines.
 
 use std::fmt::Write as _;
 
@@ -17,13 +18,14 @@ use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, RunState};
 use crate::train::TrainMetric;
 use crate::tui::app::App;
-use crate::tui::format::duration;
+use crate::tui::format::{cut, duration};
 use crate::tui::motion::Bar;
 use crate::tui::theme::Theme;
 use crate::tui::training::{
     Ended, Follow, RunActivity, RunRow, TrainingView, float, pod_rate, pod_spend, progress,
 };
 use crate::tui::views::dataset::failed;
+use crate::tui::views::system;
 use crate::tui::widgets::bar::bar;
 
 /// Rows the pod line may wrap to.
@@ -46,10 +48,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Op
         render_no_runs(frame, area, app);
         return None;
     }
-    let shown = u16::try_from(view.runs.len().min(5)).unwrap_or(5);
-    let [list, detail] =
-        Layout::vertical([Constraint::Length(shown + 3), Constraint::Fill(1)]).areas(area);
-    render_runs(frame, list, app);
+    let detail = render_top(frame, area, app);
     // The selected run's detail has no frame: a two-column margin.
     let inner = detail.inner(Margin::new(2, 0));
     let row = view.selected_run()?;
@@ -127,6 +126,39 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Op
     (activity == RunActivity::Followed).then(|| Rect::new(status.x, status.y, 1, 1))
 }
 
+/// Draws the runs, and the system panel of the selected run on their right
+/// where it fits; returns the area left below them.
+fn render_top(frame: &mut Frame, area: Rect, app: &App) -> Rect {
+    let view = &app.training;
+    let theme = &app.theme;
+    let shown = u16::try_from(view.runs.len().min(5)).unwrap_or(5);
+    let samples = view
+        .selected_run()
+        .and_then(|row| view.system.get(&row.record.id));
+    // The system panel of the selected run, right of the runs, where it fits
+    // and leaves the detail enough rows.
+    let with_panel = (shown + 3).max(system::height(samples).saturating_add(2));
+    let panel = area.width >= system::PANEL_FROM
+        && area.height >= with_panel.saturating_add(system::MIN_DETAIL);
+    let top = if panel { with_panel } else { shown + 3 };
+    let [list, detail] =
+        Layout::vertical([Constraint::Length(top), Constraint::Fill(1)]).areas(area);
+    let list = if panel {
+        let [list, side] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(system::PANEL_WIDTH)])
+                .areas(list);
+        let followed = view
+            .selected_run()
+            .is_some_and(|row| view.task_of(&row.record.id).is_some());
+        system::render(frame, side, samples, (followed, app.now), theme);
+        list
+    } else {
+        list
+    };
+    render_runs(frame, list, app);
+    detail
+}
+
 /// The runs box with no run in it: what to do to start one, or why the runs
 /// cannot be listed, in place of the table.
 fn render_no_runs(frame: &mut Frame, area: Rect, app: &App) {
@@ -168,6 +200,9 @@ fn runs_block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
 fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
     let view = &app.training;
     let theme = &app.theme;
+    // What the pod column gets: the box's borders and padding, the other
+    // columns and the four gaps between the five taken off.
+    let pod_width = usize::from(area.width.saturating_sub(4 + 21 + 10 + 10 + 10 + 4));
     let rows: Vec<Row> = view
         .runs
         .iter()
@@ -176,7 +211,9 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
                 row.record.id.clone(),
                 row.record.state.name().to_string(),
                 row.record.target.clone(),
-                shown_pod(view, row).map(pod_summary).unwrap_or_default(),
+                shown_pod(view, row)
+                    .map(|pod| cut(&pod_summary(pod), pod_width))
+                    .unwrap_or_default(),
                 view.activity(&row.record.id).label().to_string(),
             ])
         })

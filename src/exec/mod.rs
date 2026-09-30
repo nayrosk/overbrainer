@@ -377,6 +377,17 @@ pub trait Executor: Send + Sync {
         exclude: &[String],
     ) -> impl Future<Output = Result<Vec<FileDigest>, ExecError>> + Send;
 
+    /// Runs the read-only POSIX shell `script` on the target and returns its
+    /// standard output. It must not change anything there: the training flow
+    /// runs it while the job runs, to sample the machine (see
+    /// [`crate::system::probe_script`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Command`] (action `probe`) when the script exits non
+    /// zero, and an [`ExecError`] when the target cannot be reached.
+    fn probe(&self, script: &str) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send;
+
     /// Follows the file `path` from byte `offset`, one complete line at a time.
     fn tail(&self, path: &str, offset: u64) -> LineStream<'_, Self>
     where
@@ -469,6 +480,13 @@ impl Executor for AnyExecutor {
             Self::Ssh(executor) => executor.manifest(remote, entries, exclude).await,
         }
     }
+
+    async fn probe(&self, script: &str) -> Result<Vec<u8>, ExecError> {
+        match self {
+            Self::Local(executor) => executor.probe(script).await,
+            Self::Ssh(executor) => executor.probe(script).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +501,40 @@ mod tests {
         std::fs::write(&file, "0123456789")?;
         let path = file.to_string_lossy().into_owned();
         assert_eq!(executor.read_from(&path, 2, 3).await?, b"234");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_local_probe_samples_this_machine() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let executor = AnyExecutor::Local(LocalExecutor::new(root.path())?);
+        let script = crate::system::probe_script(executor.workdir());
+        let output = executor.probe(&script).await?;
+        let sample = crate::system::parse(
+            &String::from_utf8_lossy(&output),
+            std::time::SystemTime::now(),
+            None,
+        );
+        let disk = sample.run_disk().ok_or("no disk")?;
+        assert!(disk.size_bytes > 0, "{sample:?}");
+        if cfg!(target_os = "linux") {
+            assert!(sample.memory.is_some(), "{sample:?}");
+            assert!(
+                sample.cpu.as_ref().is_some_and(|cpu| cpu.cpus.is_some()),
+                "{sample:?}"
+            );
+        }
+        let failed = executor.probe("exit 3").await;
+        assert!(
+            matches!(
+                failed,
+                Err(ExecError::Command {
+                    action: "probe",
+                    ..
+                })
+            ),
+            "{failed:?}"
+        );
         Ok(())
     }
 

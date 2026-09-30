@@ -259,6 +259,10 @@ impl Executor for SshExecutor {
         let output = run(&self.session, &script, "manifest").await?;
         parse_manifest(&String::from_utf8_lossy(&output))
     }
+
+    async fn probe(&self, script: &str) -> Result<Vec<u8>, ExecError> {
+        run(&self.session, script, "probe").await
+    }
 }
 
 /// The command starting `job` detached from the SSH session, printing its process ID.
