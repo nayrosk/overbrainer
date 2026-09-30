@@ -977,6 +977,12 @@ async fn a_run_directory_another_run_owns_is_never_touched() -> TestResult {
             "the run directory belongs to another run\n",
             "{shell}: {output}"
         );
+        // The bootstrap's own log goes to the pod's directory too.
+        let log = fs::read_to_string(setup.refused_dir.join(".pod/bootstrap.log"))?;
+        assert!(
+            log.contains("bootstrap: failed: the run directory belongs to another run"),
+            "{shell}: {log}"
+        );
         assert!(
             output.contains("delete reason=bootstrap_failed"),
             "{shell}: {output}"

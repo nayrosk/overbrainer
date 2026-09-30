@@ -15,14 +15,16 @@
 # temporary directories; overbrainer appends write_watchdog and the call to
 # bootstrap_main when it builds the pod's command. POSIX sh.
 
-# log MESSAGE: on stdout, which Runpod keeps in the pod's logs, and in the run's
-# .pod/bootstrap.log once the run directory exists, which overbrainer copies
-# with the results.
+# log MESSAGE: on stdout, which Runpod keeps in the pod's logs, and in
+# bootstrap_log_dir/bootstrap.log once bootstrap_main set it: the run's .pod/
+# once the run directory is claimed (overbrainer copies it with the results),
+# or the pod's own directory for a refused run. Never into a directory this pod
+# did not claim.
 log() {
   line="$(date -u +%Y-%m-%dT%H:%M:%SZ) bootstrap: $*"
   printf '%s\n' "$line"
-  if [ -n "${OVERBRAINER_RUN_DIR:-}" ] && [ -d "$OVERBRAINER_RUN_DIR/.pod" ]; then
-    printf '%s\n' "$line" >> "$OVERBRAINER_RUN_DIR/.pod/bootstrap.log" 2>/dev/null || true
+  if [ -n "${bootstrap_log_dir:-}" ]; then
+    printf '%s\n' "$line" >> "$bootstrap_log_dir/bootstrap.log" 2>/dev/null || true
   fi
 }
 
@@ -110,6 +112,7 @@ write_job_env() {
 bootstrap_main() {
   set -eu
   umask 077
+  bootstrap_log_dir=
   watchdog_file=$(watchdog_path)
   etc_ssh_dir=${OVERBRAINER_ETC_SSH_DIR:-/etc/ssh}
   authorized_keys_dir=${OVERBRAINER_AUTHORIZED_KEYS_DIR:-/root/.ssh}
@@ -125,11 +128,13 @@ bootstrap_main() {
     OVERBRAINER_RUN_DIR=${OVERBRAINER_REFUSED_RUN_DIR:-/root/overbrainer-refused-run}
     export OVERBRAINER_RUN_DIR
     mkdir -p "$OVERBRAINER_RUN_DIR/.pod" || fail "cannot create the run directory"
+    bootstrap_log_dir="$OVERBRAINER_RUN_DIR/.pod"
     write_watchdog "$watchdog_file" || fail "cannot write the watchdog"
     fail "the run directory belongs to another run"
   fi
   [ "$claimed" = 0 ] || fail "cannot create the run directory"
   mkdir -p "$OVERBRAINER_RUN_DIR/.pod" || fail "cannot create the run directory"
+  bootstrap_log_dir="$OVERBRAINER_RUN_DIR/.pod"
   log "run ${OVERBRAINER_RUN_ID:-unknown}"
   # A verdict left by an earlier pod (a network volume outlives it) must never be
   # read as this pod's: it goes before sshd can serve it.
