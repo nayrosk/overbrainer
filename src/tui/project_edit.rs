@@ -2204,6 +2204,7 @@ mod tests {
             Ok(Done::Catalog(Ok(Listed {
                 entries: volumes(),
                 gpus: Vec::new(),
+                note: None,
             }))),
         );
         let [Effect::Spawn(running, Task::SaveConfig { .. })] = reconciled.as_slice() else {
