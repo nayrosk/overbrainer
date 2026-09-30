@@ -134,7 +134,8 @@ fn config_check_shows_auto_runpod_choices() -> Result<(), Box<dyn std::error::Er
         .success();
     let toml = std::fs::read_to_string(dir.path().join("overbrainer.toml"))?;
     let runpod = "[targets.gpu_cloud]\nkind = \"runpod\"\ngpu_types = \"auto\"\ngpu_count = 2\n\
-                  min_vram_gb = 48\nmax_price_per_hour = 1.5\ndata_center_ids = \"auto\"\nmax_hours = 6\n";
+                  min_vram_gb = 48\nmax_price_per_hour = 1.5\ndata_center_ids = \"auto\"\nmax_hours = 6\n\
+                  max_cost_usd = 20\n";
     std::fs::write(
         dir.path().join("overbrainer.toml"),
         format!("{toml}\n{runpod}"),
@@ -146,7 +147,8 @@ fn config_check_shows_auto_runpod_choices() -> Result<(), Box<dyn std::error::Er
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "targets.gpu_cloud = runpod 2x [auto] (at least 48 GB, at most $1.5/h per GPU), max 6h, ",
+            "targets.gpu_cloud = runpod 2x [auto] (at least 48 GB, at most $1.5/h per GPU), max 6h, \
+             max $20, ",
         ))
         .stdout(predicate::str::contains("data centers auto, network volume none"));
     Ok(())

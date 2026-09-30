@@ -84,13 +84,15 @@ Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.4
 
 - `kind = "local"`: this machine, `runtime = "native"` (Axolotl in `venv`) or `"docker"`.
 - `kind = "ssh"`: a machine reached with `ssh`, host from `OVERBRAINER_TARGETS__NAME__HOST`.
-- `kind = "runpod"`: a pod created for the run and deleted afterwards. Needs `gpu_types` (a list, or `"auto"` to try every GPU type in stock, cheapest first, with at least the VRAM the model is estimated to need unless `min_vram_gb` is set) and `max_hours`, and `OVERBRAINER_RUNPOD__API_KEY`. A watchdog on the pod deletes it at `max_hours` at the latest.
+- `kind = "runpod"`: a pod created for the run and deleted afterwards. Needs `gpu_types` (a list, or `"auto"` to try every GPU type in stock, cheapest first, with at least the VRAM the model is estimated to need unless `min_vram_gb` is set) and `max_hours`, and `OVERBRAINER_RUNPOD__API_KEY`. A watchdog on the pod deletes it at `max_hours` at the latest, after asking the job for a snapshot 15 minutes before when nothing follows it. An optional `max_cost_usd` stops the job with a snapshot at 95% of that spend and deletes the pod at 100%.
 
 | Command | What it does |
 |---|---|
 | `overbrainer train` | Start a run on `training.target` and follow it until it ends. |
 | `overbrainer train --target NAME` | Same, on another target. |
 | `overbrainer train attach RUN_ID` | Follow a run again, then retrieve its results. |
+| `overbrainer train stop RUN_ID` | Stop a run's job with a snapshot (a checkpoint), retrieve it and the results. |
+| `overbrainer train --resume-from RUN_ID` | Start a new run from the snapshot of a stopped run, with the same training settings. |
 | `overbrainer train cancel RUN_ID` | Stop a run's job and retrieve its artifacts. |
 | `overbrainer runs ls` | List runs: ID, state, target, creation time, pod. |
 | `overbrainer runs logs RUN_ID [--pod] [--source container\|system] [--follow] [--tail N]` | Print a run's job log, or with `--pod` its Runpod pod's logs (kept in the run directory, secrets masked). |
@@ -103,7 +105,7 @@ Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.4
 | `overbrainer pod volumes` | List the account's network volumes. |
 | `overbrainer pod templates` | List the account's pod templates. |
 
-The job runs detached. Ctrl-C, a closed terminal or a lost connection only stop following it; the training goes on. `train` then exits non-zero and prints the `overbrainer train attach RUN_ID` command to use. That does not mean the run failed. A run ends as `succeeded`, `failed` or `cancelled`. Its files are in `runs/RUN_ID/`: `job.log` (the job's output, read it when a run fails), `metrics.jsonl`, and `output/` with the LoRA adapter (or the full model, and `output/merged/` with `merge = true`). After a run that succeeded, `train` and `run` print these paths on lines such as `train: adapter in runs/RUN_ID/output`.
+The job runs detached. Ctrl-C, a closed terminal or a lost connection only stop following it; the training goes on. `train` then exits non-zero and prints the `overbrainer train attach RUN_ID` command to use. That does not mean the run failed. A run ends as `succeeded`, `failed`, `cancelled` or `stopped` (stopped with a snapshot: `train --resume-from RUN_ID` goes on from it; prefer `train stop` to `train cancel` when the steps done so far are worth keeping). Its files are in `runs/RUN_ID/`: `job.log` (the job's output, read it when a run fails), `metrics.jsonl`, and `output/` with the LoRA adapter (or the full model, and `output/merged/` with `merge = true`). After a run that succeeded, `train` and `run` print these paths on lines such as `train: adapter in runs/RUN_ID/output`.
 
 Once `train` has stopped following a run, only `overbrainer train attach RUN_ID` retrieves its results. On Runpod, the watchdog deletes the pod `retrieve_grace_minutes` (60 by default) after the job ends if its results were not retrieved, and the results are lost with it. Attach well before that.
 

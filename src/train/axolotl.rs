@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-use super::metrics::{METRICS_ENV, METRICS_PLUGIN, PLUGIN_CLASS, PLUGIN_FILE};
+use super::metrics::{
+    METRICS_ENV, METRICS_PLUGIN, PLUGIN_CLASS, PLUGIN_FILE, SNAPSHOT_ENV, SNAPSHOT_FILE,
+    SNAPSHOT_REQUEST,
+};
 use super::{Artifacts, TrainError, Trainer, to_yaml};
 use crate::config::{Adapter, Training};
 use crate::dataset::DataFiles;
@@ -27,6 +30,43 @@ const PLUGIN_DIR: &str = "plugin";
 /// Axolotl's `dataset_prepared_path`: one per run, since Axolotl's cache key ignores
 /// file contents.
 const PREPARED_DIR: &str = "prepared";
+/// Where a resumed run holds the checkpoint it resumes from, relative to the run
+/// directory.
+pub const RESUME_DIR: &str = "resume";
+/// Top-level Axolotl keys a resumed run may set differently from the run it
+/// resumes: none changes what the checkpoint was trained with. The cadence of
+/// evaluations, saves and logs, the Hub push, and the logging integrations.
+const MAY_DIFFER: [&str; 18] = [
+    "resume_from_checkpoint",
+    "hub_model_id",
+    "hub_strategy",
+    "evals_per_epoch",
+    "eval_steps",
+    "eval_strategy",
+    "saves_per_epoch",
+    "save_steps",
+    "save_strategy",
+    "save_total_limit",
+    "logging_steps",
+    "use_tensorboard",
+    "use_wandb",
+    "use_mlflow",
+    "use_comet",
+    "wandb_*",
+    "mlflow_*",
+    "comet_*",
+];
+
+/// Whether a resumed run may set `key` differently: [`MAY_DIFFER`], where a
+/// trailing `*` stands for any rest of the name.
+fn may_differ(key: &str) -> bool {
+    MAY_DIFFER
+        .iter()
+        .any(|allowed| match allowed.strip_suffix('*') {
+            Some(prefix) => key.starts_with(prefix),
+            None => key == *allowed,
+        })
+}
 
 /// Chat templates bundled with Axolotl 0.19.0 that render `reasoning_content`.
 const REASONING_TEMPLATES: [&str; 5] = ["qwen3", "qwen3_5", "exaone4", "gemma4", "gemma4_unified"];
@@ -95,12 +135,35 @@ impl Outputs {
     }
 }
 
+/// The snapshot a new run resumes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resume {
+    /// The stopped run.
+    pub run_id: String,
+    /// Its local directory, holding its data, its `axolotl.yaml` and the
+    /// checkpoint.
+    pub dir: PathBuf,
+    /// The checkpoint, relative to `dir`, for example `output/checkpoint-120`.
+    pub checkpoint: String,
+}
+
+impl Resume {
+    /// The checkpoint's directory name, `checkpoint-120`.
+    fn name(&self) -> &str {
+        self.checkpoint
+            .rsplit('/')
+            .next()
+            .unwrap_or(self.checkpoint.as_str())
+    }
+}
+
 /// Fine-tunes with Axolotl from `data/train.jsonl`, evaluating on `data/eval.jsonl`.
 #[derive(Debug)]
 pub struct Axolotl<'a> {
     training: &'a Training,
     train: PathBuf,
     eval: PathBuf,
+    resume: Option<Resume>,
 }
 
 impl<'a> Axolotl<'a> {
@@ -111,7 +174,64 @@ impl<'a> Axolotl<'a> {
             training,
             train: files.train.clone(),
             eval: files.eval.clone(),
+            resume: None,
         }
+    }
+
+    /// The same trainer resuming from `resume`: it trains on the data of the
+    /// stopped run, and its runs start from a copy of the checkpoint.
+    #[must_use]
+    pub fn resuming(self, resume: Resume) -> Self {
+        Self {
+            train: resume.dir.join(TRAIN_FILE),
+            eval: resume.dir.join(EVAL_FILE),
+            resume: Some(resume),
+            ..self
+        }
+    }
+
+    /// The snapshot this trainer resumes from, if any.
+    #[must_use]
+    pub fn resume(&self) -> Option<&Resume> {
+        self.resume.as_ref()
+    }
+
+    /// The top-level Axolotl keys whose value differs between the stopped run
+    /// this trainer resumes from (its `axolotl.yaml`) and what the settings give
+    /// now, for the same run directory: the base model, the adapter, the
+    /// learning rate, the batch size, and any other that the checkpoint depends
+    /// on. Keys that only change the cadence of evaluations and saves, or the
+    /// Hub push, may differ. Empty when nothing differs or nothing is resumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainError::Io`] when the stopped run's `axolotl.yaml` cannot
+    /// be read, or names no `output_dir`.
+    pub fn resume_mismatch(&self) -> Result<Vec<String>, TrainError> {
+        let Some(resume) = &self.resume else {
+            return Ok(Vec::new());
+        };
+        let path = resume.dir.join(CONFIG_FILE);
+        let text = fs::read_to_string(&path).map_err(io_error(&path))?;
+        let theirs = top_level(&text);
+        let root = theirs
+            .get("output_dir")
+            .and_then(|block| block.strip_prefix("output_dir: \""))
+            .and_then(|value| value.trim_end().strip_suffix(&format!("/{OUTPUT_DIR}\"")))
+            .ok_or_else(|| TrainError::Io {
+                path: path.clone(),
+                source: std::io::Error::other("no output_dir"),
+            })?;
+        let ours = to_yaml(&self.config(root, theirs.contains_key("test_datasets")));
+        let ours = top_level(&ours);
+        let mut keys: Vec<&str> = theirs.keys().chain(ours.keys()).copied().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys
+            .into_iter()
+            .filter(|key| !may_differ(key) && theirs.get(key) != ours.get(key))
+            .map(str::to_string)
+            .collect())
     }
 
     /// The Axolotl config of a run whose directory the job sees at `root`, with
@@ -145,6 +265,12 @@ impl<'a> Axolotl<'a> {
             self.cadence_keys(map, root, has_eval);
             if let Some(hub_model_id) = &training.hub_model_id {
                 map.insert("hub_model_id".into(), json!(hub_model_id));
+            }
+            if let Some(resume) = &self.resume {
+                map.insert(
+                    "resume_from_checkpoint".into(),
+                    json!(format!("{root}/{RESUME_DIR}/{}", resume.name())),
+                );
             }
         }
         for (key, value) in &training.axolotl_extra {
@@ -216,6 +342,33 @@ fn dataset(path: &str) -> Value {
     })
 }
 
+/// Each top-level key of the YAML `text` with its whole block (its line and the
+/// indented lines under it), as [`to_yaml`] writes them.
+fn top_level(text: &str) -> std::collections::BTreeMap<&str, String> {
+    let mut blocks = std::collections::BTreeMap::new();
+    let mut current: Option<(&str, String)> = None;
+    for line in text.lines() {
+        let nested = line.starts_with(' ') || line.starts_with('-');
+        match &mut current {
+            Some((_, block)) if nested => {
+                block.push('\n');
+                block.push_str(line);
+            },
+            _ => {
+                if let Some((key, block)) = current.take() {
+                    blocks.insert(key, block);
+                }
+                let key = line.split_once(':').map_or(line, |(key, _)| key);
+                current = Some((key, line.to_string()));
+            },
+        }
+    }
+    if let Some((key, block)) = current {
+        blocks.insert(key, block);
+    }
+    blocks
+}
+
 /// Single local files only expose a `train` split, also for evaluation.
 fn test_dataset(path: &str) -> Value {
     let mut value = dataset(path);
@@ -256,6 +409,10 @@ impl Trainer for Axolotl<'_> {
             copy(&self.eval, &run_dir.join(EVAL_FILE))?;
         }
         write(&run_dir.join(PLUGIN_DIR).join(PLUGIN_FILE), METRICS_PLUGIN)?;
+        if let Some(resume) = &self.resume {
+            let into = run_dir.join(RESUME_DIR).join(resume.name());
+            link_tree(&resume.dir.join(&resume.checkpoint), &into)?;
+        }
         write(
             &run_dir.join(CONFIG_FILE),
             &to_yaml(&self.config(root, has_eval)),
@@ -275,7 +432,12 @@ impl Trainer for Axolotl<'_> {
             ("AXOLOTL_DO_NOT_TRACK".into(), "1".into()),
             ("PYTHONPATH".into(), format!("{root}/{PLUGIN_DIR}")),
             (METRICS_ENV.into(), format!("{root}/{METRICS_FILE}")),
+            (SNAPSHOT_ENV.into(), format!("{root}/{SNAPSHOT_REQUEST}")),
         ]
+    }
+
+    fn stop_marker(&self) -> Option<&'static str> {
+        Some(SNAPSHOT_FILE)
     }
 
     fn metrics_file(&self) -> &'static str {
@@ -319,6 +481,24 @@ fn copy(from: &Path, to: &Path) -> Result<(), TrainError> {
             to: to.to_path_buf(),
             source,
         })
+}
+
+/// Copies the directory `from` into `to`, file by file: each is hard-linked when
+/// both are on the same file system (a checkpoint can weigh gigabytes), copied
+/// otherwise. Anything that is neither a file nor a directory is left out.
+fn link_tree(from: &Path, to: &Path) -> Result<(), TrainError> {
+    fs::create_dir_all(to).map_err(io_error(to))?;
+    for entry in fs::read_dir(from).map_err(io_error(from))? {
+        let entry = entry.map_err(io_error(from))?;
+        let kind = entry.file_type().map_err(io_error(&entry.path()))?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            link_tree(&entry.path(), &target)?;
+        } else if kind.is_file() && fs::hard_link(entry.path(), &target).is_err() {
+            copy(&entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 fn write(path: &Path, content: &str) -> Result<(), TrainError> {

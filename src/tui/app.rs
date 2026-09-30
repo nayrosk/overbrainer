@@ -309,6 +309,8 @@ pub(super) enum Action {
     Quit,
     /// Cancelling the job of run `0`.
     Cancel(String),
+    /// Stopping the job of run `0` with a snapshot.
+    Stop(String),
     /// Starting a training run as planned.
     Start(Box<StartPlan>),
     /// Running auto mode as planned.
@@ -969,7 +971,7 @@ impl App {
             Msg::Event(_, event) => self.pipeline.event(&event),
             Msg::Lagged(_, skipped) => self.pipeline.skipped += skipped,
             Msg::Report(_, Report::Line(line)) => self.pipeline.results.push(line),
-            Msg::Report(_, Report::RunCreated(_))
+            Msg::Report(_, Report::RunCreated(_) | Report::RunStopped(_))
             | Msg::EditorExited(_)
             | Msg::BrowserFailed(_)
             | Msg::LogsExported(_)
@@ -1475,6 +1477,7 @@ impl App {
                 effects
             },
             Action::Cancel(run_id) => self.cancel_run(&run_id),
+            Action::Stop(run_id) => self.stop_run(&run_id),
             Action::Start(plan) => self.confirm_start(plan),
             Action::Auto(plan) => self.confirm_auto(*plan),
             Action::CancelAuto => self.cancel_auto(),
@@ -1856,6 +1859,7 @@ impl App {
             let run = &follow.run_id;
             match follow.job {
                 super::training::Job::Cancel => format!("waiting for the cancel of run {run}..."),
+                super::training::Job::Stop => format!("waiting for run {run} to detach..."),
                 super::training::Job::Start { .. } if follow.starting() => {
                     if follow.detach == super::training::Detach::Done {
                         format!("waiting for {} to be abandoned...", follow.run())
@@ -4114,6 +4118,143 @@ mod tests {
         cancel_started(&effects)?;
         keys(&mut app, &[KeyCode::Char('c')]);
         assert_eq!(app.overlay, None, "a cancel already runs");
+        Ok(())
+    }
+
+    /// [`runs_app`] whose running run has a job, and a third run, stopped with
+    /// a snapshot, selected last.
+    fn stoppable_app() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
+        let (dir, mut app) = runs_app()?;
+        let runs = crate::runs::Runs::new(dir.path());
+        let mut running = runs.load(FIRST)?;
+        running.job = Some(crate::exec::JobId {
+            dir: running.remote_dir.clone(),
+            pid: crate::exec::Pid::new(42)?,
+            container: None,
+        });
+        runs.save(&running)?;
+        let mut stopped =
+            crate::tui::snapshots::run(STOPPED, "homelab", crate::runs::RunState::Stopped);
+        stopped.snapshot = Some(crate::runs::Snapshot {
+            checkpoint: "output/checkpoint-120".into(),
+            step: 120,
+            reason: crate::runs::SnapshotReason::Requested,
+        });
+        runs.save(&stopped)?;
+        let effects = app.refresh_runs();
+        read(&mut app, effects);
+        Ok((dir, app))
+    }
+
+    const STOPPED: &str = "20260919-090000-5a5a";
+
+    #[test]
+    fn s_asks_then_stops_a_running_run_with_a_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = stoppable_app()?;
+        keys(&mut app, &[KeyCode::Char('s')]);
+        let Some(Overlay::Confirm(confirm)) = &app.overlay else {
+            return Err(format!("no dialog: {:?}", app.overlay).into());
+        };
+        assert_eq!(confirm.title, " Stop a run with a snapshot? ");
+        let effects = keys(&mut app, &[KeyCode::Char('y')]);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Spawn(_, Task::Train(TrainJob::Stop(run)))] if run == FIRST),
+            "{effects:?}"
+        );
+        assert_eq!(app.training.runs[0].record.id, FIRST);
+        assert!(app.training.stopping(FIRST));
+        keys(&mut app, &[KeyCode::Char('s')]);
+        assert_eq!(app.overlay, None);
+        assert_eq!(
+            status(&app),
+            Some("run 20260921-133200-a1b2 is being stopped")
+        );
+        // Neither an ended run nor a stopped one has a job to stop.
+        for _ in 0..2 {
+            keys(&mut app, &[KeyCode::Char('j'), KeyCode::Char('s')]);
+            assert_eq!(app.overlay, None);
+            assert!(
+                status(&app).is_some_and(
+                    |said| said.ends_with("has no running job to stop with a snapshot")
+                ),
+                "{:?}",
+                status(&app)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_a_followed_run_detaches_it_first() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = stoppable_app()?;
+        let follow = attach(&mut app)?;
+        watching(&mut app, follow);
+        keys(&mut app, &[KeyCode::Char('s')]);
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('y')]),
+            [Effect::Cancel(follow)]
+        );
+        let effects = ended(&mut app, follow, Ok(Done::Trained(Err(DETACHED.into()))));
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Spawn(_, Task::Train(TrainJob::Stop(run))) if run == FIRST
+            )),
+            "{effects:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn t_resumes_only_a_stopped_run() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut app) = stoppable_app()?;
+        keys(&mut app, &[KeyCode::Char('j')]);
+        assert_eq!(keys(&mut app, &[KeyCode::Char('T')]), []);
+        assert_eq!(
+            status(&app),
+            Some(
+                "run 20260920-101500-9f00 is succeeded: T resumes a run stopped with a snapshot (s)"
+            )
+        );
+        let effects = press(&mut app, &[KeyCode::Char('j'), KeyCode::Char('T')]);
+        let Some(Effect::Spawn(prepare, Task::PrepareResume(run))) = effects.last() else {
+            return Err(format!("{effects:?}").into());
+        };
+        assert_eq!(run, STOPPED);
+        let rows = text(&draw(&mut app, 120, 40)?).join("\n");
+        assert!(
+            rows.contains("snapshot at step 120 (requested): T resumes from it"),
+            "{rows}"
+        );
+        let plan = crate::tui::start::StartPlan {
+            resume: Some(crate::tui::start::ResumePlan {
+                run_id: STOPPED.into(),
+                step: 120,
+                checkpoint: "output/checkpoint-120".into(),
+            }),
+            ..crate::tui::snapshots::runpod_plan()
+        };
+        let prepare = *prepare;
+        app.on_done(prepare, Ok(Done::Prepared(Ok(plan))));
+        let Some(Overlay::Confirm(confirm)) = &app.overlay else {
+            return Err(format!("no dialog: {:?}", app.overlay).into());
+        };
+        assert_eq!(confirm.title, " Resume a training run? ");
+        assert!(
+            confirm.text.iter().any(|line| line
+                == "resume      run 20260919-090000-5a5a from step 120: its snapshot \
+                    runs/20260919-090000-5a5a/output/checkpoint-120 and its data"),
+            "{:?}",
+            confirm.text
+        );
+        let effects = keys(&mut app, &[KeyCode::Char('y')]);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Spawn(_, Task::Train(TrainJob::Resume(run))) if run == STOPPED
+            )),
+            "{effects:?}"
+        );
         Ok(())
     }
 

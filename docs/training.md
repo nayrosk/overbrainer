@@ -5,9 +5,11 @@
 | Command | What it does |
 |---|---|
 | `overbrainer train [--target NAME]` | Start a run and follow it until the job ends. |
+| `overbrainer train --resume-from RUN_ID` | Start a run from the snapshot of a stopped run. |
 | `overbrainer train attach RUN_ID` | Follow a run again, then retrieve its results. |
+| `overbrainer train stop RUN_ID` | Stop the job of a run with a snapshot, then retrieve it with the results. |
 | `overbrainer train cancel RUN_ID` | Stop the job of a run and retrieve its artifacts. |
-| `overbrainer runs ls` | List the runs: ID, state, target, creation time, and the pod of a Runpod run. |
+| `overbrainer runs ls` | List the runs: ID, state, target, creation time, the step of a stopped run's snapshot, and the pod of a Runpod run. |
 | `overbrainer runs logs RUN_ID [--tail N]` | Print the run's `job.log`. With `--pod [--source container\|system] [--follow]`, the logs of its Runpod pod instead (see [Runpod](runpod.md#pod-logs)). |
 | `overbrainer pod ls` | List the Runpod pods overbrainer created, with their run. |
 | `overbrainer pod rm RUN_ID [--force]` | Delete every pod of a run and wait until Runpod no longer shows them. |
@@ -18,7 +20,7 @@
 
 A run gets an ID made of the project name and the UTC time it was created, such as `malware_development_20260922-143005`. The project name is lowercased, every run of characters other than ASCII letters and digits becomes one `_`, and it is cut to 40 characters (`run` when nothing is left). A second run created in the same second gets `_2`, then `_3`, and so on. The run directory on the target is claimed as well, with a `.claim` file created exclusively, so a run started in the same second from another checkout of the project against the same work directory also moves on to the next ID instead of overwriting the other run. On Runpod the ID is fixed before the pod exists, so the pod's bootstrap claims the directory itself, before it writes anything there. When a run from another checkout already owns the directory on a shared network volume, the pod leaves it untouched and its watchdog deletes the pod; the run fails without touching the other run's files, and starting it again gives it a new ID. Runs created before v0.5.0 keep their IDs, such as `20260922-143005-a1b2`. `runs ls` and the TUI list runs by creation time.
 
-Each run has a directory `runs/<run-id>/`. It holds `axolotl.yaml`, copies of the train and eval files, the metrics plugin and `run.json` (target, job, state). Once the job has ended, it also holds `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. After a run that succeeded, `train`, `train attach` and `run` print these paths (`train: adapter in runs/<run-id>/output`, then `train: merged model in runs/<run-id>/output/merged`). Intermediate `checkpoint-*` directories stay on the target.
+Each run has a directory `runs/<run-id>/`. It holds `axolotl.yaml`, copies of the train and eval files, the metrics plugin and `run.json` (target, job, state). Once the job has ended, it also holds `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. After a run that succeeded, `train`, `train attach` and `run` print these paths (`train: adapter in runs/<run-id>/output`, then `train: merged model in runs/<run-id>/output/merged`). Intermediate `checkpoint-*` directories stay on the target, except the snapshot of a stopped run (see below).
 
 The job runs detached from overbrainer. Once it has started, Ctrl-C, a closed terminal or a lost SSH connection stop overbrainer from following it; the training goes on. Starting a run is never interrupted: a Ctrl-C pressed while a run is starting is only acted on once the job has actually started, so the command always finishes starting before it detaches. After Ctrl-C, overbrainer prints the `overbrainer train attach` command that follows the run again and exits with an error status. It does the same after six failed attempts in a row to reach the target.
 
@@ -31,6 +33,24 @@ train: run malware_development_20260922-143005 succeeded; step 1200/1200, epoch 
 While it follows a job, overbrainer also samples the machine the job runs on every 10 seconds, over the same connection: one shell script reads `nvidia-smi`, `/proc` (load, CPU time, memory), the cgroup v2 files of a container (its memory limit and CPU quota come first, since `/proc` shows the host inside a Runpod pod) and `df` on the run directory and `/`. `nvidia-smi` and `df` get 5 seconds each, so a stuck driver or network mount cannot hold the probe. On a network volume (a Runpod network volume is a shared MooseFS cluster), `df` reports the whole cluster, not the volume: those figures are shown as shared and never warn, and the volume's own usage is measured separately. The samples feed the TUI's system panel and the [metrics](configuration.md#metrics); a sample that fails is skipped, logged at debug level, and never stops the follow. A target without `nvidia-smi` simply shows no GPU.
 
 A run fails when the job exits with a non-zero code, or when it writes no metric line at all, which means Axolotl did not load the metrics plugin. `runs/<run-id>/job.log` holds the job's output.
+
+## Stopping with a snapshot
+
+`overbrainer train stop RUN_ID` stops a running job without losing what it trained. It writes `snapshot.request` in the run directory on the target; the metrics plugin sees it at the end of the current step, saves a full checkpoint (the adapter or model, the optimizer and scheduler state, the random state), stops training, and writes `snapshot.json` with the checkpoint and its step. `merge-lora` is skipped. The command then follows the job as `train attach` does until it ends, records the run `stopped`, and retrieves the checkpoint (`runs/<run-id>/output/checkpoint-N/`) in a second pass, checked against the target's SHA-256 manifest like the other artifacts. On Runpod the pod is then deleted.
+
+```
+train: run 20260922-143005-a1b2 stopped at step 1240 (requested): snapshot in runs/20260922-143005-a1b2/output/checkpoint-1240; resume with `overbrainer train --resume-from 20260922-143005-a1b2`
+```
+
+A job that neither saves its snapshot nor ends within 30 minutes of the request is cancelled. One that saved it but has not ended 10 minutes later is cancelled too, and still recorded `stopped` with its snapshot. A request that lands after the last step changes nothing: the run succeeds as usual. Under distributed training, rank 0 reads the request and tells the other ranks, so they all stop at the same step.
+
+`run.json` of a stopped run holds `snapshot`: `checkpoint`, `step` and `reason`, which is `requested` for `train stop` and the TUI, `deadline` or `cost` for the automatic snapshots of a Runpod run (see [Runpod](runpod.md)), or `disk`.
+
+## Resuming
+
+`overbrainer train --resume-from RUN_ID` starts a new run from the snapshot of a stopped run, on any target, `--target` included. The checkpoint is copied into `runs/<new-run-id>/resume/checkpoint-N/` (hard-linked when both are on the same file system), uploaded with the run, and passed to Axolotl as `resume_from_checkpoint`. The new run trains on the stopped run's own `data/train.jsonl` and `data/eval.jsonl`, not on the project's current ones, and its `run.json` names the stopped run in `resumed_from`.
+
+A resumed checkpoint only makes sense with the settings it was trained with. The run is refused when a key of the generated Axolotl config differs from the stopped run's `axolotl.yaml`, apart from these, which do not change what the checkpoint was trained with: `hub_model_id`, `hub_strategy`, `evals_per_epoch`, `eval_steps`, `eval_strategy`, `saves_per_epoch`, `save_steps`, `save_strategy`, `save_total_limit`, `logging_steps`, `use_tensorboard`, `use_wandb`, `use_mlflow`, `use_comet`, and any `wandb_*`, `mlflow_*` or `comet_*` key: for example `cannot resume from run RUN_ID: the training settings differ from the ones it ran with (learning_rate)`. A run that is not stopped, or whose checkpoint is not in `runs/`, is refused too; `train attach` retrieves a checkpoint that was not.
 
 ## Cancelling
 
@@ -111,6 +131,6 @@ The parent's reasoning is trained only if the chat template renders `reasoning_c
 
 overbrainer also sets `attn_implementation: sdpa` (no extra package needed), `gradient_checkpointing: true`, `warmup_ratio: 0.1` and `logging_steps: 1`.
 
-`[training.axolotl_extra]` is merged into the generated YAML last. Tables merge key by key, and any other value replaces the generated one, so it can change these too: for example `attn_implementation = "flash_attention_2"` on an image with flash-attn installed, or `chat_template = "qwen3"`. An `eval_steps` or `save_steps` there replaces `evals_per_epoch` or `saves_per_epoch`. It cannot set a key that has a typed setting above (use the setting), nor the keys overbrainer manages: `datasets`, `test_datasets`, `val_set_size`, `output_dir`, `dataset_prepared_path`, `plugins`.
+`[training.axolotl_extra]` is merged into the generated YAML last. Tables merge key by key, and any other value replaces the generated one, so it can change these too: for example `attn_implementation = "flash_attention_2"` on an image with flash-attn installed, or `chat_template = "qwen3"`. An `eval_steps` or `save_steps` there replaces `evals_per_epoch` or `saves_per_epoch`. It cannot set a key that has a typed setting above (use the setting), nor the keys overbrainer manages: `datasets`, `test_datasets`, `val_set_size`, `output_dir`, `dataset_prepared_path`, `plugins`, `resume_from_checkpoint`. `save_only_model = true` is refused too: a checkpoint without its optimizer state cannot be resumed after a snapshot.
 
 Values set through the environment (`OVERBRAINER_TRAINING__AXOLOTL_EXTRA__WARMUP_STEPS=10`) arrive as text. overbrainer turns `true`, `false`, integers and decimal numbers into booleans and numbers, and leaves anything else as text. A number-like value that must stay text belongs in `overbrainer.toml`.

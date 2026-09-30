@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use secrecy::SecretString;
 
+use super::snapshot::{Proof, Snapshot, read_proof};
 use super::{MetricsSummary, RunRecord, RunState, Runs, RunsError, new_run_id, rfc3339};
 use crate::events::{Event, EventBus};
 use crate::exec::{
@@ -13,7 +14,7 @@ use crate::exec::{
 };
 use crate::runpod::{POD_FILE, SSH_DIR, chain};
 use crate::system::{self, SystemSample, probe_script};
-use crate::train::{TrainError, Trainer};
+use crate::train::{SNAPSHOT_FILE, TrainError, Trainer};
 
 /// Hugging Face cache on the target, under the executor's work directory. Shared
 /// by the runs of that target so a base model is downloaded once.
@@ -58,6 +59,9 @@ pub enum RunError {
         "{0} on the target belongs to another run with the same ID, from another checkout of the project; start the run again"
     )]
     Taken(String),
+    /// A snapshot was asked for a run whose job already ended.
+    #[error("run {0} is not running ({1}): there is nothing to snapshot")]
+    NotRunning(String, String),
     /// [`collect`] was asked for a run that has not ended yet.
     #[error(
         "run {0} has not ended yet: watch or attach it, not collect, while it is preparing or running"
@@ -227,6 +231,8 @@ fn preparing(id: String, workdir: &str, target: &str, now: SystemTime) -> RunRec
         job: None,
         state: RunState::Preparing,
         message: None,
+        snapshot: None,
+        resumed_from: None,
     }
 }
 
@@ -307,6 +313,7 @@ async fn launch_job<E: Executor, T: Trainer>(
         cache_dir: &cache_dir,
         commands: &trainer.commands(),
         env: &trainer.env(&root),
+        stop_marker: trainer.stop_marker(),
         secrets: launch.secrets,
     });
     Ok(ctx.executor.spawn(&job).await?)
@@ -355,7 +362,12 @@ pub async fn watch<E: Executor, T: Trainer>(
     let local = ctx.runs.run_dir(&record.id)?;
     if record.state != RunState::Running {
         let summary = local_summary(&local.join(trainer.metrics_file()))?;
-        let retrieved = !artifacts_missing(&record) && local.join(JOB_LOG).is_file();
+        let retrieved = !artifacts_missing(&record)
+            && local.join(JOB_LOG).is_file()
+            && record
+                .snapshot
+                .as_ref()
+                .is_none_or(|snapshot| local.join(&snapshot.checkpoint).is_dir());
         return Ok(Outcome {
             record,
             summary,
@@ -377,19 +389,39 @@ pub async fn watch<E: Executor, T: Trainer>(
         never = sampler => match never {},
     };
     let (state, message) = outcome(status, &summary, &record.id);
-    let succeeded = state == RunState::Succeeded;
+    // A job cancelled once its proof was written (a stop whose job did not
+    // end in time) saved its checkpoint all the same: it is stopped too.
+    let (state, message, snapshot) = if matches!(state, RunState::Succeeded | RunState::Cancelled) {
+        match read_proof(ctx.executor, &record.remote_dir).await? {
+            Proof::None => (state, message, None),
+            Proof::Saved(snapshot) => (RunState::Stopped, None, Some(snapshot)),
+            Proof::Invalid(_) if state == RunState::Cancelled => (state, message, None),
+            Proof::Invalid(why) => (
+                RunState::Failed,
+                Some(format!("the job stopped with a snapshot, but {why}")),
+                None,
+            ),
+        }
+    } else {
+        (state, message, None)
+    };
+    let expect = Expect::of(state, snapshot.as_ref());
+    let kept = matches!(state, RunState::Succeeded | RunState::Stopped);
     let (state, message, retrieved) =
-        match retrieve(ctx.executor, trainer, &record.remote_dir, &local, succeeded).await {
+        match retrieve(ctx.executor, trainer, &record.remote_dir, &local, expect).await {
             Ok(Retrieved::Ok) => (state, message, true),
             // Recorded Failed, not Succeeded, but everything the target had was
             // still downloaded and verified: retrieved is still true.
-            Ok(Retrieved::NoOutput) => {
-                (RunState::Failed, Some(no_output_message(&record.id)), true)
-            },
-            Err(error) if succeeded => return Err(error.into()),
+            Ok(Retrieved::NoOutput) => (
+                RunState::Failed,
+                Some(no_output_message(&record.id, snapshot.as_ref())),
+                true,
+            ),
+            Err(error) if kept => return Err(error.into()),
             Err(error) => (state, Some(not_retrieved(message, &error)), false),
         };
     record.message = message;
+    record.snapshot = snapshot.filter(|_| state == RunState::Stopped);
     record.state = state;
     ctx.runs.save(&record)?;
     Ok(Outcome {
@@ -399,23 +431,47 @@ pub async fn watch<E: Executor, T: Trainer>(
     })
 }
 
-/// What [`retrieve`] found while checking a succeeded job's required output.
+/// What [`retrieve`] checks beyond the files themselves.
+#[derive(Debug, Clone, Copy)]
+enum Expect<'a> {
+    /// Nothing: the run failed or was cancelled.
+    Nothing,
+    /// The trainer's required entry holds a file: the run succeeded.
+    Output,
+    /// The snapshot's checkpoint, retrieved in a second pass: the run stopped.
+    Snapshot(&'a Snapshot),
+}
+
+impl<'a> Expect<'a> {
+    /// What a run in `state`, with `snapshot` when stopped, must have left.
+    fn of(state: RunState, snapshot: Option<&'a Snapshot>) -> Self {
+        match (state, snapshot) {
+            (RunState::Succeeded, _) => Self::Output,
+            (RunState::Stopped, Some(snapshot)) => Self::Snapshot(snapshot),
+            _ => Self::Nothing,
+        }
+    }
+}
+
+/// What [`retrieve`] found while checking what the run must have left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Retrieved {
-    /// Every local file matched the target's manifest exactly (`succeeded` was
-    /// false, or the trainer names no required entry, or that entry held a file).
+    /// Every local file matched the target's manifest exactly, and what the run
+    /// must have left is there (see [`Expect`]).
     Ok,
-    /// The job succeeded, but the target's required entry held no file: a
-    /// permanent condition, since nothing more will appear there for a retry to
-    /// find.
+    /// The job succeeded or stopped, but the target's required entry, or the
+    /// snapshot's checkpoint, held no file: a permanent condition, since nothing
+    /// more will appear there for a retry to find.
     NoOutput,
 }
 
 /// Copies the trainer's artifacts and the job log from `remote` into `local`, then
 /// checks that the local files under the trainer's entries are exactly the ones
 /// the target's SHA-256 manifest lists, with matching hashes: no file missing, none
-/// with a different hash, and none extra that the target did not have. When
-/// `succeeded`, a target whose required entry holds no file is reported as
+/// with a different hash, and none extra that the target did not have. A stopped
+/// run then gets its checkpoint (which the artifacts leave out) and its proof the
+/// same way, in a second pass. A succeeded run whose required entry holds no file,
+/// or a stopped one whose checkpoint holds none, is reported as
 /// [`Retrieved::NoOutput`] rather than as an error, once what does exist has been
 /// downloaded and verified.
 async fn retrieve<E: Executor, T: Trainer>(
@@ -423,32 +479,58 @@ async fn retrieve<E: Executor, T: Trainer>(
     trainer: &T,
     remote: &str,
     local: &Path,
-    succeeded: bool,
+    expect: Expect<'_>,
 ) -> Result<Retrieved, ExecError> {
     let artifacts = trainer.artifacts();
     let mut entries = artifacts.entries;
     entries.push(JOB_LOG.to_string());
-    let manifest = executor
-        .manifest(remote, &entries, &artifacts.exclude)
-        .await?;
-    let no_output = succeeded
-        && artifacts
+    // Boxed, as below: their state would otherwise weigh on every caller's future.
+    let manifest = Box::pin(retrieve_pass(
+        executor,
+        remote,
+        local,
+        entries,
+        artifacts.exclude,
+    ))
+    .await?;
+    let found = match expect {
+        Expect::Nothing => true,
+        Expect::Output => artifacts
             .required
             .as_deref()
-            .is_some_and(|required| !has_required(&manifest, required));
-    executor
-        .download(remote, local, &entries, &artifacts.exclude)
-        .await?;
+            .is_none_or(|required| has_required(&manifest, required)),
+        Expect::Snapshot(snapshot) => {
+            let entries = vec![snapshot.checkpoint.clone(), SNAPSHOT_FILE.to_string()];
+            let manifest =
+                Box::pin(retrieve_pass(executor, remote, local, entries, Vec::new())).await?;
+            has_required(&manifest, &snapshot.checkpoint)
+        },
+    };
+    Ok(if found {
+        Retrieved::Ok
+    } else {
+        Retrieved::NoOutput
+    })
+}
+
+/// One retrieval: the target's manifest of `entries` (less `exclude`), the
+/// download, then the check that the local files are exactly the manifest's.
+/// Returns the manifest.
+async fn retrieve_pass<E: Executor>(
+    executor: &E,
+    remote: &str,
+    local: &Path,
+    entries: Vec<String>,
+    exclude: Vec<String>,
+) -> Result<Vec<FileDigest>, ExecError> {
+    let manifest = executor.manifest(remote, &entries, &exclude).await?;
+    executor.download(remote, local, &entries, &exclude).await?;
     let local = local.to_path_buf();
-    let exclude = artifacts.exclude.clone();
-    tokio::task::spawn_blocking(move || verify(&local, &entries, &exclude, &manifest))
+    let listed = manifest.clone();
+    tokio::task::spawn_blocking(move || verify(&local, &entries, &exclude, &listed))
         .await
         .map_err(|error| ExecError::Protocol(format!("the verification task failed: {error}")))??;
-    Ok(if no_output {
-        Retrieved::NoOutput
-    } else {
-        Retrieved::Ok
-    })
+    Ok(manifest)
 }
 
 /// Whether `manifest` holds a file at or under `required`.
@@ -507,10 +589,16 @@ fn verify_error(message: String) -> ExecError {
 }
 
 /// The message recorded when a succeeded job leaves no file in its required
-/// entry: a permanent condition, since a retry cannot make the target produce
-/// what was never written.
-fn no_output_message(id: &str) -> String {
-    format!("the job succeeded but left no output (see runs/{id}/{JOB_LOG})")
+/// entry, or a stopped one no file in its checkpoint: a permanent condition,
+/// since a retry cannot make the target produce what was never written.
+fn no_output_message(id: &str, snapshot: Option<&Snapshot>) -> String {
+    match snapshot {
+        Some(snapshot) => format!(
+            "the job stopped with a snapshot but left no file in {} (see runs/{id}/{JOB_LOG})",
+            snapshot.checkpoint
+        ),
+        None => format!("the job succeeded but left no output (see runs/{id}/{JOB_LOG})"),
+    }
 }
 
 /// `message` with the reason the artifacts could not be retrieved added to it.
@@ -564,9 +652,8 @@ pub async fn collect<E: Executor, T: Trainer>(
         return Err(RunError::NotEnded(record.id));
     }
     let local = ctx.runs.run_dir(&record.id)?;
-    let succeeded = record.state == RunState::Succeeded;
-    if let Err(error) = retrieve(ctx.executor, trainer, &record.remote_dir, &local, succeeded).await
-    {
+    let expect = Expect::of(record.state, record.snapshot.as_ref());
+    if let Err(error) = retrieve(ctx.executor, trainer, &record.remote_dir, &local, expect).await {
         tracing::warn!(
             "cannot retrieve the artifacts of run {}: {error}",
             record.id
@@ -813,7 +900,15 @@ async fn retrieve_cancelled<E: Executor, T: Trainer>(
     record: &mut RunRecord,
 ) -> Result<bool, RunError> {
     let local = runs.run_dir(&record.id)?;
-    let Err(error) = retrieve(executor, trainer, &record.remote_dir, &local, false).await else {
+    let Err(error) = retrieve(
+        executor,
+        trainer,
+        &record.remote_dir,
+        &local,
+        Expect::Nothing,
+    )
+    .await
+    else {
         return Ok(true);
     };
     cancelled_warning("retrieve the artifacts of", &record.id, &error);
@@ -918,8 +1013,10 @@ mod tests {
         /// A run directory whose later saves [`break_saves_in`] breaks when a
         /// download is asked for, before it fails.
         break_on_download: Option<PathBuf>,
-        /// What the target's manifest lists.
+        /// What the target's manifest lists, under the entries asked for.
         manifest: Vec<FileDigest>,
+        /// The content of the target's `snapshot.json`.
+        proof: String,
         reads: AtomicU32,
         cancels: AtomicU32,
         /// How the probe answers.
@@ -928,6 +1025,8 @@ mod tests {
         /// Status polls answered `Running` before [`Fake::status`].
         running_polls: u32,
         polls: AtomicU32,
+        /// Every file written with `put_file`, with its content.
+        puts: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl Fake {
@@ -941,12 +1040,14 @@ mod tests {
                 failing_read: None,
                 break_on_download: None,
                 manifest: Vec::new(),
+                proof: String::new(),
                 reads: AtomicU32::new(0),
                 cancels: AtomicU32::new(0),
                 probe: Probe::Fails,
                 probes: AtomicU32::new(0),
                 running_polls: 0,
                 polls: AtomicU32::new(0),
+                puts: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -1001,10 +1102,13 @@ mod tests {
 
         fn read_from(
             &self,
-            _path: &str,
+            path: &str,
             offset: u64,
             limit: u64,
         ) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
+            if path.ends_with(SNAPSHOT_FILE) {
+                return ready(Ok(self.proof.clone().into_bytes()));
+            }
             let read = self.reads.fetch_add(1, Ordering::SeqCst);
             let start = usize::try_from(offset).unwrap_or(self.metrics.len());
             let mut bytes = self
@@ -1058,10 +1162,24 @@ mod tests {
         fn manifest(
             &self,
             _remote: &str,
-            _entries: &[String],
-            _exclude: &[String],
+            entries: &[String],
+            exclude: &[String],
         ) -> impl Future<Output = Result<Vec<FileDigest>, ExecError>> + Send {
-            ready(Ok(self.manifest.clone()))
+            let listed = self
+                .manifest
+                .iter()
+                .filter(|file| {
+                    entries.iter().any(|entry| {
+                        file.path == *entry || file.path.starts_with(&format!("{entry}/"))
+                    }) && !file.path.split('/').any(|part| {
+                        exclude
+                            .iter()
+                            .any(|pattern| crate::exec::glob_match(pattern, part))
+                    })
+                })
+                .cloned()
+                .collect();
+            ready(Ok(listed))
         }
 
         fn probe(&self, _script: &str) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
@@ -1074,6 +1192,17 @@ mod tests {
                     Probe::Hangs => std::future::pending().await,
                 }
             }
+        }
+
+        fn put_file(
+            &self,
+            path: &str,
+            content: &str,
+        ) -> impl Future<Output = Result<(), ExecError>> + Send {
+            if let Ok(mut puts) = self.puts.lock() {
+                puts.push((path.to_string(), content.to_string()));
+            }
+            ready(Ok(()))
         }
     }
 
@@ -1105,7 +1234,8 @@ mod tests {
         }
     }
 
-    /// A trainer whose successful runs must leave a file in `output/`.
+    /// A trainer whose successful runs must leave a file in `output/`, which
+    /// leaves the checkpoints out, as Axolotl's does.
     struct WithOutput;
 
     impl Trainer for WithOutput {
@@ -1128,7 +1258,7 @@ mod tests {
         fn artifacts(&self) -> Artifacts {
             Artifacts {
                 entries: vec!["output".to_string()],
-                exclude: Vec::new(),
+                exclude: vec!["checkpoint-*".to_string()],
                 required: Some("output".to_string()),
             }
         }
@@ -1143,6 +1273,8 @@ mod tests {
             job: Some(job()?),
             state: RunState::Running,
             message: None,
+            snapshot: None,
+            resumed_from: None,
         })
     }
 
@@ -1849,6 +1981,288 @@ mod tests {
             Some("the job exited with code 2")
         );
         assert_eq!(runs.load(RUN_ID)?, collected);
+        Ok(())
+    }
+
+    const PROOF: &str =
+        r#"{"checkpoint": "output/checkpoint-3", "step": 3, "time": 1.0, "reason": "deadline"}"#;
+
+    /// What a stopped job leaves on the target: its output, its log, the
+    /// checkpoint and the proof.
+    fn stopped_manifest() -> Vec<FileDigest> {
+        vec![
+            listed("job.log"),
+            listed("output/adapter.bin"),
+            listed("output/checkpoint-3/optimizer.pt"),
+            listed("snapshot.json"),
+        ]
+    }
+
+    /// Watches a run whose job exits 0 with `proof` on a target listing
+    /// `manifest`, after writing `files` locally as the downloads would.
+    async fn watch_stopped(
+        proof: &str,
+        manifest: Vec<FileDigest>,
+        files: &[&str],
+    ) -> Result<(Runs, tempfile::TempDir, Result<Outcome, RunError>), Box<dyn std::error::Error>>
+    {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            manifest,
+            proof: proof.to_string(),
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        runs.save(&running()?)?;
+        for path in files {
+            downloaded(&runs, path, "w")?;
+        }
+        let result = watch(&ctx(&runs, &fake, &bus), &WithOutput, running()?).await;
+        Ok((runs, project, result))
+    }
+
+    #[tokio::test]
+    async fn a_job_that_left_a_proof_is_stopped_with_its_checkpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let files = [
+            "job.log",
+            "output/adapter.bin",
+            "output/checkpoint-3/optimizer.pt",
+            "snapshot.json",
+        ];
+        let (runs, _project, result) = watch_stopped(PROOF, stopped_manifest(), &files).await?;
+        let outcome = result?;
+        assert_eq!(outcome.record.state, RunState::Stopped);
+        assert!(outcome.retrieved);
+        assert_eq!(outcome.record.message, None);
+        assert_eq!(
+            outcome.record.snapshot,
+            Some(Snapshot {
+                checkpoint: "output/checkpoint-3".into(),
+                step: 3,
+                reason: crate::runs::SnapshotReason::Deadline,
+            })
+        );
+        assert_eq!(runs.load(RUN_ID)?, outcome.record);
+        // Ended, it reads as retrieved while its checkpoint is there.
+        let bus = EventBus::new();
+        let fake = Fake::new(JobStatus::Exited(0));
+        let again = watch(
+            &ctx(&runs, &fake, &bus),
+            &WithOutput,
+            outcome.record.clone(),
+        )
+        .await?;
+        assert!(again.retrieved);
+        std::fs::remove_dir_all(runs.run_dir(RUN_ID)?.join("output/checkpoint-3"))?;
+        let again = watch(&ctx(&runs, &fake, &bus), &WithOutput, outcome.record).await?;
+        assert!(!again.retrieved);
+        Ok(())
+    }
+
+    /// A proof at the final step (the plugin ignores a request there, but a job
+    /// that wrote one anyway) still records the run stopped: the proof, not
+    /// the step, decides, and the checkpoint is resumable.
+    #[tokio::test]
+    async fn a_proof_at_the_final_step_still_records_the_run_stopped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            manifest: stopped_manifest(),
+            proof: PROOF.to_string(),
+            metrics: "{\"event\": \"begin\", \"time\": 1, \"max_steps\": 3}\n\
+                      {\"event\": \"log\", \"time\": 2, \"step\": 3, \"max_steps\": 3, \"loss\": 1.0}\n"
+                .to_string(),
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        runs.save(&running()?)?;
+        for path in [
+            "job.log",
+            "output/adapter.bin",
+            "output/checkpoint-3/optimizer.pt",
+            "snapshot.json",
+        ] {
+            downloaded(&runs, path, "w")?;
+        }
+        let outcome = watch(&ctx(&runs, &fake, &bus), &WithOutput, running()?).await?;
+        assert_eq!(outcome.summary.lines, 2);
+        assert_eq!(outcome.record.state, RunState::Stopped);
+        assert_eq!(
+            outcome.record.snapshot.map(|snapshot| snapshot.step),
+            Some(3)
+        );
+        assert!(outcome.retrieved);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_cancelled_after_its_proof_is_stopped() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            manifest: stopped_manifest(),
+            proof: PROOF.to_string(),
+            ..Fake::new(JobStatus::Cancelled)
+        };
+        runs.save(&running()?)?;
+        for path in [
+            "job.log",
+            "output/adapter.bin",
+            "output/checkpoint-3/optimizer.pt",
+            "snapshot.json",
+        ] {
+            downloaded(&runs, path, "w")?;
+        }
+        let outcome = watch(&ctx(&runs, &fake, &bus), &WithOutput, running()?).await?;
+        assert_eq!(outcome.record.state, RunState::Stopped);
+        assert!(outcome.retrieved);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_not_retrieved_leaves_a_stopped_run_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let files = ["job.log", "output/adapter.bin", "snapshot.json"];
+        let (runs, _project, result) = watch_stopped(PROOF, stopped_manifest(), &files).await?;
+        let error = result.err().ok_or("the watch succeeded")?;
+        assert_eq!(
+            error.to_string(),
+            "verify failed: \"output/checkpoint-3/optimizer.pt\" is missing locally"
+        );
+        assert_eq!(runs.load(RUN_ID)?.state, RunState::Running);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_without_a_checkpoint_or_a_valid_proof_is_a_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = vec![
+            listed("job.log"),
+            listed("output/adapter.bin"),
+            listed("snapshot.json"),
+        ];
+        let files = ["job.log", "output/adapter.bin", "snapshot.json"];
+        let (_, _project, result) = watch_stopped(PROOF, manifest.clone(), &files).await?;
+        let outcome = result?;
+        assert_eq!(outcome.record.state, RunState::Failed);
+        assert_eq!(outcome.record.snapshot, None);
+        assert_eq!(
+            outcome.record.message.as_deref(),
+            Some(
+                format!(
+                    "the job stopped with a snapshot but left no file in output/checkpoint-3 \
+                     (see runs/{RUN_ID}/job.log)"
+                )
+                .as_str()
+            )
+        );
+        let (_, _project, result) =
+            watch_stopped(r#"{"checkpoint": "../x", "step": 3}"#, manifest, &files).await?;
+        let outcome = result?;
+        assert_eq!(outcome.record.state, RunState::Failed);
+        assert_eq!(
+            outcome.record.message.as_deref(),
+            Some(
+                "the job stopped with a snapshot, but snapshot.json names an invalid checkpoint path"
+            )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collect_retrieves_the_checkpoint_of_a_stopped_run_again()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let mut record = running()?;
+        record.state = RunState::Stopped;
+        record.snapshot = Some(Snapshot {
+            checkpoint: "output/checkpoint-3".into(),
+            step: 3,
+            reason: crate::runs::SnapshotReason::Requested,
+        });
+        runs.save(&record)?;
+        let fake = Fake {
+            manifest: stopped_manifest(),
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        for path in ["job.log", "output/adapter.bin", "snapshot.json"] {
+            downloaded(&runs, path, "w")?;
+        }
+        let (_, retrieved) = collect(&ctx(&runs, &fake, &bus), &WithOutput, record.clone()).await?;
+        assert!(!retrieved, "the checkpoint is missing locally");
+        downloaded(&runs, "output/checkpoint-3/optimizer.pt", "w")?;
+        let (collected, retrieved) = collect(&ctx(&runs, &fake, &bus), &WithOutput, record).await?;
+        assert!(retrieved);
+        assert_eq!(collected.state, RunState::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_request_carries_its_reason_to_a_running_run_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::runs::{SnapshotReason, request_snapshot};
+        let fake = Fake::new(JobStatus::Running);
+        let record = running()?;
+        request_snapshot(&fake, &record, SnapshotReason::Cost).await?;
+        let puts = fake.puts.lock().map_err(|_| "poisoned")?.clone();
+        assert_eq!(
+            puts,
+            vec![(format!("/w/{RUN_ID}/snapshot.request"), "cost".to_string())]
+        );
+        let mut ended = record.clone();
+        ended.state = RunState::Succeeded;
+        let refused = request_snapshot(&fake, &ended, SnapshotReason::Requested).await;
+        assert!(
+            matches!(refused, Err(RunError::NotRunning(..))),
+            "{refused:?}"
+        );
+        let mut preparing = record;
+        preparing.job = None;
+        let refused = request_snapshot(&fake, &preparing, SnapshotReason::Requested).await;
+        assert!(
+            matches!(refused, Err(RunError::NotStarted(_))),
+            "{refused:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stop_with_no_snapshot_in_time_cancels_the_job()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::runs::{StopLimits, with_stop_fallback};
+        let job = job()?;
+        let limits = StopLimits {
+            proof: Duration::from_millis(1),
+            end: Duration::from_millis(50),
+        };
+        // (proof, status, how long the flow takes, cancels): no proof is
+        // cancelled at once; a proof gets `end` more, then is cancelled if the
+        // job still runs; a flow ending first cancels nothing.
+        for (proof, status, lasts, cancels) in [
+            ("", JobStatus::Running, 200, 1),
+            (PROOF, JobStatus::Running, 200, 1),
+            (PROOF, JobStatus::Running, 20, 0),
+            ("", JobStatus::Exited(0), 200, 0),
+        ] {
+            let fake = Fake {
+                proof: proof.to_string(),
+                ..Fake::new(status)
+            };
+            let flow = tokio::time::sleep(Duration::from_millis(lasts));
+            with_stop_fallback(&fake, &job, limits, flow).await;
+            assert_eq!(
+                fake.cancels.load(Ordering::SeqCst),
+                cancels,
+                "{proof:?} {status:?} {lasts}"
+            );
+        }
         Ok(())
     }
 

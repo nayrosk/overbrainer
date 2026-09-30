@@ -388,6 +388,21 @@ pub trait Executor: Send + Sync {
     /// zero, and an [`ExecError`] when the target cannot be reached.
     fn probe(&self, script: &str) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send;
 
+    /// Replaces the small file `path` on the target with `content`, creating its
+    /// directory, through a rename: a reader sees the old content or the new one,
+    /// never part of it. A Runpod run's lease and markers, and a snapshot request,
+    /// are written with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExecError`] when the file cannot be written or the target
+    /// cannot be reached.
+    fn put_file(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> impl Future<Output = Result<(), ExecError>> + Send;
+
     /// Follows the file `path` from byte `offset`, one complete line at a time.
     fn tail(&self, path: &str, offset: u64) -> LineStream<'_, Self>
     where
@@ -487,6 +502,13 @@ impl Executor for AnyExecutor {
             Self::Ssh(executor) => executor.probe(script).await,
         }
     }
+
+    async fn put_file(&self, path: &str, content: &str) -> Result<(), ExecError> {
+        match self {
+            Self::Local(executor) => executor.put_file(path, content).await,
+            Self::Ssh(executor) => executor.put_file(path, content).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -501,6 +523,11 @@ mod tests {
         std::fs::write(&file, "0123456789")?;
         let path = file.to_string_lossy().into_owned();
         assert_eq!(executor.read_from(&path, 2, 3).await?, b"234");
+        let put = Path::new(executor.workdir()).join("r1/.pod/snapshot.request");
+        let put = put.to_string_lossy().into_owned();
+        executor.put_file(&put, "deadline").await?;
+        executor.put_file(&put, "cost").await?;
+        assert_eq!(std::fs::read_to_string(&put)?, "cost");
         Ok(())
     }
 

@@ -17,6 +17,19 @@ pub const PLUGIN_CLASS: &str = "overbrainer_metrics.OverbrainerMetricsPlugin";
 /// Env variable naming the file the plugin appends to.
 pub const METRICS_ENV: &str = "OVERBRAINER_METRICS";
 
+/// Env variable naming the snapshot request the plugin watches for.
+pub const SNAPSHOT_ENV: &str = "OVERBRAINER_SNAPSHOT";
+
+/// The snapshot request, relative to the run directory. Once it exists, the
+/// plugin saves a checkpoint at the end of the current step and stops training.
+/// It holds the reason, one word (see `runs::SnapshotReason`), or nothing.
+pub const SNAPSHOT_REQUEST: &str = "snapshot.request";
+
+/// The proof of a snapshot, relative to the run directory, written by the plugin
+/// once the checkpoint is saved: `{"checkpoint", "step", "time", "reason"}`, the
+/// checkpoint relative to the run directory.
+pub const SNAPSHOT_FILE: &str = "snapshot.json";
+
 /// One training log line: the trainer's step and the values it logged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrainMetric {

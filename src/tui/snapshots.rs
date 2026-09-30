@@ -420,6 +420,8 @@ pub(super) fn run(id: &str, target: &str, state: crate::runs::RunState) -> crate
         job: None,
         state,
         message: None,
+        snapshot: None,
+        resumed_from: None,
     }
 }
 
@@ -1544,6 +1546,7 @@ pub(super) fn runpod_plan() -> StartPlan {
             1,
         )))),
         warnings: vec!["qwen2 renders no reasoning_content (see the logs)".into()],
+        resume: None,
     }
 }
 

@@ -298,9 +298,16 @@ impl App {
         }
     }
 
-    /// Training task `id` ended on run `run`, failing with `error`: the
-    /// chain ends there when it is its run, saying where the model is.
-    pub(super) fn auto_trained(&mut self, id: TaskId, run: &str, error: Option<&str>) {
+    /// Training task `id` ended on run `run`, failing with `error`, or
+    /// stopped with a snapshot at step `stopped_at`: the chain ends there when
+    /// it is its run, saying where the model is, or how to resume it.
+    pub(super) fn auto_trained(
+        &mut self,
+        id: TaskId,
+        run: &str,
+        error: Option<&str>,
+        stopped_at: Option<u64>,
+    ) {
         if self.auto.train_task() != Some(id) {
             return;
         }
@@ -309,6 +316,17 @@ impl App {
         };
         let leaving = self.leaving.is_some();
         let said = match (error, &chain.plan.run) {
+            // Stopped with a snapshot: the model is not finished.
+            (None, Some(_)) if !leaving && stopped_at.is_some() => {
+                chain.state = ChainState::Stopped;
+                (
+                    Severity::Info,
+                    format!(
+                        "auto stopped at {TRAIN}: snapshot at step {}; T resumes it",
+                        stopped_at.unwrap_or_default()
+                    ),
+                )
+            },
             (None, Some((_, outputs))) if !leaving => {
                 chain.state = ChainState::Done;
                 let paths: Vec<String> = outputs
@@ -509,6 +527,40 @@ mod tests {
             "✓ auto done: runs/r7/output, merged model runs/r7/output/merged"
         );
         assert!(!app.auto.running());
+        Ok(())
+    }
+
+    #[test]
+    fn a_run_stopped_with_a_snapshot_stops_the_chain_and_says_how_to_resume() -> TestResult {
+        let mut app = app();
+        let mut id = confirmed(&mut app, plan(true))?;
+        for _ in 0..3 {
+            let spawned = end(&mut app, id, Ok(()));
+            let [(next, Task::Pipeline(_))] = spawned[..] else {
+                return Err(format!("{spawned:?}").into());
+            };
+            id = next;
+        }
+        let spawned = end(&mut app, id, Ok(()));
+        let [(train, Task::Train(TrainJob::Start { .. }))] = spawned[..] else {
+            return Err(format!("{spawned:?}").into());
+        };
+        app.on_message(crate::tui::tasks::Msg::Report(
+            train,
+            crate::cli::front::Report::RunCreated("r7".into()),
+        ));
+        app.on_message(crate::tui::tasks::Msg::Report(
+            train,
+            crate::cli::front::Report::RunStopped(1240),
+        ));
+        app.on_done(train, Ok(Done::Trained(Ok(()))));
+        assert_eq!(
+            status(&app),
+            "auto stopped at train: snapshot at step 1240; T resumes it"
+        );
+        assert!(!app.auto.running());
+        let chain = app.auto.chain.as_ref().ok_or("no chain")?;
+        assert_eq!(chain.state, ChainState::Stopped);
         Ok(())
     }
 

@@ -593,6 +593,7 @@ mod tests {
             venv: "/venv".to_string(),
             container_disk_gb: 50,
             max_hours: 1.0,
+            max_cost_usd: None,
             boot_grace: std::time::Duration::from_secs(1800),
             retrieve_grace: std::time::Duration::from_secs(3600),
             data_center_ids,

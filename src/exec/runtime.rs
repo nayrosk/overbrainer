@@ -48,6 +48,10 @@ pub struct JobSpec<'a> {
     /// than replacing it; every other entry, and every entry in the container
     /// runtime, is set as given.
     pub env: &'a [(String, String)],
+    /// A file, relative to the run directory, whose presence once the first
+    /// command ended skips the others (see
+    /// [`Trainer::stop_marker`](crate::train::Trainer::stop_marker)).
+    pub stop_marker: Option<&'a str>,
     /// Secret environment, passed through without its values on any command line.
     pub secrets: Vec<(String, SecretString)>,
 }
@@ -165,7 +169,10 @@ fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>)
             .map(|(name, _)| format!("-e {}", quote(name))),
     );
     words.push(quote(image));
-    words.push(format!("sh -c {}", quote(&chain(spec.commands, quote))));
+    words.push(format!(
+        "sh -c {}",
+        quote(&chain(spec.commands, spec.stop_marker, quote))
+    ));
     format!(
         "mkdir -p -- {} && {}",
         quote(spec.cache_dir),
@@ -190,7 +197,7 @@ fn native_script(venv: Option<&str>, env_file: Option<&str>, spec: &JobSpec<'_>)
             .collect();
         parts.push(format!("export {}", exports.join(" ")));
     }
-    parts.push(chain(spec.commands, resolve));
+    parts.push(chain(spec.commands, spec.stop_marker, resolve));
     parts.join(" && ")
 }
 
@@ -210,9 +217,14 @@ fn export_word(name: &str, value: &str) -> String {
 }
 
 /// `commands` joined with `&&`, each program resolved by `program` and each argument
-/// quoted.
-fn chain(commands: &[Vec<String>], program: impl Fn(&str) -> String) -> String {
-    commands
+/// quoted. With a `stop_marker`, the commands after the first run only when that
+/// file does not exist once the first ended; the job then exits 0 without them.
+fn chain(
+    commands: &[Vec<String>],
+    stop_marker: Option<&str>,
+    program: impl Fn(&str) -> String,
+) -> String {
+    let lines: Vec<String> = commands
         .iter()
         .filter_map(|command| {
             let (first, args) = command.split_first()?;
@@ -220,8 +232,15 @@ fn chain(commands: &[Vec<String>], program: impl Fn(&str) -> String) -> String {
             words.extend(args.iter().map(|arg| quote(arg)));
             Some(words.join(" "))
         })
-        .collect::<Vec<_>>()
-        .join(" && ")
+        .collect();
+    match (stop_marker, lines.split_first()) {
+        (Some(marker), Some((first, rest))) if !rest.is_empty() => format!(
+            "{first} && {{ [ -f {} ] || {{ {}; }}; }}",
+            quote(marker),
+            rest.join(" && ")
+        ),
+        _ => lines.join(" && "),
+    }
 }
 
 /// A path as a shell word, with a leading `~/` expanded to the target's home.
@@ -245,6 +264,7 @@ mod tests {
             cache_dir: "/w/.hf-cache",
             commands,
             env: &[],
+            stop_marker: None,
             secrets: Vec::new(),
         }
     }
@@ -405,6 +425,58 @@ mod tests {
 
     /// `sh` is required by [`native_pythonpath_is_prepended_to_the_inherited_value`];
     /// it skips (not fails) without it.
+    #[test]
+    fn a_stop_marker_skips_the_commands_after_the_first() -> Result<(), Box<dyn std::error::Error>>
+    {
+        if !sh_available() {
+            eprintln!("skipped: sh is not installed");
+            return Ok(());
+        }
+        let step = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let steps = vec![
+            step("printf a >> trail; [ -z \"$STOP\" ] || : > snapshot.json"),
+            step("printf b >> trail"),
+            step("printf c >> trail"),
+        ];
+        let runtime = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        };
+        let job = runtime.job(JobSpec {
+            stop_marker: Some("snapshot.json"),
+            ..spec(&steps)
+        });
+        for (stop, trail) in [(false, "abc"), (true, "a")] {
+            let dir = tempfile::tempdir()?;
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(&job.script).current_dir(dir.path());
+            if stop {
+                command.env("STOP", "1");
+            } else {
+                command.env_remove("STOP");
+            }
+            assert!(command.status()?.success(), "{}", job.script);
+            assert_eq!(std::fs::read_to_string(dir.path().join("trail"))?, trail);
+        }
+        let docker = JobRuntime::Container {
+            engine: Engine::Docker,
+            image: "img:1".into(),
+        };
+        let script = docker
+            .job(JobSpec {
+                stop_marker: Some("snapshot.json"),
+                ..spec(&commands())
+            })
+            .script;
+        assert!(
+            script.ends_with(
+                "sh -c ''\\''axolotl'\\'' '\\''train'\\'' '\\''axolotl.yaml'\\'' && { [ -f '\\''snapshot.json'\\'' ] || { '\\''axolotl'\\'' '\\''merge-lora'\\'' '\\''axolotl.yaml'\\''; }; }'"
+            ),
+            "{script}"
+        );
+        Ok(())
+    }
+
     fn sh_available() -> bool {
         std::process::Command::new("sh")
             .arg("-c")

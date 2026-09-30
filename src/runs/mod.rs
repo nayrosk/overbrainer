@@ -2,6 +2,7 @@
 //! train, attach and cancel flows.
 
 mod id;
+mod snapshot;
 mod summary;
 mod train;
 
@@ -14,6 +15,10 @@ use serde::{Deserialize, Serialize};
 pub use id::{
     RUN_ID_MAX, compact_utc, is_safe_name, is_valid_run_id, new_run_id, parse_rfc3339,
     project_slug, rfc3339,
+};
+pub use snapshot::{
+    Proof, STOP_LIMITS, STOP_TIMEOUT, Snapshot, SnapshotReason, StopLimits, parse_proof,
+    read_proof, request_snapshot, with_stop_fallback,
 };
 pub use summary::MetricsSummary;
 pub use train::{
@@ -84,6 +89,9 @@ pub enum RunState {
     Failed,
     /// The job was cancelled.
     Cancelled,
+    /// The job was stopped with a snapshot: it saved a checkpoint, ended with
+    /// exit code 0, and a new run can resume from it.
+    Stopped,
 }
 
 impl RunState {
@@ -96,6 +104,7 @@ impl RunState {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Stopped => "stopped",
         }
     }
 }
@@ -117,6 +126,12 @@ pub struct RunRecord {
     pub state: RunState,
     /// Why the run failed, when it did.
     pub message: Option<String>,
+    /// The snapshot of a stopped run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Snapshot>,
+    /// The run this one resumed from, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<String>,
 }
 
 /// Most runs [`Runs::claim`] makes with one base ID: `base`, then `base_2` to
@@ -350,7 +365,39 @@ pub(crate) mod tests {
             job: None,
             state: RunState::Preparing,
             message: None,
+            snapshot: None,
+            resumed_from: None,
         }
+    }
+
+    #[test]
+    fn a_stopped_record_keeps_its_snapshot_and_an_old_one_reads_without()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let mut stopped = record("20260922-143005-bbbb");
+        stopped.state = RunState::Stopped;
+        stopped.snapshot = Some(Snapshot {
+            checkpoint: "output/checkpoint-120".into(),
+            step: 120,
+            reason: SnapshotReason::Deadline,
+        });
+        stopped.resumed_from = Some("20260921-000000-aaaa".into());
+        runs.save(&stopped)?;
+        assert_eq!(runs.load(&stopped.id)?, stopped);
+        let json = fs::read_to_string(runs.run_dir(&stopped.id)?.join(RECORD_FILE))?;
+        assert!(json.contains("\"state\": \"stopped\""), "{json}");
+        assert!(json.contains("\"reason\": \"deadline\""), "{json}");
+        // A record without them, as older versions wrote it, has neither.
+        let plain = record("20260922-143005-cccc");
+        runs.save(&plain)?;
+        let json = fs::read_to_string(runs.run_dir(&plain.id)?.join(RECORD_FILE))?;
+        assert!(
+            !json.contains("snapshot") && !json.contains("resumed_from"),
+            "{json}"
+        );
+        assert_eq!(runs.load(&plain.id)?, plain);
+        Ok(())
     }
 
     #[test]

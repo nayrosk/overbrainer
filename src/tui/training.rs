@@ -69,6 +69,8 @@ pub(super) enum Job {
     Attach,
     /// Cancels a run's job.
     Cancel,
+    /// Stops a run's job with a snapshot, then follows it until it ends.
+    Stop,
 }
 
 /// Whether a training task is detached: its token cancelled, so its raced watch
@@ -101,6 +103,11 @@ pub(super) struct Follow {
     pub(super) skipped: u64,
     /// Whether the run is cancelled once this task, detached, ends.
     pub(super) cancel_after: bool,
+    /// Whether the run is stopped with a snapshot once this task, detached,
+    /// ends.
+    pub(super) stop_after: bool,
+    /// The step of the snapshot its run ended stopped with, once it did.
+    pub(super) stopped_at: Option<u64>,
     /// Whether it is detached, or to be once its job's first status arrives.
     pub(super) detach: Detach,
 }
@@ -116,6 +123,8 @@ impl Follow {
             lines: Vec::new(),
             skipped: 0,
             cancel_after: false,
+            stop_after: false,
+            stopped_at: None,
             detach: Detach::No,
         }
     }
@@ -157,6 +166,8 @@ pub(super) enum RunActivity {
     },
     /// A cancel task, or a task whose run is cancelled once it ended.
     Cancelling,
+    /// A stop task, or a task whose run is stopped once it ended.
+    Stopping,
 }
 
 impl RunActivity {
@@ -167,6 +178,9 @@ impl RunActivity {
         };
         if follow.job == Job::Cancel || follow.cancel_after {
             return Self::Cancelling;
+        }
+        if follow.job == Job::Stop || follow.stop_after {
+            return Self::Stopping;
         }
         let runpod = follow.job == (Job::Start { runpod: true });
         match (follow.starting(), follow.detach) {
@@ -185,6 +199,7 @@ impl RunActivity {
             Self::Followed => "followed",
             Self::Starting { .. } | Self::Abandoning { .. } => "starting",
             Self::Cancelling => "cancelling",
+            Self::Stopping => "stopping",
         }
     }
 
@@ -458,6 +473,11 @@ impl TrainingView {
     /// detaches its task first.
     pub(super) fn cancelling(&self, id: &str) -> bool {
         self.activity(id) == RunActivity::Cancelling
+    }
+
+    /// Whether run `id` is being stopped with a snapshot.
+    pub(super) fn stopping(&self, id: &str) -> bool {
+        self.activity(id) == RunActivity::Stopping
     }
 
     /// Records `event` of task `id`. Returns whether it is the first job status

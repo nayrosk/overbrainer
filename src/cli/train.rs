@@ -1,4 +1,5 @@
-//! The training commands: `train`, `train attach`, `train cancel` and `runs ls`.
+//! The training commands: `train`, `train attach`, `train stop`, `train cancel`
+//! and `runs ls`.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,9 +16,10 @@ use crate::dataset::DataFiles;
 use crate::exec::{AnyExecutor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{PodRecord, RunpodTarget};
 use crate::runs::{
-    Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, cancel, create_on, start, watch,
+    Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, STOP_LIMITS, SnapshotReason,
+    cancel, create_on, request_snapshot, start, watch, with_stop_fallback,
 };
-use crate::train::{Axolotl, OUTPUT_DIR, Outputs, reasoning_template_warning};
+use crate::train::{Axolotl, OUTPUT_DIR, Outputs, Resume, reasoning_template_warning};
 
 /// Time between two looks at a running job.
 pub(super) const POLL: Duration = Duration::from_secs(2);
@@ -41,6 +43,7 @@ pub async fn run(
             train(project_dir, &settings, args, front).await
         },
         Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id, front, source).await,
+        Some(TrainCommand::Stop { run_id }) => stop(project_dir, run_id, front, source).await,
         Some(TrainCommand::Cancel { run_id }) => {
             cancel_run(project_dir, run_id, front, source).await
         },
@@ -87,12 +90,15 @@ async fn train(
         .targets
         .get(name)
         .with_context(|| format!("unknown target `{name}`"))?;
+    let runs = Runs::new(project_dir);
+    let trainer = trainer(project_dir, training, &runs, args.resume_from.as_deref())?;
     if let Some(spec) = RunpodTarget::from_target(target) {
         let start = RunpodStart {
             name,
             spec: &spec,
             keep: keep_pod,
             vram_floor: args.vram_floor,
+            trainer: &trainer,
         };
         return super::runpod_train::train(project_dir, settings, start, front).await;
     }
@@ -113,11 +119,10 @@ async fn train(
         Ok((secrets, executor))
     })
     .await?;
-    let runs = Runs::new(project_dir);
     let record = create_on(&runs, &executor, &settings.project.name, name).await?;
+    let record = resumed(&runs, record, &trainer)?;
     started(&record);
     front.run_created(&record.id);
-    let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let id = record.id.clone();
     let guard = front.open_bus();
     let ctx = RunCtx {
@@ -183,6 +188,139 @@ async fn attach(
     finish(&runs, run_id, result, front)
 }
 
+/// The trainer of a new run of `training`: resuming from the stopped run
+/// `resume_from` when given, which must hold its snapshot locally and have
+/// been trained with the same settings.
+///
+/// # Errors
+///
+/// Returns an error when `resume_from` is not a stopped run with its
+/// checkpoint in `runs/`, or its training settings differ from `training`.
+pub(crate) fn trainer<'a>(
+    project_dir: &Path,
+    training: &'a Training,
+    runs: &Runs,
+    resume_from: Option<&str>,
+) -> anyhow::Result<Axolotl<'a>> {
+    let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
+    let Some(id) = resume_from else {
+        return Ok(trainer);
+    };
+    let source = runs.load(id)?;
+    let snapshot = match (source.state, &source.snapshot) {
+        (RunState::Stopped, Some(snapshot)) => snapshot,
+        (state, _) => bail!(
+            "cannot resume from run {id}: it is {}, not stopped with a snapshot (see `overbrainer train stop`)",
+            state.name()
+        ),
+    };
+    let dir = runs.run_dir(id)?;
+    if !dir.join(&snapshot.checkpoint).is_dir() {
+        bail!(
+            "cannot resume from run {id}: its snapshot is not in {RUNS_DIR}/{id}/{}; retrieve it \
+             with `overbrainer train attach {id}`",
+            snapshot.checkpoint
+        );
+    }
+    let trainer = trainer.resuming(Resume {
+        run_id: id.to_string(),
+        dir,
+        checkpoint: snapshot.checkpoint.clone(),
+    });
+    let differ = trainer.resume_mismatch()?;
+    if !differ.is_empty() {
+        bail!(
+            "cannot resume from run {id}: the training settings differ from the ones it ran \
+             with ({}); set them back to resume, or start a new run",
+            differ.join(", ")
+        );
+    }
+    Ok(trainer)
+}
+
+/// The new run `record` of `trainer`, recording the run it resumes from.
+///
+/// # Errors
+///
+/// Returns an error when the record cannot be saved.
+pub(super) fn resumed(
+    runs: &Runs,
+    mut record: RunRecord,
+    trainer: &Axolotl<'_>,
+) -> anyhow::Result<RunRecord> {
+    if let Some(resume) = trainer.resume() {
+        record.resumed_from = Some(resume.run_id.clone());
+        runs.save(&record)?;
+        tracing::info!(
+            "train: run {} resumes from the snapshot of run {} ({})",
+            record.id,
+            resume.run_id,
+            resume.checkpoint
+        );
+    }
+    Ok(record)
+}
+
+/// `train stop`: asks the job for a snapshot, then follows it as `train attach`
+/// does until it ends, stopped; a job that gives no snapshot in time, or does
+/// not end once it gave one, is cancelled instead (see [`STOP_LIMITS`]).
+async fn stop(
+    project_dir: &Path,
+    run_id: &str,
+    front: &Frontend,
+    source: &Source,
+) -> anyhow::Result<()> {
+    let settings = source.load(project_dir)?;
+    let training = training(&settings)?;
+    let runs = Runs::new(project_dir);
+    let record = runs.load(run_id)?;
+    let job = stoppable(&record)?;
+    if let Some(pod) = PodRecord::load(&runs, run_id)? {
+        return super::runpod_train::stop(project_dir, &settings, record, pod, front).await;
+    }
+    let executor = run_executor(project_dir, &settings, &record).await?;
+    request_snapshot(&executor, &record, SnapshotReason::Requested).await?;
+    front.line(&stop_requested(run_id));
+    let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
+    let guard = front.open_bus();
+    let ctx = RunCtx {
+        runs: &runs,
+        executor: &executor,
+        bus: &guard.bus,
+        poll: POLL,
+    };
+    let flow = async {
+        // Boxed: its state would otherwise weigh on every caller's future.
+        let watched = Box::pin(watch(&ctx, &trainer, record));
+        with_stop_fallback(&executor, &job, STOP_LIMITS, watched)
+            .await
+            .with_context(|| reattach(run_id))
+    };
+    let result = front.interrupt().race(flow).await.transpose();
+    guard.close().await;
+    finish(&runs, run_id, result, front)
+}
+
+/// The job of `record` when a snapshot can be asked of it: the run is running.
+pub(super) fn stoppable(record: &RunRecord) -> anyhow::Result<crate::exec::JobId> {
+    let id = &record.id;
+    match (&record.job, record.state) {
+        (Some(job), RunState::Running) => Ok(job.clone()),
+        (None, _) | (_, RunState::Preparing) => {
+            bail!("run {id} has not started: there is no job to snapshot yet")
+        },
+        (Some(_), state) => bail!("run {id} already ended: {}", state.name()),
+    }
+}
+
+/// What `train stop` says once the request is written.
+pub(super) fn stop_requested(run_id: &str) -> String {
+    format!(
+        "train: snapshot of run {run_id} requested: its job saves a checkpoint at the end of \
+         its current step, then stops"
+    )
+}
+
 async fn cancel_run(
     project_dir: &Path,
     run_id: &str,
@@ -233,7 +371,8 @@ async fn cancel_run(
 }
 
 /// Prints the runs in `runs/`, oldest first: ID, state, target, creation time,
-/// and, for a Runpod run, what `pod.json` says of its pod (no API call).
+/// the step and reason of a stopped run's snapshot, and, for a Runpod run, what
+/// `pod.json` says of its pod (no API call).
 ///
 /// # Errors
 ///
@@ -258,8 +397,14 @@ pub fn list(project_dir: &Path) -> anyhow::Result<()> {
                 String::new()
             },
         };
+        let snapshot = record
+            .snapshot
+            .as_ref()
+            .map_or_else(String::new, |snapshot| {
+                format!("  step {} ({})", snapshot.step, snapshot.reason.name())
+            });
         println!(
-            "{:<width$}  {:<9}  {}  {}{pod}",
+            "{:<width$}  {:<9}  {}  {}{snapshot}{pod}",
             record.id,
             record.state.name(),
             record.target,
@@ -375,7 +520,8 @@ async fn run_executor(
 /// Emits the outcome through `front` (stdout on the command line), then, for a
 /// run that succeeded, where its model is, read from the run's own files (the
 /// settings may have changed since it started; nothing is said when they
-/// cannot be read); or explains how to follow an interrupted run.
+/// cannot be read), for a stopped one where its snapshot is and how to resume
+/// from it; or explains how to follow an interrupted run.
 pub(super) fn finish(
     runs: &Runs,
     id: &str,
@@ -408,6 +554,15 @@ pub(super) fn finish(
             }
             Ok(())
         },
+        RunState::Stopped => {
+            if let Some(line) = stopped_line(record) {
+                front.line(&line);
+            }
+            if let Some(snapshot) = &record.snapshot {
+                front.run_stopped(snapshot.step);
+            }
+            Ok(())
+        },
         RunState::Cancelled => bail!("run {} was cancelled", record.id),
         _ => bail!(
             "{}",
@@ -417,6 +572,19 @@ pub(super) fn finish(
                 .unwrap_or_else(|| format!("run {} failed", record.id))
         ),
     }
+}
+
+/// What a stopped run says: where its snapshot is, and how to resume from it.
+pub(crate) fn stopped_line(record: &RunRecord) -> Option<String> {
+    let snapshot = record.snapshot.as_ref()?;
+    let id = &record.id;
+    Some(format!(
+        "train: run {id} stopped at step {} ({}): snapshot in {RUNS_DIR}/{id}/{}; resume with \
+         `overbrainer train --resume-from {id}`",
+        snapshot.step,
+        snapshot.reason.name(),
+        snapshot.checkpoint
+    ))
 }
 
 /// After Ctrl-C, which only stops following a started job: it keeps running. A

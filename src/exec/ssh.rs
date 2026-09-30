@@ -97,25 +97,6 @@ impl SshExecutor {
         Ok(Self { session, workdir })
     }
 
-    /// Creates the empty file `path` on the target through a rename, so a reader
-    /// never sees it half made. A Runpod run writes its `.pod/retrieved` marker
-    /// with it; the parent directory must exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExecError::Command`] when the file cannot be created, and
-    /// [`ExecError::Ssh`] when the target cannot be reached.
-    pub async fn write_marker(&self, path: &str) -> Result<(), ExecError> {
-        let script = format!(
-            ": > {tmp} && mv -f {tmp} {path}",
-            tmp = quote(&format!("{path}.tmp")),
-            path = quote(path)
-        );
-        run(&self.session, &script, "write a marker")
-            .await
-            .map(drop)
-    }
-
     async fn start(&self, job: &JobCommand) -> Result<JobId, ExecError> {
         let launcher = launcher(job)?;
         let mut command = self.session.shell(launcher);
@@ -263,6 +244,28 @@ impl Executor for SshExecutor {
     async fn probe(&self, script: &str) -> Result<Vec<u8>, ExecError> {
         run(&self.session, script, "probe").await
     }
+
+    async fn put_file(&self, path: &str, content: &str) -> Result<(), ExecError> {
+        run(&self.session, &put_script(path, content), "write a file")
+            .await
+            .map(drop)
+    }
+}
+
+/// Replaces `path` with `content` through a sibling temporary file of the
+/// remote shell's own (`<path>.<pid>.tmp`, never shared with a concurrent
+/// writer such as the pod's watchdog), creating its directory first. The
+/// content travels quoted on the command line: it is never a secret.
+fn put_script(path: &str, content: &str) -> String {
+    let dir = path.rsplit_once('/').map_or(".", |(dir, _)| dir);
+    let dir = if dir.is_empty() { "/" } else { dir };
+    let tmp = format!("{}.$$.tmp", quote(path));
+    format!(
+        "mkdir -p -- {dir} && printf '%s' {content} > {tmp} && mv -f {tmp} {path}",
+        dir = quote(dir),
+        content = quote(content),
+        path = quote(path)
+    )
 }
 
 /// The command starting `job` detached from the SSH session, printing its process ID.
@@ -543,6 +546,27 @@ mod tests {
             secrets: vec![(name.into(), SecretString::from("v".to_string()))],
             ..job("v")
         }
+    }
+
+    #[test]
+    fn the_put_script_creates_the_directory_and_replaces_the_file() -> TestResult {
+        let dir = tempdir()?;
+        let path = dir.path().join("r1/.pod/it's here");
+        let path = path.to_string_lossy().into_owned();
+        for content in ["deadline", "a 'quoted' $value"] {
+            let status = StdCommand::new("sh")
+                .args(["-c", &put_script(&path, content)])
+                .status()?;
+            assert!(status.success());
+            assert_eq!(fs::read_to_string(&path)?, content);
+        }
+        let left: Vec<_> = fs::read_dir(dir.path().join("r1/.pod"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "a temporary file is left: {left:?}");
+        assert!(put_script(&path, "x").contains(".$$.tmp"));
+        Ok(())
     }
 
     #[test]

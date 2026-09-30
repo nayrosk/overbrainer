@@ -211,15 +211,16 @@ const TYPED_AXOLOTL_KEYS: [(&str, &str); 16] = [
     ("hub_model_id", "hub_model_id"),
 ];
 
-/// Axolotl keys that overbrainer manages: the run layout and the metrics plugin
-/// depend on them.
-const MANAGED_AXOLOTL_KEYS: [&str; 6] = [
+/// Axolotl keys that overbrainer manages: the run layout, the metrics plugin and
+/// `train --resume-from` depend on them.
+const MANAGED_AXOLOTL_KEYS: [&str; 7] = [
     "datasets",
     "test_datasets",
     "val_set_size",
     "output_dir",
     "dataset_prepared_path",
     "plugins",
+    "resume_from_checkpoint",
 ];
 
 /// The training section points at a declared target and its values are in range.
@@ -306,6 +307,14 @@ fn check_axolotl_extra(training: &Training, problems: &mut Vec<String>) {
             ));
         }
     }
+    // A snapshot is a checkpoint a new run resumes from, optimizer included.
+    if training.axolotl_extra.get("save_only_model") == Some(&serde_json::Value::Bool(true)) {
+        problems.push(
+            "training.axolotl_extra.save_only_model: checkpoints without their optimizer state \
+             cannot be resumed after a snapshot; remove it"
+                .to_string(),
+        );
+    }
 }
 
 /// Per-kind target requirements.
@@ -373,6 +382,7 @@ fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) 
         venv,
         container_disk_gb,
         max_hours,
+        max_cost_usd,
         boot_grace_minutes,
         retrieve_grace_minutes,
         data_center_ids,
@@ -407,6 +417,11 @@ fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) 
     if !(max_hours.is_finite() && *max_hours > 0.0 && *max_hours <= MAX_RUNPOD_HOURS) {
         problems.push(format!(
             "targets.{name}.max_hours: must be greater than 0 and at most {MAX_RUNPOD_HOURS}"
+        ));
+    }
+    if max_cost_usd.is_some_and(|usd| !(usd.is_finite() && usd > 0.0)) {
+        problems.push(format!(
+            "targets.{name}.max_cost_usd: must be greater than 0"
         ));
     }
     check_target_image(name, image.as_deref(), problems);
@@ -990,6 +1005,28 @@ mod tests {
     }
 
     #[test]
+    fn a_cost_cap_is_greater_than_0() -> Result<(), config::ConfigError> {
+        let toml = with_runpod("max_cost_usd = 12.5");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        assert!(matches!(
+            settings(&toml)?.targets.get("cloud"),
+            Some(Target::Runpod {
+                max_cost_usd: Some(12.5),
+                ..
+            })
+        ));
+        for value in ["0", "-1.0", "nan", "inf"] {
+            let toml = with_runpod(&format!("max_cost_usd = {value}"));
+            assert_eq!(
+                check(&settings(&toml)?),
+                vec!["targets.cloud.max_cost_usd: must be greater than 0".to_string()],
+                "{value}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn auto_constraints_need_auto_gpu_types() -> Result<(), config::ConfigError> {
         let toml = with_runpod("min_vram_gb = 48\nmax_price_per_hour = 1.5");
         assert_eq!(
@@ -1297,7 +1334,7 @@ mod tests {
     #[test]
     fn axolotl_extra_cannot_replace_typed_or_managed_keys() -> Result<(), config::ConfigError> {
         let toml = format!(
-            "{VALID}\n[training.axolotl_extra]\nnum_epochs = 5\noutput_dir = \"/tmp/x\"\nwarmup_ratio = 0.05\n"
+            "{VALID}\n[training.axolotl_extra]\nnum_epochs = 5\noutput_dir = \"/tmp/x\"\nwarmup_ratio = 0.05\nresume_from_checkpoint = \"/tmp/c\"\n"
         );
         assert_eq!(
             check(&settings(&toml)?),
@@ -1305,8 +1342,27 @@ mod tests {
                 "training.axolotl_extra.num_epochs: set training.epochs instead".to_string(),
                 "training.axolotl_extra.output_dir: managed by overbrainer, cannot be overridden"
                     .to_string(),
+                "training.axolotl_extra.resume_from_checkpoint: managed by overbrainer, cannot \
+                 be overridden"
+                    .to_string(),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_checkpoint_without_its_optimizer_state_is_refused() -> Result<(), config::ConfigError> {
+        let toml = format!("{VALID}\n[training.axolotl_extra]\nsave_only_model = true\n");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "training.axolotl_extra.save_only_model: checkpoints without their optimizer \
+                 state cannot be resumed after a snapshot; remove it"
+                    .to_string()
+            ]
+        );
+        let toml = format!("{VALID}\n[training.axolotl_extra]\nsave_only_model = false\n");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
         Ok(())
     }
 

@@ -7,6 +7,9 @@
 //! confirmed cancel always runs, quitting included; only a signal drops one not
 //! started yet, and says how to run it.
 //!
+//! `s` stops a running run with a snapshot (`train stop`); `T` prepares a new
+//! run resuming a stopped one (`train --resume-from`), as `t` prepares a start.
+//!
 //! A start (`t`) holds the data lock until its job started. Quitting while a
 //! Runpod run still provisions offers to abandon it instead of waiting: its pod
 //! is deleted and the run fails, as Ctrl-C does on the command line. `c` on such
@@ -25,6 +28,7 @@ use super::tasks::{Msg, Task, TaskId, TrainJob};
 use super::training::{Detach, Ended, Follow, Job, Listing, RunActivity};
 use crate::cli::front::Report;
 use crate::events::Event;
+use crate::runs::RunState;
 use crate::train::TrainMetric;
 use crate::train::sizing::{Estimate, VramFloor};
 
@@ -147,7 +151,12 @@ impl App {
                 self.ask_cancel();
                 return Vec::new();
             },
-            KeyCode::Char('t') => return self.prepare_start(),
+            KeyCode::Char('t') => return self.prepare_start(None),
+            KeyCode::Char('T') => return self.prepare_resume(),
+            KeyCode::Char('s') => {
+                self.ask_stop();
+                return Vec::new();
+            },
             KeyCode::Char('x') => {
                 self.ask_clear_failed();
                 return Vec::new();
@@ -263,8 +272,9 @@ impl App {
         self.refuse_new("one task at a time", "run")
     }
 
-    /// `t`: prepares the confirmation of a new run, in a task.
-    fn prepare_start(&mut self) -> Vec<Effect> {
+    /// `t`: prepares the confirmation of a new run, in a task; with
+    /// `resume`, of a run resuming that stopped run.
+    fn prepare_start(&mut self, resume: Option<String>) -> Vec<Effect> {
         if self.start_refused() {
             return Vec::new();
         }
@@ -274,7 +284,90 @@ impl App {
         }
         let id = self.task_id();
         self.prepare = Some(id);
-        vec![Effect::Spawn(id, Task::Prepare)]
+        let task = resume.map_or(Task::Prepare, Task::PrepareResume);
+        vec![Effect::Spawn(id, task)]
+    }
+
+    /// `T`: prepares the confirmation of a new run resuming the selected run,
+    /// which must be stopped with a snapshot.
+    fn prepare_resume(&mut self) -> Vec<Effect> {
+        let Some(row) = self.training.selected_run() else {
+            return Vec::new();
+        };
+        let id = row.record.id.clone();
+        if row.record.state != RunState::Stopped || row.record.snapshot.is_none() {
+            self.say(
+                Severity::Info,
+                format!(
+                    "run {id} is {}: T resumes a run stopped with a snapshot (s)",
+                    row.record.state.name()
+                ),
+            );
+            return Vec::new();
+        }
+        self.prepare_start(Some(id))
+    }
+
+    /// `s`: asks to stop the selected run's job with a snapshot; only a
+    /// running job can be.
+    fn ask_stop(&mut self) {
+        let Some(row) = self.training.selected_run() else {
+            return;
+        };
+        let (id, target) = (row.record.id.clone(), row.record.target.clone());
+        let running = row.record.state == RunState::Running && row.record.job.is_some();
+        if self.training.stopping(&id) {
+            self.say(Severity::Info, format!("run {id} is being stopped"));
+            return;
+        }
+        if self.training.cancelling(&id) {
+            self.say(Severity::Info, format!("run {id} is being cancelled"));
+            return;
+        }
+        if !running || self.training.activity(&id).abandons() {
+            self.say(
+                Severity::Info,
+                format!("run {id} has no running job to stop with a snapshot"),
+            );
+            return;
+        }
+        if self.leaving.is_some() {
+            self.say(Severity::Warn, "refused: quitting; nothing new is followed");
+            return;
+        }
+        self.overlay = Some(Overlay::Confirm(Confirm {
+            title: " Stop a run with a snapshot? ".to_string(),
+            text: vec![format!(
+                "Stop run {id} on {target} with a snapshot? Its job saves a checkpoint at the end \
+                 of its current step and stops; the checkpoint is retrieved with its results, and \
+                 for Runpod the pod is then ended. T then starts a new run from it. A job that \
+                 gives no snapshot within 30 minutes is cancelled."
+            )],
+            yes: "stop the run",
+            no: "keep it",
+            action: Action::Stop(id),
+        }));
+    }
+
+    /// Stops run `run_id` with a snapshot: a task following it is detached
+    /// first, and the stop starts once it ended, so two flows never follow
+    /// the same run at once.
+    pub(super) fn stop_run(&mut self, run_id: &str) -> Vec<Effect> {
+        if self.training.stopping(run_id) || self.training.cancelling(run_id) {
+            return Vec::new();
+        }
+        let Some((task, _)) = self.training.task_of(run_id) else {
+            return self.train(Job::Stop, run_id);
+        };
+        let Some(follow) = self.training.tasks.get_mut(&task) else {
+            return Vec::new();
+        };
+        follow.stop_after = true;
+        self.say(
+            Severity::Info,
+            format!("detaching run {run_id}, then stopping it with a snapshot"),
+        );
+        self.detach(task)
     }
 
     /// The plan of a new run is ready: asks to start it, and reads the GPU
@@ -356,9 +449,20 @@ impl App {
             .map_or(VramFloor::ToEstimate, |need| {
                 VramFloor::Known(need.as_ref().ok().map(Estimate::floor_gb))
             });
-        let task = TrainJob::Start { vram_floor };
+        let task = plan
+            .resume
+            .as_ref()
+            .map_or(TrainJob::Start { vram_floor }, |resume| {
+                TrainJob::Resume(resume.run_id.clone())
+            });
         let effects = self.spawn_train(Job::Start { runpod }, "", task);
-        self.say(Severity::Info, format!("starting a run on {}", plan.target));
+        let resuming = plan.resume.as_ref().map_or_else(String::new, |resume| {
+            format!(", resuming run {}", resume.run_id)
+        });
+        self.say(
+            Severity::Info,
+            format!("starting a run on {}{resuming}", plan.target),
+        );
         effects
     }
 
@@ -379,6 +483,7 @@ impl App {
             },
             Job::Attach => TrainJob::Attach(run_id.to_string()),
             Job::Cancel => TrainJob::Cancel(run_id.to_string()),
+            Job::Stop => TrainJob::Stop(run_id.to_string()),
         };
         self.spawn_train(job, run_id, task)
     }
@@ -521,6 +626,11 @@ impl App {
                     follow.lines.push(line);
                 }
             },
+            Msg::Report(_, Report::RunStopped(step)) => {
+                if let Some(follow) = self.training.tasks.get_mut(&id) {
+                    follow.stopped_at = Some(step);
+                }
+            },
             Msg::Report(_, Report::RunCreated(run_id)) => {
                 if let Some(follow) = self.training.tasks.get_mut(&id) {
                     follow.run_id.clone_from(&run_id);
@@ -569,15 +679,15 @@ impl App {
     /// Training task `id` ended with `result` (see [`App::run_ended`]); auto
     /// mode ends when it was its run.
     pub(super) fn trained(&mut self, id: TaskId, result: Result<(), String>) -> Vec<Effect> {
-        let run = self
+        let ended = self
             .training
             .tasks
             .get(&id)
-            .map(|follow| follow.run_id.clone());
+            .map(|follow| (follow.run_id.clone(), follow.stopped_at));
         let error = result.as_ref().err().cloned();
         let effects = self.run_ended(id, result);
-        if let Some(run) = run {
-            self.auto_trained(id, &run, error.as_deref());
+        if let Some((run, stopped_at)) = ended {
+            self.auto_trained(id, &run, error.as_deref(), stopped_at);
         }
         effects
     }
@@ -594,11 +704,21 @@ impl App {
         let name = follow.run();
         let error = result.err();
         let cancel = follow.cancel_after && self.leaving != Some(Exit::Signal);
+        let stop = follow.stop_after && self.leaving.is_none();
         if self.leaving.is_some() {
             // The flow's lines (pod warnings) always stay.
             self.exit_notes.extend(follow.lines.iter().cloned());
             if !cancel && let Some(error) = &error {
                 self.note_leaving(error.clone(), NoteOf::Run(run.clone()));
+            }
+            if follow.stop_after {
+                self.note_leaving(
+                    format!(
+                        "run {run} was not stopped: the TUI ended before its stop started; stop \
+                         it with `overbrainer train stop {run}`"
+                    ),
+                    NoteOf::Run(run.clone()),
+                );
             }
             if follow.cancel_after && !cancel {
                 // A start abandoned may have failed with no job, or detached
@@ -619,7 +739,7 @@ impl App {
             }
         }
         match &error {
-            Some(error) if !follow.cancel_after => {
+            Some(error) if !follow.cancel_after && !follow.stop_after => {
                 self.say(Severity::Warn, format!("{name}: {error}"));
             },
             Some(_) => {},
@@ -649,6 +769,8 @@ impl App {
         }
         if cancel {
             effects.extend(self.train(Job::Cancel, &run));
+        } else if stop {
+            effects.extend(self.train(Job::Stop, &run));
         }
         self.leave_when_idle();
         effects
@@ -667,6 +789,10 @@ impl App {
                 };
                 match follow.job {
                     Job::Cancel => format!("Run {run}: cancel in progress, quitting waits for it."),
+                    Job::Stop => format!(
+                        "Run {run}: its snapshot was asked for and it keeps running until it saves \
+                         it; attach again here or with `overbrainer train attach {run}`."
+                    ),
                     _ if follow.cancel_after => format!(
                         "Run {run}: cancel pending, it starts once the run is detached; \
                          quitting waits for it."
@@ -862,8 +988,13 @@ pub(super) const NOT_STARTED: &str = "a new training run was not started: the TU
 /// The dialog asking to start the run of `plan`, with the GPU catalog `gpus`
 /// once read.
 pub(super) fn start_dialog(plan: Box<StartPlan>, gpus: Option<&Catalog>) -> Confirm {
+    let title = if plan.resume.is_some() {
+        " Resume a training run? "
+    } else {
+        " Start a training run? "
+    };
     Confirm {
-        title: " Start a training run? ".to_string(),
+        title: title.to_string(),
         text: start::text(&plan, gpus),
         yes: "start",
         no: "cancel",

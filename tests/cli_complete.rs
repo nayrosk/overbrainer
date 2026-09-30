@@ -85,6 +85,8 @@ fn save_run(
         job: None,
         state,
         message: None,
+        snapshot: None,
+        resumed_from: None,
     })?;
     Ok(())
 }

@@ -634,6 +634,12 @@ const RUNPOD: &[FieldSpec] = &[
         "Hours before the watchdog deletes a pod nothing follows",
     ),
     spec(
+        "max_cost_usd",
+        floats(Bound::Excl(0.0), Bound::Unbounded),
+        true,
+        "Most a run spends on its pod in USD: snapshot at 95%, pod deleted at 100%",
+    ),
+    spec(
         "boot_grace_minutes",
         at_least(MIN_BOOT_GRACE_MINUTES),
         true,

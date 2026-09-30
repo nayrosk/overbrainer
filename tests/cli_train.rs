@@ -20,14 +20,32 @@ const TOKEN: &str = "hf_cli_secret_17";
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// `mode` next to `bin/` picks the behavior of `axolotl train`: `ok` trains at
-/// once, `fail` exits 1, and `slow` waits (at most a minute) for a `release` file
-/// next to `bin/`, then trains.
+/// once, `fail` exits 1, `slow` waits (at most a minute) for a `release` file
+/// next to `bin/`, then trains, and `snapshot` waits the same way for the
+/// snapshot request, then saves a checkpoint at step 1 and stops as the plugin
+/// does. `axolotl merge-lora` leaves a `merged` file next to `bin/`.
 const FAKE_AXOLOTL: &str = r#"#!/bin/sh
 here="$(dirname "$0")/.."
 mode=$(cat "$here/mode")
+if [ "$1" = merge-lora ]; then echo merged >> "$here/merged"; exit 0; fi
 [ "$1" = train ] || exit 0
 case "$mode" in
   fail) echo "boom" >&2; exit 1 ;;
+  snapshot)
+    printf '{"event": "begin", "time": 1, "max_steps": 2}\n' >> "$OVERBRAINER_METRICS"
+    i=0
+    until [ -f "$OVERBRAINER_SNAPSHOT" ]; do
+      i=$((i + 1))
+      [ "$i" -gt 600 ] && exit 3
+      sleep 0.1
+    done
+    printf '{"event": "log", "time": 2, "step": 1, "epoch": 0.5, "max_steps": 2, "loss": 1.5}\n' >> "$OVERBRAINER_METRICS"
+    mkdir -p output/checkpoint-1 && echo state > output/checkpoint-1/optimizer.pt
+    echo adapter > output/adapter_model.safetensors
+    printf '{"checkpoint": "output/checkpoint-1", "step": 1, "time": 2, "reason": "%s"}\n' \
+      "$(cat "$OVERBRAINER_SNAPSHOT")" > snapshot.json
+    exit 0
+    ;;
   slow)
     i=0
     until [ -f "$here/release" ]; do
@@ -334,6 +352,109 @@ fn unusable_targets_are_refused() -> TestResult {
         .assert()
         .failure()
         .stderr(predicate::str::contains("no run `20260101-000000-abcd`"));
+    Ok(())
+}
+
+#[test]
+fn stop_saves_a_snapshot_retrieves_it_and_skips_the_merge() -> TestResult {
+    let dir = project("snapshot")?;
+    edit_config(dir.path(), |text| {
+        text.replace("adapter = \"qlora\"", "adapter = \"qlora\"\nmerge = true")
+    })?;
+    let (run, output) = interrupt_train(dir.path(), &["running"], Duration::from_millis(100))?;
+    assert_detached(&run, &output)?;
+    let id = run_id(&run)?;
+
+    overbrainer(dir.path())?
+        .args(["train", "stop", &id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "train: snapshot of run {id} requested"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "train: run {id} stopped; step 1/2"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "train: run {id} stopped at step 1 (requested): snapshot in \
+             runs/{id}/output/checkpoint-1; resume with `overbrainer train --resume-from {id}`"
+        )));
+    let record = fs::read_to_string(run.join("run.json"))?;
+    assert!(record.contains("\"state\": \"stopped\""), "{record}");
+    assert!(
+        record.contains("\"checkpoint\": \"output/checkpoint-1\""),
+        "{record}"
+    );
+    assert!(run.join("output/checkpoint-1/optimizer.pt").is_file());
+    assert!(
+        !dir.path().join("venv/merged").exists(),
+        "merge-lora ran after the snapshot"
+    );
+    overbrainer(dir.path())?
+        .args(["runs", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{id}  stopped    here  ")))
+        .stdout(predicate::str::contains("  step 1 (requested)"));
+    overbrainer(dir.path())?
+        .args(["train", "stop", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "run {id} already ended: stopped"
+        )));
+
+    // A resume needs the same training settings.
+    let config = fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+    edit_config(dir.path(), |text| {
+        text.replace("merge = true", "merge = true\nlearning_rate = 1e-4")
+    })?;
+    overbrainer(dir.path())?
+        .args(["train", "--resume-from", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "cannot resume from run {id}: the training settings differ from the ones it ran \
+             with (learning_rate)"
+        )));
+    fs::write(dir.path().join("overbrainer.toml"), config)?;
+    fs::write(dir.path().join("venv/mode"), "ok")?;
+    overbrainer(dir.path())?
+        .args(["train", "--resume-from", &id])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "resumes from the snapshot of run {id} (output/checkpoint-1)"
+        )));
+    let resumed = fs::read_dir(dir.path().join("runs"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run.json").is_file() && *path != run)
+        .ok_or("no resumed run")?;
+    let record = fs::read_to_string(resumed.join("run.json"))?;
+    assert!(
+        record.contains(&format!("\"resumed_from\": \"{id}\"")),
+        "{record}"
+    );
+    assert!(record.contains("\"state\": \"succeeded\""), "{record}");
+    assert!(resumed.join("resume/checkpoint-1/optimizer.pt").is_file());
+    let yaml = fs::read_to_string(resumed.join("axolotl.yaml"))?;
+    assert!(
+        yaml.contains(&format!(
+            "resume_from_checkpoint: \"{}/resume/checkpoint-1\"",
+            resumed.display()
+        )),
+        "{yaml}"
+    );
+    // Only a stopped run can be resumed.
+    let succeeded = run_id(&resumed)?;
+    overbrainer(dir.path())?
+        .args(["train", "--resume-from", &succeeded])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "cannot resume from run {succeeded}: it is succeeded, not stopped with a snapshot"
+        )));
     Ok(())
 }
 

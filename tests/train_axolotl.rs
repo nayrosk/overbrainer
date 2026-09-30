@@ -4,7 +4,7 @@ use std::process::Command;
 use overbrainer::config::{EnvSource, Settings, Training, load};
 use overbrainer::dataset::DataFiles;
 use overbrainer::train::{
-    Artifacts, Axolotl, TrainError, Trainer, reasoning_template_warning, to_yaml,
+    Artifacts, Axolotl, Resume, TrainError, Trainer, reasoning_template_warning, to_yaml,
 };
 use serde_json::Value;
 
@@ -179,8 +179,11 @@ fn commands_env_and_artifacts() -> TestResult {
             ("AXOLOTL_DO_NOT_TRACK".to_string(), "1".to_string()),
             ("PYTHONPATH".into(), "/r/plugin".into()),
             ("OVERBRAINER_METRICS".into(), "/r/metrics.jsonl".into()),
+            ("OVERBRAINER_SNAPSHOT".into(), "/r/snapshot.request".into()),
         ]
     );
+    // The merge is skipped once the job stopped with a snapshot.
+    assert_eq!(trainer.stop_marker(), Some("snapshot.json"));
     assert_eq!(trainer.metrics_file(), "metrics.jsonl");
     assert_eq!(
         trainer.artifacts(),
@@ -378,5 +381,94 @@ fn attn_implementation_in_axolotl_extra_overrides_the_default() -> TestResult {
     let trainer = Axolotl::new(training(&settings)?, &DataFiles::new(dir.path()));
     let config = trainer.config("/r", false);
     assert_eq!(config["attn_implementation"], "flash_attention_2");
+    Ok(())
+}
+
+/// A stopped run in `runs/src` of `dir`, prepared by `trainer` for the root
+/// `/w/src`, with a checkpoint at `output/checkpoint-7`.
+fn stopped_run(
+    dir: &std::path::Path,
+    trainer: &Axolotl<'_>,
+) -> Result<Resume, Box<dyn std::error::Error>> {
+    let source = dir.join("runs/src");
+    trainer.prepare(&source, "/w/src")?;
+    let checkpoint = source.join("output/checkpoint-7");
+    fs::create_dir_all(checkpoint.join("global_step7"))?;
+    fs::write(checkpoint.join("optimizer.pt"), "state")?;
+    fs::write(checkpoint.join("global_step7/rng.pth"), "rng")?;
+    Ok(Resume {
+        run_id: "src".into(),
+        dir: source,
+        checkpoint: "output/checkpoint-7".into(),
+    })
+}
+
+#[test]
+fn a_resumed_run_copies_the_checkpoint_and_the_source_data() -> TestResult {
+    let (dir, settings) = settings(QLORA)?;
+    let files = DataFiles::new(dir.path());
+    fs::create_dir_all(dir.path().join("data"))?;
+    fs::write(&files.train, "{\"a\":1}\n")?;
+    fs::write(&files.eval, "{\"b\":2}\n")?;
+    let trainer = Axolotl::new(training(&settings)?, &files);
+    let resume = stopped_run(dir.path(), &trainer)?;
+    // The project's data changed since: the resumed run keeps the source's.
+    fs::write(&files.train, "{\"a\":2}\n")?;
+    let resumed = Axolotl::new(training(&settings)?, &files).resuming(resume.clone());
+    assert_eq!(resumed.resume(), Some(&resume));
+    assert_eq!(resumed.resume_mismatch()?, Vec::<String>::new());
+    let run = dir.path().join("runs/new");
+    resumed.prepare(&run, "/w/new")?;
+    assert_eq!(
+        fs::read_to_string(run.join("data/train.jsonl"))?,
+        "{\"a\":1}\n"
+    );
+    assert!(run.join("data/eval.jsonl").is_file());
+    assert_eq!(
+        fs::read_to_string(run.join("resume/checkpoint-7/optimizer.pt"))?,
+        "state"
+    );
+    assert_eq!(
+        fs::read_to_string(run.join("resume/checkpoint-7/global_step7/rng.pth"))?,
+        "rng"
+    );
+    let yaml = fs::read_to_string(run.join("axolotl.yaml"))?;
+    assert!(
+        yaml.contains("resume_from_checkpoint: \"/w/new/resume/checkpoint-7\""),
+        "{yaml}"
+    );
+    assert!(!fs::read_to_string(resume.dir.join("axolotl.yaml"))?.contains("resume_from"));
+    Ok(())
+}
+
+#[test]
+fn a_resume_is_refused_when_a_training_value_changed() -> TestResult {
+    let (dir, settings) = settings(QLORA)?;
+    let files = DataFiles::new(dir.path());
+    fs::create_dir_all(dir.path().join("data"))?;
+    fs::write(&files.train, "{\"a\":1}\n")?;
+    let resume = stopped_run(dir.path(), &Axolotl::new(training(&settings)?, &files))?;
+    let changed = QLORA
+        .replace(
+            "adapter = \"qlora\"",
+            "adapter = \"qlora\"\nlearning_rate = 1e-4\nsaves_per_epoch = 3",
+        )
+        .replace(
+            "hub_model_id = \"me/qwen3-rust\"",
+            "hub_model_id = \"me/other\"",
+        )
+        .replace(
+            "chat_template = \"qwen3\"",
+            "chat_template = \"qwen3\"\nwarmup_steps = 5\nwandb_project = \"p\"\n\
+             hub_strategy = \"end\"\nuse_tensorboard = true",
+        );
+    let (_other, settings) = self::settings(&changed)?;
+    let resumed = Axolotl::new(training(&settings)?, &files).resuming(resume);
+    // Only what the checkpoint was trained with counts: the save cadence, the
+    // Hub repo and the logging integrations may change.
+    assert_eq!(
+        resumed.resume_mismatch()?,
+        vec!["learning_rate", "warmup_steps"]
+    );
     Ok(())
 }

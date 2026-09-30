@@ -21,7 +21,7 @@ use super::editor::Edited;
 use super::pod_logs::{PodLogRead, read_pod_log};
 use super::project::ProjectConfig;
 use super::project_edit::{SaveRefusal, save_config};
-use super::start::{AutoPlan, Catalog, StartPlan, look_up, prepare, prepare_auto};
+use super::start::{AutoPlan, Catalog, StartPlan, look_up, prepare, prepare_auto, prepare_resume};
 use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::{Command, Load};
 use crate::cli::front::{Frontend, Report};
@@ -74,6 +74,8 @@ pub(super) enum Task {
     },
     /// What a training run started now would use.
     Prepare,
+    /// What a training run resuming the stopped run `0` would use.
+    PrepareResume(String),
     /// What auto mode run now would do after split.
     PrepareAuto,
     /// The Runpod GPU catalog for this many GPUs per pod, for the start
@@ -116,6 +118,10 @@ pub(super) enum TrainJob {
     Attach(String),
     /// `train cancel <run-id>`.
     Cancel(String),
+    /// `train stop <run-id>`.
+    Stop(String),
+    /// `train --resume-from <run-id>`, on `training.target`.
+    Resume(String),
 }
 
 impl TrainJob {
@@ -127,6 +133,15 @@ impl TrainJob {
                     vram_floor: *vram_floor,
                     ..TrainArgs::default()
                 };
+            },
+            Self::Resume(run_id) => {
+                return TrainArgs {
+                    resume_from: Some(run_id.clone()),
+                    ..TrainArgs::default()
+                };
+            },
+            Self::Stop(run_id) => TrainCommand::Stop {
+                run_id: run_id.clone(),
             },
             Self::Attach(run_id) => TrainCommand::Attach {
                 run_id: run_id.clone(),
@@ -503,6 +518,20 @@ impl Tasks {
         })
     }
 
+    /// Prepares a run resuming the stopped run `run`, off the async threads.
+    fn spawn_prepare_resume(&mut self, run: String) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        let source = self.source.clone();
+        self.set.spawn(async move {
+            let plan =
+                tokio::task::spawn_blocking(move || prepare_resume(&dir, &source, &run)).await;
+            Done::Prepared(match plan {
+                Ok(plan) => plan,
+                Err(error) => Err(format!("cannot prepare the run: {error}")),
+            })
+        })
+    }
+
     /// Starts `task` as `id`.
     pub(super) fn spawn(&mut self, id: TaskId, task: Task) {
         let files = DataFiles::new(&self.project_dir);
@@ -585,6 +614,7 @@ impl Tasks {
                 })
             },
             Task::Prepare => self.spawn_prepare(false),
+            Task::PrepareResume(run) => self.spawn_prepare_resume(run),
             Task::PrepareAuto => self.spawn_prepare(true),
             Task::StartCatalog(gpu_count) => {
                 let dir = self.project_dir.clone();

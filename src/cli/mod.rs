@@ -248,6 +248,10 @@ pub struct TrainArgs {
     /// Nothing deletes it then but `overbrainer pod rm <run-id>`.
     #[arg(long)]
     pub keep_pod: bool,
+    /// Start from the snapshot of this stopped run (`overbrainer train stop`):
+    /// its checkpoint and its data, with the same training settings.
+    #[arg(long, value_name = "RUN_ID", add = ArgValueCandidates::new(complete::run_ids))]
+    pub resume_from: Option<String>,
     /// Follow or stop an existing run instead of starting one.
     #[command(subcommand)]
     pub command: Option<TrainCommand>,
@@ -263,6 +267,14 @@ pub struct TrainArgs {
 pub enum TrainCommand {
     /// Follow a run again after Ctrl-C or a lost connection, then retrieve its results.
     Attach {
+        /// ID of the run, as shown by `overbrainer runs ls`.
+        #[arg(add = ArgValueCandidates::new(complete::run_ids))]
+        run_id: String,
+    },
+    /// Stop the job of a run with a snapshot: it saves a checkpoint at the end of
+    /// its current step, stops, and the checkpoint is retrieved with its results.
+    /// `overbrainer train --resume-from <run-id>` then starts a new run from it.
+    Stop {
         /// ID of the run, as shown by `overbrainer runs ls`.
         #[arg(add = ArgValueCandidates::new(complete::run_ids))]
         run_id: String,
@@ -508,11 +520,13 @@ async fn dispatch(
             let args = StageArgs::default();
             let load = data::Load::Reload(&mut reloader);
             data::run(dir, data::Command::Run, &args, &front, load).await?;
-            train::after_run(dir, &front, &mut reloader).await
+            // Boxed, as below: the training flows would otherwise weigh on
+            // every command's future.
+            Box::pin(train::after_run(dir, &front, &mut reloader)).await
         },
         Command::Train(args) => {
             let source = Source::from(EnvSource::Process);
-            train::run(dir, &args, &front, &source).await
+            Box::pin(train::run(dir, &args, &front, &source)).await
         },
         Command::Runs {
             command: RunsCommand::Ls,
@@ -729,6 +743,7 @@ mod tests {
             &["train"],
             &["train", "attach", "x"],
             &["train", "cancel", "x"],
+            &["train", "stop", "x"],
             &["pod", "rm", "x"],
             &["migrate"],
             &["migrate", "--dry-run"],

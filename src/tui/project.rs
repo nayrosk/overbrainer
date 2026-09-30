@@ -710,6 +710,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             venv,
             container_disk_gb,
             max_hours,
+            max_cost_usd,
             boot_grace_minutes,
             retrieve_grace_minutes,
             data_center_ids,
@@ -723,6 +724,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             "venv" => venv.clone(),
             "container_disk_gb" => Some(container_disk_gb.to_string()),
             "max_hours" => Some(float(*max_hours)),
+            "max_cost_usd" => max_cost_usd.map(float),
             "boot_grace_minutes" => Some(boot_grace_minutes.to_string()),
             "retrieve_grace_minutes" => Some(retrieve_grace_minutes.to_string()),
             "data_center_ids" => (!data_center_ids.is_any()).then(|| data_center_ids.to_string()),
@@ -1023,8 +1025,9 @@ pub(super) fn stats(app: &App) -> Vec<Stat> {
         RunState::Preparing => 0,
         RunState::Running => 1,
         RunState::Succeeded => 2,
-        RunState::Failed => 3,
-        RunState::Cancelled => 4,
+        RunState::Stopped => 3,
+        RunState::Failed => 4,
+        RunState::Cancelled => 5,
     };
     let mut states: BTreeMap<u8, (&str, usize)> = BTreeMap::new();
     for run in &app.training.runs {

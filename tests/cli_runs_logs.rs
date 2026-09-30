@@ -49,6 +49,8 @@ fn project(pod_state: PodState) -> Result<tempfile::TempDir, Box<dyn std::error:
         job: None,
         state: RunState::Running,
         message: None,
+        snapshot: None,
+        resumed_from: None,
     })?;
     let mut record = PodRecord::new(RUN, false, 1, "ssh-ed25519 AAAAhost");
     record.pod_id = Some(PodId::new("p1")?);

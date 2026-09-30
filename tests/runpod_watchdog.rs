@@ -531,6 +531,217 @@ async fn a_live_job_is_never_ended_and_a_killed_one_is() -> TestResult {
     Ok(())
 }
 
+/// A job nearing its deadline with nobody following it is asked for a snapshot,
+/// and the deadline waits for it (at most `OVERBRAINER_SNAPSHOT_WAIT`).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_deadline_asks_for_a_snapshot_and_waits_for_it() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        let mut job = live_group()?;
+        fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
+        let started = Instant::now();
+        let child = pod.start(
+            shell,
+            &server,
+            &[
+                ("OVERBRAINER_DEADLINE", (unix_now() + 1).to_string()),
+                ("OVERBRAINER_SNAPSHOT_LEAD", "600".into()),
+                ("OVERBRAINER_SNAPSHOT_WAIT", "4".into()),
+            ],
+        )?;
+        let asked = until(Duration::from_secs(5), || {
+            pod.read("snapshot.request") == "deadline"
+        })
+        .await;
+        assert!(asked, "{shell}: no snapshot request");
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            deletes(&server).await,
+            0,
+            "{shell}: deleted during the snapshot"
+        );
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        job.kill()?;
+        job.wait()?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert!(started.elapsed() >= Duration::from_secs(3), "{shell}");
+        assert!(
+            output.contains("snapshot requested reason=deadline"),
+            "{shell}: {output}"
+        );
+        assert!(
+            output.contains("delete reason=deadline"),
+            "{shell}: {output}"
+        );
+    }
+    Ok(())
+}
+
+/// A request already there (`train stop`, or the client's cost request) near the
+/// deadline gets the same hold as one the watchdog writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_already_there_near_the_deadline_is_waited_for() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        let mut job = live_group()?;
+        fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
+        fs::write(pod.file("snapshot.request"), "requested")?;
+        let started = Instant::now();
+        let child = pod.start(
+            shell,
+            &server,
+            &[
+                ("OVERBRAINER_DEADLINE", (unix_now() + 1).to_string()),
+                ("OVERBRAINER_SNAPSHOT_LEAD", "600".into()),
+                ("OVERBRAINER_SNAPSHOT_WAIT", "4".into()),
+            ],
+        )?;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            deletes(&server).await,
+            0,
+            "{shell}: deleted during the snapshot"
+        );
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        job.kill()?;
+        job.wait()?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert!(started.elapsed() >= Duration::from_secs(3), "{shell}");
+        assert_eq!(
+            pod.read("snapshot.request"),
+            "requested",
+            "{shell}: rewritten"
+        );
+        assert_eq!(
+            output.matches("snapshot already requested").count(),
+            1,
+            "{shell}: {output}"
+        );
+        assert!(
+            output.contains("delete reason=deadline"),
+            "{shell}: {output}"
+        );
+    }
+    Ok(())
+}
+
+/// A client following the job holds the deadline off: no snapshot is asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_lease_asks_for_no_snapshot() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        let mut job = live_group()?;
+        fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
+        fs::write(pod.file(".pod/lease"), "")?;
+        let mut child = pod.start(
+            shell,
+            &server,
+            &[
+                ("OVERBRAINER_DEADLINE", (unix_now() + 60).to_string()),
+                ("OVERBRAINER_SNAPSHOT_LEAD", "600".into()),
+            ],
+        )?;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        child.kill().await?;
+        job.kill()?;
+        job.wait()?;
+        assert!(!pod.file("snapshot.request").exists(), "{shell}");
+        assert_eq!(deletes(&server).await, 0, "{shell}");
+    }
+    Ok(())
+}
+
+/// The cost cap asks for a snapshot at `.pod/snapshot_at` and deletes the pod
+/// at `.pod/cost_cap_at`, even while a client holds the lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cost_cap_asks_for_a_snapshot_then_deletes_the_pod() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        let mut job = live_group()?;
+        fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
+        fs::write(pod.file(".pod/lease"), "")?;
+        fs::write(pod.file(".pod/snapshot_at"), (unix_now() - 1).to_string())?;
+        fs::write(pod.file(".pod/cost_cap_at"), (unix_now() + 3).to_string())?;
+        let child = pod.start(
+            shell,
+            &server,
+            &[("OVERBRAINER_DEADLINE", (unix_now() + 3600).to_string())],
+        )?;
+        let asked = until(Duration::from_secs(5), || {
+            pod.read("snapshot.request") == "cost"
+        })
+        .await;
+        assert!(asked, "{shell}: no snapshot request");
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        job.kill()?;
+        job.wait()?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert!(
+            output.contains("snapshot requested reason=cost"),
+            "{shell}: {output}"
+        );
+        assert!(
+            output.contains("delete reason=cost_cap"),
+            "{shell}: {output}"
+        );
+        assert_eq!(deletes(&server).await, 1, "{shell}");
+    }
+    Ok(())
+}
+
+/// Once a snapshot ended the job, the deadline gives way to the retrieve grace,
+/// capped at the deadline plus that grace, so `train attach` can collect it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_that_ended_the_job_keeps_the_pod_past_the_deadline() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        fs::write(pod.file("job.pid"), "999999\n")?;
+        fs::write(pod.file("exit_code"), "0\n")?;
+        fs::write(pod.file("snapshot.json"), "{}\n")?;
+        let started = Instant::now();
+        // The deadline passed an hour ago, less 3 s: deadline + grace is 3 s away.
+        let child = pod.start(
+            shell,
+            &server,
+            &[("OVERBRAINER_DEADLINE", (unix_now() - 3597).to_string())],
+        )?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            deletes(&server).await,
+            0,
+            "{shell}: deleted at the deadline"
+        );
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert!(started.elapsed() >= Duration::from_secs(2), "{shell}");
+        assert!(
+            output.contains("delete reason=deadline"),
+            "{shell}: {output}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_delete_falls_back_to_terminate_then_stop() -> TestResult {
     if !curl_available() {
