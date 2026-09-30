@@ -32,9 +32,9 @@ pub use catalog::{
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
 pub use disk::{
-    ACT_PERCENT, Assessment, Critical, DISK_PROBE_EVERY, DiskProbe, DiskWatch, Usage,
-    VOLUME_SIZE_FILE, VOLUME_USABLE_PERCENT, VolumeDisk, WARN_PERCENT, WARN_STEP, assess,
-    disk_probe_script, grown_size, parse_disk_probe,
+    ACT_PERCENT, Assessment, Critical, DISK_PROBE_EVERY, DiskProbe, DiskWatch, GROW_WINDOW, Usage,
+    VOLUME_SIZE_FILE, VOLUME_USABLE_PERCENT, VolumeDisk, WARN_PERCENT, WARN_STEP,
+    WATCHDOG_ACT_PERCENT, assess, disk_probe_script, grown_size, parse_disk_probe,
 };
 pub use flow::{
     COST_CAP_FILE, DEADLINE_MARGIN, Ending, LEASE_FILE, LEASE_TTL, MAX_COST_REACHED,

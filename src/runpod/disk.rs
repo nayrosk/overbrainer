@@ -22,7 +22,7 @@ use crate::events::Event;
 use crate::exec::{Executor, quote};
 use crate::runs::{RunRecord, SnapshotReason, request_snapshot};
 use crate::system::{self, Disk, SystemSample};
-use crate::train::OUTPUT_DIR;
+use crate::train::{OUTPUT_DIR, SNAPSHOT_REQUEST};
 
 /// Use, in percent, of the first warning.
 pub const WARN_PERCENT: u64 = 85;
@@ -41,8 +41,14 @@ pub const VOLUME_USABLE_PERCENT: u64 = 94;
 pub const VOLUME_SIZE_FILE: &str = ".pod/volume_gb";
 /// How often, at most, the disk probe (`du`) runs.
 pub const DISK_PROBE_EVERY: Duration = Duration::from_secs(60);
-/// Samples after a grow within which the API must report the new size.
-const GROW_CHECKS: u32 = 2;
+/// Use, in percent, at which the watchdog asks for a snapshot on its own: later
+/// than [`ACT_PERCENT`], so a grow overbrainer is making comes first.
+pub const WATCHDOG_ACT_PERCENT: u64 = 97;
+/// How long the API may keep showing the old size after a grow before the job
+/// is stopped.
+pub const GROW_WINDOW: Duration = Duration::from_secs(120);
+/// Disk probes in a row that cannot measure the volume before a warning.
+const UNMEASURED_WARN: u32 = 3;
 /// Most a grow adds at least, in GB.
 const GROW_MIN_GB: u32 = 50;
 /// Longest wait for the disk probe.
@@ -157,13 +163,19 @@ pub fn grown_size(current_gb: u32, max_gb: u32) -> Option<u32> {
 pub fn disk_probe_script(run_dir: &str, volume_dir: Option<&str>) -> String {
     let output = quote(&format!("{run_dir}/{OUTPUT_DIR}"));
     let volume = volume_dir.map_or_else(String::new, |volume| {
-        format!("part volume\ndu -sk -- {} 2>/dev/null\n", quote(volume))
+        format!(
+            "part volume\n$limit du -sk -- {} 2>/dev/null\n",
+            quote(volume)
+        )
     });
+    // A `du` stuck on a network mount is killed rather than left running.
     format!(
         "part() {{ printf '\\n@%s\\n' \"$1\"; }}\n\
+         limit=\n\
+         command -v timeout >/dev/null 2>&1 && limit='timeout -k 5 50'\n\
          part checkpoint\n\
          last=$(ls -1d -- {output}/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -n 1)\n\
-         [ -n \"$last\" ] && du -sk -- {output}/checkpoint-\"$last\" 2>/dev/null\n\
+         [ -n \"$last\" ] && $limit du -sk -- {output}/checkpoint-\"$last\" 2>/dev/null\n\
          {volume}exit 0\n"
     )
 }
@@ -204,11 +216,21 @@ pub struct VolumeDisk<'a> {
     pub max_gb: Option<u32>,
 }
 
-/// A grow asked for, not seen yet.
+/// A grow Runpod accepted whose new size the API did not report yet.
 #[derive(Debug, Clone, Copy)]
 struct Growing {
     to_gb: u32,
-    checks_left: u32,
+    since: Instant,
+}
+
+/// What a read of the volume's size after a grow shows.
+enum GrowCheck {
+    /// The new size.
+    Grown(u32),
+    /// A smaller size, or no answer, still within the time allowed.
+    Waiting,
+    /// No new size in time: why.
+    Failed(&'static str),
 }
 
 /// The disk policy of one followed run: it warns from [`WARN_PERCENT`] on,
@@ -221,12 +243,20 @@ pub struct DiskWatch<'a, E> {
     volume: Option<VolumeDisk<'a>>,
     /// The volume's size in GB, as the API last reported it.
     size_gb: Option<u32>,
+    /// The size last written to [`VOLUME_SIZE_FILE`].
+    handed_gb: Option<u32>,
     probe: DiskProbe,
     probed_at: Option<Instant>,
+    /// Disk probes in a row that could not measure the volume.
+    unmeasured: u32,
     warned: Option<u64>,
     growing: Option<Growing>,
-    /// Whether the snapshot was asked for: nothing more is done then.
-    stopped: bool,
+    grow_window: Duration,
+    /// Whether Runpod refused a grow: the volume is not grown again.
+    cannot_grow: bool,
+    /// Whether it does nothing more: the snapshot was asked for, or the disk
+    /// cannot be measured.
+    idle: bool,
 }
 
 impl<'a, E: Executor> DiskWatch<'a, E> {
@@ -245,12 +275,32 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
             run,
             volume,
             size_gb: None,
+            handed_gb: None,
             probe: DiskProbe::default(),
             probed_at: None,
+            unmeasured: 0,
             warned: None,
             growing: None,
-            stopped: false,
+            grow_window: GROW_WINDOW,
+            cannot_grow: false,
+            idle: false,
         }
+    }
+
+    /// The same policy, waiting `window` rather than [`GROW_WINDOW`] for a grow
+    /// to show in the API.
+    #[must_use]
+    pub fn with_grow_window(mut self, window: Duration) -> Self {
+        self.grow_window = window;
+        self
+    }
+
+    /// A policy that does nothing: for a run whose disk cannot be measured,
+    /// such as one on a network volume whose ID `pod.json` does not hold.
+    #[must_use]
+    pub fn idle(mut self) -> Self {
+        self.idle = true;
+        self
     }
 
     /// Follows the samples on `events` until the bus closes, then waits
@@ -268,7 +318,7 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
 
     /// Takes the sample `sample` into account.
     async fn sampled(&mut self, sample: &SystemSample) {
-        if self.stopped {
+        if self.idle {
             return;
         }
         if self.volume.is_some() && self.size_gb.is_none() {
@@ -292,8 +342,9 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
         sample.run_disk().map(Usage::of_disk)
     }
 
-    /// Runs the disk probe when [`DISK_PROBE_EVERY`] passed since the last one;
-    /// a failure keeps what the last one found.
+    /// When [`DISK_PROBE_EVERY`] passed since the last time, reads the volume's
+    /// size again (it may have been resized elsewhere) and runs the disk
+    /// probe; a failed probe keeps what the last one found.
     async fn probe_if_due(&mut self) {
         if self
             .probed_at
@@ -302,52 +353,98 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
             return;
         }
         self.probed_at = Some(Instant::now());
+        if self.volume.is_some() {
+            self.read_size().await;
+        }
         let script =
             disk_probe_script(&self.run.remote_dir, self.volume.map(|volume| volume.mount));
         let answer = match tokio::time::timeout(PROBE_TIMEOUT, self.executor.probe(&script)).await {
-            Ok(answer) => answer.map_err(|error| error.to_string()),
+            Ok(answer) => answer
+                .map(|output| parse_disk_probe(&String::from_utf8_lossy(&output)))
+                .map_err(|error| error.to_string()),
             Err(_) => Err("no answer in time".to_string()),
         };
-        match answer {
-            Ok(output) => self.probe = parse_disk_probe(&String::from_utf8_lossy(&output)),
-            Err(error) => tracing::debug!("cannot measure the pod's disk: {error}"),
+        self.probed(answer);
+    }
+
+    /// Keeps what the disk probe found; warns once the volume could not be
+    /// measured [`UNMEASURED_WARN`] times in a row.
+    fn probed(&mut self, answer: Result<DiskProbe, String>) {
+        let why = match answer {
+            Ok(found) => {
+                self.probe.checkpoint_bytes = found.checkpoint_bytes;
+                if self.volume.is_none() || found.volume_used_bytes.is_some() {
+                    self.probe.volume_used_bytes = found.volume_used_bytes;
+                    self.unmeasured = 0;
+                    return;
+                }
+                "du gave no size".to_string()
+            },
+            Err(error) => error,
+        };
+        tracing::debug!("cannot measure the pod's disk: {why}");
+        self.unmeasured_again(&why);
+    }
+
+    /// Counts one more probe that could not measure the disk, for `why`, and
+    /// warns once the volume went unmeasured [`UNMEASURED_WARN`] times in a row.
+    fn unmeasured_again(&mut self, why: &str) {
+        self.unmeasured = self.unmeasured.saturating_add(1);
+        if self.volume.is_none() || self.unmeasured != UNMEASURED_WARN {
+            return;
+        }
+        tracing::warn!(
+            "cannot measure the network volume {UNMEASURED_WARN} times in a row ({why}): \
+             the disk policy uses its last known use until it can"
+        );
+    }
+
+    /// The volume's size in GB from the API; a size of 0 is no answer.
+    async fn fetch_size(&self, id: &str) -> Result<u32, String> {
+        match self.client.get_network_volume(id).await {
+            Ok(Some(found)) if found.size > 0 => Ok(found.size),
+            Ok(Some(_)) => Err("Runpod gave no size".to_string()),
+            Ok(None) => Err("not found".to_string()),
+            Err(error) => Err(error.to_string()),
         }
     }
 
-    /// Reads the volume's size from the API and, when it changed, hands it to
-    /// the watchdog. Returns it, or `None` without a volume or when it cannot
-    /// be read: the failure is logged, and the next sample tries again.
+    /// Reads the volume's size from the API and hands it to the watchdog
+    /// (during a grow, never less than the size asked for). Returns it, or
+    /// `None` without a volume or when it cannot be read: the failure is
+    /// logged, and the next probe tries again.
     pub async fn read_size(&mut self) -> Option<u32> {
         let volume = self.volume?;
-        let size = match self.client.get_network_volume(volume.id).await {
-            Ok(Some(found)) => Ok(found.size),
-            Ok(None) => Err("not found".to_string()),
-            Err(error) => Err(error.to_string()),
-        };
-        let size = size
+        let size = self
+            .fetch_size(volume.id)
+            .await
             .inspect_err(|error| {
                 tracing::debug!("cannot read network volume {}: {error}", volume.id);
             })
             .ok()?;
-        if self.size_gb != Some(size) {
-            self.size_gb = Some(size);
-            self.hand_size(size).await;
-        }
+        self.size_gb = Some(size);
+        let handed = self.growing.map_or(size, |growing| size.max(growing.to_gb));
+        self.hand_size(handed).await;
         Some(size)
     }
 
-    /// Writes the volume's `size` where the watchdog reads it.
-    async fn hand_size(&self, size: u32) {
+    /// Writes `size` where the watchdog reads the volume's size, unless it is
+    /// there already; a failure is tried again the next time.
+    async fn hand_size(&mut self, size: u32) {
+        if self.handed_gb == Some(size) {
+            return;
+        }
         let path = format!("{}/{VOLUME_SIZE_FILE}", self.run.remote_dir);
-        if let Err(error) = self.executor.put_file(&path, &size.to_string()).await {
-            tracing::debug!("cannot hand the volume size to the watchdog: {error}");
+        match self.executor.put_file(&path, &size.to_string()).await {
+            Ok(()) => self.handed_gb = Some(size),
+            Err(error) => tracing::debug!("cannot hand the volume size to the watchdog: {error}"),
         }
     }
 
     /// Warns and acts on `usage`, with the newest checkpoint of
     /// `checkpoint_bytes`. While a grow is pending, it only checks the grow.
     pub async fn check(&mut self, usage: Usage, checkpoint_bytes: Option<u64>) {
-        if self.stopped {
+        if self.idle {
             return;
         }
         if self.growing.is_some() {
@@ -356,16 +453,14 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
         }
         let assessment = assess(usage, checkpoint_bytes, self.warned);
         if let Some(percent) = assessment.warn {
-            self.warned = Some(percent);
-            tracing::warn!(
-                "the pod's {} is {percent}% full ({} free)",
-                self.disk_name(),
-                gb(usage.free_bytes())
-            );
+            self.warn_full(percent, usage);
         }
         let Some(critical) = assessment.act else {
             return;
         };
+        if self.resized_elsewhere().await {
+            return;
+        }
         let why = match critical {
             Critical::Full => format!("the pod's {} is {ACT_PERCENT}% full", self.disk_name()),
             Critical::NoRoomForCheckpoint => format!(
@@ -379,6 +474,27 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
         }
     }
 
+    /// Warns that the disk is `percent` full.
+    fn warn_full(&mut self, percent: u64, usage: Usage) {
+        self.warned = Some(percent);
+        tracing::warn!(
+            "the pod's {} is {percent}% full ({} free)",
+            self.disk_name(),
+            gb(usage.free_bytes())
+        );
+    }
+
+    /// Whether the volume's size changed since it was last read, as when it is
+    /// grown elsewhere: the next sample weighs it against its new size.
+    async fn resized_elsewhere(&mut self) -> bool {
+        let known = self.size_gb;
+        self.volume.is_some()
+            && self
+                .read_size()
+                .await
+                .is_some_and(|size| Some(size) != known)
+    }
+
     /// The disk's name in a warning.
     fn disk_name(&self) -> &'static str {
         if self.volume.is_some() {
@@ -388,8 +504,9 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
         }
     }
 
-    /// Asks Runpod to grow the volume, when `max_volume_gb` leaves room;
-    /// whether it did.
+    /// Asks Runpod to grow the volume, when `max_volume_gb` leaves room and
+    /// Runpod never refused; whether it accepted. The size asked for goes to
+    /// the watchdog at once, so its own rule weighs the volume against it.
     async fn grow(&mut self, why: &str) -> bool {
         let (Some(volume), Some(size)) = (self.volume, self.size_gb) else {
             return false;
@@ -397,55 +514,94 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
         let Some(to_gb) = volume.max_gb.and_then(|max| grown_size(size, max)) else {
             return false;
         };
+        if self.cannot_grow {
+            return false;
+        }
         let resized = self.client.resize_network_volume(volume.id, to_gb).await;
         let note = match &resized {
             Ok(_) => format!(
-                "{why}: growing network volume {} from {size} to {to_gb} GB (max_volume_gb)",
+                "{why}: growing network volume {} from {size} to {to_gb} GB (max_volume_gb); \
+                 a volume never shrinks back: it stays billed at {to_gb} GB after the run, \
+                 for every pod using it",
                 volume.id
             ),
             Err(error) => format!("cannot grow network volume {}: {error}", volume.id),
         };
         tracing::warn!("{note}");
-        if resized.is_ok() {
-            self.growing = Some(Growing {
-                to_gb,
-                checks_left: GROW_CHECKS,
-            });
+        let Ok(answer) = resized else {
+            self.cannot_grow = true;
+            return false;
+        };
+        self.growing = Some(Growing {
+            to_gb,
+            since: Instant::now(),
+        });
+        self.hand_size(to_gb).await;
+        if answer.size >= to_gb {
+            self.grown(answer.size);
         }
-        resized.is_ok()
+        true
     }
 
-    /// Whether the pending grow shows in the API: then the new size counts;
-    /// after [`GROW_CHECKS`] samples without it, the job is stopped.
+    /// The volume is now `size_gb`.
+    fn grown(&mut self, size_gb: u32) {
+        self.growing = None;
+        self.size_gb = Some(size_gb);
+        self.warned = None;
+    }
+
+    /// Whether the pending grow shows in the API: then the new size counts.
+    /// The job is stopped once the API kept showing a smaller size for the
+    /// grow window, or could not be read for three times as long.
     async fn check_grow(&mut self) {
-        let Some(mut growing) = self.growing.take() else {
+        let (Some(growing), Some(volume)) = (self.growing, self.volume) else {
             return;
         };
-        if self
-            .read_size()
-            .await
-            .is_some_and(|size| size >= growing.to_gb)
-        {
-            self.warned = None;
-            tracing::warn!("the network volume grew to {} GB", growing.to_gb);
-            return;
-        }
-        growing.checks_left = growing.checks_left.saturating_sub(1);
-        if growing.checks_left == 0 {
-            self.stop("the network volume did not grow").await;
-        } else {
-            self.growing = Some(growing);
+        let waited = growing.since.elapsed();
+        let check = match self.fetch_size(volume.id).await {
+            Ok(size) if size >= growing.to_gb => GrowCheck::Grown(size),
+            Ok(_) if waited >= self.grow_window => {
+                GrowCheck::Failed("the network volume did not grow")
+            },
+            Err(_) if waited >= self.grow_window.saturating_mul(3) => {
+                GrowCheck::Failed("the size of the network volume cannot be read after its grow")
+            },
+            Ok(_) | Err(_) => GrowCheck::Waiting,
+        };
+        match check {
+            GrowCheck::Grown(size) => {
+                self.grown(size);
+                tracing::warn!("network volume {} grew to {size} GB", volume.id);
+            },
+            GrowCheck::Failed(why) => {
+                self.growing = None;
+                self.stop(why).await;
+            },
+            GrowCheck::Waiting => {},
         }
     }
 
-    /// Stops the job with a snapshot for `why`; tried again at the next sample
-    /// when the request cannot be written.
+    /// Stops the job with a snapshot for `why`, unless one was asked for
+    /// already (its reason stays); tried again at the next sample when the
+    /// request cannot be written.
     async fn stop(&mut self, why: &str) {
-        let asked = request_snapshot(self.executor, self.run, SnapshotReason::Disk).await;
-        self.stopped = asked.is_ok();
-        let note = match asked {
-            Ok(()) => format!("{why}: the job is stopped with a snapshot"),
-            Err(error) => format!("{why}, but the snapshot cannot be asked for: {error}"),
+        let path = format!("{}/{SNAPSHOT_REQUEST}", self.run.remote_dir);
+        let asked = self
+            .executor
+            .read_from(&path, 0, 64)
+            .await
+            .is_ok_and(|content| !content.iter().all(u8::is_ascii_whitespace));
+        let note = if asked {
+            self.idle = true;
+            format!("{why}; a snapshot was already asked for")
+        } else {
+            match request_snapshot(self.executor, self.run, SnapshotReason::Disk).await {
+                Ok(()) => {
+                    self.idle = true;
+                    format!("{why}: the job is stopped with a snapshot")
+                },
+                Err(error) => format!("{why}, but the snapshot cannot be asked for: {error}"),
+            }
         };
         tracing::warn!("{note}");
     }
@@ -530,7 +686,7 @@ mod tests {
     #[test]
     fn the_watchdog_acts_at_the_same_share() {
         let script = crate::runpod::watchdog_script();
-        assert!(script.contains(&format!("\nDISK_ACT={ACT_PERCENT}\n")));
+        assert!(script.contains(&format!("\nDISK_ACT={WATCHDOG_ACT_PERCENT}\n")));
         assert!(script.contains(&format!("\nVOLUME_USABLE={VOLUME_USABLE_PERCENT}\n")));
         assert!(script.contains(&format!(
             "pod_number {}",
@@ -567,7 +723,7 @@ mod tests {
         assert!(!script.contains("@volume") && !script.contains("part volume"));
         let script = disk_probe_script("/w", Some("/workspace/data"));
         assert!(
-            script.contains("part volume\ndu -sk -- '/workspace/data'"),
+            script.contains("part volume\n$limit du -sk -- '/workspace/data'"),
             "{script}"
         );
     }
