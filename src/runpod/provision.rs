@@ -840,7 +840,8 @@ pub(super) fn one_line(text: &str, max: usize) -> String {
 }
 
 /// Deletes the run's current pod and waits until the API no longer knows it,
-/// then records it deleted by `by`, or by [`DeletedBy::Watchdog`] when it was
+/// after a last read of its logs into the run directory (see
+/// [`super::drain`]), then records it deleted by `by`, or by [`DeletedBy::Watchdog`] when it was
 /// already gone. Does nothing when there is no pod. The delete is sent even
 /// when `pod.json` cannot be saved first.
 ///
@@ -864,6 +865,14 @@ pub async fn remove(
     });
     record.state = super::PodState::Deleting;
     let saved = record.save(ctx.runs);
+    // Runpod drops a pod's logs with the pod: read what is left first.
+    Box::pin(super::logs::drain(
+        ctx.client,
+        ctx.runs,
+        &record.run_id,
+        &id,
+    ))
+    .await;
     // The first look only names who deleted the pod: the delete is always sent,
     // since a one-off 404 must never pass a live pod for deleted. When both the
     // look and the delete say Runpod no longer knows it, its watchdog deleted it

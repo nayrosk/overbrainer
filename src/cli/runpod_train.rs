@@ -21,7 +21,7 @@ use crate::runpod::{
     DeleteReason, DeletedBy, Ending, LEASE_TTL, MAX_HOURS_REACHED, PodCtx, PodError, PodRecord,
     PodState, RunpodClient, RunpodTarget, Timing, chain, end_pod, forget_client_key, job_started,
     listed_rows, orphan_warnings, past_deadline, reconnect, remove, settle_watch, ssh_command,
-    start_pod, watch_leased,
+    start_pod, watch_leased, with_pod_logs,
 };
 use crate::runs::{
     Launch, Outcome, RunCtx, RunRecord, RunState, Runs, artifacts_missing, cancel as cancel_job,
@@ -305,16 +305,14 @@ impl Job<'_> {
     ) -> anyhow::Result<()> {
         let ctx = self.session.ctx();
         let id = record.id.clone();
-        // Only the watch is raced: it never calls the API, so Ctrl-C drops
-        // nothing half done. Acting on it (deleting the pod past the deadline)
+        // Only the watch is raced: it never changes the pod, so Ctrl-C drops
+        // nothing half done (the capture of the pod's logs resumes from its
+        // cursor). Acting on it (deleting the pod past the deadline)
         // is shielded.
+        let run_ctx = self.run_ctx(executor);
+        let watch = watch_leased(&run_ctx, self.trainer, record, pod);
         let watched = interrupt
-            .race(watch_leased(
-                &self.run_ctx(executor),
-                self.trainer,
-                record,
-                pod,
-            ))
+            .race(with_pod_logs(&ctx, pod, Box::pin(watch)))
             .await;
         let Some(watched) = watched else {
             bail!(detached(pod, &id, self.spec));

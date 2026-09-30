@@ -15,7 +15,16 @@
 # temporary directories; overbrainer appends write_watchdog and the call to
 # bootstrap_main when it builds the pod's command. POSIX sh.
 
-log() { printf '%s bootstrap: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+# log MESSAGE: on stdout, which Runpod keeps in the pod's logs, and in the run's
+# .pod/bootstrap.log once the run directory exists, which overbrainer copies
+# with the results.
+log() {
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) bootstrap: $*"
+  printf '%s\n' "$line"
+  if [ -n "${OVERBRAINER_RUN_DIR:-}" ] && [ -d "$OVERBRAINER_RUN_DIR/.pod" ]; then
+    printf '%s\n' "$line" >> "$OVERBRAINER_RUN_DIR/.pod/bootstrap.log" 2>/dev/null || true
+  fi
+}
 
 # The watchdog file's path: OVERBRAINER_WATCHDOG_FILE when set (tests), the real
 # pod's path otherwise. Shared by bootstrap_main and fail so both agree on it.
@@ -101,7 +110,6 @@ write_job_env() {
 bootstrap_main() {
   set -eu
   umask 077
-  log "run ${OVERBRAINER_RUN_ID:-unknown}"
   watchdog_file=$(watchdog_path)
   etc_ssh_dir=${OVERBRAINER_ETC_SSH_DIR:-/etc/ssh}
   authorized_keys_dir=${OVERBRAINER_AUTHORIZED_KEYS_DIR:-/root/.ssh}
@@ -122,6 +130,7 @@ bootstrap_main() {
   fi
   [ "$claimed" = 0 ] || fail "cannot create the run directory"
   mkdir -p "$OVERBRAINER_RUN_DIR/.pod" || fail "cannot create the run directory"
+  log "run ${OVERBRAINER_RUN_ID:-unknown}"
   # A verdict left by an earlier pod (a network volume outlives it) must never be
   # read as this pod's: it goes before sshd can serve it.
   rm -f "$OVERBRAINER_RUN_DIR/.pod/watchdog" || fail "cannot remove a stale verdict"

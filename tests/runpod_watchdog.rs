@@ -921,6 +921,13 @@ async fn a_bootstrap_failure_still_deletes_a_guarded_pod() -> TestResult {
             "cannot install the authorized key\n",
             "{shell}: {output}"
         );
+        // Its log is kept in the run directory too, from its first line.
+        let log = setup.read(".pod/bootstrap.log");
+        assert!(log.contains("bootstrap: run r1\n"), "{shell}: {log}");
+        assert!(
+            log.contains("bootstrap: failed: cannot install the authorized key\n"),
+            "{shell}: {log}"
+        );
         assert_eq!(
             setup.read(".pod/watchdog"),
             "failed bootstrap: cannot install the authorized key\n",
