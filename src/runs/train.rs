@@ -855,6 +855,12 @@ mod tests {
         manifest: Vec<FileDigest>,
         reads: AtomicU32,
         cancels: AtomicU32,
+        /// What the probe prints; `None` makes it fail.
+        probe: Option<Vec<u8>>,
+        probes: AtomicU32,
+        /// Status polls answered `Running` before [`Fake::status`].
+        running_polls: u32,
+        polls: AtomicU32,
     }
 
     impl Fake {
@@ -870,6 +876,10 @@ mod tests {
                 manifest: Vec::new(),
                 reads: AtomicU32::new(0),
                 cancels: AtomicU32::new(0),
+                probe: None,
+                probes: AtomicU32::new(0),
+                running_polls: 0,
+                polls: AtomicU32::new(0),
             }
         }
     }
@@ -948,7 +958,12 @@ mod tests {
             &self,
             _job: &JobId,
         ) -> impl Future<Output = Result<JobStatus, ExecError>> + Send {
-            ready(Ok(self.status))
+            let poll = self.polls.fetch_add(1, Ordering::SeqCst);
+            ready(Ok(if poll < self.running_polls {
+                JobStatus::Running
+            } else {
+                self.status
+            }))
         }
 
         fn cancel(&self, _job: &JobId) -> impl Future<Output = Result<(), ExecError>> + Send {
@@ -980,6 +995,11 @@ mod tests {
             _exclude: &[String],
         ) -> impl Future<Output = Result<Vec<FileDigest>, ExecError>> + Send {
             ready(Ok(self.manifest.clone()))
+        }
+
+        fn probe(&self, _script: &str) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            ready(self.probe.clone().ok_or_else(|| broken("probe")))
         }
     }
 
