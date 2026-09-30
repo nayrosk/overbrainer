@@ -1,4 +1,4 @@
-//! `train`, `train attach` and `train cancel` on a Runpod target: the pod is
+//! `train`, `train attach`, `train stop` and `train cancel` on a Runpod target: the pod is
 //! created before the run's job and deleted once its results are retrieved.
 //!
 //! Ctrl-C before the job exists deletes the pod and fails the run. Once the job is
@@ -13,7 +13,10 @@ use anyhow::{Context, bail};
 use secrecy::SecretString;
 
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
-use super::train::{HF_TOKEN, POLL, finish, prepare, reattach, secrets, started, training, warn};
+use super::train::{
+    HF_TOKEN, POLL, finish, prepare, reattach, secrets, started, stop_requested, stoppable,
+    training, warn,
+};
 use crate::config::{Settings, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
@@ -24,8 +27,9 @@ use crate::runpod::{
     start_pod, watch_leased, with_pod_logs,
 };
 use crate::runs::{
-    Launch, Outcome, RunCtx, RunRecord, RunState, Runs, artifacts_missing, cancel as cancel_job,
-    collect, create, reserve, start, watch,
+    Launch, Outcome, RunCtx, RunRecord, RunState, Runs, STOP_TIMEOUT, SnapshotReason,
+    artifacts_missing, cancel as cancel_job, collect, create, request_snapshot, reserve, start,
+    watch, with_stop_fallback,
 };
 use crate::train::sizing::{HF_URL, VramFloor, estimate_model};
 use crate::train::{Axolotl, reasoning_template_warning};
@@ -145,6 +149,7 @@ pub(super) async fn train(
         spec,
         trainer: &trainer,
         vram_floor_gb,
+        stopping: false,
     };
     let result = async {
         warn_orphans(&session.ctx()).await;
@@ -202,6 +207,9 @@ struct Job<'a> {
     trainer: &'a Axolotl<'a>,
     /// See [`vram_floor`]; used only to start a pod.
     vram_floor_gb: Option<u32>,
+    /// Whether a snapshot was asked of it: following it then cancels a job
+    /// that gives none within [`STOP_TIMEOUT`].
+    stopping: bool,
 }
 
 impl Job<'_> {
@@ -305,12 +313,20 @@ impl Job<'_> {
     ) -> anyhow::Result<()> {
         let ctx = self.session.ctx();
         let id = record.id.clone();
+        let job = record.job.clone().filter(|_| self.stopping);
         // Only the watch is raced: it never changes the pod, so Ctrl-C drops
         // nothing half done (the capture of the pod's logs resumes from its
         // cursor). Acting on it (deleting the pod past the deadline)
         // is shielded.
         let run_ctx = self.run_ctx(executor);
-        let watch = watch_leased(&run_ctx, self.trainer, record, pod);
+        // Boxed: its state would otherwise weigh on every caller's future.
+        let leased = Box::pin(watch_leased(&run_ctx, self.trainer, record, pod));
+        let watch = async move {
+            match job {
+                Some(job) => with_stop_fallback(executor, &job, STOP_TIMEOUT, leased).await,
+                None => leased.await,
+            }
+        };
         let watched = interrupt
             .race(with_pod_logs(&ctx, pod, Box::pin(watch)))
             .await;
@@ -384,6 +400,24 @@ impl Job<'_> {
         let mut outcome = watch(&run_ctx, self.trainer, record).await?;
         outcome.retrieved = retrieved;
         self.end(interrupt, &executor, pod, outcome).await
+    }
+
+    /// `train stop` of the running run `record` on its pod: asks its job for a
+    /// snapshot, then follows it until it ends, and ends the pod.
+    async fn stop(
+        &self,
+        interrupt: &mut Interrupt,
+        record: RunRecord,
+        pod: &mut PodRecord,
+    ) -> anyhow::Result<()> {
+        let ctx = self.session.ctx();
+        let id = record.id.clone();
+        let Some(executor) = reconnect(&ctx, pod, &record).await? else {
+            bail!("run {id} has no pod left: nothing to stop");
+        };
+        request_snapshot(&executor, &record, SnapshotReason::Requested).await?;
+        self.session.front.line(&stop_requested(&id));
+        self.follow(interrupt, &executor, record, pod).await
     }
 
     /// `train cancel` of the started run `record` on its pod: cancels the job,
@@ -617,6 +651,7 @@ pub(super) async fn attach(
         spec: &spec,
         trainer: &trainer,
         vram_floor_gb: None,
+        stopping: false,
     };
     let result = job.attach(&mut interrupt, record, &mut pod).await;
     session.close().await;
@@ -678,8 +713,40 @@ pub(super) async fn cancel(
         spec: &spec,
         trainer: &trainer,
         vram_floor_gb: None,
+        stopping: false,
     };
     let result = job.cancel(&mut interrupt, record, &mut pod).await;
+    session.close().await;
+    result
+}
+
+/// `overbrainer train stop` on a Runpod run.
+///
+/// # Errors
+///
+/// Returns an error when the run is not running, its pod is gone or cannot be
+/// reached, the request cannot be written, or the run cannot be followed.
+pub(super) async fn stop(
+    project_dir: &Path,
+    settings: &Settings,
+    record: RunRecord,
+    mut pod: PodRecord,
+    front: &Frontend,
+) -> anyhow::Result<()> {
+    let training = training(settings)?;
+    let spec = target_of(settings, &record)?;
+    stoppable(&record)?;
+    let session = Session::open(project_dir, settings, front).await?;
+    let mut interrupt = front.interrupt();
+    let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
+    let job = Job {
+        session: &session,
+        spec: &spec,
+        trainer: &trainer,
+        vram_floor_gb: None,
+        stopping: true,
+    };
+    let result = job.stop(&mut interrupt, record, &mut pod).await;
     session.close().await;
     result
 }

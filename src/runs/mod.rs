@@ -18,7 +18,7 @@ pub use id::{
 };
 pub use snapshot::{
     Proof, STOP_TIMEOUT, Snapshot, SnapshotReason, parse_proof, read_proof, request_snapshot,
-    stop_fallback,
+    with_stop_fallback,
 };
 pub use summary::MetricsSummary;
 pub use train::{

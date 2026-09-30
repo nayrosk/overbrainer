@@ -8,6 +8,7 @@
 //! stops, and writes [`SNAPSHOT_FILE`]; the job exits 0 and the run is recorded
 //! [`RunState::Stopped`](super::RunState::Stopped).
 
+use std::future::Future;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -175,13 +176,24 @@ pub async fn request_snapshot<E: Executor>(
     Ok(())
 }
 
-/// What a stop does when its snapshot does not come: after `timeout`, a job
-/// still running without having written its proof is cancelled, and whoever
-/// follows it records it cancelled. It never ends: race it with the watch.
-pub async fn stop_fallback<E: Executor>(executor: &E, job: &JobId, timeout: Duration) {
-    tokio::time::sleep(timeout).await;
-    late_stop(executor, job, timeout).await;
-    std::future::pending::<()>().await;
+/// Runs `flow`, which follows the job `job` after its snapshot was asked for,
+/// and returns what it returns. Beside it runs what a stop does when its
+/// snapshot does not come: after `timeout`, a job still running without having
+/// written its proof is cancelled, so `flow` sees it end cancelled.
+pub async fn with_stop_fallback<E: Executor, F: Future>(
+    executor: &E,
+    job: &JobId,
+    timeout: Duration,
+    flow: F,
+) -> F::Output {
+    let mut flow = std::pin::pin!(flow);
+    tokio::select! {
+        output = &mut flow => output,
+        () = tokio::time::sleep(timeout) => {
+            late_stop(executor, job, timeout).await;
+            flow.await
+        },
+    }
 }
 
 /// Cancels `job` when it is still running without a proof `waited` after the

@@ -2170,7 +2170,7 @@ mod tests {
     #[tokio::test]
     async fn a_stop_with_no_snapshot_in_time_cancels_the_job()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::runs::stop_fallback;
+        use crate::runs::with_stop_fallback;
         let job = job()?;
         for (proof, status, cancels) in [
             ("", JobStatus::Running, 1),
@@ -2181,10 +2181,8 @@ mod tests {
                 proof: proof.to_string(),
                 ..Fake::new(status)
             };
-            tokio::select! {
-                () = stop_fallback(&fake, &job, Duration::from_millis(1)) => {},
-                () = tokio::time::sleep(Duration::from_millis(200)) => {},
-            }
+            let flow = tokio::time::sleep(Duration::from_millis(200));
+            with_stop_fallback(&fake, &job, Duration::from_millis(1), flow).await;
             assert_eq!(
                 fake.cancels.load(Ordering::SeqCst),
                 cancels,

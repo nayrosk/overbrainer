@@ -267,6 +267,14 @@ pub enum TrainCommand {
         #[arg(add = ArgValueCandidates::new(complete::run_ids))]
         run_id: String,
     },
+    /// Stop the job of a run with a snapshot: it saves a checkpoint at the end of
+    /// its current step, stops, and the checkpoint is retrieved with its results.
+    /// `overbrainer train --resume-from <run-id>` then starts a new run from it.
+    Stop {
+        /// ID of the run, as shown by `overbrainer runs ls`.
+        #[arg(add = ArgValueCandidates::new(complete::run_ids))]
+        run_id: String,
+    },
     /// Stop the job of a run.
     Cancel {
         /// ID of the run, as shown by `overbrainer runs ls`.
@@ -731,6 +739,7 @@ mod tests {
             &["train"],
             &["train", "attach", "x"],
             &["train", "cancel", "x"],
+            &["train", "stop", "x"],
             &["pod", "rm", "x"],
             &["migrate"],
             &["migrate", "--dry-run"],
