@@ -10,6 +10,7 @@ use crate::exec::JobStatus;
 use crate::llm::Usage;
 use crate::pricing::Price;
 use crate::runpod::PodStatus;
+use crate::system::SystemSample;
 use crate::train::TrainMetric;
 
 /// A pipeline stage.
@@ -149,6 +150,11 @@ pub enum Event {
     JobStatus(JobStatus),
     /// The Runpod pod of a run changed.
     PodStatus(PodStatus),
+    /// What the machine running the job looks like now: disk, CPU, memory and
+    /// GPUs. Like [`Event::Metric`], it belongs to the run of the last
+    /// [`Event::RunWatched`] on this bus; one comes every
+    /// [`PROBE_EVERY`](crate::runs::PROBE_EVERY) while the job is followed.
+    System(SystemSample),
 }
 
 /// How an item ended, as its event says.

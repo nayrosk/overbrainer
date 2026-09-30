@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -11,6 +12,7 @@ use crate::exec::{
     local_manifest,
 };
 use crate::runpod::{POD_FILE, SSH_DIR, chain};
+use crate::system::{self, SystemSample, probe_script};
 use crate::train::{TrainError, Trainer};
 
 /// Hugging Face cache on the target, under the executor's work directory. Shared
@@ -22,6 +24,12 @@ pub const HF_CACHE_DIR: &str = ".hf-cache";
 /// poll loop starts the count again; the drain that follows the job's end spends
 /// what is left of it.
 const MAX_FAILURES: u32 = 5;
+
+/// Time between two samples of the target's machine while a job is followed.
+pub const PROBE_EVERY: Duration = Duration::from_secs(10);
+
+/// How long one sample may take before it is given up.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Start of the note added to a run's message when its artifacts could not be
 /// retrieved.
@@ -357,7 +365,14 @@ pub async fn watch<E: Executor, T: Trainer>(
     let metrics = format!("{}/{}", record.remote_dir, trainer.metrics_file());
     let mut stream = ctx.executor.tail(&metrics, 0);
     let mut summary = MetricsSummary::default();
-    let status = follow(ctx, &job, &mut stream, &mut summary).await?;
+    // The samples stop with the follow: they never end it, and their failures
+    // never count against its retries. Boxed, so the watch's own future stays
+    // small.
+    let sampler = Box::pin(sample(ctx, &record.remote_dir));
+    let status = tokio::select! {
+        status = follow(ctx, &job, &mut stream, &mut summary) => status?,
+        never = sampler => match never {},
+    };
     let (state, message) = outcome(status, &summary, &record.id);
     let succeeded = state == RunState::Succeeded;
     let (state, message, retrieved) =
@@ -610,6 +625,44 @@ async fn follow<E: Executor>(
             },
         }
     }
+}
+
+/// Samples the target's machine at once, then every [`PROBE_EVERY`], and
+/// publishes each sample as an [`Event::System`]; `run_dir` is the run
+/// directory on the target, whose file system is sampled first. A sample that
+/// fails or takes longer than [`PROBE_TIMEOUT`] is logged at debug level and
+/// skipped. Never ends: the caller drops it.
+async fn sample<E: Executor>(ctx: &RunCtx<'_, E>, run_dir: &str) -> Infallible {
+    let script = probe_script(run_dir);
+    let mut previous: Option<SystemSample> = None;
+    let mut every = tokio::time::interval(PROBE_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        match sample_once(ctx.executor, &script, previous.as_ref()).await {
+            Ok(sample) => {
+                ctx.bus.publish(Event::System(sample.clone()));
+                previous = Some(sample);
+            },
+            Err(error) => tracing::debug!("cannot sample the target: {error}"),
+        }
+    }
+}
+
+/// One sample of the target: `script` run there, its answer parsed with the
+/// counters of `previous`. Fails, saying why, when the target does not answer
+/// within [`PROBE_TIMEOUT`].
+async fn sample_once<E: Executor>(
+    executor: &E,
+    script: &str,
+    previous: Option<&SystemSample>,
+) -> Result<SystemSample, String> {
+    let output = tokio::time::timeout(PROBE_TIMEOUT, executor.probe(script))
+        .await
+        .map_err(|_| format!("no answer within {}s", PROBE_TIMEOUT.as_secs()))?
+        .map_err(|error| chain(&error))?;
+    let text = String::from_utf8_lossy(&output);
+    Ok(system::parse(&text, SystemTime::now(), previous))
 }
 
 /// Counts one more failure in a row to reach the job, and returns it as an error
@@ -1137,6 +1190,61 @@ mod tests {
         assert_eq!(outcome.record.state, RunState::Succeeded);
         assert_eq!(outcome.summary.lines, 1);
         assert_eq!(fake.reads.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_target_is_sampled_while_the_job_is_followed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let df = "@df.run\nFilesystem 1024-blocks Used Available Capacity Mounted on\n\
+                  /dev/sda1 100 60 40 60% /workspace\n";
+        let fake = Fake {
+            probe: Some(df.as_bytes().to_vec()),
+            running_polls: 3,
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        let record = running()?;
+        runs.save(&record)?;
+        let outcome = watch(&ctx(&runs, &fake, &bus), &NoFiles, record).await?;
+        assert_eq!(outcome.record.state, RunState::Succeeded);
+        // At once, then every ten seconds: once in a watch this short.
+        assert_eq!(fake.probes.load(Ordering::SeqCst), 1);
+        let mut samples = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::System(sample) = event {
+                samples.push(sample);
+            }
+        }
+        let [sample] = samples.as_slice() else {
+            return Err(format!("{samples:?}").into());
+        };
+        let disk = sample.run_disk().ok_or("no disk")?;
+        assert_eq!(
+            (disk.mount.as_str(), disk.used_bytes),
+            ("/workspace", 60 * 1024)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failing_sample_never_counts_against_the_follow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            running_polls: 3,
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        let record = running()?;
+        runs.save(&record)?;
+        let outcome = watch(&ctx(&runs, &fake, &bus), &NoFiles, record).await?;
+        assert_eq!(outcome.record.state, RunState::Succeeded);
+        assert_eq!(fake.probes.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
