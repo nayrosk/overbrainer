@@ -832,3 +832,17 @@ async fn a_network_volume_is_read_and_resized() -> TestResult {
     assert_eq!(grown.size, 150);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_failing_volume_resize_is_retried_once() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/v2/network-volumes/vol1"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = client(&server)?;
+    assert!(client.resize_network_volume("vol1", 150).await.is_err());
+    Ok(())
+}

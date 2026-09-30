@@ -41,6 +41,10 @@ const EVENT_STREAM: &str = "text/event-stream";
 const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Items asked for per page of `GET /pods` (the v2 maximum).
 const PODS_PAGE_SIZE: &str = "1000";
+/// Retries of a network volume resize after its first attempt. Few, so a
+/// failing grow soon hands over to the snapshot instead of holding the disk
+/// policy for minutes while the disk fills.
+const RESIZE_RETRIES: u32 = 1;
 /// Items asked for per page of `GET /templates` (the v2 maximum).
 const TEMPLATES_PAGE_SIZE: &str = "100";
 /// The GPU types of the catalog (v2 reference: `GET /v2/catalog/gpus`).
@@ -432,8 +436,10 @@ impl RunpodClient {
 
     /// Sets the size of the network volume `id` to `size_gb` (`PATCH
     /// /network-volumes/{id}`), which Runpod only allows to grow, and returns
-    /// the volume as Runpod answers. Retried like a read: asking twice for the
-    /// same size changes nothing more.
+    /// the volume as Runpod answers. Asking twice for the same size changes
+    /// nothing more, but it is retried at most `RESIZE_RETRIES` times: the
+    /// disk policy waits on it while the disk fills, and it stops the job with
+    /// a snapshot when the grow fails.
     ///
     /// # Errors
     ///
@@ -445,8 +451,12 @@ impl RunpodClient {
     ) -> Result<NetworkVolume, ApiError> {
         let url = self.volume_url(id)?;
         let body = serde_json::json!({ "size": size_gb });
+        let policy = RetryPolicy {
+            max_retries: self.policy.max_retries.min(RESIZE_RETRIES),
+            ..self.policy
+        };
         with_retry(
-            &self.policy,
+            &policy,
             || async {
                 let answer = self
                     .send(self.http.request(Method::PATCH, url.clone()).json(&body))
