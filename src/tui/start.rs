@@ -12,6 +12,7 @@ use serde::de::IgnoredAny;
 use crate::config::{Adapter, CONFIG_FILE, ListOrAuto, Runtime, Settings, Source, Target};
 use crate::dataset::{DataFiles, read};
 use crate::runpod::{Availability, GpuType, ResolveError, RunpodTarget, resolve_with_floor};
+use crate::runs::Runs;
 use crate::train::sizing::{Estimate, Fit, HF_URL, estimate_model, fit};
 use crate::train::{Outputs, reasoning_template_warning};
 
@@ -35,6 +36,19 @@ pub(super) struct StartPlan {
     pub(super) runpod: Option<Box<RunpodPlan>>,
     /// What the flow would warn about.
     pub(super) warnings: Vec<String>,
+    /// The stopped run it resumes from, if any.
+    pub(super) resume: Option<ResumePlan>,
+}
+
+/// The stopped run a new run resumes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ResumePlan {
+    /// The stopped run.
+    pub(super) run_id: String,
+    /// The step of its snapshot.
+    pub(super) step: u64,
+    /// Its checkpoint, relative to its run directory.
+    pub(super) checkpoint: String,
 }
 
 /// The pod a Runpod run would ask for.
@@ -166,6 +180,9 @@ const AUTO_SHOWN: usize = 4;
 /// The start of the line saying what the run costs at most.
 const COST_LABEL: &str = "max_hours   ";
 
+/// The start of the line saying what the run may spend (`max_cost_usd`).
+const COST_CAP_LABEL: &str = "max_cost    ";
+
 /// The start of the line saying what `y` saves first.
 const CHANGED_LABEL: &str = "changed     ";
 
@@ -178,17 +195,53 @@ const CHANGED_LABEL: &str = "changed     ";
 /// `[training]` section, its target is unknown, or the data cannot be read.
 pub(super) fn prepare(dir: &Path, source: &Source) -> Result<StartPlan, String> {
     let settings = source.load(dir).map_err(|error| format!("{error:#}"))?;
-    plan(dir, &settings)
+    plan(&settings, &DataFiles::new(dir))
 }
 
-/// What a run started now in the project in `dir` would use, from
-/// `settings` and its data files.
+/// What a run resuming the stopped run `run_id` of the project in `dir` would
+/// use, from its settings (read from `source`) and the stopped run's own data.
+///
+/// # Errors
+///
+/// Returns why no run can start, or why `run_id` cannot be resumed: it is not
+/// stopped with its snapshot here, or the training settings changed since.
+pub(super) fn prepare_resume(
+    dir: &Path,
+    source: &Source,
+    run_id: &str,
+) -> Result<StartPlan, String> {
+    let settings = source.load(dir).map_err(|error| format!("{error:#}"))?;
+    let training = settings
+        .training
+        .as_ref()
+        .ok_or("no [training] section in overbrainer.toml")?;
+    let runs = Runs::new(dir);
+    let trainer = crate::cli::train::trainer(dir, training, &runs, Some(run_id))
+        .map_err(|error| format!("{error:#}"))?;
+    let resume = trainer
+        .resume()
+        .ok_or_else(|| format!("run {run_id} cannot be resumed"))?;
+    let step = runs
+        .load(run_id)
+        .ok()
+        .and_then(|record| record.snapshot)
+        .map_or(0, |snapshot| snapshot.step);
+    let mut plan = plan(&settings, &DataFiles::new(&resume.dir))?;
+    plan.resume = Some(ResumePlan {
+        run_id: run_id.to_string(),
+        step,
+        checkpoint: resume.checkpoint.clone(),
+    });
+    Ok(plan)
+}
+
+/// What a run started now would use, from `settings` and the data `files`.
 ///
 /// # Errors
 ///
 /// Returns why no run can start: there is no `[training]` section, its
 /// target is unknown, or the data cannot be read.
-fn plan(dir: &Path, settings: &Settings) -> Result<StartPlan, String> {
+fn plan(settings: &Settings, files: &DataFiles) -> Result<StartPlan, String> {
     let training = settings
         .training
         .as_ref()
@@ -197,7 +250,6 @@ fn plan(dir: &Path, settings: &Settings) -> Result<StartPlan, String> {
         .targets
         .get(&training.target)
         .ok_or_else(|| format!("unknown target `{}`", training.target))?;
-    let files = DataFiles::new(dir);
     let count = |path: &Path| {
         read::<IgnoredAny>(path)
             .map(|lines| lines.len())
@@ -226,6 +278,7 @@ fn plan(dir: &Path, settings: &Settings) -> Result<StartPlan, String> {
         eval: count(&files.eval)?,
         runpod: RunpodTarget::from_target(target).map(|spec| Box::new(RunpodPlan::new(spec))),
         warnings,
+        resume: None,
     })
 }
 
@@ -250,7 +303,7 @@ pub(super) fn prepare_auto(dir: &Path, source: &Source) -> Result<AutoPlan, Stri
         return Ok(AutoPlan { run: None });
     };
     let outputs = Outputs::of(training);
-    let run = plan(dir, &settings)?;
+    let run = plan(&settings, &DataFiles::new(dir))?;
     Ok(AutoPlan {
         run: Some((Box::new(run), outputs)),
     })
@@ -364,10 +417,18 @@ fn stock(gpu: &GpuType, centers: &[String]) -> Availability {
 /// The confirmation text of `plan`, with the GPU types of the catalog once
 /// looked up.
 pub(super) fn text(plan: &StartPlan, catalog: Option<&Catalog>) -> Vec<String> {
-    let data = format!(
-        "data        data/train.jsonl {} examples, data/eval.jsonl {}",
-        plan.train, plan.eval
-    );
+    let data = match &plan.resume {
+        Some(resume) => format!(
+            "data        runs/{id}/data/train.jsonl {} examples, runs/{id}/data/eval.jsonl {}",
+            plan.train,
+            plan.eval,
+            id = resume.run_id
+        ),
+        None => format!(
+            "data        data/train.jsonl {} examples, data/eval.jsonl {}",
+            plan.train, plan.eval
+        ),
+    };
     lines(plan, catalog, data)
 }
 
@@ -382,8 +443,14 @@ fn lines(plan: &StartPlan, catalog: Option<&Catalog>, data: String) -> Vec<Strin
     let mut text = vec![
         format!("target      {} ({})", plan.target, plan.kind),
         format!("model       {}", plan.model),
-        data,
     ];
+    if let Some(resume) = &plan.resume {
+        text.push(format!(
+            "resume      run {} from step {}: its snapshot runs/{}/{} and its data",
+            resume.run_id, resume.step, resume.run_id, resume.checkpoint
+        ));
+    }
+    text.push(data);
     // Before the GPU list: a dialog too tall for the terminal cuts after them.
     for warning in &plan.warnings {
         text.push(format!("warning     {warning}"));
@@ -406,11 +473,15 @@ fn lines(plan: &StartPlan, catalog: Option<&Catalog>, data: String) -> Vec<Strin
 
 /// The positions in `text`, a start dialog's, of the lines a dialog too
 /// tall for the terminal keeps: what `y` saves first, and what a Runpod run
-/// costs at most (`max_hours`).
+/// costs at most (`max_hours`, `max_cost_usd`).
 pub(super) fn pinned(text: &[String]) -> Vec<usize> {
     text.iter()
         .enumerate()
-        .filter(|(_, line)| line.starts_with(CHANGED_LABEL) || line.starts_with(COST_LABEL))
+        .filter(|(_, line)| {
+            [CHANGED_LABEL, COST_LABEL, COST_CAP_LABEL]
+                .iter()
+                .any(|label| line.starts_with(label))
+        })
         .map(|(at, _)| at)
         .collect()
 }
@@ -471,6 +542,13 @@ fn runpod_lines(spec: &RunpodTarget, catalog: Option<&Catalog>) -> Vec<String> {
     }
     lines.push(center_line(spec, listed, floor, chosen.is_ok()));
     lines.push(max_hours_line(spec, listed, &ids));
+    if let Some(usd) = spec.max_cost_usd {
+        lines.push(format!(
+            "{COST_CAP_LABEL}${usd:.2}: the job stops with a snapshot at {:.0}%, the watchdog \
+             deletes the pod at 100%",
+            crate::runpod::SNAPSHOT_SHARE * 100.0
+        ));
+    }
     lines
 }
 
@@ -709,6 +787,7 @@ mod tests {
                 )))
             }),
             warnings: Vec::new(),
+            resume: None,
         }
     }
 
@@ -982,6 +1061,37 @@ mod tests {
             lines[9],
             "max_hours   6: the watchdog deletes the pod by then"
         );
+    }
+
+    #[test]
+    fn a_resumed_run_says_where_it_starts_and_a_cost_cap_is_kept_in_view() {
+        let mut spec = runpod_spec(list(&["NVIDIA A40"]), 1);
+        spec.max_cost_usd = Some(20.0);
+        let plan = StartPlan {
+            resume: Some(ResumePlan {
+                run_id: "r0".into(),
+                step: 120,
+                checkpoint: "output/checkpoint-120".into(),
+            }),
+            ..planned(spec)
+        };
+        let lines = text(&plan, None);
+        assert_eq!(
+            lines.get(2).map(String::as_str),
+            Some(
+                "resume      run r0 from step 120: its snapshot runs/r0/output/checkpoint-120 and its data"
+            )
+        );
+        assert_eq!(
+            lines.get(3).map(String::as_str),
+            Some("data        runs/r0/data/train.jsonl 1234 examples, runs/r0/data/eval.jsonl 137")
+        );
+        let cap = lines.iter().position(|line| {
+            line == "max_cost    $20.00: the job stops with a snapshot at 95%, the watchdog \
+                         deletes the pod at 100%"
+        });
+        assert!(cap.is_some(), "{lines:?}");
+        assert!(cap.is_some_and(|at| pinned(&lines).contains(&at)));
     }
 
     #[test]

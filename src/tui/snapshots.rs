@@ -1546,6 +1546,7 @@ pub(super) fn runpod_plan() -> StartPlan {
             1,
         )))),
         warnings: vec!["qwen2 renders no reasoning_content (see the logs)".into()],
+        resume: None,
     }
 }
 

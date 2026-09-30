@@ -196,7 +196,7 @@ async fn attach(
 ///
 /// Returns an error when `resume_from` is not a stopped run with its
 /// checkpoint in `runs/`, or its training settings differ from `training`.
-fn trainer<'a>(
+pub(crate) fn trainer<'a>(
     project_dir: &Path,
     training: &'a Training,
     runs: &Runs,

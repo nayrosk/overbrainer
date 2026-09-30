@@ -74,7 +74,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Op
         .bar(Bar::Step, view.selected_ratio().unwrap_or(0.0), STEP_BAR);
     let head = head_line(&row.record, series, (activity, shown), theme);
     let facts = facts_line(
-        series,
+        (series, &row.record),
         (follow, ended),
         (activity, app.motion.spinner()),
         theme,
@@ -305,11 +305,12 @@ fn head_line(
     Line::from(head)
 }
 
-/// The selected run's second status line: its epoch, whether a task starts
-/// (with the spinner) or cancels it, and the points its forwarder skipped;
-/// empty when there is none of them.
+/// The selected run's second status line: its epoch, the run it resumed from,
+/// the snapshot of a stopped run, whether a task starts (with the spinner),
+/// cancels or stops it, and the points its forwarder skipped; empty when there
+/// is none of them.
 fn facts_line(
-    series: &[TrainMetric],
+    (series, record): (&[TrainMetric], &RunRecord),
     (follow, ended): (Option<&Follow>, Option<&Ended>),
     (activity, spinner): (RunActivity, &str),
     theme: &Theme,
@@ -318,12 +319,31 @@ fn facts_line(
     if let Some(epoch) = progress(series).and_then(|now| now.epoch) {
         facts.push(Span::raw(format!("epoch {epoch:.2}")));
     }
+    if let Some(from) = &record.resumed_from {
+        facts.push(Span::styled(format!("resumed from {from}"), theme.dim));
+    }
+    if let Some(snapshot) = record
+        .snapshot
+        .as_ref()
+        .filter(|_| record.state == RunState::Stopped)
+    {
+        facts.push(Span::styled(
+            format!(
+                "snapshot at step {} ({}): T resumes from it",
+                snapshot.step,
+                snapshot.reason.name()
+            ),
+            theme.accent,
+        ));
+    }
     match activity {
         RunActivity::Starting { .. } | RunActivity::Abandoning { .. } => facts.push(Span::styled(
             format!("{spinner} {}", activity.label()),
             theme.accent,
         )),
-        RunActivity::Cancelling => facts.push(Span::styled(activity.label(), theme.accent)),
+        RunActivity::Cancelling | RunActivity::Stopping => {
+            facts.push(Span::styled(activity.label(), theme.accent));
+        },
         RunActivity::None | RunActivity::Followed => {},
     }
     let missing = match (follow, ended) {

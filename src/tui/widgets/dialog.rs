@@ -36,7 +36,8 @@ pub(in crate::tui) fn destructive(action: &Action, stage_running: bool) -> bool 
         | Action::Remove(_)
         | Action::CancelAuto => true,
         Action::Quit => stage_running,
-        Action::Start(_) | Action::Auto(_) | Action::ClearFailed(_) => false,
+        // A stop keeps what the job did: its snapshot.
+        Action::Start(_) | Action::Auto(_) | Action::ClearFailed(_) | Action::Stop(_) => false,
     }
 }
 
