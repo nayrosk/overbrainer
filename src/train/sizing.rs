@@ -205,25 +205,44 @@ pub fn estimate(shape: &ModelShape, recipe: &Recipe) -> Estimate {
     let params = u128::from(shape.params);
     let hidden = u128::from(shape.hidden_size);
     let layers = u128::from(shape.layers);
-    let tokens = u128::from(recipe.micro_batch_size) * u128::from(recipe.sequence_len);
+    let tokens = product(&[
+        u128::from(recipe.micro_batch_size),
+        u128::from(recipe.sequence_len),
+    ]);
     let optimizer = if recipe.eight_bit_optimizer { 10 } else { 16 };
-    let lora = layers * u128::from(recipe.lora_r) * hidden * LORA_WIDTHS;
+    let lora = product(&[layers, u128::from(recipe.lora_r), hidden, LORA_WIDTHS]);
     let (weights, trained) = match recipe.adapter {
-        Adapter::Full => (2 * params, params),
-        Adapter::Lora => (2 * params, lora),
-        Adapter::Qlora => (params * 6 / 10, lora),
+        Adapter::Full => (params.saturating_mul(2), params),
+        Adapter::Lora => (params.saturating_mul(2), lora),
+        Adapter::Qlora => (params.saturating_mul(6) / 10, lora),
     };
     let kept = if recipe.gradient_checkpointing {
         CHECKPOINTED_BYTES
     } else {
         FULL_ACTIVATION_BYTES
     };
-    let activations = tokens * hidden * layers * kept;
-    let logits = tokens * u128::from(shape.vocab_size) * 4;
-    let bytes = weights + trained * optimizer + activations + logits + u128::from(OVERHEAD);
+    let activations = product(&[tokens, hidden, layers, kept]);
+    let logits = product(&[tokens, u128::from(shape.vocab_size), 4]);
+    let bytes = [
+        weights,
+        trained.saturating_mul(optimizer),
+        activations,
+        logits,
+        u128::from(OVERHEAD),
+    ]
+    .into_iter()
+    .fold(0, u128::saturating_add);
     Estimate {
-        bytes: u64::try_from(bytes * 12 / 10).unwrap_or(u64::MAX),
+        bytes: u64::try_from(bytes.saturating_mul(12) / 10).unwrap_or(u64::MAX),
     }
+}
+
+/// The product of `factors`, saturating at `u128::MAX`: Hub metadata or
+/// `axolotl_extra` values far beyond any real model never overflow.
+fn product(factors: &[u128]) -> u128 {
+    factors
+        .iter()
+        .fold(1, |product, factor| product.saturating_mul(*factor))
 }
 
 /// Whether a GPU holds the run.
@@ -259,11 +278,11 @@ pub fn fit(memory_gb: u32, need: Option<&Estimate>) -> Fit {
     let Some(need) = need else {
         return Fit::Unknown;
     };
-    let memory = u128::from(memory_gb) * u128::from(GB);
+    let memory = u128::from(memory_gb).saturating_mul(u128::from(GB));
     let need = u128::from(need.bytes);
     if memory < need {
         Fit::Small
-    } else if memory * 10 < need * 11 {
+    } else if memory.saturating_mul(10) < need.saturating_mul(11) {
         Fit::Tight
     } else {
         Fit::Ok
@@ -471,6 +490,33 @@ mod tests {
             ..recipe(Adapter::Lora)
         };
         assert!(need(&QWEN3_4B, &unchecked) > lora + 20);
+    }
+
+    #[test]
+    fn an_absurd_shape_saturates_instead_of_overflowing() {
+        let huge = ModelShape {
+            params: u64::MAX,
+            hidden_size: u64::MAX,
+            layers: u64::MAX,
+            vocab_size: u64::MAX,
+        };
+        let recipe = Recipe {
+            sequence_len: u32::MAX,
+            micro_batch_size: u32::MAX,
+            lora_r: u32::MAX,
+            gradient_checkpointing: false,
+            ..recipe(Adapter::Full)
+        };
+        for adapter in [Adapter::Full, Adapter::Lora, Adapter::Qlora] {
+            let need = estimate(&huge, &Recipe { adapter, ..recipe });
+            assert_eq!(need, Estimate { bytes: u64::MAX }, "{adapter:?}");
+            assert_eq!(need.floor_gb(), u32::MAX);
+            assert_eq!(fit(u32::MAX, Some(&need)), Fit::Small);
+            assert!(need.to_string().starts_with("about "));
+        }
+        let most = Estimate { bytes: u64::MAX };
+        assert_eq!(fit(u32::MAX, Some(&Estimate { bytes: 0 })), Fit::Ok);
+        assert_eq!(most.floor_gb(), u32::MAX);
     }
 
     #[test]
