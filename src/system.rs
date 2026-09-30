@@ -3,8 +3,8 @@
 //! a [`SystemSample`] ([`parse`]).
 //!
 //! Inside a container (a Runpod pod), `/proc/meminfo` and `nproc` describe the
-//! host, so the cgroup v2 files of the container come first; `/proc` is the
-//! fallback where there is no cgroup limit (a plain host, cgroup v1).
+//! host, so the cgroup files of the container come first, v2 then v1; `/proc`
+//! is the fallback where no cgroup limits the container (a plain host).
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -81,8 +81,9 @@ pub struct Cpu {
     pub load1: Option<f64>,
     /// CPUs available: the container's quota when it has one, else `nproc`.
     pub cpus: Option<f64>,
-    /// Whether the figures are the container's (its cgroup has a `cpu.max`):
-    /// `load1` then describes another, larger machine.
+    /// Whether the figures are the container's (its cgroup v2 has a `cpu.max`,
+    /// or its cgroup v1 a quota): `load1` then describes another, larger
+    /// machine.
     pub container: bool,
     /// The counters the next sample's usage is computed from.
     pub(crate) times: Option<CpuTimes>,
@@ -192,6 +193,13 @@ part memory.current; cat /sys/fs/cgroup/memory.current 2>/dev/null
 part memory.stat; grep '^inactive_file ' /sys/fs/cgroup/memory.stat 2>/dev/null
 part cpu.max; cat /sys/fs/cgroup/cpu.max 2>/dev/null
 part cpu.stat; grep '^usage_usec ' /sys/fs/cgroup/cpu.stat 2>/dev/null
+v1() {{ cat "/sys/fs/cgroup/$1/$2" 2>/dev/null || cat "/sys/fs/cgroup/cpu,cpuacct/$2" 2>/dev/null; }}
+part memory.limit_in_bytes; v1 memory memory.limit_in_bytes
+part memory.usage_in_bytes; v1 memory memory.usage_in_bytes
+part memory.stat.v1; grep '^total_inactive_file ' /sys/fs/cgroup/memory/memory.stat 2>/dev/null
+part cpu.cfs_quota_us; v1 cpu cpu.cfs_quota_us
+part cpu.cfs_period_us; v1 cpu cpu.cfs_period_us
+part cpuacct.usage; v1 cpuacct cpuacct.usage
 part nproc; nproc 2>/dev/null
 disk() {{ $limit df -PkT -- "$1" 2>/dev/null || {{ [ "$?" -ne 124 ] && $limit df -Pk -- "$1" 2>/dev/null; }}; }}
 part df.run; disk {dir}
@@ -309,9 +317,13 @@ fn is_shared(source: &str, fstype: Option<&str>) -> bool {
     typed || source.contains(':') || source.starts_with("mfs#")
 }
 
-/// The memory: the cgroup's limit and use when it has a limit, else
-/// `/proc/meminfo`. A cgroup limit above the machine's memory counts as the
-/// machine's.
+/// A cgroup v1 memory limit from 2^62 bytes on is no limit: v1 writes "no
+/// limit" as the largest page-aligned 64-bit value, about 2^63.
+const V1_UNLIMITED: u64 = 1 << 62;
+
+/// The memory: the cgroup's limit and use when it has a limit (v2 first, then
+/// v1), else `/proc/meminfo`. A cgroup limit above the machine's memory counts
+/// as the machine's.
 fn memory<'a>(part: &impl Fn(&str) -> &'a [&'a str]) -> Option<Memory> {
     let field = |name: &str| -> Option<u64> {
         let line = part("meminfo").iter().find(|line| line.starts_with(name))?;
@@ -322,11 +334,12 @@ fn memory<'a>(part: &impl Fn(&str) -> &'a [&'a str]) -> Option<Memory> {
             .checked_mul(1024)
     };
     let total = field("MemTotal:");
-    let cgroup = || {
-        let max: u64 = first_number(part("memory.max"))?;
+    // The parts of the limit, the use and the `inactive_file` line.
+    let cgroup = |max: &str, current: &str, stat: &str| {
+        let max: u64 = first_number::<u64>(part(max)).filter(|max| *max < V1_UNLIMITED)?;
         let limit = total.map_or(max, |total| max.min(total));
-        let current: u64 = first_number(part("memory.current"))?;
-        let inactive: u64 = part("memory.stat")
+        let current: u64 = first_number(part(current))?;
+        let inactive: u64 = part(stat)
             .first()
             .and_then(|line| line.split_whitespace().nth(1)?.parse().ok())
             .unwrap_or(0);
@@ -335,7 +348,15 @@ fn memory<'a>(part: &impl Fn(&str) -> &'a [&'a str]) -> Option<Memory> {
             limit_bytes: limit,
         })
     };
-    cgroup().or_else(|| {
+    let v2 = cgroup("memory.max", "memory.current", "memory.stat");
+    let v1 = || {
+        cgroup(
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+            "memory.stat.v1",
+        )
+    };
+    v2.or_else(v1).or_else(|| {
         let total = total?;
         let available = field("MemAvailable:")?;
         Some(Memory {
@@ -349,17 +370,17 @@ fn memory<'a>(part: &impl Fn(&str) -> &'a [&'a str]) -> Option<Memory> {
 fn cpu<'a>(part: &impl Fn(&str) -> &'a [&'a str], before: Option<CpuTimes>) -> Option<Cpu> {
     let load1: Option<f64> = first_number(part("loadavg"));
     let nproc: Option<f64> = first_number(part("nproc"));
-    let quota = part("cpu.max").first().and_then(|line| {
-        let mut fields = line.split_whitespace();
-        let quota: f64 = fields.next()?.parse().ok()?;
-        let period: f64 = fields.next()?.parse().ok()?;
-        (period > 0.0).then_some(quota / period)
-    });
+    let cgroup = cgroup_cpu(part);
     // A capacity of no CPU at all (or not a number) is no capacity.
     let valid = |cpus: &f64| cpus.is_finite() && *cpus > 0.0;
-    let cpus = quota.filter(valid).or(nproc.filter(valid));
-    let container = !part("cpu.max").is_empty();
-    let times = cgroup_times(part, cpus).or_else(|| proc_times(part("stat")));
+    let cpus = cgroup
+        .and_then(|cgroup| cgroup.quota)
+        .filter(valid)
+        .or(nproc.filter(valid));
+    let container = cgroup.is_some();
+    let times = cgroup
+        .and_then(|cgroup| cgroup_times(part, cgroup.usage, cpus))
+        .or_else(|| proc_times(part("stat")));
     if load1.is_none() && cpus.is_none() && times.is_none() {
         return None;
     }
@@ -382,20 +403,54 @@ fn cpu<'a>(part: &impl Fn(&str) -> &'a [&'a str], before: Option<CpuTimes>) -> O
     })
 }
 
-/// The cgroup's CPU time and the time `cpus` CPUs had since boot, in seconds;
-/// `None` outside a cgroup with a `cpu.max` file.
-fn cgroup_times<'a>(part: &impl Fn(&str) -> &'a [&'a str], cpus: Option<f64>) -> Option<CpuTimes> {
-    part("cpu.max").first()?;
-    let usage: f64 = part("cpu.stat")
-        .first()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()?;
+/// The CPU figures of the container's cgroup.
+#[derive(Debug, Clone, Copy)]
+struct CgroupCpu {
+    /// Its quota in CPUs; `None` for a cgroup v2 without one (`max`).
+    quota: Option<f64>,
+    /// The CPU time it used, in seconds.
+    usage: Option<f64>,
+}
+
+/// The cgroup's CPU figures: from cgroup v2 when there is a `cpu.max`, else
+/// from cgroup v1 when it has a quota. `None` otherwise: a v1 cgroup without a
+/// quota (`-1`) is also the one of a plain host.
+fn cgroup_cpu<'a>(part: &impl Fn(&str) -> &'a [&'a str]) -> Option<CgroupCpu> {
+    if let Some(line) = part("cpu.max").first() {
+        let mut fields = line.split_whitespace();
+        let quota = fields.next().and_then(|quota| quota.parse::<f64>().ok());
+        let period = fields.next().and_then(|period| period.parse::<f64>().ok());
+        let usage = part("cpu.stat")
+            .first()
+            .and_then(|line| line.split_whitespace().nth(1)?.parse::<f64>().ok());
+        return Some(CgroupCpu {
+            quota: quota
+                .zip(period.filter(|period| *period > 0.0))
+                .map(|(quota, period)| quota / period),
+            usage: usage.map(|usec| usec / 1e6),
+        });
+    }
+    let quota: f64 = first_number(part("cpu.cfs_quota_us"))?;
+    let period: f64 = first_number(part("cpu.cfs_period_us"))?;
+    let usage: Option<f64> = first_number(part("cpuacct.usage"));
+    (quota > 0.0 && period > 0.0).then(|| CgroupCpu {
+        quota: Some(quota / period),
+        usage: usage.map(|nsec| nsec / 1e9),
+    })
+}
+
+/// The cgroup's CPU time `usage` and the time `cpus` CPUs had since boot, in
+/// seconds.
+fn cgroup_times<'a>(
+    part: &impl Fn(&str) -> &'a [&'a str],
+    usage: Option<f64>,
+    cpus: Option<f64>,
+) -> Option<CpuTimes> {
+    let usage = usage?;
     let uptime: f64 = first_number(part("uptime"))?;
     let cpus = cpus?;
     Some(CpuTimes {
-        busy: usage / 1e6,
+        busy: usage,
         total: uptime * cpus,
         cgroup: true,
         cpus: Some(cpus),
@@ -538,6 +593,87 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
 Filesystem     1024-blocks      Used Available Capacity Mounted on
 /dev/nvme0n1p2  1000000  400000  600000      40% /
 ";
+
+    /// A Runpod pod on cgroup v1 (EU-RO-1): no v2 file, a 31 GiB limit and a
+    /// quota of 5.1 CPUs on a 48-CPU host with 270 GB.
+    const V1_POD: &str = "
+@loadavg
+12.00 11.00 10.00 4/812 12345
+@stat
+cpu  1000 0 1000 7000 1000 0 0 0 0 0
+@uptime
+100.00 1500.00
+@meminfo
+MemTotal:       263671875 kB
+MemAvailable:   193359375 kB
+@memory.max
+@memory.current
+@memory.stat
+@cpu.max
+@cpu.stat
+@memory.limit_in_bytes
+33285996544
+@memory.usage_in_bytes
+5368709120
+@memory.stat.v1
+total_inactive_file 1073741824
+@cpu.cfs_quota_us
+510000
+@cpu.cfs_period_us
+100000
+@cpuacct.usage
+200000000000
+@nproc
+48
+";
+
+    #[test]
+    fn a_cgroup_v1_pod_reads_its_limit_and_its_quota() -> Result<(), String> {
+        let first = parse(V1_POD, at(0), None);
+        assert_eq!(
+            first.memory,
+            Some(Memory {
+                used_bytes: 4 * 1024 * MIB,
+                limit_bytes: 31 * 1024 * MIB,
+            })
+        );
+        let cpu = first.cpu.as_ref().ok_or("no cpu")?;
+        assert_eq!((cpu.cpus, cpu.container), (Some(5.1), true));
+        // 25.5 CPU seconds over 10 seconds of 5.1 CPUs.
+        let later = V1_POD
+            .replace("200000000000", "225500000000")
+            .replace("100.00 1500.00", "110.00 1500.00");
+        let second = parse(&later, at(10), Some(&first));
+        let usage = second.cpu.and_then(|cpu| cpu.usage).ok_or("no usage")?;
+        assert!((usage - 0.5).abs() < 1e-9, "{usage}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unlimited_cgroup_v1_reads_proc() -> Result<(), String> {
+        let output = V1_POD
+            .replace("33285996544", "9223372036854771712")
+            .replace("@cpu.cfs_quota_us\n510000", "@cpu.cfs_quota_us\n-1");
+        let sample = parse(&output, at(0), None);
+        assert_eq!(
+            sample.memory,
+            Some(Memory {
+                used_bytes: 70_312_500 * 1024,
+                limit_bytes: 263_671_875 * 1024,
+            })
+        );
+        let cpu = sample.cpu.ok_or("no cpu")?;
+        assert_eq!((cpu.cpus, cpu.container), (Some(48.0), false));
+        assert_eq!(cpu.times.map(|times| times.cgroup), Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn a_cgroup_v1_limit_above_the_machine_is_the_machine() {
+        let output = V1_POD.replace("33285996544", "300000000000");
+        let memory = parse(&output, at(0), None).memory;
+        assert_eq!(memory.map(|m| m.limit_bytes), Some(263_671_875 * 1024));
+    }
 
     #[test]
     fn a_pod_reads_its_gpus_and_its_cgroup() -> Result<(), String> {
@@ -838,6 +974,16 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
         assert!(script.contains("$limit df -Pk -- \"$1\""), "{script}");
         assert!(script.contains("$limit nvidia-smi"), "{script}");
         assert!(script.find("limit=") < script.find("part gpu"), "{script}");
+        // cgroup v1, where its controllers are mounted apart or together.
+        assert!(
+            script.contains(
+                "cat \"/sys/fs/cgroup/$1/$2\" 2>/dev/null || cat \"/sys/fs/cgroup/cpu,cpuacct/$2\""
+            ),
+            "{script}"
+        );
+        for part in ["memory.limit_in_bytes", "cpu.cfs_quota_us", "cpuacct.usage"] {
+            assert!(script.contains(&format!("part {part};")), "{part}");
+        }
         assert!(script.ends_with("exit 0\n"));
     }
 }
