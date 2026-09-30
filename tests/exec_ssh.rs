@@ -110,6 +110,38 @@ async fn a_run_directory_is_claimed_once_over_ssh() -> TestResult {
 }
 
 #[tokio::test]
+async fn the_system_probe_samples_the_remote_machine() -> TestResult {
+    let Some(executor) = connect("system").await? else {
+        skip();
+        return Ok(());
+    };
+    let script = overbrainer::system::probe_script(executor.workdir());
+    let output = executor.probe(&script).await?;
+    let sample = overbrainer::system::parse(
+        &String::from_utf8_lossy(&output),
+        std::time::SystemTime::now(),
+        None,
+    );
+    assert!(
+        sample.run_disk().is_some_and(|disk| disk.size_bytes > 0),
+        "{sample:?}"
+    );
+    assert!(sample.memory.is_some(), "{sample:?}");
+    let failed = executor.probe("exit 3").await;
+    assert!(
+        matches!(
+            failed,
+            Err(ExecError::Command {
+                action: "probe",
+                ..
+            })
+        ),
+        "{failed:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn connect_resolves_the_workdir_under_home() -> TestResult {
     let Some(executor) = connect("workdir").await? else {
         skip();
