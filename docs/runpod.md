@@ -138,11 +138,13 @@ A pod whose bootstrap failed (for example sshd could not start) is deleted at on
 
 Runpod keeps a pod's logs (its container's output and its own system lines, such as the image pull) only while the pod exists. overbrainer keeps a copy in `runs/<run-id>/.pod/pod.log` (mode 600), one JSON object per line (`ts`, `source`, `line`):
 
-- while it follows the run (`train`, `train attach`, the TUI), it reads the pod's log stream (`GET /v2/pods/{id}/logs`), starting with the last 5000 lines, then resuming where it stopped (the last event ID is in `.pod/pod.log.cursor`), so a reconnect or a later `train attach` repeats no line;
+- while it follows the run (`train`, `train attach`, the TUI), it reads the pod's log stream (`GET /v2/pods/{id}/logs`), starting with the last 5000 lines (which covers the image pull and the bootstrap), then resuming where it stopped (the last event ID is in `.pod/pod.log.cursor`), so a reconnect or a later `train attach` repeats no line; when Runpod no longer accepts that event ID, it starts again once from the event's time;
 - before every delete of the run's pod (at the end of the run, at `max_hours`, after a failed start, `pod rm`), it reads what is left for up to 5 seconds;
-- once the job ended, it copies `.pod/watchdog.log` and `.pod/bootstrap.log` from the pod next to it.
+- once the job ended, it copies `.pod/watchdog.log` and `.pod/bootstrap.log` from the pod next to it (up to 4 MiB each).
 
-The copy stops at 20 MiB, with a last line saying so. Every line is cleaned before it is written or shown: the Runpod API key, anything shaped like a Runpod key (`rpa_`, `rps_`) or a Hugging Face token (`hf_`), PEM private keys, the value of `NAME=value` when NAME contains KEY, TOKEN, SECRET or PASSWORD, and runs of 200 or more base64 characters become `***`.
+Nothing under `.pod/` is written or read through a symbolic link or a file with a second hard link: such a path is refused, whatever the pod sent back.
+
+The copy stops at 20 MiB, with a last line saying so. Every line is cleaned before it is written or shown: the Runpod API key, anything shaped like a Runpod key (`rpa_`, `rps_`) or a Hugging Face token (`hf_`), PEM private keys, the job's own secrets (the Hugging Face token), the value of `NAME=value` when NAME contains KEY, TOKEN, SECRET or PASSWORD (and of `NAME: value`, quoted or not, when NAME ends with one of them), runs of 200 or more base64 characters, and lines made only of 40 or more base64 characters become `***`. Lines are printed without terminal control characters.
 
 `overbrainer runs logs RUN_ID --pod` prints what is kept (the bootstrap's and watchdog's logs, then the pod's), then, while the pod exists, the lines Runpod has after the kept ones. `--source container` or `--source system` keeps one source, `--tail N` the last N lines of each log, and `--follow` keeps printing new lines until Ctrl-C. It only reads: the copy belongs to the command following the run. The TUI shows the same log with `s` in the Logs view.
 
