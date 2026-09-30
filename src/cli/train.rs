@@ -12,10 +12,10 @@ use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
 use crate::config::{DEFAULT_WORKDIR, Settings, Source, Target, Training};
 use crate::dataset::DataFiles;
-use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
+use crate::exec::{AnyExecutor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{PodRecord, RunpodTarget};
 use crate::runs::{
-    Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, cancel, create, start, watch,
+    Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, cancel, create_on, start, watch,
 };
 use crate::train::{Axolotl, OUTPUT_DIR, Outputs, reasoning_template_warning};
 
@@ -120,7 +120,7 @@ async fn train(
     })
     .await?;
     let runs = Runs::new(project_dir);
-    let record = create(&runs, &settings.project.name, executor.workdir(), name)?;
+    let record = create_on(&runs, &executor, &settings.project.name, name).await?;
     started(&record);
     front.run_created(&record.id);
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));

@@ -18,7 +18,7 @@ pub use id::{
 pub use summary::MetricsSummary;
 pub use train::{
     HF_CACHE_DIR, Launch, Outcome, RunCtx, RunError, artifacts_missing, cancel, collect, create,
-    start, watch,
+    create_on, reserve, start, watch,
 };
 
 use crate::exec::JobId;
@@ -119,6 +119,10 @@ pub struct RunRecord {
     pub message: Option<String>,
 }
 
+/// Most runs [`Runs::claim`] makes with one base ID: `base`, then `base_2` to
+/// `base_99`.
+const MAX_CLAIMS: u32 = 99;
+
 /// The `runs/` directory of a project.
 #[derive(Debug, Clone)]
 pub struct Runs {
@@ -155,21 +159,21 @@ impl Runs {
         }
     }
 
-    /// Creates the directory of a new run and returns its ID: `base`, or, when a
-    /// run already has that ID, `base_2`, `base_3` and so on up to `base_99`.
-    /// Each directory is created exclusively, so no existing run is ever
-    /// overwritten, even by another process creating a run at the same second.
+    /// Creates the directory of a new run and returns its ID with its number:
+    /// `base` is 1, `base_2` is 2, and so on up to `base_99`. Only numbers past
+    /// `after` are tried, and a number whose directory exists is skipped. Each
+    /// directory is created exclusively, so no existing run is ever overwritten,
+    /// even by another process creating a run at the same second.
     ///
     /// # Errors
     ///
     /// Returns [`RunsError::InvalidId`] when `base` is not a valid run ID, and
-    /// [`RunsError::Io`] when a directory cannot be created, or all 99 IDs are
-    /// taken (an `AlreadyExists` error).
-    pub fn claim(&self, base: &str) -> Result<String, RunsError> {
-        self.run_dir(base)?;
+    /// [`RunsError::Io`] when a directory cannot be created, or no number up to
+    /// 99 is left (an `AlreadyExists` error).
+    pub fn claim(&self, base: &str, after: u32) -> Result<(String, u32), RunsError> {
+        let first = self.run_dir(base)?;
         fs::create_dir_all(&self.dir).map_err(io_error(&self.dir))?;
-        let mut n = 1;
-        loop {
+        for n in after + 1..=MAX_CLAIMS {
             let id = if n == 1 {
                 base.to_string()
             } else {
@@ -177,10 +181,32 @@ impl Runs {
             };
             let dir = self.run_dir(&id)?;
             match fs::create_dir(&dir) {
-                Ok(()) => return Ok(id),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 99 => n += 1,
+                Ok(()) => return Ok((id, n)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {},
                 Err(e) => return Err(io_error(&dir)(e)),
             }
+        }
+        Err(RunsError::Io {
+            path: first,
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("runs {base} to {base}_{MAX_CLAIMS} all exist"),
+            ),
+        })
+    }
+
+    /// Removes the directory of run `id` made by [`Runs::claim`] when the run
+    /// cannot use it after all. Only an empty directory is removed; a failure is
+    /// logged, since an empty directory without a record is never listed.
+    pub(crate) fn release(&self, id: &str) {
+        let Ok(dir) = self.run_dir(id) else {
+            return;
+        };
+        if let Err(error) = fs::remove_dir(&dir) {
+            tracing::warn!(
+                "cannot remove the unused run directory {}: {error}",
+                dir.display()
+            );
         }
     }
 
@@ -378,22 +404,29 @@ pub(crate) mod tests {
     fn a_claimed_run_directory_is_never_claimed_again() -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
-        assert_eq!(runs.claim("p_20260930-120000")?, "p_20260930-120000");
-        assert_eq!(runs.claim("p_20260930-120000")?, "p_20260930-120000_2");
-        fs::create_dir(runs.dir().join("p_20260930-120000_3"))?;
-        assert_eq!(runs.claim("p_20260930-120000")?, "p_20260930-120000_4");
-        for n in 5..=99 {
-            assert_eq!(
-                runs.claim("p_20260930-120000")?,
-                format!("p_20260930-120000_{n}")
-            );
+        let base = "p_20260930-120000";
+        assert_eq!(runs.claim(base, 0)?, (base.to_string(), 1));
+        assert_eq!(runs.claim(base, 0)?, (format!("{base}_2"), 2));
+        fs::create_dir(runs.dir().join(format!("{base}_3")))?;
+        assert_eq!(runs.claim(base, 0)?, (format!("{base}_4"), 4));
+        // Past `after` only: 5 is skipped although it is free.
+        assert_eq!(runs.claim(base, 5)?, (format!("{base}_6"), 6));
+        assert_eq!(runs.claim(base, 0)?, (format!("{base}_5"), 5));
+        for n in 7..=99 {
+            assert_eq!(runs.claim(base, 0)?, (format!("{base}_{n}"), n));
         }
-        let full = runs.claim("p_20260930-120000");
+        let full = runs.claim(base, 0);
         assert!(
             matches!(&full, Err(RunsError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists),
             "{full:?}"
         );
-        assert!(matches!(runs.claim("../p"), Err(RunsError::InvalidId(_))));
+        assert!(runs.claim(base, 99).is_err());
+        assert!(matches!(
+            runs.claim("../p", 0),
+            Err(RunsError::InvalidId(_))
+        ));
+        runs.release(&format!("{base}_99"));
+        assert_eq!(runs.claim(base, 0)?, (format!("{base}_99"), 99));
         Ok(())
     }
 

@@ -42,6 +42,11 @@ pub enum RunError {
     /// The run never started a job.
     #[error("run {0} has no job: it stopped before the job started")]
     NotStarted(String),
+    /// The run directory on the target belongs to another run.
+    #[error(
+        "{0} on the target belongs to another run with the same ID, from another checkout of the project; start the run again"
+    )]
+    Taken(String),
     /// [`collect`] was asked for a run that has not ended yet.
     #[error(
         "run {0} has not ended yet: watch or attach it, not collect, while it is preparing or running"
@@ -95,9 +100,10 @@ pub struct Outcome {
 
 /// Creates a run of the project named `project` for `target`, whose run
 /// directories live in `workdir` on the target: a new ID (see [`new_run_id`]
-/// and [`Runs::claim`]), and its record saved as `Preparing`. `workdir` is the
-/// executor's [`Executor::workdir`], or, for a target whose executor only exists
-/// later (a Runpod pod), the directory it will have.
+/// and [`Runs::claim`]), and its record saved as `Preparing`. For a target whose
+/// executor only exists later (a Runpod pod): `workdir` is the directory it will
+/// have, and [`reserve`] claims the run directory there once it exists. A target
+/// with an executor uses [`create_on`].
 ///
 /// # Errors
 ///
@@ -110,8 +116,92 @@ pub fn create(
     target: &str,
 ) -> Result<RunRecord, RunsError> {
     let now = SystemTime::now();
-    let id = runs.claim(&new_run_id(project, now))?;
-    let record = RunRecord {
+    let (id, _) = runs.claim(&new_run_id(project, now), 0)?;
+    let record = preparing(id, workdir, target, now);
+    runs.save(&record)?;
+    Ok(record)
+}
+
+/// [`create`] on the target of `executor`: the run directory is also claimed
+/// there ([`Executor::claim`]) before the record is saved. When another run
+/// already owns it on the target, such as a run started in the same second from
+/// another checkout of the project against the same work directory, the next ID
+/// is tried, `_2`, `_3` and so on, as [`Runs::claim`] does locally.
+///
+/// # Errors
+///
+/// Returns [`RunError::Runs`] when no local ID is left or the record cannot be
+/// saved, and [`RunError::Exec`] when the target cannot claim the directory.
+pub async fn create_on<E: Executor>(
+    runs: &Runs,
+    executor: &E,
+    project: &str,
+    target: &str,
+) -> Result<RunRecord, RunError> {
+    let now = SystemTime::now();
+    create_named(runs, executor, &new_run_id(project, now), target, now).await
+}
+
+/// [`create_on`] with the base ID `base`, created `now`.
+async fn create_named<E: Executor>(
+    runs: &Runs,
+    executor: &E,
+    base: &str,
+    target: &str,
+    now: SystemTime,
+) -> Result<RunRecord, RunError> {
+    let mut after = 0;
+    loop {
+        let (id, n) = runs.claim(base, after)?;
+        let remote_dir = format!("{}/{id}", executor.workdir());
+        match executor.claim(&remote_dir).await {
+            Ok(true) => {
+                let record = preparing(id, executor.workdir(), target, now);
+                runs.save(&record)?;
+                return Ok(record);
+            },
+            Ok(false) => {
+                tracing::debug!("{remote_dir} belongs to another run: trying the next ID");
+                runs.release(&id);
+                after = n;
+            },
+            Err(error) => {
+                runs.release(&id);
+                return Err(error.into());
+            },
+        }
+    }
+}
+
+/// Claims the run directory of `record` on the target ([`Executor::claim`]),
+/// for a run made by [`create`] before its target existed. Its ID can no longer
+/// change then: when another run owns the directory, the run fails, saved
+/// `Failed` like a run [`start`] cannot start, before anything is copied there.
+///
+/// # Errors
+///
+/// Returns [`RunError::Taken`] when another run owns the directory, and
+/// [`RunError::Exec`] when the target cannot claim it.
+pub async fn reserve<E: Executor>(
+    ctx: &RunCtx<'_, E>,
+    record: &mut RunRecord,
+) -> Result<(), RunError> {
+    let error = match ctx.executor.claim(&record.remote_dir).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => RunError::Taken(record.remote_dir.clone()),
+        Err(error) => error.into(),
+    };
+    record.state = RunState::Failed;
+    record.message = Some(error.to_string());
+    if let Err(save_error) = ctx.runs.save(record) {
+        tracing::warn!("cannot record run {} as failed: {save_error}", record.id);
+    }
+    Err(error)
+}
+
+/// The record of the new run `id`, `Preparing`, created `now`.
+fn preparing(id: String, workdir: &str, target: &str, now: SystemTime) -> RunRecord {
+    RunRecord {
         remote_dir: format!("{workdir}/{id}"),
         id,
         target: target.to_string(),
@@ -119,9 +209,7 @@ pub fn create(
         job: None,
         state: RunState::Preparing,
         message: None,
-    };
-    runs.save(&record)?;
-    Ok(record)
+    }
 }
 
 /// Prepares the files of the run `record` (from [`create`]), copies them to the
@@ -749,6 +837,8 @@ mod tests {
         status: JobStatus,
         metrics: String,
         spawn_fails: bool,
+        /// Whether another run owns every run directory on the target.
+        claim_taken: bool,
         download_fails: bool,
         failing_read: Option<u32>,
         /// A run directory whose later saves [`break_saves_in`] breaks when a
@@ -766,6 +856,7 @@ mod tests {
                 status,
                 metrics: METRICS.to_string(),
                 spawn_fails: false,
+                claim_taken: false,
                 download_fails: false,
                 failing_read: None,
                 break_on_download: None,
@@ -794,6 +885,10 @@ mod tests {
     impl Executor for Fake {
         fn workdir(&self) -> &'static str {
             "/w"
+        }
+
+        fn claim(&self, _dir: &str) -> impl Future<Output = Result<bool, ExecError>> + Send {
+            ready(Ok(!self.claim_taken))
         }
 
         fn upload(
@@ -1038,6 +1133,87 @@ mod tests {
         let outcome = watch(&ctx(&runs, &fake, &bus), &NoFiles, record).await?;
         assert_eq!(outcome.record.state, RunState::Succeeded);
         assert_eq!(outcome.summary.lines, count);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_directory_another_checkout_owns_on_the_target_is_skipped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let target = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let executor = crate::exec::LocalExecutor::new(target.path())?;
+        let base = "demo_20260930-120000";
+        let now = SystemTime::UNIX_EPOCH;
+        // Another checkout of the project, against the same work directory, got
+        // there first with the same ID; its own `runs/` is elsewhere.
+        assert!(
+            executor
+                .claim(&format!("{}/{base}", executor.workdir()))
+                .await?
+        );
+        let record = create_named(&runs, &executor, base, "box", now).await?;
+        assert_eq!(record.id, format!("{base}_2"));
+        assert_eq!(
+            record.remote_dir,
+            format!("{}/{base}_2", executor.workdir())
+        );
+        assert!(
+            Path::new(&record.remote_dir)
+                .join(crate::exec::CLAIM_FILE)
+                .is_file()
+        );
+        // The local directory of the ID the target refused is not left behind.
+        assert!(!runs.dir().join(base).exists());
+        assert_eq!(runs.list()?, vec![record]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_local_target_claims_the_run_directory_it_shares_with_runs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let executor = crate::exec::LocalExecutor::new(runs.dir())?;
+        let first = create_on(&runs, &executor, "demo", "here").await?;
+        let second = create_on(&runs, &executor, "demo", "here").await?;
+        assert_ne!(first.id, second.id);
+        for record in [&first, &second] {
+            assert_eq!(runs.load(&record.id)?, *record);
+            assert!(
+                runs.run_dir(&record.id)?
+                    .join(crate::exec::CLAIM_FILE)
+                    .is_file()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_directory_is_taken_on_its_pod_fails_before_any_copy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            claim_taken: true,
+            ..Fake::new(JobStatus::Running)
+        };
+        let mut record = create(&runs, "demo", fake.workdir(), "cloud")?;
+        let result = reserve(&ctx(&runs, &fake, &bus), &mut record).await;
+        assert!(matches!(&result, Err(RunError::Taken(dir)) if *dir == record.remote_dir));
+        let saved = runs.load(&record.id)?;
+        assert_eq!(saved.state, RunState::Failed);
+        assert!(
+            saved
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("belongs to another run")),
+            "{saved:?}"
+        );
+        let mut free = create(&runs, "demo", "/w", "cloud")?;
+        reserve(&ctx(&runs, &Fake::new(JobStatus::Running), &bus), &mut free).await?;
+        assert_eq!(runs.load(&free.id)?.state, RunState::Preparing);
         Ok(())
     }
 

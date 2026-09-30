@@ -144,6 +144,10 @@ mod tests {
             "/w"
         }
 
+        fn claim(&self, _dir: &str) -> impl Future<Output = Result<bool, ExecError>> + Send {
+            std::future::ready(Ok(true))
+        }
+
         fn upload(
             &self,
             _local: &Path,
