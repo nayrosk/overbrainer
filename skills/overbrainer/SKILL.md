@@ -84,7 +84,7 @@ Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.4
 
 - `kind = "local"`: this machine, `runtime = "native"` (Axolotl in `venv`) or `"docker"`.
 - `kind = "ssh"`: a machine reached with `ssh`, host from `OVERBRAINER_TARGETS__NAME__HOST`.
-- `kind = "runpod"`: a pod created for the run and deleted afterwards. Needs `gpu_types` (a list, or `"auto"` to try every GPU type in stock, cheapest first, with at least the VRAM the model is estimated to need unless `min_vram_gb` is set) and `max_hours`, and `OVERBRAINER_RUNPOD__API_KEY`. A watchdog on the pod deletes it at `max_hours` at the latest, after asking the job for a snapshot 15 minutes before when nothing follows it. An optional `max_cost_usd` stops the job with a snapshot at 95% of that spend and deletes the pod at 100%.
+- `kind = "runpod"`: a pod created for the run and deleted afterwards. Needs `gpu_types` (a list, or `"auto"` to try every GPU type in stock, cheapest first, with at least the VRAM the model is estimated to need unless `min_vram_gb` is set) and `max_hours`, and `OVERBRAINER_RUNPOD__API_KEY`. A watchdog on the pod deletes it at `max_hours` at the latest, after asking the job for a snapshot 15 minutes before when nothing follows it. An optional `max_cost_usd` stops the job with a snapshot at 95% of that spend and deletes the pod at 100%. A disk 92% full also stops the job with a snapshot, unless an optional `max_volume_gb` lets overbrainer grow the network volume first.
 
 | Command | What it does |
 |---|---|

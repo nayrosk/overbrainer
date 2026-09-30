@@ -131,7 +131,7 @@ Topic names must be unique. `subtopics` and `questions_per_subtopic` must be at 
 
 Retries wait with exponential backoff and jitter, or as long as the provider's `Retry-After` asks.
 
-The `[training]` section and the `[targets.*]` tables are described in [Training](training.md) and [Runpod](runpod.md). A Runpod target's `gpu_types` and `data_center_ids` take a TOML array, or `"auto"`; from the environment, a comma-separated value or `auto`, for example `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. `min_vram_gb` and `max_price_per_hour` narrow an `auto` choice of GPU types and are rejected otherwise; see [Runpod](runpod.md) for every field.
+The `[training]` section and the `[targets.*]` tables are described in [Training](training.md) and [Runpod](runpod.md). A Runpod target's `gpu_types` and `data_center_ids` take a TOML array, or `"auto"`; from the environment, a comma-separated value or `auto`, for example `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. `min_vram_gb` and `max_price_per_hour` narrow an `auto` choice of GPU types and are rejected otherwise, and `max_volume_gb` needs `network_volume_id`; see [Runpod](runpod.md) for every field.
 
 ## Metrics
 
