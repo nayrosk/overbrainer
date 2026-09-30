@@ -326,7 +326,7 @@ impl Job<'_> {
         // is shielded.
         let run_ctx = self.run_ctx(executor);
         // Boxed: its state would otherwise weigh on every caller's future.
-        let leased = Box::pin(watch_leased(&run_ctx, self.trainer, record, pod));
+        let leased = Box::pin(watch_leased(&ctx, &run_ctx, self.trainer, record, pod));
         let watch = async move {
             match job {
                 Some(job) => with_stop_fallback(executor, &job, STOP_LIMITS, leased).await,

@@ -11,6 +11,7 @@ use std::path::PathBuf;
 mod bootstrap;
 mod catalog;
 mod client;
+mod disk;
 mod flow;
 mod keys;
 mod logs;
@@ -30,6 +31,11 @@ pub use catalog::{
     template_table, volume_table,
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
+pub use disk::{
+    ACT_PERCENT, Assessment, Critical, DISK_PROBE_EVERY, DiskProbe, DiskWatch, Usage,
+    VOLUME_SIZE_FILE, VOLUME_USABLE_PERCENT, VolumeDisk, WARN_PERCENT, WARN_STEP, assess,
+    disk_probe_script, grown_size, parse_disk_probe,
+};
 pub use flow::{
     COST_CAP_FILE, DEADLINE_MARGIN, Ending, LEASE_FILE, LEASE_TTL, MAX_COST_REACHED,
     MAX_HOURS_REACHED, RETRIEVED_MARKER, SNAPSHOT_AT_FILE, WATCHDOG_LOG, Watched, arm_cost_cap,

@@ -237,7 +237,7 @@ pub fn parse(output: &str, at: SystemTime, previous: Option<&SystemSample>) -> S
 }
 
 /// The non-blank lines of each `@name` part of `output`.
-fn parts(output: &str) -> BTreeMap<&str, Vec<&str>> {
+pub(crate) fn parts(output: &str) -> BTreeMap<&str, Vec<&str>> {
     let mut parts: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut current = None;
     for line in output.lines().map(str::trim) {
@@ -254,7 +254,7 @@ fn parts(output: &str) -> BTreeMap<&str, Vec<&str>> {
 }
 
 /// The first number of the first line of `lines`.
-fn first_number<T: std::str::FromStr>(lines: &[&str]) -> Option<T> {
+pub(crate) fn first_number<T: std::str::FromStr>(lines: &[&str]) -> Option<T> {
     lines.first()?.split_whitespace().next()?.parse().ok()
 }
 
