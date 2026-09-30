@@ -33,6 +33,10 @@ const PREPARED_DIR: &str = "prepared";
 /// Where a resumed run holds the checkpoint it resumes from, relative to the run
 /// directory.
 pub const RESUME_DIR: &str = "resume";
+/// Checkpoints Axolotl keeps in [`OUTPUT_DIR`] when `axolotl_extra` sets no
+/// `save_total_limit`.
+pub const SAVE_TOTAL_LIMIT: u32 = 2;
+
 /// Top-level Axolotl keys a resumed run may set differently from the run it
 /// resumes: none changes what the checkpoint was trained with. The cadence of
 /// evaluations, saves and logs, the Hub push, and the logging integrations.
@@ -326,6 +330,11 @@ impl<'a> Axolotl<'a> {
                 "saves_per_epoch".into(),
                 json!(self.training.saves_per_epoch),
             );
+        }
+        // Older checkpoints are removed so they never fill the disk; a
+        // snapshot is always the newest one, so it stays.
+        if !extra.contains_key("save_total_limit") {
+            map.insert("save_total_limit".into(), json!(SAVE_TOTAL_LIMIT));
         }
     }
 }

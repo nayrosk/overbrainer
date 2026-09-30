@@ -129,7 +129,7 @@ The parent's reasoning is trained only if the chat template renders `reasoning_c
 | `merge` | `false` | Also write the merged model (`lora` and `qlora` only). |
 | `hub_model_id` | none | Push the adapter to this private Hub repository. |
 
-overbrainer also sets `attn_implementation: sdpa` (no extra package needed), `gradient_checkpointing: true`, `warmup_ratio: 0.1` and `logging_steps: 1`.
+overbrainer also sets `attn_implementation: sdpa` (no extra package needed), `gradient_checkpointing: true`, `warmup_ratio: 0.1`, `logging_steps: 1` and `save_total_limit: 2`: Axolotl keeps the two newest checkpoints and removes older ones, so saves never fill the target's disk. A snapshot is always the newest checkpoint, so it is kept. Set `save_total_limit` in `[training.axolotl_extra]` to keep more.
 
 `[training.axolotl_extra]` is merged into the generated YAML last. Tables merge key by key, and any other value replaces the generated one, so it can change these too: for example `attn_implementation = "flash_attention_2"` on an image with flash-attn installed, or `chat_template = "qwen3"`. An `eval_steps` or `save_steps` there replaces `evals_per_epoch` or `saves_per_epoch`. It cannot set a key that has a typed setting above (use the setting), nor the keys overbrainer manages: `datasets`, `test_datasets`, `val_set_size`, `output_dir`, `dataset_prepared_path`, `plugins`, `resume_from_checkpoint`. `save_only_model = true` is refused too: a checkpoint without its optimizer state cannot be resumed after a snapshot.
 
