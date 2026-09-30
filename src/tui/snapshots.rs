@@ -420,6 +420,8 @@ pub(super) fn run(id: &str, target: &str, state: crate::runs::RunState) -> crate
         job: None,
         state,
         message: None,
+        snapshot: None,
+        resumed_from: None,
     }
 }
 

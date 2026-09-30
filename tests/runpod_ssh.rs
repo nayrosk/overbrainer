@@ -485,6 +485,8 @@ async fn started_run(
         job: None,
         state: RunState::Succeeded,
         message: None,
+        snapshot: None,
+        resumed_from: None,
     };
     runs.save(&run)?;
     let mut pod = PodRecord::new(&run_id, keep, 1, &sshd.host_public);
@@ -902,6 +904,8 @@ async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestRes
         job: None,
         state: RunState::Preparing,
         message: None,
+        snapshot: None,
+        resumed_from: None,
     };
     runs.save(&record)?;
     let observer = Observer {

@@ -1023,8 +1023,9 @@ pub(super) fn stats(app: &App) -> Vec<Stat> {
         RunState::Preparing => 0,
         RunState::Running => 1,
         RunState::Succeeded => 2,
-        RunState::Failed => 3,
-        RunState::Cancelled => 4,
+        RunState::Stopped => 3,
+        RunState::Failed => 4,
+        RunState::Cancelled => 5,
     };
     let mut states: BTreeMap<u8, (&str, usize)> = BTreeMap::new();
     for run in &app.training.runs {

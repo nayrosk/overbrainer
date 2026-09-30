@@ -508,11 +508,13 @@ async fn dispatch(
             let args = StageArgs::default();
             let load = data::Load::Reload(&mut reloader);
             data::run(dir, data::Command::Run, &args, &front, load).await?;
-            train::after_run(dir, &front, &mut reloader).await
+            // Boxed, as below: the training flows would otherwise weigh on
+            // every command's future.
+            Box::pin(train::after_run(dir, &front, &mut reloader)).await
         },
         Command::Train(args) => {
             let source = Source::from(EnvSource::Process);
-            train::run(dir, &args, &front, &source).await
+            Box::pin(train::run(dir, &args, &front, &source)).await
         },
         Command::Runs {
             command: RunsCommand::Ls,
