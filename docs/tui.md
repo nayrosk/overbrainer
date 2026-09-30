@@ -87,7 +87,8 @@ Logs:
 | `k` `j`, Up, Down, PgUp, PgDn | Scroll. |
 | `G`, End | Follow the newest lines. |
 | `f` | Cycle the level shown: error, warn, info, debug, trace. |
-| `x` | Export the lines at the level shown to `.overbrainer/logs-<timestamp>.log`. |
+| `s` | Show the pod log of the run selected in the Training view, or overbrainer's own log again. |
+| `x` | Export the lines shown to `.overbrainer/logs-<timestamp>.log` (`logs-pod-<run-id>-<timestamp>.log` for a pod log). |
 
 ## The views
 
@@ -131,6 +132,8 @@ The runs of `runs/`, and for the selected one its progress, ETA, pod and estimat
 ### Logs (`5`)
 
 The captured log lines, newest at the bottom. Scrolling back with `k`/`j`, the arrows or PgUp/PgDn pins the view on the line it reached; `G` or End follows the newest lines again. `f` cycles the level shown (error, warn, info, debug, trace) and resumes following. `x` exports every retained line at the shown level or more severe, oldest first, to a new file `.overbrainer/logs-<YYYYMMDDTHHMMSSZ>.log`; it never overwrites an existing file, writes none when no line is at the shown level, and the footer says how many lines went where, or why it wrote none.
+
+`s` switches to the Runpod pod log of the run selected in the Training view, as overbrainer keeps it in `runs/<run-id>/.pod/pod.log` (see [pod logs](runpod.md#pod-logs)), read again every 2 seconds. Each line shows its time, its source (`sys` for Runpod's own lines, such as the image pull, `ctr` for the container's output) and the line, secrets masked. `f` does not apply there; `x` exports that log to `.overbrainer/logs-pod-<run-id>-<YYYYMMDDTHHMMSSZ>.log`. `s` again shows overbrainer's own log.
 
 ## The footer and dialogs
 

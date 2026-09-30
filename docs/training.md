@@ -8,6 +8,7 @@
 | `overbrainer train attach RUN_ID` | Follow a run again, then retrieve its results. |
 | `overbrainer train cancel RUN_ID` | Stop the job of a run and retrieve its artifacts. |
 | `overbrainer runs ls` | List the runs: ID, state, target, creation time, and the pod of a Runpod run. |
+| `overbrainer runs logs RUN_ID [--tail N]` | Print the run's `job.log`. With `--pod [--source container\|system] [--follow]`, the logs of its Runpod pod instead (see [Runpod](runpod.md#pod-logs)). |
 | `overbrainer pod ls` | List the Runpod pods overbrainer created, with their run. |
 | `overbrainer pod rm RUN_ID [--force]` | Delete every pod of a run and wait until Runpod no longer shows them. |
 

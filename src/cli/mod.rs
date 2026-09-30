@@ -283,7 +283,7 @@ pub enum RunsCommand {
     Ls,
     /// Print the log of a run's job, or with --pod the logs of its Runpod pod.
     ///
-    /// The pod's logs are kept in runs/<run-id>/.pod/ while overbrainer follows
+    /// The pod's logs are kept in `runs/<run-id>/.pod/` while overbrainer follows
     /// the run and before every delete, so they outlive the pod; while the pod
     /// exists, the lines not kept yet are read from Runpod.
     Logs(LogsArgs),

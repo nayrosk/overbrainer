@@ -132,7 +132,19 @@ The pod's command starts a small shell watchdog as its first process. At startup
 
 While overbrainer follows a job (`train`, `train attach` or the TUI stays open) and the job keeps making progress, `max_hours` deletes nothing: overbrainer renews a lease on the pod (`.pod/lease`) every 5 minutes, and the watchdog skips its deadline while that lease is less than 15 minutes old. The lease is only renewed while metrics keep arriving; a job with no new metric for 30 minutes stops renewing it. Once overbrainer stops following (Ctrl-C, closed, crashed, network lost) or the job stalls, the lease runs out after 15 minutes and a pod past its deadline is deleted.
 
-A pod whose bootstrap failed (for example sshd could not start) is deleted at once too, once the watchdog's own proof runs. The watchdog writes its log to `.pod/watchdog.log` in the run directory on the pod, and to the pod's Runpod logs.
+A pod whose bootstrap failed (for example sshd could not start) is deleted at once too, once the watchdog's own proof runs. The watchdog writes its log to `.pod/watchdog.log` in the run directory on the pod, and to the pod's Runpod logs; the bootstrap writes its own to `.pod/bootstrap.log` and to the pod's Runpod logs.
+
+### Pod logs
+
+Runpod keeps a pod's logs (its container's output and its own system lines, such as the image pull) only while the pod exists. overbrainer keeps a copy in `runs/<run-id>/.pod/pod.log` (mode 600), one JSON object per line (`ts`, `source`, `line`):
+
+- while it follows the run (`train`, `train attach`, the TUI), it reads the pod's log stream (`GET /v2/pods/{id}/logs`), starting with the last 5000 lines, then resuming where it stopped (the last event ID is in `.pod/pod.log.cursor`), so a reconnect or a later `train attach` repeats no line;
+- before every delete of the run's pod (at the end of the run, at `max_hours`, after a failed start, `pod rm`), it reads what is left for up to 5 seconds;
+- once the job ended, it copies `.pod/watchdog.log` and `.pod/bootstrap.log` from the pod next to it.
+
+The copy stops at 20 MiB, with a last line saying so. Every line is cleaned before it is written or shown: the Runpod API key, anything shaped like a Runpod key (`rpa_`, `rps_`) or a Hugging Face token (`hf_`), PEM private keys, the value of `NAME=value` when NAME contains KEY, TOKEN, SECRET or PASSWORD, and runs of 200 or more base64 characters become `***`.
+
+`overbrainer runs logs RUN_ID --pod` prints what is kept (the bootstrap's and watchdog's logs, then the pod's), then, while the pod exists, the lines Runpod has after the kept ones. `--source container` or `--source system` keeps one source, `--tail N` the last N lines of each log, and `--follow` keeps printing new lines until Ctrl-C. It only reads: the copy belongs to the command following the run. The TUI shows the same log with `s` in the Logs view.
 
 ### Retrieval
 
