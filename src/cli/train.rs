@@ -558,6 +558,9 @@ pub(super) fn finish(
             if let Some(line) = stopped_line(record) {
                 front.line(&line);
             }
+            if let Some(snapshot) = &record.snapshot {
+                front.run_stopped(snapshot.step);
+            }
             Ok(())
         },
         RunState::Cancelled => bail!("run {} was cancelled", record.id),

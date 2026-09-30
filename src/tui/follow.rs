@@ -623,6 +623,11 @@ impl App {
                     follow.lines.push(line);
                 }
             },
+            Msg::Report(_, Report::RunStopped(step)) => {
+                if let Some(follow) = self.training.tasks.get_mut(&id) {
+                    follow.stopped_at = Some(step);
+                }
+            },
             Msg::Report(_, Report::RunCreated(run_id)) => {
                 if let Some(follow) = self.training.tasks.get_mut(&id) {
                     follow.run_id.clone_from(&run_id);
@@ -671,15 +676,15 @@ impl App {
     /// Training task `id` ended with `result` (see [`App::run_ended`]); auto
     /// mode ends when it was its run.
     pub(super) fn trained(&mut self, id: TaskId, result: Result<(), String>) -> Vec<Effect> {
-        let run = self
+        let ended = self
             .training
             .tasks
             .get(&id)
-            .map(|follow| follow.run_id.clone());
+            .map(|follow| (follow.run_id.clone(), follow.stopped_at));
         let error = result.as_ref().err().cloned();
         let effects = self.run_ended(id, result);
-        if let Some(run) = run {
-            self.auto_trained(id, &run, error.as_deref());
+        if let Some((run, stopped_at)) = ended {
+            self.auto_trained(id, &run, error.as_deref(), stopped_at);
         }
         effects
     }

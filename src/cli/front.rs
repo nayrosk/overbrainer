@@ -42,6 +42,9 @@ pub(crate) enum Report {
     Line(String),
     /// A training run was created, with this ID (the command line says nothing).
     RunCreated(String),
+    /// The training run ended stopped, with its snapshot at this step (the
+    /// command line says it in a line).
+    RunStopped(u64),
 }
 
 impl Frontend {
@@ -125,6 +128,14 @@ impl Frontend {
         match self {
             Self::Cli(_) => println!("{line}"),
             Self::Tui { report, .. } => report(Report::Line(line.to_string())),
+        }
+    }
+
+    /// Says that the training run ended stopped, its snapshot at `step`.
+    pub(crate) fn run_stopped(&self, step: u64) {
+        match self {
+            Self::Cli(_) => {},
+            Self::Tui { report, .. } => report(Report::RunStopped(step)),
         }
     }
 

@@ -971,7 +971,7 @@ impl App {
             Msg::Event(_, event) => self.pipeline.event(&event),
             Msg::Lagged(_, skipped) => self.pipeline.skipped += skipped,
             Msg::Report(_, Report::Line(line)) => self.pipeline.results.push(line),
-            Msg::Report(_, Report::RunCreated(_))
+            Msg::Report(_, Report::RunCreated(_) | Report::RunStopped(_))
             | Msg::EditorExited(_)
             | Msg::BrowserFailed(_)
             | Msg::LogsExported(_)

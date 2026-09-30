@@ -106,6 +106,8 @@ pub(super) struct Follow {
     /// Whether the run is stopped with a snapshot once this task, detached,
     /// ends.
     pub(super) stop_after: bool,
+    /// The step of the snapshot its run ended stopped with, once it did.
+    pub(super) stopped_at: Option<u64>,
     /// Whether it is detached, or to be once its job's first status arrives.
     pub(super) detach: Detach,
 }
@@ -122,6 +124,7 @@ impl Follow {
             skipped: 0,
             cancel_after: false,
             stop_after: false,
+            stopped_at: None,
             detach: Detach::No,
         }
     }
