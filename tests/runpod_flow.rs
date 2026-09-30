@@ -173,7 +173,7 @@ async fn a_run_whose_pod_cannot_be_placed_is_failed() -> TestResult {
         .mount(&harness.server)
         .await;
     let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
-    let result = start_pod(&harness.ctx(), &target(), run.clone(), false).await;
+    let result = start_pod(&harness.ctx(), &target(), run.clone(), false, None).await;
     assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
     let saved = harness.runs.load(&run.id)?;
     assert_eq!(saved.state, RunState::Failed);
@@ -213,7 +213,7 @@ async fn a_run_with_nothing_in_stock_fails_without_a_pod() -> TestResult {
     auto.gpu_types = ListOrAuto::Auto;
     auto.max_price_per_hour = Some(0.5);
     let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
-    let result = start_pod(&harness.ctx(), &auto, run.clone(), false).await;
+    let result = start_pod(&harness.ctx(), &auto, run.clone(), false, None).await;
     assert!(matches!(result, Err(PodError::NotInStock(_))), "{result:?}");
     let saved = harness.runs.load(&run.id)?;
     assert_eq!(saved.state, RunState::Failed);
@@ -236,6 +236,36 @@ async fn a_run_with_nothing_in_stock_fails_without_a_pod() -> TestResult {
     assert!(pod.attempts.is_empty() && pod.pod_id.is_none());
     let ssh = harness.runs.run_dir(&run.id)?.join("ssh");
     assert!(!ssh.join("id_ed25519").exists());
+    Ok(())
+}
+
+/// `auto` GPU types keep the estimated VRAM floor when the target sets no
+/// `min_vram_gb`: a 48 GB GPU in stock is too small for 60 GB.
+#[tokio::test]
+async fn auto_keeps_the_estimated_vram_floor() -> TestResult {
+    if !keygen_available() {
+        return Ok(());
+    }
+    let harness = Harness::new().await?;
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"gpus": [
+            {"id": "NVIDIA A40", "memory": 48, "secure": true, "price": {"secure": 0.4},
+             "maxCount": {"secure": 8}, "availability": "HIGH"}
+        ]})))
+        .mount(&harness.server)
+        .await;
+    let mut auto = target();
+    auto.gpu_types = ListOrAuto::Auto;
+    let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
+    let result = start_pod(&harness.ctx(), &auto, run.clone(), false, Some(60)).await;
+    let Err(PodError::NotInStock(message)) = result else {
+        return Err(format!("{result:?}").into());
+    };
+    assert!(
+        message.ends_with("(gpu_count = 1, at least 60 GB of VRAM estimated for the model)"),
+        "{message}"
+    );
     Ok(())
 }
 
@@ -268,7 +298,7 @@ async fn a_failed_provisioning_keeps_the_client_key_while_a_pod_may_remain() -> 
         .mount(&harness.server)
         .await;
     let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
-    let result = start_pod(&harness.ctx(), &target(), run.clone(), false).await;
+    let result = start_pod(&harness.ctx(), &target(), run.clone(), false, None).await;
     assert!(matches!(result, Err(PodError::NotDeleted(_))), "{result:?}");
     let pod = PodRecord::load(&harness.runs, &run.id)?.ok_or("no pod.json")?;
     assert_eq!(pod.state, PodState::Deleting);
@@ -285,7 +315,7 @@ async fn ctrl_c_before_the_pod_fails_the_run_as_interrupted() -> TestResult {
     let harness = Harness::new().await?;
     harness.interrupted.store(true, Ordering::SeqCst);
     let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
-    let result = start_pod(&harness.ctx(), &target(), run.clone(), false).await;
+    let result = start_pod(&harness.ctx(), &target(), run.clone(), false, None).await;
     assert!(matches!(result, Err(PodError::Interrupted)), "{result:?}");
     let saved = harness.runs.load(&run.id)?;
     assert_eq!(saved.state, RunState::Failed);

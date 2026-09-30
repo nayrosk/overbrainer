@@ -25,7 +25,8 @@ pub use bootstrap::{
 };
 pub use catalog::{
     DataCenterStock, GpuFilter, by_price, data_center_stock, data_center_table, gpu_table,
-    printable, resolve, select_gpus, stocked_data_centers, template_table, volume_table,
+    printable, resolve, resolve_with_floor, select_gpus, stocked_data_centers, template_table,
+    volume_table,
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
 pub use flow::{

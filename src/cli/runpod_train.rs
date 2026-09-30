@@ -7,13 +7,16 @@
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
+use secrecy::SecretString;
 
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
-use super::train::{POLL, finish, prepare, reattach, secrets, started, training, warn};
-use crate::config::Settings;
+use super::train::{
+    HF_TOKEN, POLL, finish, prepare, reattach, secrets, started, training, warn,
+};
+use crate::config::{Settings, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{
@@ -26,6 +29,7 @@ use crate::runs::{
     Launch, Outcome, RunCtx, RunRecord, RunState, Runs, artifacts_missing, cancel as cancel_job,
     collect, create, reserve, start, watch,
 };
+use crate::train::sizing::{HF_URL, estimate_model};
 use crate::train::{Axolotl, reasoning_template_warning};
 
 /// What every Runpod command sets up: the API client, the front end's bus and
@@ -112,10 +116,15 @@ pub(super) async fn train(
     }
     // Caught from before the preparation: Ctrl-C stops it without a run.
     let mut interrupt = front.interrupt();
-    let (secrets, session) = prepare(&mut interrupt, async {
+    let (secrets, vram_floor_gb, session) = prepare(&mut interrupt, async {
         let secrets = secrets(settings).await?;
+        let token = secrets
+            .iter()
+            .find(|(name, _)| name == HF_TOKEN)
+            .map(|(_, token)| token);
+        let vram_floor_gb = vram_floor(training, spec, token).await;
         let session = Session::open(project_dir, settings, front).await?;
-        Ok((secrets, session))
+        Ok((secrets, vram_floor_gb, session))
     })
     .await?;
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
@@ -123,6 +132,7 @@ pub(super) async fn train(
         session: &session,
         spec,
         trainer: &trainer,
+        vram_floor_gb,
     };
     let result = async {
         warn_orphans(&session.ctx()).await;
@@ -136,11 +146,47 @@ pub(super) async fn train(
     result
 }
 
+/// How long the model's shape may take to read from Hugging Face.
+const ESTIMATE_LIMIT: Duration = Duration::from_secs(10);
+
+/// The least VRAM the `auto` GPU types of `spec` need: the estimate of what a
+/// run of `training` needs per GPU, when `spec` has `auto` GPU types and no
+/// `min_vram_gb`. Without an estimate (the model's shape cannot be read), a
+/// warning says so and `auto` picks as it would without one.
+async fn vram_floor(
+    training: &Training,
+    spec: &RunpodTarget,
+    token: Option<&SecretString>,
+) -> Option<u32> {
+    if !spec.gpu_types.is_auto() || spec.min_vram_gb.is_some() {
+        return None;
+    }
+    match estimate_model(training, token, HF_URL, ESTIMATE_LIMIT).await {
+        Ok(need) => {
+            tracing::info!(
+                "the run needs {need} of VRAM per GPU (estimate): gpu_types = \"auto\" keeps \
+                 GPU types with at least {} GB",
+                need.floor_gb()
+            );
+            Some(need.floor_gb())
+        },
+        Err(error) => {
+            warn(&format!(
+                "cannot estimate the VRAM the run needs ({error}): gpu_types = \"auto\" picks \
+                 without a VRAM floor"
+            ));
+            None
+        },
+    }
+}
+
 /// A run's job on its pod.
 struct Job<'a> {
     session: &'a Session<'a>,
     spec: &'a RunpodTarget,
     trainer: &'a Axolotl<'a>,
+    /// See [`vram_floor`]; used only to start a pod.
+    vram_floor_gb: Option<u32>,
 }
 
 impl Job<'_> {
@@ -167,7 +213,13 @@ impl Job<'_> {
         let id = record.id.clone();
         // Provisioning checks the Ctrl-C flag between its steps and deletes its pod.
         let provisioned = interrupt
-            .shield(start_pod(&ctx, self.spec, record.clone(), keep))
+            .shield(start_pod(
+                &ctx,
+                self.spec,
+                record.clone(),
+                keep,
+                self.vram_floor_gb,
+            ))
             .await;
         let (mut pod, provisioned) = match provisioned {
             Ok(ready) => ready,
@@ -551,6 +603,7 @@ pub(super) async fn attach(
         session: &session,
         spec: &spec,
         trainer: &trainer,
+        vram_floor_gb: None,
     };
     let result = job.attach(&mut interrupt, record, &mut pod).await;
     session.close().await;
@@ -611,6 +664,7 @@ pub(super) async fn cancel(
         session: &session,
         spec: &spec,
         trainer: &trainer,
+        vram_floor_gb: None,
     };
     let result = job.cancel(&mut interrupt, record, &mut pod).await;
     session.close().await;

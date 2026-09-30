@@ -298,6 +298,9 @@ pub(super) fn training(settings: &Settings) -> anyhow::Result<&Training> {
         .context("no [training] section in overbrainer.toml")
 }
 
+/// The job's environment variable holding the Hugging Face token.
+pub(super) const HF_TOKEN: &str = "HF_TOKEN";
+
 /// The Hugging Face token, resolved only now, for the job's environment.
 pub(super) async fn secrets(
     settings: &Settings,
@@ -318,7 +321,7 @@ pub(super) async fn secrets(
         .resolve(token)
         .await
         .context("cannot resolve hf_token")?;
-    Ok(vec![("HF_TOKEN".to_string(), token)])
+    Ok(vec![(HF_TOKEN.to_string(), token)])
 }
 
 async fn executor(project_dir: &Path, name: &str, target: &Target) -> anyhow::Result<AnyExecutor> {

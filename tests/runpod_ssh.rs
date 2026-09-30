@@ -332,6 +332,7 @@ async fn provision_against(
         ssh_dir: &ssh_dir,
         workdir: &workdir,
         api_url: client.base_url(),
+        vram_floor_gb: None,
     };
     let mut record = PodRecord::new(&run_id, false, 1, &keys.host_public);
     let result = provision(&ctx, &plan, &mut record).await;
@@ -889,6 +890,7 @@ async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestRes
         ssh_dir: &ssh_dir,
         workdir: &workdir,
         api_url: client.base_url(),
+        vram_floor_gb: None,
     };
     let mut pod = PodRecord::new(&run_id, false, 1, &keys.host_public);
     let provisioned = provision(&ctx, &plan, &mut pod).await?;
