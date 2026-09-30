@@ -202,10 +202,10 @@ pub async fn provision(
 }
 
 /// `target` with its `auto` choices resolved from the Runpod catalog (see
-/// [`resolve_with_floor`](super::resolve_with_floor), with `floor_gb`), logged at info level; a target without any
-/// is returned as it is, without an API call. Both choices are resolved from
-/// the same GPU listing, scoped to `target.gpu_count`: `catalog/datacenters`
-/// is never read for this.
+/// [`resolve_with_floor`](super::resolve_with_floor), with `floor_gb`), logged
+/// at info level; a target without any is returned as it is, without an API
+/// call. Both choices are resolved from the same GPU listing, scoped to
+/// `target.gpu_count`: `catalog/datacenters` is never read for this.
 ///
 /// # Errors
 ///

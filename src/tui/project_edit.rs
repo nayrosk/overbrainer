@@ -13,7 +13,7 @@ use crossterm::event::KeyCode;
 
 use super::app::{Action, App, Confirm, Effect, Origin, Overlay, PAGE, Picked, Project, Severity};
 use super::catalog::{
-    CatalogKind, DEFAULT_IMAGE, NO_VOLUME, Query, Sizing, cost_hint, gpu_count_hint,
+    CatalogKind, DEFAULT_IMAGE, FitBy, NO_VOLUME, Query, Sizing, cost_hint, gpu_count_hint,
     volume_data_center,
 };
 use super::follow::NOT_STARTED;
@@ -522,12 +522,17 @@ impl App {
             // Unset: the `none` or `default` entry is the one chosen.
             CatalogKind::Volumes | CatalogKind::Templates => Choice::List(vec![shown.to_string()]),
         };
+        let fit_by = match (&path, kind) {
+            (FieldPath::Target { name, .. }, CatalogKind::Gpus) => FitBy::Target(name.clone()),
+            _ => FitBy::Nothing,
+        };
         let query = Query {
             kind,
             gpu_count: sizing.gpu_count,
             gpu_types: ListOrAuto::from_form_text(&sizing.gpu_types)
                 .list()
                 .to_vec(),
+            fit_by,
         };
         self.open_picker(query, preselected, Origin::Field(path))
     }
@@ -2534,6 +2539,7 @@ mod tests {
                 kind: CatalogKind::Gpus,
                 gpu_count: 1,
                 gpu_types: vec!["NVIDIA A40".into()],
+                fit_by: FitBy::Target("gpu_cloud".into()),
             }
         );
         assert!(picker_open(&app));
@@ -2638,6 +2644,7 @@ mod tests {
                 kind: CatalogKind::DataCenters,
                 gpu_count: 2,
                 gpu_types: vec!["NVIDIA A40".into()],
+                fit_by: FitBy::Nothing,
             }
         );
         Ok(())

@@ -37,6 +37,22 @@ pub(super) struct Query {
     pub(super) gpu_count: u32,
     /// The GPU types chosen, whose stock a data center shows; none for `auto`.
     pub(super) gpu_types: Vec<String>,
+    /// How a GPU listing judges each type's fit.
+    pub(super) fit_by: FitBy,
+}
+
+/// How a GPU listing judges whether each type holds the training run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum FitBy {
+    /// It does not: the field hints need the GPU types only, and a data
+    /// center, volume or template listing has no fit.
+    Nothing,
+    /// With this estimate, already made (the start dialog's).
+    Known(Need),
+    /// With the estimate of the training run, made now, when the Runpod
+    /// target of this name is `training.target`; the fit of another target's
+    /// GPU types is unknown.
+    Target(String),
 }
 
 /// What a listing read.
@@ -131,12 +147,19 @@ async fn fetch_within(
     let lookup = async {
         let settings = source.load(dir)?;
         let client = crate::cli::pod::client(&settings).await?;
+        let training = settings
+            .training
+            .as_ref()
+            .map(|training| training.target.as_str());
         let need = async {
-            if query.kind == CatalogKind::Gpus {
+            match &query.fit_by {
+                FitBy::Nothing => None,
+                FitBy::Known(need) => Some(need.clone()),
+                FitBy::Target(name) if training != Some(name.as_str()) => {
+                    Some(Err(format!("{name} is not training.target")))
+                },
                 // Half the time: an unknown fit never costs the listing.
-                Some(estimate_need(dir, source.clone(), hub, limit / 2).await)
-            } else {
-                None
+                FitBy::Target(_) => Some(estimate_need(dir, source.clone(), hub, limit / 2).await),
             }
         };
         let (listed, need) = tokio::join!(read(&client, &query), need);
@@ -483,6 +506,7 @@ mod tests {
             kind,
             gpu_count,
             gpu_types: gpu_types.iter().map(|id| (*id).to_string()).collect(),
+            fit_by: FitBy::Nothing,
         }
     }
 
@@ -747,7 +771,7 @@ mod tests {
     fn gpu_entries_say_whether_they_hold_the_run() -> TestResult {
         let gpus: Vec<GpuType> = serde_json::from_value(json!([
             {"id": "small", "memory": 16, "price": {"secure": 0.2}, "maxCount": {"secure": 8}},
-            {"id": "tight", "memory": 20, "price": {"secure": 0.3}, "maxCount": {"secure": 8}},
+            {"id": "tight", "memory": 21, "price": {"secure": 0.3}, "maxCount": {"secure": 8}},
             {"id": "roomy", "memory": 48, "price": {"secure": 0.5}, "maxCount": {"secure": 8}}
         ]))?;
         let need = crate::tui::snapshots::need();
@@ -813,15 +837,53 @@ mod tests {
             crate::tui::snapshots::CONFIG
         );
         std::fs::write(dir.path().join("overbrainer.toml"), config)?;
+        let gpus = |fit_by| Query {
+            fit_by,
+            ..query(CatalogKind::Gpus, 1, &[])
+        };
+        let hub_asks = || async {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| !request.url.path().starts_with("/v2/"))
+                .count()
+        };
+        // No estimate for the hints, a known one, or another target.
+        let other = FitBy::Target("homelab".into());
+        let known = FitBy::Known(Ok(crate::tui::snapshots::need()));
+        let mut notes = Vec::new();
+        for fit_by in [FitBy::Nothing, known, other] {
+            let listed = fetch_within(
+                dir.path(),
+                env.clone().into(),
+                gpus(fit_by),
+                CATALOG_TIMEOUT,
+                &server.uri(),
+            )
+            .await?;
+            notes.push(listed.note);
+        }
+        assert_eq!(
+            notes,
+            [
+                None,
+                Some("about 20.4 GB per GPU needed".to_string()),
+                Some("fit unknown".to_string())
+            ]
+        );
+        assert_eq!(hub_asks().await, 0, "Hugging Face never asked");
         let listed = fetch_within(
             dir.path(),
             env.clone().into(),
-            query(CatalogKind::Gpus, 1, &[]),
+            gpus(FitBy::Target("gpu_cloud".into())),
             CATALOG_TIMEOUT,
             &server.uri(),
         )
         .await?;
-        assert_eq!(listed.note.as_deref(), Some("about 19.1 GB per GPU needed"));
+        assert_eq!(hub_asks().await, 2);
+        assert_eq!(listed.note.as_deref(), Some("about 20.4 GB per GPU needed"));
         let fits: Vec<(&str, bool)> = listed
             .entries
             .iter()
@@ -829,16 +891,16 @@ mod tests {
             .collect();
         assert_eq!(fits, [("small", false), ("ok", true)]);
         // Without the model's shape, the fit is unknown and the listing stands.
-        let centers = fetch_within(
+        let unknown = fetch_within(
             dir.path(),
             env.into(),
-            query(CatalogKind::Gpus, 1, &[]),
+            gpus(FitBy::Target("gpu_cloud".into())),
             CATALOG_TIMEOUT,
             &format!("{}/nowhere", server.uri()),
         )
         .await?;
-        assert_eq!(centers.note.as_deref(), Some("fit unknown"));
-        assert_eq!(centers.entries.len(), 2);
+        assert_eq!(unknown.note.as_deref(), Some("fit unknown"));
+        assert_eq!(unknown.entries.len(), 2);
         Ok(())
     }
 

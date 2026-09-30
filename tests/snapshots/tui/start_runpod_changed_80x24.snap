@@ -1,6 +1,6 @@
 ---
 source: src/tui/snapshots.rs
-assertion_line: 602
+assertion_line: 603
 ---
 " ⠿ o╭ Start a training run? ───────────────────────────────────────────────╮ex… "
 "╭ r │                                                                      │ ──╮"
@@ -13,7 +13,7 @@ assertion_line: 602
 "    │  warning     warning number 4 about this run                         │    "
 "    │  changed     gpu_types: saved to overbrainer.toml on y, then the     │    "
 "    │  run starts                                                          │    "
-"    │  vram        about 19.1 GB per GPU (estimate): auto keeps >= 20 GB   │    "
+"    │  vram        about 20.4 GB per GPU (estimate): auto keeps >= 21 GB   │    "
 "    │  GPU types   auto picks now, list price x 1 GPU, VRAM, stock, fit:   │    "
 "    │  - NVIDIA A40               $0.40/h   48 GB  HIGH    ok              │    "
 "    │  - NVIDIA L4                $0.43/h   24 GB  HIGH    ok              │    "

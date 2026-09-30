@@ -1,12 +1,13 @@
 //! How much GPU memory a training run needs per GPU, estimated from the child
 //! model's shape (its parameter count from Hugging Face `safetensors.total`,
 //! and its hidden size, layers and vocabulary from `config.json`) and the
-//! `[training]` settings. The estimate is rough and on the safe side: it only
-//! marks the GPU types that obviously cannot hold the run, and gives
-//! `gpu_types = "auto"` a VRAM floor.
+//! `[training]` settings, `axolotl_extra` included. The estimate is rough and
+//! on the safe side: it only marks the GPU types that obviously cannot hold
+//! the run, and gives `gpu_types = "auto"` a VRAM floor.
 //!
 //! Every GPU of a pod holds a whole copy of the model (data parallel), so the
-//! estimate never divides by the GPU count.
+//! estimate never divides by the GPU count; a run that shards the model
+//! (`deepspeed` or `fsdp` in `axolotl_extra`) gets no estimate.
 
 use std::fmt;
 use std::time::Duration;
@@ -19,23 +20,40 @@ use crate::config::{Adapter, Training};
 /// The Hugging Face Hub the shape is read from.
 pub const HF_URL: &str = "https://huggingface.co";
 
-/// Bytes in a GB as Runpod counts VRAM (a 24 GB card holds 24 GiB).
-const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+/// Bytes in a GB of the Runpod catalog. Its VRAM figures are the vendors' (an
+/// A40 "48 GB" gives about 45 GiB to CUDA), so a GB counts as 10^9 bytes, the
+/// smaller unit, to stay on the safe side.
+const GB: u64 = 1_000_000_000;
 
 /// Memory neither the model nor its batch takes: CUDA context, allocator
 /// fragmentation, buffers.
-const OVERHEAD_GIB: f64 = 2.0;
-
-/// The estimate is raised by this much, to stay on the safe side.
-const MARGIN: f64 = 1.2;
-
-/// A GPU with less than this much more than the estimate is `tight`.
-const TIGHT: f64 = 1.1;
+const OVERHEAD: u64 = 2 * GB;
 
 /// `LoRA` parameters per layer, per unit of rank and hidden size: the seven
 /// linear modules `lora_target_linear` adapts add `r * (d_in + d_out)` each,
 /// about 18 hidden sizes in all with grouped attention and a 3x MLP.
-const LORA_WIDTHS: f64 = 18.0;
+const LORA_WIDTHS: u128 = 18;
+
+/// Bytes each token keeps per layer and unit of hidden size for the
+/// backward pass: one bf16 hidden state with gradient checkpointing, about 34
+/// bytes without (attention and MLP inputs, masks, dropout).
+const CHECKPOINTED_BYTES: u128 = 2;
+const FULL_ACTIVATION_BYTES: u128 = 34;
+
+/// The `axolotl_extra` keys that shard the model across the GPUs.
+const SHARDING: [&str; 3] = ["deepspeed", "fsdp", "fsdp_config"];
+
+/// The VRAM floor of a run's `auto` GPU types, as whoever starts the run
+/// knows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VramFloor {
+    /// Not estimated yet: the run estimates it when it starts.
+    #[default]
+    ToEstimate,
+    /// Estimated already (the TUI's start confirmation shows it): this floor
+    /// in GB, or none when the estimate could not be made.
+    Known(Option<u32>),
+}
 
 /// What the estimate needs to know about the child model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,98 +81,112 @@ pub struct Recipe {
     pub lora_r: u32,
     /// Whether the optimizer keeps its state in 8 bits.
     pub eight_bit_optimizer: bool,
+    /// Whether only one hidden state per layer is kept for the backward pass.
+    pub gradient_checkpointing: bool,
 }
 
-impl From<&Training> for Recipe {
-    fn from(training: &Training) -> Self {
-        Self {
-            adapter: training.adapter,
-            sequence_len: training.sequence_len,
-            micro_batch_size: training.micro_batch_size,
-            lora_r: training.lora_r,
-            eight_bit_optimizer: training.optimizer.contains("8bit"),
+impl Recipe {
+    /// The recipe of `training`, read as Axolotl gets it: `micro_batch_size`,
+    /// `sequence_len`, `optimizer` and `gradient_checkpointing` from
+    /// `axolotl_extra` when it sets them, else from `[training]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns why there is no estimate: `axolotl_extra` shards the model
+    /// (`deepspeed`, `fsdp` or `fsdp_config`), or sets one of those fields to
+    /// a value of the wrong type.
+    pub fn of(training: &Training) -> Result<Self, String> {
+        let extra = |key: &str| {
+            training
+                .axolotl_extra
+                .get(key)
+                .filter(|value| !value.is_null())
+        };
+        if let Some(key) = SHARDING.into_iter().find(|key| extra(key).is_some()) {
+            return Err(format!(
+                "axolotl_extra shards the model ({key}): each GPU holds only part of it"
+            ));
         }
+        let count = |key: &str, default: u32| match extra(key) {
+            None => Ok(default),
+            Some(value) => value
+                .as_u64()
+                .and_then(|count| u32::try_from(count).ok())
+                .ok_or_else(|| format!("axolotl_extra.{key} is not a count")),
+        };
+        let optimizer = match extra("optimizer") {
+            None => training.optimizer.as_str(),
+            Some(value) => value
+                .as_str()
+                .ok_or("axolotl_extra.optimizer is not a name")?,
+        };
+        let gradient_checkpointing =
+            extra("gradient_checkpointing").is_none_or(|value| *value != Value::Bool(false));
+        Ok(Self {
+            adapter: training.adapter,
+            sequence_len: count("sequence_len", training.sequence_len)?,
+            micro_batch_size: count("micro_batch_size", training.micro_batch_size)?,
+            lora_r: training.lora_r,
+            eight_bit_optimizer: optimizer.contains("8bit"),
+            gradient_checkpointing,
+        })
     }
 }
 
 /// The memory a run needs on each GPU.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Estimate {
-    bytes: f64,
+    bytes: u64,
 }
 
 impl Estimate {
-    /// The estimate in GB (GiB, as Runpod counts VRAM).
-    #[must_use]
-    pub fn gib(&self) -> f64 {
-        self.bytes / GIB
-    }
-
-    /// The least VRAM a GPU needs, in whole GB: the floor of `auto`.
+    /// The least VRAM a GPU needs, in whole GB of the Runpod catalog: the
+    /// floor of `auto`.
     #[must_use]
     pub fn floor_gb(&self) -> u32 {
-        // The least whole GB at or above the estimate, without a float cast.
-        let gib = self.gib();
-        let (mut low, mut high) = (0_u32, u32::MAX);
-        while low < high {
-            let middle = u32::midpoint(low, high);
-            if f64::from(middle) < gib {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        low
+        u32::try_from(self.bytes.div_ceil(GB)).unwrap_or(u32::MAX)
     }
 }
 
 impl fmt::Display for Estimate {
-    /// `about 19.4 GB`.
+    /// `about 20.5 GB`, in GB of the Runpod catalog.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "about {:.1} GB", self.gib())
+        let tenths = self.bytes.div_ceil(GB / 10);
+        write!(f, "about {}.{} GB", tenths / 10, tenths % 10)
     }
-}
-
-/// `value` as a float, exactly below 2^53, far above any model size.
-fn float(value: u64) -> f64 {
-    let high = u32::try_from(value >> 32).unwrap_or(u32::MAX);
-    let low = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-    f64::from(high) * 4_294_967_296.0 + f64::from(low)
 }
 
 /// The memory a run of `recipe` on a model of `shape` needs per GPU: the
 /// weights (bf16, or about 0.6 bytes per parameter in 4 bits with `QLoRA`),
 /// the gradients and `AdamW` state (16 bytes per trained parameter, 10 with
-/// an 8-bit optimizer; only the adapter's with `LoRA`), the activations kept by
-/// gradient checkpointing (one bf16 hidden state per token and layer), the
-/// fp32 logits, then 2 GB of overhead, all raised by 20%.
+/// an 8-bit optimizer; only the adapter's with `LoRA`), the activations kept
+/// for the backward pass (one bf16 hidden state per token and layer with
+/// gradient checkpointing, about 17 times that without), the fp32 logits,
+/// then 2 GB of overhead, all raised by 20%.
 #[must_use]
 pub fn estimate(shape: &ModelShape, recipe: &Recipe) -> Estimate {
-    let params = float(shape.params);
-    let hidden = float(shape.hidden_size);
-    let layers = float(shape.layers);
-    let tokens = f64::from(recipe.micro_batch_size) * f64::from(recipe.sequence_len);
-    let optimizer = if recipe.eight_bit_optimizer {
-        10.0
-    } else {
-        16.0
-    };
+    let params = u128::from(shape.params);
+    let hidden = u128::from(shape.hidden_size);
+    let layers = u128::from(shape.layers);
+    let tokens = u128::from(recipe.micro_batch_size) * u128::from(recipe.sequence_len);
+    let optimizer = if recipe.eight_bit_optimizer { 10 } else { 16 };
+    let lora = layers * u128::from(recipe.lora_r) * hidden * LORA_WIDTHS;
     let (weights, trained) = match recipe.adapter {
-        Adapter::Full => (2.0 * params, params),
-        Adapter::Lora => (2.0 * params, lora_params(shape, recipe)),
-        Adapter::Qlora => (0.6 * params, lora_params(shape, recipe)),
+        Adapter::Full => (2 * params, params),
+        Adapter::Lora => (2 * params, lora),
+        Adapter::Qlora => (params * 6 / 10, lora),
     };
-    let activations = tokens * hidden * layers * 2.0;
-    let logits = tokens * float(shape.vocab_size) * 4.0;
-    let bytes = weights + trained * optimizer + activations + logits + OVERHEAD_GIB * GIB;
+    let kept = if recipe.gradient_checkpointing {
+        CHECKPOINTED_BYTES
+    } else {
+        FULL_ACTIVATION_BYTES
+    };
+    let activations = tokens * hidden * layers * kept;
+    let logits = tokens * u128::from(shape.vocab_size) * 4;
+    let bytes = weights + trained * optimizer + activations + logits + u128::from(OVERHEAD);
     Estimate {
-        bytes: bytes * MARGIN,
+        bytes: u64::try_from(bytes * 12 / 10).unwrap_or(u64::MAX),
     }
-}
-
-/// The parameters a `LoRA` adapter of rank `recipe.lora_r` trains.
-fn lora_params(shape: &ModelShape, recipe: &Recipe) -> f64 {
-    float(shape.layers) * f64::from(recipe.lora_r) * float(shape.hidden_size) * LORA_WIDTHS
 }
 
 /// Whether a GPU holds the run.
@@ -183,16 +215,18 @@ impl Fit {
     }
 }
 
-/// Whether a GPU with `memory_gb` of VRAM holds a run needing `need`.
+/// Whether a GPU with `memory_gb` of VRAM, as the Runpod catalog counts it,
+/// holds a run needing `need`.
 #[must_use]
 pub fn fit(memory_gb: u32, need: Option<&Estimate>) -> Fit {
     let Some(need) = need else {
         return Fit::Unknown;
     };
-    let memory = f64::from(memory_gb);
-    if memory < need.gib() {
+    let memory = u128::from(memory_gb) * u128::from(GB);
+    let need = u128::from(need.bytes);
+    if memory < need {
         Fit::Small
-    } else if memory < need.gib() * TIGHT {
+    } else if memory * 10 < need * 11 {
         Fit::Tight
     } else {
         Fit::Ok
@@ -309,15 +343,16 @@ fn shape(info: &Value, config: &Value) -> Option<ModelShape> {
 ///
 /// # Errors
 ///
-/// Returns why the shape is unknown (see [`fetch_shape`]).
+/// Returns why there is no estimate (see [`Recipe::of`] and [`fetch_shape`]).
 pub async fn estimate_model(
     training: &Training,
     token: Option<&SecretString>,
     base_url: &str,
     limit: Duration,
 ) -> Result<Estimate, String> {
+    let recipe = Recipe::of(training)?;
     let shape = fetch_shape(base_url, &training.base_model, token, limit).await?;
-    Ok(estimate(&shape, &Recipe::from(training)))
+    Ok(estimate(&shape, &recipe))
 }
 
 #[cfg(test)]
@@ -359,15 +394,16 @@ mod tests {
             micro_batch_size: 2,
             lora_r: 16,
             eight_bit_optimizer: false,
+            gradient_checkpointing: true,
         }
     }
 
     #[test]
     fn the_estimate_follows_the_model_and_the_adapter() {
         let cases = [
-            (QWEN3_4B, recipe(Adapter::Lora), 20),
-            (QWEN3_8B, recipe(Adapter::Qlora), 17),
-            (MISTRAL_7B, recipe(Adapter::Full), 152),
+            (QWEN3_4B, recipe(Adapter::Lora), 21),
+            (QWEN3_8B, recipe(Adapter::Qlora), 18),
+            (MISTRAL_7B, recipe(Adapter::Full), 163),
         ];
         for (shape, recipe, floor) in cases {
             let need = estimate(&shape, &recipe);
@@ -375,52 +411,112 @@ mod tests {
         }
         assert_eq!(
             estimate(&QWEN3_4B, &recipe(Adapter::Lora)).to_string(),
-            "about 19.1 GB"
+            "about 20.4 GB"
         );
     }
 
     #[test]
-    fn an_eight_bit_optimizer_and_a_shorter_batch_need_less() {
-        let full = estimate(&MISTRAL_7B, &recipe(Adapter::Full)).gib();
+    fn an_eight_bit_optimizer_a_shorter_batch_and_checkpointing_need_less() {
+        let need = |shape: &ModelShape, recipe: &Recipe| estimate(shape, recipe).floor_gb();
+        let full = need(&MISTRAL_7B, &recipe(Adapter::Full));
         let eight = Recipe {
             eight_bit_optimizer: true,
             ..recipe(Adapter::Full)
         };
-        assert!(estimate(&MISTRAL_7B, &eight).gib() < full - 40.0);
+        assert!(need(&MISTRAL_7B, &eight) + 40 < full);
+        let lora = need(&QWEN3_4B, &recipe(Adapter::Lora));
         let short = Recipe {
             sequence_len: 1024,
             ..recipe(Adapter::Lora)
         };
-        assert!(
-            estimate(&QWEN3_4B, &short).gib() < estimate(&QWEN3_4B, &recipe(Adapter::Lora)).gib()
-        );
+        assert!(need(&QWEN3_4B, &short) < lora);
+        let unchecked = Recipe {
+            gradient_checkpointing: false,
+            ..recipe(Adapter::Lora)
+        };
+        assert!(need(&QWEN3_4B, &unchecked) > lora + 20);
+    }
+
+    #[test]
+    fn floor_gb_rounds_up_to_a_whole_gb() {
+        let at = |bytes| Estimate { bytes }.floor_gb();
+        assert_eq!(at(20 * GB), 20);
+        assert_eq!(at(20 * GB + 1), 21);
+        assert_eq!(at(0), 0);
+        assert_eq!(at(u64::MAX), u32::MAX);
+        assert_eq!(Estimate { bytes: 20 * GB }.to_string(), "about 20.0 GB");
+        assert_eq!(Estimate { bytes: 20 * GB + 1 }.to_string(), "about 20.1 GB");
+    }
+
+    fn training(extra: &Value) -> Result<Training, serde_json::Error> {
+        serde_json::from_value(json!({
+            "target": "cloud", "base_model": "Qwen/Qwen3-4B", "adapter": "qlora",
+            "optimizer": "paged_adamw_8bit", "sequence_len": 2048, "axolotl_extra": extra
+        }))
     }
 
     #[test]
     fn the_recipe_reads_the_training_settings() -> Result<(), Box<dyn std::error::Error>> {
-        let training: Training = serde_json::from_value(json!({
-            "target": "cloud", "base_model": "Qwen/Qwen3-4B", "adapter": "qlora",
-            "optimizer": "paged_adamw_8bit", "sequence_len": 2048
-        }))?;
+        let expected = Recipe {
+            adapter: Adapter::Qlora,
+            sequence_len: 2048,
+            micro_batch_size: 2,
+            lora_r: 16,
+            eight_bit_optimizer: true,
+            gradient_checkpointing: true,
+        };
+        assert_eq!(Recipe::of(&training(&json!({}))?), Ok(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn axolotl_extra_goes_before_the_training_settings() -> Result<(), Box<dyn std::error::Error>> {
+        let extra = json!({"micro_batch_size": 8, "sequence_len": 8192,
+                           "optimizer": "adamw_torch_fused", "gradient_checkpointing": false});
         assert_eq!(
-            Recipe::from(&training),
-            Recipe {
+            Recipe::of(&training(&extra)?),
+            Ok(Recipe {
                 adapter: Adapter::Qlora,
-                sequence_len: 2048,
-                micro_batch_size: 2,
+                sequence_len: 8192,
+                micro_batch_size: 8,
                 lora_r: 16,
-                eight_bit_optimizer: true,
-            }
+                eight_bit_optimizer: false,
+                gradient_checkpointing: false,
+            })
+        );
+        // Axolotl's own "unsloth" checkpointing still checkpoints.
+        let unsloth = Recipe::of(&training(&json!({"gradient_checkpointing": "unsloth"}))?)?;
+        assert!(unsloth.gradient_checkpointing);
+        assert_eq!(
+            Recipe::of(&training(&json!({"micro_batch_size": "eight"}))?),
+            Err("axolotl_extra.micro_batch_size is not a count".to_string())
         );
         Ok(())
     }
 
     #[test]
+    fn a_sharded_run_has_no_estimate() -> Result<(), Box<dyn std::error::Error>> {
+        for key in ["deepspeed", "fsdp", "fsdp_config"] {
+            let recipe = Recipe::of(&training(&json!({key: "zero3.json"}))?);
+            assert_eq!(
+                recipe,
+                Err(format!(
+                    "axolotl_extra shards the model ({key}): each GPU holds only part of it"
+                ))
+            );
+        }
+        assert!(Recipe::of(&training(&json!({"deepspeed": null}))?).is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn fit_is_ok_tight_small_or_unknown() {
-        let need = estimate(&QWEN3_4B, &recipe(Adapter::Lora));
+        let need = Estimate { bytes: 20 * GB };
         assert_eq!(fit(48, Some(&need)), Fit::Ok);
-        assert_eq!(fit(20, Some(&need)), Fit::Tight);
-        assert_eq!(fit(16, Some(&need)), Fit::Small);
+        assert_eq!(fit(22, Some(&need)), Fit::Ok, "exactly 10% to spare");
+        assert_eq!(fit(21, Some(&need)), Fit::Tight);
+        assert_eq!(fit(20, Some(&need)), Fit::Tight, "exactly the estimate");
+        assert_eq!(fit(19, Some(&need)), Fit::Small);
         assert_eq!(fit(80, None), Fit::Unknown);
         let names: Vec<&str> = [Fit::Ok, Fit::Tight, Fit::Small, Fit::Unknown]
             .into_iter()
@@ -489,6 +585,20 @@ mod tests {
             &server,
             json!({"text_config": {"hidden_size": 2560, "num_hidden_layers": 36,
                                    "vocab_size": 151_936}}),
+        )
+        .await;
+        let shape = fetch_shape(&server.uri(), "Qwen/Qwen3-4B", None, LIMIT).await?;
+        assert_eq!(shape, QWEN3_4B);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_multimodal_config_may_keep_its_vocabulary_at_the_top() -> Result<(), String> {
+        let server = MockServer::start().await;
+        hub(
+            &server,
+            json!({"vocab_size": 151_936,
+                   "text_config": {"hidden_size": 2560, "num_hidden_layers": 36}}),
         )
         .await;
         let shape = fetch_shape(&server.uri(), "Qwen/Qwen3-4B", None, LIMIT).await?;

@@ -27,7 +27,7 @@ use crate::runs::{
     Launch, Outcome, RunCtx, RunRecord, RunState, Runs, artifacts_missing, cancel as cancel_job,
     collect, create, reserve, start, watch,
 };
-use crate::train::sizing::{HF_URL, estimate_model};
+use crate::train::sizing::{HF_URL, VramFloor, estimate_model};
 use crate::train::{Axolotl, reasoning_template_warning};
 
 /// What every Runpod command sets up: the API client, the front end's bus and
@@ -93,6 +93,9 @@ pub(super) struct RunpodStart<'a> {
     pub(super) spec: &'a RunpodTarget,
     /// `--keep-pod`.
     pub(super) keep: bool,
+    /// The VRAM floor of `auto` GPU types, when the caller already estimated
+    /// it; else it is estimated here (see [`vram_floor`]).
+    pub(super) vram_floor: VramFloor,
 }
 
 /// `overbrainer train` on the Runpod target `start.name`.
@@ -107,7 +110,12 @@ pub(super) async fn train(
     start: RunpodStart<'_>,
     front: &Frontend,
 ) -> anyhow::Result<()> {
-    let RunpodStart { name, spec, keep } = start;
+    let RunpodStart {
+        name,
+        spec,
+        keep,
+        vram_floor: known,
+    } = start;
     let training = training(settings)?;
     if let Some(warning) = reasoning_template_warning(training) {
         warn(&warning);
@@ -120,9 +128,15 @@ pub(super) async fn train(
             .iter()
             .find(|(name, _)| name == HF_TOKEN)
             .map(|(_, token)| token);
-        let vram_floor_gb = vram_floor(training, spec, token).await;
-        let session = Session::open(project_dir, settings, front).await?;
-        Ok((secrets, vram_floor_gb, session))
+        let floor = async {
+            match known {
+                VramFloor::Known(floor) => floor,
+                VramFloor::ToEstimate => vram_floor(training, spec, token, HF_URL).await,
+            }
+        };
+        let (vram_floor_gb, session) =
+            tokio::join!(floor, Session::open(project_dir, settings, front));
+        Ok((secrets, vram_floor_gb, session?))
     })
     .await?;
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
@@ -148,18 +162,21 @@ pub(super) async fn train(
 const ESTIMATE_LIMIT: Duration = Duration::from_secs(10);
 
 /// The least VRAM the `auto` GPU types of `spec` need: the estimate of what a
-/// run of `training` needs per GPU, when `spec` has `auto` GPU types and no
-/// `min_vram_gb`. Without an estimate (the model's shape cannot be read), a
-/// warning says so and `auto` picks as it would without one.
+/// run of `training` needs per GPU, its model's shape read from the Hugging
+/// Face Hub at `hub`, only when `spec` has `auto` GPU types and no
+/// `min_vram_gb`. Without an estimate (the model's shape cannot be read, or
+/// the run shards the model), a warning says so and `auto` picks as it would
+/// without one.
 async fn vram_floor(
     training: &Training,
     spec: &RunpodTarget,
     token: Option<&SecretString>,
+    hub: &str,
 ) -> Option<u32> {
     if !spec.gpu_types.is_auto() || spec.min_vram_gb.is_some() {
         return None;
     }
-    match estimate_model(training, token, HF_URL, ESTIMATE_LIMIT).await {
+    match estimate_model(training, token, hub, ESTIMATE_LIMIT).await {
         Ok(need) => {
             tracing::info!(
                 "the run needs {need} of VRAM per GPU (estimate): gpu_types = \"auto\" keeps \
@@ -690,6 +707,51 @@ mod tests {
     use super::*;
     use crate::config::ListOrAuto;
     use crate::runpod::{AttemptResult, Pod};
+
+    /// The floor asks Hugging Face only for `auto` GPU types without
+    /// `min_vram_gb`.
+    #[tokio::test]
+    async fn the_vram_floor_is_estimated_only_when_auto_uses_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/Qwen/Qwen3-4B"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"safetensors": {"total": 4_022_468_096_u64}}),
+                ),
+            )
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/Qwen/Qwen3-4B/resolve/main/config.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hidden_size": 2560, "num_hidden_layers": 36, "vocab_size": 151_936
+            })))
+            .mount(&hub)
+            .await;
+        let training: Training = serde_json::from_value(serde_json::json!({
+            "target": "cloud", "base_model": "Qwen/Qwen3-4B", "adapter": "lora"
+        }))?;
+        let listed = target();
+        let mut with_min = target();
+        with_min.gpu_types = ListOrAuto::Auto;
+        with_min.min_vram_gb = Some(24);
+        for spec in [&listed, &with_min] {
+            assert_eq!(vram_floor(&training, spec, None, &hub.uri()).await, None);
+        }
+        let asked = hub.received_requests().await.unwrap_or_default();
+        assert!(asked.is_empty(), "{asked:?}");
+        let mut auto = target();
+        auto.gpu_types = ListOrAuto::Auto;
+        assert_eq!(
+            vram_floor(&training, &auto, None, &hub.uri()).await,
+            Some(21)
+        );
+        Ok(())
+    }
 
     fn target() -> RunpodTarget {
         RunpodTarget {

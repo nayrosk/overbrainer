@@ -250,6 +250,11 @@ pub struct TrainArgs {
     /// Follow or stop an existing run instead of starting one.
     #[command(subcommand)]
     pub command: Option<TrainCommand>,
+    /// Never on the command line: the VRAM floor of `auto` GPU types, which
+    /// the TUI's start confirmation may have estimated already, so the run
+    /// uses what it showed.
+    #[arg(skip)]
+    pub vram_floor: crate::train::sizing::VramFloor,
 }
 
 /// Subcommands of `overbrainer train`.

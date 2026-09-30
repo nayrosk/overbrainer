@@ -487,6 +487,7 @@ pub(super) fn need() -> crate::train::sizing::Estimate {
         micro_batch_size: 2,
         lora_r: 16,
         eight_bit_optimizer: false,
+        gradient_checkpointing: true,
     };
     estimate(&shape, &recipe)
 }
@@ -1048,6 +1049,7 @@ fn picker_app(
         kind,
         gpu_count: 2,
         gpu_types: Vec::new(),
+        fit_by: super::catalog::FitBy::Nothing,
     };
     let origin = super::app::Origin::Field(crate::config::edit::FieldPath::Target {
         name: "gpu_cloud".into(),

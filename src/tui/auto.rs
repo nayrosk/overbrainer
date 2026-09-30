@@ -272,7 +272,7 @@ impl App {
             (None, Some((run, _))) => self.start_run(&run),
         };
         let task = effects.iter().find_map(|effect| match effect {
-            Effect::Spawn(id, Task::Train(TrainJob::Start) | Task::Pipeline(_)) => Some(*id),
+            Effect::Spawn(id, Task::Train(TrainJob::Start { .. }) | Task::Pipeline(_)) => Some(*id),
             _ => None,
         });
         let Some(task) = task else {
@@ -491,7 +491,7 @@ mod tests {
             id = next_id;
         }
         let spawned = end(&mut app, id, Ok(()));
-        let [(train, Task::Train(TrainJob::Start))] = spawned[..] else {
+        let [(train, Task::Train(TrainJob::Start { .. }))] = spawned[..] else {
             return Err(format!("{spawned:?}").into());
         };
         assert_eq!(

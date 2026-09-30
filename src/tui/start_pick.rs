@@ -6,7 +6,7 @@
 //! `u` there undoes it.
 
 use super::app::{App, Effect, Origin, Overlay, Picked, Severity};
-use super::catalog::{CatalogKind, Query};
+use super::catalog::{CatalogKind, FitBy, Query};
 use super::follow::start_dialog;
 use super::project::Writing;
 use super::start::{DATA_CENTER_IDS, GPU_TYPES, RunpodPlan, StartPlan};
@@ -81,10 +81,17 @@ impl App {
                 Choice::from(&spec.data_center_ids),
             )
         };
+        // The dialog's own estimate, once made; else the listing makes one.
+        let fit_by = match (gpus, &runpod.need) {
+            (false, _) => FitBy::Nothing,
+            (true, Some(need)) => FitBy::Known(need.clone()),
+            (true, None) => FitBy::Target(target.clone()),
+        };
         let query = Query {
             kind,
             gpu_count: spec.gpu_count,
             gpu_types: spec.gpu_types.list().to_vec(),
+            fit_by,
         };
         self.open_picker(query, preselected, Origin::Start(target))
     }
@@ -372,9 +379,12 @@ mod tests {
     }
 
     fn starts(effects: &[Effect]) -> bool {
-        effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Spawn(_, Task::Train(TrainJob::Start))))
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Spawn(_, Task::Train(TrainJob::Start { .. }))
+            )
+        })
     }
 
     fn written(dir: &Path) -> std::io::Result<String> {
@@ -398,6 +408,8 @@ mod tests {
                 kind: CatalogKind::Gpus,
                 gpu_count: 1,
                 gpu_types: vec!["NVIDIA A40".into()],
+                // The dialog's estimate, never asked for again.
+                fit_by: FitBy::Known(Ok(crate::tui::snapshots::need())),
             }
         );
         let Some(Overlay::Picker(picking)) = &app.overlay else {

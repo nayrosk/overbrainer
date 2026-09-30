@@ -12,7 +12,7 @@ use serde::de::IgnoredAny;
 use crate::config::{Adapter, CONFIG_FILE, ListOrAuto, Runtime, Settings, Source, Target};
 use crate::dataset::{DataFiles, read};
 use crate::runpod::{Availability, GpuType, RunpodTarget, resolve_with_floor};
-use crate::train::sizing::{Estimate, HF_URL, estimate_model, fit};
+use crate::train::sizing::{Estimate, Fit, HF_URL, estimate_model, fit};
 use crate::train::{Outputs, reasoning_template_warning};
 
 /// Total time the GPU catalog may take; the dialog never waits for it.
@@ -51,6 +51,8 @@ pub(super) struct RunpodPlan {
     pub(super) file_min_vram_gb: Option<u32>,
     /// `max_price_per_hour` as the settings have it.
     pub(super) file_max_price_per_hour: Option<f64>,
+    /// The VRAM the run needs per GPU, once the start dialog estimated it.
+    pub(super) need: Option<Need>,
 }
 
 impl RunpodPlan {
@@ -61,6 +63,7 @@ impl RunpodPlan {
             file_data_center_ids: spec.data_center_ids.clone(),
             file_min_vram_gb: spec.min_vram_gb,
             file_max_price_per_hour: spec.max_price_per_hour,
+            need: None,
             spec,
         }
     }
@@ -455,6 +458,9 @@ fn runpod_lines(spec: &RunpodTarget, catalog: Option<&Catalog>) -> Vec<String> {
     if ids.len() > shown {
         lines.push(format!("- and {} more", ids.len() - shown));
     }
+    if let (ListOrAuto::List(chosen), Some(catalog)) = (&spec.gpu_types, catalog) {
+        lines.extend(small_line(chosen, catalog));
+    }
     if let Some(Catalog {
         gpus: Err(error), ..
     }) = catalog
@@ -464,6 +470,33 @@ fn runpod_lines(spec: &RunpodTarget, catalog: Option<&Catalog>) -> Vec<String> {
     lines.push(center_line(spec, listed, floor, chosen.is_ok()));
     lines.push(max_hours_line(spec, listed, &ids));
     lines
+}
+
+/// A warning naming the `chosen` GPU types with less VRAM than the estimate
+/// of `catalog`, if any: they stay chosen, but their pod may run out of
+/// memory.
+fn small_line(chosen: &[String], catalog: &Catalog) -> Option<String> {
+    let (Ok(listed), Ok(need)) = (&catalog.gpus, &catalog.need) else {
+        return None;
+    };
+    let small: Vec<&str> = chosen
+        .iter()
+        .filter(|id| {
+            listed
+                .iter()
+                .find(|gpu| gpu.id == **id)
+                .is_some_and(|gpu| fit(gpu.memory, Some(need)) == Fit::Small)
+        })
+        .map(String::as_str)
+        .collect();
+    let (verb, names) = match small.as_slice() {
+        [] => return None,
+        [one] => ("has", (*one).to_string()),
+        several => ("have", several.join(", ")),
+    };
+    Some(format!(
+        "warning     {names} {verb} less VRAM than the estimate: the run may run out of memory"
+    ))
 }
 
 /// The VRAM the run needs per GPU, once estimated, and the `floor` of `auto`
@@ -719,7 +752,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let gpus = fixture()?;
         let lines = text(&plan(true), Some(&gpus));
-        assert_eq!(lines[3], "vram        about 19.1 GB per GPU (estimate)");
+        assert_eq!(lines[3], "vram        about 20.4 GB per GPU (estimate)");
         assert_eq!(
             lines[4],
             "GPU types   tried in order, list price x 2 GPU, VRAM, stock, fit:"
@@ -771,6 +804,40 @@ mod tests {
     }
 
     #[test]
+    fn chosen_gpu_types_below_the_estimate_are_warned_about()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let small = "NVIDIA RTX 2000 Ada Generation";
+        let chosen = planned(runpod_spec(list(&[small, "NVIDIA A40"]), 1));
+        let lines = text(&chosen, Some(&fixture()?));
+        assert!(lines[5].ends_with("16 GB  HIGH  small"), "{lines:?}");
+        assert_eq!(
+            lines[7],
+            format!(
+                "warning     {small} has less VRAM than the estimate: the run may run out of \
+                 memory"
+            )
+        );
+        let both = planned(runpod_spec(list(&[small, "NVIDIA A40", small]), 1));
+        let lines = text(&both, Some(&fixture()?));
+        assert!(lines[8].contains(&format!("{small}, {small} have less VRAM")));
+        let fine = text(&plan(true), Some(&fixture()?));
+        assert!(
+            !fine.iter().any(|line| line.contains("less VRAM")),
+            "{fine:?}"
+        );
+        let unknown = Catalog {
+            gpus: Ok(gpu_types()?),
+            need: Err("unknown".into()),
+        };
+        let lines = text(&chosen, Some(&unknown));
+        assert!(
+            !lines.iter().any(|line| line.contains("less VRAM")),
+            "{lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_price_of_zero_or_less_is_unknown_and_never_bounds_the_run()
     -> Result<(), Box<dyn std::error::Error>> {
         let gpus: Vec<GpuType> = serde_json::from_value(serde_json::json!([
@@ -801,7 +868,7 @@ mod tests {
         let lines = text(&planned(auto.clone()), Some(&fixture()?));
         assert_eq!(
             lines[3],
-            "vram        about 19.1 GB per GPU (estimate): auto keeps >= 20 GB"
+            "vram        about 20.4 GB per GPU (estimate): auto keeps >= 21 GB"
         );
         assert_eq!(
             lines[4],
@@ -825,7 +892,7 @@ mod tests {
         // An explicit min_vram_gb wins over the estimate.
         auto.min_vram_gb = Some(10);
         let lines = text(&planned(auto.clone()), Some(&fixture()?));
-        assert_eq!(lines[3], "vram        about 19.1 GB per GPU (estimate)");
+        assert_eq!(lines[3], "vram        about 20.4 GB per GPU (estimate)");
         assert!(
             lines[5].starts_with("- NVIDIA RTX 2000 Ada Generation")
                 && lines[5].ends_with("HIGH  small"),
@@ -1084,7 +1151,7 @@ mod tests {
         let env = EnvSource::Vars(vec![("OVERBRAINER_HF_TOKEN".into(), token.into())]);
         let need = estimate_need(dir.path(), env.into(), &hub.uri(), START_CATALOG_TIMEOUT).await?;
         // qlora on Qwen3-4B, the project's settings.
-        assert_eq!(need.floor_gb(), 13, "{need}");
+        assert_eq!(need.floor_gb(), 14, "{need}");
         let none = estimate_need(
             dir.path(),
             EnvSource::Vars(Vec::new()).into(),

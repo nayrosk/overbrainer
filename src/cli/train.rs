@@ -38,14 +38,7 @@ pub async fn run(
     match &args.command {
         None => {
             let settings = source.load(project_dir)?;
-            train(
-                project_dir,
-                &settings,
-                args.target.as_deref(),
-                args.keep_pod,
-                front,
-            )
-            .await
+            train(project_dir, &settings, args, front).await
         },
         Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id, front, source).await,
         Some(TrainCommand::Cancel { run_id }) => {
@@ -74,7 +67,7 @@ pub(crate) async fn after_run(
         no_training();
         return Ok(());
     }
-    train(project_dir, &settings, None, false, front).await
+    train(project_dir, &settings, &TrainArgs::default(), front).await
 }
 
 fn no_training() {
@@ -84,12 +77,12 @@ fn no_training() {
 async fn train(
     project_dir: &Path,
     settings: &Settings,
-    target: Option<&str>,
-    keep_pod: bool,
+    args: &TrainArgs,
     front: &Frontend,
 ) -> anyhow::Result<()> {
+    let keep_pod = args.keep_pod;
     let training = training(settings)?;
-    let name = target.unwrap_or(&training.target);
+    let name = args.target.as_deref().unwrap_or(&training.target);
     let target = settings
         .targets
         .get(name)
@@ -99,6 +92,7 @@ async fn train(
             name,
             spec: &spec,
             keep: keep_pod,
+            vram_floor: args.vram_floor,
         };
         return super::runpod_train::train(project_dir, settings, start, front).await;
     }

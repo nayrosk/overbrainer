@@ -11,7 +11,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tracing::Level;
 
 use super::auto::Auto;
-use super::catalog::{CatalogKind, Listed, Query};
+use super::catalog::{CatalogKind, FitBy, Listed, Query};
 use super::config_watch::ConfigWatch;
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
 use super::editor::{self, Session, Target};
@@ -1020,6 +1020,7 @@ impl App {
             kind: CatalogKind::Gpus,
             gpu_count,
             gpu_types: Vec::new(),
+            fit_by: FitBy::Nothing,
         };
         vec![Effect::Spawn(task, Task::Catalog(query))]
     }
@@ -4508,9 +4509,16 @@ mod tests {
             confirm.text
         );
         let effects = press(&mut app, &[KeyCode::Char('y')]);
-        let [Effect::Spawn(start, Task::Train(TrainJob::Start))] = effects.as_slice() else {
+        let [Effect::Spawn(start, Task::Train(TrainJob::Start { vram_floor }))] =
+            effects.as_slice()
+        else {
             return Err(format!("{effects:?}"));
         };
+        // The run uses the estimate the dialog showed, never another one.
+        assert_eq!(
+            *vram_floor,
+            crate::train::sizing::VramFloor::Known(Some(21))
+        );
         assert_eq!(app.lock().as_deref(), Some("a new run is starting"));
         for code in ['t', 'r'] {
             assert_eq!(press(&mut app, &[KeyCode::Char(code)]), []);
@@ -4762,7 +4770,7 @@ mod tests {
         assert!(
             !effects
                 .iter()
-                .any(|e| matches!(e, Effect::Spawn(_, Task::Train(TrainJob::Start)))),
+                .any(|e| matches!(e, Effect::Spawn(_, Task::Train(TrainJob::Start { .. })))),
             "{effects:?}"
         );
         assert_eq!(app.leaving, Some(Exit::Quit), "y quits");
@@ -4988,6 +4996,7 @@ mod tests {
             kind: CatalogKind::Gpus,
             gpu_count: 2,
             gpu_types: Vec::new(),
+            fit_by: FitBy::Nothing,
         };
         let effects = app.open_picker(query.clone(), chosen, Origin::Field(gpu_cloud("gpu_types")));
         let [Effect::Spawn(id, Task::Catalog(asked))] = effects.as_slice() else {
@@ -5142,6 +5151,7 @@ mod tests {
             kind: CatalogKind::Volumes,
             gpu_count: 1,
             gpu_types: Vec::new(),
+            fit_by: FitBy::Nothing,
         };
         let origin = Origin::Field(crate::config::edit::FieldPath::Target {
             name: "gpu_cloud".into(),

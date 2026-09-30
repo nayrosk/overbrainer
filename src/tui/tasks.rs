@@ -32,6 +32,7 @@ use crate::history::{self, Cost, Entry, Total};
 use crate::pipeline::{Ctx, SplitReport};
 use crate::prompts::Prompts;
 use crate::train::TrainMetric;
+use crate::train::sizing::VramFloor;
 
 /// Events kept for a TUI task's forwarder when it falls behind. `watch` publishes
 /// every line of one tail read at once, at most 1 MiB, and a metrics line is at
@@ -96,8 +97,13 @@ pub(super) enum Task {
 /// A training flow, run exactly as `overbrainer train` runs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TrainJob {
-    /// `train`, on `training.target`, without `--keep-pod`.
-    Start,
+    /// `train`, on `training.target`, without `--keep-pod`, with the VRAM
+    /// floor the start confirmation estimated, if it did (see
+    /// [`TrainArgs::vram_floor`]).
+    Start {
+        /// The floor, when the confirmation estimated it.
+        vram_floor: VramFloor,
+    },
     /// `train attach <run-id>`.
     Attach(String),
     /// `train cancel <run-id>`.
@@ -108,7 +114,12 @@ impl TrainJob {
     /// The arguments `overbrainer train` would get.
     fn args(&self) -> TrainArgs {
         let command = match self {
-            Self::Start => return TrainArgs::default(),
+            Self::Start { vram_floor } => {
+                return TrainArgs {
+                    vram_floor: *vram_floor,
+                    ..TrainArgs::default()
+                };
+            },
             Self::Attach(run_id) => TrainCommand::Attach {
                 run_id: run_id.clone(),
             },
@@ -1195,7 +1206,12 @@ exit 0
         let dir = local_project()?;
         let (messages, mut inbox) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = Tasks::new(dir.path(), messages);
-        tasks.spawn(TaskId(1), Task::Train(TrainJob::Start));
+        tasks.spawn(
+            TaskId(1),
+            Task::Train(TrainJob::Start {
+                vram_floor: VramFloor::ToEstimate,
+            }),
+        );
         let mut created = None;
         loop {
             match next_message(&mut inbox).await? {

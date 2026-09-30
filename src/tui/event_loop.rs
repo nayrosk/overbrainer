@@ -395,7 +395,7 @@ where
     /// export is dropped.
     fn apply_late(&mut self, app: &mut App, effect: Effect) {
         match effect {
-            Effect::Spawn(id, Task::Train(TrainJob::Start)) => app.start_dropped(id),
+            Effect::Spawn(id, Task::Train(TrainJob::Start { .. })) => app.start_dropped(id),
             Effect::Spawn(
                 id,
                 task @ (Task::Train(_) | Task::Edit(_) | Task::SaveConfig { .. }),
@@ -1446,7 +1446,12 @@ mod tests {
         app.training
             .tasks
             .insert(TaskId(4), Follow::new(Job::Start { runpod: true }, ""));
-        looping.pending = vec![Effect::Spawn(TaskId(4), Task::Train(TrainJob::Start))];
+        looping.pending = vec![Effect::Spawn(
+            TaskId(4),
+            Task::Train(TrainJob::Start {
+                vram_floor: crate::train::sizing::VramFloor::ToEstimate,
+            }),
+        )];
         tokio::time::timeout(LIMIT, looping.settle(&mut app)).await?;
         assert!(looping.tasks.is_empty(), "never spawned");
         assert!(app.training.tasks.is_empty());

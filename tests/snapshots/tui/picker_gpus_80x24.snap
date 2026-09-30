@@ -1,13 +1,13 @@
 ---
 source: src/tui/snapshots.rs
-assertion_line: 602
+assertion_line: 603
 ---
 " ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  rust_ex… "
 "╭ data ────────────────────────────────────────────────────────────────────────╮"
 "│ … reading data/                                                              │"
 "│                                                                              │"
 "│                                                                              │"
-"│ ╭ GPU types by price (about 19.1 GB per GPU needed): 2 chosen ─────────────╮ │"
+"│ ╭ GPU types by price (about 20.4 GB per GPU needed): 2 chosen ─────────────╮ │"
 "│ │       ID                              VRAM  $/H   MAX  STOCK    FIT      │ │"
 "│ │       auto: cheapest in stock                                            │ │"
 "│ │   1   NVIDIA A40                      48    0.40  10   HIGH     ok       │ │"
