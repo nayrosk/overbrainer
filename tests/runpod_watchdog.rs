@@ -697,6 +697,10 @@ async fn the_cost_cap_asks_for_a_snapshot_then_deletes_the_pod() -> TestResult {
             "{shell}: {output}"
         );
         assert!(
+            output.contains("max_cost_usd reached in 1 min: the pod is deleted then"),
+            "{shell}: {output}"
+        );
+        assert!(
             output.contains("delete reason=cost_cap"),
             "{shell}: {output}"
         );

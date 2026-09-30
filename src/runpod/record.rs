@@ -196,6 +196,33 @@ pub const SNAPSHOT_SHARE: f64 = 0.95;
 /// cap as for the deadline.
 pub const SNAPSHOT_LEAD: Duration = Duration::from_secs(15 * 60);
 
+/// Least time `max_cost_usd` should buy for a run to train before its cost
+/// snapshot: [`SNAPSHOT_LEAD`] twice.
+pub const MIN_CAP_TIME: Duration = Duration::from_secs(2 * SNAPSHOT_LEAD.as_secs());
+
+/// A warning when `cap` USD buys less than [`MIN_CAP_TIME`] of a pod billed
+/// `rate` USD an hour: its job is stopped with a snapshot [`SNAPSHOT_LEAD`]
+/// before the cap, so it would hardly train. `None` otherwise, and without a
+/// positive rate and cap.
+#[must_use]
+pub fn short_cap_warning(cap: f64, rate: f64) -> Option<String> {
+    if !(rate > 0.0 && cap > 0.0) {
+        return None;
+    }
+    let minutes = cap / rate * 60.0;
+    let least = MIN_CAP_TIME.as_secs_f64() / 60.0;
+    let lead = SNAPSHOT_LEAD.as_secs_f64() / 60.0;
+    (minutes < least).then(|| {
+        format!(
+            "max_cost_usd ${cap:.2} buys {minutes:.0} min at ${rate:.2}/h: the job is stopped \
+             with a snapshot {lead:.0} min before the cap, so it trains {:.0} min at most; set \
+             max_cost_usd to ${:.2} or more",
+            (minutes - lead).max(0.0),
+            rate * least / 60.0
+        )
+    })
+}
+
 /// When the cost cap of a pod applies, in Unix seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostCap {
@@ -250,6 +277,15 @@ impl PodRecord {
             network_volume_id: None,
             max_volume_gb: None,
         }
+    }
+
+    /// What the current pod spent at `now` (Unix seconds), from its creation
+    /// time and hourly rate; `None` without them.
+    #[must_use]
+    pub fn spent_at(&self, now: u64) -> Option<f64> {
+        let (rate, created) = (self.cost_per_hour?, self.created_unix?);
+        let hours = Duration::from_secs(now.saturating_sub(created)).as_secs_f64() / 3600.0;
+        Some(rate * hours)
     }
 
     /// When the current pod reaches its cost cap, from its creation time and
@@ -542,6 +578,31 @@ mod tests {
         record.cost_per_hour = Some(0.53);
         record.keep = true;
         assert_eq!(record.cost_cap(), None, "kept");
+        Ok(())
+    }
+
+    #[test]
+    fn a_cap_that_buys_too_little_training_is_warned_about() -> TestResult {
+        // The live test: $0.05 at $0.24/h buys 12.5 min, less than the lead.
+        assert_eq!(
+            short_cap_warning(0.05, 0.24).as_deref(),
+            Some(
+                "max_cost_usd $0.05 buys 12 min at $0.24/h: the job is stopped with a snapshot \
+                 15 min before the cap, so it trains 0 min at most; set max_cost_usd to $0.12 \
+                 or more"
+            )
+        );
+        assert!(
+            short_cap_warning(0.2, 0.53).is_some_and(|warning| warning.contains("trains 8 min"))
+        );
+        // 30 min or more is enough; no rate, no warning.
+        assert_eq!(short_cap_warning(0.12, 0.24), None);
+        assert_eq!(short_cap_warning(0.05, 0.0), None);
+        let mut record = PodRecord::new(RUN, false, 1, "ssh-ed25519 AAAAhost");
+        assert_eq!(record.spent_at(1_790_000_000), None);
+        record.begin_attempt("NVIDIA RTX A6000", at(1_790_000_000), 6.0);
+        record.created(&pod()?, AttemptResult::Created, at(1_790_000_000));
+        assert_eq!(record.spent_at(1_790_000_000 + 7200), Some(1.06));
         Ok(())
     }
 
