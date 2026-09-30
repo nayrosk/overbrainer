@@ -598,6 +598,7 @@ mod tests {
             retrieve_grace: std::time::Duration::from_secs(3600),
             data_center_ids,
             network_volume_id: None,
+            max_volume_gb: None,
         }
     }
 

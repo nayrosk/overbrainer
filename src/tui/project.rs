@@ -715,6 +715,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             retrieve_grace_minutes,
             data_center_ids,
             network_volume_id,
+            max_volume_gb,
         } => match field {
             "gpu_types" => Some(gpu_types.to_string()),
             "min_vram_gb" => min_vram_gb.map(|gb| gb.to_string()),
@@ -729,6 +730,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             "retrieve_grace_minutes" => Some(retrieve_grace_minutes.to_string()),
             "data_center_ids" => (!data_center_ids.is_any()).then(|| data_center_ids.to_string()),
             "network_volume_id" => network_volume_id.clone(),
+            "max_volume_gb" => max_volume_gb.map(|gb| gb.to_string()),
             _ => None,
         },
     }

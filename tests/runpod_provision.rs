@@ -136,6 +136,7 @@ fn target(gpu_types: &[&str]) -> RunpodTarget {
         retrieve_grace: Duration::from_secs(3600),
         data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
+        max_volume_gb: None,
     }
 }
 

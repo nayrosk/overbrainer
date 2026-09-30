@@ -1528,10 +1528,12 @@ runtime = "native"
                                 || problem.contains(&key)),
                         "{path} = {value:?}: {found:?}"
                     );
-                    // thinking_budget also needs an anthropic provider: only refusals agree.
-                    if spec.name == "thinking_budget" && !accepted {
+                    // thinking_budget also needs an anthropic provider, and
+                    // max_volume_gb a network volume: only refusals agree.
+                    let needs_more = ["thinking_budget", "max_volume_gb"].contains(&spec.name);
+                    if needs_more && !accepted {
                         assert!(refused, "{path} = {value:?} accepted: {found:?}");
-                    } else if spec.name != "thinking_budget" {
+                    } else if !needs_more {
                         assert_eq!(accepted, !refused, "{path} = {value:?}: {found:?}");
                     }
                     probed += 1;

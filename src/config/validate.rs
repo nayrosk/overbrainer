@@ -387,6 +387,7 @@ fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) 
         retrieve_grace_minutes,
         data_center_ids,
         network_volume_id,
+        max_volume_gb,
     } = target
     else {
         return;
@@ -423,6 +424,13 @@ fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) 
         problems.push(format!(
             "targets.{name}.max_cost_usd: must be greater than 0"
         ));
+    }
+    match (max_volume_gb, network_volume_id) {
+        (Some(0), _) => problems.push(format!("targets.{name}.max_volume_gb: must be at least 1")),
+        (Some(_), None) => problems.push(format!(
+            "targets.{name}.max_volume_gb: needs network_volume_id, the only disk that can grow"
+        )),
+        _ => {},
     }
     check_target_image(name, image.as_deref(), problems);
     check_target_venv(name, venv.as_deref(), problems);
@@ -1023,6 +1031,33 @@ mod tests {
                 "{value}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_volume_size_cap_needs_a_network_volume() -> Result<(), config::ConfigError> {
+        let volume = "network_volume_id = \"vol1\"\ndata_center_ids = [\"EU-RO-1\"]";
+        let toml = with_runpod(&format!("{volume}\nmax_volume_gb = 200"));
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        assert!(matches!(
+            settings(&toml)?.targets.get("cloud"),
+            Some(Target::Runpod {
+                max_volume_gb: Some(200),
+                ..
+            })
+        ));
+        assert_eq!(
+            check(&settings(&with_runpod("max_volume_gb = 200"))?),
+            vec![
+                "targets.cloud.max_volume_gb: needs network_volume_id, the only disk that can grow"
+                    .to_string()
+            ]
+        );
+        let toml = with_runpod(&format!("{volume}\nmax_volume_gb = 0"));
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["targets.cloud.max_volume_gb: must be at least 1".to_string()]
+        );
         Ok(())
     }
 

@@ -450,6 +450,12 @@ pub enum Target {
         /// Network volume mounted at `/workspace/data`. Requires exactly one entry
         /// in `data_center_ids`, the volume's data center (never `"auto"`).
         network_volume_id: Option<String>,
+        /// Largest size, in GB, overbrainer may grow the network volume to when
+        /// the run fills it; without it, a full disk stops the job with a
+        /// snapshot. At least 1, and only with `network_volume_id`. None by
+        /// default.
+        #[serde(default, deserialize_with = "optional_number")]
+        max_volume_gb: Option<u32>,
     },
 }
 

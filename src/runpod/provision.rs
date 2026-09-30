@@ -1209,6 +1209,7 @@ mod tests {
                     retrieve_grace: Duration::from_secs(3600),
                     data_center_ids: crate::config::ListOrAuto::default(),
                     network_volume_id: None,
+                    max_volume_gb: None,
                 },
                 keys: PodKeys::new(
                     std::path::PathBuf::from("/nonexistent/id_ed25519"),

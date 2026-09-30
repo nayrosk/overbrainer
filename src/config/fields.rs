@@ -663,6 +663,12 @@ const RUNPOD: &[FieldSpec] = &[
         true,
         "Network volume, needs exactly one data center",
     ),
+    spec(
+        "max_volume_gb",
+        COUNT,
+        true,
+        "Largest size in GB the network volume may grow to when it fills",
+    ),
 ];
 
 const METRICS: &[FieldSpec] = &[spec(
