@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use id::{
-    RUN_ID_MAX, compact_utc, is_safe_name, is_valid_run_id, new_run_id, parse_rfc3339, rfc3339,
+    RUN_ID_MAX, compact_utc, is_safe_name, is_valid_run_id, new_run_id, parse_rfc3339,
+    project_slug, rfc3339,
 };
 pub use summary::MetricsSummary;
 pub use train::{

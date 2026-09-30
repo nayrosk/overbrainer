@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 use secrecy::SecretString;
 use secrecy::zeroize::Zeroizing;
 
-use crate::runs::is_valid_run_id;
+use crate::runs::is_safe_name;
 
 use super::{PodError, SshEndpoint};
 
@@ -176,15 +176,19 @@ fn key_fields(line: &str) -> String {
         .join(" ")
 }
 
+/// Longest ssh alias [`valid_alias`] accepts: room for [`alias`] of the longest
+/// run ID, and a suffix.
+const ALIAS_MAX: usize = 128;
+
 /// Checks that `alias` is safe to interpolate into an ssh config or a
-/// `known_hosts` line: the same allow-list as a run ID, letters, digits and
-/// `-`, non-empty.
+/// `known_hosts` line: the same allow-list as a run ID, letters, digits, `_`
+/// and `-`, starting with a letter or a digit, non-empty.
 fn valid_alias(alias: &str) -> Result<(), PodError> {
-    if is_valid_run_id(alias) {
+    if is_safe_name(alias, ALIAS_MAX) {
         Ok(())
     } else {
         Err(PodError::InvalidPath(format!(
-            "{} is not a valid ssh alias: only letters, digits and `-`",
+            "{} is not a valid ssh alias: only letters, digits, `_` and `-`, starting with a letter or a digit, at most {ALIAS_MAX} characters",
             alias.escape_debug()
         )))
     }
@@ -417,8 +421,20 @@ mod tests {
     }
 
     #[test]
+    fn the_alias_of_the_longest_run_id_is_accepted() -> TestResult {
+        let id = format!("{}_20260930-120000_99", "a".repeat(40));
+        assert!(crate::runs::is_valid_run_id(&id));
+        let dir = tempfile::tempdir()?;
+        write_known_hosts(dir.path(), &alias(&id), "ssh-ed25519 AAAAkey")?;
+        let config = ssh_config(&alias(&id), &endpoint(), Path::new("/id"), Path::new("/kh"));
+        assert!(config.is_ok(), "{config:?}");
+        Ok(())
+    }
+
+    #[test]
     fn a_bad_alias_is_refused_everywhere_it_is_interpolated() -> TestResult {
-        for bad in ["a b", "a*b", "a,b", "a\nb", ""] {
+        let long = "a".repeat(ALIAS_MAX + 1);
+        for bad in ["a b", "a*b", "a,b", "a\nb", "", "-a", "a.b", &long] {
             let config = ssh_config(bad, &endpoint(), Path::new("/id"), Path::new("/kh"));
             assert!(matches!(config, Err(PodError::InvalidPath(_))), "{bad:?}");
 
