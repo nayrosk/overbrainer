@@ -27,7 +27,9 @@
 # deadline off for up to SNAPSHOT_WAIT; once a snapshot ended the job, the
 # deadline gives way to the retrieve grace, capped at the deadline plus
 # RETRIEVE_GRACE, so `train attach` can still collect it. At .pod/cost_cap_at
-# (100% of max_cost_usd) the pod is deleted, whatever the lease.
+# (100% of max_cost_usd) the pod is deleted, whatever the lease. A disk at
+# DISK_ACT percent full asks for a snapshot too, kept pod or not, so a full disk
+# never kills the job even with no client attached (see disk_full).
 #
 # POSIX sh: it runs under bash on the pod and is tested under sh, dash and busybox.
 # group_signal comes from overbrainer's job scripts and is prepended to this file.
@@ -45,6 +47,9 @@ LEASE_TTL=${OVERBRAINER_LEASE_TTL:-900}
 SNAPSHOT_LEAD=${OVERBRAINER_SNAPSHOT_LEAD:-900}
 SNAPSHOT_WAIT=${OVERBRAINER_SNAPSHOT_WAIT:-900}
 BOOT_FAILED=${OVERBRAINER_BOOT_FAILED:-0}
+VOLUME_DIR=${OVERBRAINER_VOLUME_DIR:-}
+DISK_ACT=92
+VOLUME_USABLE=94
 API=${OVERBRAINER_API_URL:-https://api.runpod.io/v2}
 AGENT="overbrainer-watchdog/${OVERBRAINER_VERSION:-unknown}"
 
@@ -57,8 +62,9 @@ lease_fresh() {
   [ $(($1 - touched)) -lt "$LEASE_TTL" ]
 }
 
-# Prints the Unix time the client wrote in .pod/$1, nothing when there is none.
-pod_time() {
+# Prints the number (a Unix time, a size) the client wrote in .pod/$1, nothing
+# when there is none.
+pod_number() {
   value=$(cat "$POD_DIR/$1" 2>/dev/null)
   case $value in '' | *[!0-9]*) value= ;; esac
   printf '%s' "$value"
@@ -78,6 +84,32 @@ request_snapshot() {
   printf '%s' "$1" > "$tmp" && mv -f "$tmp" "$RUN_DIR/snapshot.request" || return 1
   requested_at=$n
   log "snapshot requested reason=$1"
+}
+
+# Succeeds when the run's disk is at least DISK_ACT percent full. On a network
+# volume (VOLUME_DIR), df shows the whole shared cluster, so what the volume
+# holds (du) is weighed against its size, which the client writes in
+# .pod/volume_gb: only VOLUME_USABLE percent of it can be written before the
+# quota refuses writes. Without that file the rule waits. Anywhere else, df of
+# the run directory, used over used plus available.
+disk_full() {
+  total=
+  if [ -n "$VOLUME_DIR" ]; then
+    gb=$(pod_number volume_gb)
+    [ -n "$gb" ] || return 1
+    total=$((gb * 1000000000 / 1024 * VOLUME_USABLE / 100))
+    used=$(du -sk -- "$VOLUME_DIR" 2>/dev/null | cut -f 1)
+  else
+    line=$(df -Pk -- "$RUN_DIR" 2>/dev/null | tail -n 1)
+    read -r _ _ used avail _ <<DF
+$line
+DF
+    case $avail in '' | *[!0-9]*) return 1 ;; esac
+  fi
+  # Checked before any arithmetic: a bad number there would end the watchdog.
+  case $used in '' | *[!0-9]*) return 1 ;; esac
+  [ -n "$total" ] || total=$((used + avail))
+  [ "$total" -gt 0 ] && [ $((used * 100)) -ge $((DISK_ACT * total)) ]
 }
 
 # Whether the deadline deletes the pod at $1, once passed with the lease stale:
@@ -223,14 +255,17 @@ while :; do
     held=1
     log "deadline passed, lease held by the client"
   fi
-  snapshot_at=$(pod_time snapshot_at)
-  cost_cap_at=$(pod_time cost_cap_at)
+  snapshot_at=$(pod_number snapshot_at)
+  cost_cap_at=$(pod_number cost_cap_at)
   if [ "$started" = 1 ] && [ -z "$ended_at" ] && [ "$KEEP" != 1 ] && [ -z "$requested_at" ]; then
     if [ -n "$snapshot_at" ] && [ "$n" -ge "$snapshot_at" ]; then
       request_snapshot cost
     elif [ -n "$DEADLINE" ] && [ "$n" -ge $((DEADLINE - SNAPSHOT_LEAD)) ] && ! lease_fresh "$n"; then
       request_snapshot deadline
     fi
+  fi
+  if [ "$started" = 1 ] && [ -z "$ended_at" ] && [ ! -f "$RUN_DIR/snapshot.request" ] && disk_full; then
+    request_snapshot disk
   fi
   # Keep mode stays the cost cap, deadline, retrieved and abandoned rules only
   # once the job started; a failed bootstrap deletes the pod whatever the mode.

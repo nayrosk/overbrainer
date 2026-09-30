@@ -705,6 +705,125 @@ async fn the_cost_cap_asks_for_a_snapshot_then_deletes_the_pod() -> TestResult {
     Ok(())
 }
 
+/// A directory on `PATH` whose `df` reports a file system `df_percent` full and
+/// whose `du` reports `du_kib` KiB, and that `PATH`.
+fn fake_disk(
+    df_percent: u64,
+    du_kib: u64,
+) -> Result<(tempfile::TempDir, String), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let scripts = [
+        (
+            "df",
+            format!(
+                "#!/bin/sh\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
+                 echo 'overlay 1000 {df_percent}0 {}0 {df_percent}% /'\n",
+                100 - df_percent
+            ),
+        ),
+        (
+            "du",
+            format!("#!/bin/sh\nprintf '{du_kib}\\t%s\\n' \"$3\"\n"),
+        ),
+    ];
+    for (name, script) in scripts {
+        let path = dir.path().join(name);
+        fs::write(&path, script)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Ok((dir, path))
+}
+
+/// Runs the watchdog of a started job under every shell, on a disk that `df`
+/// and `du` describe as [`fake_disk`] does, with `env` and `.pod/volume_gb`
+/// holding `volume_gb`; returns, per shell, the snapshot request it wrote
+/// within 3 seconds (empty for none) and its output.
+async fn disk_rule(
+    df_percent: u64,
+    du_kib: u64,
+    volume_gb: Option<&str>,
+    env: &[(&str, String)],
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let mut seen = Vec::new();
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        let (_bin, path) = fake_disk(df_percent, du_kib)?;
+        let mut job = live_group()?;
+        fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
+        if let Some(gb) = volume_gb {
+            fs::write(pod.file(".pod/volume_gb"), gb)?;
+        }
+        let mut all = vec![("PATH", path)];
+        all.extend(env.iter().cloned());
+        let mut child = pod.start(shell, &server, &all)?;
+        until(Duration::from_secs(3), || {
+            pod.file("snapshot.request").exists()
+        })
+        .await;
+        child.kill().await?;
+        let output = child.wait_with_output().await?;
+        job.kill()?;
+        job.wait()?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert_eq!(deletes(&server).await, 0, "{shell}: {text}");
+        seen.push((pod.read("snapshot.request"), format!("{shell}: {text}")));
+    }
+    Ok(seen)
+}
+
+/// At 92% of the container disk the watchdog asks for a snapshot, kept pod or
+/// not; below, it does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_disk_asks_for_a_snapshot() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    let keep = [("OVERBRAINER_KEEP_POD", "1".to_string())];
+    for (request, output) in disk_rule(92, 0, None, &keep).await? {
+        assert_eq!(request, "disk", "{output}");
+        assert!(
+            output.contains("snapshot requested reason=disk"),
+            "{output}"
+        );
+    }
+    for (request, output) in disk_rule(91, 0, None, &[]).await? {
+        assert_eq!(request, "", "{output}");
+    }
+    Ok(())
+}
+
+/// On a network volume, `df` (the whole cluster) is ignored: `du` of the volume
+/// is weighed against 94% of `.pod/volume_gb`, and without that file nothing
+/// is asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_network_volume_asks_for_a_snapshot() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    let volume = tempfile::tempdir()?;
+    let env = [(
+        "OVERBRAINER_VOLUME_DIR",
+        volume.path().display().to_string(),
+    )];
+    // 1 GB holds 917968 KiB: 92% of it is 844531 KiB.
+    for (request, output) in disk_rule(10, 844_600, Some("1"), &env).await? {
+        assert_eq!(request, "disk", "{output}");
+    }
+    for (request, output) in disk_rule(99, 844_000, Some("1"), &env).await? {
+        assert_eq!(request, "", "{output}");
+    }
+    for (request, output) in disk_rule(99, 999_999, None, &env).await? {
+        assert_eq!(request, "", "{output}");
+    }
+    Ok(())
+}
+
 /// Once a snapshot ended the job, the deadline gives way to the retrieve grace,
 /// capped at the deadline plus that grace, so `train attach` can collect it.
 #[tokio::test(flavor = "multi_thread")]

@@ -62,6 +62,9 @@ pub struct PodSettings<'a> {
     /// `--keep-pod`: once the job exists, the watchdog never deletes the pod
     /// (before that, the boot grace and a failed bootstrap still do).
     pub keep: bool,
+    /// Where the network volume is mounted, when the pod has one: the
+    /// watchdog's disk rule reads it with `du` rather than `df`.
+    pub volume_dir: Option<&'a str>,
     /// Base URL of the Runpod API, for the watchdog.
     pub api_url: &'a str,
     /// The run's client public key.
@@ -101,6 +104,9 @@ pub fn pod_env(settings: &PodSettings<'_>) -> BTreeMap<String, String> {
         "OVERBRAINER_KEEP_POD",
         if settings.keep { "1" } else { "0" }.to_string(),
     );
+    if let Some(volume_dir) = settings.volume_dir {
+        set("OVERBRAINER_VOLUME_DIR", volume_dir.to_string());
+    }
     set("OVERBRAINER_API_URL", settings.api_url.to_string());
     set(
         "OVERBRAINER_AUTHORIZED_KEY",
@@ -163,6 +169,7 @@ mod tests {
             boot_grace: Duration::from_secs(1800),
             retrieve_grace: Duration::from_secs(3600),
             keep: false,
+            volume_dir: None,
             api_url: "https://api.runpod.io/v2",
             authorized_key: "ssh-ed25519 AAAAclient overbrainer-r1",
             claim: "ssh-ed25519 AAAAhost",
@@ -192,5 +199,14 @@ mod tests {
             Some("1")
         );
         assert!(!kept.contains_key("OVERBRAINER_DEADLINE"));
+        assert!(!kept.contains_key("OVERBRAINER_VOLUME_DIR"));
+        let on_volume = pod_env(&PodSettings {
+            volume_dir: Some("/workspace/data"),
+            ..settings
+        });
+        assert_eq!(
+            on_volume.get("OVERBRAINER_VOLUME_DIR").map(String::as_str),
+            Some("/workspace/data")
+        );
     }
 }

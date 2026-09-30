@@ -442,6 +442,7 @@ fn request(plan: &PodPlan<'_>, keep: bool, attempt: &Attempt) -> CreatePod {
         boot_grace: target.boot_grace,
         retrieve_grace: target.retrieve_grace,
         keep,
+        volume_dir: target.network_volume_id.as_ref().map(|_| VOLUME_MOUNT),
         api_url: plan.api_url,
         authorized_key: &plan.keys.client_public,
         claim: &plan.keys.host_public,

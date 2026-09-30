@@ -526,6 +526,17 @@ mod tests {
     }
 
     #[test]
+    fn the_watchdog_acts_at_the_same_share() {
+        let script = crate::runpod::watchdog_script();
+        assert!(script.contains(&format!("\nDISK_ACT={ACT_PERCENT}\n")));
+        assert!(script.contains(&format!("\nVOLUME_USABLE={VOLUME_USABLE_PERCENT}\n")));
+        assert!(script.contains(&format!(
+            "pod_number {}",
+            VOLUME_SIZE_FILE.trim_start_matches(".pod/")
+        )));
+    }
+
+    #[test]
     fn a_volume_grows_by_half_at_least_50_gb_up_to_its_cap() {
         assert_eq!(grown_size(200, 1000), Some(300));
         assert_eq!(grown_size(20, 1000), Some(70));
