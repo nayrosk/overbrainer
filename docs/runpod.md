@@ -17,6 +17,7 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 | `min_vram_gb` | none | Least VRAM per GPU, in GB. Only with `gpu_types = "auto"`. At least 1. Unset, `auto` uses the [VRAM estimate](#vram-estimate) instead, when it can be made. |
 | `max_price_per_hour` | none | Highest Secure Cloud list price of one GPU, in USD per hour. Only with `gpu_types = "auto"`. Greater than 0. |
 | `max_hours` | required | The pod's watchdog deletes the pod this long after it was created, unless overbrainer is following a job that still makes progress ([the watchdog](#the-watchdog)). At most 720. |
+| `max_cost_usd` | none | Most a run may spend on its pod, in USD, at the pod's hourly rate: at 95% the job is stopped with a snapshot, at 100% the watchdog deletes the pod ([automatic snapshots](#automatic-snapshots)). Greater than 0. Not applied with `--keep-pod`. |
 | `gpu_count` | `1` | GPUs per pod. |
 | `image` | `axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1`, pinned by digest | Pod image (CUDA 13, driver 580 or newer). |
 | `venv` | `/workspace/axolotl-venv` | Virtual environment holding `bin/axolotl` on the pod. Absolute. |
@@ -126,6 +127,7 @@ Each run gets its own client key and its own pod host key in `runs/<run-id>/ssh/
 The pod's command starts a small shell watchdog as its first process. At startup it checks that the pod's own Runpod key can read the pod, and overbrainer refuses to train (and deletes the pod) when it cannot. The watchdog then deletes the pod:
 
 - at `max_hours`, unless overbrainer is following the job (see below);
+- at `max_cost_usd`, whether or not overbrainer follows the job;
 - `boot_grace_minutes` after the pod started, if no job ever did;
 - `retrieve_grace_minutes` after the job ended, if its results were not retrieved;
 - at once, when overbrainer marks the results retrieved.
@@ -147,6 +149,15 @@ Nothing under `.pod/` is written or read through a symbolic link or a file with 
 The copy stops at 20 MiB, with a last line saying so. Every line is cleaned before it is written or shown: the Runpod API key, anything shaped like a Runpod key (`rpa_`, `rps_`) or a Hugging Face token (`hf_`), PEM private keys, the job's own secrets (the Hugging Face token), the value of `NAME=value` when NAME contains KEY, TOKEN, SECRET or PASSWORD (and of `NAME: value`, quoted or not, when NAME ends with one of them), runs of 200 or more base64 characters, and lines made only of 40 or more base64 characters become `***`. Lines are printed without terminal control characters.
 
 `overbrainer runs logs RUN_ID --pod` prints what is kept (the bootstrap's and watchdog's logs, then the pod's), then, while the pod exists, the lines Runpod has after the kept ones. `--source container` or `--source system` keeps one source, `--tail N` the last N lines of each log, and `--follow` keeps printing new lines until Ctrl-C. It only reads: the copy belongs to the command following the run. The TUI shows the same log with `s` in the Logs view.
+
+### Automatic snapshots
+
+Before a pod is lost to a limit, its job is stopped with a snapshot, as `overbrainer train stop` does (see [Training](training.md#stopping-with-a-snapshot)), so the steps done so far can be resumed with `overbrainer train --resume-from RUN_ID`:
+
+- 15 minutes before `max_hours`, when nothing holds the lease: the watchdog asks for the snapshot (reason `deadline`) and holds the deadline off for up to 15 minutes while the checkpoint is saved;
+- at 95% of `max_cost_usd`: once the pod exists, overbrainer writes on it when that is, from the pod's creation time and hourly rate (`.pod/snapshot_at`, and `.pod/cost_cap_at` for 100%). The watchdog asks for the snapshot then (reason `cost`), and so does overbrainer while it follows the job.
+
+When overbrainer follows the job, it retrieves the snapshot and deletes the pod as usual. When nothing follows it, the pod stays after the job ended, so `overbrainer train attach RUN_ID` can still collect the snapshot: until the retrieve grace ends, and at most `retrieve_grace_minutes` past the deadline. At 100% of `max_cost_usd` the pod is deleted whatever happens. A run whose pod was deleted there fails with `max_cost_usd reached: the pod was deleted before the job ended`.
 
 ### Retrieval
 
@@ -190,6 +201,6 @@ While following a job, overbrainer says once when the training pace ends it afte
 at this pace the job needs about 20.4h more, past max_hours (2026-09-29T19:54:50Z): the pod stays while overbrainer follows the job; if it stops following, the pod's watchdog deletes the pod
 ```
 
-Keep overbrainer following the job until it ends, raise `max_hours` above the time the run needs (the TUI shows its ETA), or train with `--keep-pod` and remove the pod with `overbrainer pod rm RUN_ID` once done. A run stopped this way starts over from the beginning.
+Keep overbrainer following the job until it ends, raise `max_hours` above the time the run needs (the TUI shows its ETA), or train with `--keep-pod` and remove the pod with `overbrainer pod rm RUN_ID` once done. When the watchdog's snapshot before the deadline was saved, the run is recorded `stopped` once `train attach` collects it, and `overbrainer train --resume-from RUN_ID` goes on from there; otherwise the run starts over from the beginning.
 
 When the connection to the pod fails for another reason, the warnings name it, for example `cannot reach the job (1/5): ssh failed: the connection was terminated`.
