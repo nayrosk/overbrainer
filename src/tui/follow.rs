@@ -449,9 +449,12 @@ impl App {
             .map_or(VramFloor::ToEstimate, |need| {
                 VramFloor::Known(need.as_ref().ok().map(Estimate::floor_gb))
             });
-        let task = plan.resume.as_ref().map_or(TrainJob::Start { vram_floor }, |resume| {
-            TrainJob::Resume(resume.run_id.clone())
-        });
+        let task = plan
+            .resume
+            .as_ref()
+            .map_or(TrainJob::Start { vram_floor }, |resume| {
+                TrainJob::Resume(resume.run_id.clone())
+            });
         let effects = self.spawn_train(Job::Start { runpod }, "", task);
         let resuming = plan.resume.as_ref().map_or_else(String::new, |resume| {
             format!(", resuming run {}", resume.run_id)

@@ -15,8 +15,7 @@ use secrecy::SecretString;
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
 use super::train::{
     HF_TOKEN, POLL, finish, prepare, reattach, resumed, secrets, started, stop_requested,
-    stoppable,
-    training, warn,
+    stoppable, training, warn,
 };
 use crate::config::{Settings, Training};
 use crate::dataset::DataFiles;

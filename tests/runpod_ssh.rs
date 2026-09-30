@@ -309,21 +309,7 @@ async fn provision_against(
         timing: &timing,
         interrupted: &interrupted,
     };
-    let target = RunpodTarget {
-        gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
-        min_vram_gb: None,
-        max_price_per_hour: None,
-        gpu_count: 1,
-        image: "img".into(),
-        venv: "/venv".into(),
-        container_disk_gb: 50,
-        max_hours: 1.0,
-        max_cost_usd: None,
-        boot_grace: Duration::from_secs(1800),
-        retrieve_grace: Duration::from_secs(3600),
-        data_center_ids: ListOrAuto::default(),
-        network_volume_id: None,
-    };
+    let target = a40_target();
     let keys = keys(sshd, &sshd.host_public);
     let ssh_dir = runs.run_dir(&run_id)?.join("ssh");
     let plan = PodPlan {
@@ -839,6 +825,25 @@ impl Trainer for Observer {
     }
 }
 
+/// A Runpod target of one A40 for an hour, nothing else set.
+fn a40_target() -> RunpodTarget {
+    RunpodTarget {
+        gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
+        min_vram_gb: None,
+        max_price_per_hour: None,
+        gpu_count: 1,
+        image: "img".into(),
+        venv: "/venv".into(),
+        container_disk_gb: 50,
+        max_hours: 1.0,
+        max_cost_usd: None,
+        boot_grace: Duration::from_secs(1800),
+        retrieve_grace: Duration::from_secs(3600),
+        data_center_ids: ListOrAuto::default(),
+        network_volume_id: None,
+    }
+}
+
 /// The library order the CLI's `train` relies on: `provision` has saved the
 /// pod's ID in `pod.json` when it returns, so when `runs::start` then prepares
 /// the run (before it spawns the job and saves the run `Running`), `pod.json`
@@ -870,21 +875,7 @@ async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestRes
         timing: &timing,
         interrupted: &interrupted,
     };
-    let target = RunpodTarget {
-        gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
-        min_vram_gb: None,
-        max_price_per_hour: None,
-        gpu_count: 1,
-        image: "img".into(),
-        venv: "/venv".into(),
-        container_disk_gb: 50,
-        max_hours: 1.0,
-        max_cost_usd: None,
-        boot_grace: Duration::from_secs(1800),
-        retrieve_grace: Duration::from_secs(3600),
-        data_center_ids: ListOrAuto::default(),
-        network_volume_id: None,
-    };
+    let target = a40_target();
     let keys = keys(&sshd, &sshd.host_public);
     let ssh_dir = runs.run_dir(&run_id)?.join("ssh");
     let plan = PodPlan {

@@ -518,6 +518,20 @@ impl Tasks {
         })
     }
 
+    /// Prepares a run resuming the stopped run `run`, off the async threads.
+    fn spawn_prepare_resume(&mut self, run: String) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        let source = self.source.clone();
+        self.set.spawn(async move {
+            let plan =
+                tokio::task::spawn_blocking(move || prepare_resume(&dir, &source, &run)).await;
+            Done::Prepared(match plan {
+                Ok(plan) => plan,
+                Err(error) => Err(format!("cannot prepare the run: {error}")),
+            })
+        })
+    }
+
     /// Starts `task` as `id`.
     pub(super) fn spawn(&mut self, id: TaskId, task: Task) {
         let files = DataFiles::new(&self.project_dir);
@@ -600,19 +614,7 @@ impl Tasks {
                 })
             },
             Task::Prepare => self.spawn_prepare(false),
-            Task::PrepareResume(run) => {
-                let dir = self.project_dir.clone();
-                let source = self.source.clone();
-                self.set.spawn(async move {
-                    let plan =
-                        tokio::task::spawn_blocking(move || prepare_resume(&dir, &source, &run))
-                            .await;
-                    Done::Prepared(match plan {
-                        Ok(plan) => plan,
-                        Err(error) => Err(format!("cannot prepare the run: {error}")),
-                    })
-                })
-            },
+            Task::PrepareResume(run) => self.spawn_prepare_resume(run),
             Task::PrepareAuto => self.spawn_prepare(true),
             Task::StartCatalog(gpu_count) => {
                 let dir = self.project_dir.clone();

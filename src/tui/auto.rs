@@ -542,7 +542,7 @@ mod tests {
             id = next;
         }
         let spawned = end(&mut app, id, Ok(()));
-        let [(train, Task::Train(TrainJob::Start))] = spawned[..] else {
+        let [(train, Task::Train(TrainJob::Start { .. }))] = spawned[..] else {
             return Err(format!("{spawned:?}").into());
         };
         app.on_message(crate::tui::tasks::Msg::Report(
