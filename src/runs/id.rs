@@ -51,8 +51,8 @@ pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
     let [year, month, day, hour, minute, second] = fields[..] else {
         return None;
     };
-    // Four-digit years only, as `rfc3339` writes them: this also keeps the
-    // arithmetic below far from overflowing.
+    // Up to 9999, as `rfc3339` writes them: this also keeps the arithmetic
+    // below far from overflowing.
     if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
@@ -68,7 +68,10 @@ pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = (era * 146_097 + doe).checked_sub(719_468)?;
     let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
+    let at = UNIX_EPOCH.checked_add(Duration::from_secs(seconds))?;
+    // Only the exact form `rfc3339` writes: no sign, no leading zero, no
+    // impossible date such as February 31.
+    (rfc3339(at) == text).then_some(at)
 }
 
 /// `now` in compact UTC form, UTC, to the second, for use in file names:
@@ -120,6 +123,10 @@ mod tests {
             "2026-09-21T24:00:00Z",
             "1969-12-31T23:59:59Z",
             "10000-01-01T00:00:00Z",
+            "0000001970-01-01T00:00:00Z",
+            "2026-9-21T14:13:20Z",
+            "2026-09-21T+4:13:20Z",
+            "2026-02-31T00:00:00Z",
             "18446744073709551615-01-01T00:00:00Z",
             "2026-09-21T14:13Z",
             "",
