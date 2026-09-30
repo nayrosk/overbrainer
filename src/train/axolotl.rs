@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-use super::metrics::{METRICS_ENV, METRICS_PLUGIN, PLUGIN_CLASS, PLUGIN_FILE};
+use super::metrics::{
+    METRICS_ENV, METRICS_PLUGIN, PLUGIN_CLASS, PLUGIN_FILE, SNAPSHOT_ENV, SNAPSHOT_FILE,
+    SNAPSHOT_REQUEST,
+};
 use super::{Artifacts, TrainError, Trainer, to_yaml};
 use crate::config::{Adapter, Training};
 use crate::dataset::DataFiles;
@@ -275,7 +278,12 @@ impl Trainer for Axolotl<'_> {
             ("AXOLOTL_DO_NOT_TRACK".into(), "1".into()),
             ("PYTHONPATH".into(), format!("{root}/{PLUGIN_DIR}")),
             (METRICS_ENV.into(), format!("{root}/{METRICS_FILE}")),
+            (SNAPSHOT_ENV.into(), format!("{root}/{SNAPSHOT_REQUEST}")),
         ]
+    }
+
+    fn stop_marker(&self) -> Option<&'static str> {
+        Some(SNAPSHOT_FILE)
     }
 
     fn metrics_file(&self) -> &'static str {

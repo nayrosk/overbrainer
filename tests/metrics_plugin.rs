@@ -38,6 +38,36 @@ main = SimpleNamespace(is_world_process_zero=True, max_steps=1, global_step=0, e
 callback.on_train_begin(None, main, None)
 ";
 
+/// Drives the snapshot callback alone (no `OVERBRAINER_METRICS`): nothing at a
+/// step without a request, nothing for an ordinary save, then the request makes
+/// the step save and stop, and the save writes the proof.
+const SNAPSHOT_DRIVER: &str = r#"
+import os
+from types import SimpleNamespace
+from overbrainer_metrics import OverbrainerMetricsPlugin
+
+callbacks = OverbrainerMetricsPlugin().add_callbacks_pre_trainer(cfg=None, model=None)
+assert len(callbacks) == 1
+callback = callbacks[0]
+request = os.environ["OVERBRAINER_SNAPSHOT"]
+root = os.path.dirname(request)
+proof = os.path.join(root, "snapshot.json")
+rank0 = os.environ.get("RANK0", "1") == "1"
+args = SimpleNamespace(output_dir=os.path.join(root, "output"), device="cpu")
+state = SimpleNamespace(is_world_process_zero=rank0, global_step=2)
+control = SimpleNamespace(should_save=False, should_training_stop=False)
+callback.on_step_end(args, state, control)
+assert not control.should_save and not control.should_training_stop
+callback.on_save(args, state, control)
+assert not os.path.exists(proof)
+with open(request, "w") as file:
+    file.write(os.environ.get("REASON", ""))
+state.global_step = 3
+callback.on_step_end(args, state, control)
+print("stopped" if control.should_save and control.should_training_stop else "running")
+callback.on_save(args, state, control)
+"#;
+
 fn write(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -58,6 +88,22 @@ fn stage_plugin(dir: &std::path::Path) -> std::io::Result<String> {
     write(
         &stubs.join("axolotl/integrations/base.py"),
         "class BasePlugin:\n    pass\n",
+    )?;
+    // A stand-in for `torch.distributed`: initialized with `STUB_DIST=1`, when
+    // its broadcast hands every rank what rank 0 finds, the request once it
+    // exists with `STUB_FOUND=1`, never without.
+    write(
+        &stubs.join("torch/__init__.py"),
+        "class _Tensor:\n    def __init__(self, values):\n        self.values = values\n\n    \
+         def item(self):\n        return self.values[0]\n\n\n\
+         def tensor(values, device=None):\n    return _Tensor(list(values))\n",
+    )?;
+    write(
+        &stubs.join("torch/distributed.py"),
+        "import os\n\n\ndef is_available():\n    return True\n\n\n\
+         def is_initialized():\n    return os.environ.get(\"STUB_DIST\") == \"1\"\n\n\n\
+         def broadcast(flag, src):\n    found = os.environ.get(\"STUB_FOUND\") == \"1\"\n    \
+         flag.values[0] = int(found and os.path.exists(os.environ[\"OVERBRAINER_SNAPSHOT\"]))\n",
     )?;
     let plugin = dir.join("plugin");
     write(&plugin.join(PLUGIN_FILE), METRICS_PLUGIN)?;
@@ -139,5 +185,84 @@ fn the_plugin_creates_a_missing_metrics_directory() -> TestResult {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(metrics.is_file());
+    Ok(())
+}
+
+/// Runs [`SNAPSHOT_DRIVER`] with `env`; returns what it printed and the proof
+/// it left, if any.
+fn drive_snapshot(
+    env: &[(&str, &str)],
+) -> Result<Option<(String, serde_json::Value)>, Box<dyn std::error::Error>> {
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: python3 is not installed");
+        return Ok(None);
+    }
+    let dir = tempfile::tempdir()?;
+    let python_path = stage_plugin(dir.path())?;
+    let root = dir.path().join("run");
+    fs::create_dir_all(&root)?;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(SNAPSHOT_DRIVER)
+        .env("PYTHONPATH", python_path)
+        .env_remove("OVERBRAINER_METRICS")
+        .env("OVERBRAINER_SNAPSHOT", root.join("snapshot.request"))
+        .envs(env.iter().copied())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let proof = match fs::read_to_string(root.join("snapshot.json")) {
+        Ok(text) => serde_json::from_str(&text)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+        Err(error) => return Err(error.into()),
+    };
+    assert!(!root.join("snapshot.json.tmp").exists());
+    Ok(Some((printed, proof)))
+}
+
+#[test]
+fn a_request_saves_a_checkpoint_stops_and_leaves_its_proof() -> TestResult {
+    let Some((printed, proof)) = drive_snapshot(&[("REASON", "deadline\n")])? else {
+        return Ok(());
+    };
+    assert_eq!(printed, "stopped");
+    assert_eq!(proof["checkpoint"], "output/checkpoint-3");
+    assert_eq!(proof["step"], 3);
+    assert_eq!(proof["reason"], "deadline");
+    assert!(proof["time"].as_f64().is_some_and(|time| time > 0.0));
+    Ok(())
+}
+
+#[test]
+fn a_request_without_a_known_reason_reads_as_requested() -> TestResult {
+    for reason in ["", "shutdown"] {
+        let Some((_, proof)) = drive_snapshot(&[("REASON", reason)])? else {
+            return Ok(());
+        };
+        assert_eq!(proof["reason"], "requested", "{reason:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn every_rank_stops_with_rank_0_and_only_rank_0_writes_the_proof() -> TestResult {
+    // Another rank never looks at the file: the broadcast tells it.
+    let Some((printed, proof)) =
+        drive_snapshot(&[("RANK0", "0"), ("STUB_DIST", "1"), ("STUB_FOUND", "1")])?
+    else {
+        return Ok(());
+    };
+    assert_eq!(printed, "stopped");
+    assert!(proof.is_null(), "{proof}");
+    let Some((printed, _)) =
+        drive_snapshot(&[("RANK0", "0"), ("STUB_DIST", "1"), ("STUB_FOUND", "0")])?
+    else {
+        return Ok(());
+    };
+    assert_eq!(printed, "running");
     Ok(())
 }

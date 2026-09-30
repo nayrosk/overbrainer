@@ -179,8 +179,11 @@ fn commands_env_and_artifacts() -> TestResult {
             ("AXOLOTL_DO_NOT_TRACK".to_string(), "1".to_string()),
             ("PYTHONPATH".into(), "/r/plugin".into()),
             ("OVERBRAINER_METRICS".into(), "/r/metrics.jsonl".into()),
+            ("OVERBRAINER_SNAPSHOT".into(), "/r/snapshot.request".into()),
         ]
     );
+    // The merge is skipped once the job stopped with a snapshot.
+    assert_eq!(trainer.stop_marker(), Some("snapshot.json"));
     assert_eq!(trainer.metrics_file(), "metrics.jsonl");
     assert_eq!(
         trainer.artifacts(),

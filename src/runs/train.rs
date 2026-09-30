@@ -307,6 +307,7 @@ async fn launch_job<E: Executor, T: Trainer>(
         cache_dir: &cache_dir,
         commands: &trainer.commands(),
         env: &trainer.env(&root),
+        stop_marker: trainer.stop_marker(),
         secrets: launch.secrets,
     });
     Ok(ctx.executor.spawn(&job).await?)
