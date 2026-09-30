@@ -5,7 +5,10 @@
 //! A line loses every known secret (the literal values overbrainer holds), then
 //! whatever looks like one: Runpod keys (`rpa_`, `rps_`), Hugging Face tokens
 //! (`hf_`), PEM private key blocks, the value of `NAME=value` when NAME names a
-//! key, token, secret or password, and runs of 200 or more base64 characters.
+//! key, token, secret or password (and of `NAME: value`, quoted or not, when
+//! NAME ends with one of those words), runs of 200 or more base64 characters,
+//! and lines that are nothing but 40 or more base64 characters (the body of a
+//! PEM block whose header was not seen).
 
 use secrecy::{ExposeSecret, SecretString};
 
@@ -27,6 +30,10 @@ const SECRET_NAMES: [&str; 4] = ["KEY", "TOKEN", "SECRET", "PASSWORD"];
 
 /// Base64 characters in a row from which the run is taken for key material.
 const MIN_BASE64_RUN: usize = 200;
+
+/// Base64 characters from which a line made of nothing else is taken for a
+/// line of a PEM body (64 characters, the last one shorter).
+const MIN_BASE64_LINE: usize = 40;
 
 /// Start of a PEM header or footer.
 const PEM_BEGIN: &str = "-----BEGIN ";
@@ -89,7 +96,22 @@ fn redact_known(line: &str, known: &[&str]) -> String {
 
 /// The patterns that need no state, in order.
 fn patterns(line: &str) -> String {
+    if base64_line(line) {
+        return MASK.to_string();
+    }
     base64_runs(&assignments(&tokens(line)))
+}
+
+/// Whether `line` is nothing but 40 or more standard base64 characters,
+/// letters and digits among them: a line of a PEM body.
+fn base64_line(line: &str) -> bool {
+    let text = line.trim();
+    text.len() >= MIN_BASE64_LINE
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        && text.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && text.bytes().any(|byte| byte.is_ascii_digit())
 }
 
 /// Masks PEM private key material in `line`; `in_key` says whether a block
@@ -198,11 +220,11 @@ fn assignments(line: &str) -> String {
     let mut copied = 0;
     let mut at = 0;
     while at < bytes.len() {
-        if bytes[at] != b'=' || !secret_name(&bytes[..at]) {
+        let Some(start) = value_start(bytes, at) else {
             at += 1;
             continue;
-        }
-        let Some((start, end)) = value_span(bytes, at + 1) else {
+        };
+        let Some((start, end)) = value_span(bytes, start) else {
             at += 1;
             continue;
         };
@@ -215,15 +237,42 @@ fn assignments(line: &str) -> String {
     out
 }
 
-/// Whether the name ending `before` (its word characters) holds a secret word.
-fn secret_name(before: &[u8]) -> bool {
+/// Where the value starts when `at` is the separator of a secret: `=` after a
+/// NAME holding a secret word, or `:` (then spaces) after a NAME ending with
+/// one, the NAME possibly closed by a quote (`"HF_TOKEN": "..."`). The `:`
+/// form asks more of its NAME since `tokenizer: ...` is common in logs.
+fn value_start(bytes: &[u8], at: usize) -> Option<usize> {
+    let separator = *bytes.get(at)?;
+    if separator != b'=' && separator != b':' {
+        return None;
+    }
+    let mut before = &bytes[..at];
+    if separator == b':'
+        && let Some((last, rest)) = before.split_last()
+        && matches!(last, b'"' | b'\'')
+    {
+        before = rest;
+    }
     let length = before
         .iter()
         .rev()
         .take_while(|byte| is_word(**byte))
         .count();
     let name = String::from_utf8_lossy(&before[before.len() - length..]).to_ascii_uppercase();
-    SECRET_NAMES.iter().any(|word| name.contains(word))
+    if separator == b'=' {
+        return SECRET_NAMES
+            .iter()
+            .any(|word| name.contains(word))
+            .then_some(at + 1);
+    }
+    if !SECRET_NAMES.iter().any(|word| name.ends_with(word)) {
+        return None;
+    }
+    let spaces = bytes[at + 1..]
+        .iter()
+        .take_while(|byte| **byte == b' ')
+        .count();
+    Some(at + 1 + spaces)
 }
 
 /// The span of the value starting at `start`: inside its quotes when quoted,
@@ -331,6 +380,34 @@ mod tests {
     }
 
     #[test]
+    fn quoted_and_colon_forms_lose_their_value() {
+        assert_eq!(
+            redact_line(r#"{"HF_TOKEN": "abc def", "n": 1}"#, &[]),
+            r#"{"HF_TOKEN": "***", "n": 1}"#
+        );
+        assert_eq!(redact_line("{'api_key': 'xyz'}", &[]), "{'api_key': '***'}");
+        assert_eq!(
+            redact_line("password: hunter2 next", &[]),
+            "password: *** next"
+        );
+        // Names that only contain a secret word, and URLs, stay.
+        let kept = "tokenizer: loaded from https://huggingface.co/x";
+        assert_eq!(redact_line(kept, &[]), kept);
+    }
+
+    #[test]
+    fn a_replay_starting_inside_a_private_key_masks_its_body() {
+        let body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun";
+        let mut redactor = Redactor::new(Vec::new());
+        assert_eq!(redactor.line(body), "***");
+        assert_eq!(redactor.line("  dGVzdA=="), "  dGVzdA==");
+        assert_eq!(redact_line(&body[..40], &[]), "***");
+        // Plain words or a separator line of that length stay.
+        let words = "a".repeat(50);
+        assert_eq!(redact_line(&words, &[]), words);
+    }
+
+    #[test]
     fn a_private_key_on_one_line_is_masked() {
         let line = "key: -----BEGIN OPENSSH PRIVATE KEY-----\\nb3BlbnNzaA\\n-----END OPENSSH PRIVATE KEY----- end";
         assert_eq!(redact_line(line, &[]), "key: *** end");
@@ -357,8 +434,10 @@ mod tests {
     fn long_base64_runs_are_masked() {
         let run = "aB3+".repeat(50);
         assert_eq!(redact_line(&format!("env {run} end"), &[]), "env *** end");
-        let short = &run[..199];
-        assert_eq!(redact_line(short, &[]), short);
+        // Shorter, among other words: kept (alone on a line, it would be a
+        // PEM body line).
+        let short = format!("env {} end", &run[..199]);
+        assert_eq!(redact_line(&short, &[]), short);
         let banner = "=".repeat(300);
         assert_eq!(redact_line(&banner, &[]), banner);
     }
