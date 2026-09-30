@@ -403,6 +403,70 @@ impl RunpodClient {
         Ok(list.network_volumes)
     }
 
+    /// The network volume `id` (`GET /network-volumes/{id}`), or `None` when
+    /// Runpod says in its own error shape that it does not know it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
+    pub async fn get_network_volume(&self, id: &str) -> Result<Option<NetworkVolume>, ApiError> {
+        let url = self.volume_url(id)?;
+        with_retry(
+            &self.policy,
+            || async {
+                let (status, body, retry_after) = self
+                    .fetch(self.http.request(Method::GET, url.clone()))
+                    .await?;
+                if status.is_success() {
+                    return decode(&body, false).map(Some);
+                }
+                if status == StatusCode::NOT_FOUND && is_runpod_error_shape(status, &body) {
+                    return Ok(None);
+                }
+                Err(self.status_error(status, &body, retry_after, false))
+            },
+            log_retry,
+        )
+        .await
+    }
+
+    /// Sets the size of the network volume `id` to `size_gb` (`PATCH
+    /// /network-volumes/{id}`), which Runpod only allows to grow, and returns
+    /// the volume as Runpod answers. Retried like a read: asking twice for the
+    /// same size changes nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
+    pub async fn resize_network_volume(
+        &self,
+        id: &str,
+        size_gb: u32,
+    ) -> Result<NetworkVolume, ApiError> {
+        let url = self.volume_url(id)?;
+        let body = serde_json::json!({ "size": size_gb });
+        with_retry(
+            &self.policy,
+            || async {
+                let answer = self
+                    .send(self.http.request(Method::PATCH, url.clone()).json(&body))
+                    .await?;
+                decode(&answer, false)
+            },
+            log_retry,
+        )
+        .await
+    }
+
+    /// The URL of the network volume `id`, the ID escaped as one path segment.
+    fn volume_url(&self, id: &str) -> Result<reqwest::Url, ApiError> {
+        let mut url = self.list_url(NETWORK_VOLUMES_PATH, &[])?;
+        url.path_segments_mut()
+            .map_err(|()| ApiError::InvalidResponse("the Runpod base URL has no path".into()))?
+            .push(id);
+        Ok(url)
+    }
+
     /// The account's pod templates (serverless ones are left out), following
     /// the pagination of `GET /templates` up to a fixed page limit; an ID
     /// listed twice keeps its first occurrence.
