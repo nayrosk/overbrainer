@@ -68,6 +68,38 @@ print("stopped" if control.should_save and control.should_training_stop else "ru
 callback.on_save(args, state, control)
 "#;
 
+/// A trainer loop in the order of transformers' `Trainer`: after each step,
+/// `on_step_end`, then a save when `should_save` (its checkpoint first, then
+/// `on_save`), then a stop when `should_training_stop`. The request appears
+/// before the step `REQUEST_AT`; prints the step training stopped at and the
+/// checkpoints saved.
+const LOOP_DRIVER: &str = r#"
+import os
+from types import SimpleNamespace
+from overbrainer_metrics import OverbrainerMetricsPlugin
+
+callback = OverbrainerMetricsPlugin().add_callbacks_pre_trainer(cfg=None, model=None)[0]
+request = os.environ["OVERBRAINER_SNAPSHOT"]
+root = os.path.dirname(request)
+args = SimpleNamespace(output_dir=os.path.join(root, "output"), device="cpu")
+max_steps = 5
+state = SimpleNamespace(is_world_process_zero=True, global_step=0, max_steps=max_steps)
+saved = []
+for step in range(1, max_steps + 1):
+    if step == int(os.environ["REQUEST_AT"]):
+        open(request, "w").close()
+    state.global_step = step
+    control = SimpleNamespace(should_save=False, should_training_stop=False)
+    callback.on_step_end(args, state, control)
+    if control.should_save:
+        os.makedirs(os.path.join(args.output_dir, f"checkpoint-{step}"))
+        saved.append(step)
+        callback.on_save(args, state, control)
+    if control.should_training_stop:
+        break
+print(state.global_step, saved)
+"#;
+
 fn write(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -264,5 +296,59 @@ fn every_rank_stops_with_rank_0_and_only_rank_0_writes_the_proof() -> TestResult
         return Ok(());
     };
     assert_eq!(printed, "running");
+    Ok(())
+}
+
+/// Runs [`LOOP_DRIVER`] with the request before step `at`; what it printed and
+/// the proof it left (`Null` when none).
+fn drive_loop(at: u32) -> Result<Option<(String, serde_json::Value)>, Box<dyn std::error::Error>> {
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: python3 is not installed");
+        return Ok(None);
+    }
+    let dir = tempfile::tempdir()?;
+    let python_path = stage_plugin(dir.path())?;
+    let root = dir.path().join("run");
+    fs::create_dir_all(&root)?;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(LOOP_DRIVER)
+        .env("PYTHONPATH", python_path)
+        .env_remove("OVERBRAINER_METRICS")
+        .env("OVERBRAINER_SNAPSHOT", root.join("snapshot.request"))
+        .env("REQUEST_AT", at.to_string())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let proof = match fs::read_to_string(root.join("snapshot.json")) {
+        Ok(text) => serde_json::from_str(&text)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some((printed, proof)))
+}
+
+#[test]
+fn in_the_trainer_s_order_the_checkpoint_lands_before_the_stop() -> TestResult {
+    let Some((printed, proof)) = drive_loop(3)? else {
+        return Ok(());
+    };
+    assert_eq!(printed, "3 [3]");
+    assert_eq!(proof["checkpoint"], "output/checkpoint-3");
+    assert_eq!(proof["step"], 3);
+    Ok(())
+}
+
+#[test]
+fn a_request_at_the_last_step_lets_the_run_end_as_usual() -> TestResult {
+    let Some((printed, proof)) = drive_loop(5)? else {
+        return Ok(());
+    };
+    assert_eq!(printed, "5 []");
+    assert!(proof.is_null(), "{proof}");
     Ok(())
 }

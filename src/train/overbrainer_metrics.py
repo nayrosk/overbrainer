@@ -101,6 +101,11 @@ class OverbrainerSnapshotCallback(TrainerCallback):
         return bool(flag.item())
 
     def on_step_end(self, args, state, control, **kwargs):
+        # The last step ends the run anyway, with its model saved and merged:
+        # a request then changes nothing. Every rank sees the same step.
+        max_steps = getattr(state, "max_steps", 0) or 0
+        if max_steps > 0 and state.global_step >= max_steps:
+            return
         if self.reason is not None or not self._requested(args, state):
             return
         self.reason = _reason(self.request) if state.is_world_process_zero else "requested"
