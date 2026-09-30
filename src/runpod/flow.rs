@@ -21,8 +21,9 @@ use super::provision::note_strays;
 use super::{
     BOOTSTRAP_LOG, CLIENT_KEY, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId, PodKeys,
     PodPlan, PodRecord, PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget, SSH_DIR,
-    SshEndpoint, alias, provision, remove, sweep, with_pod_logs, write_config,
+    SshEndpoint, alias, keep_file, provision, remove, sweep, with_pod_logs, write_config,
 };
+use crate::secrets::Redactor;
 
 /// How long after the watchdog's deadline the client deletes the pod itself, when
 /// it is still there: the watchdog should have done it first.
@@ -727,7 +728,7 @@ pub async fn end_pod(
     run: &RunRecord,
     retrieved: bool,
 ) -> Result<Ending, PodError> {
-    fetch_watchdog_log(ctx.runs, executor, run).await;
+    fetch_watchdog_log(ctx, executor, run).await;
     if !retrieved {
         return unretrieved(ctx, pod, &run.id);
     }
@@ -784,23 +785,50 @@ fn unretrieved(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> Result<En
 /// The watchdog's log on the pod, in the run directory on the pod.
 pub const WATCHDOG_LOG: &str = ".pod/watchdog.log";
 
+/// Largest copy of the watchdog's or the bootstrap's log, in bytes.
+const MAX_POD_FILE_LOG: u64 = 4 * 1024 * 1024;
+
 /// Copies the watchdog's and the bootstrap's logs of the run into
-/// `runs/<run-id>/.pod/`, best effort: the pod's own logs keep them too. Each
-/// is copied on its own, since a pod of an older overbrainer has no bootstrap
-/// log.
-async fn fetch_watchdog_log(runs: &Runs, executor: &SshExecutor, run: &RunRecord) {
-    let Ok(local) = runs.run_dir(&run.id) else {
+/// `runs/<run-id>/.pod/`, best effort: the pod's own logs keep them too.
+/// Each is read as bytes (never extracted from an archive the pod builds, so
+/// the pod cannot make the copy land anywhere else), redacted line by line,
+/// then written like the pod's log (see [`keep_file`]). A pod of an older
+/// overbrainer has no bootstrap log: nothing is written for it.
+async fn fetch_watchdog_log(ctx: &PodCtx<'_>, executor: &SshExecutor, run: &RunRecord) {
+    let Ok(local) = ctx.runs.run_dir(&run.id) else {
         return;
     };
     for (entry, what) in [(WATCHDOG_LOG, "watchdog"), (BOOTSTRAP_LOG, "bootstrap")] {
-        let entries = [entry.to_string()];
-        if let Err(error) = executor
-            .download(&run.remote_dir, &local, &entries, &[])
-            .await
-        {
+        if let Err(error) = copy_pod_file(ctx, executor, &run.remote_dir, &local, entry).await {
             tracing::warn!("cannot copy the {what}'s log of run {}: {error}", run.id);
         }
     }
+}
+
+/// Copies `entry` of the run directory `remote_dir` on the pod to the run
+/// directory `local`, redacted; nothing when it is empty or absent.
+async fn copy_pod_file(
+    ctx: &PodCtx<'_>,
+    executor: &SshExecutor,
+    remote_dir: &str,
+    local: &Path,
+    entry: &str,
+) -> Result<(), PodError> {
+    let remote = format!("{remote_dir}/{entry}");
+    let bytes = executor.read_from(&remote, 0, MAX_POD_FILE_LOG).await?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut redactor = Redactor::new(ctx.client.log_secrets());
+    let mut text = String::new();
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        text.push_str(&redactor.line(line));
+        text.push('\n');
+    }
+    keep_file(local, entry, text.as_bytes()).map_err(|source| PodError::Io {
+        path: local.join(entry),
+        source,
+    })
 }
 
 /// Removes the private client key of a run whose pod is gone, best effort.

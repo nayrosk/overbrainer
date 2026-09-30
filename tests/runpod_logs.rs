@@ -88,6 +88,7 @@ async fn a_snapshot_reads_the_replay_redacted_and_returns_its_cursor() -> TestRe
     let query = LogQuery {
         source: Some(LogSource::Container),
         tail: Some(10),
+        since: None,
         cursor: None,
     };
     let mut kept = Kept::default();
@@ -186,6 +187,7 @@ async fn follow_resumes_with_the_last_event_id_until_the_pod_is_gone() -> TestRe
     let query = LogQuery {
         source: None,
         tail: Some(TAIL_MAX),
+        since: None,
         cursor: None,
     };
     let mut kept = Kept::default();
@@ -411,5 +413,104 @@ async fn a_pod_is_deleted_only_after_a_last_read_of_its_logs() -> TestResult {
     assert_eq!(order, ["GET", "DELETE"]);
     let kept = std::fs::read_to_string(project.path().join("runs/r1").join(POD_LOG))?;
     assert!(kept.contains("last words"), "{kept}");
+    Ok(())
+}
+
+/// After a connection that delivered, failed reconnects wait longer and
+/// longer (0.5 s, then 1 s, then 2 s): not 0.5 s each time.
+#[tokio::test]
+async fn failed_reconnects_back_off_after_a_good_connection() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(LOGS))
+        .respond_with(stream(event("c/1", "container", "one")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(LOGS))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let mut kept = Kept::default();
+    let client = client(&server.uri())?;
+    let pod = PodId::new("p1")?;
+    let followed = tokio::time::timeout(
+        Duration::from_millis(2200),
+        follow_logs(&client, &pod, LogQuery::default(), &mut kept.sink()),
+    )
+    .await;
+    assert!(followed.is_err(), "the follow should still run");
+    let requests = server.received_requests().await.unwrap_or_default();
+    // At 0, 0.5 and 1.5 s; the next one would be at 3.5 s.
+    assert_eq!(requests.len(), 3);
+    Ok(())
+}
+
+/// A cursor Runpod no longer knows (400) is given up once, for its time.
+#[tokio::test]
+async fn a_refused_cursor_falls_back_to_its_time_once() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(LOGS))
+        .and(header("last-event-id", "2026-06-01T12:02:03Z/000000000009"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(json!({"status": 400, "title": "Bad"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(LOGS))
+        .and(query_param("since", "2026-06-01T12:02:03Z"))
+        .respond_with(stream(event(
+            "2026-06-01T12:02:04Z/1",
+            "container",
+            "after",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let query = LogQuery {
+        cursor: Some("2026-06-01T12:02:03Z/000000000009".into()),
+        ..LogQuery::default()
+    };
+    let mut kept = Kept::default();
+    let cursor = snapshot(
+        &client(&server.uri())?,
+        &PodId::new("p1")?,
+        query,
+        Duration::from_secs(10),
+        &mut kept.sink(),
+    )
+    .await?;
+    assert_eq!(kept.texts(), ["after"]);
+    assert_eq!(cursor.as_deref(), Some("2026-06-01T12:02:04Z/1"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_jobs_secrets_are_masked_too() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(LOGS))
+        .respond_with(stream(event(
+            "c/1",
+            "container",
+            "token is s3cr3t-value-77",
+        )))
+        .mount(&server)
+        .await;
+    let client = client(&server.uri())?.with_secrets(vec![SecretString::from("s3cr3t-value-77")]);
+    let mut kept = Kept::default();
+    snapshot(
+        &client,
+        &PodId::new("p1")?,
+        LogQuery::default(),
+        Duration::from_secs(10),
+        &mut kept.sink(),
+    )
+    .await?;
+    assert_eq!(kept.texts(), ["token is ***"]);
     Ok(())
 }

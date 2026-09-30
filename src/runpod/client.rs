@@ -221,6 +221,8 @@ pub struct RunpodClient {
     stream: reqwest::Client,
     base_url: String,
     api_key: SecretString,
+    /// Other secrets the pod log redaction looks for (the job's).
+    secrets: Vec<SecretString>,
     policy: RetryPolicy,
 }
 
@@ -261,6 +263,7 @@ impl RunpodClient {
             stream,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.clone(),
+            secrets: Vec::new(),
             policy: RetryPolicy::new(5),
         })
     }
@@ -506,9 +509,20 @@ impl RunpodClient {
         .await
     }
 
-    /// The account API key, which the pod log redaction looks for.
-    pub(super) fn api_key(&self) -> &SecretString {
-        &self.api_key
+    /// This client with `secrets` (the values the run's job gets, such as
+    /// its Hugging Face token), which the pod's logs never show.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: Vec<SecretString>) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    /// The secrets the pod log redaction looks for: the account API key,
+    /// then those of [`RunpodClient::with_secrets`].
+    pub(super) fn log_secrets(&self) -> Vec<SecretString> {
+        std::iter::once(self.api_key.clone())
+            .chain(self.secrets.iter().cloned())
+            .collect()
     }
 
     /// Opens the log stream of the pod `id` (`GET /pods/{id}/logs`, an event
@@ -537,6 +551,9 @@ impl RunpodClient {
             }
             if let Some(tail) = &tail {
                 pairs.append_pair("tail", tail);
+            }
+            if let Some(since) = &query.since {
+                pairs.append_pair("since", since);
             }
         }
         let mut request = self.stream.get(url).header(ACCEPT, EVENT_STREAM);
