@@ -78,6 +78,7 @@ impl Redactor {
     }
 
     /// The next line of the stream, redacted.
+    #[must_use]
     pub fn line(&mut self, line: &str) -> String {
         let known: Vec<&str> = self.known.iter().map(ExposeSecret::expose_secret).collect();
         let (text, in_key) = redact_pem(&redact_known(line, &known), self.in_key);
