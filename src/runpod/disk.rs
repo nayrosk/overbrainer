@@ -139,7 +139,7 @@ pub fn assess(usage: Usage, checkpoint_bytes: Option<u64>, warned: Option<u64>) 
 }
 
 /// The size, in GB, to grow a network volume of `current_gb` to: half again
-/// its size, and at least [`GROW_MIN_GB`] more, but never past `max_gb`.
+/// its size, and at least 50 GB more, but never past `max_gb`.
 /// `None` when that is no growth at all.
 #[must_use]
 pub fn grown_size(current_gb: u32, max_gb: u32) -> Option<u32> {
@@ -211,7 +211,9 @@ struct Growing {
     checks_left: u32,
 }
 
-/// The disk policy of one followed run: see the [module](self).
+/// The disk policy of one followed run: it warns from [`WARN_PERCENT`] on,
+/// and at [`ACT_PERCENT`], or when the next checkpoint would not fit, grows the
+/// network volume within `max_volume_gb` or stops the job with a snapshot.
 pub struct DiskWatch<'a, E> {
     executor: &'a E,
     client: &'a RunpodClient,
