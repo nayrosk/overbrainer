@@ -22,10 +22,10 @@ use crate::config::{Settings, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{
-    DeleteReason, DeletedBy, Ending, LEASE_TTL, MAX_HOURS_REACHED, PodCtx, PodError, PodRecord,
-    PodState, RunpodClient, RunpodTarget, Timing, chain, end_pod, forget_client_key, job_started,
-    listed_rows, orphan_warnings, past_deadline, reconnect, remove, settle_watch, ssh_command,
-    start_pod, watch_leased, with_pod_logs,
+    DeleteReason, DeletedBy, Ending, LEASE_TTL, PodCtx, PodError, PodRecord, PodState,
+    RunpodClient, RunpodTarget, Timing, arm_cost_cap, chain, end_pod, forget_client_key,
+    job_started, limit_reached, listed_rows, orphan_warnings, reconnect, remove, settle_watch,
+    ssh_command, start_pod, watch_leased, with_pod_logs,
 };
 use crate::runs::{
     Launch, Outcome, RunCtx, RunRecord, RunState, Runs, STOP_TIMEOUT, SnapshotReason,
@@ -257,6 +257,7 @@ impl Job<'_> {
             return abandon(&ctx, interrupt, &mut pod, &id).await;
         }
         let executor = provisioned.executor;
+        arm_cost_cap(&executor, &pod, &record).await;
         let runtime = self.spec.runtime();
         let launch = Launch {
             runtime: &runtime,
@@ -673,12 +674,12 @@ async fn from_local_files(
     tracing::info!("pod: {} already deleted", pod_name(pod));
     if record.state == RunState::Running {
         record.state = RunState::Failed;
-        // Its watchdog deleted it on `max_hours` once the deadline passed.
-        record.message = Some(if past_deadline(pod, SystemTime::now()) {
-            MAX_HOURS_REACHED.to_string()
-        } else {
-            format!("pod {} no longer exists", pod_name(pod))
-        });
+        // Its watchdog deleted it on `max_hours` or `max_cost_usd` once one
+        // passed.
+        record.message = Some(limit_reached(pod, SystemTime::now()).map_or_else(
+            || format!("pod {} no longer exists", pod_name(pod)),
+            str::to_string,
+        ));
         session.runs.save(&record)?;
     }
     let id = record.id.clone();

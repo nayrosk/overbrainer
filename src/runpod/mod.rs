@@ -31,9 +31,10 @@ pub use catalog::{
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
 pub use flow::{
-    DEADLINE_MARGIN, Ending, LEASE_FILE, LEASE_TTL, MAX_HOURS_REACHED, RETRIEVED_MARKER,
-    WATCHDOG_LOG, Watched, end_pod, follow, forget_client_key, job_started, past_deadline,
-    reconnect, settle_watch, ssh_command, start_pod, watch_leased, watch_on_pod,
+    COST_CAP_FILE, DEADLINE_MARGIN, Ending, LEASE_FILE, LEASE_TTL, MAX_COST_REACHED,
+    MAX_HOURS_REACHED, RETRIEVED_MARKER, SNAPSHOT_AT_FILE, WATCHDOG_LOG, Watched, arm_cost_cap,
+    end_pod, follow, forget_client_key, job_started, limit_reached, past_deadline, reconnect,
+    settle_watch, ssh_command, start_pod, watch_leased, watch_on_pod,
 };
 pub use keys::{
     CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,
@@ -53,8 +54,8 @@ pub use provision::{
     PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, resolve_target, sweep,
 };
 pub use record::{
-    Attempt, AttemptResult, DeletedBy, POD_FILE, POD_RECORD_VERSION, PodRecord, PodState,
-    SshEndpoint, hours,
+    Attempt, AttemptResult, CostCap, DeletedBy, POD_FILE, POD_RECORD_VERSION, PodRecord, PodState,
+    SNAPSHOT_SHARE, SshEndpoint, hours,
 };
 pub use status::{DeleteReason, PodStatus};
 pub use target::{MIN_CUDA_VERSION, RunpodTarget, VOLUME_MOUNT, VOLUME_WORKDIR, WORKDIR};
@@ -161,6 +162,10 @@ pub enum PodError {
     /// deleted the pod at its deadline, before the job ended.
     #[error("max_hours reached: the pod was deleted before the job ended")]
     DeadlineReached,
+    /// `max_cost_usd` ran out: the pod's watchdog deleted the pod once it had
+    /// spent it, before the job ended.
+    #[error("max_cost_usd reached: the pod was deleted before the job ended")]
+    CostCapReached,
     /// The run's pod no longer exists.
     #[error("pod {0} no longer exists")]
     PodGone(PodId),

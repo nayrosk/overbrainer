@@ -19,6 +19,15 @@
 # lease fresh: overbrainer touches .pod/lease every few minutes while the job makes
 # progress, and the deadline applies again once the lease is LEASE_TTL old.
 #
+# Before the pod is lost, the job is asked for a snapshot (snapshot.request, which
+# the trainer's plugin reads: it saves a checkpoint and stops): SNAPSHOT_LEAD
+# before the deadline while the lease is stale, and at .pod/snapshot_at, the time
+# the client wrote for 95% of max_cost_usd. A request the watchdog made holds the
+# deadline off for up to SNAPSHOT_WAIT; once a snapshot ended the job, the
+# deadline gives way to the retrieve grace, capped at the deadline plus
+# RETRIEVE_GRACE, so `train attach` can still collect it. At .pod/cost_cap_at
+# (100% of max_cost_usd) the pod is deleted, whatever the lease.
+#
 # POSIX sh: it runs under bash on the pod and is tested under sh, dash and busybox.
 # group_signal comes from overbrainer's job scripts and is prepended to this file.
 
@@ -32,6 +41,8 @@ RETRIEVE_GRACE=${OVERBRAINER_RETRIEVE_GRACE:-3600}
 KEEP=${OVERBRAINER_KEEP_POD:-0}
 DEADLINE=${OVERBRAINER_DEADLINE:-}
 LEASE_TTL=${OVERBRAINER_LEASE_TTL:-900}
+SNAPSHOT_LEAD=${OVERBRAINER_SNAPSHOT_LEAD:-900}
+SNAPSHOT_WAIT=${OVERBRAINER_SNAPSHOT_WAIT:-900}
 BOOT_FAILED=${OVERBRAINER_BOOT_FAILED:-0}
 API=${OVERBRAINER_API_URL:-https://api.runpod.io/v2}
 AGENT="overbrainer-watchdog/${OVERBRAINER_VERSION:-unknown}"
@@ -43,6 +54,36 @@ now() { date +%s; }
 lease_fresh() {
   touched=$(stat -c %Y "$POD_DIR/lease" 2>/dev/null) || return 1
   [ $(($1 - touched)) -lt "$LEASE_TTL" ]
+}
+
+# Prints the Unix time the client wrote in .pod/$1, nothing when there is none.
+pod_time() {
+  value=$(cat "$POD_DIR/$1" 2>/dev/null)
+  case $value in '' | *[!0-9]*) value= ;; esac
+  printf '%s' "$value"
+}
+
+# Asks the job for a snapshot for reason $1, unless one was asked for already.
+request_snapshot() {
+  [ -f "$RUN_DIR/snapshot.request" ] && return 0
+  printf '%s' "$1" > "$RUN_DIR/snapshot.request.tmp" &&
+    mv -f "$RUN_DIR/snapshot.request.tmp" "$RUN_DIR/snapshot.request" || return 1
+  requested_at=$n
+  log "snapshot requested reason=$1"
+}
+
+# Whether the deadline deletes the pod at $1, once passed with the lease stale:
+# not while a snapshot the watchdog asked for is being taken (SNAPSHOT_WAIT at
+# most), and, once a snapshot ended the job, not before DEADLINE + RETRIEVE_GRACE.
+deadline_due() {
+  if [ -n "$ended_at" ] && [ -f "$RUN_DIR/snapshot.json" ]; then
+    [ "$1" -ge $((DEADLINE + RETRIEVE_GRACE)) ]
+    return
+  fi
+  if [ -n "$requested_at" ] && [ -z "$ended_at" ] && [ $(($1 - requested_at)) -lt "$SNAPSHOT_WAIT" ]; then
+    return 1
+  fi
+  return 0
 }
 
 log() {
@@ -155,6 +196,7 @@ log "probe $result"
 started=0
 ended_at=
 retrieved=0
+requested_at=
 while :; do
   n=$(now)
   if [ "$started" = 0 ] && [ -f "$RUN_DIR/job.pid" ]; then
@@ -173,14 +215,25 @@ while :; do
     held=1
     log "deadline passed, lease held by the client"
   fi
-  # Keep mode stays the deadline, retrieved and abandoned rules only once the
-  # job started; a failed bootstrap deletes the pod whatever the mode.
+  snapshot_at=$(pod_time snapshot_at)
+  cost_cap_at=$(pod_time cost_cap_at)
+  if [ "$started" = 1 ] && [ -z "$ended_at" ] && [ "$KEEP" != 1 ] && [ -z "$requested_at" ]; then
+    if [ -n "$snapshot_at" ] && [ "$n" -ge "$snapshot_at" ]; then
+      request_snapshot cost
+    elif [ -n "$DEADLINE" ] && [ "$n" -ge $((DEADLINE - SNAPSHOT_LEAD)) ] && ! lease_fresh "$n"; then
+      request_snapshot deadline
+    fi
+  fi
+  # Keep mode stays the cost cap, deadline, retrieved and abandoned rules only
+  # once the job started; a failed bootstrap deletes the pod whatever the mode.
   reason=
   if [ "$BOOT_FAILED" = 1 ]; then
     reason=bootstrap_failed
   elif [ "$KEEP" = 1 ] && [ "$started" = 1 ]; then
     :
-  elif [ -n "$DEADLINE" ] && [ "$n" -ge "$DEADLINE" ] && ! lease_fresh "$n"; then
+  elif [ -n "$cost_cap_at" ] && [ "$n" -ge "$cost_cap_at" ]; then
+    reason=cost_cap
+  elif [ -n "$DEADLINE" ] && [ "$n" -ge "$DEADLINE" ] && ! lease_fresh "$n" && deadline_due "$n"; then
     reason=deadline
   elif [ "$retrieved" = 1 ]; then
     reason=retrieved

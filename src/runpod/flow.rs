@@ -11,15 +11,15 @@ use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::events::Event;
-use crate::exec::{Executor, SshExecutor};
-use crate::runs::{Outcome, RunCtx, RunError, RunRecord, RunState, Runs, watch};
-use crate::train::{Pace, Trainer};
+use crate::exec::{ExecError, Executor, SshExecutor};
+use crate::runs::{Outcome, RunCtx, RunError, RunRecord, RunState, Runs, SnapshotReason, watch};
+use crate::train::{Pace, SNAPSHOT_REQUEST, Trainer};
 
 use super::provision::note_strays;
 use super::{
-    BOOTSTRAP_LOG, CLIENT_KEY, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId, PodKeys,
-    PodPlan, PodRecord, PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget, SSH_DIR,
-    SshEndpoint, alias, keep_file, provision, remove, sweep, with_pod_logs, write_config,
+    BOOTSTRAP_LOG, CLIENT_KEY, CostCap, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId,
+    PodKeys, PodPlan, PodRecord, PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget,
+    SSH_DIR, SshEndpoint, alias, keep_file, provision, remove, sweep, with_pod_logs, write_config,
 };
 use crate::secrets::Redactor;
 
@@ -34,6 +34,17 @@ pub const RETRIEVED_MARKER: &str = ".pod/retrieved";
 /// Why a run fails when its pod was deleted on `max_hours`, by the client's own
 /// guard or by the pod's watchdog.
 pub const MAX_HOURS_REACHED: &str = "max_hours reached: the pod was deleted before the job ended";
+
+/// Why a run fails when its pod was deleted on `max_cost_usd` by its watchdog.
+pub const MAX_COST_REACHED: &str = "max_cost_usd reached: the pod was deleted before the job ended";
+
+/// Where the client writes, on the pod, when the job is stopped with a snapshot
+/// for the cost cap (Unix seconds), in the run directory: read by the watchdog.
+pub const SNAPSHOT_AT_FILE: &str = ".pod/snapshot_at";
+
+/// Where the client writes, on the pod, when the watchdog deletes the pod for
+/// the cost cap (Unix seconds), in the run directory.
+pub const COST_CAP_FILE: &str = ".pod/cost_cap_at";
 
 /// The lease a client following a job keeps on its pod, in the run directory:
 /// the watchdog skips its `max_hours` deadline while the file was touched less
@@ -133,6 +144,7 @@ async fn provision_run(
     let ssh_dir = ctx.runs.run_dir(&run.id)?.join(SSH_DIR);
     let keys = PodKeys::generate(&ssh_dir, &alias(&run.id))?;
     let mut record = PodRecord::new(&run.id, keep, target.gpu_count, &keys.host_public);
+    record.max_cost_usd = target.max_cost_usd.filter(|_| !keep);
     record.save(ctx.runs)?;
     let plan = PodPlan {
         run_id: &run.id,
@@ -145,6 +157,50 @@ async fn provision_run(
     };
     let provisioned = provision(ctx, &plan, &mut record).await?;
     Ok((record, provisioned))
+}
+
+/// Hands the cost cap of `pod` to its watchdog, best effort, before the job of
+/// `run` starts: when to stop the job with a snapshot and when to delete the
+/// pod, in files the watchdog reads every minute. A cap Runpod gave no rate
+/// for cannot be applied, which is said.
+pub async fn arm_cost_cap<E: Executor>(executor: &E, pod: &PodRecord, run: &RunRecord) {
+    let note = match pod.cost_cap() {
+        Some(cap) => write_cost_cap(executor, cap, &run.remote_dir)
+            .await
+            .err()
+            .map(|error| {
+                format!(
+                    "cannot hand the cost cap of run {} to its pod: {error}",
+                    run.id
+                )
+            }),
+        None if pod.max_cost_usd.is_some() && !pod.keep => Some(format!(
+            "max_cost_usd is not applied to run {}: Runpod gave no hourly rate for its pod",
+            run.id
+        )),
+        None => None,
+    };
+    if let Some(note) = note {
+        tracing::warn!("{note}");
+    }
+}
+
+/// Writes the times of `cap` where the watchdog of the run in `remote_dir`
+/// reads them.
+async fn write_cost_cap<E: Executor>(
+    executor: &E,
+    cap: CostCap,
+    remote_dir: &str,
+) -> Result<(), ExecError> {
+    for (file, at) in [
+        (SNAPSHOT_AT_FILE, cap.snapshot_at),
+        (COST_CAP_FILE, cap.delete_at),
+    ] {
+        executor
+            .put_file(&format!("{remote_dir}/{file}"), &at.to_string())
+            .await?;
+    }
+    Ok(())
 }
 
 /// Records that the job of the run was started on the pod.
@@ -224,7 +280,9 @@ pub async fn watch_on_pod<E: Executor, T: Trainer>(
 /// the watchdog nor the client's own guard. Once the job stalls or the lease
 /// cannot be renewed, the lease runs out after [`LEASE_TTL`] and the deadline
 /// applies again. It warns once, as information, when the job ends after the
-/// deadline. A kept pod has no deadline and needs no lease.
+/// deadline. Once the pod has spent [`SNAPSHOT_SHARE`](super::SNAPSHOT_SHARE) of
+/// its cost cap, it asks the job for a snapshot, as the watchdog does. A kept
+/// pod has no deadline and needs no lease.
 pub async fn watch_leased<E: Executor, T: Trainer>(
     run_ctx: &RunCtx<'_, E>,
     trainer: &T,
@@ -235,24 +293,25 @@ pub async fn watch_leased<E: Executor, T: Trainer>(
         return Watched::Ended(Box::new(watch(run_ctx, trainer, record).await));
     }
     let events = run_ctx.bus.subscribe();
-    let lease = format!("{}/{LEASE_FILE}", record.remote_dir);
+    let remote_dir = record.remote_dir.clone();
     tokio::select! {
         outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
         // Boxed: its state would otherwise weigh on every caller's future.
-        () = Box::pin(hold_lease(run_ctx.executor, &lease, events, pod)) => Watched::DeadlinePassed,
+        () = Box::pin(hold_lease(run_ctx.executor, &remote_dir, events, pod)) => Watched::DeadlinePassed,
     }
 }
 
-/// Renews the lease at `path` while the job progresses, warns once when it
-/// ends after the deadline, and returns once the client's own deadline passed
-/// with no lease held.
+/// Renews the lease of the run in `remote_dir` while the job progresses, asks
+/// for a snapshot at the cost cap, warns once when the job ends after the
+/// deadline, and returns once the client's own deadline passed with no lease
+/// held.
 async fn hold_lease<E: Executor>(
     executor: &E,
-    path: &str,
+    remote_dir: &str,
     mut events: Receiver<Event>,
     pod: &PodRecord,
 ) {
-    let mut lease = Lease::new(pod);
+    let mut lease = Lease::new(pod, remote_dir);
     let mut open = true;
     let mut tick = tokio::time::interval(LEASE_TICK);
     loop {
@@ -263,7 +322,7 @@ async fn hold_lease<E: Executor>(
                 Err(RecvError::Closed) => open = false,
             },
             _ = tick.tick() => {
-                if lease.tick(executor, path).await {
+                if lease.tick(executor).await {
                     return;
                 }
             },
@@ -271,23 +330,29 @@ async fn hold_lease<E: Executor>(
     }
 }
 
-/// What [`hold_lease`] knows of the followed job and of its lease.
+/// What [`hold_lease`] knows of the followed job, of its lease and of its cost
+/// cap.
 struct Lease<'a> {
     pod: &'a PodRecord,
+    remote_dir: &'a str,
     pace: Pace,
     last_metric: SystemTime,
     renewed: Option<SystemTime>,
     warned: bool,
+    /// Whether the snapshot for the cost cap was asked for.
+    capped: bool,
 }
 
 impl<'a> Lease<'a> {
-    fn new(pod: &'a PodRecord) -> Self {
+    fn new(pod: &'a PodRecord, remote_dir: &'a str) -> Self {
         Self {
             pod,
+            remote_dir,
             pace: Pace::default(),
             last_metric: SystemTime::now(),
             renewed: None,
             warned: false,
+            capped: false,
         }
     }
 
@@ -308,17 +373,55 @@ impl<'a> Lease<'a> {
         }
     }
 
-    /// Renews the lease at `path` when due; whether the client's guard fires.
-    async fn tick<E: Executor>(&mut self, executor: &E, path: &str) -> bool {
+    /// Renews the lease when due and asks for the cost cap's snapshot once it
+    /// is due; whether the client's guard fires.
+    async fn tick<E: Executor>(&mut self, executor: &E) -> bool {
         let now = SystemTime::now();
         if renewal_due(self.renewed, self.last_metric, now) {
-            match executor.put_file(path, "").await {
-                Ok(()) => self.renewed = Some(now),
-                Err(error) => tracing::debug!("cannot renew the pod's lease: {error}"),
-            }
+            self.renew(executor, now).await;
+        }
+        if !self.capped && cap_snapshot_due(self.pod, now) {
+            self.cap(executor).await;
         }
         guard_fires(self.pod, self.renewed, now)
     }
+
+    /// Renews the lease at `now`.
+    async fn renew<E: Executor>(&mut self, executor: &E, now: SystemTime) {
+        let path = format!("{}/{LEASE_FILE}", self.remote_dir);
+        match executor.put_file(&path, "").await {
+            Ok(()) => self.renewed = Some(now),
+            Err(error) => tracing::debug!("cannot renew the pod's lease: {error}"),
+        }
+    }
+
+    /// Asks the job for the cost cap's snapshot; tried again next tick when
+    /// the request cannot be written.
+    async fn cap<E: Executor>(&mut self, executor: &E) {
+        let path = format!("{}/{SNAPSHOT_REQUEST}", self.remote_dir);
+        let written = executor.put_file(&path, SnapshotReason::Cost.name()).await;
+        self.capped = written.is_ok();
+        let note = match written {
+            Ok(()) => format!(
+                "the pod spent {:.0}% of max_cost_usd: its job is stopped with a snapshot",
+                super::SNAPSHOT_SHARE * 100.0
+            ),
+            Err(error) => format!("cannot ask for the cost cap's snapshot: {error}"),
+        };
+        tracing::warn!("{note}");
+    }
+}
+
+/// Whether the job on `pod` is due for its cost cap's snapshot at `now`.
+fn cap_snapshot_due(pod: &PodRecord, now: SystemTime) -> bool {
+    pod.cost_cap()
+        .is_some_and(|cap| unix_secs(now) >= cap.snapshot_at)
+}
+
+/// Seconds since the Unix epoch at `now`, 0 before it.
+fn unix_secs(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// Whether the lease, last renewed at `renewed`, should be renewed at `now`:
@@ -449,6 +552,10 @@ async fn unreachable(
     error: PodError,
 ) -> PodError {
     match gone(ctx, pod).await {
+        Ok(true) if past_cost_cap(pod, SystemTime::now()) => {
+            fail_run(ctx.runs, run_id, MAX_COST_REACHED);
+            PodError::CostCapReached
+        },
         Ok(true) if past_deadline(pod, SystemTime::now()) => {
             fail_run(ctx.runs, run_id, MAX_HOURS_REACHED);
             PodError::DeadlineReached
@@ -495,10 +602,30 @@ pub fn past_deadline(pod: &PodRecord, now: SystemTime) -> bool {
     !pod.keep && pod.deadline_unix.is_some_and(|deadline| now >= deadline)
 }
 
+/// Whether the cost cap of `pod` was spent at `now`: a pod found gone then was
+/// deleted by its watchdog on `max_cost_usd`.
+fn past_cost_cap(pod: &PodRecord, now: SystemTime) -> bool {
+    pod.cost_cap()
+        .is_some_and(|cap| unix_secs(now) >= cap.delete_at)
+}
+
+/// Why the run of `pod`, found gone at `now`, failed when a limit of its
+/// watchdog had passed: [`MAX_COST_REACHED`] or [`MAX_HOURS_REACHED`].
+#[must_use]
+pub fn limit_reached(pod: &PodRecord, now: SystemTime) -> Option<&'static str> {
+    if past_cost_cap(pod, now) {
+        Some(MAX_COST_REACHED)
+    } else if past_deadline(pod, now) {
+        Some(MAX_HOURS_REACHED)
+    } else {
+        None
+    }
+}
+
 /// Who deleted `pod`, found gone at `now` without overbrainer deleting it: its
-/// watchdog once its deadline passed, otherwise nobody known.
+/// watchdog once its deadline or its cost cap passed, otherwise nobody known.
 fn gone_by(pod: &PodRecord, now: SystemTime) -> DeletedBy {
-    if past_deadline(pod, now) {
+    if limit_reached(pod, now).is_some() {
         DeletedBy::Watchdog
     } else {
         DeletedBy::Unknown
@@ -995,6 +1122,27 @@ mod tests {
             overrun(&Pace::default(), &pod_due_in(6, false, now), now, false),
             None
         );
+    }
+
+    #[test]
+    fn the_cost_cap_asks_for_a_snapshot_then_names_why_the_pod_went() {
+        let now = SystemTime::now();
+        // Created an hour ago at $1/h, with a cap of $2: the snapshot at 1.9h.
+        let mut pod = pod_due_in(6, false, now);
+        pod.created_unix = Some(unix_secs(now) - 3600);
+        pod.cost_per_hour = Some(1.0);
+        assert!(!cap_snapshot_due(&pod, now), "no cap");
+        pod.max_cost_usd = Some(2.0);
+        let hours = |h: f64| now + Duration::from_secs_f64(h * 3600.0);
+        assert!(!cap_snapshot_due(&pod, hours(0.85)));
+        assert!(cap_snapshot_due(&pod, hours(0.95)));
+        assert_eq!(limit_reached(&pod, hours(0.95)), None);
+        assert_eq!(limit_reached(&pod, hours(1.0)), Some(MAX_COST_REACHED));
+        assert_eq!(gone_by(&pod, hours(1.0)), DeletedBy::Watchdog);
+        assert_eq!(limit_reached(&pod, hours(6.0)), Some(MAX_COST_REACHED));
+        pod.max_cost_usd = None;
+        assert_eq!(limit_reached(&pod, hours(6.0)), Some(MAX_HOURS_REACHED));
+        assert_eq!(gone_by(&pod, hours(1.0)), DeletedBy::Unknown);
     }
 
     #[test]
