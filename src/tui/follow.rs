@@ -20,12 +20,13 @@ use crossterm::event::KeyCode;
 
 use super::app::{Action, App, Confirm, Effect, Exit, NoteOf, Overlay, Severity, View};
 use super::auto;
-use super::start::{self, Gpus, StartPlan};
+use super::start::{self, Catalog, StartPlan};
 use super::tasks::{Msg, Task, TaskId, TrainJob};
 use super::training::{Detach, Ended, Follow, Job, Listing, RunActivity};
 use crate::cli::front::Report;
 use crate::events::Event;
 use crate::train::TrainMetric;
+use crate::train::sizing::{Estimate, VramFloor};
 
 /// Time between two reads of `runs/` while the Training view is shown, and of
 /// the data files while the Dataset view is shown during a stage.
@@ -314,8 +315,22 @@ impl App {
 
     /// The GPU catalog of the start dialog arrived: kept while the dialog or
     /// its picker is open, and shown in the dialog.
-    pub(super) fn start_catalog_read(&mut self, gpus: Gpus) {
+    pub(super) fn start_catalog_read(&mut self, gpus: Catalog) {
         self.start_catalog = None;
+        // The plan keeps the estimate: the run and the dialog's picker use it.
+        let held = self.start_held.as_deref_mut();
+        let shown = match &mut self.overlay {
+            Some(Overlay::Confirm(Confirm {
+                action: Action::Start(plan),
+                ..
+            })) => Some(&mut **plan),
+            _ => None,
+        };
+        for plan in [held, shown].into_iter().flatten() {
+            if let Some(runpod) = plan.runpod.as_deref_mut() {
+                runpod.need = Some(gpus.need.clone());
+            }
+        }
         self.start_gpus = Some(gpus);
         if let Some(Overlay::Confirm(confirm)) = &mut self.overlay {
             match &confirm.action {
@@ -327,13 +342,22 @@ impl App {
     }
 
     /// Starts the run of `plan`, on `training.target` and without keeping its
-    /// pod, unless something started meanwhile.
+    /// pod, unless something started meanwhile. The VRAM floor its
+    /// confirmation showed, once estimated, is the one the run uses.
     pub(super) fn start_run(&mut self, plan: &StartPlan) -> Vec<Effect> {
         if self.start_refused() {
             return Vec::new();
         }
         let runpod = plan.runpod.is_some();
-        let effects = self.train(Job::Start { runpod }, "");
+        let vram_floor = plan
+            .runpod
+            .as_ref()
+            .and_then(|runpod| runpod.need.as_ref())
+            .map_or(VramFloor::ToEstimate, |need| {
+                VramFloor::Known(need.as_ref().ok().map(Estimate::floor_gb))
+            });
+        let task = TrainJob::Start { vram_floor };
+        let effects = self.spawn_train(Job::Start { runpod }, "", task);
         self.say(Severity::Info, format!("starting a run on {}", plan.target));
         effects
     }
@@ -349,12 +373,19 @@ impl App {
     /// Starts a training task doing `job` on run `run_id`. The late messages of
     /// the run's earlier tasks, and a read of its metrics, no longer count.
     fn train(&mut self, job: Job, run_id: &str) -> Vec<Effect> {
-        let id = self.task_id();
         let task = match job {
-            Job::Start { .. } => TrainJob::Start,
+            Job::Start { .. } => TrainJob::Start {
+                vram_floor: VramFloor::ToEstimate,
+            },
             Job::Attach => TrainJob::Attach(run_id.to_string()),
             Job::Cancel => TrainJob::Cancel(run_id.to_string()),
         };
+        self.spawn_train(job, run_id, task)
+    }
+
+    /// [`Self::train`] with its task given.
+    fn spawn_train(&mut self, job: Job, run_id: &str, task: TrainJob) -> Vec<Effect> {
+        let id = self.task_id();
         if !run_id.is_empty() {
             self.forget_notes(&NoteOf::Run(run_id.to_string()));
         }
@@ -830,7 +861,7 @@ pub(super) const NOT_STARTED: &str = "a new training run was not started: the TU
 
 /// The dialog asking to start the run of `plan`, with the GPU catalog `gpus`
 /// once read.
-pub(super) fn start_dialog(plan: Box<StartPlan>, gpus: Option<&Gpus>) -> Confirm {
+pub(super) fn start_dialog(plan: Box<StartPlan>, gpus: Option<&Catalog>) -> Confirm {
     Confirm {
         title: " Start a training run? ".to_string(),
         text: start::text(&plan, gpus),

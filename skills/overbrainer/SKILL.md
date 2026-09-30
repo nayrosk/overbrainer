@@ -84,7 +84,7 @@ Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.4
 
 - `kind = "local"`: this machine, `runtime = "native"` (Axolotl in `venv`) or `"docker"`.
 - `kind = "ssh"`: a machine reached with `ssh`, host from `OVERBRAINER_TARGETS__NAME__HOST`.
-- `kind = "runpod"`: a pod created for the run and deleted afterwards. Needs `gpu_types` (a list, or `"auto"` to try every GPU type in stock, cheapest first) and `max_hours`, and `OVERBRAINER_RUNPOD__API_KEY`. A watchdog on the pod deletes it at `max_hours` at the latest.
+- `kind = "runpod"`: a pod created for the run and deleted afterwards. Needs `gpu_types` (a list, or `"auto"` to try every GPU type in stock, cheapest first, with at least the VRAM the model is estimated to need unless `min_vram_gb` is set) and `max_hours`, and `OVERBRAINER_RUNPOD__API_KEY`. A watchdog on the pod deletes it at `max_hours` at the latest.
 
 | Command | What it does |
 |---|---|

@@ -124,6 +124,10 @@ pub struct PodPlan<'a> {
     pub workdir: &'a str,
     /// Base URL of the Runpod API, which the pod's watchdog calls too.
     pub api_url: &'a str,
+    /// The least VRAM `auto` GPU types need when the target sets no
+    /// `min_vram_gb`: the estimate of what the run needs (see
+    /// [`resolve_with_floor`](super::resolve_with_floor)).
+    pub vram_floor_gb: Option<u32>,
 }
 
 /// A pod ready for the run: reachable over SSH with its pinned host key, with a
@@ -185,7 +189,7 @@ pub async fn provision(
     record: &mut PodRecord,
 ) -> Result<Provisioned, PodError> {
     ctx.check()?;
-    let target = resolve_target(ctx.client, plan.target).await?;
+    let target = resolve_target(ctx.client, plan.target, plan.vram_floor_gb).await?;
     let plan = &PodPlan {
         target: &target,
         ..*plan
@@ -198,10 +202,10 @@ pub async fn provision(
 }
 
 /// `target` with its `auto` choices resolved from the Runpod catalog (see
-/// [`resolve`](super::resolve)), logged at info level; a target without any
-/// is returned as it is, without an API call. Both choices are resolved from
-/// the same GPU listing, scoped to `target.gpu_count`: `catalog/datacenters`
-/// is never read for this.
+/// [`resolve_with_floor`](super::resolve_with_floor), with `floor_gb`), logged
+/// at info level; a target without any is returned as it is, without an API
+/// call. Both choices are resolved from the same GPU listing, scoped to
+/// `target.gpu_count`: `catalog/datacenters` is never read for this.
 ///
 /// # Errors
 ///
@@ -210,12 +214,13 @@ pub async fn provision(
 pub async fn resolve_target(
     client: &RunpodClient,
     target: &RunpodTarget,
+    floor_gb: Option<u32>,
 ) -> Result<RunpodTarget, PodError> {
     if !target.gpu_types.is_auto() && !target.data_center_ids.is_auto() {
         return Ok(target.clone());
     }
     let gpus = client.list_gpu_types(target.gpu_count).await?;
-    let resolved = super::resolve(target, &gpus).map_err(PodError::NotInStock)?;
+    let resolved = super::resolve_with_floor(target, &gpus, floor_gb)?;
     log_picks(target, &resolved);
     Ok(resolved)
 }
@@ -1223,6 +1228,7 @@ mod tests {
                 ssh_dir: self.project.path(),
                 workdir: "/workspace/overbrainer",
                 api_url: self.client.base_url(),
+                vram_floor_gb: None,
             }
         }
 

@@ -24,8 +24,9 @@ pub use bootstrap::{
     HOST_KEY_ENV, JOB_ENV, PodSettings, bootstrap_functions, pod_command, pod_env, watchdog_script,
 };
 pub use catalog::{
-    DataCenterStock, GpuFilter, by_price, data_center_stock, data_center_table, gpu_table,
-    printable, resolve, select_gpus, stocked_data_centers, template_table, volume_table,
+    DataCenterStock, GpuFilter, ResolveError, by_price, data_center_stock, data_center_table,
+    gpu_table, printable, resolve, resolve_with_floor, select_gpus, stocked_data_centers,
+    template_table, volume_table,
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
 pub use flow::{
@@ -93,8 +94,8 @@ pub enum PodError {
     NoCapacity(String),
     /// An `auto` choice of the target found nothing in stock in the Runpod
     /// catalog; no pod was asked for. Says what was asked.
-    #[error("{0}")]
-    NotInStock(String),
+    #[error(transparent)]
+    NotInStock(#[from] ResolveError),
     /// Runpod asks for credits (402).
     #[error(
         "Runpod refused for lack of credits (402): deploying needs at least one hour of credits"

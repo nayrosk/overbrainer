@@ -63,6 +63,8 @@ const GONE_LOOKS: u32 = 3;
 /// fails, the run is saved `Failed` with the reason (`interrupted before the job
 /// started` after Ctrl-C), whatever pod was created is deleted, and once every
 /// pod of the run is confirmed deleted, the run's private client key is removed.
+/// `vram_floor_gb` is the least VRAM `auto` GPU types need when the target sets
+/// no `min_vram_gb` (see [`PodPlan::vram_floor_gb`]).
 ///
 /// # Errors
 ///
@@ -72,8 +74,9 @@ pub async fn start_pod(
     target: &RunpodTarget,
     mut run: RunRecord,
     keep: bool,
+    vram_floor_gb: Option<u32>,
 ) -> Result<(PodRecord, Provisioned), PodError> {
-    let result = provision_run(ctx, target, &run, keep).await;
+    let result = provision_run(ctx, target, &run, keep, vram_floor_gb).await;
     if let Err(error) = &result {
         run.state = RunState::Failed;
         run.message = Some(run_message(error));
@@ -126,6 +129,7 @@ async fn provision_run(
     target: &RunpodTarget,
     run: &RunRecord,
     keep: bool,
+    vram_floor_gb: Option<u32>,
 ) -> Result<(PodRecord, Provisioned), PodError> {
     let ssh_dir = ctx.runs.run_dir(&run.id)?.join(SSH_DIR);
     let keys = PodKeys::generate(&ssh_dir, &alias(&run.id))?;
@@ -138,6 +142,7 @@ async fn provision_run(
         ssh_dir: &ssh_dir,
         workdir: target.workdir(),
         api_url: ctx.client.base_url(),
+        vram_floor_gb,
     };
     let provisioned = provision(ctx, &plan, &mut record).await?;
     Ok((record, provisioned))

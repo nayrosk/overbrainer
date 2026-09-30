@@ -38,14 +38,7 @@ pub async fn run(
     match &args.command {
         None => {
             let settings = source.load(project_dir)?;
-            train(
-                project_dir,
-                &settings,
-                args.target.as_deref(),
-                args.keep_pod,
-                front,
-            )
-            .await
+            train(project_dir, &settings, args, front).await
         },
         Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id, front, source).await,
         Some(TrainCommand::Cancel { run_id }) => {
@@ -74,7 +67,7 @@ pub(crate) async fn after_run(
         no_training();
         return Ok(());
     }
-    train(project_dir, &settings, None, false, front).await
+    train(project_dir, &settings, &TrainArgs::default(), front).await
 }
 
 fn no_training() {
@@ -84,12 +77,12 @@ fn no_training() {
 async fn train(
     project_dir: &Path,
     settings: &Settings,
-    target: Option<&str>,
-    keep_pod: bool,
+    args: &TrainArgs,
     front: &Frontend,
 ) -> anyhow::Result<()> {
+    let keep_pod = args.keep_pod;
     let training = training(settings)?;
-    let name = target.unwrap_or(&training.target);
+    let name = args.target.as_deref().unwrap_or(&training.target);
     let target = settings
         .targets
         .get(name)
@@ -99,6 +92,7 @@ async fn train(
             name,
             spec: &spec,
             keep: keep_pod,
+            vram_floor: args.vram_floor,
         };
         return super::runpod_train::train(project_dir, settings, start, front).await;
     }
@@ -298,6 +292,9 @@ pub(super) fn training(settings: &Settings) -> anyhow::Result<&Training> {
         .context("no [training] section in overbrainer.toml")
 }
 
+/// The job's environment variable holding the Hugging Face token.
+pub(super) const HF_TOKEN: &str = "HF_TOKEN";
+
 /// The Hugging Face token, resolved only now, for the job's environment.
 pub(super) async fn secrets(
     settings: &Settings,
@@ -314,11 +311,22 @@ pub(super) async fn secrets(
         }
         return Ok(Vec::new());
     };
-    let token = super::resolver()
+    let token = hf_token(token).await?;
+    Ok(vec![(HF_TOKEN.to_string(), token)])
+}
+
+/// The Hugging Face token `token` of the settings, resolved only now.
+///
+/// # Errors
+///
+/// Returns an error when it cannot be resolved.
+pub(crate) async fn hf_token(
+    token: &secrecy::SecretString,
+) -> anyhow::Result<secrecy::SecretString> {
+    super::resolver()
         .resolve(token)
         .await
-        .context("cannot resolve hf_token")?;
-    Ok(vec![("HF_TOKEN".to_string(), token)])
+        .context("cannot resolve hf_token")
 }
 
 async fn executor(project_dir: &Path, name: &str, target: &Target) -> anyhow::Result<AnyExecutor> {

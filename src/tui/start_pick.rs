@@ -6,7 +6,7 @@
 //! `u` there undoes it.
 
 use super::app::{App, Effect, Origin, Overlay, Picked, Severity};
-use super::catalog::{CatalogKind, Query};
+use super::catalog::{CatalogKind, FitBy, Query};
 use super::follow::start_dialog;
 use super::project::Writing;
 use super::start::{DATA_CENTER_IDS, GPU_TYPES, RunpodPlan, StartPlan};
@@ -81,10 +81,17 @@ impl App {
                 Choice::from(&spec.data_center_ids),
             )
         };
+        // The dialog's own estimate, once made; else the listing makes one.
+        let fit_by = match (gpus, &runpod.need) {
+            (false, _) => FitBy::Nothing,
+            (true, Some(need)) => FitBy::Known(need.clone()),
+            (true, None) => FitBy::Target(target.clone()),
+        };
         let query = Query {
             kind,
             gpu_count: spec.gpu_count,
             gpu_types: spec.gpu_types.list().to_vec(),
+            fit_by,
         };
         self.open_picker(query, preselected, Origin::Start(target))
     }
@@ -284,7 +291,12 @@ mod tests {
         let [Effect::Spawn(lookup, Task::StartCatalog(1))] = effects.as_slice() else {
             return Err(format!("{effects:?}").into());
         };
-        app.on_done(*lookup, Ok(Done::StartCatalog(Ok(gpu_types()?))));
+        app.on_done(
+            *lookup,
+            Ok(Done::StartCatalog(crate::tui::snapshots::looked_up(Ok(
+                gpu_types()?,
+            )))),
+        );
         Ok((dir, app))
     }
 
@@ -324,6 +336,7 @@ mod tests {
             Ok(Done::Catalog(Ok(Listed {
                 entries,
                 gpus: Vec::new(),
+                note: None,
             }))),
         );
     }
@@ -366,9 +379,12 @@ mod tests {
     }
 
     fn starts(effects: &[Effect]) -> bool {
-        effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Spawn(_, Task::Train(TrainJob::Start))))
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Spawn(_, Task::Train(TrainJob::Start { .. }))
+            )
+        })
     }
 
     fn written(dir: &Path) -> std::io::Result<String> {
@@ -379,7 +395,7 @@ mod tests {
     fn g_and_c_open_untyped_pickers_on_what_the_run_would_use() -> TestResult {
         let (_dir, mut app) = starting(PROJECT_CONFIG)?;
         assert!(
-            dialog(&app).contains("- NVIDIA A40  $0.40/h        48 GB  HIGH"),
+            dialog(&app).contains("- NVIDIA A40  $0.40/h   48 GB  HIGH  ok"),
             "price, VRAM and stock: {}",
             dialog(&app)
         );
@@ -392,6 +408,8 @@ mod tests {
                 kind: CatalogKind::Gpus,
                 gpu_count: 1,
                 gpu_types: vec!["NVIDIA A40".into()],
+                // The dialog's estimate, never asked for again.
+                fit_by: FitBy::Known(Ok(crate::tui::snapshots::need())),
             }
         );
         let Some(Overlay::Picker(picking)) = &app.overlay else {
@@ -421,7 +439,11 @@ mod tests {
              "maxCount": {"secure": 8}, "availability": "HIGH"}
         ]))?;
         let (id, _) = open(&mut app, 'g')?;
-        listed(&mut app, id, crate::tui::catalog::gpu_entries(&gpus, 1));
+        listed(
+            &mut app,
+            id,
+            crate::tui::catalog::gpu_entries(&gpus, 1, None),
+        );
         press(
             &mut app,
             &[KeyCode::End, KeyCode::Char(' '), KeyCode::Enter],
@@ -451,7 +473,7 @@ mod tests {
             "{shown}"
         );
         assert!(
-            shown.contains("- NVIDIA RTX 2000 Ada Generation  $0.24/h        16 GB  HIGH"),
+            shown.contains("- NVIDIA RTX 2000 Ada Generation  $0.24/h   16 GB  HIGH  small"),
             "{shown}"
         );
         let rows = screen(&draw(&mut app, 80, 24)?).join("\n");

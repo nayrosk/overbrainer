@@ -138,6 +138,9 @@ pub(in crate::tui) struct Picker {
     typed: bool,
     /// The order shown, an index into [`Spec::orders`].
     order: usize,
+    /// What the title adds once the entries are read, such as the VRAM a
+    /// run needs.
+    note: Option<String>,
 }
 
 impl Picker {
@@ -168,6 +171,7 @@ impl Picker {
             typing: false,
             typed: true,
             order: 0,
+            note: None,
         }
     }
 
@@ -220,6 +224,11 @@ impl Picker {
             .iter()
             .position(|row| self.is_chosen(*row))
             .unwrap_or(0);
+    }
+
+    /// Sets what the title adds.
+    pub(in crate::tui) fn set_note(&mut self, note: Option<String>) {
+        self.note = note;
     }
 
     /// Whether the entries are still being read.
@@ -381,12 +390,12 @@ impl Picker {
                 let Some(entry) = self.entries().get(index) else {
                     return;
                 };
-                if !entry.selectable {
-                    return;
-                }
                 let id = entry.id.clone();
+                // One that cannot be chosen can still be taken out.
                 if let Some(at) = self.chosen.iter().position(|chosen| *chosen == id) {
                     self.chosen.remove(at);
+                } else if !entry.selectable {
+                    return;
                 } else {
                     self.chosen.push(id);
                     self.auto = false;
@@ -613,12 +622,15 @@ pub(in crate::tui) fn render(
 }
 
 /// The title of `picker`: its name, the order shown when there are several,
-/// and what is chosen in [`Mode::Multi`].
+/// its note, and what is chosen in [`Mode::Multi`].
 fn title(picker: &Picker) -> String {
-    let name = match picker.order_name() {
+    let mut name = match picker.order_name() {
         Some(order) => format!("{} by {order}", picker.spec.title),
         None => picker.spec.title.to_string(),
     };
+    if let Some(note) = &picker.note {
+        name = format!("{name} ({note})");
+    }
     let chosen = picker.chosen.len();
     match (picker.spec.mode, picker.auto) {
         (Mode::Multi, true) => format!(" {name}: {AUTO} "),
@@ -1043,6 +1055,25 @@ mod tests {
         keys(&mut picker, &[KeyCode::Char('o')]);
         assert_eq!(ids(&picker), ["b", "c", "a"]);
         assert_eq!(title(&picker), " GPU types by size: 1 chosen ");
+    }
+
+    #[test]
+    fn the_note_shows_in_the_title() {
+        let mut picker = sortable(Mode::Multi, list(&["b"]));
+        picker.set_note(Some("about 19.1 GB per GPU needed".into()));
+        assert_eq!(
+            title(&picker),
+            " GPU types by name (about 19.1 GB per GPU needed): 1 chosen "
+        );
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_chosen_can_be_taken_out() {
+        let mut picker = picker(Mode::Multi, false, list(&["c"]));
+        keys(&mut picker, &[KeyCode::Char(' ')]);
+        assert_eq!(picker.choice(), list(&[]), "c taken out");
+        keys(&mut picker, &[KeyCode::End, KeyCode::Char(' ')]);
+        assert_eq!(picker.choice(), list(&[]), "c cannot be chosen again");
     }
 
     #[test]

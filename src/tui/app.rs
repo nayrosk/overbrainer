@@ -11,7 +11,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tracing::Level;
 
 use super::auto::Auto;
-use super::catalog::{CatalogKind, Listed, Query};
+use super::catalog::{CatalogKind, FitBy, Listed, Query};
 use super::config_watch::ConfigWatch;
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
 use super::editor::{self, Session, Target};
@@ -20,7 +20,7 @@ use super::motion::{Motion, MotionLevel};
 use super::pipeline::{PipelineView, STAGES, command_name};
 use super::project::{ProjectConfig, ProjectView};
 use super::project_edit::{Removal, SaveRefusal, editor_failure};
-use super::start::{AutoPlan, Gpus, StartPlan};
+use super::start::{AutoPlan, Catalog, StartPlan};
 use super::tasks::{Done, Edit, History, Msg, Saved, Task, TaskId};
 use super::theme::Theme;
 use super::training::TrainingView;
@@ -464,8 +464,9 @@ pub(super) struct App {
     /// The task reading the GPU catalog of the start dialog, if any; an
     /// earlier one's result is ignored.
     pub(super) start_catalog: Option<TaskId>,
-    /// The GPU catalog of the start dialog, while it or its picker is open.
-    pub(super) start_gpus: Option<Gpus>,
+    /// The GPU catalog and the VRAM estimate of the start dialog, while it or
+    /// its picker is open.
+    pub(super) start_gpus: Option<Catalog>,
     /// The plan of the start dialog while its picker is open.
     pub(super) start_held: Option<Box<StartPlan>>,
     /// The run started once the save of its choices ends well.
@@ -842,7 +843,10 @@ impl App {
         }
         if self.start_catalog == Some(id) {
             // The dialog never keeps waiting.
-            self.start_catalog_read(Err(error));
+            self.start_catalog_read(Catalog {
+                gpus: Err(error.clone()),
+                need: Err(error),
+            });
             return Vec::new();
         }
         if self.catalog_reads.iter().any(|(read, _)| *read == id) {
@@ -1016,6 +1020,7 @@ impl App {
             kind: CatalogKind::Gpus,
             gpu_count,
             gpu_types: Vec::new(),
+            fit_by: FitBy::Nothing,
         };
         vec![Effect::Spawn(task, Task::Catalog(query))]
     }
@@ -1031,7 +1036,9 @@ impl App {
         };
         let (_, kind) = self.catalog_reads.remove(at);
         let volumes = kind == CatalogKind::Volumes && self.volume_read == Some(id);
+        let mut note = None;
         let entries = listed.map(|listed| {
+            note = listed.note;
             if !listed.gpus.is_empty() {
                 self.gpu_catalog = Some(listed.gpus);
             }
@@ -1048,6 +1055,7 @@ impl App {
         if let Some(Overlay::Picker(picking)) = &mut self.overlay
             && picking.task == id
         {
+            picking.picker.set_note(note);
             picking.picker.loaded(entries);
         }
         effects
@@ -4483,7 +4491,12 @@ mod tests {
             return Err(format!("{effects:?}"));
         };
         let listed = crate::tui::snapshots::gpu_types().map_err(|error| error.to_string())?;
-        app.on_done(*catalog, Ok(Done::StartCatalog(Ok(listed))));
+        app.on_done(
+            *catalog,
+            Ok(Done::StartCatalog(crate::tui::snapshots::looked_up(Ok(
+                listed,
+            )))),
+        );
         let Some(Overlay::Confirm(confirm)) = &app.overlay else {
             return Err("no dialog".into());
         };
@@ -4491,14 +4504,21 @@ mod tests {
             confirm
                 .text
                 .iter()
-                .any(|line| line.ends_with("$0.40/h        48 GB  HIGH")),
+                .any(|line| line.ends_with("$0.40/h   48 GB  HIGH    ok")),
             "{:?}",
             confirm.text
         );
         let effects = press(&mut app, &[KeyCode::Char('y')]);
-        let [Effect::Spawn(start, Task::Train(TrainJob::Start))] = effects.as_slice() else {
+        let [Effect::Spawn(start, Task::Train(TrainJob::Start { vram_floor }))] =
+            effects.as_slice()
+        else {
             return Err(format!("{effects:?}"));
         };
+        // The run uses the estimate the dialog showed, never another one.
+        assert_eq!(
+            *vram_floor,
+            crate::train::sizing::VramFloor::Known(Some(21))
+        );
         assert_eq!(app.lock().as_deref(), Some("a new run is starting"));
         for code in ['t', 'r'] {
             assert_eq!(press(&mut app, &[KeyCode::Char(code)]), []);
@@ -4698,7 +4718,12 @@ mod tests {
             return Err(format!("{first:?} {second:?}"));
         };
         let listed = crate::tui::snapshots::gpu_types().map_err(|error| error.to_string())?;
-        app.on_done(*old, Ok(Done::StartCatalog(Ok(listed))));
+        app.on_done(
+            *old,
+            Ok(Done::StartCatalog(crate::tui::snapshots::looked_up(Ok(
+                listed,
+            )))),
+        );
         assert!(dialog(&app).contains("looking up the catalog..."), "stale");
         app.on_done(*new, Err("a background task failed: cancelled".into()));
         assert!(!dialog(&app).contains("looking up"), "{}", dialog(&app));
@@ -4745,7 +4770,7 @@ mod tests {
         assert!(
             !effects
                 .iter()
-                .any(|e| matches!(e, Effect::Spawn(_, Task::Train(TrainJob::Start)))),
+                .any(|e| matches!(e, Effect::Spawn(_, Task::Train(TrainJob::Start { .. })))),
             "{effects:?}"
         );
         assert_eq!(app.leaving, Some(Exit::Quit), "y quits");
@@ -4792,7 +4817,12 @@ mod tests {
             press(&mut app, &[code]);
             assert_eq!(app.start_catalog, None, "{code:?}");
             assert!(!app.work().contains(&"preparing a run".to_string()));
-            app.on_done(*lookup, Ok(Done::StartCatalog(Ok(Vec::new()))));
+            app.on_done(
+                *lookup,
+                Ok(Done::StartCatalog(crate::tui::snapshots::looked_up(Ok(
+                    Vec::new(),
+                )))),
+            );
         }
         let mut app = app();
         app.prepared(Ok(crate::tui::snapshots::runpod_plan()));
@@ -4966,6 +4996,7 @@ mod tests {
             kind: CatalogKind::Gpus,
             gpu_count: 2,
             gpu_types: Vec::new(),
+            fit_by: FitBy::Nothing,
         };
         let effects = app.open_picker(query.clone(), chosen, Origin::Field(gpu_cloud("gpu_types")));
         let [Effect::Spawn(id, Task::Catalog(asked))] = effects.as_slice() else {
@@ -4981,6 +5012,7 @@ mod tests {
         Ok(Listed {
             entries: crate::tui::snapshots::gpu_catalog(2)?,
             gpus: crate::tui::snapshots::gpu_types()?,
+            note: None,
         })
     }
 
@@ -5119,6 +5151,7 @@ mod tests {
             kind: CatalogKind::Volumes,
             gpu_count: 1,
             gpu_types: Vec::new(),
+            fit_by: FitBy::Nothing,
         };
         let origin = Origin::Field(crate::config::edit::FieldPath::Target {
             name: "gpu_cloud".into(),
@@ -5140,6 +5173,7 @@ mod tests {
                 data_center: center.into(),
             }]),
             gpus: Vec::new(),
+            note: None,
         };
         app.on_done(newer, Ok(Done::Catalog(Ok(volumes("EU-RO-1")))));
         app.on_done(older, Ok(Done::Catalog(Ok(volumes("US-KS-2")))));

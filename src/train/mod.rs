@@ -2,6 +2,7 @@
 
 mod axolotl;
 mod metrics;
+pub mod sizing;
 mod yaml;
 
 use std::path::{Path, PathBuf};

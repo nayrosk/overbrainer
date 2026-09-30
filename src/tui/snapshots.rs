@@ -464,11 +464,40 @@ pub(super) fn series() -> Vec<crate::train::TrainMetric> {
         .collect()
 }
 
-/// The fixture GPU catalog as the GPU picker lists it for `gpu_count` GPUs.
+/// The fixture GPU catalog as the GPU picker lists it for `gpu_count` GPUs,
+/// the fit of each unknown.
 pub(super) fn gpu_catalog(
     gpu_count: u32,
 ) -> Result<Vec<super::widgets::picker::Entry>, serde_json::Error> {
-    Ok(super::catalog::gpu_entries(&gpu_types()?, gpu_count))
+    Ok(super::catalog::gpu_entries(&gpu_types()?, gpu_count, None))
+}
+
+/// What the fixture run needs per GPU: Qwen3-4B with `LoRA`, about 19.1 GB.
+pub(super) fn need() -> crate::train::sizing::Estimate {
+    use crate::train::sizing::{ModelShape, Recipe, estimate};
+    let shape = ModelShape {
+        params: 4_022_468_096,
+        hidden_size: 2560,
+        layers: 36,
+        vocab_size: 151_936,
+    };
+    let recipe = Recipe {
+        adapter: crate::config::Adapter::Lora,
+        sequence_len: 4096,
+        micro_batch_size: 2,
+        lora_r: 16,
+        eight_bit_optimizer: false,
+        gradient_checkpointing: true,
+    };
+    estimate(&shape, &recipe)
+}
+
+/// The start dialog's lookup of `gpus`, the run needing [`need`].
+pub(super) fn looked_up(gpus: super::start::Gpus) -> super::start::Catalog {
+    super::start::Catalog {
+        gpus,
+        need: Ok(need()),
+    }
 }
 
 /// The fixture GPU catalog as listed.
@@ -501,7 +530,18 @@ fn listed(entries: Vec<super::widgets::picker::Entry>) -> super::catalog::Listed
     super::catalog::Listed {
         entries,
         gpus: Vec::new(),
+        note: None,
     }
+}
+
+/// The fixture GPU catalog as the GPU picker reads it for `gpu_count` GPUs,
+/// the run needing [`need`].
+fn gpu_listing(gpu_count: u32) -> Result<super::catalog::Listed, serde_json::Error> {
+    let entries = super::catalog::gpu_entries(&gpu_types()?, gpu_count, Some(&need()));
+    Ok(super::catalog::Listed {
+        note: Some(format!("{} per GPU needed", need())),
+        ..listed(entries)
+    })
 }
 
 /// A key press.
@@ -1009,6 +1049,7 @@ fn picker_app(
         kind,
         gpu_count: 2,
         gpu_types: Vec::new(),
+        fit_by: super::catalog::FitBy::Nothing,
     };
     let origin = super::app::Origin::Field(crate::config::edit::FieldPath::Target {
         name: "gpu_cloud".into(),
@@ -1034,7 +1075,7 @@ fn the_gpu_picker_on_a_fixture_catalog() -> TestResult {
             .any(|row| row.contains("reading the Runpod catalog")),
         "{rows:#?}"
     );
-    app.on_done(id, Ok(Done::Catalog(Ok(listed(gpu_catalog(2)?)))));
+    app.on_done(id, Ok(Done::Catalog(Ok(gpu_listing(2)?))));
     app.on_input(&key(KeyCode::Down));
     app.on_input(&key(KeyCode::Down));
     snapshot("picker_gpus", &mut app)?;
@@ -1045,7 +1086,7 @@ fn the_gpu_picker_on_a_fixture_catalog() -> TestResult {
 #[test]
 fn the_gpu_picker_sorted_by_vram() -> TestResult {
     let (mut app, id) = picker_app(super::catalog::CatalogKind::Gpus, &["NVIDIA A40"])?;
-    app.on_done(id, Ok(Done::Catalog(Ok(listed(gpu_catalog(2)?)))));
+    app.on_done(id, Ok(Done::Catalog(Ok(gpu_listing(2)?))));
     app.on_input(&key(KeyCode::Char('o')));
     snapshot_at("picker_gpus_by_vram_80x24", &mut app, 80, 24)?;
     Ok(())
@@ -1054,7 +1095,7 @@ fn the_gpu_picker_sorted_by_vram() -> TestResult {
 #[test]
 fn a_picker_filtered_while_typed() -> TestResult {
     let (mut app, id) = picker_app(super::catalog::CatalogKind::Gpus, &[])?;
-    app.on_done(id, Ok(Done::Catalog(Ok(listed(gpu_catalog(2)?)))));
+    app.on_done(id, Ok(Done::Catalog(Ok(gpu_listing(2)?))));
     for c in "/h1".chars() {
         app.on_input(&key(KeyCode::Char(c)));
     }
@@ -1359,7 +1400,7 @@ fn the_start_dialog_of_a_runpod_run_before_and_with_its_prices() -> TestResult {
     snapshot("start_runpod_looking_up", &mut app)?;
     let mut gpus = gpu_types()?;
     gpus.retain(|gpu| gpu.id != "NVIDIA A40");
-    app.start_catalog_read(Ok(gpus));
+    app.start_catalog_read(looked_up(Ok(gpus)));
     snapshot("start_runpod", &mut app)?;
     Ok(())
 }
@@ -1428,7 +1469,7 @@ fn a_changed_start_keeps_what_it_saves_and_its_cost() -> TestResult {
         .map(|n| format!("warning number {n} about this run"))
         .collect();
     app.prepared(Ok(plan));
-    app.start_catalog_read(Ok(gpu_types()?));
+    app.start_catalog_read(looked_up(Ok(gpu_types()?)));
     snapshot("start_runpod_changed", &mut app)?;
     // More warnings than fit: the changed line would be cut, it is kept.
     let many = (5..=11).map(|n| format!("warning     warning number {n} about this run"));
@@ -1467,9 +1508,9 @@ fn a_tall_dialog_keeps_its_keys_and_its_cost_at_80x24() -> TestResult {
         .iter()
         .map(|gpu| serde_json::json!({"id": gpu, "memory": 48, "price": {"secure": 0.5}}))
         .collect();
-    app.start_catalog_read(Ok(serde_json::from_value(serde_json::Value::Array(
-        listed,
-    ))?));
+    app.start_catalog_read(looked_up(Ok(serde_json::from_value(
+        serde_json::Value::Array(listed),
+    )?)));
     let rows = text(&draw(&mut app, 80, 24)?).join("\n");
     for shown in [
         "warning     warning number 1 about this run",

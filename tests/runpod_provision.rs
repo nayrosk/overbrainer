@@ -214,6 +214,7 @@ impl Harness {
             ssh_dir: &self.ssh_dir,
             workdir: "/workspace/overbrainer",
             api_url: self.client.base_url(),
+            vram_floor_gb: None,
         };
         let result = provision(&self.ctx(), &plan, &mut record).await.map(drop);
         assert_eq!(PodRecord::load(&self.runs, RUN)?.as_ref(), Some(&record));
@@ -1064,6 +1065,7 @@ async fn a_pod_is_still_deleted_when_pod_json_cannot_be_saved() -> TestResult {
         ssh_dir: &harness.ssh_dir,
         workdir: "/workspace/overbrainer",
         api_url: harness.client.base_url(),
+        vram_floor_gb: None,
     };
     let result = provision(&harness.ctx(), &plan, &mut record).await;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -1190,7 +1192,7 @@ async fn nothing_in_stock_fails_before_any_create_call() -> TestResult {
         return Err(format!("expected NotInStock, got {result:?}").into());
     };
     assert_eq!(
-        message,
+        message.to_string(),
         "no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" (gpu_count = 1, min_vram_gb = 40)"
     );
     assert!(harness.calls("POST").await.is_empty());

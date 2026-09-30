@@ -7,7 +7,7 @@ use crossterm::event::KeyCode;
 
 use super::app::{Action, App, Confirm, Effect, Overlay, Severity, View};
 use super::pipeline::command_name;
-use super::start::{self, AutoPlan, Gpus};
+use super::start::{self, AutoPlan, Catalog};
 use super::tasks::{Task, TaskId, TrainJob};
 use crate::cli::data::Command;
 use crate::config::CONFIG_FILE;
@@ -133,7 +133,7 @@ impl Auto {
 
 /// The confirmation text of `plan`: the stages, then the run's, as `t`
 /// shows it, with the GPU types of the catalog once looked up.
-pub(super) fn text(plan: &AutoPlan, gpus: Option<&Gpus>) -> Vec<String> {
+pub(super) fn text(plan: &AutoPlan, gpus: Option<&Catalog>) -> Vec<String> {
     let mut text = vec![
         "stages      subtopics, questions, answers, split: each starts once the one before \
          ended without failed items; what is done is skipped"
@@ -152,7 +152,7 @@ pub(super) fn text(plan: &AutoPlan, gpus: Option<&Gpus>) -> Vec<String> {
 }
 
 /// The dialog asking to run `plan`.
-pub(super) fn dialog(plan: Box<AutoPlan>, gpus: Option<&Gpus>) -> Confirm {
+pub(super) fn dialog(plan: Box<AutoPlan>, gpus: Option<&Catalog>) -> Confirm {
     Confirm {
         title: " Run auto mode? ".to_string(),
         text: text(&plan, gpus),
@@ -272,7 +272,7 @@ impl App {
             (None, Some((run, _))) => self.start_run(&run),
         };
         let task = effects.iter().find_map(|effect| match effect {
-            Effect::Spawn(id, Task::Train(TrainJob::Start) | Task::Pipeline(_)) => Some(*id),
+            Effect::Spawn(id, Task::Train(TrainJob::Start { .. }) | Task::Pipeline(_)) => Some(*id),
             _ => None,
         });
         let Some(task) = task else {
@@ -491,7 +491,7 @@ mod tests {
             id = next_id;
         }
         let spawned = end(&mut app, id, Ok(()));
-        let [(train, Task::Train(TrainJob::Start))] = spawned[..] else {
+        let [(train, Task::Train(TrainJob::Start { .. }))] = spawned[..] else {
             return Err(format!("{spawned:?}").into());
         };
         assert_eq!(
@@ -647,7 +647,9 @@ mod tests {
         };
         app.on_done(
             catalog,
-            Ok(Done::StartCatalog(Ok(crate::tui::snapshots::gpu_types()?))),
+            Ok(Done::StartCatalog(crate::tui::snapshots::looked_up(Ok(
+                crate::tui::snapshots::gpu_types()?,
+            )))),
         );
         crate::tui::snapshots::snapshot("auto_dialog", &mut app)?;
         Ok(())

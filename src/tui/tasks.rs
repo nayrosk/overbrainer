@@ -20,7 +20,7 @@ use super::cost::history_cost;
 use super::editor::Edited;
 use super::project::ProjectConfig;
 use super::project_edit::{SaveRefusal, save_config};
-use super::start::{AutoPlan, Gpus, StartPlan, list_gpus, prepare, prepare_auto};
+use super::start::{AutoPlan, Catalog, StartPlan, look_up, prepare, prepare_auto};
 use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::{Command, Load};
 use crate::cli::front::{Frontend, Report};
@@ -32,6 +32,7 @@ use crate::history::{self, Cost, Entry, Total};
 use crate::pipeline::{Ctx, SplitReport};
 use crate::prompts::Prompts;
 use crate::train::TrainMetric;
+use crate::train::sizing::VramFloor;
 
 /// Events kept for a TUI task's forwarder when it falls behind. `watch` publishes
 /// every line of one tail read at once, at most 1 MiB, and a metrics line is at
@@ -68,7 +69,7 @@ pub(super) enum Task {
     /// What auto mode run now would do after split.
     PrepareAuto,
     /// The Runpod GPU catalog for this many GPUs per pod, for the start
-    /// dialog: list prices, VRAM and stock.
+    /// dialog (list prices, VRAM and stock), and the VRAM the run needs.
     StartCatalog(u32),
     /// What a picker lists, or the GPU types a field hint needs.
     Catalog(Query),
@@ -96,8 +97,13 @@ pub(super) enum Task {
 /// A training flow, run exactly as `overbrainer train` runs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TrainJob {
-    /// `train`, on `training.target`, without `--keep-pod`.
-    Start,
+    /// `train`, on `training.target`, without `--keep-pod`, with the VRAM
+    /// floor the start confirmation estimated, if it did (see
+    /// [`TrainArgs::vram_floor`]).
+    Start {
+        /// The floor, when the confirmation estimated it.
+        vram_floor: VramFloor,
+    },
     /// `train attach <run-id>`.
     Attach(String),
     /// `train cancel <run-id>`.
@@ -108,7 +114,12 @@ impl TrainJob {
     /// The arguments `overbrainer train` would get.
     fn args(&self) -> TrainArgs {
         let command = match self {
-            Self::Start => return TrainArgs::default(),
+            Self::Start { vram_floor } => {
+                return TrainArgs {
+                    vram_floor: *vram_floor,
+                    ..TrainArgs::default()
+                };
+            },
             Self::Attach(run_id) => TrainCommand::Attach {
                 run_id: run_id.clone(),
             },
@@ -197,8 +208,9 @@ pub(super) enum Done {
     Prepared(Result<StartPlan, String>),
     /// What auto mode would do after split, or why it cannot run.
     PreparedAuto(Result<AutoPlan, String>),
-    /// The GPU catalog of the start dialog, or why it cannot be read.
-    StartCatalog(Gpus),
+    /// The GPU catalog of the start dialog and the VRAM the run needs, or
+    /// why they cannot be read.
+    StartCatalog(Catalog),
     /// A picker's entries, or why they cannot be read.
     Catalog(Result<Listed, String>),
     /// The configuration written to `overbrainer.toml`, or why nothing was.
@@ -552,7 +564,7 @@ impl Tasks {
                 let dir = self.project_dir.clone();
                 let source = self.source.clone();
                 self.spawn_lookup(id, async move {
-                    Done::StartCatalog(list_gpus(&dir, source, gpu_count).await)
+                    Done::StartCatalog(look_up(&dir, source, gpu_count).await)
                 })
             },
             Task::Catalog(query) => {
@@ -1194,7 +1206,12 @@ exit 0
         let dir = local_project()?;
         let (messages, mut inbox) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = Tasks::new(dir.path(), messages);
-        tasks.spawn(TaskId(1), Task::Train(TrainJob::Start));
+        tasks.spawn(
+            TaskId(1),
+            Task::Train(TrainJob::Start {
+                vram_floor: VramFloor::ToEstimate,
+            }),
+        );
         let mut created = None;
         loop {
             match next_message(&mut inbox).await? {
