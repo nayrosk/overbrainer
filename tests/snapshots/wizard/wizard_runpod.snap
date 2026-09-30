@@ -69,6 +69,7 @@ adapter = "lora"              # lora | qlora | full
 kind = "runpod"              # needs OVERBRAINER_RUNPOD__API_KEY; Secure Cloud only
 gpu_types = "auto"           # "auto": the cheapest in stock at start; or a list, tried in order
 max_hours = 6                # the pod watchdog deletes the pod after this, whatever it is doing
+# max_cost_usd = 20           # stop with a snapshot at 95% of this spend in USD, delete at 100%
 # min_vram_gb = 48             # gpu_types = "auto" only: least VRAM per GPU
 # max_price_per_hour = 1.0     # gpu_types = "auto" only: highest list price of one GPU, USD
 # gpu_count = 1

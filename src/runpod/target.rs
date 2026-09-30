@@ -37,6 +37,9 @@ pub struct RunpodTarget {
     pub container_disk_gb: u32,
     /// Hours after which the watchdog deletes the pod.
     pub max_hours: f64,
+    /// Most a run may spend on its pod, in USD: a snapshot at 95%, the pod
+    /// deleted at 100%.
+    pub max_cost_usd: Option<f64>,
     /// How long the watchdog waits for a job to start.
     pub boot_grace: Duration,
     /// How long the watchdog keeps a pod whose ended job was not retrieved.
@@ -61,6 +64,7 @@ impl RunpodTarget {
             venv,
             container_disk_gb,
             max_hours,
+            max_cost_usd,
             boot_grace_minutes,
             retrieve_grace_minutes,
             data_center_ids,
@@ -82,6 +86,7 @@ impl RunpodTarget {
                 .unwrap_or_else(|| DEFAULT_RUNPOD_VENV.to_string()),
             container_disk_gb: *container_disk_gb,
             max_hours: *max_hours,
+            max_cost_usd: *max_cost_usd,
             boot_grace: Duration::from_secs(u64::from(*boot_grace_minutes) * 60),
             retrieve_grace: Duration::from_secs(u64::from(*retrieve_grace_minutes) * 60),
             data_center_ids: data_center_ids.clone(),
@@ -124,6 +129,7 @@ mod tests {
             venv: None,
             container_disk_gb: 50,
             max_hours: 6.0,
+            max_cost_usd: None,
             boot_grace_minutes: 30,
             retrieve_grace_minutes: 60,
             data_center_ids: ListOrAuto::List(vec!["EU-RO-1".into()]),

@@ -149,6 +149,7 @@ fn runpod_summary(target: &Target) -> String {
         venv,
         container_disk_gb,
         max_hours,
+        max_cost_usd,
         boot_grace_minutes,
         retrieve_grace_minutes,
         data_center_ids,
@@ -174,8 +175,9 @@ fn runpod_summary(target: &Target) -> String {
     } else {
         format!(" ({})", limits.join(", "))
     };
+    let cost = max_cost_usd.map_or_else(String::new, |usd| format!(", max ${usd}"));
     format!(
-        "runpod {gpu_count}x [{gpu_types}]{limits}, max {max_hours}h, image {}, venv {}, disk {container_disk_gb} GB, \
+        "runpod {gpu_count}x [{gpu_types}]{limits}, max {max_hours}h{cost}, image {}, venv {}, disk {container_disk_gb} GB, \
          boot grace {boot_grace_minutes} min, retrieve grace {retrieve_grace_minutes} min, \
          data centers {data_centers}, network volume {}",
         image.as_deref().unwrap_or(DEFAULT_RUNPOD_IMAGE),

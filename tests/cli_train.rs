@@ -432,7 +432,10 @@ fn stop_saves_a_snapshot_retrieves_it_and_skips_the_merge() -> TestResult {
         .find(|path| path.join("run.json").is_file() && *path != run)
         .ok_or("no resumed run")?;
     let record = fs::read_to_string(resumed.join("run.json"))?;
-    assert!(record.contains(&format!("\"resumed_from\": \"{id}\"")), "{record}");
+    assert!(
+        record.contains(&format!("\"resumed_from\": \"{id}\"")),
+        "{record}"
+    );
     assert!(record.contains("\"state\": \"succeeded\""), "{record}");
     assert!(resumed.join("resume/checkpoint-1/optimizer.pt").is_file());
     let yaml = fs::read_to_string(resumed.join("axolotl.yaml"))?;

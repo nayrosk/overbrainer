@@ -374,6 +374,7 @@ fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) 
         venv,
         container_disk_gb,
         max_hours,
+        max_cost_usd,
         boot_grace_minutes,
         retrieve_grace_minutes,
         data_center_ids,
@@ -408,6 +409,11 @@ fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) 
     if !(max_hours.is_finite() && *max_hours > 0.0 && *max_hours <= MAX_RUNPOD_HOURS) {
         problems.push(format!(
             "targets.{name}.max_hours: must be greater than 0 and at most {MAX_RUNPOD_HOURS}"
+        ));
+    }
+    if max_cost_usd.is_some_and(|usd| !(usd.is_finite() && usd > 0.0)) {
+        problems.push(format!(
+            "targets.{name}.max_cost_usd: must be greater than 0"
         ));
     }
     check_target_image(name, image.as_deref(), problems);
@@ -984,6 +990,28 @@ mod tests {
             assert_eq!(
                 check(&settings(&toml)?),
                 vec!["targets.cloud.max_price_per_hour: must be greater than 0".to_string()],
+                "{value}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_cost_cap_is_greater_than_0() -> Result<(), config::ConfigError> {
+        let toml = with_runpod("max_cost_usd = 12.5");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        assert!(matches!(
+            settings(&toml)?.targets.get("cloud"),
+            Some(Target::Runpod {
+                max_cost_usd: Some(12.5),
+                ..
+            })
+        ));
+        for value in ["0", "-1.0", "nan", "inf"] {
+            let toml = with_runpod(&format!("max_cost_usd = {value}"));
+            assert_eq!(
+                check(&settings(&toml)?),
+                vec!["targets.cloud.max_cost_usd: must be greater than 0".to_string()],
                 "{value}"
             );
         }

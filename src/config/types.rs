@@ -425,6 +425,12 @@ pub enum Target {
         /// `--keep-pod`.
         #[serde(deserialize_with = "number")]
         max_hours: f64,
+        /// Most a run may spend on its pod, in USD, at the pod's hourly rate: at
+        /// 95% the job is stopped with a snapshot, at 100% the watchdog deletes the
+        /// pod. Greater than 0. None by default. Not applied to a pod kept with
+        /// `--keep-pod`.
+        #[serde(default, deserialize_with = "optional_number")]
+        max_cost_usd: Option<f64>,
         /// Minutes the watchdog waits for a job to start before deleting the pod.
         /// Must be at least 5.
         #[serde(default = "default_boot_grace_minutes", deserialize_with = "number")]
