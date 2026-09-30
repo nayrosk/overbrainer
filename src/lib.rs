@@ -19,6 +19,7 @@ pub mod retry;
 pub mod runpod;
 pub mod runs;
 pub mod secrets;
+pub mod system;
 pub mod train;
 pub mod tui;
 pub mod update;
