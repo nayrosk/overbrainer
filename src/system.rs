@@ -98,6 +98,10 @@ pub(crate) struct CpuTimes {
     /// Whether they come from the cgroup (`cpu.stat` and the uptime) rather than
     /// `/proc/stat`: counters from different sources are never compared.
     cgroup: bool,
+    /// The CPUs `total` counts for a cgroup, which the uptime is multiplied
+    /// by; `None` for `/proc/stat`, whose jiffies count every CPU already.
+    /// Counters taken with another capacity are never compared.
+    cpus: Option<f64>,
 }
 
 /// The memory of the target, or the limit of its container when that is
@@ -351,17 +355,20 @@ fn cpu<'a>(part: &impl Fn(&str) -> &'a [&'a str], before: Option<CpuTimes>) -> O
         let period: f64 = fields.next()?.parse().ok()?;
         (period > 0.0).then_some(quota / period)
     });
-    let cpus = quota.or(nproc);
+    // A capacity of no CPU at all (or not a number) is no capacity.
+    let valid = |cpus: &f64| cpus.is_finite() && *cpus > 0.0;
+    let cpus = quota.filter(valid).or(nproc.filter(valid));
     let container = !part("cpu.max").is_empty();
     let times = cgroup_times(part, cpus).or_else(|| proc_times(part("stat")));
     if load1.is_none() && cpus.is_none() && times.is_none() {
         return None;
     }
     let usage = match (before, times) {
-        (Some(before), Some(now)) if before.cgroup == now.cgroup => {
+        (Some(before), Some(now)) if before.cgroup == now.cgroup && before.cpus == now.cpus => {
             let total = now.total - before.total;
             let busy = now.busy - before.busy;
-            // Counters that went back (a reboot, a new container) say nothing.
+            // Counters that went back (a reboot, a new container) or no time
+            // elapsed (the same uptime twice) say nothing.
             (total > 0.0 && busy >= 0.0).then(|| (busy / total).clamp(0.0, 1.0))
         },
         _ => None,
@@ -386,10 +393,12 @@ fn cgroup_times<'a>(part: &impl Fn(&str) -> &'a [&'a str], cpus: Option<f64>) ->
         .parse()
         .ok()?;
     let uptime: f64 = first_number(part("uptime"))?;
+    let cpus = cpus?;
     Some(CpuTimes {
         busy: usage / 1e6,
-        total: uptime * cpus?,
+        total: uptime * cpus,
         cgroup: true,
+        cpus: Some(cpus),
     })
 }
 
@@ -410,6 +419,7 @@ fn proc_times(lines: &[&str]) -> Option<CpuTimes> {
         busy: total - idle,
         total,
         cgroup: false,
+        cpus: None,
     })
 }
 
@@ -657,6 +667,52 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
         let output = POD.replace("800000 100000", "max 100000");
         let cpu = parse(&output, at(0), None).cpu.ok_or("no cpu")?;
         assert_eq!((cpu.cpus, cpu.container), (Some(128.0), true));
+        Ok(())
+    }
+
+    #[test]
+    fn a_capacity_that_changed_gives_no_usage() -> Result<(), String> {
+        let first = parse(POD, at(0), None);
+        // The quota went from 8 to 16 CPUs while 40 more CPU seconds ran.
+        let later = POD
+            .replace("800000 100000", "1600000 100000")
+            .replace("usage_usec 200000000", "usage_usec 240000000")
+            .replace("100.00 1500.00", "110.00 1500.00");
+        let second = parse(&later, at(10), Some(&first));
+        let cpu = second.cpu.as_ref().ok_or("no cpu")?;
+        assert_eq!((cpu.cpus, cpu.usage), (Some(16.0), None));
+        // The sample after that one compares like with like again.
+        let third = parse(
+            &later
+                .replace("usage_usec 240000000", "usage_usec 260000000")
+                .replace("110.00 1500.00", "120.00 1500.00"),
+            at(20),
+            Some(&second),
+        );
+        // 20 CPU seconds over 10 seconds of 16 CPUs.
+        let usage = third.cpu.and_then(|cpu| cpu.usage).ok_or("no usage")?;
+        assert!((usage - 0.125).abs() < 1e-9, "{usage}");
+        Ok(())
+    }
+
+    #[test]
+    fn no_elapsed_time_or_no_cpu_gives_no_usage() -> Result<(), String> {
+        let first = parse(POD, at(0), None);
+        // The same uptime twice: nothing elapsed.
+        let same = POD.replace("usage_usec 200000000", "usage_usec 210000000");
+        let second = parse(&same, at(10), Some(&first));
+        assert_eq!(second.cpu.ok_or("no cpu")?.usage, None);
+        // A quota of zero CPUs, or `nproc` saying none, is no capacity at all.
+        for zero in [
+            POD.replace("800000 100000", "0 100000")
+                .replace("@nproc\n128", "@nproc\n0"),
+            POD.replace("800000 100000", "max 100000")
+                .replace("@nproc\n128", "@nproc\n0"),
+        ] {
+            let cpu = parse(&zero, at(0), None).cpu.ok_or("no cpu")?;
+            assert_eq!(cpu.cpus, None, "{zero}");
+            assert_eq!(cpu.times.map(|times| times.cgroup), Some(false), "{zero}");
+        }
         Ok(())
     }
 
