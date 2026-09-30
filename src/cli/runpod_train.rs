@@ -28,7 +28,7 @@ use crate::runpod::{
     ssh_command, start_pod, watch_leased, with_pod_logs,
 };
 use crate::runs::{
-    Launch, Outcome, RunCtx, RunRecord, RunState, Runs, STOP_TIMEOUT, SnapshotReason,
+    Launch, Outcome, RunCtx, RunRecord, RunState, Runs, STOP_LIMITS, SnapshotReason,
     artifacts_missing, cancel as cancel_job, collect, create, request_snapshot, reserve, start,
     watch, with_stop_fallback,
 };
@@ -212,7 +212,7 @@ struct Job<'a> {
     /// See [`vram_floor`]; used only to start a pod.
     vram_floor_gb: Option<u32>,
     /// Whether a snapshot was asked of it: following it then cancels a job
-    /// that gives none within [`STOP_TIMEOUT`].
+    /// that gives none within [`STOP_LIMITS`].
     stopping: bool,
 }
 
@@ -328,7 +328,7 @@ impl Job<'_> {
         let leased = Box::pin(watch_leased(&run_ctx, self.trainer, record, pod));
         let watch = async move {
             match job {
-                Some(job) => with_stop_fallback(executor, &job, STOP_TIMEOUT, leased).await,
+                Some(job) => with_stop_fallback(executor, &job, STOP_LIMITS, leased).await,
                 None => leased.await,
             }
         };

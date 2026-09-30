@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{RunError, RunRecord, RunState};
 use crate::exec::{ExecError, Executor, JobId, JobStatus};
-use crate::train::{SNAPSHOT_FILE, SNAPSHOT_REQUEST};
+use crate::train::{OUTPUT_DIR, SNAPSHOT_FILE, SNAPSHOT_REQUEST};
 
 /// How long a stop waits for the snapshot before it cancels the job instead:
 /// a job that neither wrote its proof nor ended by then will not.
@@ -96,8 +96,8 @@ pub enum Proof {
 }
 
 /// Reads the proof `content` of a `snapshot.json`; empty content is no proof.
-/// The checkpoint must be a relative path of plain names (letters, digits, `.`,
-/// `_`, `-`), never `.` or `..`: it names local directories later.
+/// The checkpoint must be exactly `output/checkpoint-<step>` for its step: it
+/// names local directories later.
 #[must_use]
 pub fn parse_proof(content: &[u8]) -> Proof {
     if content.iter().all(u8::is_ascii_whitespace) {
@@ -113,7 +113,7 @@ pub fn parse_proof(content: &[u8]) -> Proof {
             ));
         },
     };
-    if !valid_checkpoint(&written.checkpoint) {
+    if written.checkpoint != expected_checkpoint(written.step) {
         return Proof::Invalid(format!("{SNAPSHOT_FILE} names an invalid checkpoint path"));
     }
     Proof::Saved(Snapshot {
@@ -123,17 +123,10 @@ pub fn parse_proof(content: &[u8]) -> Proof {
     })
 }
 
-/// Whether `path` is relative and made of plain names only.
-fn valid_checkpoint(path: &str) -> bool {
-    !path.is_empty()
-        && path.split('/').all(|part| {
-            !part.is_empty()
-                && part != "."
-                && part != ".."
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        })
+/// The only checkpoint a proof may name for a snapshot at `step`: where the
+/// trainer saves it, `output/checkpoint-<step>`.
+fn expected_checkpoint(step: u64) -> String {
+    format!("{OUTPUT_DIR}/checkpoint-{step}")
 }
 
 /// Reads the proof the job of the run in `remote_dir` left on the target.
@@ -176,49 +169,92 @@ pub async fn request_snapshot<E: Executor>(
     Ok(())
 }
 
+/// How long a stop waits before it cancels the job instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopLimits {
+    /// For the proof, from the request: a job that neither wrote it nor ended
+    /// by then will not.
+    pub proof: Duration,
+    /// For the job to end once its proof is there: its checkpoint is saved,
+    /// what is left is the final save of the model.
+    pub end: Duration,
+}
+
+/// The limits of `train stop`: [`STOP_TIMEOUT`] for the proof, then 10 more
+/// minutes for the job to end.
+pub const STOP_LIMITS: StopLimits = StopLimits {
+    proof: STOP_TIMEOUT,
+    end: Duration::from_secs(10 * 60),
+};
+
 /// Runs `flow`, which follows the job `job` after its snapshot was asked for,
 /// and returns what it returns. Beside it runs what a stop does when its
-/// snapshot does not come: after `timeout`, a job still running without having
-/// written its proof is cancelled, so `flow` sees it end cancelled.
+/// snapshot does not come: after `limits.proof`, a job still running without
+/// having written its proof is cancelled; one that wrote it but still runs
+/// `limits.end` later is cancelled too (its checkpoint is saved). `flow` then
+/// sees it end cancelled.
 pub async fn with_stop_fallback<E: Executor, F: Future>(
     executor: &E,
     job: &JobId,
-    timeout: Duration,
+    limits: StopLimits,
     flow: F,
 ) -> F::Output {
     let mut flow = std::pin::pin!(flow);
     tokio::select! {
-        output = &mut flow => output,
-        () = tokio::time::sleep(timeout) => {
-            late_stop(executor, job, timeout).await;
-            flow.await
-        },
+        output = &mut flow => return output,
+        () = tokio::time::sleep(limits.proof) => {},
     }
+    if late_check(executor, job, limits.proof).await {
+        tokio::select! {
+            output = &mut flow => return output,
+            () = tokio::time::sleep(limits.end) => {},
+        }
+        late_stop(executor, job).await;
+    }
+    flow.await
 }
 
-/// Cancels `job` when it is still running without a proof `waited` after the
-/// request, and says so; a failure is only logged.
-async fn late_stop<E: Executor>(executor: &E, job: &JobId, waited: Duration) {
-    let note = match cancel_unproven(executor, job).await {
-        Ok(true) => format!(
+/// Where a stop stands once `waited` passed: a job still running without a
+/// proof is cancelled, and said so; returns whether it wrote its proof and
+/// still runs, so it gets more time to end. A failure is only logged.
+async fn late_check<E: Executor>(executor: &E, job: &JobId, waited: Duration) -> bool {
+    let checked = async {
+        let proven = read_proof(executor, &job.dir).await? != Proof::None;
+        let running = executor.status(job).await? == JobStatus::Running;
+        if running && !proven {
+            executor.cancel(job).await?;
+        }
+        Ok::<_, ExecError>((proven, running))
+    };
+    let note = match checked.await {
+        Ok((true, running)) => return running,
+        Ok((false, false)) => return false,
+        Ok((false, true)) => format!(
             "no snapshot {} min after it was asked for: the job was cancelled",
             waited.as_secs() / 60
         ),
-        Ok(false) => return,
         Err(error) => format!("cannot cancel a job that gave no snapshot: {error}"),
     };
     tracing::warn!("{note}");
+    false
 }
 
-/// Cancels `job` when it is still running without a proof; whether it did.
-async fn cancel_unproven<E: Executor>(executor: &E, job: &JobId) -> Result<bool, ExecError> {
-    if read_proof(executor, &job.dir).await? != Proof::None
-        || executor.status(job).await? != JobStatus::Running
-    {
-        return Ok(false);
-    }
-    executor.cancel(job).await?;
-    Ok(true)
+/// Cancels `job`, which saved its snapshot but did not end in time, when it
+/// still runs; a failure is only logged.
+async fn late_stop<E: Executor>(executor: &E, job: &JobId) {
+    let stopped = async {
+        if executor.status(job).await? != JobStatus::Running {
+            return Ok(false);
+        }
+        executor.cancel(job).await?;
+        Ok::<_, ExecError>(true)
+    };
+    let note = match stopped.await {
+        Ok(true) => "the job saved its snapshot but did not end: it was cancelled".to_string(),
+        Ok(false) => return,
+        Err(error) => format!("cannot cancel a job that did not end: {error}"),
+    };
+    tracing::warn!("{note}");
 }
 
 #[cfg(test)]
@@ -262,6 +298,10 @@ mod tests {
             "output//checkpoint-1",
             "output/./checkpoint-1",
             "output/check point",
+            "output/other-1",
+            "output/checkpoint-2",
+            "output/checkpoint-1/x",
+            "checkpoint-1",
             "",
         ] {
             let text = format!(r#"{{"checkpoint": {checkpoint:?}, "step": 1}}"#);

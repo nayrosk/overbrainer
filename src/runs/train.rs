@@ -389,10 +389,13 @@ pub async fn watch<E: Executor, T: Trainer>(
         never = sampler => match never {},
     };
     let (state, message) = outcome(status, &summary, &record.id);
-    let (state, message, snapshot) = if state == RunState::Succeeded {
+    // A job cancelled once its proof was written (a stop whose job did not
+    // end in time) saved its checkpoint all the same: it is stopped too.
+    let (state, message, snapshot) = if matches!(state, RunState::Succeeded | RunState::Cancelled) {
         match read_proof(ctx.executor, &record.remote_dir).await? {
             Proof::None => (state, message, None),
             Proof::Saved(snapshot) => (RunState::Stopped, None, Some(snapshot)),
+            Proof::Invalid(_) if state == RunState::Cancelled => (state, message, None),
             Proof::Invalid(why) => (
                 RunState::Failed,
                 Some(format!("the job stopped with a snapshot, but {why}")),
@@ -2058,6 +2061,69 @@ mod tests {
         Ok(())
     }
 
+    /// A proof at the final step (the plugin ignores a request there, but a job
+    /// that wrote one anyway) still records the run stopped: the proof, not
+    /// the step, decides, and the checkpoint is resumable.
+    #[tokio::test]
+    async fn a_proof_at_the_final_step_still_records_the_run_stopped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            manifest: stopped_manifest(),
+            proof: PROOF.to_string(),
+            metrics: "{\"event\": \"begin\", \"time\": 1, \"max_steps\": 3}\n\
+                      {\"event\": \"log\", \"time\": 2, \"step\": 3, \"max_steps\": 3, \"loss\": 1.0}\n"
+                .to_string(),
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        runs.save(&running()?)?;
+        for path in [
+            "job.log",
+            "output/adapter.bin",
+            "output/checkpoint-3/optimizer.pt",
+            "snapshot.json",
+        ] {
+            downloaded(&runs, path, "w")?;
+        }
+        let outcome = watch(&ctx(&runs, &fake, &bus), &WithOutput, running()?).await?;
+        assert_eq!(outcome.summary.lines, 2);
+        assert_eq!(outcome.record.state, RunState::Stopped);
+        assert_eq!(
+            outcome.record.snapshot.map(|snapshot| snapshot.step),
+            Some(3)
+        );
+        assert!(outcome.retrieved);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_cancelled_after_its_proof_is_stopped() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake {
+            manifest: stopped_manifest(),
+            proof: PROOF.to_string(),
+            ..Fake::new(JobStatus::Cancelled)
+        };
+        runs.save(&running()?)?;
+        for path in [
+            "job.log",
+            "output/adapter.bin",
+            "output/checkpoint-3/optimizer.pt",
+            "snapshot.json",
+        ] {
+            downloaded(&runs, path, "w")?;
+        }
+        let outcome = watch(&ctx(&runs, &fake, &bus), &WithOutput, running()?).await?;
+        assert_eq!(outcome.record.state, RunState::Stopped);
+        assert!(outcome.retrieved);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_checkpoint_not_retrieved_leaves_a_stopped_run_running()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2170,23 +2236,31 @@ mod tests {
     #[tokio::test]
     async fn a_stop_with_no_snapshot_in_time_cancels_the_job()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::runs::with_stop_fallback;
+        use crate::runs::{StopLimits, with_stop_fallback};
         let job = job()?;
-        for (proof, status, cancels) in [
-            ("", JobStatus::Running, 1),
-            (PROOF, JobStatus::Running, 0),
-            ("", JobStatus::Exited(0), 0),
+        let limits = StopLimits {
+            proof: Duration::from_millis(1),
+            end: Duration::from_millis(50),
+        };
+        // (proof, status, how long the flow takes, cancels): no proof is
+        // cancelled at once; a proof gets `end` more, then is cancelled if the
+        // job still runs; a flow ending first cancels nothing.
+        for (proof, status, lasts, cancels) in [
+            ("", JobStatus::Running, 200, 1),
+            (PROOF, JobStatus::Running, 200, 1),
+            (PROOF, JobStatus::Running, 20, 0),
+            ("", JobStatus::Exited(0), 200, 0),
         ] {
             let fake = Fake {
                 proof: proof.to_string(),
                 ..Fake::new(status)
             };
-            let flow = tokio::time::sleep(Duration::from_millis(200));
-            with_stop_fallback(&fake, &job, Duration::from_millis(1), flow).await;
+            let flow = tokio::time::sleep(Duration::from_millis(lasts));
+            with_stop_fallback(&fake, &job, limits, flow).await;
             assert_eq!(
                 fake.cancels.load(Ordering::SeqCst),
                 cancels,
-                "{proof:?} {status:?}"
+                "{proof:?} {status:?} {lasts}"
             );
         }
         Ok(())

@@ -17,8 +17,8 @@ pub use id::{
     project_slug, rfc3339,
 };
 pub use snapshot::{
-    Proof, STOP_TIMEOUT, Snapshot, SnapshotReason, parse_proof, read_proof, request_snapshot,
-    with_stop_fallback,
+    Proof, STOP_LIMITS, STOP_TIMEOUT, Snapshot, SnapshotReason, StopLimits, parse_proof,
+    read_proof, request_snapshot, with_stop_fallback,
 };
 pub use summary::MetricsSummary;
 pub use train::{

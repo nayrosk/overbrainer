@@ -16,7 +16,7 @@ use crate::dataset::DataFiles;
 use crate::exec::{AnyExecutor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{PodRecord, RunpodTarget};
 use crate::runs::{
-    Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, STOP_TIMEOUT, SnapshotReason,
+    Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, STOP_LIMITS, SnapshotReason,
     cancel, create_on, request_snapshot, start, watch, with_stop_fallback,
 };
 use crate::train::{Axolotl, OUTPUT_DIR, Outputs, Resume, reasoning_template_warning};
@@ -262,8 +262,8 @@ pub(super) fn resumed(
 }
 
 /// `train stop`: asks the job for a snapshot, then follows it as `train attach`
-/// does until it ends, stopped; a job that gives no snapshot within
-/// [`STOP_TIMEOUT`] is cancelled instead.
+/// does until it ends, stopped; a job that gives no snapshot in time, or does
+/// not end once it gave one, is cancelled instead (see [`STOP_LIMITS`]).
 async fn stop(
     project_dir: &Path,
     run_id: &str,
@@ -292,7 +292,7 @@ async fn stop(
     let flow = async {
         // Boxed: its state would otherwise weigh on every caller's future.
         let watched = Box::pin(watch(&ctx, &trainer, record));
-        with_stop_fallback(&executor, &job, STOP_TIMEOUT, watched)
+        with_stop_fallback(&executor, &job, STOP_LIMITS, watched)
             .await
             .with_context(|| reattach(run_id))
     };
