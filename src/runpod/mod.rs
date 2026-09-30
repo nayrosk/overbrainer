@@ -13,6 +13,7 @@ mod catalog;
 mod client;
 mod flow;
 mod keys;
+mod logs;
 mod orphans;
 mod provision;
 mod record;
@@ -37,6 +38,11 @@ pub use flow::{
 pub use keys::{
     CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,
     write_known_hosts,
+};
+pub use logs::{
+    BOOTSTRAP_LOG, Capture, DRAIN_WAIT, LogError, LogQuery, LogSource, POD_LOG, POD_LOG_CAP,
+    POD_LOG_CURSOR, PodLogLine, TAIL_MAX, capture, drain, follow as follow_logs, snapshot,
+    with_pod_logs,
 };
 pub use orphans::{
     PodRow, Removal, Removed, RowKind, listed_rows, orphan_warnings, pod_rows, remove_run_pods,
