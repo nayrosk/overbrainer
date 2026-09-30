@@ -667,7 +667,7 @@ const RUNPOD: &[FieldSpec] = &[
         "max_volume_gb",
         COUNT,
         true,
-        "Largest size in GB the network volume may grow to when it fills",
+        "Largest size in GB the network volume may grow to when it fills; a grow is permanent and billed monthly",
     ),
 ];
 

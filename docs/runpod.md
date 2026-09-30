@@ -26,7 +26,7 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 | `retrieve_grace_minutes` | `60` | The watchdog deletes a pod whose ended job was not retrieved after this. |
 | `data_center_ids` | any | Data centers the pod may be placed in, for example `["EU-RO-1"]`, or `"auto"` for those with a chosen GPU type in stock when the run starts (see [`"auto"`](#auto) below). Cannot be `"auto"` together with `network_volume_id`: list the volume's data center instead. |
 | `network_volume_id` | none | Network volume mounted at `/workspace/data`; runs and the Hugging Face cache then live on it. Needs exactly one `data_center_ids` entry, the volume's data center, never `"auto"`. overbrainer never deletes anything on it. |
-| `max_volume_gb` | none | Largest size, in GB, overbrainer may grow the network volume to when the run fills it ([disk space](#disk-space)). At least 1, and only with `network_volume_id`. Without it, a full disk stops the job with a snapshot. |
+| `max_volume_gb` | none | Largest size, in GB, overbrainer may grow the network volume to when the run fills it ([disk space](#disk-space)). A grow is permanent: a volume cannot shrink, it is billed per GB each month after the pod is gone, and every pod sharing it sees the new size. At least 1, and only with `network_volume_id`. Without it, a full disk stops the job with a snapshot. |
 
 `gpu_type` became `gpu_types`: a configuration with the old key is rejected as `unknown field`.
 
@@ -170,10 +170,12 @@ A run that fills its disk would fail and lose its steps, so while overbrainer fo
 
 At 85% used overbrainer warns, then again at 90%, 95% and 100%. At 92% used, or once the free space is less than 1.5 times the size of the newest `checkpoint-*` (the next save would not fit), it acts:
 
-- on a network volume with `max_volume_gb` set, it grows the volume through the API to half again its size, at least 50 GB more, never past `max_volume_gb`. Runpod grows a mounted volume without restarting the pod: writes work again within seconds. overbrainer checks over the next two samples that the API reports the new size, and stops the job with a snapshot if it does not. Once the volume is at `max_volume_gb`, the next full disk stops the job;
-- otherwise it stops the job with a snapshot (reason `disk`), as `overbrainer train stop` does. The container disk of a running pod cannot grow without restarting it.
+- on a network volume with `max_volume_gb` set, it grows the volume through the API to half again its size, at least 50 GB more, never past `max_volume_gb`. Runpod grows a mounted volume without restarting the pod: writes work again within seconds. When the API does not report the new size within two minutes, the job is stopped with a snapshot. Once the volume is at `max_volume_gb`, or when Runpod refuses the grow, the next full disk stops the job. A grow cannot be undone: the volume keeps its new size, and its monthly bill, after the run, and other pods using it see it too;
+- otherwise it stops the job with a snapshot (reason `disk`), as `overbrainer train stop` does. The container disk of a running pod cannot grow without restarting it. A snapshot already asked for (for example at the cost cap) keeps its reason.
 
-The watchdog applies the same 92% rule on its own, once a minute, so a full disk stops the job with a snapshot even when nothing follows it: `df` of the run directory, or on a network volume `du` of the volume against the size overbrainer wrote in `.pod/volume_gb` when it started following the job (and after each grow). Generated Axolotl configs keep only the two newest checkpoints (`save_total_limit: 2`, see [Training](training.md)), which keeps the disk use of a long run flat.
+The volume's size is read again every minute, so a volume grown elsewhere (from another pod, or the Runpod console) is weighed against its new size.
+
+The watchdog applies a backstop of its own at 97%, once a minute, so a full disk stops the job with a snapshot even when nothing follows it, while a grow overbrainer makes at 92% comes first. It reads `df` of the run directory, or on a network volume the last `du` of the volume, run in the background so a slow network mount never delays its other rules, against the volume's size: the one overbrainer writes in `.pod/volume_gb` while it follows the job and right after a grow, or else the size when the pod was created. A run started before overbrainer kept the volume's ID in `pod.json` is not measured at all on a network volume. Generated Axolotl configs keep only the two newest checkpoints (`save_total_limit: 2`, see [Training](training.md)), which keeps the disk use of a long run flat.
 
 ### Retrieval
 
