@@ -304,8 +304,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns the first validation problem, or why no write starts; nothing
-    /// is written then.
+    /// Returns the first validation problem, or why no write starts (quitting,
+    /// or another write running); nothing is written then.
     fn write(&mut self, doc: &ConfigDoc, mut writing: Writing) -> Result<Vec<Effect>, String> {
         let config = self
             .config
@@ -324,17 +324,25 @@ impl App {
         })?;
         let base = config.text.clone();
         writing.before = Some(base.clone());
-        Ok(self.spawn_write(text, base, writing))
+        self.spawn_write(text, base, writing)
     }
 
     /// Writes `text` to `overbrainer.toml` off the UI thread, unless the file
-    /// no longer holds `base`.
+    /// no longer holds `base`. Every write of the TUI starts here.
+    ///
+    /// # Errors
+    ///
+    /// Refuses while another write runs: its end would be ignored, and this
+    /// one would find the file it changed.
     pub(super) fn spawn_write(
         &mut self,
         text: String,
         base: String,
         writing: Writing,
-    ) -> Vec<Effect> {
+    ) -> Result<Vec<Effect>, String> {
+        if self.project_view.save.is_some() {
+            return Err(format!("{CONFIG_FILE} is being saved; try again"));
+        }
         let id = self.task_id();
         self.project_view.save = Some(id);
         self.project_view.writing = writing;
@@ -343,7 +351,7 @@ impl App {
             base,
             env: self.env.clone(),
         };
-        vec![Effect::Spawn(id, task)]
+        Ok(vec![Effect::Spawn(id, task)])
     }
 
     /// Sets the field `path` to `value`, or unsets it for `None`, and writes
@@ -1310,6 +1318,10 @@ impl App {
             ..Writing::default()
         };
         self.spawn_write(before, after, writing)
+            .unwrap_or_else(|error| {
+                self.say(Severity::Warn, format!("not undone: {error}"));
+                Vec::new()
+            })
     }
 
     /// `E`: opens `overbrainer.toml` in the editor, after which `u` has
@@ -2090,6 +2102,78 @@ mod tests {
             "✓ saved overbrainer.toml; targets.gpu_cloud.data_center_ids = US-KS-2, the \
              network volume's data center"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_form_kept_open_across_a_background_write_waits_for_it() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        let before = PROJECT_CONFIG.replace(
+            "max_hours = 6\n",
+            "max_hours = 6\nnetwork_volume_id = \"voleu\"\ndata_center_ids = [\"US-KS-2\"]\n",
+        );
+        std::fs::write(dir.path().join(CONFIG_FILE), &before)?;
+        app.set_config(ProjectConfig::new(&before, &app.env)?);
+        // The form opens on the volume before its listing ends.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        press(&mut app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        chars(&mut app, "volus");
+        // The listing ends: its reconciliation starts a write.
+        let reconciled = app.on_done(
+            id,
+            Ok(Done::Catalog(Ok(Listed {
+                entries: volumes(),
+                gpus: Vec::new(),
+            }))),
+        );
+        let [Effect::Spawn(running, Task::SaveConfig { .. })] = reconciled.as_slice() else {
+            return Err(format!("no reconciliation: {reconciled:?}").into());
+        };
+        let running = *running;
+        // Enter meanwhile starts nothing and keeps the value typed.
+        assert_eq!(app.on_input(&key(KeyCode::Enter)), []);
+        let Some(Form::Value { error, input, .. }) = &app.project_view.form else {
+            return Err("the form closed".into());
+        };
+        assert_eq!(
+            error.as_deref(),
+            Some("overbrainer.toml is being saved; try again")
+        );
+        assert_eq!(input.text(), "volus");
+        assert_eq!(app.project_view.save, Some(running), "the first write kept");
+        // A reconciliation meanwhile starts nothing either.
+        assert_eq!(app.reconcile_volume_centers(), []);
+        // The first write ends and is adopted; Enter then writes the value.
+        run_saves(&mut app, reconciled);
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "EU-RO-1"
+        );
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.project_view.form, None, "{}", status(&app));
+        let text = written(dir.path())?;
+        assert!(text.contains("network_volume_id = \"volus\""), "{text}");
+        assert!(text.contains("data_center_ids = [\"US-KS-2\"]"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn no_write_starts_while_another_runs() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        select(&mut app, "pipeline.include_system_prompt")?;
+        let effects = app.on_input(&key(KeyCode::Enter));
+        assert_eq!(effects.len(), 1, "{effects:?}");
+        let again = app.spawn_write(
+            PROJECT_CONFIG.to_string(),
+            PROJECT_CONFIG.to_string(),
+            Writing::default(),
+        );
+        assert_eq!(
+            again,
+            Err("overbrainer.toml is being saved; try again".into())
+        );
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG);
         Ok(())
     }
 

@@ -200,6 +200,20 @@ impl App {
                 return Vec::new();
             },
         };
+        let writing = Writing {
+            before: Some(base.clone()),
+            ..Writing::default()
+        };
+        let effects = match self.spawn_write(text, base, writing) {
+            Ok(effects) => effects,
+            Err(reason) => {
+                self.say(
+                    Severity::Warn,
+                    format!("refused: {reason}; run not started"),
+                );
+                return Vec::new();
+            },
+        };
         self.say(
             Severity::Info,
             format!(
@@ -208,11 +222,7 @@ impl App {
             ),
         );
         self.start_after_save = Some(plan);
-        let writing = Writing {
-            before: Some(base.clone()),
-            ..Writing::default()
-        };
-        self.spawn_write(text, base, writing)
+        effects
     }
 
     /// The choices of `plan` were saved: its run starts, with the settings
