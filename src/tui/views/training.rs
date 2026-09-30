@@ -431,6 +431,21 @@ fn render_legend(frame: &mut Frame, area: Rect, theme: &Theme) {
     frame.render_widget(Paragraph::new(legend), area);
 }
 
+/// The x axis of the loss chart: from 0 to the run's `max_steps` when the
+/// metrics carry it (or to the last step, if the run went past it), else over
+/// the steps seen, one step wide at least.
+fn x_bounds(series: &[TrainMetric]) -> (f64, f64) {
+    let steps = series.iter().map(|m| float(m.step));
+    let (x0, x1) = steps.fold((f64::MAX, f64::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
+    if let Some(max) = progress(series)
+        .and_then(|p| p.max_steps)
+        .filter(|max| *max > 0)
+    {
+        return (0.0, float(max).max(x1));
+    }
+    (x0, if x1 > x0 { x1 } else { x0 + 1.0 })
+}
+
 fn render_chart(frame: &mut Frame, area: Rect, series: &[TrainMetric], theme: &Theme) {
     let width = area.width.saturating_sub(8);
     let points = |value: fn(&TrainMetric) -> Option<f64>| {
@@ -442,13 +457,11 @@ fn render_chart(frame: &mut Frame, area: Rect, series: &[TrainMetric], theme: &T
     };
     let loss = points(|m| m.loss);
     let eval = points(|m| m.eval_loss);
-    let steps = series.iter().map(|m| float(m.step));
-    let (x0, x1) = steps.fold((f64::MAX, f64::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
+    let (x0, x1) = x_bounds(series);
     let values = loss.iter().chain(&eval).map(|(_, y)| *y);
     let (y0, y1) = values.fold((f64::MAX, f64::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
     let (y0, y1) = if y0 > y1 { (0.0, 1.0) } else { (y0, y1) };
     let pad = ((y1 - y0) * 0.05).max(0.01);
-    let x1 = if x1 > x0 { x1 } else { x0 + 1.0 };
     let datasets = vec![
         Dataset::default()
             .marker(Marker::HalfBlock)
@@ -550,4 +563,45 @@ fn messages(follow: Option<&Follow>, ended: Option<&Ended>, theme: &Theme) -> Ve
     }
     let skip = lines.len().saturating_sub(3);
     lines.split_off(skip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(steps: &[u64], max_steps: Option<u64>) -> Vec<TrainMetric> {
+        steps
+            .iter()
+            .map(|step| TrainMetric {
+                time: float(*step),
+                step: *step,
+                epoch: None,
+                max_steps,
+                loss: Some(1.0),
+                eval_loss: None,
+                learning_rate: None,
+                grad_norm: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_known_max_steps_spans_the_axis_from_zero() {
+        assert_eq!(
+            x_bounds(&metrics(&[10, 600, 1200], Some(4000))),
+            (0.0, 4000.0)
+        );
+    }
+
+    #[test]
+    fn an_unknown_max_steps_keeps_the_axis_over_the_steps_seen() {
+        assert_eq!(x_bounds(&metrics(&[10, 50], None)), (10.0, 50.0));
+        assert_eq!(x_bounds(&metrics(&[10], None)), (10.0, 11.0));
+        assert_eq!(x_bounds(&metrics(&[10, 50], Some(0))), (10.0, 50.0));
+    }
+
+    #[test]
+    fn a_step_past_max_steps_is_not_clipped() {
+        assert_eq!(x_bounds(&metrics(&[3900, 4100], Some(4000))), (0.0, 4100.0));
+    }
 }
