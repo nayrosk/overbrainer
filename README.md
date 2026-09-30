@@ -188,6 +188,10 @@ With `[metrics] listen = "127.0.0.1:9464"` in `overbrainer.toml` (or `OVERBRAINE
 | `overbrainer_item_retries_total` | counter | `stage` |
 | `overbrainer_train_step`, `overbrainer_train_loss`, `overbrainer_eval_loss`, `overbrainer_learning_rate` | gauge | `run_id` |
 | `overbrainer_runpod_spend_usd` | gauge | `run_id` |
+| `overbrainer_target_disk_used_bytes`, `overbrainer_target_disk_size_bytes` | gauge | `run_id`, `mount` |
+| `overbrainer_target_cpu_usage_ratio`, `overbrainer_target_cpu_load1`, `overbrainer_target_cpus`, `overbrainer_target_memory_used_bytes`, `overbrainer_target_memory_limit_bytes`, `overbrainer_target_sample_timestamp_seconds` | gauge | `run_id` |
+| `overbrainer_gpu_utilization_ratio`, `overbrainer_gpu_memory_used_bytes`, `overbrainer_gpu_memory_total_bytes`, `overbrainer_gpu_temperature_celsius`, `overbrainer_gpu_power_watts`, `overbrainer_gpu_power_limit_watts` | gauge | `run_id`, `gpu` |
+| `overbrainer_gpu_info` | gauge | `run_id`, `gpu`, `name` |
 | `overbrainer_build_info` | gauge | `version` |
 
 A Prometheus scrape config:

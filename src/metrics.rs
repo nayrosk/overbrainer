@@ -27,6 +27,9 @@ use prometheus_client::registry::{Metric, Registry};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 
+mod system;
+
+use self::system::{SystemFamilies, SystemSeries};
 use crate::events::{Event, Observer, Stage};
 use crate::history::Entry;
 use crate::llm::Usage;
@@ -95,6 +98,8 @@ struct Followed {
     running: Vec<Stage>,
     /// The run whose metrics come next, from [`Event::RunWatched`].
     run_id: Option<String>,
+    /// The series the last [`Event::System`] set.
+    system: Option<SystemSeries>,
 }
 
 /// The metric families of a project and their registry.
@@ -111,6 +116,7 @@ pub struct Metrics {
     eval_loss: Family<RunLabels, FloatGauge>,
     learning_rate: Family<RunLabels, FloatGauge>,
     spend: Family<RunLabels, FloatGauge>,
+    system: SystemFamilies,
     /// Where the Runpod spend is read at each scrape; none leaves it out.
     runs: Option<Runs>,
     /// Per bus ID.
@@ -175,6 +181,7 @@ impl Metrics {
             "overbrainer_runpod_spend_usd",
             "Estimated Runpod spend of a run in USD: rate times uptime",
         );
+        let system = SystemFamilies::new(&mut registry);
         let build: Family<VersionLabels, Gauge> = register(
             &mut registry,
             "overbrainer_build_info",
@@ -197,6 +204,7 @@ impl Metrics {
             eval_loss,
             learning_rate,
             spend,
+            system,
             runs: None,
             buses: Mutex::default(),
             scrape: Mutex::default(),
@@ -317,17 +325,29 @@ impl Metrics {
                     self.stage_running(*stage).dec();
                 }
             },
-            Event::RunWatched { run_id } => followed.run_id = Some(run_id.clone()),
+            Event::RunWatched { run_id } => {
+                if let Some(series) = followed.system.take() {
+                    self.system.remove(&series);
+                }
+                followed.run_id = Some(run_id.clone());
+            },
             Event::Metric(metric) => {
                 if let Some(run_id) = &followed.run_id {
                     self.train(run_id, metric);
                 }
             },
+            Event::System(sample) => {
+                if let Some(run_id) = &followed.run_id {
+                    // A scrape sees the old series or the new ones, never a mix.
+                    let _scrape = self.scrape.lock().unwrap_or_else(PoisonError::into_inner);
+                    let set = self.system.set(run_id, sample, followed.system.as_ref());
+                    followed.system = Some(set);
+                }
+            },
             Event::ItemDone { .. }
             | Event::ItemFailed { .. }
             | Event::JobStatus(_)
-            | Event::PodStatus(_)
-            | Event::System(_) => {},
+            | Event::PodStatus(_) => {},
         }
     }
 
@@ -390,9 +410,14 @@ impl Observer for Metrics {
 
     fn closed(&self, bus: usize) {
         let mut buses = self.buses.lock().unwrap_or_else(PoisonError::into_inner);
+        let followed = buses.remove(&bus).unwrap_or_default();
         // A stage that failed or was interrupted never finished.
-        for stage in buses.remove(&bus).unwrap_or_default().running {
+        for stage in followed.running {
             self.stage_running(stage).dec();
+        }
+        // The machine of a run nothing watches any more is not shown as it was.
+        if let Some(series) = &followed.system {
+            self.system.remove(series);
         }
     }
 }
@@ -855,6 +880,121 @@ mod tests {
         assert_value(&text, &format!("overbrainer_eval_loss{run}"), 1.25);
         assert_value(&text, &format!("overbrainer_learning_rate{run}"), 2e-5);
         assert_eq!(text.matches("overbrainer_train_step{").count(), 1, "{text}");
+        Ok(())
+    }
+
+    /// A sample of a pod with `gpus` GPUs, taken at 1000 s past the epoch.
+    fn sample(gpus: u32) -> crate::system::SystemSample {
+        let mut output = String::from("@gpu\n");
+        for index in 0..gpus {
+            output.push_str(&index.to_string());
+            output.push_str(
+                ", NVIDIA H100, 50, 1024, 2048, 60, 300, 700
+",
+            );
+        }
+        output.push_str(
+            "@loadavg\n2.5 1 1 1/1 1\n@nproc\n16\n@meminfo\nMemTotal: 1000 kB\n\
+             MemAvailable: 250 kB\n@df.run\nh\nd 100 60 40 60% /workspace\n\
+             @df.root\nh\no 10 5 5 50% /\n",
+        );
+        crate::system::parse(&output, UNIX_EPOCH + Duration::from_secs(1000), None)
+    }
+
+    #[test]
+    fn the_target_machine_shows_in_base_units_until_the_bus_closes() -> TestResult {
+        let metrics = Metrics::new(&[]);
+        // A sample before any run: nothing to label it with.
+        metrics.event(1, &Event::System(sample(1)));
+        assert!(!metrics.encode()?.contains("overbrainer_target_"));
+        let run_id = "20260928-100000-a1b2";
+        metrics.event(
+            1,
+            &Event::RunWatched {
+                run_id: run_id.into(),
+            },
+        );
+        metrics.event(1, &Event::Metric(metric(5, Some(1.5), None)));
+        metrics.event(1, &Event::System(sample(2)));
+        let text = metrics.encode()?;
+        let run = format!("run_id=\"{run_id}\"");
+        for (series, expected) in [
+            (
+                format!("overbrainer_target_disk_used_bytes{{{run},mount=\"/workspace\"}}"),
+                61_440.0,
+            ),
+            (
+                format!("overbrainer_target_disk_size_bytes{{{run},mount=\"/\"}}"),
+                10_240.0,
+            ),
+            (format!("overbrainer_target_cpu_load1{{{run}}}"), 2.5),
+            (format!("overbrainer_target_cpus{{{run}}}"), 16.0),
+            (
+                format!("overbrainer_target_memory_used_bytes{{{run}}}"),
+                768_000.0,
+            ),
+            (
+                format!("overbrainer_target_memory_limit_bytes{{{run}}}"),
+                1_024_000.0,
+            ),
+            (
+                format!("overbrainer_target_sample_timestamp_seconds{{{run}}}"),
+                1000.0,
+            ),
+            (
+                format!("overbrainer_gpu_utilization_ratio{{{run},gpu=\"1\"}}"),
+                0.5,
+            ),
+            (
+                format!("overbrainer_gpu_memory_used_bytes{{{run},gpu=\"0\"}}"),
+                1_073_741_824.0,
+            ),
+            (
+                format!("overbrainer_gpu_memory_total_bytes{{{run},gpu=\"0\"}}"),
+                2_147_483_648.0,
+            ),
+            (
+                format!("overbrainer_gpu_temperature_celsius{{{run},gpu=\"0\"}}"),
+                60.0,
+            ),
+            (
+                format!("overbrainer_gpu_power_watts{{{run},gpu=\"0\"}}"),
+                300.0,
+            ),
+            (
+                format!("overbrainer_gpu_power_limit_watts{{{run},gpu=\"0\"}}"),
+                700.0,
+            ),
+            (
+                format!("overbrainer_gpu_info{{{run},gpu=\"1\",name=\"NVIDIA H100\"}}"),
+                1.0,
+            ),
+        ] {
+            assert_value(&text, &series, expected);
+        }
+        // No previous sample: no usage yet.
+        assert!(
+            !text.contains("overbrainer_target_cpu_usage_ratio{"),
+            "{text}"
+        );
+        // A GPU gone at the next sample takes its series with it.
+        metrics.event(1, &Event::System(sample(1)));
+        let text = metrics.encode()?;
+        assert!(!text.contains("gpu=\"1\""), "{text}");
+        assert!(text.contains("gpu=\"0\""), "{text}");
+        metrics.closed(1);
+        let text = metrics.encode()?;
+        assert!(
+            !text.contains("overbrainer_target_disk_used_bytes{"),
+            "{text}"
+        );
+        assert!(!text.contains("overbrainer_gpu_"), "{text}");
+        assert!(
+            !text.contains("overbrainer_target_sample_timestamp_seconds{"),
+            "{text}"
+        );
+        // The training series stay: they say how the run ended.
+        assert_value(&text, &format!("overbrainer_train_step{{{run}}}"), 5.0);
         Ok(())
     }
 
