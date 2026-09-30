@@ -17,7 +17,7 @@ use super::catalog::{
     volume_data_center,
 };
 use super::follow::NOT_STARTED;
-use super::project::{Addable, Form, Listing, Locks, ProjectConfig, Shown, Undo, Writing};
+use super::project::{Addable, Form, Listing, Locks, ProjectConfig, Shown, Undo, Writing, rows};
 use super::start::{AUTO_LIMITS, GPU_TYPES};
 use super::tasks::Task;
 use super::widgets::form::{Input, InputOutcome};
@@ -333,7 +333,8 @@ impl App {
     /// # Errors
     ///
     /// Refuses while another write runs: its end would be ignored, and this
-    /// one would find the file it changed.
+    /// one would find the file it changed. Refuses a change of a field a
+    /// stage or a training run uses, whichever key asked for it.
     pub(super) fn spawn_write(
         &mut self,
         text: String,
@@ -342,6 +343,9 @@ impl App {
     ) -> Result<Vec<Effect>, String> {
         if self.project_view.save.is_some() {
             return Err(format!("{CONFIG_FILE} is being saved; try again"));
+        }
+        if let Some((key, user)) = self.locked_change(&text) {
+            return Err(format!("{key} is used by {user}; read-only until it ends"));
         }
         let id = self.task_id();
         self.project_view.save = Some(id);
@@ -352,6 +356,31 @@ impl App {
             env: self.env.clone(),
         };
         Ok(vec![Effect::Spawn(id, task)])
+    }
+
+    /// The first field something uses now that `text`, written over the
+    /// file read, would change, and what uses it. A text that does not load
+    /// is left to the save to refuse.
+    fn locked_change(&mut self, text: &str) -> Option<(String, String)> {
+        let then = ProjectConfig::new(text, &self.env).ok()?;
+        let locks = Locks::of(self);
+        let then = Listing::new(rows(&then, &locks), &BTreeMap::new());
+        let now = self.project_listing();
+        let fields = |listing: &Listing| -> BTreeMap<String, (Shown, Option<String>)> {
+            (0..listing.fields.len())
+                .filter_map(|index| listing.field(index))
+                .map(|field| (field.key.clone(), (field.shown.clone(), field.lock.clone())))
+                .collect()
+        };
+        let (now, then) = (fields(&now), fields(&then));
+        now.keys().chain(then.keys()).find_map(|key| {
+            let (was, is) = (now.get(key), then.get(key));
+            let user = was
+                .and_then(|(_, lock)| lock.clone())
+                .or_else(|| is.and_then(|(_, lock)| lock.clone()))?;
+            let same = matches!((was, is), (Some((a, _)), Some((b, _))) if a == b);
+            (!same).then(|| (key.clone(), user))
+        })
     }
 
     /// Sets the field `path` to `value`, or unsets it for `None`, and writes
@@ -1292,12 +1321,15 @@ impl App {
     }
 
     /// `u`: writes back the text before the last write of the TUI, unless the
-    /// file changed on disk since; there is no undo of the undo.
+    /// file changed on disk since, or a stage or a training run uses a field
+    /// it would change (the undo then stays for later); there is no undo of
+    /// the undo.
     fn undo(&mut self) -> Vec<Effect> {
         if self.refuse_change() {
             return Vec::new();
         }
-        let Some(Undo { before, after }) = self.project_view.undo.take() else {
+        // Taken once its write starts: a refused undo stays for later.
+        let Some(Undo { before, after }) = self.project_view.undo.clone() else {
             self.say(Severity::Info, "nothing to undo");
             return Vec::new();
         };
@@ -1317,11 +1349,16 @@ impl App {
             note: Some("the last write undone".to_string()),
             ..Writing::default()
         };
-        self.spawn_write(before, after, writing)
-            .unwrap_or_else(|error| {
+        match self.spawn_write(before, after, writing) {
+            Ok(effects) => {
+                self.project_view.undo = None;
+                effects
+            },
+            Err(error) => {
                 self.say(Severity::Warn, format!("not undone: {error}"));
                 Vec::new()
-            })
+            },
+        }
     }
 
     /// `E`: opens `overbrainer.toml` in the editor, after which `u` has
@@ -1932,6 +1969,43 @@ mod tests {
         press(&mut app, &[KeyCode::Char('u')]);
         assert_eq!(status(&app), "nothing to undo", "no undo of the undo");
         assert_eq!(written(dir.path())?, renamed);
+        Ok(())
+    }
+
+    #[test]
+    fn u_is_refused_while_a_run_or_a_stage_uses_what_it_changes() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        set(&mut app, "targets.gpu_cloud.gpu_count", "2")?;
+        let counted = written(dir.path())?;
+        let mut follow =
+            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, "20260921-a1");
+        follow.watching = true;
+        app.training.tasks.insert(TaskId(9), follow);
+        assert_eq!(press(&mut app, &[KeyCode::Char('u')]), []);
+        assert_eq!(
+            status(&app),
+            "not undone: targets.gpu_cloud.gpu_count is used by run 20260921-a1; read-only \
+             until it ends"
+        );
+        assert_eq!(written(dir.path())?, counted);
+        assert!(app.project_view.undo.is_some(), "kept for later");
+        app.training.tasks.clear();
+        press(&mut app, &[KeyCode::Char('u')]);
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "undone once it ended");
+        // A stage uses the parent's role.
+        set(&mut app, "roles.parent.model", "claude-opus-6")?;
+        app.pipeline_task = Some(TaskId(7));
+        app.pipeline.started(Command::Answers, 8);
+        assert_eq!(press(&mut app, &[KeyCode::Char('u')]), []);
+        assert_eq!(
+            status(&app),
+            "not undone: roles.parent.model is used by answers; read-only until it ends"
+        );
+        assert!(written(dir.path())?.contains("claude-opus-6"));
+        // A field no one uses is undone meanwhile.
+        set(&mut app, "project.name", "rust_pro")?;
+        press(&mut app, &[KeyCode::Char('u')]);
+        assert!(!written(dir.path())?.contains("rust_pro"));
         Ok(())
     }
 

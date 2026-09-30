@@ -486,6 +486,35 @@ mod tests {
     }
 
     #[test]
+    fn u_waits_for_the_run_a_saved_choice_started() -> TestResult {
+        let (dir, mut app) = starting(PROJECT_CONFIG)?;
+        pick_gpus(&mut app)?;
+        let effects = confirm_and_save(&mut app, dir.path())?;
+        assert!(starts(&effects), "{effects:?}");
+        let text = written(dir.path())?;
+        assert!(!app.training.tasks.is_empty(), "the run is followed");
+        app.view = crate::tui::app::View::Project;
+        assert_eq!(press(&mut app, &[KeyCode::Char('u')]), []);
+        assert!(
+            status(&app).starts_with("not undone: targets.gpu_cloud.")
+                && status(&app).ends_with("; read-only until it ends"),
+            "{}",
+            status(&app)
+        );
+        assert_eq!(written(dir.path())?, text, "kept");
+        app.training.tasks.clear();
+        let effects = press(&mut app, &[KeyCode::Char('u')]);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Spawn(_, Task::SaveConfig { .. })]
+            ),
+            "{effects:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn choices_left_as_they_were_start_without_a_save() -> TestResult {
         let (dir, mut app) = starting(PROJECT_CONFIG)?;
         let (id, _) = open(&mut app, 'g')?;
