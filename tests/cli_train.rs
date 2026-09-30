@@ -378,6 +378,9 @@ fn stop_saves_a_snapshot_retrieves_it_and_skips_the_merge() -> TestResult {
         .stdout(predicate::str::contains(format!(
             "train: run {id} stopped at step 1 (requested): snapshot in \
              runs/{id}/output/checkpoint-1; resume with `overbrainer train --resume-from {id}`"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "train: runs/{id}/output also holds the partial model at step 1, not a finished one"
         )));
     let record = fs::read_to_string(run.join("run.json"))?;
     assert!(record.contains("\"state\": \"stopped\""), "{record}");
@@ -395,7 +398,9 @@ fn stop_saves_a_snapshot_retrieves_it_and_skips_the_merge() -> TestResult {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!("{id}  stopped    here  ")))
-        .stdout(predicate::str::contains("  step 1 (requested)"));
+        .stdout(predicate::str::contains(
+            "  step 1 (requested): partial model in output/",
+        ));
     overbrainer(dir.path())?
         .args(["train", "stop", &id])
         .assert()

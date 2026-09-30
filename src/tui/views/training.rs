@@ -306,7 +306,7 @@ fn head_line(
 }
 
 /// The selected run's second status line: its epoch, the run it resumed from,
-/// the snapshot of a stopped run, whether a task starts (with the spinner),
+/// the snapshot of a stopped run (the model in its `output/` is partial), whether a task starts (with the spinner),
 /// cancels or stops it, and the points its forwarder skipped; empty when there
 /// is none of them.
 fn facts_line(
@@ -329,7 +329,7 @@ fn facts_line(
     {
         facts.push(Span::styled(
             format!(
-                "snapshot at step {} ({}): T resumes from it",
+                "snapshot at step {} ({}), output/ partial: T resumes it",
                 snapshot.step,
                 snapshot.reason.name()
             ),
