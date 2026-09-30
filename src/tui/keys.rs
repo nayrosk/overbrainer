@@ -51,15 +51,14 @@ const PROJECT: &[KeyHelp] = &[
         "k j, PgUp PgDn, Home End",
         "select a field, by page, the first or last",
     ),
-    row("Enter", "edit the field; toggles a bool, cycles a choice"),
+    row("Enter", "edit and save; toggles a bool, cycles a choice"),
     row(
         "t o, in a Runpod picker",
         "type the value instead, sort another way",
     ),
     row("a", "add a topic, a provider or a target"),
     row("d", "delete the selected topic, provider or target"),
-    row("s", "save to overbrainer.toml, validated first"),
-    row("u", "drop the pending changes (asks first)"),
+    row("u", "undo the last write to overbrainer.toml"),
     row("E", "open overbrainer.toml in $EDITOR"),
 ];
 
@@ -181,7 +180,7 @@ const FOOTER_PROJECT: &[Hint] = &[
     hint("Enter", "edit"),
     hint("a", "add"),
     hint("d", "delete"),
-    hint("s", "save"),
+    hint("u", "undo"),
     hint("E", "$EDITOR"),
 ];
 const FOOTER_DATASET: &[Hint] = &[
@@ -222,7 +221,7 @@ const FOOTER_LOGS: &[Hint] = &[
     hint("x", "export"),
 ];
 const FOOTER_FILTER: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "clear")];
-const FOOTER_FORM: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "cancel")];
+const FOOTER_FORM: &[Hint] = &[hint("Enter", "save"), hint("Esc", "cancel")];
 const FOOTER_PICK: &[Hint] = &[
     hint("←/→", "choose"),
     hint("Enter", "pick"),

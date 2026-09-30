@@ -1,6 +1,7 @@
 //! Editing the configuration from the Project view: the keys, the form under
-//! the list, the confirmations, the save and the read after `$EDITOR`. Changes
-//! stay in a pending document until `s` validates and writes it.
+//! the list, the confirmations, the writes and the read after `$EDITOR`. Each
+//! change is validated, then written to `overbrainer.toml` at once; `u` undoes
+//! the last write.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -16,7 +17,7 @@ use super::catalog::{
     volume_data_center,
 };
 use super::follow::NOT_STARTED;
-use super::project::{Addable, Form, Listing, Locks, Pending, ProjectConfig, Shown};
+use super::project::{Addable, Form, Listing, Locks, ProjectConfig, Shown, Undo, Writing, rows};
 use super::start::{AUTO_LIMITS, GPU_TYPES};
 use super::tasks::Task;
 use super::widgets::form::{Input, InputOutcome};
@@ -27,7 +28,7 @@ use crate::config::{
     CONFIG_FILE, ConfigError, EnvSource, ListOrAuto, Protocol, is_valid_name, stamp,
 };
 
-/// What a confirmed `d` takes out of the pending document.
+/// What a confirmed `d` takes out of `overbrainer.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Removal {
     /// The topic at this index, of this name.
@@ -187,13 +188,47 @@ pub(super) fn first_of(problems: &[String]) -> String {
     }
 }
 
-/// `count` changes, in words.
-fn changes(count: usize) -> String {
-    if count == 1 {
-        "1 change".to_string()
-    } else {
-        format!("{count} changes")
+/// Sets the field `path` of `doc` to `value`, or unsets it for `None`. GPU
+/// types listed for a target also unset its `min_vram_gb` and
+/// `max_price_per_hour`, which go with `auto` only: returns what that removed,
+/// in words.
+///
+/// # Errors
+///
+/// Returns why the document cannot be edited so.
+fn set_field(
+    doc: &mut ConfigDoc,
+    path: &FieldPath,
+    value: Option<&FieldValue>,
+) -> Result<Option<String>, String> {
+    match value {
+        Some(value) => doc.set(path, value.clone()),
+        None => doc.unset(path).map(drop),
     }
+    .map_err(|error| error.to_string())?;
+    let (FieldPath::Target { name, field }, Some(FieldValue::List(_))) = (path, value) else {
+        return Ok(None);
+    };
+    if *field != GPU_TYPES {
+        return Ok(None);
+    }
+    let mut removed = Vec::new();
+    for field in AUTO_LIMITS {
+        let limit = FieldPath::Target {
+            name: name.clone(),
+            field,
+        };
+        if doc.get(&limit).is_some() {
+            doc.unset(&limit).map_err(|error| error.to_string())?;
+            removed.push(limit.to_string());
+        }
+    }
+    Ok((!removed.is_empty()).then(|| {
+        format!(
+            "{} removed: only with gpu_types = \"auto\"",
+            removed.join(" and ")
+        )
+    }))
 }
 
 impl App {
@@ -204,7 +239,7 @@ impl App {
     }
 
     /// The rows of the Project view, built again only when the configuration,
-    /// the pending changes, the errors or the locks changed.
+    /// the errors or the locks changed.
     pub(super) fn project_listing(&mut self) -> Arc<Listing> {
         let locks = Locks::of(self);
         self.project_view.listing(self.config.as_ref(), locks)
@@ -216,8 +251,7 @@ impl App {
             KeyCode::Enter => return self.edit_field(),
             KeyCode::Char('a') => self.start_adding(),
             KeyCode::Char('d') => self.ask_removal(),
-            KeyCode::Char('s') => return self.save_changes(),
-            KeyCode::Char('u') => self.ask_drop(),
+            KeyCode::Char('u') => return self.undo(),
             KeyCode::Char('E') => return self.open_config(),
             code => self.move_field(code),
         }
@@ -255,108 +289,129 @@ impl App {
         false
     }
 
-    /// The pending changes, started from the file's document when there are
-    /// none yet.
-    fn pending_mut(&mut self) -> Option<&mut Pending> {
-        let config = self.config.as_ref()?;
-        Some(
-            self.project_view
-                .pending
-                .get_or_insert_with(|| Pending::new(config)),
-        )
-    }
-
-    /// The document shown: the pending one, else the file's.
-    fn shown_doc(&self) -> Option<&ConfigDoc> {
-        match &self.project_view.pending {
-            Some(pending) => Some(&pending.doc),
-            None => self.config.as_ref().map(|config| &config.doc),
-        }
-    }
-
-    /// Drops the pending changes when they leave the document as it was read,
-    /// and has the rows built again.
-    fn settle_pending(&mut self) {
-        let same = self
-            .project_view
-            .pending
+    /// The document of the file read, to edit, then hand to [`Self::write`].
+    fn draft(&self) -> Result<ConfigDoc, String> {
+        self.config
             .as_ref()
-            .is_some_and(|pending| pending.doc.text() == pending.original.text());
-        if same {
-            self.project_view.pending = None;
-        }
-        self.project_view.touch();
+            .map(|config| config.doc.clone())
+            .ok_or_else(|| "no configuration read".to_string())
     }
 
-    /// Sets the field `path` to `value` in the pending document, or unsets it
-    /// for `None`, and marks it changed unless it is back to the file's value.
-    fn apply(&mut self, path: &FieldPath, value: Option<&FieldValue>) -> Result<(), String> {
+    /// Validates `doc`, an edited [`Self::draft`], then writes it to
+    /// `overbrainer.toml` off the UI thread; `writing` says what the write
+    /// leaves once it succeeds, and gets the text it replaces for `u`. Nothing
+    /// happens when `doc` leaves the file as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first validation problem, or why no write starts (quitting,
+    /// or another write running); nothing is written then.
+    fn write(&mut self, doc: &ConfigDoc, mut writing: Writing) -> Result<Vec<Effect>, String> {
         let config = self
             .config
             .as_ref()
             .ok_or_else(|| "no configuration read".to_string())?;
-        let pending = self
-            .project_view
-            .pending
-            .get_or_insert_with(|| Pending::new(config));
-        let applied = match value {
-            Some(value) => pending.doc.set(path, value.clone()),
-            None => pending.doc.unset(path).map(drop),
-        };
-        if let Err(error) = applied {
-            self.settle_pending();
-            return Err(error.to_string());
+        let text = doc.text();
+        if text == config.doc.text() {
+            return Ok(Vec::new());
         }
-        self.project_view.errors.remove(&path.to_string());
-        // A renamed topic keeps its marks, under its new name.
-        let path = match (path, value) {
-            (FieldPath::Topic { index, name, field }, Some(FieldValue::Text(new)))
-                if *field == "name" =>
-            {
-                pending.rename(name, new);
-                FieldPath::Topic {
-                    index: *index,
-                    name: new.clone(),
-                    field,
-                }
-            },
-            _ => path.clone(),
-        };
-        pending.mark(&path);
-        self.settle_pending();
-        if let (FieldPath::Target { name, field }, Some(FieldValue::List(_))) = (&path, value)
-            && *field == GPU_TYPES
-        {
-            self.drop_auto_limits(name)?;
+        if self.leaving.is_some() {
+            return Err("quitting; no save starts".to_string());
         }
-        Ok(())
+        ProjectConfig::new(&text, &self.env).map_err(|error| match error {
+            ConfigError::Invalid(problems) => first_of(&problems),
+            error => error.to_string(),
+        })?;
+        let base = config.text.clone();
+        writing.before = Some(base.clone());
+        self.spawn_write(text, base, writing)
     }
 
-    /// GPU types listed for the target `name`: its `min_vram_gb` and
-    /// `max_price_per_hour`, which go with `auto` only, are unset too, and the
-    /// status line says so.
-    fn drop_auto_limits(&mut self, name: &str) -> Result<(), String> {
-        let mut removed = Vec::new();
-        for field in AUTO_LIMITS {
-            let path = FieldPath::Target {
-                name: name.to_string(),
-                field,
-            };
-            if self.shown_doc().and_then(|doc| doc.get(&path)).is_some() {
-                self.apply(&path, None)?;
-                removed.push(path.to_string());
-            }
+    /// Writes `text` to `overbrainer.toml` off the UI thread, unless the file
+    /// no longer holds `base`. Every write of the TUI starts here.
+    ///
+    /// # Errors
+    ///
+    /// Refuses while another write runs: its end would be ignored, and this
+    /// one would find the file it changed. Refuses a change of a field a
+    /// stage or a training run uses, whichever key asked for it.
+    pub(super) fn spawn_write(
+        &mut self,
+        text: String,
+        base: String,
+        writing: Writing,
+    ) -> Result<Vec<Effect>, String> {
+        if self.project_view.save.is_some() {
+            return Err(format!("{CONFIG_FILE} is being saved; try again"));
         }
-        if !removed.is_empty() {
-            self.say(
-                Severity::Info,
-                format!(
-                    "{} removed: only with gpu_types = \"auto\"",
-                    removed.join(" and ")
-                ),
-            );
+        if let Some((key, user)) = self.locked_change(&text) {
+            return Err(format!("{key} is used by {user}; read-only until it ends"));
         }
-        Ok(())
+        let id = self.task_id();
+        self.project_view.save = Some(id);
+        self.project_view.writing = writing;
+        let task = Task::SaveConfig {
+            text,
+            base,
+            env: self.env.clone(),
+        };
+        Ok(vec![Effect::Spawn(id, task)])
+    }
+
+    /// The first field something uses now that `text`, written over the
+    /// file read, would change, and what uses it. A text that does not load
+    /// is left to the save to refuse.
+    fn locked_change(&mut self, text: &str) -> Option<(String, String)> {
+        let then = ProjectConfig::new(text, &self.env).ok()?;
+        let locks = Locks::of(self);
+        let then = Listing::new(rows(&then, &locks), &BTreeMap::new());
+        let now = self.project_listing();
+        let fields = |listing: &Listing| -> BTreeMap<String, (Shown, Option<String>)> {
+            (0..listing.fields.len())
+                .filter_map(|index| listing.field(index))
+                .map(|field| (field.key.clone(), (field.shown.clone(), field.lock.clone())))
+                .collect()
+        };
+        let (now, then) = (fields(&now), fields(&then));
+        now.keys().chain(then.keys()).find_map(|key| {
+            let (was, is) = (now.get(key), then.get(key));
+            let user = was
+                .and_then(|(_, lock)| lock.clone())
+                .or_else(|| is.and_then(|(_, lock)| lock.clone()))?;
+            let same = matches!((was, is), (Some((a, _)), Some((b, _))) if a == b);
+            (!same).then(|| (key.clone(), user))
+        })
+    }
+
+    /// Sets the field `path` to `value`, or unsets it for `None`, and writes
+    /// the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns why nothing is written.
+    fn edit(
+        &mut self,
+        path: &FieldPath,
+        value: Option<&FieldValue>,
+    ) -> Result<Vec<Effect>, String> {
+        let mut doc = self.draft()?;
+        let note = set_field(&mut doc, path, value)?;
+        self.write(
+            &doc,
+            Writing {
+                note,
+                ..Writing::default()
+            },
+        )
+    }
+
+    /// The effects of an edit, or none with the status line saying why
+    /// nothing was written.
+    fn written(&mut self, edited: Result<Vec<Effect>, String>) -> Vec<Effect> {
+        edited.unwrap_or_else(|error| {
+            self.say(Severity::Warn, format!("not saved: {error}"));
+            Vec::new()
+        })
     }
 
     /// Enter: toggles a bool, cycles a choice (to unset after the last, when
@@ -384,7 +439,11 @@ impl App {
         let Some(path) = field.path.clone() else {
             return Vec::new();
         };
-        let Some(spec) = self.shown_doc().and_then(|doc| doc.spec(&path)) else {
+        let Some(spec) = self
+            .config
+            .as_ref()
+            .and_then(|config| config.doc.spec(&path))
+        else {
             let said = format!("{key}: not edited here; E opens {CONFIG_FILE}");
             self.say(Severity::Warn, said);
             return Vec::new();
@@ -394,7 +453,7 @@ impl App {
             name,
             field: name_of,
         } = &path
-            && self.shown_doc().and_then(|doc| doc.target_kind(name)) == Some(TargetKind::Runpod)
+            && self.target_kind(name) == Some(TargetKind::Runpod)
         {
             let sizing = sizing(&listing, name);
             if let Some(kind) = picked_kind(name_of) {
@@ -436,10 +495,14 @@ impl App {
                 return effects;
             },
         };
-        if let Err(error) = self.apply(&path, value.as_ref()) {
-            self.say(Severity::Warn, error);
-        }
+        let edited = self.edit(&path, value.as_ref());
+        effects.extend(self.written(edited));
         effects
+    }
+
+    /// The kind of the target `name` in the file read.
+    fn target_kind(&self, name: &str) -> Option<TargetKind> {
+        self.config.as_ref()?.doc.target_kind(name)
     }
 
     /// Opens the picker of `kind` on the Runpod target field `path`, which
@@ -469,13 +532,13 @@ impl App {
         self.open_picker(query, preselected, Origin::Field(path))
     }
 
-    /// A picker opened on the Runpod target field `path` kept `picked`: it
-    /// becomes a pending edit of that field. `auto` is written as such, an
-    /// empty data center list unsets it (any), a volume sets the target's
-    /// data centers to its own, `none` unsets it and leaves them.
-    pub(super) fn picked_field(&mut self, path: &FieldPath, picked: Picked) {
+    /// A picker opened on the Runpod target field `path` kept `picked`: it is
+    /// written to that field. `auto` is written as such, an empty data center
+    /// list unsets it (any), a volume sets the target's data centers to its
+    /// own, `none` unsets it and leaves them.
+    pub(super) fn picked_field(&mut self, path: &FieldPath, picked: Picked) -> Vec<Effect> {
         if self.refuse_change() || self.refuse_locked(path) {
-            return;
+            return Vec::new();
         }
         if picked.kind == CatalogKind::DataCenters {
             let value = match &picked.choice {
@@ -485,40 +548,40 @@ impl App {
             };
             if let Some(refusal) = self.volume_centers_refusal(path, value.as_ref()) {
                 self.say(Severity::Warn, refusal);
-                return;
+                return Vec::new();
             }
         }
         let ids = match picked.choice {
             Choice::Auto => {
                 let auto = FieldValue::Text(ListOrAuto::AUTO.to_string());
-                if let Err(error) = self.apply(path, Some(&auto)) {
-                    self.say(Severity::Warn, error);
-                }
-                return;
+                let edited = self.edit(path, Some(&auto));
+                return self.written(edited);
             },
             Choice::List(ids) => ids,
         };
-        let applied = match (picked.kind, ids.first()) {
-            (CatalogKind::Gpus, None) => Err(format!(
-                "{path}: choose a GPU type or auto; nothing changed"
-            )),
-            (CatalogKind::DataCenters, None) => self.apply(path, None),
-            (CatalogKind::Gpus | CatalogKind::DataCenters, Some(_)) => {
-                self.apply(path, Some(&FieldValue::List(ids)))
+        let edited = match (picked.kind, ids.first()) {
+            (CatalogKind::Gpus, None) => {
+                self.say(
+                    Severity::Warn,
+                    format!("{path}: choose a GPU type or auto; nothing changed"),
+                );
+                return Vec::new();
             },
-            (CatalogKind::Volumes | CatalogKind::Templates, None) => Ok(()),
-            (CatalogKind::Volumes, Some(id)) if id == NO_VOLUME => self.apply(path, None),
+            (CatalogKind::DataCenters, None) => self.edit(path, None),
+            (CatalogKind::Gpus | CatalogKind::DataCenters, Some(_)) => {
+                self.edit(path, Some(&FieldValue::List(ids)))
+            },
+            (CatalogKind::Volumes | CatalogKind::Templates, None) => Ok(Vec::new()),
+            (CatalogKind::Volumes, Some(id)) if id == NO_VOLUME => self.edit(path, None),
             (CatalogKind::Volumes, Some(id)) => self.picked_volume(path, id, &picked.entries),
             (CatalogKind::Templates, Some(image)) if image == DEFAULT_IMAGE => {
-                self.apply(path, None)
+                self.edit(path, None)
             },
             (CatalogKind::Templates, Some(image)) => {
-                self.apply(path, Some(&FieldValue::Text(image.clone())))
+                self.edit(path, Some(&FieldValue::Text(image.clone())))
             },
         };
-        if let Err(error) = applied {
-            self.say(Severity::Warn, error);
-        }
+        self.written(edited)
     }
 
     /// Why `value` cannot be set on the field `path`, when it is the
@@ -567,22 +630,27 @@ impl App {
 
     /// A volume listing was read: each Runpod target whose network volume it
     /// lists in another data center than `data_center_ids` gets that data
-    /// center as a pending change. One status line says what changed, a
-    /// warning listing first what could not (a field the environment sets or
-    /// a task locks, or a refused edit). Nothing while `overbrainer.toml` is
-    /// open in the editor: it runs once the file is read again.
-    pub(super) fn reconcile_volume_centers(&mut self) {
-        if let Some((severity, text)) = self.volume_centers_reconciled() {
+    /// center, all in one write. One status line, once written, says what
+    /// changed, a warning listing first what could not (a field the
+    /// environment sets or a task locks, or a refused edit). Nothing while
+    /// `overbrainer.toml` is open in the editor or being saved, or while
+    /// quitting: it runs once the file is read again.
+    pub(super) fn reconcile_volume_centers(&mut self) -> Vec<Effect> {
+        let (effects, said) = self.volume_centers_reconciled();
+        if let Some((severity, text)) = said {
             self.say(severity, text);
         }
+        effects
     }
 
-    /// [`Self::reconcile_volume_centers`], what it would say returned.
-    fn volume_centers_reconciled(&mut self) -> Option<(Severity, String)> {
-        if self.config.is_none() || self.project_view.save.is_some() || self.project_view.editing {
-            return None;
+    /// [`Self::reconcile_volume_centers`], what it would say now returned.
+    fn volume_centers_reconciled(&mut self) -> (Vec<Effect>, Option<(Severity, String)>) {
+        if self.leaving.is_some() || self.project_view.save.is_some() || self.project_view.editing {
+            return (Vec::new(), None);
         }
-        let doc = self.shown_doc()?;
+        let Ok(mut doc) = self.draft() else {
+            return (Vec::new(), None);
+        };
         let names: Vec<String> = doc
             .names(Collection::Targets)
             .into_iter()
@@ -622,14 +690,35 @@ impl App {
                 name,
                 field: "data_center_ids",
             };
-            match self.apply(&path, Some(&FieldValue::List(vec![center.clone()]))) {
-                Ok(()) => done.push(format!("{path} = {center}")),
+            match set_field(
+                &mut doc,
+                &path,
+                Some(&FieldValue::List(vec![center.clone()])),
+            ) {
+                Ok(_) => done.push(format!("{path} = {center}")),
                 Err(error) => failed.push(format!(
                     "{path} not set to {center}, {VOLUME_CENTER}: {error}"
                 )),
             }
         }
-        reconciled(&failed, &done)
+        let said = reconciled(&failed, &done);
+        if done.is_empty() {
+            return (Vec::new(), said);
+        }
+        // Said once written, the warnings first: a later line would hide them.
+        let writing = Writing {
+            warn: !failed.is_empty(),
+            note: said.as_ref().map(|(_, text)| text.clone()),
+            ..Writing::default()
+        };
+        match self.write(&doc, writing) {
+            Ok(effects) if !effects.is_empty() => (effects, None),
+            Ok(_) => (Vec::new(), said),
+            Err(error) => {
+                failed.push(format!("{} not saved: {error}", done.join(", ")));
+                (Vec::new(), reconciled(&failed, &[]))
+            },
+        }
     }
 
     /// Refuses a change of the field `path` while something uses it, as the
@@ -660,7 +749,11 @@ impl App {
         if self.refuse_change() || self.refuse_locked(path) {
             return;
         }
-        let Some(spec) = self.shown_doc().and_then(|doc| doc.spec(path)) else {
+        let Some(spec) = self
+            .config
+            .as_ref()
+            .and_then(|config| config.doc.spec(path))
+        else {
             return;
         };
         let listing = self.project_listing();
@@ -677,7 +770,7 @@ impl App {
     /// The volume `volume` typed for the field `path`: as if picked when the
     /// volume listing read last has it, so its data center is set too;
     /// otherwise set alone, `data_center_ids` left as is.
-    fn typed_volume(&mut self, path: &FieldPath, volume: &str) -> Result<(), String> {
+    fn typed_volume(&mut self, path: &FieldPath, volume: &str) -> Result<Vec<Effect>, String> {
         let known = self.volume_catalog.as_ref().and_then(|entries| {
             entries
                 .iter()
@@ -687,43 +780,47 @@ impl App {
         if let Some(entry) = known {
             return self.picked_volume(path, volume, &[entry]);
         }
-        self.apply(path, Some(&FieldValue::Text(volume.to_string())))
+        self.edit(path, Some(&FieldValue::Text(volume.to_string())))
     }
 
     /// The volume `id` picked for the field `path`: it is set, and its
     /// target's data centers become the volume's, when `entries` says which;
-    /// both or neither.
+    /// both in one write, or neither.
     fn picked_volume(
         &mut self,
         path: &FieldPath,
         id: &str,
         entries: &[super::widgets::picker::Entry],
-    ) -> Result<(), String> {
+    ) -> Result<Vec<Effect>, String> {
         let center = entries
             .iter()
             .find(|entry| entry.id == id)
             .and_then(volume_data_center)
             .map(str::to_string);
-        let before = self.project_view.pending.clone();
-        let applied = self.apply(path, Some(&FieldValue::Text(id.to_string())));
-        let (FieldPath::Target { name, .. }, Some(center), Ok(())) = (path, center, &applied)
-        else {
-            return applied;
+        let mut doc = self.draft()?;
+        set_field(&mut doc, path, Some(&FieldValue::Text(id.to_string())))?;
+        let note = match (path, center) {
+            (FieldPath::Target { name, .. }, Some(center)) => {
+                let centers = FieldPath::Target {
+                    name: name.clone(),
+                    field: "data_center_ids",
+                };
+                set_field(
+                    &mut doc,
+                    &centers,
+                    Some(&FieldValue::List(vec![center.clone()])),
+                )?;
+                Some(format!("{centers} = {center}, the volume's data center"))
+            },
+            _ => None,
         };
-        let centers = FieldPath::Target {
-            name: name.clone(),
-            field: "data_center_ids",
-        };
-        if let Err(error) = self.apply(&centers, Some(&FieldValue::List(vec![center.clone()]))) {
-            self.project_view.pending = before;
-            self.settle_pending();
-            return Err(error);
-        }
-        self.say(
-            Severity::Info,
-            format!("{centers} = {center}, the volume's data center"),
-        );
-        Ok(())
+        self.write(
+            &doc,
+            Writing {
+                note,
+                ..Writing::default()
+            },
+        )
     }
 
     /// What the selected field's hint adds, from the GPU types read last: the
@@ -736,7 +833,7 @@ impl App {
         let Some(FieldPath::Target { name, field: key }) = &field.path else {
             return None;
         };
-        if self.shown_doc()?.target_kind(name) != Some(TargetKind::Runpod) {
+        if self.target_kind(name) != Some(TargetKind::Runpod) {
             return None;
         }
         let gpus = self.gpu_catalog.as_deref()?;
@@ -748,10 +845,11 @@ impl App {
         }
     }
 
-    /// A key while the form is open.
-    pub(super) fn on_form_key(&mut self, code: KeyCode) {
+    /// A key while the form is open: Enter on the last step writes the file,
+    /// or keeps the form open with why it does not.
+    pub(super) fn on_form_key(&mut self, code: KeyCode) -> Vec<Effect> {
         let Some(form) = self.project_view.form.take() else {
-            return;
+            return Vec::new();
         };
         let choices = Addable::ALL.len();
         let cycle = |at: usize, count: usize| match code {
@@ -763,6 +861,7 @@ impl App {
             },
             _ => None,
         };
+        let mut effects = Vec::new();
         self.project_view.form = match form {
             Form::Value {
                 path,
@@ -780,7 +879,10 @@ impl App {
                 }),
                 InputOutcome::Cancelled => None,
                 InputOutcome::Done(text) => match self.typed(&path, kind, optional, &text) {
-                    Ok(()) => None,
+                    Ok(written) => {
+                        effects = written;
+                        None
+                    },
                     Err(error) => Some(Form::Value {
                         path,
                         kind,
@@ -807,7 +909,10 @@ impl App {
                 InputOutcome::Editing => Some(Form::Name { what, input, error }),
                 InputOutcome::Cancelled => None,
                 InputOutcome::Done(name) => match self.named(what, name.trim()) {
-                    Ok(next) => next,
+                    Ok((next, written)) => {
+                        effects = written;
+                        next
+                    },
                     Err(error) => Some(Form::Name {
                         what,
                         input,
@@ -815,31 +920,49 @@ impl App {
                     }),
                 },
             },
-            Form::Kind { what, name, choice } => match code {
-                KeyCode::Enter => {
-                    self.add(what, &name, choice);
-                    None
+            Form::Kind {
+                what,
+                name,
+                choice,
+                error,
+            } => match code {
+                KeyCode::Enter => match self.add(what, &name, choice) {
+                    Ok(written) => {
+                        effects = written;
+                        None
+                    },
+                    Err(error) => Some(Form::Kind {
+                        what,
+                        name,
+                        choice,
+                        error: Some(error),
+                    }),
                 },
                 KeyCode::Esc => None,
                 _ => Some(Form::Kind {
                     what,
                     choice: cycle(choice, what.kinds().len().max(1)).unwrap_or(choice),
                     name,
+                    error,
                 }),
             },
         };
+        effects
     }
 
     /// Enter in the value form: checks `text` against `kind` and its bounds,
-    /// then keeps it in the pending document; an empty text unsets an
-    /// `optional` field.
+    /// then writes it; an empty text unsets an `optional` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns why nothing is written, shown in the form.
     fn typed(
         &mut self,
         path: &FieldPath,
         kind: FieldKind,
         optional: bool,
         text: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<Effect>, String> {
         let value = match (text.trim().is_empty(), optional) {
             (true, true) => None,
             (true, false) => return Err("is required".to_string()),
@@ -857,8 +980,9 @@ impl App {
             && *field == "name"
         {
             let names = self
-                .shown_doc()
-                .map(ConfigDoc::topic_names)
+                .config
+                .as_ref()
+                .map(|config| config.doc.topic_names())
                 .unwrap_or_default();
             let clash = names
                 .iter()
@@ -868,7 +992,7 @@ impl App {
                 return Err(format!("topics.{new} already exists"));
             }
         }
-        self.apply(path, value.as_ref())
+        self.edit(path, value.as_ref())
     }
 
     /// A key while a bracketed paste arrives: it goes to the form's input.
@@ -900,12 +1024,17 @@ impl App {
     }
 
     /// Enter on the name of what is added, which must match `^[a-z0-9_]+$`
-    /// and be new: a topic is added at once, a provider or a target asks its
-    /// protocol or kind next.
-    fn named(&mut self, what: Addable, name: &str) -> Result<Option<Form>, String> {
-        let Some(doc) = self.shown_doc() else {
-            return Ok(None);
+    /// and be new: a topic is added and written at once, a provider or a
+    /// target asks its protocol or kind next.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the name is refused, or why nothing is written.
+    fn named(&mut self, what: Addable, name: &str) -> Result<(Option<Form>, Vec<Effect>), String> {
+        let Some(config) = &self.config else {
+            return Ok((None, Vec::new()));
         };
+        let doc = &config.doc;
         if !is_valid_name(name) {
             return Err("the name must match ^[a-z0-9_]+$".to_string());
         }
@@ -917,53 +1046,49 @@ impl App {
             return Err(format!("{} already exists", table_key(what, name)));
         }
         if what == Addable::Topic {
-            self.add(what, name, 0);
-            return Ok(None);
+            return Ok((None, self.add(what, name, 0)?));
         }
-        Ok(Some(Form::Kind {
+        let form = Form::Kind {
             what,
             name: name.to_string(),
             choice: 0,
-        }))
+            error: None,
+        };
+        Ok((Some(form), Vec::new()))
     }
 
-    /// Adds `what` named `name` to the pending document, with the `choice`-th
-    /// of its kinds, and selects its first field.
-    fn add(&mut self, what: Addable, name: &str, choice: usize) {
+    /// Adds `what` named `name`, with the `choice`-th of its kinds, and writes
+    /// the file; its first field is selected once written.
+    ///
+    /// # Errors
+    ///
+    /// Returns why nothing is written.
+    fn add(&mut self, what: Addable, name: &str, choice: usize) -> Result<Vec<Effect>, String> {
         let kind = what.kinds().get(choice).copied().unwrap_or_default();
         let key = table_key(what, name);
-        let Some(pending) = self.pending_mut() else {
-            return;
-        };
+        let mut doc = self.draft()?;
         let added = match what {
-            Addable::Topic => pending.add_topic(name),
+            Addable::Topic => doc.add_topic(name).map(drop),
             Addable::Provider => {
                 let protocol = if kind == "anthropic" {
                     Protocol::Anthropic
                 } else {
                     Protocol::Openai
                 };
-                pending.doc.add_provider(name, protocol)
+                doc.add_provider(name, protocol)
             },
-            Addable::Target => pending.doc.add_target(
+            Addable::Target => doc.add_target(
                 name,
                 TargetKind::from_name(kind).unwrap_or(TargetKind::Local),
             ),
         };
-        match added {
-            Ok(()) => {
-                pending.note_table(&key, true);
-                self.settle_pending();
-                if let Some(index) = self.project_listing().find(&key) {
-                    self.project_view.selected = index;
-                }
-                self.say(Severity::Info, format!("{key} added; s saves it"));
-            },
-            Err(error) => {
-                self.settle_pending();
-                self.say(Severity::Warn, error.to_string());
-            },
-        }
+        added.map_err(|error| error.to_string())?;
+        let writing = Writing {
+            note: Some(format!("{key} added")),
+            select: Some(key),
+            ..Writing::default()
+        };
+        self.write(&doc, writing)
     }
 
     /// `d`: asks to delete the topic, provider or target of the selected
@@ -1020,7 +1145,7 @@ impl App {
         self.overlay = Some(Overlay::Confirm(Confirm {
             title: format!(" Delete {key}? "),
             text: vec![format!(
-                "{key} goes from the pending changes: s saves them, u drops them."
+                "{key} is deleted from {CONFIG_FILE} at once; u undoes it."
             )],
             yes: "delete",
             no: "keep",
@@ -1028,75 +1153,34 @@ impl App {
         }));
     }
 
-    /// A confirmed `d`: takes `removal` out of the pending document.
-    pub(super) fn remove(&mut self, removal: &Removal) {
+    /// A confirmed `d`: takes `removal` out of `overbrainer.toml`.
+    pub(super) fn remove(&mut self, removal: &Removal) -> Vec<Effect> {
         if self.refuse_change() {
-            return;
+            return Vec::new();
         }
         let key = removal.key();
-        let Some(pending) = self.pending_mut() else {
-            return;
+        let Ok(mut doc) = self.draft() else {
+            return Vec::new();
         };
         let removed = match removal {
             Removal::Topic(index, name) => {
-                pending.doc.topic_names().get(*index) == Some(name) && pending.remove_topic(*index)
+                doc.topic_names().get(*index) == Some(name) && doc.remove_topic(*index)
             },
-            Removal::Table(collection, name) => pending.doc.remove_table(*collection, name),
+            Removal::Table(collection, name) => doc.remove_table(*collection, name),
         };
-        if removed {
-            pending.note_table(&key, false);
-        }
-        self.settle_pending();
-        let count = self.project_listing().fields.len();
-        self.project_view.step(0, count);
-        if removed {
-            self.say(Severity::Info, format!("{key} deleted; s saves it"));
-        } else {
+        if !removed {
             self.say(
                 Severity::Warn,
                 format!("{key} is not in {CONFIG_FILE}: the environment sets it"),
             );
-        }
-    }
-
-    /// `s`: validates and writes the pending document, off the UI thread;
-    /// refused while something uses a changed field or table.
-    fn save_changes(&mut self) -> Vec<Effect> {
-        if self.refuse_change() {
             return Vec::new();
         }
-        let (Some(config), Some(pending)) = (&self.config, &self.project_view.pending) else {
-            self.say(Severity::Info, "nothing to save");
-            return Vec::new();
+        let writing = Writing {
+            note: Some(format!("{key} deleted")),
+            ..Writing::default()
         };
-        let locks = Locks::of(self);
-        let conflict = pending.changed.iter().find_map(|key| {
-            locks
-                .user_of(&config.settings, key)
-                .map(|user| (key.clone(), user))
-        });
-        if let Some((key, user)) = conflict {
-            self.say(
-                Severity::Warn,
-                format!("refused: {key} is used by {user}; save once it ends"),
-            );
-            return Vec::new();
-        }
-        if self.leaving.is_some() {
-            self.say(Severity::Warn, "refused: quitting; no save starts");
-            return Vec::new();
-        }
-        let Some(pending) = &self.project_view.pending else {
-            return Vec::new();
-        };
-        let task = Task::SaveConfig {
-            text: pending.doc.text(),
-            base: pending.base.clone(),
-            env: self.env.clone(),
-        };
-        let id = self.task_id();
-        self.project_view.save = Some(id);
-        vec![Effect::Spawn(id, task)]
+        let edited = self.write(&doc, writing);
+        self.written(edited)
     }
 
     /// The save ended: the app reads the configuration written, or each
@@ -1107,16 +1191,32 @@ impl App {
         saved: Result<Box<ProjectConfig>, SaveRefusal>,
     ) -> Vec<Effect> {
         self.project_view.save = None;
+        let writing = std::mem::take(&mut self.project_view.writing);
         let start = self.start_after_save.take();
         let mut effects = Vec::new();
         match saved {
             Ok(config) => {
-                self.project_view.pending = None;
+                let after = config.text.clone();
                 let used = self.adopt(*config);
+                self.project_view.undo = writing.before.map(|before| Undo { before, after });
+                let listing = self.project_listing();
+                match writing.select.and_then(|key| listing.find(&key)) {
+                    Some(index) => self.project_view.selected = index,
+                    None => self.project_view.step(0, listing.fields.len()),
+                }
                 if self.leaving.is_some() {
                     self.exit_notes.push(format!("{CONFIG_FILE} was saved"));
                 }
-                self.say(Severity::Info, format!("✓ saved {CONFIG_FILE}"));
+                let said = match writing.note {
+                    Some(note) => format!("✓ saved {CONFIG_FILE}; {note}"),
+                    None => format!("✓ saved {CONFIG_FILE}"),
+                };
+                let severity = if writing.warn {
+                    Severity::Warn
+                } else {
+                    Severity::Info
+                };
+                self.say(severity, said);
                 effects = vec![used];
                 effects.extend(self.reload());
                 match start {
@@ -1194,8 +1294,9 @@ impl App {
     /// Shows each of `problems` on the field it names.
     pub(super) fn note_errors(&mut self, problems: &[String]) {
         let topics = self
-            .shown_doc()
-            .map(ConfigDoc::topic_names)
+            .config
+            .as_ref()
+            .map(|config| config.doc.topic_names())
             .unwrap_or_default();
         self.project_view.errors.clear();
         self.project_view.touch();
@@ -1219,49 +1320,52 @@ impl App {
         self.project_view.touch();
     }
 
-    /// `u`: asks to drop the pending changes.
-    fn ask_drop(&mut self) {
-        if self.refuse_change() {
-            return;
-        }
-        let count = self.project_view.changes();
-        if self.project_view.pending.is_none() {
-            self.say(Severity::Info, "nothing to drop");
-            return;
-        }
-        self.overlay = Some(Overlay::Confirm(Confirm {
-            title: " Drop the pending changes? ".to_string(),
-            text: vec![format!(
-                "{} to {CONFIG_FILE} {} dropped; the file stays as it is.",
-                changes(count),
-                if count == 1 { "is" } else { "are" },
-            )],
-            yes: "drop",
-            no: "keep",
-            action: Action::DropChanges,
-        }));
-    }
-
-    /// Drops the pending changes and the errors of the last save.
-    pub(super) fn drop_changes(&mut self) {
-        self.project_view.pending = None;
-        self.project_view.errors.clear();
-        self.project_view.form = None;
-        self.project_view.touch();
-    }
-
-    /// `E`: opens `overbrainer.toml` in the editor; refused with pending
-    /// changes, while a save runs, or while a stage, an edit or a training
-    /// uses the configuration.
-    fn open_config(&mut self) -> Vec<Effect> {
+    /// `u`: writes back the text before the last write of the TUI, unless the
+    /// file changed on disk since, or a stage or a training run uses a field
+    /// it would change (the undo then stays for later); there is no undo of
+    /// the undo.
+    fn undo(&mut self) -> Vec<Effect> {
         if self.refuse_change() {
             return Vec::new();
         }
-        if self.project_view.pending.is_some() {
-            self.say(
-                Severity::Warn,
-                "refused: save (s) or drop (u) the pending changes first",
-            );
+        // Taken once its write starts: a refused undo stays for later.
+        let Some(Undo { before, after }) = self.project_view.undo.clone() else {
+            self.say(Severity::Info, "nothing to undo");
+            return Vec::new();
+        };
+        if self.leaving.is_some() {
+            self.say(Severity::Warn, "not undone: quitting; no save starts");
+            return Vec::new();
+        }
+        if let Err(error) = ProjectConfig::new(&before, &self.env) {
+            let why = match error {
+                ConfigError::Invalid(problems) => first_of(&problems),
+                error => error.to_string(),
+            };
+            self.say(Severity::Warn, format!("not undone: {why}"));
+            return Vec::new();
+        }
+        let writing = Writing {
+            note: Some("the last write undone".to_string()),
+            ..Writing::default()
+        };
+        match self.spawn_write(before, after, writing) {
+            Ok(effects) => {
+                self.project_view.undo = None;
+                effects
+            },
+            Err(error) => {
+                self.say(Severity::Warn, format!("not undone: {error}"));
+                Vec::new()
+            },
+        }
+    }
+
+    /// `E`: opens `overbrainer.toml` in the editor, after which `u` has
+    /// nothing to undo; refused while a save runs, or while a stage, an edit
+    /// or a training uses the configuration.
+    fn open_config(&mut self) -> Vec<Effect> {
+        if self.refuse_change() {
             return Vec::new();
         }
         if self.refuse_new("E edits the whole file", "edit") {
@@ -1275,6 +1379,7 @@ impl App {
             return Vec::new();
         }
         self.project_view.editing = true;
+        self.project_view.undo = None;
         vec![Effect::OpenEditor {
             command: self.editor.clone(),
             path: self.project.dir.join(CONFIG_FILE),
@@ -1327,7 +1432,8 @@ impl App {
             None => (Severity::Info, what),
         };
         // A volume listing read while the file was edited applies to it now.
-        if let Some((reconciled, text)) = self.volume_centers_reconciled() {
+        let (written, reconciled) = self.volume_centers_reconciled();
+        if let Some((reconciled, text)) = reconciled {
             if reconciled != Severity::Info {
                 severity = reconciled;
             }
@@ -1336,6 +1442,7 @@ impl App {
         self.say(severity, said);
         let mut effects = vec![used];
         effects.extend(self.reload());
+        effects.extend(written);
         effects
     }
 }
@@ -1374,7 +1481,6 @@ mod tests {
     use super::*;
     use crate::cli::data::Command;
     use crate::runpod::{GpuType, NetworkVolume, Template};
-    use crate::tui::app::View;
     use crate::tui::catalog::{Listed, template_entries, volume_entries};
     use crate::tui::snapshots::{
         PROJECT_CONFIG, draw, key, project_app, project_env, text as screen,
@@ -1395,11 +1501,36 @@ mod tests {
         Ok((dir, app))
     }
 
+    /// Runs each write `effects` spawn in the project directory, as its task
+    /// would, and hands its end back to `app`; returns `effects` with what
+    /// those ends returned.
+    fn run_saves(app: &mut App, effects: Vec<Effect>) -> Vec<Effect> {
+        let mut all = Vec::new();
+        let mut queue = effects;
+        while !queue.is_empty() {
+            let mut next = Vec::new();
+            for effect in queue {
+                if let Effect::Spawn(id, Task::SaveConfig { text, base, env }) = &effect {
+                    assert_eq!(app.project_view.save, Some(*id));
+                    assert_eq!(env, &app.env, "the app's environment");
+                    let saved = save_config(&app.project.dir, text, base, env).map(Box::new);
+                    next.extend(app.on_done(*id, Ok(Done::ConfigSaved(saved))));
+                }
+                all.push(effect);
+            }
+            queue = next;
+        }
+        all
+    }
+
+    /// Each key of `codes`, the write it starts run to its end.
     fn press(app: &mut App, codes: &[KeyCode]) -> Vec<Effect> {
-        codes
-            .iter()
-            .flat_map(|code| app.on_input(&key(*code)))
-            .collect()
+        let mut effects = Vec::new();
+        for code in codes {
+            let pressed = app.on_input(&key(*code));
+            effects.extend(run_saves(app, pressed));
+        }
+        effects
     }
 
     fn chars(app: &mut App, text: &str) {
@@ -1418,13 +1549,25 @@ mod tests {
         Ok(())
     }
 
-    /// Enter on the field `key`, its text replaced by `value`, then Enter.
-    fn set(app: &mut App, key: &str, value: &str) -> Result<(), String> {
+    /// Enter on the field `key`, its text replaced by `value`, not Enter yet.
+    fn type_value(app: &mut App, key: &str, value: &str) -> Result<(), String> {
         select(app, key)?;
         press(app, &[KeyCode::Enter, KeyCode::End]);
         press(app, &[KeyCode::Backspace; 80]);
         chars(app, value);
-        press(app, &[KeyCode::Enter]);
+        Ok(())
+    }
+
+    /// [`type_value`], then Enter, its write run: what Enter returned.
+    fn set(app: &mut App, key: &str, value: &str) -> Result<Vec<Effect>, String> {
+        type_value(app, key, value)?;
+        Ok(press(app, &[KeyCode::Enter]))
+    }
+
+    /// The field `path` set to `value`, as Enter sets it, and written.
+    fn edit_now(app: &mut App, path: &FieldPath, value: Option<&FieldValue>) -> TestResult {
+        let effects = app.edit(path, value)?;
+        run_saves(app, effects);
         Ok(())
     }
 
@@ -1442,25 +1585,22 @@ mod tests {
             .ok_or_else(|| format!("no field {key}"))
     }
 
-    /// `s`, then the save task run in `dir`, its end handed back to `app`.
-    fn save(app: &mut App, dir: &Path) -> Result<Vec<Effect>, String> {
-        let effects = press(app, &[KeyCode::Char('s')]);
-        let [Effect::Spawn(id, Task::SaveConfig { text, base, env })] = effects.as_slice() else {
-            return Err(format!("no save: {effects:?} ({})", status(app)));
-        };
-        assert_eq!(app.project_view.save, Some(*id));
-        assert_eq!(env, &project_env(), "the app's environment");
-        let saved = save_config(dir, text, base, env).map(Box::new);
-        Ok(app.on_done(*id, Ok(Done::ConfigSaved(saved))))
-    }
-
     fn written(dir: &Path) -> std::io::Result<String> {
         std::fs::read_to_string(dir.join(CONFIG_FILE))
     }
 
+    /// The text before the last write, which `u` writes back.
+    fn before_last_write(app: &App) -> Result<&str, String> {
+        app.project_view
+            .undo
+            .as_ref()
+            .map(|undo| undo.before.as_str())
+            .ok_or_else(|| "nothing to undo".to_string())
+    }
+
     #[test]
     fn a_number_out_of_bounds_is_refused_on_enter() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+        let (dir, mut app) = editing_app()?;
         set(&mut app, "topics.ownership.subtopics", "0")?;
         let Some(Form::Value { error, .. }) = &app.project_view.form else {
             return Err("the form closed".into());
@@ -1475,20 +1615,16 @@ mod tests {
         assert_eq!(error.as_deref(), Some("must be a whole number"));
         press(&mut app, &[KeyCode::Esc]);
         assert_eq!(app.project_view.form, None);
-        assert!(app.project_view.pending.is_none(), "Esc keeps nothing");
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "nothing written");
+        assert_eq!(app.project_view.undo, None);
         Ok(())
     }
 
     #[test]
-    fn a_text_edited_and_saved_is_written_with_its_comments() -> TestResult {
+    fn enter_writes_the_value_at_once_with_the_comments_kept() -> TestResult {
         let (dir, mut app) = editing_app()?;
-        set(&mut app, "project.name", "rust_pro")?;
+        let effects = set(&mut app, "project.name", "rust_pro")?;
         assert_eq!(app.project_view.form, None);
-        let name = field(&mut app, "project.name")?;
-        assert!(name.changed, "marked with *");
-        assert_eq!(name.shown.text(), "rust_pro");
-        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "nothing written yet");
-        let effects = save(&mut app, dir.path())?;
         let text = written(dir.path())?;
         assert!(text.contains("name = \"rust_pro\""), "{text}");
         assert!(text.starts_with("# the project\n"), "{text}");
@@ -1498,7 +1634,7 @@ mod tests {
         );
         assert_eq!(status(&app), "✓ saved overbrainer.toml");
         assert_eq!(app.project.name, "rust_pro", "the settings are read again");
-        assert!(app.project_view.pending.is_none());
+        assert_eq!(field(&mut app, "project.name")?.shown.text(), "rust_pro");
         assert_eq!(app.project_view.save, None);
         assert!(
             effects
@@ -1506,54 +1642,53 @@ mod tests {
                 .any(|effect| matches!(effect, Effect::Spawn(_, Task::Load))),
             "the data is read again with the new topics"
         );
-        assert!(!field(&mut app, "project.name")?.changed);
+        assert_eq!(before_last_write(&app)?, PROJECT_CONFIG);
         Ok(())
     }
 
     #[test]
-    fn a_save_that_does_not_validate_writes_nothing_and_marks_the_field() -> TestResult {
+    fn a_value_that_does_not_validate_keeps_the_form_open_and_writes_nothing() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        set(&mut app, "roles.parent.provider", "nope")?;
+        let Some(Form::Value { error, .. }) = &app.project_view.form else {
+            return Err("the form closed".into());
+        };
+        assert_eq!(
+            error.as_deref(),
+            Some("roles.parent: unknown provider `nope`")
+        );
+        assert_eq!(app.project_view.save, None, "no write started");
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG);
+        let rows = screen(&draw(&mut app, 80, 24)?).join("\n");
+        assert!(rows.contains("unknown provider `nope`"), "{rows}");
+        press(&mut app, &[KeyCode::Backspace; 4]);
+        chars(&mut app, "nanogpt");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.project_view.form, None);
+        assert!(written(dir.path())?.contains("parent = { provider = \"nanogpt\""));
+        Ok(())
+    }
+
+    #[test]
+    fn a_choice_that_does_not_validate_writes_nothing_and_says_why() -> TestResult {
         let (dir, mut app) = editing_app()?;
         select(&mut app, "roles.generator.reasoning_effort")?;
-        press(&mut app, &[KeyCode::Enter]);
-        assert_eq!(
-            field(&mut app, "roles.generator.reasoning_effort")?
-                .shown
-                .text(),
-            "low",
-            "a choice cycles from unset to the first"
-        );
-        select(&mut app, "project.name")?;
-        save(&mut app, dir.path())?;
+        let effects = press(&mut app, &[KeyCode::Enter]);
+        assert!(effects.is_empty(), "{effects:?}");
         assert_eq!(written(dir.path())?, PROJECT_CONFIG);
-        assert!(
-            status(&app).starts_with(
-                "not saved: roles.generator.reasoning_effort: requires reasoning = true"
-            ),
-            "{}",
-            status(&app)
-        );
-        let marked = field(&mut app, "roles.generator.reasoning_effort")?;
         assert_eq!(
-            marked.error.as_deref(),
-            Some("roles.generator.reasoning_effort: requires reasoning = true")
+            status(&app),
+            "not saved: roles.generator.reasoning_effort: requires reasoning = true"
         );
         assert_eq!(
-            marked.detail(None),
-            marked.error.clone().unwrap_or_default()
+            field(&mut app, "roles.generator.reasoning_effort")?.shown,
+            Shown::Unset
         );
-        assert_eq!(
-            app.project_listing()
-                .field(app.project_view.selected)
-                .map(|field| field.key.clone()),
-            Some(marked.key),
-            "the first marked field is selected"
-        );
-        assert!(app.project_view.pending.is_some(), "the changes are kept");
         Ok(())
     }
 
     #[test]
-    fn a_adds_a_topic_and_s_saves_it() -> TestResult {
+    fn a_adds_a_topic_written_at_once() -> TestResult {
         let (dir, mut app) = editing_app()?;
         press(&mut app, &[KeyCode::Char('a')]);
         assert_eq!(app.project_view.form, Some(Form::Adding(0)));
@@ -1575,22 +1710,25 @@ mod tests {
         chars(&mut app, "traits");
         press(&mut app, &[KeyCode::Enter]);
         assert_eq!(app.project_view.form, None);
-        let selected = app
-            .project_listing()
-            .field(app.project_view.selected)
-            .map(|field| (field.key.clone(), field.changed));
-        assert_eq!(selected, Some(("topics.traits.name".to_string(), true)));
-        save(&mut app, dir.path())?;
         let text = written(dir.path())?;
         assert!(
             text.contains("[[topics]]\nname = \"traits\"\nsubtopics = 10"),
             "{text}"
         );
         assert_eq!(app.project.topics.len(), 2);
+        let selected = app
+            .project_listing()
+            .field(app.project_view.selected)
+            .map(|field| field.key.clone());
+        assert_eq!(selected.as_deref(), Some("topics.traits.name"));
+        assert_eq!(
+            status(&app),
+            "✓ saved overbrainer.toml; topics.traits added"
+        );
         Ok(())
     }
 
-    /// [`editing_app`] with a second topic, `traits`, pending.
+    /// [`editing_app`] with a second topic, `traits`, written.
     fn two_topics() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
         let (dir, mut app) = editing_app()?;
         press(&mut app, &[KeyCode::Char('a'), KeyCode::Enter]);
@@ -1600,8 +1738,9 @@ mod tests {
     }
 
     fn topic_names(app: &App) -> Vec<String> {
-        app.shown_doc()
-            .map(ConfigDoc::topic_names)
+        app.config
+            .as_ref()
+            .map(|config| config.doc.topic_names())
             .unwrap_or_default()
     }
 
@@ -1615,24 +1754,39 @@ mod tests {
         assert_eq!(error.as_deref(), Some("topics.ownership already exists"));
         assert_eq!(topic_names(&app), ["ownership", "traits"]);
         press(&mut app, &[KeyCode::Esc]);
-        set(&mut app, "topics.traits.name", "traits")?;
+        let effects = set(&mut app, "topics.traits.name", "traits")?;
         assert_eq!(app.project_view.form, None, "its own name is no clash");
+        assert!(effects.is_empty(), "the same value writes nothing");
         Ok(())
     }
 
     #[test]
-    fn d_removes_the_topic_selected() -> TestResult {
-        let (_dir, mut app) = two_topics()?;
+    fn d_deletes_the_topic_selected_once_confirmed() -> TestResult {
+        let (dir, mut app) = two_topics()?;
         select(&mut app, "topics.traits.subtopics")?;
-        press(&mut app, &[KeyCode::Char('d'), KeyCode::Char('y')]);
+        press(&mut app, &[KeyCode::Char('d')]);
+        let Some(Overlay::Confirm(confirm)) = &app.overlay else {
+            return Err("no dialog".into());
+        };
+        assert_eq!(
+            confirm.text,
+            ["topics.traits is deleted from overbrainer.toml at once; u undoes it."]
+        );
+        press(&mut app, &[KeyCode::Char('y')]);
         assert_eq!(topic_names(&app), ["ownership"]);
-        assert_eq!(status(&app), "topics.traits deleted; s saves it");
+        assert!(!written(dir.path())?.contains("traits"));
+        assert_eq!(
+            status(&app),
+            "✓ saved overbrainer.toml; topics.traits deleted"
+        );
+        let selected = app.project_view.selected;
+        assert!(app.project_listing().field(selected).is_some(), "in range");
         Ok(())
     }
 
     #[test]
-    fn a_provider_and_a_target_are_added_with_their_kind() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+    fn a_provider_and_targets_are_added_with_their_kind() -> TestResult {
+        let (dir, mut app) = editing_app()?;
         select(&mut app, "providers.claude.protocol")?;
         press(&mut app, &[KeyCode::Char('a')]);
         assert_eq!(app.project_view.form, Some(Form::Adding(1)), "a provider");
@@ -1664,12 +1818,34 @@ mod tests {
             "docker"
         );
         assert!(field(&mut app, "targets.box.host").is_ok(), "an ssh target");
-        assert_eq!(app.project_view.changes(), 2);
+        // A Runpod target validates as added: its GPU types are `auto`.
+        press(&mut app, &[KeyCode::Char('a')]);
+        assert_eq!(app.project_view.form, Some(Form::Adding(2)), "a target");
+        press(&mut app, &[KeyCode::Enter]);
+        chars(&mut app, "pod");
+        press(&mut app, &[KeyCode::Enter, KeyCode::Left, KeyCode::Enter]);
+        assert_eq!(
+            field(&mut app, "targets.pod.gpu_types")?.shown.text(),
+            "auto"
+        );
+        let text = written(dir.path())?;
+        assert!(
+            text.contains("[providers.local]\nprotocol = \"anthropic\"\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[targets.box]\nkind = \"ssh\"\nruntime = \"docker\"\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[targets.pod]\nkind = \"runpod\"\ngpu_types = \"auto\"\n"),
+            "{text}"
+        );
         Ok(())
     }
 
     #[test]
-    fn a_provider_a_role_uses_is_refused_at_save_naming_the_role() -> TestResult {
+    fn deleting_a_provider_a_role_uses_is_refused_naming_the_role() -> TestResult {
         let (dir, mut app) = editing_app()?;
         select(&mut app, "providers.claude.api_key")?;
         press(&mut app, &[KeyCode::Char('d')]);
@@ -1677,28 +1853,24 @@ mod tests {
             return Err("no dialog".into());
         };
         assert_eq!(confirm.title, " Delete providers.claude? ");
-        press(&mut app, &[KeyCode::Char('y')]);
-        assert!(
-            field(&mut app, "providers.claude.protocol").is_err(),
-            "gone"
-        );
-        assert_eq!(status(&app), "providers.claude deleted; s saves it");
-        save(&mut app, dir.path())?;
+        let effects = press(&mut app, &[KeyCode::Char('y')]);
+        assert!(effects.is_empty(), "{effects:?}");
         assert_eq!(written(dir.path())?, PROJECT_CONFIG);
         assert_eq!(
             status(&app),
             "not saved: roles.parent: unknown provider `claude`"
         );
-        assert!(field(&mut app, "roles.parent.provider")?.error.is_some());
+        assert!(field(&mut app, "providers.claude.protocol").is_ok(), "kept");
         Ok(())
     }
 
     #[test]
-    fn a_locked_field_refuses_enter_and_a_locked_change_is_not_saved() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+    fn a_locked_field_refuses_enter_and_a_locked_table_refuses_d() -> TestResult {
+        let (dir, mut app) = editing_app()?;
         set(&mut app, "roles.parent.model", "claude-opus-6")?;
         app.pipeline_task = Some(TaskId(7));
         app.pipeline.started(Command::Answers, 8);
+        let before = written(dir.path())?;
         select(&mut app, "roles.parent.model")?;
         press(&mut app, &[KeyCode::Enter]);
         assert_eq!(app.project_view.form, None);
@@ -1706,22 +1878,17 @@ mod tests {
             status(&app),
             "refused: roles.parent.model is used by answers; read-only until it ends"
         );
-        let effects = press(&mut app, &[KeyCode::Char('s')]);
-        assert!(effects.is_empty());
-        assert_eq!(
-            status(&app),
-            "refused: roles.parent.model is used by answers; save once it ends"
-        );
         select(&mut app, "providers.claude.protocol")?;
         press(&mut app, &[KeyCode::Char('d')]);
         assert_eq!(app.overlay, None);
         assert!(status(&app).starts_with("refused: providers.claude is used by answers"));
+        assert_eq!(written(dir.path())?, before);
         Ok(())
     }
 
     #[test]
     fn env_fields_refuse_enter_and_say_to_use_dot_env() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+        let (dir, mut app) = editing_app()?;
         select(&mut app, "providers.nanogpt.api_key")?;
         press(&mut app, &[KeyCode::Enter]);
         assert_eq!(
@@ -1737,18 +1904,22 @@ mod tests {
              change it in .env"
         );
         assert_eq!(app.project_view.form, None);
-        assert!(app.project_view.pending.is_none());
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG);
         Ok(())
     }
 
     #[test]
     fn a_bool_toggles_a_choice_cycles_and_a_paste_goes_to_the_form() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+        let (dir, mut app) = editing_app()?;
         select(&mut app, "pipeline.include_system_prompt")?;
         let before = field(&mut app, "pipeline.include_system_prompt")?;
         press(&mut app, &[KeyCode::Enter]);
         let after = field(&mut app, "pipeline.include_system_prompt")?;
         assert_ne!(before.shown.text(), after.shown.text());
+        assert!(
+            written(dir.path())?
+                .contains(&format!("include_system_prompt = {}", after.shown.text()))
+        );
         select(&mut app, "training.adapter")?;
         press(&mut app, &[KeyCode::Enter]);
         assert_eq!(field(&mut app, "training.adapter")?.shown.text(), "qlora");
@@ -1771,109 +1942,150 @@ mod tests {
             Shown::Unset,
             "an empty value unsets an optional field"
         );
+        assert!(!written(dir.path())?.contains("description"));
         Ok(())
     }
 
     #[test]
-    fn switching_views_keeps_the_pending_changes_and_u_drops_them() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
-        set(&mut app, "project.name", "rust_pro")?;
-        press(&mut app, &[KeyCode::Char('2')]);
-        assert_eq!((app.view, &app.overlay), (View::Dataset, &None));
-        press(
-            &mut app,
-            &[KeyCode::Tab, KeyCode::BackTab, KeyCode::Char('1')],
-        );
-        assert_eq!(field(&mut app, "project.name")?.shown.text(), "rust_pro");
-        let effects = press(
-            &mut app,
-            &[KeyCode::Char('r'), KeyCode::Down, KeyCode::Enter],
-        );
-        assert!(!effects.is_empty(), "a stage starts");
-        assert_eq!(app.view, View::Pipeline);
-        assert!(app.project_view.pending.is_some(), "kept");
-        app.view = View::Project;
-        app.pipeline_task = None;
+    fn u_undoes_the_last_write_only_once() -> TestResult {
+        let (dir, mut app) = editing_app()?;
         press(&mut app, &[KeyCode::Char('u')]);
-        assert!(matches!(
-            &app.overlay,
-            Some(Overlay::Confirm(Confirm {
-                action: Action::DropChanges,
-                ..
-            }))
-        ));
-        press(&mut app, &[KeyCode::Char('y')]);
-        assert!(app.project_view.pending.is_none());
-        assert_eq!(status(&app), "pending changes dropped");
-        assert_eq!(field(&mut app, "project.name")?.shown.text(), "rust_expert");
+        assert_eq!(status(&app), "nothing to undo");
+        set(&mut app, "project.name", "rust_pro")?;
+        let renamed = written(dir.path())?;
+        set(&mut app, "topics.ownership.subtopics", "5")?;
+        assert!(written(dir.path())?.contains("subtopics = 5"));
+        press(&mut app, &[KeyCode::Char('u')]);
+        assert_eq!(written(dir.path())?, renamed, "the last write alone");
+        assert_eq!(
+            status(&app),
+            "✓ saved overbrainer.toml; the last write undone"
+        );
+        assert_eq!(
+            field(&mut app, "topics.ownership.subtopics")?.shown.text(),
+            "2"
+        );
+        assert_eq!(app.project.name, "rust_pro");
+        press(&mut app, &[KeyCode::Char('u')]);
+        assert_eq!(status(&app), "nothing to undo", "no undo of the undo");
+        assert_eq!(written(dir.path())?, renamed);
         Ok(())
     }
 
     #[test]
-    fn nothing_changes_while_a_save_runs() -> TestResult {
+    fn u_is_refused_while_a_run_or_a_stage_uses_what_it_changes() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        set(&mut app, "targets.gpu_cloud.gpu_count", "2")?;
+        let counted = written(dir.path())?;
+        let mut follow =
+            crate::tui::training::Follow::new(crate::tui::training::Job::Attach, "20260921-a1");
+        follow.watching = true;
+        app.training.tasks.insert(TaskId(9), follow);
+        assert_eq!(press(&mut app, &[KeyCode::Char('u')]), []);
+        assert_eq!(
+            status(&app),
+            "not undone: targets.gpu_cloud.gpu_count is used by run 20260921-a1; read-only \
+             until it ends"
+        );
+        assert_eq!(written(dir.path())?, counted);
+        assert!(app.project_view.undo.is_some(), "kept for later");
+        app.training.tasks.clear();
+        press(&mut app, &[KeyCode::Char('u')]);
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "undone once it ended");
+        // A stage uses the parent's role.
+        set(&mut app, "roles.parent.model", "claude-opus-6")?;
+        app.pipeline_task = Some(TaskId(7));
+        app.pipeline.started(Command::Answers, 8);
+        assert_eq!(press(&mut app, &[KeyCode::Char('u')]), []);
+        assert_eq!(
+            status(&app),
+            "not undone: roles.parent.model is used by answers; read-only until it ends"
+        );
+        assert!(written(dir.path())?.contains("claude-opus-6"));
+        // A field no one uses is undone meanwhile.
+        set(&mut app, "project.name", "rust_pro")?;
+        press(&mut app, &[KeyCode::Char('u')]);
+        assert!(!written(dir.path())?.contains("rust_pro"));
+        Ok(())
+    }
+
+    #[test]
+    fn u_is_refused_when_the_file_changed_on_disk() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        set(&mut app, "project.name", "rust_pro")?;
+        std::fs::write(dir.path().join(CONFIG_FILE), "# changed elsewhere\n")?;
+        press(&mut app, &[KeyCode::Char('u')]);
+        assert_eq!(written(dir.path())?, "# changed elsewhere\n");
+        assert_eq!(
+            status(&app),
+            "not saved: overbrainer.toml changed on disk since it was read; nothing written"
+        );
+        assert_eq!(app.project_view.undo, None);
+        Ok(())
+    }
+
+    #[test]
+    fn e_leaves_nothing_to_undo() -> TestResult {
         let (_dir, mut app) = editing_app()?;
         set(&mut app, "project.name", "rust_pro")?;
-        let effects = press(&mut app, &[KeyCode::Char('s')]);
-        assert_eq!(effects.len(), 1);
-        for code in ['u', 'a', 'd', 's', 'E'] {
-            assert!(press(&mut app, &[KeyCode::Char(code)]).is_empty(), "{code}");
+        assert!(app.project_view.undo.is_some());
+        press(&mut app, &[KeyCode::Char('E')]);
+        assert_eq!(app.project_view.undo, None);
+        app.on_editor_exit(Ok(ExitStatus::from_raw(0)));
+        press(&mut app, &[KeyCode::Char('u')]);
+        assert_eq!(status(&app), "nothing to undo");
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_changes_while_a_write_runs() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        select(&mut app, "pipeline.include_system_prompt")?;
+        let effects = app.on_input(&key(KeyCode::Enter));
+        let [Effect::Spawn(id, Task::SaveConfig { .. })] = effects.as_slice() else {
+            return Err(format!("no write: {effects:?}").into());
+        };
+        assert_eq!(app.project_view.save, Some(*id));
+        for code in ['u', 'a', 'd', 'E'] {
+            assert!(app.on_input(&key(KeyCode::Char(code))).is_empty(), "{code}");
             assert_eq!(app.overlay, None, "{code}");
             assert_eq!(app.project_view.form, None, "{code}");
             assert_eq!(status(&app), "refused: overbrainer.toml is being saved");
         }
-        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.on_input(&key(KeyCode::Enter)).is_empty());
         assert_eq!(app.project_view.form, None);
-        assert_eq!(field(&mut app, "project.name")?.shown.text(), "rust_pro");
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "the task writes");
         Ok(())
     }
 
     #[test]
-    fn a_field_set_back_loses_its_mark_and_a_rename_is_one_change() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
-        set(&mut app, "topics.ownership.subtopics", "5")?;
+    fn a_rename_is_one_write_and_the_same_value_writes_nothing() -> TestResult {
+        let (dir, mut app) = editing_app()?;
         set(&mut app, "topics.ownership.name", "owning")?;
-        assert_eq!(app.project_view.changes(), 2);
-        assert!(field(&mut app, "topics.owning.subtopics")?.changed);
-        assert!(field(&mut app, "topics.owning.name")?.changed);
-        set(&mut app, "topics.owning.subtopics", "2")?;
-        assert_eq!(app.project_view.changes(), 1, "the rename alone");
-        assert!(!field(&mut app, "topics.owning.subtopics")?.changed);
-        set(&mut app, "project.name", "rust_pro")?;
-        set(&mut app, "project.name", "rust_expert")?;
-        assert!(!field(&mut app, "project.name")?.changed);
-        assert_eq!(app.project_view.changes(), 1);
-        set(&mut app, "topics.owning.name", "ownership")?;
-        assert!(app.project_view.pending.is_none(), "back to the file");
+        assert_eq!(before_last_write(&app)?, PROJECT_CONFIG);
+        assert_eq!(topic_names(&app), ["owning"]);
+        assert!(written(dir.path())?.contains("name = \"owning\""));
+        let effects = set(&mut app, "topics.owning.subtopics", "2")?;
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(app.project_view.form, None);
+        assert_eq!(before_last_write(&app)?, PROJECT_CONFIG, "no new write");
         Ok(())
     }
 
     #[test]
-    fn quitting_with_pending_changes_asks() -> TestResult {
+    fn quitting_after_a_write_asks_nothing_about_it() -> TestResult {
         let (_dir, mut app) = editing_app()?;
         set(&mut app, "project.name", "rust_pro")?;
         press(&mut app, &[KeyCode::Char('q')]);
-        let Some(Overlay::Confirm(confirm)) = &app.overlay else {
-            return Err("no dialog".into());
-        };
-        assert!(
-            confirm
-                .text
-                .iter()
-                .any(|line| line.contains("pending changes to overbrainer.toml")),
-            "{confirm:?}"
-        );
-        assert_eq!(app.exit, None);
-        Ok(())
-    }
-
-    #[test]
-    fn a_change_that_undoes_itself_leaves_nothing_pending() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
-        select(&mut app, "roles.parent.reasoning")?;
-        press(&mut app, &[KeyCode::Enter]);
-        assert!(app.project_view.pending.is_some());
-        press(&mut app, &[KeyCode::Enter]);
-        assert!(app.project_view.pending.is_none());
+        if let Some(Overlay::Confirm(confirm)) = &app.overlay {
+            assert!(
+                !confirm
+                    .text
+                    .iter()
+                    .any(|line| line.contains("overbrainer.toml")),
+                "{confirm:?}"
+            );
+        }
         Ok(())
     }
 
@@ -1945,37 +2157,103 @@ mod tests {
             },
         ]);
         listed(&mut app, id, volumes, Vec::new());
-        assert!(app.project_view.pending.is_none(), "nothing while edited");
-        std::fs::write(
-            dir.path().join(CONFIG_FILE),
-            with_volume("volus", "EU-RO-1"),
-        )?;
-        app.on_editor_exit(Ok(ExitStatus::from_raw(0)));
+        assert_eq!(written(dir.path())?, before, "nothing while edited");
+        let edited = with_volume("volus", "EU-RO-1");
+        std::fs::write(dir.path().join(CONFIG_FILE), &edited)?;
+        let effects = app.on_editor_exit(Ok(ExitStatus::from_raw(0)));
+        assert_eq!(status(&app), "overbrainer.toml read again");
+        run_saves(&mut app, effects);
         let key = "targets.gpu_cloud.data_center_ids";
         assert_eq!(
             shown(&mut app, key)?,
             "US-KS-2",
             "reconciled on the new file"
         );
-        assert!(field(&mut app, key)?.changed);
+        assert_eq!(written(dir.path())?, with_volume("volus", "US-KS-2"));
+        assert_eq!(before_last_write(&app)?, edited, "u undoes it");
         assert_eq!(
             status(&app),
-            "overbrainer.toml read again; targets.gpu_cloud.data_center_ids = US-KS-2, the \
+            "✓ saved overbrainer.toml; targets.gpu_cloud.data_center_ids = US-KS-2, the \
              network volume's data center"
         );
         Ok(())
     }
 
     #[test]
-    fn e_is_refused_with_pending_changes_or_while_a_stage_runs() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
-        set(&mut app, "project.name", "rust_pro")?;
-        assert!(press(&mut app, &[KeyCode::Char('E')]).is_empty());
-        assert_eq!(
-            status(&app),
-            "refused: save (s) or drop (u) the pending changes first"
+    fn a_form_kept_open_across_a_background_write_waits_for_it() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        let before = PROJECT_CONFIG.replace(
+            "max_hours = 6\n",
+            "max_hours = 6\nnetwork_volume_id = \"voleu\"\ndata_center_ids = [\"US-KS-2\"]\n",
         );
-        app.drop_changes();
+        std::fs::write(dir.path().join(CONFIG_FILE), &before)?;
+        app.set_config(ProjectConfig::new(&before, &app.env)?);
+        // The form opens on the volume before its listing ends.
+        let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
+        press(&mut app, &[KeyCode::Char('t'), KeyCode::End]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        chars(&mut app, "volus");
+        // The listing ends: its reconciliation starts a write.
+        let reconciled = app.on_done(
+            id,
+            Ok(Done::Catalog(Ok(Listed {
+                entries: volumes(),
+                gpus: Vec::new(),
+            }))),
+        );
+        let [Effect::Spawn(running, Task::SaveConfig { .. })] = reconciled.as_slice() else {
+            return Err(format!("no reconciliation: {reconciled:?}").into());
+        };
+        let running = *running;
+        // Enter meanwhile starts nothing and keeps the value typed.
+        assert_eq!(app.on_input(&key(KeyCode::Enter)), []);
+        let Some(Form::Value { error, input, .. }) = &app.project_view.form else {
+            return Err("the form closed".into());
+        };
+        assert_eq!(
+            error.as_deref(),
+            Some("overbrainer.toml is being saved; try again")
+        );
+        assert_eq!(input.text(), "volus");
+        assert_eq!(app.project_view.save, Some(running), "the first write kept");
+        // A reconciliation meanwhile starts nothing either.
+        assert_eq!(app.reconcile_volume_centers(), []);
+        // The first write ends and is adopted; Enter then writes the value.
+        run_saves(&mut app, reconciled);
+        assert_eq!(
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "EU-RO-1"
+        );
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.project_view.form, None, "{}", status(&app));
+        let text = written(dir.path())?;
+        assert!(text.contains("network_volume_id = \"volus\""), "{text}");
+        assert!(text.contains("data_center_ids = [\"US-KS-2\"]"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn no_write_starts_while_another_runs() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        select(&mut app, "pipeline.include_system_prompt")?;
+        let effects = app.on_input(&key(KeyCode::Enter));
+        assert_eq!(effects.len(), 1, "{effects:?}");
+        let again = app.spawn_write(
+            PROJECT_CONFIG.to_string(),
+            PROJECT_CONFIG.to_string(),
+            Writing::default(),
+        );
+        assert_eq!(
+            again,
+            Err("overbrainer.toml is being saved; try again".into())
+        );
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG);
+        Ok(())
+    }
+
+    #[test]
+    fn e_is_refused_while_a_stage_runs() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
         app.pipeline_task = Some(TaskId(7));
         app.pipeline.started(Command::Split, 8);
         assert!(press(&mut app, &[KeyCode::Char('E')]).is_empty());
@@ -1988,18 +2266,17 @@ mod tests {
     }
 
     #[test]
-    fn a_save_is_refused_when_the_file_changed_on_disk() -> TestResult {
+    fn a_write_is_refused_when_the_file_changed_on_disk() -> TestResult {
         let (dir, mut app) = editing_app()?;
-        set(&mut app, "project.name", "rust_pro")?;
+        type_value(&mut app, "project.name", "rust_pro")?;
         std::fs::write(dir.path().join(CONFIG_FILE), "# changed elsewhere\n")?;
-        save(&mut app, dir.path())?;
+        press(&mut app, &[KeyCode::Enter]);
         assert_eq!(written(dir.path())?, "# changed elsewhere\n");
-        assert!(
-            status(&app).starts_with("not saved: overbrainer.toml changed on disk"),
-            "{}",
-            status(&app)
+        assert_eq!(
+            status(&app),
+            "not saved: overbrainer.toml changed on disk since it was read; nothing written"
         );
-        assert!(app.project_view.pending.is_some());
+        assert_eq!(app.project_view.undo, None);
         Ok(())
     }
 
@@ -2018,18 +2295,19 @@ mod tests {
     }
 
     #[test]
-    fn the_form_and_the_marks_are_drawn() -> TestResult {
+    fn the_form_is_drawn() -> TestResult {
         let (_dir, mut app) = editing_app()?;
         set(&mut app, "project.name", "rust_pro")?;
         select(&mut app, "topics.ownership.subtopics")?;
         press(&mut app, &[KeyCode::Enter]);
         chars(&mut app, "x");
+        app.status = None;
         let rows = screen(&draw(&mut app, 80, 24)?).join("\n");
-        assert!(rows.contains("configuration · 1 change"), "{rows}");
-        assert!(rows.contains("rust_pro *"), "{rows}");
+        assert!(rows.contains("╭ configuration ─"), "{rows}");
+        assert!(rows.contains("rust_pro"), "{rows}");
         assert!(rows.contains("subtopics = 2x"), "{rows}");
         assert!(rows.contains("at least 1"), "{rows}");
-        assert!(rows.contains("Enter keep"), "{rows}");
+        assert!(rows.contains("Enter save"), "{rows}");
         press(
             &mut app,
             &[KeyCode::Esc, KeyCode::Char('a'), KeyCode::Enter],
@@ -2048,8 +2326,8 @@ mod tests {
     }
 
     #[test]
-    fn a_save_reloads_the_settings_the_app_uses() -> TestResult {
-        let (dir, mut app) = editing_app()?;
+    fn a_write_reloads_the_settings_the_app_uses() -> TestResult {
+        let (_dir, mut app) = editing_app()?;
         assert_eq!(app.project.concurrency, 8, "the fixture's");
         set(&mut app, "pipeline.eval_ratio", "0.2")?;
         press(
@@ -2060,7 +2338,6 @@ mod tests {
         chars(&mut app, "box");
         press(&mut app, &[KeyCode::Enter, KeyCode::Enter]);
         set(&mut app, "training.target", "box")?;
-        save(&mut app, dir.path())?;
         assert_eq!(status(&app), "✓ saved overbrainer.toml");
         assert!((app.project.eval_ratio - 0.2).abs() < f64::EPSILON);
         assert_eq!(app.project.concurrency, 4, "from the environment");
@@ -2069,13 +2346,12 @@ mod tests {
     }
 
     #[test]
-    fn a_save_keeps_the_file_mode_and_refuses_a_symlink() -> TestResult {
+    fn a_write_keeps_the_file_mode_and_refuses_a_symlink() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
         let (dir, mut app) = editing_app()?;
         let path = dir.path().join(CONFIG_FILE);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
         set(&mut app, "project.name", "rust_pro")?;
-        save(&mut app, dir.path())?;
         assert_eq!(status(&app), "✓ saved overbrainer.toml");
         let mode = |path: &Path| -> std::io::Result<u32> {
             Ok(std::fs::metadata(path)?.permissions().mode() & 0o7777)
@@ -2083,16 +2359,13 @@ mod tests {
         assert_eq!(mode(&path)?, 0o640);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755))?;
         set(&mut app, "project.name", "rust_suid")?;
-        save(&mut app, dir.path())?;
         assert_eq!(status(&app), "✓ saved overbrainer.toml");
         assert_eq!(mode(&path)?, 0o755, "never setuid, setgid or sticky");
         set(&mut app, "project.name", "rust_pro")?;
-        save(&mut app, dir.path())?;
         let real = dir.path().join("real.toml");
         std::fs::rename(&path, &real)?;
         std::os::unix::fs::symlink(&real, &path)?;
         set(&mut app, "project.name", "rust_max")?;
-        save(&mut app, dir.path())?;
         assert_eq!(
             status(&app),
             "not saved: overbrainer.toml is a symlink; nothing written, edit it with E"
@@ -2104,7 +2377,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_save_never_blocks_on_a_fifo() -> TestResult {
+    fn a_write_never_blocks_on_a_fifo() -> TestResult {
         let dir = tempfile::tempdir()?;
         rustix::fs::mkfifoat(
             rustix::fs::CWD,
@@ -2154,11 +2427,11 @@ mod tests {
     }
 
     #[test]
-    fn quitting_or_a_signal_waits_for_a_save_then_notes_it() -> TestResult {
+    fn quitting_or_a_signal_waits_for_a_write_then_notes_it() -> TestResult {
         for signal in [false, true] {
             let (dir, mut app) = editing_app()?;
-            set(&mut app, "project.name", "rust_pro")?;
-            let effects = press(&mut app, &[KeyCode::Char('s')]);
+            type_value(&mut app, "project.name", "rust_pro")?;
+            let effects = app.on_input(&key(KeyCode::Enter));
             let [Effect::Spawn(id, Task::SaveConfig { text, base, env })] = effects.as_slice()
             else {
                 return Err(format!("{effects:?}").into());
@@ -2176,11 +2449,11 @@ mod tests {
                 );
                 press(&mut app, &[KeyCode::Char('y')]);
             }
-            assert_eq!(app.exit, None, "waits for the save");
+            assert_eq!(app.exit, None, "waits for the write");
             let saved = save_config(dir.path(), text, base, env).map(Box::new);
             app.on_done(*id, Ok(Done::ConfigSaved(saved)));
             assert!(app.exit.is_some());
-            assert!(app.project_view.pending.is_none());
+            assert!(written(dir.path())?.contains("rust_pro"));
             assert!(
                 app.exit_notes
                     .contains(&"overbrainer.toml was saved".to_string()),
@@ -2188,6 +2461,19 @@ mod tests {
                 app.exit_notes
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn no_write_starts_while_quitting() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        app.leaving = Some(crate::tui::app::Exit::Quit);
+        set(&mut app, "project.name", "rust_pro")?;
+        let Some(Form::Value { error, .. }) = &app.project_view.form else {
+            return Err("the form closed".into());
+        };
+        assert_eq!(error.as_deref(), Some("quitting; no save starts"));
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG);
         Ok(())
     }
 
@@ -2216,9 +2502,11 @@ mod tests {
         }
     }
 
-    /// The picker open lists `entries` (and `gpus`), read by `id`.
+    /// The picker open lists `entries` (and `gpus`), read by `id`; the write
+    /// it starts is run.
     fn listed(app: &mut App, id: TaskId, entries: Vec<Entry>, gpus: Vec<GpuType>) {
-        app.on_done(id, Ok(Done::Catalog(Ok(Listed { entries, gpus }))));
+        let effects = app.on_done(id, Ok(Done::Catalog(Ok(Listed { entries, gpus }))));
+        run_saves(app, effects);
     }
 
     fn shown(app: &mut App, key: &str) -> Result<String, String> {
@@ -2230,7 +2518,7 @@ mod tests {
     }
 
     #[test]
-    fn picking_gpus_writes_an_ordered_list_to_the_pending_document() -> TestResult {
+    fn picking_gpus_writes_an_ordered_list() -> TestResult {
         let (dir, mut app) = editing_app()?;
         let (id, query) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
         assert_eq!(
@@ -2255,14 +2543,10 @@ mod tests {
             ],
         );
         assert!(!picker_open(&app));
-        let gpus = field(&mut app, "targets.gpu_cloud.gpu_types")?;
-        assert!(gpus.changed, "a pending change");
         assert_eq!(
-            gpus.shown.text(),
+            shown(&mut app, "targets.gpu_cloud.gpu_types")?,
             "NVIDIA RTX 2000 Ada Generation, NVIDIA A40"
         );
-        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "nothing written yet");
-        save(&mut app, dir.path())?;
         let text = written(dir.path())?;
         assert!(
             text.contains(r#"gpu_types = ["NVIDIA RTX 2000 Ada Generation", "NVIDIA A40"]"#),
@@ -2354,11 +2638,11 @@ mod tests {
 
     #[test]
     fn no_gpu_type_chosen_changes_nothing() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+        let (dir, mut app) = editing_app()?;
         let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
         listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
         press(&mut app, &[KeyCode::Char(' '), KeyCode::Enter]);
-        assert!(app.project_view.pending.is_none());
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG);
         assert_eq!(
             status(&app),
             "targets.gpu_cloud.gpu_types: choose a GPU type or auto; nothing changed"
@@ -2369,13 +2653,13 @@ mod tests {
     fn volumes() -> Vec<Entry> {
         volume_entries(&[
             NetworkVolume {
-                id: "vol-eu".into(),
+                id: "voleu".into(),
                 name: "alpha".into(),
                 size: 100,
                 data_center: "EU-RO-1".into(),
             },
             NetworkVolume {
-                id: "vol-us".into(),
+                id: "volus".into(),
                 name: "zeta".into(),
                 size: 50,
                 data_center: "US-KS-2".into(),
@@ -2384,14 +2668,15 @@ mod tests {
     }
 
     #[test]
-    fn picking_a_volume_sets_it_and_its_single_data_center() -> TestResult {
+    fn picking_a_volume_writes_it_and_its_single_data_center_at_once() -> TestResult {
         let (_dir, mut app) = editing_app()?;
         let centers = FieldPath::Target {
             name: "gpu_cloud".into(),
             field: "data_center_ids",
         };
         let two = FieldValue::List(vec!["US-KS-2".into(), "CA-MTL-1".into()]);
-        app.apply(&centers, Some(&two))?;
+        edit_now(&mut app, &centers, Some(&two))?;
+        let two_centers = app.config.as_ref().map(|config| config.text.clone());
         let (id, query) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
         assert_eq!(query.kind, CatalogKind::Volumes);
         listed(&mut app, id, volumes(), Vec::new());
@@ -2399,7 +2684,7 @@ mod tests {
         press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
         assert_eq!(
             shown(&mut app, "targets.gpu_cloud.network_volume_id")?,
-            "vol-eu"
+            "voleu"
         );
         assert_eq!(
             shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
@@ -2407,7 +2692,13 @@ mod tests {
         );
         assert_eq!(
             status(&app),
-            "targets.gpu_cloud.data_center_ids = EU-RO-1, the volume's data center"
+            "✓ saved overbrainer.toml; targets.gpu_cloud.data_center_ids = EU-RO-1, the \
+             volume's data center"
+        );
+        assert_eq!(
+            Some(before_last_write(&app)?.to_string()),
+            two_centers,
+            "both in one write"
         );
         // none unsets the volume and leaves the data centers.
         let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
@@ -2462,7 +2753,7 @@ mod tests {
         app.status = None;
         let (id, _) = open_picker_on(&mut app, key)?;
         listed(&mut app, id, centers(), Vec::new());
-        press(&mut app, &[KeyCode::Enter]);
+        assert!(press(&mut app, &[KeyCode::Enter]).is_empty(), "no write");
         assert_eq!(status(&app), "");
         // Typed instead: refused in the form.
         open_picker_on(&mut app, key)?;
@@ -2507,19 +2798,20 @@ mod tests {
     #[test]
     fn a_typed_volume_the_catalog_lists_sets_its_data_center() -> TestResult {
         let (_dir, mut app) = editing_app()?;
-        type_volume(&mut app, "vol-eu", Some(volumes()))?;
+        type_volume(&mut app, "voleu", Some(volumes()))?;
         let key = "targets.gpu_cloud.data_center_ids";
         assert_eq!(shown(&mut app, key)?, "EU-RO-1");
         // Typed again, while the listing is still read: the one read is used.
-        type_volume(&mut app, "vol-us", None)?;
+        type_volume(&mut app, "volus", None)?;
         assert_eq!(
             shown(&mut app, "targets.gpu_cloud.network_volume_id")?,
-            "vol-us"
+            "volus"
         );
         assert_eq!(shown(&mut app, key)?, "US-KS-2");
         assert_eq!(
             status(&app),
-            "targets.gpu_cloud.data_center_ids = US-KS-2, the volume's data center"
+            "✓ saved overbrainer.toml; targets.gpu_cloud.data_center_ids = US-KS-2, the \
+             volume's data center"
         );
         Ok(())
     }
@@ -2527,7 +2819,7 @@ mod tests {
     #[test]
     fn a_typed_volume_the_catalog_lacks_leaves_the_data_centers_free() -> TestResult {
         let (_dir, mut app) = editing_app()?;
-        type_volume(&mut app, "vol-eu", Some(volumes()))?;
+        type_volume(&mut app, "voleu", Some(volumes()))?;
         type_volume(&mut app, "volnew", Some(volumes()))?;
         let key = "targets.gpu_cloud.data_center_ids";
         assert_eq!(shown(&mut app, key)?, "EU-RO-1", "unchanged");
@@ -2574,13 +2866,15 @@ mod tests {
             name: "gpu_cloud".into(),
             field,
         };
-        app.apply(
-            &target("network_volume_id"),
-            Some(&FieldValue::Text("volnew".into())),
-        )?;
-        app.apply(
+        edit_now(
+            &mut app,
             &target("data_center_ids"),
             Some(&FieldValue::List(vec!["EU-RO-1".into()])),
+        )?;
+        edit_now(
+            &mut app,
+            &target("network_volume_id"),
+            Some(&FieldValue::Text("volnew".into())),
         )?;
         let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
         listed(&mut app, id, volumes(), Vec::new());
@@ -2596,26 +2890,33 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_volume_listed_later_gets_its_data_center() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+    fn a_typed_volume_listed_later_gets_its_data_center_in_its_own_write() -> TestResult {
+        let (dir, mut app) = editing_app()?;
         let key = "targets.gpu_cloud.data_center_ids";
-        assert!(type_in(
+        // A volume needs one data center: without it, the file does not
+        // validate and the form keeps the value.
+        assert!(!type_in(
             &mut app,
             "targets.gpu_cloud.network_volume_id",
-            "vol-us"
+            "volus"
         )?);
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG);
+        assert!(type_in(&mut app, key, "EU-RO-1")?);
         assert!(
-            type_in(&mut app, key, "EU-RO-1")?,
+            type_in(&mut app, "targets.gpu_cloud.network_volume_id", "volus")?,
             "not listed yet: allowed"
         );
+        let before = written(dir.path())?;
         let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
         listed(&mut app, id, volumes(), Vec::new());
         assert_eq!(shown(&mut app, key)?, "US-KS-2", "reconciled");
         assert_eq!(
             status(&app),
-            "targets.gpu_cloud.data_center_ids = US-KS-2, the network volume's data center"
+            "✓ saved overbrainer.toml; targets.gpu_cloud.data_center_ids = US-KS-2, the \
+             network volume's data center"
         );
-        assert!(field(&mut app, key)?.changed, "a pending change");
+        assert!(written(dir.path())?.contains("data_center_ids = [\"US-KS-2\"]"));
+        assert_eq!(before_last_write(&app)?, before, "a write of its own");
         press(&mut app, &[KeyCode::Esc]);
         assert!(!type_in(&mut app, key, "EU-RO-1")?, "refused now");
         assert_eq!(shown(&mut app, key)?, "US-KS-2");
@@ -2623,14 +2924,17 @@ mod tests {
     }
 
     #[test]
-    fn a_listing_reconciles_every_target_and_says_it_once() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+    fn a_listing_reconciles_every_target_in_one_write_and_says_it_once() -> TestResult {
+        let (dir, mut app) = editing_app()?;
         let config = PROJECT_CONFIG.replace(
             "max_hours = 6\n",
             "max_hours = 6\nnetwork_volume_id = \"voleu\"\ndata_center_ids = [\"US-KS-2\"]\n\n\
              [targets.gpu_two]\nkind = \"runpod\"\ngpu_types = [\"NVIDIA A40\"]\n\
-             max_hours = 6\nnetwork_volume_id = \"volus\"\ndata_center_ids = [\"EU-RO-1\"]\n",
+             max_hours = 6\nnetwork_volume_id = \"volus\"\ndata_center_ids = [\"EU-RO-1\"]\n\n\
+             [targets.gpu_three]\nkind = \"runpod\"\ngpu_types = [\"NVIDIA A40\"]\n\
+             max_hours = 6\nnetwork_volume_id = \"volus\"\ndata_center_ids = [\"CA-MTL-1\"]\n",
         );
+        std::fs::write(dir.path().join(CONFIG_FILE), &config)?;
         let read = crate::tui::project::ProjectConfig::new(&config, &app.env)?;
         app.set_config(read);
         let mut follow =
@@ -2653,29 +2957,33 @@ mod tests {
         ]);
         let (id, _) = open_picker_on(&mut app, "targets.gpu_two.network_volume_id")?;
         listed(&mut app, id, volumes, Vec::new());
-        assert_eq!(
-            shown(&mut app, "targets.gpu_two.data_center_ids")?,
-            "US-KS-2"
-        );
+        for name in ["gpu_two", "gpu_three"] {
+            assert_eq!(
+                shown(&mut app, &format!("targets.{name}.data_center_ids"))?,
+                "US-KS-2"
+            );
+        }
         assert_eq!(
             shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
             "US-KS-2",
             "locked by the run"
         );
+        assert_eq!(before_last_write(&app)?, config, "one write");
         let said = app.status.as_ref().ok_or("nothing said")?;
         assert_eq!(said.severity, Severity::Warn);
         assert_eq!(
             said.text,
-            "targets.gpu_cloud.data_center_ids not set to EU-RO-1, the network volume's data \
-             center: used by run 20260921-a1; targets.gpu_two.data_center_ids = US-KS-2, the \
-             network volume's data center"
+            "✓ saved overbrainer.toml; targets.gpu_cloud.data_center_ids not set to EU-RO-1, \
+             the network volume's data center: used by run 20260921-a1; \
+             targets.gpu_two.data_center_ids = US-KS-2, targets.gpu_three.data_center_ids = \
+             US-KS-2, the network volumes' data centers"
         );
         Ok(())
     }
 
     #[test]
     fn picking_a_template_sets_its_image_and_esc_keeps_the_value() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+        let (dir, mut app) = editing_app()?;
         let templates = template_entries(&[Template {
             id: "t1".into(),
             name: "trainer".into(),
@@ -2686,11 +2994,12 @@ mod tests {
         assert_eq!(query.kind, CatalogKind::Templates);
         listed(&mut app, id, templates.clone(), Vec::new());
         press(&mut app, &[KeyCode::Esc]);
-        assert!(app.project_view.pending.is_none(), "Esc keeps the image");
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "Esc keeps the image");
         let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.image")?;
         listed(&mut app, id, templates, Vec::new());
         press(&mut app, &[KeyCode::End, KeyCode::Enter]);
         assert_eq!(shown(&mut app, "targets.gpu_cloud.image")?, "img/trainer:2");
+        assert!(written(dir.path())?.contains("image = \"img/trainer:2\""));
         Ok(())
     }
 
@@ -2804,14 +3113,17 @@ mod tests {
             shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
             "EU-RO-1, US-KS-2"
         );
-        save(&mut app, dir.path())?;
         let text = written(dir.path())?;
         assert!(text.contains(r#"gpu_types = "auto""#), "{text}");
+        assert!(
+            text.contains(r#"data_center_ids = ["EU-RO-1", "US-KS-2"]"#),
+            "{text}"
+        );
         Ok(())
     }
 
     #[test]
-    fn auto_picked_is_saved_as_a_string() -> TestResult {
+    fn auto_picked_is_written_as_a_string() -> TestResult {
         let (dir, mut app) = editing_app()?;
         let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
         listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
@@ -2819,7 +3131,6 @@ mod tests {
             &mut app,
             &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
         );
-        save(&mut app, dir.path())?;
         assert_eq!(status(&app), "✓ saved overbrainer.toml");
         let text = written(dir.path())?;
         assert!(text.contains(r#"gpu_types = "auto""#), "{text}");
@@ -2828,7 +3139,7 @@ mod tests {
 
     #[test]
     fn the_default_row_of_the_template_picker_unsets_the_image() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+        let (dir, mut app) = editing_app()?;
         let templates = template_entries(&[Template {
             id: "t1".into(),
             name: "trainer".into(),
@@ -2847,13 +3158,13 @@ mod tests {
             Shown::Unset,
             "the pinned default applies"
         );
-        assert!(app.project_view.pending.is_none(), "back to the file");
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "back to the file");
         Ok(())
     }
 
     #[test]
     fn a_lock_taken_while_the_picker_is_open_refuses_the_choice() -> TestResult {
-        let (_dir, mut app) = editing_app()?;
+        let (dir, mut app) = editing_app()?;
         let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.gpu_types")?;
         listed(&mut app, id, gpu_catalog(1)?, gpu_types()?);
         let mut follow =
@@ -2864,7 +3175,7 @@ mod tests {
             &mut app,
             &[KeyCode::Home, KeyCode::Char(' '), KeyCode::Enter],
         );
-        assert!(app.project_view.pending.is_none());
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG);
         assert_eq!(
             status(&app),
             "refused: targets.gpu_cloud.gpu_types is used by run 20260921-a1; \
@@ -2900,22 +3211,25 @@ mod tests {
     #[test]
     fn a_volume_the_catalog_does_not_list_leaves_the_data_centers() -> TestResult {
         let (_dir, mut app) = editing_app()?;
-        let path = FieldPath::Target {
+        let target = |field| FieldPath::Target {
             name: "gpu_cloud".into(),
-            field: "network_volume_id",
+            field,
         };
-        app.apply(&path, Some(&FieldValue::Text("vol-gone".into())))?;
+        let centers = FieldValue::List(vec!["CA-MTL-1".into()]);
+        edit_now(&mut app, &target("data_center_ids"), Some(&centers))?;
+        let volume = FieldValue::Text("volgone".into());
+        edit_now(&mut app, &target("network_volume_id"), Some(&volume))?;
         let (id, _) = open_picker_on(&mut app, "targets.gpu_cloud.network_volume_id")?;
         listed(&mut app, id, volumes(), Vec::new());
-        // none, alpha, zeta, then vol-gone, kept in view: picked again.
+        // none, alpha, zeta, then volgone, kept in view: picked again.
         press(&mut app, &[KeyCode::End, KeyCode::Enter]);
         assert_eq!(
             shown(&mut app, "targets.gpu_cloud.network_volume_id")?,
-            "vol-gone"
+            "volgone"
         );
         assert_eq!(
-            field(&mut app, "targets.gpu_cloud.data_center_ids")?.shown,
-            Shown::Unset
+            shown(&mut app, "targets.gpu_cloud.data_center_ids")?,
+            "CA-MTL-1"
         );
         Ok(())
     }
@@ -2932,27 +3246,28 @@ mod tests {
         Ok((dir, app))
     }
 
-    /// Both `auto` limits are unset and marked changed, the status says so,
-    /// and `s` writes a file without them.
+    /// Both `auto` limits are unset in the same write as the GPU types, and
+    /// the status says so.
     fn limits_dropped(app: &mut App, dir: &Path) -> TestResult {
         for key in [
             "targets.gpu_cloud.min_vram_gb",
             "targets.gpu_cloud.max_price_per_hour",
         ] {
-            let limit = field(app, key)?;
-            assert!(limit.changed, "{key} marked");
-            assert_eq!(limit.shown, Shown::Unset, "{key}");
+            assert_eq!(field(app, key)?.shown, Shown::Unset, "{key}");
         }
         assert_eq!(
             status(app),
-            "targets.gpu_cloud.min_vram_gb and targets.gpu_cloud.max_price_per_hour removed: \
-             only with gpu_types = \"auto\""
+            "✓ saved overbrainer.toml; targets.gpu_cloud.min_vram_gb and \
+             targets.gpu_cloud.max_price_per_hour removed: only with gpu_types = \"auto\""
         );
-        save(app, dir)?;
         let text = written(dir)?;
         assert!(text.contains(r#"gpu_types = ["NVIDIA A40"]"#), "{text}");
         assert!(!text.contains("min_vram_gb") && !text.contains("max_price_per_hour"));
-        assert_eq!(status(app), "✓ saved overbrainer.toml");
+        let before = before_last_write(app)?;
+        assert!(
+            before.contains("gpu_types = \"auto\"\nmin_vram_gb = 24"),
+            "one write: {before}"
+        );
         Ok(())
     }
 

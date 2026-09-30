@@ -148,7 +148,7 @@ In a directory without `overbrainer.toml`, `overbrainer tui` opens an init wizar
 
 `overbrainer tui` has five views, and opens on Project:
 
-- Project (`1`): the effective configuration by section, with env-set and secret values marked, next to the project's stats. Edit a field, add or delete a topic, provider or target, and save to `overbrainer.toml` with its comments kept.
+- Project (`1`): the effective configuration by section, with env-set and secret values marked, next to the project's stats. Edit a field, add or delete a topic, provider or target: each change is validated and saved to `overbrainer.toml` at once, its comments kept, and `u` undoes the last one.
 - Dataset (`2`): the topics, subtopics and questions as a tree, with a question's answer, reasoning, stats and a filter in a detail pane. Edit or delete a question, its answer or a subtopic in place.
 - Pipeline (`3`): run a stage, or auto mode (every stage then training, `A`), and watch its progress, tokens and cost, live as it runs.
 - Training (`4`): the runs, with progress, pod, spend, a loss chart and learning rate and gradient norm sparklines. Start, follow or cancel a run.
@@ -159,12 +159,12 @@ In a directory without `overbrainer.toml`, `overbrainer tui` opens an init wizar
 | `1` to `5`, Tab, Shift-Tab | Switch view. |
 | `?` | The keys of the current view. |
 | `j` `k`, `l` `h`, Enter | Move, expand and collapse (Enter toggles); in Project, move and edit a field. |
-| `/`, `s` | Filter the tree, show the stats; in Project, `s` saves the configuration. |
+| `/`, `s` | Filter the tree, show the stats. |
 | `[` `]` | Jump the detail between a question, its reasoning and its answer. |
 | `e`, `d` | Edit in `$EDITOR`, delete (asks first); in Project, `d` deletes the selected topic, provider or target. |
 | `E`, `D` | Edit or delete only a question's answer; in Project, `E` opens `overbrainer.toml` in `$EDITOR`. |
 | `a` | Attach to a training run; in Project, add a topic, a provider or a target. |
-| `u` | In Project, drop the pending changes (asks first). |
+| `u` | In Project, undo the last write to `overbrainer.toml`. |
 | `r` | Run auto mode or a pipeline stage. |
 | `A` | Auto mode: every stage, then training (asks first). |
 | `t`, `c` | Start, or cancel a training run. |

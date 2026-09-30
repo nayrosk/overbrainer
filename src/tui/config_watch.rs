@@ -111,19 +111,14 @@ impl App {
         }
     }
 
-    /// Applies the configuration read again, as a save does; pending changes
-    /// stay, made on the old file.
+    /// Applies the configuration read again, as a save does; `u` then has
+    /// nothing to undo.
     fn reloaded(&mut self, reread: Reread) -> Vec<Effect> {
         let Reread { config, env } = reread;
         self.env = env;
         let used = self.adopt(config);
-        let said = if self.project_view.pending.is_some() {
-            "✓ config reloaded; the pending changes are on the old file: drop them (u), then \
-             make them again"
-        } else {
-            "✓ config reloaded"
-        };
-        self.say(Severity::Info, said);
+        self.project_view.undo = None;
+        self.say(Severity::Info, "✓ config reloaded");
         let mut effects = vec![used];
         effects.extend(self.reload());
         effects
@@ -162,7 +157,7 @@ mod tests {
     use super::*;
     use crate::config::{DOTENV_FILE, EnvSource, Source, stamp};
     use crate::tui::app::View;
-    use crate::tui::project::{Pending, ProjectConfig};
+    use crate::tui::project::{ProjectConfig, Undo};
     use crate::tui::project_edit::save_config;
     use crate::tui::snapshots::{
         NOW, PROJECT_CONFIG, SECRET, at, draw, key, project_app, project_env, text,
@@ -389,10 +384,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_changes_stay_and_their_save_is_refused_on_the_old_file() -> TestResult {
+    fn a_reload_leaves_nothing_to_undo() -> TestResult {
         let (dir, mut app) = watched()?;
-        let old = app.config.as_ref().map(Pending::new);
-        app.project_view.pending = old;
+        app.project_view.undo = Some(Undo {
+            before: PROJECT_CONFIG.replace("rust_expert", "rust_old"),
+            after: PROJECT_CONFIG.to_string(),
+        });
         let (id, _) = tick(&mut app, NOW)?;
         let renamed = PROJECT_CONFIG.replace("rust_expert", "rust_pro");
         app.on_done(
@@ -402,19 +399,12 @@ mod tests {
                 &renamed,
             )?))),
         );
-        assert!(app.project_view.pending.is_some());
-        assert!(status(&app).contains("drop them (u)"), "{}", status(&app));
+        assert_eq!(status(&app), "✓ config reloaded");
+        assert_eq!(app.project_view.undo, None);
         app.view = View::Project;
-        let effects = app.on_input(&key(KeyCode::Char('s')));
-        let [Effect::Spawn(_, Task::SaveConfig { text, base, env })] = effects.as_slice() else {
-            return Err(format!("no save: {effects:?}").into());
-        };
-        assert_eq!(base, PROJECT_CONFIG, "the text the changes were made to");
-        let refused = save_config(dir.path(), text, base, env);
-        assert!(
-            matches!(&refused, Err(crate::tui::project_edit::SaveRefusal::Failed(message)) if message.contains("changed on disk")),
-            "{refused:?}"
-        );
+        assert_eq!(app.on_input(&key(KeyCode::Char('u'))), []);
+        assert_eq!(status(&app), "nothing to undo");
+        assert_eq!(fs::read_to_string(dir.path().join(CONFIG_FILE))?, renamed);
         Ok(())
     }
 
