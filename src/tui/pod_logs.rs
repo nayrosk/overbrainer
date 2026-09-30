@@ -2,8 +2,6 @@
 //! `runs/<run-id>/.pod/pod.log` by the command following it, read by a task
 //! from where the last read stopped, every [`REFRESH`] while it is shown.
 
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -13,7 +11,7 @@ use super::app::{App, Effect, Severity, View};
 use super::follow::REFRESH;
 use super::tasks::{Task, TaskId};
 use crate::logging::{LOG_LINES, LogBuffer, LogLine};
-use crate::runpod::{POD_LOG, PodLogLine, one_line};
+use crate::runpod::{PodLogLine, one_line, parse_kept_line, read_kept_from};
 use crate::runs::{Runs, parse_rfc3339};
 use crate::secrets::redact_line;
 
@@ -83,46 +81,28 @@ pub(super) fn read_pod_log(dir: &Path, run: &str, offset: u64) -> PodLogRead {
         lines: Vec::new(),
         error: None,
     };
-    let path = match Runs::new(dir).run_dir(run) {
-        Ok(run_dir) => run_dir.join(POD_LOG),
+    let run_dir = match Runs::new(dir).run_dir(run) {
+        Ok(run_dir) => run_dir,
         Err(error) => {
             read.error = Some(error.to_string());
             return read;
         },
     };
-    match read_from(&path, offset) {
-        Ok((bytes, start)) => {
+    match read_kept_from(&run_dir, offset) {
+        Ok(Some((bytes, start))) => {
             read.restarted = start != offset;
             let complete = bytes
                 .iter()
                 .rposition(|byte| *byte == b'\n')
                 .map_or(0, |at| at + 1);
             let text = String::from_utf8_lossy(&bytes[..complete]);
-            read.lines = text
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
+            read.lines = text.lines().filter_map(parse_kept_line).collect();
             read.offset = start + u64::try_from(complete).unwrap_or(0);
         },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-        Err(error) => read.error = Some(format!("cannot read {}: {error}", path.display())),
+        Ok(None) => {},
+        Err(error) => read.error = Some(format!("cannot read the pod log: {error}")),
     }
     read
-}
-
-/// The bytes of `path` from `offset`, or from its start when it is now
-/// shorter, with where they start.
-fn read_from(path: &Path, offset: u64) -> io::Result<(Vec<u8>, u64)> {
-    let mut file = File::open(path)?;
-    let start = if file.metadata()?.len() < offset {
-        0
-    } else {
-        offset
-    };
-    file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok((bytes, start))
 }
 
 /// A pod log line as the Logs view keeps it.
@@ -267,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_log_is_read_by_complete_lines_from_an_offset() -> io::Result<()> {
+    fn a_kept_log_is_read_by_complete_lines_from_an_offset() -> std::io::Result<()> {
         let dir = tempfile::tempdir()?;
         let pod = dir.path().join("runs").join(RUN).join(".pod");
         std::fs::create_dir_all(&pod)?;
