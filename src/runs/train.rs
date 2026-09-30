@@ -150,11 +150,14 @@ async fn create_named<E: Executor>(
     target: &str,
     now: SystemTime,
 ) -> Result<RunRecord, RunError> {
+    // Only this call ever claims with it: a directory that holds anything
+    // else belongs to another run.
+    let owner = format!("{:016x}", fastrand::u64(..));
     let mut after = 0;
     loop {
         let (id, n) = runs.claim(base, after)?;
         let remote_dir = format!("{}/{id}", executor.workdir());
-        match executor.claim(&remote_dir).await {
+        match executor.claim(&remote_dir, &owner).await {
             Ok(true) => {
                 let record = preparing(id, executor.workdir(), target, now);
                 runs.save(&record)?;
@@ -173,10 +176,13 @@ async fn create_named<E: Executor>(
     }
 }
 
-/// Claims the run directory of `record` on the target ([`Executor::claim`]),
-/// for a run made by [`create`] before its target existed. Its ID can no longer
-/// change then: when another run owns the directory, the run fails, saved
-/// `Failed` like a run [`start`] cannot start, before anything is copied there.
+/// Claims the run directory of `record` on the target for `owner`
+/// ([`Executor::claim`]), for a run made by [`create`] before its target
+/// existed. `owner` is the run's own value, the same the target itself may
+/// have claimed the directory with already (a Runpod pod's bootstrap does), so
+/// that claim is accepted. The run's ID can no longer change: when another run
+/// owns the directory, the run fails, saved `Failed` like a run [`start`]
+/// cannot start, before anything is copied there.
 ///
 /// # Errors
 ///
@@ -185,8 +191,9 @@ async fn create_named<E: Executor>(
 pub async fn reserve<E: Executor>(
     ctx: &RunCtx<'_, E>,
     record: &mut RunRecord,
+    owner: &str,
 ) -> Result<(), RunError> {
-    let error = match ctx.executor.claim(&record.remote_dir).await {
+    let error = match ctx.executor.claim(&record.remote_dir, owner).await {
         Ok(true) => return Ok(()),
         Ok(false) => RunError::Taken(record.remote_dir.clone()),
         Err(error) => error.into(),
@@ -887,7 +894,11 @@ mod tests {
             "/w"
         }
 
-        fn claim(&self, _dir: &str) -> impl Future<Output = Result<bool, ExecError>> + Send {
+        fn claim(
+            &self,
+            _dir: &str,
+            _owner: &str,
+        ) -> impl Future<Output = Result<bool, ExecError>> + Send {
             ready(Ok(!self.claim_taken))
         }
 
@@ -1149,7 +1160,7 @@ mod tests {
         // there first with the same ID; its own `runs/` is elsewhere.
         assert!(
             executor
-                .claim(&format!("{}/{base}", executor.workdir()))
+                .claim(&format!("{}/{base}", executor.workdir()), "elsewhere")
                 .await?
         );
         let record = create_named(&runs, &executor, base, "box", now).await?;
@@ -1200,7 +1211,7 @@ mod tests {
             ..Fake::new(JobStatus::Running)
         };
         let mut record = create(&runs, "demo", fake.workdir(), "cloud")?;
-        let result = reserve(&ctx(&runs, &fake, &bus), &mut record).await;
+        let result = reserve(&ctx(&runs, &fake, &bus), &mut record, "mine").await;
         assert!(matches!(&result, Err(RunError::Taken(dir)) if *dir == record.remote_dir));
         let saved = runs.load(&record.id)?;
         assert_eq!(saved.state, RunState::Failed);
@@ -1212,8 +1223,53 @@ mod tests {
             "{saved:?}"
         );
         let mut free = create(&runs, "demo", "/w", "cloud")?;
-        reserve(&ctx(&runs, &Fake::new(JobStatus::Running), &bus), &mut free).await?;
+        reserve(
+            &ctx(&runs, &Fake::new(JobStatus::Running), &bus),
+            &mut free,
+            "mine",
+        )
+        .await?;
         assert_eq!(runs.load(&free.id)?.state, RunState::Preparing);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reserve_accepts_the_runs_own_claim_and_refuses_another()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let target = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let executor = crate::exec::LocalExecutor::new(target.path())?;
+        let ctx = RunCtx {
+            runs: &runs,
+            executor: &executor,
+            bus: &bus,
+            poll: Duration::from_millis(1),
+        };
+        // As a pod's bootstrap claims it, with the run's own value.
+        let mut ours = create(&runs, "demo", executor.workdir(), "cloud")?;
+        assert!(
+            executor
+                .claim(&ours.remote_dir, "ssh-ed25519 AAAAours")
+                .await?
+        );
+        reserve(&ctx, &mut ours, "ssh-ed25519 AAAAours").await?;
+        assert_eq!(runs.load(&ours.id)?.state, RunState::Preparing);
+        // Claimed by a run of another checkout.
+        let mut theirs = create(&runs, "demo", executor.workdir(), "cloud")?;
+        assert!(
+            executor
+                .claim(&theirs.remote_dir, "ssh-ed25519 AAAAtheirs")
+                .await?
+        );
+        let refused = reserve(&ctx, &mut theirs, "ssh-ed25519 AAAAours").await;
+        assert!(matches!(refused, Err(RunError::Taken(_))), "{refused:?}");
+        assert_eq!(runs.load(&theirs.id)?.state, RunState::Failed);
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&theirs.remote_dir).join(crate::exec::CLAIM_FILE))?,
+            "ssh-ed25519 AAAAtheirs\n"
+        );
         Ok(())
     }
 

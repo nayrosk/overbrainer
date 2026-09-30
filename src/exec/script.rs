@@ -85,19 +85,22 @@ pub fn status_script(dir: &str, pid: u32) -> String {
     )
 }
 
-/// Claims the run directory `dir`, as [`Executor::claim`](super::Executor::claim)
-/// does: creates `dir` and its parents, then [`CLAIM_FILE`] with `set -C`, whose
-/// `O_EXCL` open fails when the file exists. Prints `claimed`, or `taken` when the
-/// marker was already there; exits `1` with a message when neither can be made.
+/// Claims the run directory `dir` for `owner`, as
+/// [`Executor::claim`](super::Executor::claim) does: creates `dir` and its
+/// parents, then [`CLAIM_FILE`] holding `owner` with `set -C`, whose `O_EXCL`
+/// open fails when the file exists. Prints `claimed` when it made the marker or
+/// the marker already holds `owner`, `taken` when it holds anything else; exits
+/// `1` with a message when neither can be made.
 #[must_use]
-pub fn claim_script(dir: &str) -> String {
+pub fn claim_script(dir: &str, owner: &str) -> String {
     format!(
-        "mkdir -p -- {dir} || exit 1
-         if (set -C; : > {marker}) 2>/dev/null; then echo claimed
-         elif [ -e {marker} ]; then echo taken
-         else echo \"cannot create {CLAIM_FILE} in the run directory\" >&2; exit 1; fi
-",
+        "mkdir -p -- {dir} || exit 1\n\
+         if (set -C; printf '%s\\n' {owner} > {marker}) 2>/dev/null; then echo claimed\n\
+         elif [ -f {marker} ]; then\n\
+         if [ \"$(cat {marker})\" = {owner} ]; then echo claimed; else echo taken; fi\n\
+         else echo \"cannot create {CLAIM_FILE} in the run directory\" >&2; exit 1; fi\n",
         dir = quote(dir),
+        owner = quote(owner),
         marker = quote(&format!("{dir}/{CLAIM_FILE}"))
     )
 }
@@ -742,19 +745,19 @@ mod tests {
             let dir = tempdir()?;
             let run = dir.path().join("a b/run_1");
             let run = run.to_string_lossy();
-            let claim = || shell.run(&claim_script(&run)).output();
-            let first = claim()?;
-            assert!(first.status.success(), "{shell}");
+            let claim = |owner: &str| -> Result<String, Box<dyn std::error::Error>> {
+                let output = shell.run(&claim_script(&run, owner)).output()?;
+                assert!(output.status.success(), "{shell}");
+                Ok(String::from_utf8(output.stdout)?)
+            };
+            let owner = "ssh-ed25519 AAAA'x";
+            assert_eq!(claim(owner)?, "claimed\n", "{shell}");
+            // The same run again, such as a pod restarted on its volume.
+            assert_eq!(claim(owner)?, "claimed\n", "{shell}");
+            assert_eq!(claim("other")?, "taken\n", "{shell}");
             assert_eq!(
-                String::from_utf8_lossy(&first.stdout),
-                "claimed\n",
-                "{shell}"
-            );
-            let second = claim()?;
-            assert!(second.status.success(), "{shell}");
-            assert_eq!(
-                String::from_utf8_lossy(&second.stdout),
-                "taken\n",
+                fs::read_to_string(dir.path().join("a b/run_1").join(CLAIM_FILE))?,
+                format!("{owner}\n"),
                 "{shell}"
             );
             // A directory where the marker cannot be made at all is an error,
@@ -762,7 +765,7 @@ mod tests {
             let blocked = dir.path().join("file");
             fs::write(&blocked, b"")?;
             let failed = shell
-                .run(&claim_script(&blocked.join("run").to_string_lossy()))
+                .run(&claim_script(&blocked.join("run").to_string_lossy(), owner))
                 .output()?;
             assert!(!failed.status.success(), "{shell}");
             assert!(failed.stdout.is_empty(), "{shell}");

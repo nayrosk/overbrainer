@@ -188,10 +188,13 @@ impl Job<'_> {
         // The run directory is claimed before anything is copied: on a network
         // volume, a run from another checkout could own it.
         let run_ctx = self.run_ctx(&executor);
+        // The run's own value, the one its pod's bootstrap claimed the directory
+        // with: the pod's public host key, unique to the run.
+        let owner = pod.host_key.clone();
         let started_run = interrupt
             .shield(async {
                 let mut record = record;
-                reserve(&run_ctx, &mut record).await?;
+                reserve(&run_ctx, &mut record, &owner).await?;
                 start(&run_ctx, self.trainer, launch, record).await
             })
             .await;

@@ -199,8 +199,9 @@ impl Executor for SshExecutor {
         &self.workdir
     }
 
-    async fn claim(&self, dir: &str) -> Result<bool, ExecError> {
-        let output = run(&self.session, &claim_script(dir), "claim the run directory").await?;
+    async fn claim(&self, dir: &str, owner: &str) -> Result<bool, ExecError> {
+        let script = claim_script(dir, owner);
+        let output = run(&self.session, &script, "claim the run directory").await?;
         match String::from_utf8_lossy(&output).trim() {
             "claimed" => Ok(true),
             "taken" => Ok(false),

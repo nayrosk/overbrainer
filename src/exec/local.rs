@@ -202,7 +202,8 @@ impl LocalExecutor {
 }
 
 /// [`Executor::claim`] on this machine.
-fn claim_dir(dir: &Path) -> Result<bool, ExecError> {
+fn claim_dir(dir: &Path, owner: &str) -> Result<bool, ExecError> {
+    use std::io::Write as _;
     fs::create_dir_all(dir).map_err(io_error(dir))?;
     let marker = dir.join(CLAIM_FILE);
     match fs::OpenOptions::new()
@@ -210,8 +211,14 @@ fn claim_dir(dir: &Path) -> Result<bool, ExecError> {
         .create_new(true)
         .open(&marker)
     {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Ok(mut file) => {
+            writeln!(file, "{owner}").map_err(io_error(&marker))?;
+            Ok(true)
+        },
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let held = fs::read_to_string(&marker).map_err(io_error(&marker))?;
+            Ok(held.strip_suffix('\n') == Some(owner))
+        },
         Err(e) => Err(io_error(&marker)(e)),
     }
 }
@@ -221,8 +228,12 @@ impl Executor for LocalExecutor {
         &self.workdir
     }
 
-    fn claim(&self, dir: &str) -> impl Future<Output = Result<bool, ExecError>> + Send {
-        ready(claim_dir(Path::new(dir)))
+    fn claim(
+        &self,
+        dir: &str,
+        owner: &str,
+    ) -> impl Future<Output = Result<bool, ExecError>> + Send {
+        ready(claim_dir(Path::new(dir), owner))
     }
 
     async fn upload(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {

@@ -439,6 +439,7 @@ fn request(plan: &PodPlan<'_>, keep: bool, attempt: &Attempt) -> CreatePod {
         keep,
         api_url: plan.api_url,
         authorized_key: &plan.keys.client_public,
+        claim: &plan.keys.host_public,
     });
     CreatePod {
         name: attempt.name.clone(),

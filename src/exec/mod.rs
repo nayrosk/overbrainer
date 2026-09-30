@@ -59,7 +59,8 @@ pub const CANCELLING_FILE: &str = "cancelling";
 /// `pid`, or an [`EXIT_FILE`] written before the cancel finished, can change it.
 pub const CANCEL_FILE: &str = "cancelled";
 /// Marker [`Executor::claim`] creates, exclusively, in a new run's directory on
-/// the target: the run directory belongs to the run that created it.
+/// the target. It holds its run's owner value: the run directory belongs to the
+/// run with that value.
 pub const CLAIM_FILE: &str = ".claim";
 
 /// Errors from running or reaching a job.
@@ -243,17 +244,20 @@ pub trait Executor: Send + Sync {
     /// Directory holding the run directories on the target, absolute.
     fn workdir(&self) -> &str;
 
-    /// Claims the directory `dir` for a new run: creates it and its parents, then
-    /// [`CLAIM_FILE`] in it, exclusively. Returns false, and changes nothing, when
-    /// [`CLAIM_FILE`] is already there: another run owns `dir`, for example one
+    /// Claims the directory `dir` for the run whose owner value is `owner`:
+    /// creates it and its parents, then [`CLAIM_FILE`] in it, exclusively,
+    /// holding `owner`. A [`CLAIM_FILE`] already there that holds `owner` is a
+    /// claim of the same run, and accepted. Returns false, and changes nothing,
+    /// when it holds anything else: another run owns `dir`, for example one
     /// started in the same second from another checkout of the project against
-    /// the same work directory.
+    /// the same work directory. `owner` is one line.
     ///
     /// # Errors
     ///
     /// Returns an [`ExecError`] when the directory or the marker cannot be
     /// created, or the target cannot be reached.
-    fn claim(&self, dir: &str) -> impl Future<Output = Result<bool, ExecError>> + Send;
+    fn claim(&self, dir: &str, owner: &str)
+    -> impl Future<Output = Result<bool, ExecError>> + Send;
 
     /// Copies the content of the local directory `local` into `remote`, creating it,
     /// except the top-level entries of `local` named in `skip`, which never leave
@@ -399,10 +403,10 @@ impl Executor for AnyExecutor {
         }
     }
 
-    async fn claim(&self, dir: &str) -> Result<bool, ExecError> {
+    async fn claim(&self, dir: &str, owner: &str) -> Result<bool, ExecError> {
         match self {
-            Self::Local(executor) => executor.claim(dir).await,
-            Self::Ssh(executor) => executor.claim(dir).await,
+            Self::Local(executor) => executor.claim(dir, owner).await,
+            Self::Ssh(executor) => executor.claim(dir, owner).await,
         }
     }
 

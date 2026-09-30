@@ -101,10 +101,11 @@ async fn a_run_directory_is_claimed_once_over_ssh() -> TestResult {
         return Ok(());
     };
     let dir = format!("{}/demo_20260930-120000", executor.workdir());
-    assert!(executor.claim(&dir).await?);
-    assert!(!executor.claim(&dir).await?);
+    assert!(executor.claim(&dir, "mine").await?);
+    assert!(executor.claim(&dir, "mine").await?);
+    assert!(!executor.claim(&dir, "other").await?);
     let marker = executor.read_from(&format!("{dir}/.claim"), 0, 16).await?;
-    assert!(marker.is_empty());
+    assert_eq!(marker, b"mine\n");
     Ok(())
 }
 
