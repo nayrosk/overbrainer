@@ -39,7 +39,7 @@ pub fn rfc3339(now: SystemTime) -> String {
 }
 
 /// The time `text` gives in the form [`rfc3339`] writes, `2026-09-22T14:30:05Z`;
-/// `None` for any other form, or a time before 1970.
+/// `None` for any other form, or a year outside 1970 to 9999.
 #[must_use]
 pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
     let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
@@ -51,7 +51,9 @@ pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
     let [year, month, day, hour, minute, second] = fields[..] else {
         return None;
     };
-    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // Four-digit years only, as `rfc3339` writes them: this also keeps the
+    // arithmetic below far from overflowing.
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
     if hour > 23 || minute > 59 || second > 59 {
@@ -66,7 +68,7 @@ pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = (era * 146_097 + doe).checked_sub(719_468)?;
     let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    Some(UNIX_EPOCH + Duration::from_secs(seconds))
+    UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
 }
 
 /// `now` in compact UTC form, UTC, to the second, for use in file names:
@@ -117,6 +119,8 @@ mod tests {
             "2026-13-21T14:13:20Z",
             "2026-09-21T24:00:00Z",
             "1969-12-31T23:59:59Z",
+            "10000-01-01T00:00:00Z",
+            "18446744073709551615-01-01T00:00:00Z",
             "2026-09-21T14:13Z",
             "",
         ] {
