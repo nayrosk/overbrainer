@@ -75,6 +75,8 @@ Training:
 | `a` | Attach: follow the selected run again. |
 | `c` | Cancel the selected run's job (asks first). On a Runpod run still starting, abandon it instead (asks first). |
 | `t` | Start a training run (asks first). |
+| `x` | Hide the failed runs from the list until the TUI restarts (asks first). Nothing is deleted. |
+| `p` | Dismiss the selected run's pod from the view, or show it again. Refused while the run is followed. |
 | `g` `c`, in the start confirmation for a Runpod target | Choose the GPU types or the data centers from the catalog instead of what `overbrainer.toml` has; the choice is saved to `overbrainer.toml` when the run starts. |
 
 Logs:
@@ -120,6 +122,9 @@ The runs of `runs/`, and for the selected one its progress, ETA, pod and estimat
 - `g` and `c` in that confirmation open the catalog picker (no `t`: only picking, never typing) to choose the GPU types or the data centers the run will use instead of what `overbrainer.toml` has; the dialog shows again once the picker closes, with what changed on a line of its own. `y` then saves that choice to `overbrainer.toml` first (validated and written atomically, like `s` in the Project view) and only starts the run once the save succeeds; a refused save (validation, the file changed on disk, a lock) starts nothing: the confirmation closes, its choices are dropped, the status line says why, and `t` opens it again. `g` and `c` are themselves refused while there are pending Project view changes not yet saved or dropped (they are never saved along), while `overbrainer.toml` is being saved, or on a field the environment sets or a running task locks.
 - A start holds the data lock until its job begins and is never interrupted before then. Quitting while a Runpod run is still provisioning offers to abandon it instead of waiting.
 - `a` follows a run again, and `c` cancels its job after a confirmation. A Runpod run still starting has no job to cancel yet, so `c` offers to abandon that run instead, and the TUI stays open. If its pod is still being prepared, the pod is deleted and the run fails. Once its job is being sent, the run is detached, and `c` then cancels it.
+- The pod line shows the state `pod.json` records (`running` once the job started), the rate, the uptime and spend so far, and when the watchdog deletes the pod at the latest. A deleted pod shows when it was deleted, how long it existed and what it cost. The TUI only learns that a pod is gone from `pod.json`: a pod its watchdog deleted while nothing followed the run still shows as it was last recorded, until `overbrainer train attach` or `overbrainer pod ls` finds it gone.
+- `x` hides the failed runs that no task follows, after a confirmation. They stay hidden for as long as the TUI runs, even when `runs/` is read again; their files are kept and `overbrainer runs ls` still lists them. A run that fails later shows until `x` is pressed again.
+- `p` dismisses the selected run's pod: its pod line and its pod column show nothing, until `p` shows them again or the run is followed again. It is refused while a task follows the run, since that pod is live.
 - Leaving the view does not stop following a run: while the TUI is open, its results are still retrieved and its pod deleted on time.
 
 ### Logs (`5`)

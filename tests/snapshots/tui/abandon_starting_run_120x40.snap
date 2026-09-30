@@ -11,7 +11,7 @@ source: src/tui/snapshots.rs
 "  20260921-133200-a1b2                                                                                                  "
 "  … starting                                                                                                            "
 "                                                                                                                        "
-"  pod k3x9abc ready $0.53/h  up 41m (about $0.36)  deleted by the watchdog by 2026-09-21T19:32:20Z                      "
+"  pod k3x9abc ready $0.53/h  up 41m (about $0.36)  the watchdog deletes it by 2026-09-21T19:32:20Z                      "
 "                                                                                                                        "
 "  no metrics yet                                                                                                        "
 "                                                                                                                        "

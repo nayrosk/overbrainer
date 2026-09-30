@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use super::tasks::TaskId;
 use crate::events::Event;
 use crate::runpod::{PodRecord, PodState, PodStatus};
-use crate::runs::{RunRecord, Runs};
+use crate::runs::{RunRecord, RunState, Runs};
 use crate::train::{METRICS_FILE, MetricLine, Pace, TrainMetric, parse_line};
 
 /// A run of `runs/`, with its pod record when it has one.
@@ -278,6 +278,11 @@ pub(super) struct TrainingView {
     pub(super) reading: BTreeMap<String, TaskId>,
     /// The listing warnings already logged: each is logged once.
     pub(super) warned: BTreeSet<String>,
+    /// The runs left out of the list until the TUI restarts, by run ID: the
+    /// failed runs cleared with `x`. Their files stay.
+    pub(super) hidden: BTreeSet<String>,
+    /// The runs whose pod is no longer shown, by run ID: dismissed with `p`.
+    pub(super) dismissed: BTreeSet<String>,
 }
 
 /// The progress a series of metrics shows.
@@ -331,14 +336,16 @@ pub(super) fn read_series(dir: &Path, id: &str) -> Option<Vec<TrainMetric>> {
 }
 
 impl TrainingView {
-    /// Shows the runs of `listing`, keeping the selected run, or selecting the
-    /// run wanted once it is listed. When it failed, the earlier runs stay, with
-    /// its error. Returns the warnings not logged yet.
+    /// Shows the runs of `listing` but the hidden ones, keeping the selected
+    /// run, or selecting the run wanted once it is listed. When it failed, the
+    /// earlier runs stay, with its error. Returns the warnings not logged yet.
     pub(super) fn listed(&mut self, listing: Listing) -> Vec<String> {
         let selected = self.selected_run().map(|row| row.record.id.clone());
         match listing.runs {
             Ok(runs) => {
                 self.runs = runs;
+                let hidden = &self.hidden;
+                self.runs.retain(|row| !hidden.contains(&row.record.id));
                 self.error = None;
             },
             Err(error) => self.error = Some(error),
@@ -359,6 +366,29 @@ impl TrainingView {
             .into_iter()
             .filter(|warning| self.warned.insert(warning.clone()))
             .collect()
+    }
+
+    /// The failed runs no task is on: what `x` clears.
+    pub(super) fn failed_runs(&self) -> Vec<String> {
+        self.runs
+            .iter()
+            .filter(|row| row.record.state == RunState::Failed)
+            .map(|row| row.record.id.clone())
+            .filter(|id| self.task_of(id).is_none())
+            .collect()
+    }
+
+    /// Leaves runs `ids` out of the list until the TUI restarts, keeping the
+    /// selected run when it stays.
+    pub(super) fn hide(&mut self, ids: &[String]) {
+        let selected = self.selected_run().map(|row| row.record.id.clone());
+        self.hidden.extend(ids.iter().cloned());
+        let hidden = &self.hidden;
+        self.runs.retain(|row| !hidden.contains(&row.record.id));
+        if let Some(id) = selected {
+            self.select(&id);
+        }
+        self.selected = self.selected.min(self.runs.len().saturating_sub(1));
     }
 
     /// Selects run `id`, when listed.

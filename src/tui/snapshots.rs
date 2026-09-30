@@ -1195,6 +1195,114 @@ fn training_of_a_run_nothing_follows() -> TestResult {
     Ok(())
 }
 
+/// The pod line of the followed run, whose pod's last event is `ready` while
+/// `pod.json` holds `record`, drawn at 120x40.
+fn pod_line_of(record: crate::runpod::PodRecord) -> Result<String, Box<dyn std::error::Error>> {
+    let mut app = training_app()?;
+    app.training.runs[0].pod = Some(record);
+    if let Some(follow) = app.training.tasks.get_mut(&TaskId(3)) {
+        follow.pod = Some(crate::runpod::PodStatus::Ready {
+            pod_id: crate::runpod::PodId::new("k3x9abc")?,
+            after: Duration::from_secs(180),
+            deadline: Some("2026-09-21T19:32:20Z".into()),
+        });
+    }
+    let rows = text(&draw(&mut app, 120, 40)?);
+    let line = rows
+        .iter()
+        .find(|row| row.trim_start().starts_with("pod k3x9abc"))
+        .ok_or("no pod line")?;
+    Ok(line.trim().to_string())
+}
+
+/// No event marks the job's start, so the pod line reads the state `pod.json`
+/// records, not the pod's last event: a pod whose job runs reads `running`.
+#[test]
+fn the_pod_line_reads_the_recorded_state_over_the_last_event() -> TestResult {
+    let mut record = pod(FOLLOWED)?;
+    record.state = crate::runpod::PodState::Running;
+    let line = pod_line_of(record)?;
+    assert!(
+        line.starts_with("pod k3x9abc running $0.53/h  up 41m"),
+        "{line}"
+    );
+    Ok(())
+}
+
+/// A pod `pod.json` records deleted reads `deleted`, with its final uptime and
+/// spend, whatever its last event said.
+#[test]
+fn a_deleted_pod_reads_deleted_with_its_final_uptime_and_spend() -> TestResult {
+    let mut record = pod(FOLLOWED)?;
+    record.deleted(crate::runpod::DeletedBy::Watchdog, at(NOW - 60));
+    let line = pod_line_of(record)?;
+    assert_eq!(
+        line,
+        "pod k3x9abc deleted at 2026-09-21T14:12:20Z  up 40m  spent about $0.35"
+    );
+    Ok(())
+}
+
+/// A failed Runpod run whose pod line is stale.
+const BROKEN: &str = "20260918-080000-dead";
+
+/// `x` asks, then leaves the failed runs out of the list until the TUI
+/// restarts: a later read of `runs/` keeps them out. With none, it says so.
+#[test]
+fn x_clears_the_failed_runs_from_the_list_after_asking() -> TestResult {
+    let mut app = training_app()?;
+    app.training.runs.push(RunRow {
+        record: run(BROKEN, "gpu_cloud", RunState::Failed),
+        pod: Some(pod(BROKEN)?),
+    });
+    let rows = app.training.runs.clone();
+    app.training.selected = 3;
+    app.on_input(&key(KeyCode::Char('x')));
+    snapshot("training_clear_failed", &mut app)?;
+    app.on_input(&key(KeyCode::Char('y')));
+    let ids = |app: &App| -> Vec<String> {
+        app.training
+            .runs
+            .iter()
+            .map(|row| row.record.id.clone())
+            .collect()
+    };
+    assert_eq!(ids(&app), [FOLLOWED, FINISHED, LEFT]);
+    assert_eq!(app.training.selected, 2);
+    app.training.listed(crate::tui::training::Listing {
+        runs: Ok(rows),
+        skipped: Vec::new(),
+    });
+    assert_eq!(ids(&app), [FOLLOWED, FINISHED, LEFT], "still cleared");
+    app.on_input(&key(KeyCode::Char('x')));
+    assert!(app.overlay.is_none());
+    let said = app.status.as_ref().map(|status| status.text.as_str());
+    assert_eq!(said, Some("no failed run to clear"));
+    Ok(())
+}
+
+/// `p` dismisses the pod of a run nothing follows, line and column, and shows
+/// it again; a followed run's pod stays, and following a run shows its pod.
+#[test]
+fn p_dismisses_the_pod_of_a_run_nothing_follows() -> TestResult {
+    let mut app = training_app()?;
+    let shows = |app: &mut App| -> Result<bool, Infallible> {
+        let rows = text(&draw(app, 120, 40)?);
+        Ok(rows.iter().any(|row| row.contains("k3x9abc")))
+    };
+    app.on_input(&key(KeyCode::Char('p')));
+    assert!(shows(&mut app)?, "followed: the pod stays");
+    app.training.tasks.clear();
+    app.on_input(&key(KeyCode::Char('p')));
+    assert!(!shows(&mut app)?, "dismissed");
+    app.on_input(&key(KeyCode::Char('p')));
+    assert!(shows(&mut app)?, "shown again");
+    app.on_input(&key(KeyCode::Char('p')));
+    app.on_input(&key(KeyCode::Char('a')));
+    assert!(shows(&mut app)?, "followed again: the pod shows");
+    Ok(())
+}
+
 #[test]
 fn the_cancel_dialog_and_the_quit_dialog_of_a_followed_run() -> TestResult {
     let mut app = training_app()?;
@@ -1461,7 +1569,7 @@ fn a_pod_asked_to_be_kept_is_kept_only_once_its_job_starts() -> TestResult {
     pod.keep = true;
     let line = pod_text(&mut app)?;
     assert!(
-        line.contains("kept once its job starts  deleted by the watchdog by 2026-09-21T19:32:20Z"),
+        line.contains("kept once its job starts  the watchdog deletes it by 2026-09-21T19:32:20Z"),
         "{line}"
     );
     assert!(!line.contains("no time limit"), "{line}");

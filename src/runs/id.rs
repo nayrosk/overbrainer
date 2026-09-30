@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// UTC calendar fields of `time`: year, month, day, hour, minute, second. Times
 /// before 1970 read as 1970-01-01.
@@ -38,6 +38,42 @@ pub fn rfc3339(now: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// The time `text` gives in the form [`rfc3339`] writes, `2026-09-22T14:30:05Z`;
+/// `None` for any other form, or a year outside 1970 to 9999.
+#[must_use]
+pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
+    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+    let fields: Vec<u64> = date
+        .split('-')
+        .chain(time.split(':'))
+        .map(|field| field.parse().ok())
+        .collect::<Option<_>>()?;
+    let [year, month, day, hour, minute, second] = fields[..] else {
+        return None;
+    };
+    // Up to 9999, as `rfc3339` writes them: this also keeps the arithmetic
+    // below far from overflowing.
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    // Civil date to days, from Howard Hinnant's `days_from_civil`, for years
+    // from 1970.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year / 400;
+    let yoe = year - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146_097 + doe).checked_sub(719_468)?;
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    let at = UNIX_EPOCH.checked_add(Duration::from_secs(seconds))?;
+    // Only the exact form `rfc3339` writes: no sign, no leading zero, no
+    // impossible date such as February 31.
+    (rfc3339(at) == text).then_some(at)
+}
+
 /// `now` in compact UTC form, UTC, to the second, for use in file names:
 /// `20260922T143005Z`.
 #[must_use]
@@ -55,8 +91,6 @@ pub fn is_valid_run_id(id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     fn at(seconds: u64) -> SystemTime {
@@ -69,6 +103,36 @@ mod tests {
         assert_eq!(rfc3339(at(1_709_164_800)), "2024-02-29T00:00:00Z");
         assert_eq!(rfc3339(at(1_790_035_199)), "2026-09-21T23:59:59Z");
         assert_eq!(rfc3339(at(0)), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_times_read_back() {
+        for seconds in [
+            0,
+            1_709_164_800,
+            1_790_000_000,
+            1_790_035_199,
+            4_102_444_800,
+        ] {
+            assert_eq!(parse_rfc3339(&rfc3339(at(seconds))), Some(at(seconds)));
+        }
+        for text in [
+            "2026-09-21T14:13:20",
+            "2026-09-21 14:13:20Z",
+            "2026-13-21T14:13:20Z",
+            "2026-09-21T24:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "10000-01-01T00:00:00Z",
+            "0000001970-01-01T00:00:00Z",
+            "2026-9-21T14:13:20Z",
+            "2026-09-21T+4:13:20Z",
+            "2026-02-31T00:00:00Z",
+            "18446744073709551615-01-01T00:00:00Z",
+            "2026-09-21T14:13Z",
+            "",
+        ] {
+            assert_eq!(parse_rfc3339(text), None, "{text}");
+        }
     }
 
     #[test]

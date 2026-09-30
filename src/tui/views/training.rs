@@ -21,7 +21,7 @@ use crate::tui::format::duration;
 use crate::tui::motion::Bar;
 use crate::tui::theme::Theme;
 use crate::tui::training::{
-    Ended, Follow, RunActivity, RunRow, float, pod_rate, pod_spend, progress,
+    Ended, Follow, RunActivity, RunRow, TrainingView, float, pod_rate, pod_spend, progress,
 };
 use crate::tui::views::dataset::failed;
 use crate::tui::widgets::bar::bar;
@@ -60,7 +60,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Op
         .map_or(&[][..], Vec::as_slice);
     let ended = view.ended.get(&row.record.id);
     let messages = Paragraph::new(messages(follow, ended, theme)).wrap(Wrap { trim: true });
-    let pod = row.pod.as_ref().map(|record| {
+    let pod = shown_pod(view, row).map(|record| {
         Paragraph::new(pod_line(record, follow.and_then(|f| f.pod.as_ref()), app))
             .wrap(Wrap { trim: true })
     });
@@ -133,6 +133,10 @@ fn render_no_runs(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let text = match (&app.training.error, &app.project.target) {
         (Some(error), _) => failed(error, theme),
+        (None, _) if !app.training.hidden.is_empty() => vec![Line::from(
+            "No runs to show: the failed runs are cleared until the TUI restarts. Press t to \
+             start one.",
+        )],
         (None, Some(target)) => vec![Line::from(format!(
             "No runs yet: press t to start one on {target}."
         ))],
@@ -172,7 +176,7 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
                 row.record.id.clone(),
                 row.record.state.name().to_string(),
                 row.record.target.clone(),
-                row.pod.as_ref().map(pod_summary).unwrap_or_default(),
+                shown_pod(view, row).map(pod_summary).unwrap_or_default(),
                 view.activity(&row.record.id).label().to_string(),
             ])
         })
@@ -200,6 +204,13 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
     ));
     let mut state = TableState::default().with_selected(Some(view.selected));
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// The pod record of `row`, unless its pod was dismissed with `p`.
+fn shown_pod<'a>(view: &TrainingView, row: &'a RunRow) -> Option<&'a PodRecord> {
+    row.pod
+        .as_ref()
+        .filter(|_| !view.dismissed.contains(&row.record.id))
 }
 
 /// What `pod.json` says of a run's pod, as `runs ls` prints it, less the leading
@@ -314,7 +325,8 @@ fn pod_line(record: &PodRecord, latest: Option<&PodStatus>, app: &App) -> Line<'
     Line::from(Span::styled(text, app.theme.dim))
 }
 
-/// The pod line of a deleted pod: its recorded spend, uptime and deletion time.
+/// The pod line of a deleted pod: its deletion time, its final uptime (as its
+/// last event gave it, else from `pod.json`) and its recorded spend.
 fn deleted_line(
     id: &str,
     spend: Option<f64>,
@@ -325,7 +337,7 @@ fn deleted_line(
     if let Some(at) = &record.deleted_at {
         write!(text, " at {at}").ok();
     }
-    if let Some(up) = uptime {
+    if let Some(up) = uptime.or_else(|| record.final_uptime()) {
         write!(text, "  up {}", duration(up)).ok();
     }
     match spend {
@@ -336,7 +348,10 @@ fn deleted_line(
 }
 
 /// The pod line of a pod that exists: its state, rate, uptime and spend so far,
-/// and the watchdog's deadline, or no time limit for a kept pod.
+/// and the watchdog's deadline, or no time limit for a kept pod. The state is
+/// the one `pod.json` records: no event marks the job's start, so the last
+/// event would read `ready` for as long as the job runs. Only while the pod is
+/// being created does the last event say more (the GPU type being tried).
 fn live_line(
     id: &str,
     record: &PodRecord,
@@ -344,7 +359,10 @@ fn live_line(
     spend: Option<f64>,
     app: &App,
 ) -> String {
-    let state = latest.map_or_else(|| record.state.name(), status_name);
+    let state = match (record.state, latest) {
+        (PodState::Creating, Some(status)) => status_name(status),
+        (state, _) => state.name(),
+    };
     let mut text = format!("pod {id} {state}");
     if let Some(rate) = pod_rate(record, latest) {
         write!(text, " ${rate:.2}/h").ok();
@@ -366,7 +384,7 @@ fn live_line(
         text.push_str("  kept once its job starts");
     }
     if let Some(at) = &record.deadline {
-        write!(text, "  deleted by the watchdog by {at}").ok();
+        write!(text, "  the watchdog deletes it by {at}").ok();
     }
     text
 }
