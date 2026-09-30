@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "│ project.name: Name of the project        ││           412k/1.5M cost ?       │"
 "│                                          ││   gen         43k/9.9k $0.0135   │"
 "╰──────────────────────────────────────────╯╰──────────────────────────────────╯"
-" j/k move · Enter edit · a add · d delete · s save       $0.38+  v#.#.#  ? help "
+" j/k move · Enter edit · a add · d delete · u undo       $0.38+  v#.#.#  ? help "

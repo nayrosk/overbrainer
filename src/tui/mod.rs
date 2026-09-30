@@ -138,10 +138,6 @@ pub async fn run(
     let result = event_loop::run(&mut terminal, &mut app, check, observer).await;
     drop(guard);
     app.abandon_edit();
-    if app.project_view.pending.is_some() {
-        app.exit_notes
-            .push("the pending changes to overbrainer.toml were not saved".to_string());
-    }
     for note in &app.exit_notes {
         writeln!(io::stderr(), "{note}").ok();
     }

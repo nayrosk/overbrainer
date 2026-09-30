@@ -206,8 +206,7 @@ pub(super) enum Overlay {
 /// What opened a picker, which its kept choice goes back to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Origin {
-    /// Enter on this field of the Project view: the choice becomes a pending
-    /// edit of it.
+    /// Enter on this field of the Project view: the choice is written to it.
     Field(FieldPath),
     /// `g` or `c` in the dialog starting a run on this Runpod target: the
     /// choice is used for the run and saved on `y`.
@@ -322,10 +321,8 @@ pub(super) enum Action {
     /// Leaving the failed runs `0` out of the Training view's list until the
     /// TUI restarts, asked for with `x`.
     ClearFailed(Vec<String>),
-    /// Taking a topic, a provider or a target out of the pending changes.
+    /// Deleting a topic, a provider or a target from `overbrainer.toml`.
     Remove(Removal),
-    /// Dropping the pending changes to `overbrainer.toml`.
-    DropChanges,
 }
 
 /// What an exit note added while leaving is about.
@@ -761,10 +758,7 @@ impl App {
             Ok(Done::ConfigSaved(saved)) if self.project_view.save == Some(id) => {
                 self.config_saved(saved)
             },
-            Ok(Done::Catalog(listed)) => {
-                self.listed_catalog(id, listed);
-                Vec::new()
-            },
+            Ok(Done::Catalog(listed)) => self.listed_catalog(id, listed),
             Ok(Done::ConfigChecked(checked)) => self.config_checked(id, *checked),
             Ok(
                 Done::Prepared(_)
@@ -852,8 +846,7 @@ impl App {
             return Vec::new();
         }
         if self.catalog_reads.iter().any(|(read, _)| *read == id) {
-            self.listed_catalog(id, Err(error));
-            return Vec::new();
+            return self.listed_catalog(id, Err(error));
         }
         if self.read_failed(id, &error) {
             return Vec::new();
@@ -1032,9 +1025,9 @@ impl App {
     /// and the data centers they hold, its entries shown when it fills the
     /// picker open. Its failure shows in that picker only: once the picker is
     /// closed, nothing is said.
-    fn listed_catalog(&mut self, id: TaskId, listed: Result<Listed, String>) {
+    fn listed_catalog(&mut self, id: TaskId, listed: Result<Listed, String>) -> Vec<Effect> {
         let Some(at) = self.catalog_reads.iter().position(|(read, _)| *read == id) else {
-            return;
+            return Vec::new();
         };
         let (_, kind) = self.catalog_reads.remove(at);
         let volumes = kind == CatalogKind::Volumes && self.volume_read == Some(id);
@@ -1047,23 +1040,28 @@ impl App {
             }
             listed.entries
         });
-        if volumes && entries.is_ok() {
-            self.reconcile_volume_centers();
-        }
+        let effects = if volumes && entries.is_ok() {
+            self.reconcile_volume_centers()
+        } else {
+            Vec::new()
+        };
         if let Some(Overlay::Picker(picking)) = &mut self.overlay
             && picking.task == id
         {
             picking.picker.loaded(entries);
         }
+        effects
     }
 
     /// A picker opened from `origin` kept `picked`: it goes back there.
     fn picked(&mut self, origin: Origin, picked: Picked) -> Vec<Effect> {
         match origin {
             Origin::Field(path) => self.picked_field(&path, picked),
-            Origin::Start(target) => self.picked_start(&target, picked),
+            Origin::Start(target) => {
+                self.picked_start(&target, picked);
+                Vec::new()
+            },
         }
-        Vec::new()
     }
 
     /// `r`: the menu of pipeline commands, unless the data is locked or the TUI
@@ -1302,7 +1300,7 @@ impl App {
         }
         if self.view == View::Project && self.project_view.form.is_some() {
             if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
-                self.on_form_key(key.code);
+                return self.on_form_key(key.code);
             }
             return Vec::new();
         }
@@ -1466,17 +1464,7 @@ impl App {
             Action::Abandon(tasks) => self.abandon(&tasks),
             Action::AbandonStart(task) => self.abandon_start(task),
             Action::ClearFailed(runs) => self.clear_failed(&runs),
-            Action::Remove(removal) => {
-                self.remove(&removal);
-                Vec::new()
-            },
-            Action::DropChanges => {
-                if !self.refuse_change() {
-                    self.drop_changes();
-                    self.say(Severity::Info, "pending changes dropped");
-                }
-                Vec::new()
-            },
+            Action::Remove(removal) => self.remove(&removal),
             Action::Delete { deletion, counts } => {
                 if self.locked() {
                     return Vec::new();
@@ -1763,12 +1751,6 @@ impl App {
         }
         if self.project_view.save.is_some() {
             text.push("overbrainer.toml is being saved: quitting waits for it.".to_string());
-        }
-        if self.project_view.pending.is_some() {
-            text.push(
-                "The pending changes to overbrainer.toml are not saved: quitting drops them."
-                    .to_string(),
-            );
         }
         text.extend(self.training_quit_text());
         if text.is_empty() {
@@ -2136,11 +2118,10 @@ mod tests {
     fn the_project_view_moves_by_field_and_by_page() -> TestResult {
         let mut app = app();
         let config = crate::tui::snapshots::project_config()?;
-        let count =
-            crate::tui::project::rows(&config, None, &crate::tui::project::Locks::default())
-                .iter()
-                .filter(|row| matches!(row, crate::tui::project::Row::Field(_)))
-                .count();
+        let count = crate::tui::project::rows(&config, &crate::tui::project::Locks::default())
+            .iter()
+            .filter(|row| matches!(row, crate::tui::project::Row::Field(_)))
+            .count();
         app.config = Some(config);
         press(
             &mut app,
@@ -5003,12 +4984,16 @@ mod tests {
         })
     }
 
-    /// The `gpu_types` the Project view shows.
-    fn gpu_types_shown(app: &App) -> Option<String> {
-        app.project_view
-            .pending
-            .as_ref()
-            .and_then(|pending| pending.doc.get(&gpu_cloud("gpu_types")))
+    /// The `gpu_types` the write `effects` start sets.
+    fn gpu_types_written(effects: &[Effect]) -> Option<String> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Spawn(_, Task::SaveConfig { text, .. }) => {
+                crate::config::edit::ConfigDoc::parse(text)
+                    .ok()?
+                    .get(&gpu_cloud("gpu_types"))
+            },
+            _ => None,
+        })
     }
 
     fn picker_of(app: &App) -> Option<&Picker> {
@@ -5032,10 +5017,10 @@ mod tests {
         app.on_done(id, Ok(Done::Catalog(Ok(gpus_listed()?))));
         assert!(app.work().is_empty());
         assert!(app.gpu_catalog.is_some(), "kept for the hints");
-        press(&mut app, &[KeyCode::Char('J'), KeyCode::Enter]);
+        let effects = press(&mut app, &[KeyCode::Char('J'), KeyCode::Enter]);
         assert_eq!(app.overlay, None);
         assert_eq!(
-            gpu_types_shown(&app).as_deref(),
+            gpu_types_written(&effects).as_deref(),
             Some("NVIDIA GeForce RTX 4090, NVIDIA A40"),
             "back to the field that opened it"
         );
@@ -5045,15 +5030,15 @@ mod tests {
     #[test]
     fn esc_or_ctrl_c_closes_a_picker_and_keeps_nothing() -> TestResult {
         let (mut app, id) = gpu_picker()?;
-        press(&mut app, &[KeyCode::Esc]);
+        assert_eq!(press(&mut app, &[KeyCode::Esc]), []);
         assert_eq!(app.overlay, None);
-        assert!(app.project_view.pending.is_none());
+        assert_eq!(app.project_view.save, None);
         assert_eq!(app.on_done(id, Ok(Done::Catalog(Ok(gpus_listed()?)))), []);
         assert_eq!(app.overlay, None, "a late listing opens nothing");
         let (mut app, _) = gpu_picker()?;
-        app.on_input(&ctrl_c());
+        assert_eq!(app.on_input(&ctrl_c()), []);
         assert_eq!(app.overlay, None);
-        assert!(app.project_view.pending.is_none());
+        assert_eq!(app.project_view.save, None);
         Ok(())
     }
 
@@ -5105,13 +5090,13 @@ mod tests {
         );
         press(&mut app, &[KeyCode::Char('/')]);
         app.on_input(&Event::Paste("A40\n".into()));
-        press(
+        let effects = press(
             &mut app,
             &[KeyCode::Enter, KeyCode::Char(' '), KeyCode::Enter],
         );
         // A40, found through the pasted filter, is taken out.
         assert_eq!(
-            gpu_types_shown(&app).as_deref(),
+            gpu_types_written(&effects).as_deref(),
             Some("NVIDIA GeForce RTX 4090")
         );
         let (mut app, id) = gpu_picker()?;

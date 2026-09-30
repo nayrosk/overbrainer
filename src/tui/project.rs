@@ -1,7 +1,6 @@
 //! The Project view's model: one row per configuration field, built from the
 //! effective settings, the text of `overbrainer.toml`, the keys the environment
-//! sets, the pending changes and what a running stage or training uses; and the
-//! project's stats.
+//! sets and what a running stage or training uses; and the project's stats.
 //! Secrets are never read: a row says `set`, `unset` or `vault ref`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +13,7 @@ use super::pipeline::command_name;
 use super::tasks::TaskId;
 use super::widgets::form::Input;
 use crate::cli::data::Command;
-use crate::config::edit::{Collection, ConfigDoc, EditError, FieldPath, Role};
+use crate::config::edit::{Collection, ConfigDoc, FieldPath, Role};
 use crate::config::fields::{self, FieldKind, FieldSpec, Section, TargetKind};
 use crate::config::{
     Adapter, ConfigError, ENV_PREFIX, Engine, EnvSource, Pipeline, Protocol, RoleModel, Runtime,
@@ -143,8 +142,6 @@ pub(super) struct Field {
     pub(super) lock: Option<String>,
     /// What it is.
     pub(super) help: &'static str,
-    /// Whether a pending change sets it, or adds its table.
-    pub(super) changed: bool,
     /// Why the last save refused it.
     pub(super) error: Option<String>,
 }
@@ -268,128 +265,15 @@ fn roles_of(command: Command) -> Vec<Role> {
     }
 }
 
-/// The changes not saved yet: the edited document, and the dotted keys of the
-/// fields they set to another value and of the tables they add or remove.
-#[derive(Debug, Clone)]
-pub(super) struct Pending {
-    /// `overbrainer.toml` as edited.
-    pub(super) doc: ConfigDoc,
-    /// The file's document the changes were made to: a reload of the file
-    /// leaves it, so the marks stay those of the changes made.
-    pub(super) original: ConfigDoc,
-    /// The text of the file they were made to: a save refuses a file that no
-    /// longer holds it, even once it was read again.
-    pub(super) base: String,
-    /// What changed: `pipeline.seed`, `providers.local`.
-    pub(super) changed: BTreeSet<String>,
-    /// For each topic of `doc`, its position in the file's document; `None`
-    /// for a topic added.
-    origins: Vec<Option<usize>>,
-}
-
-impl Pending {
-    /// No change yet to the document of `config`.
-    pub(super) fn new(config: &ProjectConfig) -> Self {
-        let doc = &config.doc;
-        Self {
-            doc: doc.clone(),
-            original: doc.clone(),
-            base: config.text.clone(),
-            changed: BTreeSet::new(),
-            origins: (0..doc.topic_names().len()).map(Some).collect(),
-        }
-    }
-
-    /// Where the field `path` of the edited document was in the file's
-    /// document: `None` for a field of a topic added.
-    fn original_path(&self, path: &FieldPath) -> Option<FieldPath> {
-        let FieldPath::Topic { index, field, .. } = path else {
-            return Some(path.clone());
-        };
-        let at = self.origins.get(*index).copied().flatten()?;
-        let name = self.original.topic_names().get(at)?.clone();
-        Some(FieldPath::Topic {
-            index: at,
-            name,
-            field,
-        })
-    }
-
-    /// Marks the field `path` changed when its value differs from the one it
-    /// has in the file's document, and unmarks it otherwise.
-    pub(super) fn mark(&mut self, path: &FieldPath) {
-        let before = self.original_path(path).map(|at| self.original.get(&at));
-        let key = path.to_string();
-        if before == Some(self.doc.get(path)) {
-            self.changed.remove(&key);
-        } else {
-            self.changed.insert(key);
-        }
-    }
-
-    /// The topic `old` is now named `new`: what was noted of it follows.
-    pub(super) fn rename(&mut self, old: &str, new: &str) {
-        let (old, new) = (format!("topics.{old}"), format!("topics.{new}"));
-        self.changed = std::mem::take(&mut self.changed)
-            .into_iter()
-            .map(|key| match key.strip_prefix(old.as_str()) {
-                Some(rest) if rest.is_empty() || rest.starts_with('.') => format!("{new}{rest}"),
-                _ => key,
-            })
-            .collect();
-    }
-
-    /// Appends a topic named `name`.
-    ///
-    /// # Errors
-    ///
-    /// Returns what [`ConfigDoc::add_topic`] returns.
-    pub(super) fn add_topic(&mut self, name: &str) -> Result<(), EditError> {
-        let index = self.doc.add_topic(name)?;
-        self.origins.truncate(index);
-        self.origins.push(None);
-        Ok(())
-    }
-
-    /// Removes the `index`-th topic; returns whether it existed.
-    pub(super) fn remove_topic(&mut self, index: usize) -> bool {
-        let removed = self.doc.remove_topic(index);
-        if removed && index < self.origins.len() {
-            self.origins.remove(index);
-        }
-        removed
-    }
-
-    /// Notes that the table `key` was added or removed: a table added then
-    /// removed leaves no mark, and nothing noted inside it stays.
-    pub(super) fn note_table(&mut self, key: &str, added: bool) {
-        let inside = format!("{key}.");
-        self.changed.retain(|noted| !noted.starts_with(&inside));
-        if !added && self.changed.remove(key) {
-            return;
-        }
-        self.changed.insert(key.to_string());
-    }
-
-    /// Whether a change sets `key` or adds its table.
-    fn covers(&self, key: &str) -> bool {
-        self.changed.contains(key)
-            || key
-                .rsplit_once('.')
-                .is_some_and(|(table, _)| self.changed.contains(table))
-    }
-}
-
-/// The rows of `config` with the `pending` changes: project, topics,
+/// The rows of `config`: project, topics,
 /// providers, roles, pipeline, training, targets, then the env-only `runpod`
 /// and the rest. Topics, providers and targets are those of the document,
 /// with the tables only the environment sets.
-pub(super) fn rows(config: &ProjectConfig, pending: Option<&Pending>, locks: &Locks) -> Vec<Row> {
+pub(super) fn rows(config: &ProjectConfig, locks: &Locks) -> Vec<Row> {
     let settings = &config.settings;
     let mut rows = Builder {
         config,
-        doc: pending.map_or(&config.doc, |pending| &pending.doc),
-        pending,
+        doc: &config.doc,
         rows: Vec::new(),
     };
     rows.heading("project");
@@ -612,9 +496,8 @@ struct Table<'a> {
 /// The rows being built.
 struct Builder<'a> {
     config: &'a ProjectConfig,
-    /// The document shown: the pending one, else the file's.
+    /// The document shown, the file's.
     doc: &'a ConfigDoc,
-    pending: Option<&'a Pending>,
     rows: Vec<Row>,
 }
 
@@ -624,19 +507,16 @@ impl Builder<'_> {
     }
 
     /// Every editable field of `table`: its value in the document, else the
-    /// one the environment sets, else its default. A field a pending change
-    /// took out of the document is unset: the value read before no longer
-    /// applies.
+    /// one the environment sets, else its default.
     fn fields(&mut self, table: &Table<'_>) {
         for FieldSpec { name, help, .. } in fields::for_section(table.section) {
             let path = (table.path)(name);
             let key = path.to_string();
             let env = self.config.env.contains(&key);
-            let changed = self.pending.is_some_and(|pending| pending.covers(&key));
             let effective = (table.value)(name);
             let shown = match (env, self.doc.get(&path), effective) {
                 (true, _, Some(value)) | (false, Some(value), _) => Shown::Value(value),
-                (false, None, Some(value)) if !changed => Shown::Default(value),
+                (false, None, Some(value)) => Shown::Default(value),
                 _ => Shown::Unset,
             };
             self.rows.push(Row::Field(Field {
@@ -647,7 +527,6 @@ impl Builder<'_> {
                 env,
                 lock: table.lock.clone(),
                 help,
-                changed,
                 error: None,
             }));
         }
@@ -673,7 +552,6 @@ impl Builder<'_> {
             shown,
             lock,
             help,
-            changed: false,
             error: None,
         }));
     }
@@ -971,25 +849,51 @@ pub(super) enum Form {
         name: String,
         /// The choice selected, among [`Addable::kinds`].
         choice: usize,
+        /// Why the last Enter was refused.
+        error: Option<String>,
     },
 }
 
-/// The Project view's state: the selection, the changes not saved yet, the
-/// form open, and the rows as last built.
+/// What a write of `overbrainer.toml` leaves once it succeeds.
+#[derive(Debug, Default)]
+pub(super) struct Writing {
+    /// The text it replaces, which `u` writes back; `None` for an undo.
+    pub(super) before: Option<String>,
+    /// What else it changed, said after `✓ saved`.
+    pub(super) note: Option<String>,
+    /// Whether that note warns of something left undone.
+    pub(super) warn: bool,
+    /// The table it adds, whose first field is selected once written.
+    pub(super) select: Option<String>,
+}
+
+/// The last write of `overbrainer.toml` from the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Undo {
+    /// The text before it, written back by `u`.
+    pub(super) before: String,
+    /// The text it wrote: `u` refuses a file that no longer holds it.
+    pub(super) after: String,
+}
+
+/// The Project view's state: the selection, the form open, the write running
+/// and the one `u` undoes, and the rows as last built.
 #[derive(Debug, Default)]
 pub(super) struct ProjectView {
     /// Position of the selected field among the fields.
     pub(super) selected: usize,
     /// The first row shown, set at each draw so the selection stays in view.
     pub(super) offset: usize,
-    /// The changes not saved yet.
-    pub(super) pending: Option<Pending>,
     /// Why the last save was refused, by field key.
     pub(super) errors: BTreeMap<String, String>,
     /// The form open, if any.
     pub(super) form: Option<Form>,
     /// The save running, if any.
     pub(super) save: Option<TaskId>,
+    /// What the save running leaves once it succeeds.
+    pub(super) writing: Writing,
+    /// The last write of the TUI, which `u` undoes.
+    pub(super) undo: Option<Undo>,
     /// Whether the editor open is on `overbrainer.toml`.
     pub(super) editing: bool,
     /// Bumped by every change of what the rows show but the locks.
@@ -1006,14 +910,14 @@ impl ProjectView {
         self.selected = self.selected.saturating_add_signed(by).min(last);
     }
 
-    /// Notes that the configuration, the pending changes or the errors changed:
-    /// the rows are built again.
+    /// Notes that the configuration or the errors changed: the rows are built
+    /// again.
     pub(super) fn touch(&mut self) {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// The rows of `config` with the pending changes and `locks`: those built
-    /// last while nothing changed.
+    /// The rows of `config` with `locks`: those built last while nothing
+    /// changed.
     pub(super) fn listing(&mut self, config: Option<&ProjectConfig>, locks: Locks) -> Arc<Listing> {
         if let Some((generation, cached, listing)) = &self.cache
             && *generation == self.generation
@@ -1022,17 +926,10 @@ impl ProjectView {
             return Arc::clone(listing);
         }
         let listing = Arc::new(config.map_or_else(Listing::default, |config| {
-            Listing::new(rows(config, self.pending.as_ref(), &locks), &self.errors)
+            Listing::new(rows(config, &locks), &self.errors)
         }));
         self.cache = Some((self.generation, locks, Arc::clone(&listing)));
         listing
-    }
-
-    /// How many changes are pending.
-    pub(super) fn changes(&self) -> usize {
-        self.pending
-            .as_ref()
-            .map_or(0, |pending| pending.changed.len())
     }
 }
 
@@ -1201,7 +1098,7 @@ mod tests {
 
     #[test]
     fn the_rows_follow_the_file_order_with_the_env_only_tables_last() -> TestResult {
-        let rows = rows(&config()?, None, &Locks::default());
+        let rows = rows(&config()?, &Locks::default());
         let headings: Vec<&str> = rows
             .iter()
             .filter_map(|row| match row {
@@ -1232,7 +1129,7 @@ mod tests {
 
     #[test]
     fn values_come_from_the_file_the_environment_or_the_defaults() -> TestResult {
-        let rows = rows(&config()?, None, &Locks::default());
+        let rows = rows(&config()?, &Locks::default());
         let concurrency = field(&rows, "pipeline.concurrency")?;
         assert_eq!(concurrency.shown, Shown::Value("4".into()));
         assert!(concurrency.env);
@@ -1264,7 +1161,7 @@ mod tests {
 
     #[test]
     fn secrets_show_set_unset_or_vault_ref_and_never_their_value() -> TestResult {
-        let rows = rows(&config()?, None, &Locks::default());
+        let rows = rows(&config()?, &Locks::default());
         // `matches!` with fixed messages: a failure never prints what a secret row shows.
         let key = field(&rows, "providers.nanogpt.api_key")?;
         assert!(
@@ -1303,7 +1200,7 @@ mod tests {
 
     #[test]
     fn the_detail_says_where_a_value_comes_from() -> TestResult {
-        let rows = rows(&config()?, None, &Locks::default());
+        let rows = rows(&config()?, &Locks::default());
         assert_eq!(
             field(&rows, "providers.nanogpt.api_key")?.detail(None),
             "providers.nanogpt.api_key: env only, set \
@@ -1326,7 +1223,7 @@ mod tests {
             stage: Some(("answers", roles_of(Command::Answers))),
             runs: Vec::new(),
         };
-        let rows = rows(&config()?, None, &locks);
+        let rows = rows(&config()?, &locks);
         let locked: Vec<&str> = rows
             .iter()
             .filter_map(|row| match row {
@@ -1357,7 +1254,7 @@ mod tests {
             stage: None,
             runs: vec![("run 20260921-a1".into(), "gpu_cloud".into())],
         };
-        let rows = rows(&config()?, None, &locks);
+        let rows = rows(&config()?, &locks);
         for key in ["training.epochs", "targets.gpu_cloud.max_hours"] {
             assert_eq!(
                 field(&rows, key)?.lock.as_deref(),
@@ -1427,7 +1324,7 @@ mod tests {
         let finished = locks.user_of(settings, "targets.homelab.host");
         assert_eq!(finished, Some(format!("run {FINISHED}")));
         assert!(locks.user_of(settings, "training.epochs").is_some());
-        let rows = rows(&config, None, &locks);
+        let rows = rows(&config, &locks);
         assert_eq!(
             field(&rows, "targets.gpu_cloud.max_hours")?.lock.as_deref(),
             Some("run 20260921-133200-a1b2")
@@ -1441,7 +1338,7 @@ mod tests {
             stage: Some(("questions", roles_of(Command::Questions))),
             runs: Vec::new(),
         };
-        let rows = rows(&config()?, None, &locks);
+        let rows = rows(&config()?, &locks);
         for key in [
             "roles.embedder.model",
             "roles.generator.model",

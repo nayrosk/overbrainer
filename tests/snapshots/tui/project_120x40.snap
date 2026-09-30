@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "│ project.name: Name of the project                              ││                                                    │"
 "│                                                                ││                                                    │"
 "╰────────────────────────────────────────────────────────────────╯╰────────────────────────────────────────────────────╯"
-" j/k move · Enter edit · a add · d delete · s save · E $EDITOR                                   $0.38+  v#.#.#  ? help "
+" j/k move · Enter edit · a add · d delete · u undo · E $EDITOR                                   $0.38+  v#.#.#  ? help "

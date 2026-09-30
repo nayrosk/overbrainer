@@ -1297,7 +1297,8 @@ mod tests {
     }
 
     /// [`crate::tui::snapshots::project_app`] on a project directory holding
-    /// its configuration, with `project.name` changed and not saved.
+    /// its configuration, `rust_pro` typed in the form of `project.name`,
+    /// Enter not pressed yet.
     fn saving_app() -> Result<(tempfile::TempDir, App), Box<dyn std::error::Error>> {
         use crate::tui::snapshots::{PROJECT_CONFIG, project_app, project_env};
         let dir = tempfile::tempdir()?;
@@ -1309,16 +1310,15 @@ mod tests {
             .into_iter()
             .chain([KeyCode::Backspace; 20])
             .chain("rust_pro".chars().map(KeyCode::Char))
-            .chain([KeyCode::Enter])
         {
             app.on_input(&key(code));
         }
-        assert!(app.project_view.pending.is_some());
+        assert!(app.project_view.form.is_some());
         Ok((dir, app))
     }
 
     /// A save started, then the terminal fails (its input, or the draw after
-    /// `s`, whose effects are then applied late): the save is still waited
+    /// Enter, whose effects are then applied late): the save is still waited
     /// for, and the app hears how it ended.
     #[tokio::test]
     async fn a_save_is_waited_for_when_the_terminal_fails() -> Result<(), Box<dyn std::error::Error>>
@@ -1332,14 +1332,14 @@ mod tests {
             let run_loop = drive(&mut terminal, &mut app, input, None);
             let keys = async {
                 // Once the start's load ended: while it runs, its spinner is
-                // drawn every frame, and the draw after `s` may then not be due
+                // drawn every frame, and the draw after Enter may then not be due
                 // before the save ends.
                 drawn_without(&frame, "configuration", "loading").await?;
                 tokio::time::sleep(FRAME * 2).await;
                 if draw_fails {
                     fail.store(true, Ordering::SeqCst);
                 }
-                events.send(Ok(key(KeyCode::Char('s'))))?;
+                events.send(Ok(key(KeyCode::Enter)))?;
                 if !draw_fails {
                     events.send(Err(io::Error::other("the terminal is gone")))?;
                 }
@@ -1353,7 +1353,7 @@ mod tests {
             assert!(result.is_err(), "{draw_fails}");
             let text = std::fs::read_to_string(dir.path().join("overbrainer.toml"))?;
             assert!(text.contains("name = \"rust_pro\""), "{draw_fails}: {text}");
-            assert!(app.project_view.pending.is_none(), "{draw_fails}");
+            assert_eq!(app.project_view.form, None, "{draw_fails}");
             assert_eq!(app.project_view.save, None);
             assert!(
                 app.exit_notes

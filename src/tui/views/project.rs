@@ -31,12 +31,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
-    let title = match app.project_view.changes() {
-        0 if app.project_view.pending.is_none() => " configuration ".to_string(),
-        1 => " configuration · 1 change ".to_string(),
-        count => format!(" configuration · {count} changes "),
-    };
-    let block = pane(theme.border_focus).title(Span::styled(title, theme.title));
+    let block = pane(theme.border_focus).title(Span::styled(" configuration ", theme.title));
     let inner = block.inner(left);
     frame.render_widget(block, left);
     if app.config.is_some() {
@@ -187,7 +182,12 @@ fn form_lines(form: &Form, width: u16, hint: Option<&str>, theme: &Theme) -> Vec
             };
             vec![Line::from(line), note(error, hint.to_string())]
         },
-        Form::Kind { what, name, choice } => {
+        Form::Kind {
+            what,
+            name,
+            choice,
+            error,
+        } => {
             let asked = if *what == Addable::Provider {
                 "protocol"
             } else {
@@ -198,7 +198,7 @@ fn form_lines(form: &Form, width: u16, hint: Option<&str>, theme: &Theme) -> Vec
             line.extend(choices(what.kinds(), *choice));
             vec![
                 Line::from(line),
-                note(&None, "←/→ choose, Enter adds, Esc cancels".to_string()),
+                note(error, "←/→ choose, Enter adds, Esc cancels".to_string()),
             ]
         },
     }
@@ -224,9 +224,6 @@ fn field_line(
     // `(used by …)` becomes `(used)` when the value and it do not fit: the
     // detail line under the list says by what.
     let mut marks = String::new();
-    if field.changed {
-        marks.push_str(" *");
-    }
     if field.env {
         marks.push_str(" (env)");
     }

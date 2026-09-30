@@ -2,15 +2,14 @@
 //! and data centers picked from the catalog are used for the run and saved to
 //! `overbrainer.toml` on `y`, validated and written atomically like a save of
 //! the Project view, before the run starts. A save refused (validation, the
-//! file changed, a lock) starts nothing. Pending Project changes are never
-//! saved along: `g`, `c` and such a `y` are refused until they are saved or
-//! dropped.
+//! file changed, a lock) starts nothing. Like a write of the Project view,
+//! `u` there undoes it.
 
 use super::app::{App, Effect, Origin, Overlay, Picked, Severity};
 use super::catalog::{CatalogKind, Query};
 use super::follow::start_dialog;
+use super::project::Writing;
 use super::start::{DATA_CENTER_IDS, GPU_TYPES, RunpodPlan, StartPlan};
-use super::tasks::Task;
 use super::widgets::picker::Choice;
 use crate::config::edit::{ConfigDoc, FieldPath};
 use crate::config::fields::FieldValue;
@@ -92,8 +91,7 @@ impl App {
 
     /// Why the field `field` of the Runpod target `target` (whose plan is
     /// `runpod`) cannot be chosen at start and saved now, if it cannot: no
-    /// configuration read, a save running, pending Project changes, the TUI
-    /// quitting, the data center of a network volume, or the field set by
+    /// configuration read, a save running, the TUI quitting, the data center of a network volume, or the field set by
     /// the environment or used by a run, as the Project view refuses it.
     fn start_choice_refusal(
         &mut self,
@@ -106,13 +104,6 @@ impl App {
         }
         if self.project_view.save.is_some() {
             return Some(format!("{CONFIG_FILE} is being saved"));
-        }
-        if self.project_view.pending.is_some() {
-            return Some(
-                "save (s) or drop (u) the pending Project changes first; they are never \
-                 saved along"
-                    .to_string(),
-            );
         }
         if self.leaving.is_some() {
             return Some("quitting; nothing is saved".to_string());
@@ -209,8 +200,6 @@ impl App {
                 return Vec::new();
             },
         };
-        let id = self.task_id();
-        self.project_view.save = Some(id);
         self.say(
             Severity::Info,
             format!(
@@ -219,14 +208,11 @@ impl App {
             ),
         );
         self.start_after_save = Some(plan);
-        vec![Effect::Spawn(
-            id,
-            Task::SaveConfig {
-                text,
-                base,
-                env: self.env.clone(),
-            },
-        )]
+        let writing = Writing {
+            before: Some(base.clone()),
+            ..Writing::default()
+        };
+        self.spawn_write(text, base, writing)
     }
 
     /// The choices of `plan` were saved: its run starts, with the settings
@@ -257,6 +243,7 @@ mod tests {
         PROJECT_CONFIG, draw, gpu_catalog, gpu_types, key, project_app, project_env, runpod_plan,
         text as screen,
     };
+    use crate::tui::tasks::Task;
     use crate::tui::tasks::{Done, TaskId, TrainJob};
     use crate::tui::widgets::picker::Entry;
 
@@ -480,6 +467,11 @@ mod tests {
             "✓ saved overbrainer.toml; starting a run on gpu_cloud"
         );
         assert_eq!(app.start_after_save, None);
+        let undo = app.project_view.undo.as_ref().ok_or("no undo")?;
+        assert_eq!(
+            undo.before, PROJECT_CONFIG,
+            "u in the Project view undoes it"
+        );
         Ok(())
     }
 
@@ -608,19 +600,8 @@ mod tests {
     }
 
     #[test]
-    fn pending_changes_a_lock_or_a_volume_refuse_the_choice() -> TestResult {
+    fn a_lock_or_a_volume_refuse_the_choice() -> TestResult {
         let (_dir, mut app) = starting(PROJECT_CONFIG)?;
-        app.project_view.pending = Some(crate::tui::project::Pending::new(
-            &crate::tui::project::ProjectConfig::new(PROJECT_CONFIG, &app.env)?,
-        ));
-        assert_eq!(press(&mut app, &[KeyCode::Char('g')]), []);
-        assert_eq!(
-            status(&app),
-            "refused: save (s) or drop (u) the pending Project changes first; they are never \
-             saved along"
-        );
-        assert!(dialog(&app).contains("NVIDIA A40"), "the dialog stays");
-        app.project_view.pending = None;
         let mut follow =
             crate::tui::training::Follow::new(crate::tui::training::Job::Attach, "20260921-a1");
         follow.watching = true;

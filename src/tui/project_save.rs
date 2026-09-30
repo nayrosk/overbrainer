@@ -65,7 +65,7 @@ pub(super) fn stage(dir: &Path, text: &str, base: &str) -> Result<Staged, SaveRe
     };
     if on_disk != base {
         return Err(SaveRefusal::Failed(format!(
-            "{CONFIG_FILE} changed on disk since it was read; drop the changes (u), then E"
+            "{CONFIG_FILE} changed on disk since it was read; nothing written"
         )));
     }
     let tmp = format!(".{CONFIG_FILE}.{:016x}.tmp", fastrand::u64(..));
@@ -223,7 +223,7 @@ fn identity(stat: &Stat) -> impl PartialEq + use<> {
 
 fn changed_while_saving() -> SaveRefusal {
     SaveRefusal::Failed(format!(
-        "{CONFIG_FILE} changed on disk while saving; drop the changes (u), then E"
+        "{CONFIG_FILE} changed on disk while saving; nothing written"
     ))
 }
 
