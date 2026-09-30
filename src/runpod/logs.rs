@@ -116,6 +116,61 @@ impl PodLogLine {
     }
 }
 
+impl PodLogLine {
+    /// The line for a terminal or a text file: `<ts> <sys|ctr> <line>`, the
+    /// line redacted again and on one line (a newline or a carriage return is
+    /// written `\n` or `\r`, another control character `\u{..}`).
+    #[must_use]
+    pub fn display(&self) -> String {
+        let line = crate::secrets::redact_line(&self.line, &[]);
+        format!("{} {} {}", self.ts, self.short_source(), one_line(&line))
+    }
+}
+
+/// `text` on one line: a newline and a carriage return are written `\n` and
+/// `\r`, other control characters but tab `\u{..}`.
+#[must_use]
+pub fn one_line(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push('\t'),
+            c if c.is_control() => escaped.extend(c.escape_unicode()),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// The event ID the log kept in the run directory `run_dir` ends at, if any.
+#[must_use]
+pub fn kept_cursor(run_dir: &Path) -> Option<String> {
+    fs::read_to_string(run_dir.join(POD_LOG_CURSOR))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|cursor| valid_cursor(cursor))
+}
+
+/// The lines of the log kept in the run directory `run_dir`, oldest first;
+/// a line that cannot be read is skipped. Empty when none is kept.
+///
+/// # Errors
+///
+/// Returns the I/O error of reading an existing log.
+pub fn kept_lines(run_dir: &Path) -> io::Result<Vec<PodLogLine>> {
+    let text = match fs::read(run_dir.join(POD_LOG)) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect())
+}
+
 /// What to ask of the log stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogQuery {
@@ -480,10 +535,7 @@ impl Capture {
             .open(&log)?;
         let size = file.metadata()?.len();
         let cursor_path = run_dir.join(POD_LOG_CURSOR);
-        let cursor = fs::read_to_string(&cursor_path)
-            .ok()
-            .map(|text| text.trim().to_string())
-            .filter(|cursor| valid_cursor(cursor));
+        let cursor = kept_cursor(run_dir);
         let mut capture = Self {
             log,
             cursor_path,
@@ -798,6 +850,19 @@ mod tests {
         assert!(!valid_cursor("a b"));
         assert!(!valid_cursor("a\nb"));
         assert!(!valid_cursor(&"a".repeat(MAX_CURSOR + 1)));
+    }
+
+    #[test]
+    fn a_line_is_shown_redacted_on_one_line() {
+        let line = PodLogLine {
+            ts: "2026-06-01T12:02:03Z".into(),
+            source: "system".into(),
+            line: "a\r\nb\tc\u{1b}[0m HF_TOKEN=x".into(),
+        };
+        assert_eq!(
+            line.display(),
+            "2026-06-01T12:02:03Z sys a\\r\\nb\tc\\u{1b}[0m HF_TOKEN=***"
+        );
     }
 
     #[test]

@@ -108,6 +108,7 @@ fn completes_run_ids_with_their_state_and_target() -> Result<(), Box<dyn std::er
         ["train", "attach", ""].as_slice(),
         &["train", "cancel", ""],
         &["pod", "rm", ""],
+        &["runs", "logs", ""],
     ] {
         let out = complete(dir.path(), words)?;
         assert!(

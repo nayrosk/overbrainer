@@ -41,8 +41,8 @@ pub use keys::{
 };
 pub use logs::{
     BOOTSTRAP_LOG, Capture, DRAIN_WAIT, LogError, LogQuery, LogSource, POD_LOG, POD_LOG_CAP,
-    POD_LOG_CURSOR, PodLogLine, TAIL_MAX, capture, drain, follow as follow_logs, snapshot,
-    with_pod_logs,
+    POD_LOG_CURSOR, PodLogLine, TAIL_MAX, capture, drain, follow as follow_logs, kept_cursor,
+    kept_lines, one_line, snapshot, with_pod_logs,
 };
 pub use orphans::{
     PodRow, Removal, Removed, RowKind, listed_rows, orphan_warnings, pod_rows, remove_run_pods,
