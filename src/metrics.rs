@@ -338,8 +338,6 @@ impl Metrics {
             },
             Event::System(sample) => {
                 if let Some(run_id) = &followed.run_id {
-                    // A scrape sees the old series or the new ones, never a mix.
-                    let _scrape = self.scrape.lock().unwrap_or_else(PoisonError::into_inner);
                     let set = self.system.set(run_id, sample, followed.system.as_ref());
                     followed.system = Some(set);
                 }
@@ -888,15 +886,12 @@ mod tests {
         let mut output = String::from("@gpu\n");
         for index in 0..gpus {
             output.push_str(&index.to_string());
-            output.push_str(
-                ", NVIDIA H100, 50, 1024, 2048, 60, 300, 700
-",
-            );
+            output.push_str(", NVIDIA H100, 50, 1024, 2048, 60, 300, 700\n");
         }
         output.push_str(
             "@loadavg\n2.5 1 1 1/1 1\n@nproc\n16\n@meminfo\nMemTotal: 1000 kB\n\
              MemAvailable: 250 kB\n@df.run\nh\nd 100 60 40 60% /workspace\n\
-             @df.root\nh\no 10 5 5 50% /\n",
+             @df.root\nh\nnas:/export 10 5 5 50% /\n",
         );
         crate::system::parse(&output, UNIX_EPOCH + Duration::from_secs(1000), None)
     }
@@ -924,8 +919,8 @@ mod tests {
                 61_440.0,
             ),
             (
-                format!("overbrainer_target_disk_size_bytes{{{run},mount=\"/\"}}"),
-                10_240.0,
+                format!("overbrainer_target_disk_size_bytes{{{run},mount=\"/workspace\"}}"),
+                102_400.0,
             ),
             (format!("overbrainer_target_cpu_load1{{{run}}}"), 2.5),
             (format!("overbrainer_target_cpus{{{run}}}"), 16.0),
@@ -972,14 +967,23 @@ mod tests {
         ] {
             assert_value(&text, &series, expected);
         }
+        // A network file system shows the whole cluster: left out.
+        assert!(!text.contains("mount=\"/\""), "{text}");
         // No previous sample: no usage yet.
         assert!(
             !text.contains("overbrainer_target_cpu_usage_ratio{"),
             "{text}"
         );
-        // A GPU gone at the next sample takes its series with it.
-        metrics.event(1, &Event::System(sample(1)));
+        // A GPU gone at the next sample takes its series with it, and so does
+        // a figure the target no longer reports.
+        let mut later = sample(1);
+        if let Some(cpu) = later.cpu.as_mut() {
+            cpu.load1 = None;
+        }
+        metrics.event(1, &Event::System(later));
         let text = metrics.encode()?;
+        assert!(!text.contains("overbrainer_target_cpu_load1{"), "{text}");
+        assert_value(&text, &format!("overbrainer_target_cpus{{{run}}}"), 16.0);
         assert!(!text.contains("gpu=\"1\""), "{text}");
         assert!(text.contains("gpu=\"0\""), "{text}");
         metrics.closed(1);
