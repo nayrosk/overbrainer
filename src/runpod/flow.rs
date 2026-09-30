@@ -159,29 +159,31 @@ async fn provision_run(
     Ok((record, provisioned))
 }
 
-/// Hands the cost cap of `pod` to its watchdog, best effort, before the job of
-/// `run` starts: when to stop the job with a snapshot and when to delete the
-/// pod, in files the watchdog reads every minute. A cap Runpod gave no rate
-/// for cannot be applied, which is said.
-pub async fn arm_cost_cap<E: Executor>(executor: &E, pod: &PodRecord, run: &RunRecord) {
-    let note = match pod.cost_cap() {
+/// Hands the cost cap of `pod` to its watchdog before the job of `run` starts:
+/// when to stop the job with a snapshot and when to delete the pod, in files
+/// the watchdog reads every minute. Nothing to do without a cap, or for a kept
+/// pod.
+///
+/// # Errors
+///
+/// Returns [`PodError::CostCapUnset`] when a cap is set but cannot be applied:
+/// Runpod gave no hourly rate for the pod, or the files cannot be written. No
+/// job may start then, since nothing would stop it at its cap.
+pub async fn arm_cost_cap<E: Executor>(
+    executor: &E,
+    pod: &PodRecord,
+    run: &RunRecord,
+) -> Result<(), PodError> {
+    match pod.cost_cap() {
         Some(cap) => write_cost_cap(executor, cap, &run.remote_dir)
             .await
-            .err()
-            .map(|error| {
-                format!(
-                    "cannot hand the cost cap of run {} to its pod: {error}",
-                    run.id
-                )
+            .map_err(|error| {
+                PodError::CostCapUnset(format!("cannot write it on the pod: {error}"))
             }),
-        None if pod.max_cost_usd.is_some() && !pod.keep => Some(format!(
-            "max_cost_usd is not applied to run {}: Runpod gave no hourly rate for its pod",
-            run.id
+        None if pod.max_cost_usd.is_some() && !pod.keep => Err(PodError::CostCapUnset(
+            "Runpod gave no hourly rate for the pod".to_string(),
         )),
-        None => None,
-    };
-    if let Some(note) = note {
-        tracing::warn!("{note}");
+        None => Ok(()),
     }
 }
 
@@ -247,6 +249,8 @@ pub enum Watched {
     Ended(Box<Result<Outcome, RunError>>),
     /// The client's deadline passed first; nothing was deleted yet.
     DeadlinePassed,
+    /// The pod spent its cost cap first; nothing was deleted yet.
+    CostCapPassed,
 }
 
 /// Watches the started run `record` until its job ends or the client's deadline
@@ -297,7 +301,7 @@ pub async fn watch_leased<E: Executor, T: Trainer>(
     tokio::select! {
         outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
         // Boxed: its state would otherwise weigh on every caller's future.
-        () = Box::pin(hold_lease(run_ctx.executor, &remote_dir, events, pod)) => Watched::DeadlinePassed,
+        watched = Box::pin(hold_lease(run_ctx.executor, &remote_dir, events, pod)) => watched,
     }
 }
 
@@ -310,7 +314,7 @@ async fn hold_lease<E: Executor>(
     remote_dir: &str,
     mut events: Receiver<Event>,
     pod: &PodRecord,
-) {
+) -> Watched {
     let mut lease = Lease::new(pod, remote_dir);
     let mut open = true;
     let mut tick = tokio::time::interval(LEASE_TICK);
@@ -322,8 +326,8 @@ async fn hold_lease<E: Executor>(
                 Err(RecvError::Closed) => open = false,
             },
             _ = tick.tick() => {
-                if lease.tick(executor).await {
-                    return;
+                if let Some(guard) = lease.tick(executor).await {
+                    return guard;
                 }
             },
         }
@@ -374,8 +378,9 @@ impl<'a> Lease<'a> {
     }
 
     /// Renews the lease when due and asks for the cost cap's snapshot once it
-    /// is due; whether the client's guard fires.
-    async fn tick<E: Executor>(&mut self, executor: &E) -> bool {
+    /// is due; which of the client's guards fires, if one does: the cost cap
+    /// (whatever the lease) or the deadline.
+    async fn tick<E: Executor>(&mut self, executor: &E) -> Option<Watched> {
         let now = SystemTime::now();
         if renewal_due(self.renewed, self.last_metric, now) {
             self.renew(executor, now).await;
@@ -383,7 +388,10 @@ impl<'a> Lease<'a> {
         if !self.capped && cap_snapshot_due(self.pod, now) {
             self.cap(executor).await;
         }
-        guard_fires(self.pod, self.renewed, now)
+        if past_cost_cap(self.pod, now) {
+            return Some(Watched::CostCapPassed);
+        }
+        guard_fires(self.pod, self.renewed, now).then_some(Watched::DeadlinePassed)
     }
 
     /// Renews the lease at `now`.
@@ -489,8 +497,8 @@ fn overrun(pace: &Pace, pod: &PodRecord, now: SystemTime, leased: bool) -> Optio
     ))
 }
 
-/// Acts on what [`watch_on_pod`] found for the run `run_id`: past the deadline,
-/// deletes the pod and fails the run; after a failed watch, fails the run when
+/// Acts on what [`watch_on_pod`] found for the run `run_id`: past the deadline
+/// or the cost cap, deletes the pod and fails the run; after a failed watch, fails the run when
 /// its pod is gone. Callers must not drop it midway (the CLI shields it from
 /// Ctrl-C), since it may be deleting the pod.
 ///
@@ -509,6 +517,7 @@ pub async fn settle_watch(
             Err(error) => Err(unreachable(ctx, pod, run_id, error.into()).await),
         },
         Watched::DeadlinePassed => Err(deadline_reached(ctx, pod, run_id).await),
+        Watched::CostCapPassed => Err(cost_cap_reached(ctx, pod, run_id).await),
     }
 }
 
@@ -539,6 +548,16 @@ async fn deadline_reached(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -
     }
     fail_run(ctx.runs, run_id, MAX_HOURS_REACHED);
     PodError::DeadlineReached
+}
+
+/// The pod spent its cost cap: deletes it (confirmed), as its watchdog does
+/// too, and fails the run.
+async fn cost_cap_reached(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> PodError {
+    if let Err(error) = remove(ctx, pod, DeleteReason::CostCap, DeletedBy::Client).await {
+        return error;
+    }
+    fail_run(ctx.runs, run_id, MAX_COST_REACHED);
+    PodError::CostCapReached
 }
 
 /// The watch failed with `error`: when the pod is gone, the run is failed with
@@ -1127,15 +1146,16 @@ mod tests {
     #[test]
     fn the_cost_cap_asks_for_a_snapshot_then_names_why_the_pod_went() {
         let now = SystemTime::now();
-        // Created an hour ago at $1/h, with a cap of $2: the snapshot at 1.9h.
+        // Created an hour ago at $1/h, with a cap of $2: deleted at 2h, the
+        // snapshot 15 min before (95% would leave only 6 min).
         let mut pod = pod_due_in(6, false, now);
         pod.created_unix = Some(unix_secs(now) - 3600);
         pod.cost_per_hour = Some(1.0);
         assert!(!cap_snapshot_due(&pod, now), "no cap");
         pod.max_cost_usd = Some(2.0);
         let hours = |h: f64| now + Duration::from_secs_f64(h * 3600.0);
-        assert!(!cap_snapshot_due(&pod, hours(0.85)));
-        assert!(cap_snapshot_due(&pod, hours(0.95)));
+        assert!(!cap_snapshot_due(&pod, hours(0.7)));
+        assert!(cap_snapshot_due(&pod, hours(0.75)));
         assert_eq!(limit_reached(&pod, hours(0.95)), None);
         assert_eq!(limit_reached(&pod, hours(1.0)), Some(MAX_COST_REACHED));
         assert_eq!(gone_by(&pod, hours(1.0)), DeletedBy::Watchdog);
@@ -1143,6 +1163,99 @@ mod tests {
         pod.max_cost_usd = None;
         assert_eq!(limit_reached(&pod, hours(6.0)), Some(MAX_HOURS_REACHED));
         assert_eq!(gone_by(&pod, hours(1.0)), DeletedBy::Unknown);
+    }
+
+    #[test]
+    fn the_watchdog_asks_for_a_snapshot_as_early_as_the_client_counts_on() {
+        let default = format!(
+            "OVERBRAINER_SNAPSHOT_LEAD:-{}}}",
+            super::super::SNAPSHOT_LEAD.as_secs()
+        );
+        assert!(super::super::watchdog_script().contains(&default));
+    }
+
+    /// A pod created an hour before `now` at $1/h.
+    fn billed_pod(now: SystemTime, cap: Option<f64>) -> PodRecord {
+        let mut pod = pod_due_in(6, false, now);
+        pod.created_unix = Some(unix_secs(now) - 3600);
+        pod.cost_per_hour = Some(1.0);
+        pod.max_cost_usd = cap;
+        pod
+    }
+
+    fn run_in(remote_dir: &str) -> RunRecord {
+        RunRecord {
+            id: "r1".into(),
+            target: "gpu".into(),
+            created: "2026-09-22T14:30:05Z".into(),
+            remote_dir: remote_dir.into(),
+            job: None,
+            state: RunState::Preparing,
+            message: None,
+            snapshot: None,
+            resumed_from: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cost_cap_that_cannot_be_armed_refuses_the_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let executor = crate::exec::LocalExecutor::new(root.path())?;
+        let now = SystemTime::now();
+        let dir = root.path().join("r1");
+        let run = run_in(&dir.to_string_lossy());
+        // Armed: both times written where the watchdog reads them.
+        arm_cost_cap(&executor, &billed_pod(now, Some(2.0)), &run).await?;
+        let written = std::fs::read_to_string(dir.join(COST_CAP_FILE))?;
+        assert_eq!(written, (unix_secs(now) + 3600).to_string());
+        assert!(dir.join(SNAPSHOT_AT_FILE).is_file());
+        // Nothing to arm without a cap.
+        arm_cost_cap(&executor, &billed_pod(now, None), &run).await?;
+        // No rate: refused.
+        let mut unrated = billed_pod(now, Some(2.0));
+        unrated.cost_per_hour = None;
+        let refused = arm_cost_cap(&executor, &unrated, &run).await;
+        assert!(
+            matches!(refused, Err(PodError::CostCapUnset(_))),
+            "{refused:?}"
+        );
+        // Files that cannot be written: refused.
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, "")?;
+        let refused = arm_cost_cap(
+            &executor,
+            &billed_pod(now, Some(2.0)),
+            &run_in(&blocked.to_string_lossy()),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(PodError::CostCapUnset(_))),
+            "{refused:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_client_deletes_the_pod_at_its_cost_cap_whatever_the_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let executor = crate::exec::LocalExecutor::new(root.path())?;
+        let now = SystemTime::now();
+        let remote = root.path().join("r1").to_string_lossy().into_owned();
+        let spent = billed_pod(now, Some(0.5));
+        let mut lease = Lease::new(&spent, &remote);
+        let fired = lease.tick(&executor).await;
+        assert!(matches!(fired, Some(Watched::CostCapPassed)), "{fired:?}");
+        // Its snapshot was asked for on the way.
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("r1").join(SNAPSHOT_REQUEST))?,
+            "cost"
+        );
+        let within = billed_pod(now, Some(20.0));
+        let mut lease = Lease::new(&within, &remote);
+        assert!(lease.tick(&executor).await.is_none());
+        Ok(())
     }
 
     #[test]

@@ -22,7 +22,8 @@
 # Before the pod is lost, the job is asked for a snapshot (snapshot.request, which
 # the trainer's plugin reads: it saves a checkpoint and stops): SNAPSHOT_LEAD
 # before the deadline while the lease is stale, and at .pod/snapshot_at, the time
-# the client wrote for 95% of max_cost_usd. A request the watchdog made holds the
+# the client wrote for 95% of max_cost_usd (SNAPSHOT_LEAD before 100% at the
+# latest). A request the watchdog made holds the
 # deadline off for up to SNAPSHOT_WAIT; once a snapshot ended the job, the
 # deadline gives way to the retrieve grace, capped at the deadline plus
 # RETRIEVE_GRACE, so `train attach` can still collect it. At .pod/cost_cap_at

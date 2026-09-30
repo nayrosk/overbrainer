@@ -184,11 +184,17 @@ pub struct PodRecord {
 /// Share of `max_cost_usd` at which the job is stopped with a snapshot.
 pub const SNAPSHOT_SHARE: f64 = 0.95;
 
+/// How long before the pod is deleted at the latest its job is asked for a
+/// snapshot: the watchdog's `OVERBRAINER_SNAPSHOT_LEAD` default, for the cost
+/// cap as for the deadline.
+pub const SNAPSHOT_LEAD: Duration = Duration::from_secs(15 * 60);
+
 /// When the cost cap of a pod applies, in Unix seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostCap {
-    /// When the pod will have spent [`SNAPSHOT_SHARE`] of the cap: the job is
-    /// stopped with a snapshot.
+    /// When the job is stopped with a snapshot: once the pod has spent
+    /// [`SNAPSHOT_SHARE`] of the cap, and [`SNAPSHOT_LEAD`] before
+    /// [`CostCap::delete_at`] at the latest (never before the pod's creation).
     pub snapshot_at: u64,
     /// When it will have spent the whole cap: the watchdog deletes the pod.
     pub delete_at: u64,
@@ -254,9 +260,13 @@ impl PodRecord {
             let seconds = Duration::try_from_secs_f64(share * cap / rate * 3600.0).ok()?;
             created.checked_add(seconds.as_secs())
         };
+        let delete_at = at(1.0)?;
+        let lead = delete_at
+            .saturating_sub(SNAPSHOT_LEAD.as_secs())
+            .max(created);
         Some(CostCap {
-            snapshot_at: at(SNAPSHOT_SHARE)?,
-            delete_at: at(1.0)?,
+            snapshot_at: at(SNAPSHOT_SHARE)?.min(lead),
+            delete_at,
         })
     }
 
@@ -489,15 +499,33 @@ mod tests {
         record.begin_attempt("NVIDIA RTX A6000", at(1_790_000_000), 6.0);
         record.created(&pod()?, AttemptResult::Created, at(1_790_000_000));
         assert_eq!(record.cost_cap(), None, "no cap set");
-        // $1.06 at $0.53/h: 2 hours, the snapshot at 95% of them.
+        // $1.06 at $0.53/h: 2 hours; 95% of them leaves 6 min, less than the
+        // 15 min lead, which wins.
         record.max_cost_usd = Some(1.06);
         assert_eq!(
             record.cost_cap(),
             Some(CostCap {
-                snapshot_at: 1_790_000_000 + 6840,
+                snapshot_at: 1_790_000_000 + 6300,
                 delete_at: 1_790_000_000 + 7200,
             })
         );
+        // $5.30: 10 hours; 95% of them leaves 30 min.
+        record.max_cost_usd = Some(5.30);
+        assert_eq!(
+            record.cost_cap(),
+            Some(CostCap {
+                snapshot_at: 1_790_000_000 + 34_200,
+                delete_at: 1_790_000_000 + 36_000,
+            })
+        );
+        // $0.10: about 11 min, less than the lead: at once.
+        record.max_cost_usd = Some(0.1);
+        assert!(
+            record
+                .cost_cap()
+                .is_some_and(|cap| cap.snapshot_at == 1_790_000_000)
+        );
+        record.max_cost_usd = Some(1.06);
         let json = serde_json::to_string(&record)?;
         assert!(json.contains("\"max_cost_usd\":1.06"), "{json}");
         record.cost_per_hour = None;

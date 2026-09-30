@@ -21,6 +21,10 @@ pub enum DeleteReason {
     Interrupted,
     /// `max_hours` has passed.
     Deadline,
+    /// The pod spent `max_cost_usd`.
+    CostCap,
+    /// `max_cost_usd` is set but could not be handed to the pod's watchdog.
+    CostCapUnset,
     /// `overbrainer pod rm`, or a failure after the pod was created.
     Requested,
     /// A second pod of the same run, left by an ambiguous create.
@@ -39,6 +43,8 @@ impl DeleteReason {
             Self::LocalSsh => "the local ssh cannot keep its connection",
             Self::Interrupted => "interrupted before the job started",
             Self::Deadline => "max_hours reached",
+            Self::CostCap => "max_cost_usd reached",
+            Self::CostCapUnset => "its max_cost_usd could not be applied",
             Self::Requested => "requested",
             Self::Duplicate => "duplicate of this run's pod",
         }

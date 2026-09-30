@@ -257,7 +257,9 @@ impl Job<'_> {
             return abandon(&ctx, interrupt, &mut pod, &id).await;
         }
         let executor = provisioned.executor;
-        arm_cost_cap(&executor, &pod, &record).await;
+        if let Err(error) = arm_cost_cap(&executor, &pod, &record).await {
+            return refuse_uncapped(&ctx, interrupt, &mut pod, record, error).await;
+        }
         let runtime = self.spec.runtime();
         let launch = Launch {
             runtime: &runtime,
@@ -502,6 +504,23 @@ async fn abandon(
     run.message = Some(PodError::Interrupted.to_string());
     ctx.runs.save(&run)?;
     bail!(interrupted_before_job(ctx.runs, id))
+}
+
+/// A cost cap could not be applied to the pod of `run`: deletes the pod, fails
+/// the run with `error` and returns it, since nothing would stop the run at
+/// its cap.
+async fn refuse_uncapped(
+    ctx: &PodCtx<'_>,
+    interrupt: &mut Interrupt,
+    pod: &mut PodRecord,
+    mut run: RunRecord,
+    error: PodError,
+) -> anyhow::Result<()> {
+    release(ctx, interrupt, pod, DeleteReason::CostCapUnset).await;
+    run.state = RunState::Failed;
+    run.message = Some(error.to_string());
+    ctx.runs.save(&run)?;
+    Err(error.into())
 }
 
 /// Deletes the pod of a run that will not run its job, shielded from Ctrl-C; a

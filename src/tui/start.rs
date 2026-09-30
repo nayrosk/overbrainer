@@ -544,9 +544,11 @@ fn runpod_lines(spec: &RunpodTarget, catalog: Option<&Catalog>) -> Vec<String> {
     lines.push(max_hours_line(spec, listed, &ids));
     if let Some(usd) = spec.max_cost_usd {
         lines.push(format!(
-            "{COST_CAP_LABEL}${usd:.2}: the job stops with a snapshot at {:.0}%, the watchdog \
-             deletes the pod at 100%",
-            crate::runpod::SNAPSHOT_SHARE * 100.0
+            "{COST_CAP_LABEL}${usd:.2}: the job stops with a snapshot at {:.0}% ({} min before \
+             the cap at the latest); the pod is deleted at 100%, with a snapshot nobody \
+             collected by then",
+            crate::runpod::SNAPSHOT_SHARE * 100.0,
+            crate::runpod::SNAPSHOT_LEAD.as_secs() / 60
         ));
     }
     lines
@@ -1087,8 +1089,9 @@ mod tests {
             Some("data        runs/r0/data/train.jsonl 1234 examples, runs/r0/data/eval.jsonl 137")
         );
         let cap = lines.iter().position(|line| {
-            line == "max_cost    $20.00: the job stops with a snapshot at 95%, the watchdog \
-                         deletes the pod at 100%"
+            line == "max_cost    $20.00: the job stops with a snapshot at 95% (15 min before \
+                         the cap at the latest); the pod is deleted at 100%, with a snapshot \
+                         nobody collected by then"
         });
         assert!(cap.is_some(), "{lines:?}");
         assert!(cap.is_some_and(|at| pinned(&lines).contains(&at)));

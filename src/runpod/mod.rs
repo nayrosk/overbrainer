@@ -55,7 +55,7 @@ pub use provision::{
 };
 pub use record::{
     Attempt, AttemptResult, CostCap, DeletedBy, POD_FILE, POD_RECORD_VERSION, PodRecord, PodState,
-    SNAPSHOT_SHARE, SshEndpoint, hours,
+    SNAPSHOT_LEAD, SNAPSHOT_SHARE, SshEndpoint, hours,
 };
 pub use status::{DeleteReason, PodStatus};
 pub use target::{MIN_CUDA_VERSION, RunpodTarget, VOLUME_MOUNT, VOLUME_WORKDIR, WORKDIR};
@@ -166,6 +166,10 @@ pub enum PodError {
     /// spent it, before the job ended.
     #[error("max_cost_usd reached: the pod was deleted before the job ended")]
     CostCapReached,
+    /// `max_cost_usd` is set but could not be handed to the pod's watchdog:
+    /// nothing would stop the run at its cap, so no job was started.
+    #[error("max_cost_usd cannot be applied ({0}): the pod was deleted and training refused")]
+    CostCapUnset(String),
     /// The run's pod no longer exists.
     #[error("pod {0} no longer exists")]
     PodGone(PodId),
