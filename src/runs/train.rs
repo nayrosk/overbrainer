@@ -1075,6 +1075,14 @@ mod tests {
                 }
             }
         }
+
+        fn put_file(
+            &self,
+            _path: &str,
+            _content: &str,
+        ) -> impl Future<Output = Result<(), ExecError>> + Send {
+            ready(Ok(()))
+        }
     }
 
     struct NoFiles;

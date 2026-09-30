@@ -579,13 +579,13 @@ async fn a_marker_is_written_through_a_rename() -> TestResult {
     let made = executor.spawn(&job(dir.clone(), "true")).await?;
     assert_eq!(wait_finished(&executor, &made).await?, JobStatus::Exited(0));
     let marker = format!("{dir}/retrieved");
-    executor.write_marker(&marker).await?;
+    executor.put_file(&marker, "").await?;
     let listing = probe(&executor, dir.clone(), "ls -a").await?;
     assert!(listing.lines().any(|name| name == "retrieved"), "{listing}");
     assert!(!listing.contains("retrieved.tmp"), "{listing}");
-    let missing = executor
-        .write_marker(&format!("{}/no/such/dir/retrieved", executor.workdir()))
-        .await;
-    assert!(missing.is_err());
+    let request = format!("{}/r10/new/dir/snapshot.request", executor.workdir());
+    executor.put_file(&request, "requested").await?;
+    let read = executor.read_from(&request, 0, 100).await?;
+    assert_eq!(read, b"requested");
     Ok(())
 }

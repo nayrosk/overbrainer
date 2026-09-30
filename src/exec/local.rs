@@ -285,6 +285,14 @@ impl Executor for LocalExecutor {
         self.copy(from, local, entries, exclude).await
     }
 
+    fn put_file(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> impl Future<Output = Result<(), ExecError>> + Send {
+        ready(put_local(Path::new(path), content))
+    }
+
     /// Computed here with the `sha2` crate, off the async runtime's threads, so a
     /// local target needs no `sha256sum` (macOS has none).
     async fn manifest(
@@ -305,6 +313,25 @@ impl Executor for LocalExecutor {
         let output = self.run_script(script.to_string(), "probe").await?;
         Ok(output.stdout)
     }
+}
+
+/// Replaces `path` with `content` through a temporary file of its own in the
+/// same directory, created with its parents; the temporary file is removed when
+/// the rename fails.
+fn put_local(path: &Path, content: &str) -> Result<(), ExecError> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir).map_err(io_error(dir))?;
+    let name = path
+        .file_name()
+        .map_or_else(|| "file".into(), |name| name.to_string_lossy().into_owned());
+    let tmp = dir.join(format!(".{name}.{:016x}.tmp", fastrand::u64(..)));
+    fs::write(&tmp, content).map_err(io_error(&tmp))?;
+    fs::rename(&tmp, path).map_err(|error| {
+        if let Err(removal) = fs::remove_file(&tmp) {
+            tracing::warn!("cannot remove {}: {removal}", tmp.display());
+        }
+        io_error(path)(error)
+    })
 }
 
 /// At most `limit` bytes of `path` from `offset`; a missing file reads as empty.

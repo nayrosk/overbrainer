@@ -3,9 +3,7 @@
 //! results are retrieved. The CLI drives them and decides what Ctrl-C does.
 
 use std::fs;
-use std::future::Future;
 use std::io;
-use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use secrecy::SecretString;
@@ -13,7 +11,7 @@ use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::events::Event;
-use crate::exec::{ExecError, Executor, LocalExecutor, SshExecutor};
+use crate::exec::{Executor, SshExecutor};
 use crate::runs::{Outcome, RunCtx, RunError, RunRecord, RunState, Runs, watch};
 use crate::train::{Pace, Trainer};
 
@@ -220,36 +218,6 @@ pub async fn watch_on_pod<E: Executor, T: Trainer>(
     }
 }
 
-/// A target that can renew the lease of the pod it reaches.
-pub trait Lessee: Executor {
-    /// Creates `path` on the target, or updates its modification time.
-    fn touch(&self, path: &str) -> impl Future<Output = Result<(), ExecError>> + Send;
-}
-
-impl Lessee for SshExecutor {
-    async fn touch(&self, path: &str) -> Result<(), ExecError> {
-        self.write_marker(path).await
-    }
-}
-
-impl Lessee for LocalExecutor {
-    fn touch(&self, path: &str) -> impl Future<Output = Result<(), ExecError>> + Send {
-        std::future::ready(touch_local(Path::new(path)))
-    }
-}
-
-/// Creates or rewrites the empty file `path`, with its directory.
-fn touch_local(path: &Path) -> Result<(), ExecError> {
-    let io = |source| ExecError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(io)?;
-    }
-    fs::write(path, b"").map_err(io)
-}
-
 /// [`watch_on_pod`] for a client that stays with the job: while the job keeps
 /// making progress (a metric in the last 30 minutes), it renews the pod's lease
 /// ([`LEASE_FILE`]) every few minutes, so `max_hours` deletes nothing, neither
@@ -257,7 +225,7 @@ fn touch_local(path: &Path) -> Result<(), ExecError> {
 /// cannot be renewed, the lease runs out after [`LEASE_TTL`] and the deadline
 /// applies again. It warns once, as information, when the job ends after the
 /// deadline. A kept pod has no deadline and needs no lease.
-pub async fn watch_leased<E: Lessee, T: Trainer>(
+pub async fn watch_leased<E: Executor, T: Trainer>(
     run_ctx: &RunCtx<'_, E>,
     trainer: &T,
     record: RunRecord,
@@ -278,7 +246,7 @@ pub async fn watch_leased<E: Lessee, T: Trainer>(
 /// Renews the lease at `path` while the job progresses, warns once when it
 /// ends after the deadline, and returns once the client's own deadline passed
 /// with no lease held.
-async fn hold_lease<E: Lessee>(
+async fn hold_lease<E: Executor>(
     executor: &E,
     path: &str,
     mut events: Receiver<Event>,
@@ -341,10 +309,10 @@ impl<'a> Lease<'a> {
     }
 
     /// Renews the lease at `path` when due; whether the client's guard fires.
-    async fn tick<E: Lessee>(&mut self, executor: &E, path: &str) -> bool {
+    async fn tick<E: Executor>(&mut self, executor: &E, path: &str) -> bool {
         let now = SystemTime::now();
         if renewal_due(self.renewed, self.last_metric, now) {
-            match executor.touch(path).await {
+            match executor.put_file(path, "").await {
                 Ok(()) => self.renewed = Some(now),
                 Err(error) => tracing::debug!("cannot renew the pod's lease: {error}"),
             }
@@ -733,7 +701,7 @@ pub async fn end_pod(
         return unretrieved(ctx, pod, &run.id);
     }
     let marker = format!("{}/{RETRIEVED_MARKER}", run.remote_dir);
-    if let Err(error) = executor.write_marker(&marker).await {
+    if let Err(error) = executor.put_file(&marker, "").await {
         tracing::warn!(
             "cannot mark the results of run {} retrieved on the pod: {error}",
             run.id

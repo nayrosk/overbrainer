@@ -214,6 +214,14 @@ mod tests {
         fn probe(&self, _script: &str) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
             std::future::ready(Err(ExecError::Protocol("unused".to_string())))
         }
+
+        fn put_file(
+            &self,
+            _path: &str,
+            _content: &str,
+        ) -> impl Future<Output = Result<(), ExecError>> + Send {
+            std::future::ready(Ok(()))
+        }
     }
 
     #[tokio::test]
