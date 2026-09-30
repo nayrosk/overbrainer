@@ -1250,6 +1250,113 @@ fn training_of_a_run_nothing_follows() -> TestResult {
     Ok(())
 }
 
+/// Samples of a pod's machine, one every 10 seconds up to [`NOW`]: the volume
+/// filling up, the CPU busier each time, and `gpus` GPUs, the first nearly
+/// out of memory and the second at full use.
+fn machine(count: u64, gpus: u32) -> std::collections::VecDeque<crate::system::SystemSample> {
+    use std::fmt::Write as _;
+
+    let mut samples = std::collections::VecDeque::new();
+    for index in 0..count {
+        let mut output = String::from("@gpu\n");
+        for gpu in 0..gpus {
+            let (utilization, used) = if gpu == 1 {
+                (99, 40_960)
+            } else {
+                (60 + index, 79_000)
+            };
+            writeln!(
+                output,
+                "{gpu}, NVIDIA H100 80GB HBM3, {utilization}, {used}, 81920, {}, 312.4, 700",
+                60 + gpu
+            )
+            .ok();
+        }
+        write!(
+            output,
+            "@loadavg\n6.40 5.00 4.00 1/1 1\n@stat\ncpu {busy} 0 0 {idle} 0 0 0 0\n\
+             @nproc\n16\n@meminfo\nMemTotal: 134217728 kB\nMemAvailable: 83886080 kB\n\
+             @df.run\nh\nmfs 104857600 {used} {free} 0% /workspace\n\
+             @df.root\nh\noverlay 20971520 5242880 15728640 25% /\n",
+            busy = index * index * 40,
+            idle = index * 800,
+            used = 80_000_000 + index * 1_000_000,
+            free = 24_857_600 - index * 1_000_000,
+        )
+        .ok();
+        let at = crate::tui::snapshots::at(NOW - (count - 1 - index) * 10);
+        let sample = crate::system::parse(&output, at, samples.back());
+        samples.push_back(sample);
+    }
+    samples
+}
+
+#[test]
+fn training_with_the_system_panel() -> TestResult {
+    let mut app = training_app()?;
+    app.training.system.insert(FOLLOWED.into(), machine(12, 2));
+    snapshot_at("training_system_120x40", &mut app, 120, 40)?;
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains("gpu1 ██████  99%"), "{shown}");
+    // Too narrow: no panel, as before.
+    let narrow = text(&draw(&mut app, 80, 24)?).join("\n");
+    assert!(!narrow.contains("system"), "{narrow}");
+    Ok(())
+}
+
+#[test]
+fn the_system_panel_warns_as_its_gauges_fill() -> TestResult {
+    let mut app = training_app()?;
+    app.training.system.insert(FOLLOWED.into(), machine(12, 2));
+    let terminal = draw(&mut app, 120, 40)?;
+    let rows = text(&terminal);
+    let buffer = terminal.backend().buffer();
+    let style_of = |needle: &str| -> Result<ratatui::style::Style, Box<dyn std::error::Error>> {
+        let (y, line) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains(needle))
+            .ok_or(format!("no {needle}"))?;
+        let start = line.find(needle).ok_or("gone")?;
+        let x = line[..start].chars().count() + needle.chars().count() - 1;
+        let cell = buffer
+            .cell((u16::try_from(x)?, u16::try_from(y)?))
+            .ok_or("no cell")?;
+        Ok(cell.style())
+    };
+    let theme = app.theme;
+    // The volume at 87%, the second GPU at 99%, the CPU below both.
+    assert_eq!(style_of("87%")?.fg, theme.warn.fg);
+    assert_eq!(style_of("99%")?.fg, theme.error.fg);
+    assert_eq!(style_of("cpu  ")?.fg, theme.dim.fg);
+    // The first GPU's memory is nearly full: its figures turn red.
+    assert_eq!(style_of("77/80G")?.fg, theme.error.fg);
+    Ok(())
+}
+
+#[test]
+fn the_system_panel_of_a_run_nothing_follows_shows_its_age() -> TestResult {
+    let mut app = training_app()?;
+    app.training.selected = 2;
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains("no sample: not followed"), "{shown}");
+    let mut samples = machine(3, 6);
+    for sample in &mut samples {
+        sample.at -= Duration::from_secs(300);
+    }
+    app.training.system.insert(LEFT.into(), samples);
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains(" system · 5m ago "), "{shown}");
+    assert!(shown.contains("rest"), "{shown}");
+    assert!(shown.contains("avg of 3"), "{shown}");
+    assert!(!shown.contains("gpu3"), "{shown}");
+    // Followed, before the first sample.
+    app.training.selected = 0;
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains("waiting for the first sample"), "{shown}");
+    Ok(())
+}
+
 /// The pod line of the followed run, whose pod's last event is `ready` while
 /// `pod.json` holds `record`, drawn at 120x40.
 fn pod_line_of(record: crate::runpod::PodRecord) -> Result<String, Box<dyn std::error::Error>> {
