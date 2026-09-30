@@ -1165,6 +1165,20 @@ fn a_step_past_max_steps_reads_100_percent() -> TestResult {
 }
 
 #[test]
+fn the_run_column_fits_the_longest_run_id() -> TestResult {
+    let mut app = training_app()?;
+    let long = "malware_development_20260930-120000_2";
+    app.training.runs[2].record = run(long, "homelab", RunState::Running);
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains(&format!("{long}  running")), "{shown}");
+    assert!(
+        shown.contains(&format!("{FOLLOWED}                   running")),
+        "{shown}"
+    );
+    Ok(())
+}
+
+#[test]
 fn training_of_a_finished_local_run() -> TestResult {
     let mut app = training_app()?;
     app.training.selected = 1;

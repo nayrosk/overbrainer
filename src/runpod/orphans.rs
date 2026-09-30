@@ -396,8 +396,12 @@ pub fn table(rows: &[PodRow]) -> Vec<String> {
     if rows.is_empty() {
         return Vec::new();
     }
+    let run = rows
+        .iter()
+        .map(|row| row.run.chars().count())
+        .fold("RUN".len(), usize::max);
     let mut lines = vec![format!(
-        "{:<20}  {:<14}  {:<12}  {:<24}  {:>5}  {:<20}  NOTE",
+        "{:<run$}  {:<14}  {:<12}  {:<24}  {:>5}  {:<20}  NOTE",
         "RUN", "POD", "STATUS", "GPU", "$/H", "CREATED"
     )];
     for row in rows {
@@ -405,7 +409,7 @@ pub fn table(rows: &[PodRow]) -> Vec<String> {
             .rate
             .map_or_else(|| "-".to_string(), |rate| format!("{rate:.2}"));
         lines.push(format!(
-            "{:<20}  {:<14}  {:<12}  {:<24}  {rate:>5}  {:<20}  {}",
+            "{:<run$}  {:<14}  {:<12}  {:<24}  {rate:>5}  {:<20}  {}",
             row.run, row.pod_id, row.status, row.gpu, row.created, row.note
         ));
     }
@@ -747,6 +751,22 @@ mod tests {
             vec![
                 "RUN                   POD             STATUS        GPU                         $/H  CREATED               NOTE".to_string(),
                 "20260921-090000-ffff  k3x9abc         RUNNING       NVIDIA A40                 0.49  2026-09-21T09:00:03Z  run succeeded, not deleted".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_run_column_fits_the_longest_run_id() {
+        let lines = table(&[
+            row("r1", RowKind::Ended, "a"),
+            row("malware_development_20260930-120000_2", RowKind::Ended, "b"),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "RUN                                    POD             STATUS        GPU                         $/H  CREATED               NOTE".to_string(),
+                "r1                                     k3x9abc         RUNNING       NVIDIA A40                 0.49  2026-09-21T09:00:03Z  a".to_string(),
+                "malware_development_20260930-120000_2  k3x9abc         RUNNING       NVIDIA A40                 0.49  2026-09-21T09:00:03Z  b".to_string(),
             ]
         );
     }

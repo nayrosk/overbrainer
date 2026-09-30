@@ -246,7 +246,13 @@ async fn cancel_run(
 /// Returns an error when a run record cannot be read.
 pub fn list(project_dir: &Path) -> anyhow::Result<()> {
     let runs = Runs::new(project_dir);
-    for record in runs.list()? {
+    let records = runs.list()?;
+    let width = records
+        .iter()
+        .map(|record| record.id.len())
+        .max()
+        .unwrap_or(0);
+    for record in records {
         let pod = match PodRecord::load(&runs, &record.id) {
             Ok(Some(pod)) => format!("  {}", pod.summary()),
             Ok(None) => String::new(),
@@ -259,7 +265,7 @@ pub fn list(project_dir: &Path) -> anyhow::Result<()> {
             },
         };
         println!(
-            "{}  {:<9}  {}  {}{pod}",
+            "{:<width$}  {:<9}  {}  {}{pod}",
             record.id,
             record.state.name(),
             record.target,

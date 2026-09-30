@@ -227,6 +227,8 @@ fn train_runs_the_job_and_prints_a_summary() -> TestResult {
         .stderr(predicate::str::contains(TOKEN).not());
     let run = only_run(dir.path())?;
     let id = run_id(&run)?;
+    // The project is `demo`: `demo_YYYYMMDD-HHMMSS`.
+    assert!(id.starts_with("demo_") && id.len() == 20, "{id}");
     assert_eq!(fs::read_to_string(run.join("job.log"))?, "token present\n");
     assert!(run.join("output/adapter_model.safetensors").is_file());
     assert!(
@@ -439,6 +441,37 @@ fn ctrl_c_while_preparing_creates_no_run() -> TestResult {
         "{stderr}"
     );
     assert!(only_run(dir.path()).is_err(), "a run was created");
+    Ok(())
+}
+
+/// Writes the `run.json` of a run `id` created at `created`, never started.
+fn preparing_run(project: &Path, id: &str, created: &str) -> std::io::Result<()> {
+    let run = project.join("runs").join(id);
+    fs::create_dir_all(&run)?;
+    fs::write(
+        run.join("run.json"),
+        format!(
+            r#"{{"id": "{id}", "target": "here", "created": "{created}",
+"remote_dir": "/w/{id}", "job": null, "state": "preparing", "message": null}}"#
+        ),
+    )
+}
+
+#[test]
+fn runs_ls_lists_old_and_new_ids_by_creation_time_aligned() -> TestResult {
+    let dir = project("ok")?;
+    preparing_run(dir.path(), "20260930-120000-abcd", "2026-09-30T12:00:00Z")?;
+    preparing_run(dir.path(), "demo_20260929-080000", "2026-09-29T08:00:00Z")?;
+    preparing_run(dir.path(), "demo_20260929-080000_2", "2026-09-29T08:00:00Z")?;
+    overbrainer(dir.path())?
+        .args(["runs", "ls"])
+        .assert()
+        .success()
+        .stdout(
+            "demo_20260929-080000    preparing  here  2026-09-29T08:00:00Z\n\
+             demo_20260929-080000_2  preparing  here  2026-09-29T08:00:00Z\n\
+             20260930-120000-abcd    preparing  here  2026-09-30T12:00:00Z\n",
+        );
     Ok(())
 }
 

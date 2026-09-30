@@ -182,10 +182,17 @@ fn render_runs(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let header = Row::new(vec!["run", "state", "target", "pod", ""]).style(theme.dim);
+    // Wide enough for the longest ID, and never narrower than an ID of the
+    // older `20260922-143005-a1b2` form with a space.
+    let id_width = view
+        .runs
+        .iter()
+        .map(|row| row.record.id.len() + 1)
+        .fold(21, usize::max);
     let table = Table::new(
         rows,
         [
-            Constraint::Length(21),
+            Constraint::Length(u16::try_from(id_width).unwrap_or(u16::MAX)),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Fill(1),
