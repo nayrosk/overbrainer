@@ -459,12 +459,13 @@ fn a_resume_is_refused_when_a_training_value_changed() -> TestResult {
         )
         .replace(
             "chat_template = \"qwen3\"",
-            "chat_template = \"qwen3\"\nwarmup_steps = 5",
+            "chat_template = \"qwen3\"\nwarmup_steps = 5\nwandb_project = \"p\"\n\
+             hub_strategy = \"end\"\nuse_tensorboard = true",
         );
     let (_other, settings) = self::settings(&changed)?;
     let resumed = Axolotl::new(training(&settings)?, &files).resuming(resume);
-    // Only what the checkpoint was trained with counts: the save cadence and
-    // the Hub repo may change.
+    // Only what the checkpoint was trained with counts: the save cadence, the
+    // Hub repo and the logging integrations may change.
     assert_eq!(
         resumed.resume_mismatch()?,
         vec!["learning_rate", "warmup_steps"]

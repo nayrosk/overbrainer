@@ -34,10 +34,12 @@ const PREPARED_DIR: &str = "prepared";
 /// directory.
 pub const RESUME_DIR: &str = "resume";
 /// Top-level Axolotl keys a resumed run may set differently from the run it
-/// resumes: none changes what the checkpoint was trained with.
-const MAY_DIFFER: [&str; 10] = [
+/// resumes: none changes what the checkpoint was trained with. The cadence of
+/// evaluations, saves and logs, the Hub push, and the logging integrations.
+const MAY_DIFFER: [&str; 18] = [
     "resume_from_checkpoint",
     "hub_model_id",
+    "hub_strategy",
     "evals_per_epoch",
     "eval_steps",
     "eval_strategy",
@@ -46,7 +48,25 @@ const MAY_DIFFER: [&str; 10] = [
     "save_strategy",
     "save_total_limit",
     "logging_steps",
+    "use_tensorboard",
+    "use_wandb",
+    "use_mlflow",
+    "use_comet",
+    "wandb_*",
+    "mlflow_*",
+    "comet_*",
 ];
+
+/// Whether a resumed run may set `key` differently: [`MAY_DIFFER`], where a
+/// trailing `*` stands for any rest of the name.
+fn may_differ(key: &str) -> bool {
+    MAY_DIFFER
+        .iter()
+        .any(|allowed| match allowed.strip_suffix('*') {
+            Some(prefix) => key.starts_with(prefix),
+            None => key == *allowed,
+        })
+}
 
 /// Chat templates bundled with Axolotl 0.19.0 that render `reasoning_content`.
 const REASONING_TEMPLATES: [&str; 5] = ["qwen3", "qwen3_5", "exaone4", "gemma4", "gemma4_unified"];
@@ -209,7 +229,7 @@ impl<'a> Axolotl<'a> {
         keys.dedup();
         Ok(keys
             .into_iter()
-            .filter(|key| !MAY_DIFFER.contains(key) && theirs.get(key) != ours.get(key))
+            .filter(|key| !may_differ(key) && theirs.get(key) != ours.get(key))
             .map(str::to_string)
             .collect())
     }

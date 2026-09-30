@@ -307,6 +307,14 @@ fn check_axolotl_extra(training: &Training, problems: &mut Vec<String>) {
             ));
         }
     }
+    // A snapshot is a checkpoint a new run resumes from, optimizer included.
+    if training.axolotl_extra.get("save_only_model") == Some(&serde_json::Value::Bool(true)) {
+        problems.push(
+            "training.axolotl_extra.save_only_model: checkpoints without their optimizer state \
+             cannot be resumed after a snapshot; remove it"
+                .to_string(),
+        );
+    }
 }
 
 /// Per-kind target requirements.
@@ -1339,6 +1347,22 @@ mod tests {
                     .to_string(),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_checkpoint_without_its_optimizer_state_is_refused() -> Result<(), config::ConfigError> {
+        let toml = format!("{VALID}\n[training.axolotl_extra]\nsave_only_model = true\n");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "training.axolotl_extra.save_only_model: checkpoints without their optimizer \
+                 state cannot be resumed after a snapshot; remove it"
+                    .to_string()
+            ]
+        );
+        let toml = format!("{VALID}\n[training.axolotl_extra]\nsave_only_model = false\n");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
         Ok(())
     }
 
