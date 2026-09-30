@@ -14,7 +14,7 @@ use super::{TrainArgs, TrainCommand};
 use crate::config::{DEFAULT_WORKDIR, Settings, Source, Target, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{AnyExecutor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
-use crate::runpod::{PodRecord, RunpodTarget};
+use crate::runpod::{PodRecord, RunpodTarget, connect_followed};
 use crate::runs::{
     Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, STOP_LIMITS, SnapshotReason,
     cancel, create_on, request_snapshot, start, watch, with_stop_fallback,
@@ -299,6 +299,54 @@ async fn stop(
     let result = front.interrupt().race(flow).await.transpose();
     guard.close().await;
     finish(&runs, run_id, result, front)
+}
+
+/// `train stop` while another overbrainer process, `holder`, holds the project,
+/// most likely following the run: only writes the snapshot request on the
+/// target and leaves the snapshot to the process that follows the run. Reads
+/// `run.json` and `pod.json`, and writes nothing in the run directory but, on a
+/// local target, the request itself.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be used, the run is not
+/// running, its target cannot be reached, or the request cannot be written.
+pub(super) async fn request_stop(
+    project_dir: &Path,
+    run_id: &str,
+    holder: Option<u32>,
+    front: &Frontend,
+    source: &Source,
+) -> anyhow::Result<()> {
+    let settings = source.load(project_dir)?;
+    let runs = Runs::new(project_dir);
+    let record = runs.load(run_id)?;
+    stoppable(&record)?;
+    if let Some(pod) = PodRecord::load(&runs, run_id)? {
+        let Some(executor) = connect_followed(&runs, &pod, &record).await? else {
+            bail!("run {run_id} has no pod to reach: nothing to stop");
+        };
+        request_snapshot(&executor, &record, SnapshotReason::Requested).await?;
+    } else {
+        let executor = run_executor(project_dir, &settings, &record).await?;
+        request_snapshot(&executor, &record, SnapshotReason::Requested).await?;
+    }
+    front.line(&stop_requested(run_id));
+    front.line(&left_to_holder(run_id, holder));
+    Ok(())
+}
+
+/// What `train stop` says when another overbrainer process, `holder`, holds
+/// the project and so collects the snapshot.
+fn left_to_holder(run_id: &str, holder: Option<u32>) -> String {
+    let holder = holder.map_or_else(
+        || "another overbrainer".to_string(),
+        |pid| format!("overbrainer (pid {pid})"),
+    );
+    format!(
+        "train: {holder} is using this project: if it follows run {run_id}, it collects the \
+         snapshot; if not, collect it with `overbrainer train attach {run_id}`"
+    )
 }
 
 /// The job of `record` when a snapshot can be asked of it: the run is running.

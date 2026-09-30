@@ -39,8 +39,8 @@ pub use disk::{
 pub use flow::{
     COST_CAP_FILE, DEADLINE_MARGIN, Ending, LEASE_FILE, LEASE_TTL, MAX_COST_REACHED,
     MAX_HOURS_REACHED, RETRIEVED_MARKER, SNAPSHOT_AT_FILE, WATCHDOG_LOG, Watched, arm_cost_cap,
-    end_pod, follow, forget_client_key, job_started, limit_reached, past_deadline, reconnect,
-    settle_watch, ssh_command, start_pod, watch_leased, watch_on_pod,
+    connect_followed, end_pod, follow, forget_client_key, job_started, limit_reached,
+    past_deadline, reconnect, settle_watch, ssh_command, start_pod, watch_leased, watch_on_pod,
 };
 pub use keys::{
     CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,

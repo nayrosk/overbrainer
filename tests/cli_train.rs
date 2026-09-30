@@ -459,6 +459,93 @@ fn stop_saves_a_snapshot_retrieves_it_and_skips_the_merge() -> TestResult {
 }
 
 #[test]
+fn stop_while_train_follows_the_run_leaves_the_snapshot_to_it() -> TestResult {
+    let dir = project("snapshot")?;
+    let binary = assert_cmd::cargo::cargo_bin("overbrainer");
+    let train = std::process::Command::new(binary)
+        .env_clear()
+        .env("NO_COLOR", "1")
+        .env("HOME", "/nonexistent")
+        .env("PATH", PATH)
+        .env("OVERBRAINER_HF_TOKEN", TOKEN)
+        .arg("-C")
+        .arg(dir.path())
+        .arg("train")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut run = None;
+    for _ in 0..600 {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(found) = only_run(dir.path())
+            && fs::read_to_string(found.join("run.json"))
+                .is_ok_and(|record| record.contains("\"state\": \"running\""))
+        {
+            run = Some(found);
+            break;
+        }
+    }
+    let Some(run) = run else {
+        let output = train.wait_with_output()?;
+        return Err(format!(
+            "the run did not start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    };
+    let id = run_id(&run)?;
+
+    // `train` holds the project: any other command is refused, and the stop
+    // only writes the request.
+    overbrainer(dir.path())?
+        .args(["train", "attach", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "another overbrainer (pid {}) is using this project",
+            train.id()
+        )));
+    overbrainer(dir.path())?
+        .args(["train", "stop", &id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "train: snapshot of run {id} requested"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "train: overbrainer (pid {}) is using this project: if it follows run {id}, it \
+             collects the snapshot; if not, collect it with `overbrainer train attach {id}`",
+            train.id()
+        )));
+
+    // The process following the run collects the snapshot.
+    let output = train.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "train: run {id} stopped at step 1 (requested): snapshot in \
+             runs/{id}/output/checkpoint-1"
+        )),
+        "{stdout}"
+    );
+    let record = fs::read_to_string(run.join("run.json"))?;
+    assert!(record.contains("\"state\": \"stopped\""), "{record}");
+    assert!(run.join("output/checkpoint-1/optimizer.pt").is_file());
+
+    // Once `train` is gone, the stop takes the project and sees the run ended.
+    overbrainer(dir.path())?
+        .args(["train", "stop", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "run {id} already ended: stopped"
+        )));
+    Ok(())
+}
+
+#[test]
 fn ctrl_c_detaches_and_cancel_stops_the_job() -> TestResult {
     let dir = project("slow")?;
     let (run, output) = interrupt_train(dir.path(), &["running"], Duration::from_millis(100))?;
