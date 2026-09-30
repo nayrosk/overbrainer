@@ -8,12 +8,11 @@
 use std::fmt;
 
 use toml_edit::{
-    Array, ArrayOfTables, Decor, DocumentMut, InlineTable, Item, RawString, Table, TableLike,
-    Value, value,
+    ArrayOfTables, Decor, DocumentMut, InlineTable, Item, RawString, Table, TableLike, Value, value,
 };
 
 use super::fields::{self, FieldError, FieldSpec, FieldValue, Section, TargetKind};
-use super::types::Protocol;
+use super::types::{ListOrAuto, Protocol};
 use super::validate::is_valid_name;
 
 /// One of the pipeline roles.
@@ -428,8 +427,8 @@ impl ConfigDoc {
     }
 
     /// Adds `[targets.<name>]` of `kind` after the other targets: `runtime = "docker"`
-    /// for `local` and `ssh`; for `runpod`, an empty `gpu_types` to fill, a 6-hour
-    /// `max_hours` and the defaults of the other counts.
+    /// for `local` and `ssh`; for `runpod`, `gpu_types = "auto"`, a 6-hour
+    /// `max_hours` and the defaults of the other counts, so it validates as added.
     ///
     /// # Errors
     ///
@@ -444,7 +443,7 @@ impl ConfigDoc {
             },
             TargetKind::Runpod => {
                 // The serde defaults of `types.rs`, written so the file shows them.
-                table.insert("gpu_types", value(Array::new()));
+                table.insert("gpu_types", value(ListOrAuto::AUTO));
                 table.insert("gpu_count", value(1));
                 table.insert("container_disk_gb", value(50));
                 table.insert("max_hours", value(NEW_RUNPOD_MAX_HOURS));
@@ -1313,17 +1312,14 @@ runtime = "native"
             "misplaced target in:\n{text}"
         );
         assert!(text.contains(
-            "[targets.cloud]\nkind = \"runpod\"\ngpu_types = []\ngpu_count = 1\ncontainer_disk_gb = 50\nmax_hours = 6.0\nboot_grace_minutes = 30\nretrieve_grace_minutes = 60\n"
+            "[targets.cloud]\nkind = \"runpod\"\ngpu_types = \"auto\"\ngpu_count = 1\ncontainer_disk_gb = 50\nmax_hours = 6.0\nboot_grace_minutes = 30\nretrieve_grace_minutes = 60\n"
         ));
         assert!(text.contains("[targets.box]\nkind = \"ssh\"\nruntime = \"docker\"\n"));
         assert_eq!(doc.target_kind("cloud"), Some(TargetKind::Runpod));
         assert_eq!(doc.names(Collection::Providers), vec!["nanogpt", "claude"]);
 
-        assert!(
-            problems(&doc)
-                .iter()
-                .any(|problem| problem.starts_with("targets.cloud.gpu_types:"))
-        );
+        // Each table added validates on its own: the TUI writes it at once.
+        validate(&doc)?;
         let gpus = FieldPath::Target {
             name: "cloud".to_string(),
             field: "gpu_types",
