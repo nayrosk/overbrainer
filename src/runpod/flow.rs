@@ -21,8 +21,8 @@ use super::provision::note_strays;
 use super::{
     BOOTSTRAP_LOG, CLIENT_KEY, CostCap, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId,
     PodKeys, PodPlan, PodRecord, PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget,
-    SSH_DIR, SshEndpoint, VOLUME_MOUNT, alias, keep_file, provision, remove, sweep, with_pod_logs,
-    write_config,
+    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, keep_file, provision, remove, sweep,
+    with_pod_logs, write_config,
 };
 use crate::secrets::Redactor;
 
@@ -161,6 +161,7 @@ async fn provision_run(
         workdir: target.workdir(),
         api_url: ctx.client.base_url(),
         vram_floor_gb,
+        volume_gb: None,
     };
     let provisioned = provision(ctx, &plan, &mut record).await?;
     Ok((record, provisioned))
@@ -303,7 +304,14 @@ fn disk_watch<'a, E: Executor>(
         mount: VOLUME_MOUNT,
         max_gb: pod.max_volume_gb,
     });
-    DiskWatch::new(executor, ctx.client, run, volume)
+    let watch = DiskWatch::new(executor, ctx.client, run, volume);
+    // A run on a network volume whose ID `pod.json` does not hold (written
+    // before overbrainer kept it) cannot be measured: `df` there is the whole
+    // shared cluster.
+    if volume.is_none() && run.remote_dir.starts_with(VOLUME_WORKDIR) {
+        return watch.idle();
+    }
+    watch
 }
 
 /// [`watch_on_pod`] for a client that stays with the job: while the job keeps

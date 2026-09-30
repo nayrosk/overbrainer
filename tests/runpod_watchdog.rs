@@ -706,10 +706,10 @@ async fn the_cost_cap_asks_for_a_snapshot_then_deletes_the_pod() -> TestResult {
 }
 
 /// A directory on `PATH` whose `df` reports a file system `df_percent` full and
-/// whose `du` reports `du_kib` KiB, and that `PATH`.
+/// whose `du` runs `du_body`, and that `PATH`.
 fn fake_disk(
     df_percent: u64,
-    du_kib: u64,
+    du_body: &str,
 ) -> Result<(tempfile::TempDir, String), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let scripts = [
@@ -721,10 +721,7 @@ fn fake_disk(
                 100 - df_percent
             ),
         ),
-        (
-            "du",
-            format!("#!/bin/sh\nprintf '{du_kib}\\t%s\\n' \"$3\"\n"),
-        ),
+        ("du", format!("#!/bin/sh\n{du_body}\n")),
     ];
     for (name, script) in scripts {
         let path = dir.path().join(name);
@@ -739,10 +736,15 @@ fn fake_disk(
     Ok((dir, path))
 }
 
+/// A `du` body printing `kib` for its path.
+fn du_prints(kib: u64) -> String {
+    format!("printf '{kib}\\t%s\\n' \"$3\"")
+}
+
 /// Runs the watchdog of a started job under every shell, on a disk that `df`
 /// and `du` describe as [`fake_disk`] does, with `env` and `.pod/volume_gb`
 /// holding `volume_gb`; returns, per shell, the snapshot request it wrote
-/// within 3 seconds (empty for none) and its output.
+/// within 5 seconds (empty for none) and its output.
 async fn disk_rule(
     df_percent: u64,
     du_kib: u64,
@@ -753,7 +755,7 @@ async fn disk_rule(
     for &shell in shells() {
         let server = stub(200, 204).await;
         let pod = Pod::new()?;
-        let (_bin, path) = fake_disk(df_percent, du_kib)?;
+        let (_bin, path) = fake_disk(df_percent, &du_prints(du_kib))?;
         let mut job = live_group()?;
         fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
         if let Some(gb) = volume_gb {
@@ -762,7 +764,7 @@ async fn disk_rule(
         let mut all = vec![("PATH", path)];
         all.extend(env.iter().cloned());
         let mut child = pod.start(shell, &server, &all)?;
-        until(Duration::from_secs(3), || {
+        until(Duration::from_secs(5), || {
             pod.file("snapshot.request").exists()
         })
         .await;
@@ -777,49 +779,117 @@ async fn disk_rule(
     Ok(seen)
 }
 
-/// At 92% of the container disk the watchdog asks for a snapshot, kept pod or
-/// not; below, it does not.
+/// At 97% of the container disk the watchdog asks for a snapshot, kept pod or
+/// not; below, it leaves the disk to the client, which acts at 92%.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_disk_asks_for_a_snapshot() -> TestResult {
     if !curl_available() {
         return Ok(());
     }
     let keep = [("OVERBRAINER_KEEP_POD", "1".to_string())];
-    for (request, output) in disk_rule(92, 0, None, &keep).await? {
+    for (request, output) in disk_rule(97, 0, None, &keep).await? {
         assert_eq!(request, "disk", "{output}");
         assert!(
             output.contains("snapshot requested reason=disk"),
             "{output}"
         );
     }
-    for (request, output) in disk_rule(91, 0, None, &[]).await? {
+    for (request, output) in disk_rule(96, 0, None, &[]).await? {
         assert_eq!(request, "", "{output}");
     }
     Ok(())
 }
 
 /// On a network volume, `df` (the whole cluster) is ignored: `du` of the volume
-/// is weighed against 94% of `.pod/volume_gb`, and without that file nothing
-/// is asked for.
+/// is weighed against 94% of its size, `.pod/volume_gb` or else the size when
+/// the pod was created, and without either nothing is asked for.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_network_volume_asks_for_a_snapshot() -> TestResult {
     if !curl_available() {
         return Ok(());
     }
     let volume = tempfile::tempdir()?;
-    let env = [(
+    let dir = (
         "OVERBRAINER_VOLUME_DIR",
         volume.path().display().to_string(),
-    )];
-    // 1 GB holds 917968 KiB: 92% of it is 844531 KiB.
-    for (request, output) in disk_rule(10, 844_600, Some("1"), &env).await? {
+    );
+    let created = [dir.clone(), ("OVERBRAINER_VOLUME_GB", "1".to_string())];
+    // 1 GB holds 917968 KiB: 97% of it is 890429 KiB.
+    for (request, output) in disk_rule(10, 890_500, Some("1"), std::slice::from_ref(&dir)).await? {
         assert_eq!(request, "disk", "{output}");
     }
-    for (request, output) in disk_rule(99, 844_000, Some("1"), &env).await? {
+    for (request, output) in disk_rule(10, 890_500, None, &created).await? {
+        assert_eq!(request, "disk", "{output}");
+    }
+    for (request, output) in disk_rule(99, 890_000, Some("1"), std::slice::from_ref(&dir)).await? {
         assert_eq!(request, "", "{output}");
     }
-    for (request, output) in disk_rule(99, 999_999, None, &env).await? {
+    for (request, output) in disk_rule(99, 999_999, None, &[dir]).await? {
         assert_eq!(request, "", "{output}");
+    }
+    Ok(())
+}
+
+/// Once the client grew the volume, `.pod/volume_gb` holds the new size at once:
+/// the watchdog weighs the volume against it, not against the size it had
+/// when the pod was created, and asks for nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grown_volume_holds_the_watchdog_off() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    let volume = tempfile::tempdir()?;
+    let env = [
+        (
+            "OVERBRAINER_VOLUME_DIR",
+            volume.path().display().to_string(),
+        ),
+        ("OVERBRAINER_VOLUME_GB", "1".to_string()),
+    ];
+    for (request, output) in disk_rule(10, 890_500, Some("2"), &env).await? {
+        assert_eq!(request, "", "{output}");
+    }
+    Ok(())
+}
+
+/// A `du` that hangs on the volume never holds up the loop: the cost cap still
+/// deletes the pod at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hanging_du_never_holds_up_the_watchdog() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        let volume = tempfile::tempdir()?;
+        let (_bin, path) = fake_disk(10, "exec sleep 60")?;
+        let mut job = live_group()?;
+        fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
+        fs::write(pod.file(".pod/volume_gb"), "1")?;
+        let child = pod.start(
+            shell,
+            &server,
+            &[
+                ("PATH", path),
+                (
+                    "OVERBRAINER_VOLUME_DIR",
+                    volume.path().display().to_string(),
+                ),
+            ],
+        )?;
+        // The first loop starts du, the next ones only read its result.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        fs::write(pod.file(".pod/cost_cap_at"), (unix_now() - 1).to_string())?;
+        let (code, output) = finished(child, Duration::from_secs(5)).await?;
+        job.kill()?;
+        job.wait()?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert!(
+            output.contains("delete reason=cost_cap"),
+            "{shell}: {output}"
+        );
+        assert!(pod.file(".pod/du.running").exists(), "{shell}: du ended");
     }
     Ok(())
 }

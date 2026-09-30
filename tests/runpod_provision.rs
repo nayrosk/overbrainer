@@ -217,6 +217,7 @@ impl Harness {
             workdir: "/workspace/overbrainer",
             api_url: self.client.base_url(),
             vram_floor_gb: None,
+            volume_gb: None,
         };
         let result = provision(&self.ctx(), &plan, &mut record).await.map(drop);
         assert_eq!(PodRecord::load(&self.runs, RUN)?.as_ref(), Some(&record));
@@ -670,6 +671,11 @@ async fn the_create_carries_the_target_and_the_watchdog_settings() -> TestResult
         .respond_with(ResponseTemplate::new(400))
         .mount(&harness.server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/network-volumes/vol1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "vol1", "size": 200})))
+        .mount(&harness.server)
+        .await;
     let mut target = target(&["NVIDIA A40"]);
     target.data_center_ids = ListOrAuto::List(vec!["EU-RO-1".into()]);
     target.network_volume_id = Some("vol1".into());
@@ -708,6 +714,9 @@ async fn the_create_carries_the_target_and_the_watchdog_settings() -> TestResult
         format!("{}/v2", harness.server.uri())
     );
     assert_eq!(env["OVERBRAINER_KEEP_POD"], "0");
+    // The watchdog's disk rule works on the volume from the start.
+    assert_eq!(env["OVERBRAINER_VOLUME_DIR"], "/workspace/data");
+    assert_eq!(env["OVERBRAINER_VOLUME_GB"], "200");
     let deadline: u64 = env["OVERBRAINER_DEADLINE"]
         .as_str()
         .unwrap_or("0")
@@ -1068,6 +1077,7 @@ async fn a_pod_is_still_deleted_when_pod_json_cannot_be_saved() -> TestResult {
         workdir: "/workspace/overbrainer",
         api_url: harness.client.base_url(),
         vram_floor_gb: None,
+        volume_gb: None,
     };
     let result = provision(&harness.ctx(), &plan, &mut record).await;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;

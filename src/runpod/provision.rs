@@ -128,6 +128,9 @@ pub struct PodPlan<'a> {
     /// `min_vram_gb`: the estimate of what the run needs (see
     /// [`resolve_with_floor`](super::resolve_with_floor)).
     pub vram_floor_gb: Option<u32>,
+    /// The network volume's size in GB, for the watchdog's disk rule; when
+    /// `None`, [`provision`] reads it from the API.
+    pub volume_gb: Option<u32>,
 }
 
 /// A pod ready for the run: reachable over SSH with its pinned host key, with a
@@ -190,8 +193,13 @@ pub async fn provision(
 ) -> Result<Provisioned, PodError> {
     ctx.check()?;
     let target = resolve_target(ctx.client, plan.target, plan.vram_floor_gb).await?;
+    let volume_gb = match (plan.volume_gb, &target.network_volume_id) {
+        (None, Some(id)) => volume_size(ctx.client, id).await,
+        (known, _) => known,
+    };
     let plan = &PodPlan {
         target: &target,
+        volume_gb,
         ..*plan
     };
     let result = walk(ctx, plan, record).await;
@@ -199,6 +207,21 @@ pub async fn provision(
         after_failure(ctx, record).await;
     }
     result
+}
+
+/// The size in GB of the network volume `id`, `None` when the API does not
+/// tell: the watchdog's disk rule then waits for the client to write it.
+async fn volume_size(client: &RunpodClient, id: &str) -> Option<u32> {
+    let size = match client.get_network_volume(id).await {
+        Ok(Some(volume)) if volume.size > 0 => return Some(volume.size),
+        Ok(_) => "Runpod gave no size".to_string(),
+        Err(error) => error.to_string(),
+    };
+    tracing::warn!(
+        "cannot read the size of network volume {id} ({size}): the pod's watchdog checks \
+         the volume's disk space only once overbrainer follows the job"
+    );
+    None
 }
 
 /// `target` with its `auto` choices resolved from the Runpod catalog (see
@@ -443,6 +466,7 @@ fn request(plan: &PodPlan<'_>, keep: bool, attempt: &Attempt) -> CreatePod {
         retrieve_grace: target.retrieve_grace,
         keep,
         volume_dir: target.network_volume_id.as_ref().map(|_| VOLUME_MOUNT),
+        volume_gb: plan.volume_gb,
         api_url: plan.api_url,
         authorized_key: &plan.keys.client_public,
         claim: &plan.keys.host_public,
@@ -1241,6 +1265,7 @@ mod tests {
                 workdir: "/workspace/overbrainer",
                 api_url: self.client.base_url(),
                 vram_floor_gb: None,
+                volume_gb: None,
             }
         }
 

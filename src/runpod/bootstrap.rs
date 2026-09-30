@@ -65,6 +65,9 @@ pub struct PodSettings<'a> {
     /// Where the network volume is mounted, when the pod has one: the
     /// watchdog's disk rule reads it with `du` rather than `df`.
     pub volume_dir: Option<&'a str>,
+    /// The network volume's size in GB when the pod is created, when known;
+    /// the client's `.pod/volume_gb` replaces it once written.
+    pub volume_gb: Option<u32>,
     /// Base URL of the Runpod API, for the watchdog.
     pub api_url: &'a str,
     /// The run's client public key.
@@ -106,6 +109,9 @@ pub fn pod_env(settings: &PodSettings<'_>) -> BTreeMap<String, String> {
     );
     if let Some(volume_dir) = settings.volume_dir {
         set("OVERBRAINER_VOLUME_DIR", volume_dir.to_string());
+    }
+    if let Some(volume_gb) = settings.volume_gb {
+        set("OVERBRAINER_VOLUME_GB", volume_gb.to_string());
     }
     set("OVERBRAINER_API_URL", settings.api_url.to_string());
     set(
@@ -170,6 +176,7 @@ mod tests {
             retrieve_grace: Duration::from_secs(3600),
             keep: false,
             volume_dir: None,
+            volume_gb: None,
             api_url: "https://api.runpod.io/v2",
             authorized_key: "ssh-ed25519 AAAAclient overbrainer-r1",
             claim: "ssh-ed25519 AAAAhost",
@@ -202,11 +209,16 @@ mod tests {
         assert!(!kept.contains_key("OVERBRAINER_VOLUME_DIR"));
         let on_volume = pod_env(&PodSettings {
             volume_dir: Some("/workspace/data"),
+            volume_gb: Some(200),
             ..settings
         });
         assert_eq!(
             on_volume.get("OVERBRAINER_VOLUME_DIR").map(String::as_str),
             Some("/workspace/data")
+        );
+        assert_eq!(
+            on_volume.get("OVERBRAINER_VOLUME_GB").map(String::as_str),
+            Some("200")
         );
     }
 }
