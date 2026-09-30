@@ -102,7 +102,7 @@ impl Setup {
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
         let executor = LocalExecutor::new(&project.path().join("pod"))?;
-        let mut run = create(&runs, executor.workdir(), "gpu_cloud")?;
+        let mut run = create(&runs, "demo", executor.workdir(), "gpu_cloud")?;
         std::fs::create_dir_all(Path::new(&run.remote_dir).join(".pod"))?;
         run.job = Some(serde_json::from_value(
             json!({"dir": run.remote_dir, "pid": 424_242}),
@@ -349,5 +349,39 @@ async fn a_full_container_disk_sample_stops_the_job() -> TestResult {
     }
     assert_eq!(setup.read(SNAPSHOT_REQUEST), "disk");
     assert_eq!(setup.patches().await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_shared_file_system_is_never_judged_by_df() -> TestResult {
+    let setup = Setup::new(true).await?;
+    let bus = EventBus::new();
+    let disk = DiskWatch::new(&setup.executor, &setup.client, &setup.run, None);
+    let events = bus.subscribe();
+    // A network volume's `df` shows the whole cluster: 99% says nothing of
+    // what this run may still write.
+    let sample = SystemSample {
+        at: SystemTime::now(),
+        disks: vec![Disk {
+            mount: "/workspace/data".into(),
+            fstype: Some("fuse.mfs".into()),
+            shared: true,
+            size_bytes: 100 * GB,
+            used_bytes: 99 * GB,
+            available_bytes: GB,
+        }],
+        cpu: None,
+        memory: None,
+        gpus: Vec::new(),
+    };
+    let publish = async {
+        bus.publish(Event::System(sample));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    tokio::select! {
+        never = disk.run(events) => match never {},
+        () = publish => {},
+    }
+    assert_eq!(setup.read(SNAPSHOT_REQUEST), "");
     Ok(())
 }

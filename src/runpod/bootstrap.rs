@@ -207,18 +207,26 @@ mod tests {
         );
         assert!(!kept.contains_key("OVERBRAINER_DEADLINE"));
         assert!(!kept.contains_key("OVERBRAINER_VOLUME_DIR"));
-        let on_volume = pod_env(&PodSettings {
+    }
+
+    #[test]
+    fn a_network_volume_hands_its_mount_and_size_to_the_watchdog() {
+        let settings = PodSettings {
+            run_id: "r1",
+            workdir: "/workspace/overbrainer",
+            deadline_unix: Some(1_790_021_600),
+            boot_grace: Duration::from_secs(1800),
+            retrieve_grace: Duration::from_secs(3600),
+            keep: false,
             volume_dir: Some("/workspace/data"),
             volume_gb: Some(200),
-            ..settings
-        });
-        assert_eq!(
-            on_volume.get("OVERBRAINER_VOLUME_DIR").map(String::as_str),
-            Some("/workspace/data")
-        );
-        assert_eq!(
-            on_volume.get("OVERBRAINER_VOLUME_GB").map(String::as_str),
-            Some("200")
-        );
+            api_url: "https://api.runpod.io/v2",
+            authorized_key: "ssh-ed25519 AAAAclient overbrainer-r1",
+            claim: "ssh-ed25519 AAAAhost",
+        };
+        let env = pod_env(&settings);
+        let get = |name: &str| env.get(name).map(String::as_str);
+        assert_eq!(get("OVERBRAINER_VOLUME_DIR"), Some("/workspace/data"));
+        assert_eq!(get("OVERBRAINER_VOLUME_GB"), Some("200"));
     }
 }

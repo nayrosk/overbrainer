@@ -4,7 +4,8 @@
 //! with a snapshot.
 //!
 //! On a pod without a network volume, the run's disk is the container disk, read
-//! with `df` by the system sampler ([`Event::System`]). On a network volume, `df`
+//! with `df` by the system sampler ([`Event::System`]); a disk the sampler marks
+//! shared is never judged by its `df`. On a network volume, `df`
 //! shows the whole shared cluster instead, so the volume's own use is read with
 //! `du` and weighed against its size as the API reports it, less a margin: the
 //! quota refuses writes a little before the size in GB. That `du`, and the size
@@ -331,7 +332,8 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
     }
 
     /// The run disk's use: the volume's `du` against its size, or the run
-    /// directory's file system from `sample`.
+    /// directory's file system from `sample`, unless it is shared: `df` then
+    /// shows the whole cluster, which says nothing of what the run may write.
     fn usage(&self, sample: &SystemSample) -> Option<Usage> {
         if self.volume.is_some() {
             return Some(Usage::of_volume(
@@ -339,7 +341,10 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
                 self.size_gb?,
             ));
         }
-        sample.run_disk().map(Usage::of_disk)
+        sample
+            .run_disk()
+            .filter(|disk| !disk.shared)
+            .map(Usage::of_disk)
     }
 
     /// When [`DISK_PROBE_EVERY`] passed since the last time, reads the volume's
