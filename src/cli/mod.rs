@@ -248,6 +248,10 @@ pub struct TrainArgs {
     /// Nothing deletes it then but `overbrainer pod rm <run-id>`.
     #[arg(long)]
     pub keep_pod: bool,
+    /// Start from the snapshot of this stopped run (`overbrainer train stop`):
+    /// its checkpoint and its data, with the same training settings.
+    #[arg(long, value_name = "RUN_ID", add = ArgValueCandidates::new(complete::run_ids))]
+    pub resume_from: Option<String>,
     /// Follow or stop an existing run instead of starting one.
     #[command(subcommand)]
     pub command: Option<TrainCommand>,

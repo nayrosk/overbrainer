@@ -14,7 +14,8 @@ use secrecy::SecretString;
 
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
 use super::train::{
-    HF_TOKEN, POLL, finish, prepare, reattach, secrets, started, stop_requested, stoppable,
+    HF_TOKEN, POLL, finish, prepare, reattach, resumed, secrets, started, stop_requested,
+    stoppable,
     training, warn,
 };
 use crate::config::{Settings, Training};
@@ -100,6 +101,8 @@ pub(super) struct RunpodStart<'a> {
     /// The VRAM floor of `auto` GPU types, when the caller already estimated
     /// it; else it is estimated here (see [`vram_floor`]).
     pub(super) vram_floor: VramFloor,
+    /// The trainer, resuming a stopped run or not.
+    pub(super) trainer: &'a Axolotl<'a>,
 }
 
 /// `overbrainer train` on the Runpod target `start.name`.
@@ -119,6 +122,7 @@ pub(super) async fn train(
         spec,
         keep,
         vram_floor: known,
+        trainer,
     } = start;
     let training = training(settings)?;
     if let Some(warning) = reasoning_template_warning(training) {
@@ -143,17 +147,17 @@ pub(super) async fn train(
         Ok((secrets, vram_floor_gb, session?))
     })
     .await?;
-    let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let job = Job {
         session: &session,
         spec,
-        trainer: &trainer,
+        trainer,
         vram_floor_gb,
         stopping: false,
     };
     let result = async {
         warn_orphans(&session.ctx()).await;
         let record = create(&session.runs, &settings.project.name, spec.workdir(), name)?;
+        let record = resumed(&session.runs, record, trainer)?;
         started(&record);
         front.run_created(&record.id);
         job.run(&mut interrupt, record, keep, secrets).await

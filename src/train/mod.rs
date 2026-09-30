@@ -8,7 +8,8 @@ mod yaml;
 use std::path::{Path, PathBuf};
 
 pub use axolotl::{
-    Axolotl, CONFIG_FILE, MERGED_DIR, METRICS_FILE, OUTPUT_DIR, Outputs, reasoning_template_warning,
+    Axolotl, CONFIG_FILE, MERGED_DIR, METRICS_FILE, OUTPUT_DIR, Outputs, RESUME_DIR, Resume,
+    reasoning_template_warning,
 };
 pub use metrics::{
     METRICS_ENV, METRICS_PLUGIN, MetricLine, PLUGIN_CLASS, PLUGIN_FILE, Pace, SNAPSHOT_ENV,

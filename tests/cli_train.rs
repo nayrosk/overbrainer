@@ -403,6 +403,55 @@ fn stop_saves_a_snapshot_retrieves_it_and_skips_the_merge() -> TestResult {
         .stderr(predicate::str::contains(format!(
             "run {id} already ended: stopped"
         )));
+
+    // A resume needs the same training settings.
+    let config = fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+    edit_config(dir.path(), |text| {
+        text.replace("merge = true", "merge = true\nlearning_rate = 1e-4")
+    })?;
+    overbrainer(dir.path())?
+        .args(["train", "--resume-from", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "cannot resume from run {id}: the training settings differ from the ones it ran \
+             with (learning_rate)"
+        )));
+    fs::write(dir.path().join("overbrainer.toml"), config)?;
+    fs::write(dir.path().join("venv/mode"), "ok")?;
+    overbrainer(dir.path())?
+        .args(["train", "--resume-from", &id])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "resumes from the snapshot of run {id} (output/checkpoint-1)"
+        )));
+    let resumed = fs::read_dir(dir.path().join("runs"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run.json").is_file() && *path != run)
+        .ok_or("no resumed run")?;
+    let record = fs::read_to_string(resumed.join("run.json"))?;
+    assert!(record.contains(&format!("\"resumed_from\": \"{id}\"")), "{record}");
+    assert!(record.contains("\"state\": \"succeeded\""), "{record}");
+    assert!(resumed.join("resume/checkpoint-1/optimizer.pt").is_file());
+    let yaml = fs::read_to_string(resumed.join("axolotl.yaml"))?;
+    assert!(
+        yaml.contains(&format!(
+            "resume_from_checkpoint: \"{}/resume/checkpoint-1\"",
+            resumed.display()
+        )),
+        "{yaml}"
+    );
+    // Only a stopped run can be resumed.
+    let succeeded = run_id(&resumed)?;
+    overbrainer(dir.path())?
+        .args(["train", "--resume-from", &succeeded])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "cannot resume from run {succeeded}: it is succeeded, not stopped with a snapshot"
+        )));
     Ok(())
 }
 

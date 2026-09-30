@@ -19,7 +19,7 @@ use crate::runs::{
     Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, STOP_TIMEOUT, SnapshotReason,
     cancel, create_on, request_snapshot, start, watch, with_stop_fallback,
 };
-use crate::train::{Axolotl, OUTPUT_DIR, Outputs, reasoning_template_warning};
+use crate::train::{Axolotl, OUTPUT_DIR, Outputs, Resume, reasoning_template_warning};
 
 /// Time between two looks at a running job.
 pub(super) const POLL: Duration = Duration::from_secs(2);
@@ -90,12 +90,15 @@ async fn train(
         .targets
         .get(name)
         .with_context(|| format!("unknown target `{name}`"))?;
+    let runs = Runs::new(project_dir);
+    let trainer = trainer(project_dir, training, &runs, args.resume_from.as_deref())?;
     if let Some(spec) = RunpodTarget::from_target(target) {
         let start = RunpodStart {
             name,
             spec: &spec,
             keep: keep_pod,
             vram_floor: args.vram_floor,
+            trainer: &trainer,
         };
         return super::runpod_train::train(project_dir, settings, start, front).await;
     }
@@ -116,11 +119,10 @@ async fn train(
         Ok((secrets, executor))
     })
     .await?;
-    let runs = Runs::new(project_dir);
     let record = create_on(&runs, &executor, &settings.project.name, name).await?;
+    let record = resumed(&runs, record, &trainer)?;
     started(&record);
     front.run_created(&record.id);
-    let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
     let id = record.id.clone();
     let guard = front.open_bus();
     let ctx = RunCtx {
@@ -184,6 +186,79 @@ async fn attach(
     let result = front.interrupt().race(flow).await.transpose();
     guard.close().await;
     finish(&runs, run_id, result, front)
+}
+
+/// The trainer of a new run of `training`: resuming from the stopped run
+/// `resume_from` when given, which must hold its snapshot locally and have
+/// been trained with the same settings.
+///
+/// # Errors
+///
+/// Returns an error when `resume_from` is not a stopped run with its
+/// checkpoint in `runs/`, or its training settings differ from `training`.
+fn trainer<'a>(
+    project_dir: &Path,
+    training: &'a Training,
+    runs: &Runs,
+    resume_from: Option<&str>,
+) -> anyhow::Result<Axolotl<'a>> {
+    let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
+    let Some(id) = resume_from else {
+        return Ok(trainer);
+    };
+    let source = runs.load(id)?;
+    let snapshot = match (source.state, &source.snapshot) {
+        (RunState::Stopped, Some(snapshot)) => snapshot,
+        (state, _) => bail!(
+            "cannot resume from run {id}: it is {}, not stopped with a snapshot (see `overbrainer train stop`)",
+            state.name()
+        ),
+    };
+    let dir = runs.run_dir(id)?;
+    if !dir.join(&snapshot.checkpoint).is_dir() {
+        bail!(
+            "cannot resume from run {id}: its snapshot is not in {RUNS_DIR}/{id}/{}; retrieve it \
+             with `overbrainer train attach {id}`",
+            snapshot.checkpoint
+        );
+    }
+    let trainer = trainer.resuming(Resume {
+        run_id: id.to_string(),
+        dir,
+        checkpoint: snapshot.checkpoint.clone(),
+    });
+    let differ = trainer.resume_mismatch()?;
+    if !differ.is_empty() {
+        bail!(
+            "cannot resume from run {id}: the training settings differ from the ones it ran \
+             with ({}); set them back to resume, or start a new run",
+            differ.join(", ")
+        );
+    }
+    Ok(trainer)
+}
+
+/// The new run `record` of `trainer`, recording the run it resumes from.
+///
+/// # Errors
+///
+/// Returns an error when the record cannot be saved.
+pub(super) fn resumed(
+    runs: &Runs,
+    mut record: RunRecord,
+    trainer: &Axolotl<'_>,
+) -> anyhow::Result<RunRecord> {
+    if let Some(resume) = trainer.resume() {
+        record.resumed_from = Some(resume.run_id.clone());
+        runs.save(&record)?;
+        tracing::info!(
+            "train: run {} resumes from the snapshot of run {} ({})",
+            record.id,
+            resume.run_id,
+            resume.checkpoint
+        );
+    }
+    Ok(record)
 }
 
 /// `train stop`: asks the job for a snapshot, then follows it as `train attach`

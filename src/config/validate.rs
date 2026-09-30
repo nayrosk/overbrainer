@@ -211,15 +211,16 @@ const TYPED_AXOLOTL_KEYS: [(&str, &str); 16] = [
     ("hub_model_id", "hub_model_id"),
 ];
 
-/// Axolotl keys that overbrainer manages: the run layout and the metrics plugin
-/// depend on them.
-const MANAGED_AXOLOTL_KEYS: [&str; 6] = [
+/// Axolotl keys that overbrainer manages: the run layout, the metrics plugin and
+/// `train --resume-from` depend on them.
+const MANAGED_AXOLOTL_KEYS: [&str; 7] = [
     "datasets",
     "test_datasets",
     "val_set_size",
     "output_dir",
     "dataset_prepared_path",
     "plugins",
+    "resume_from_checkpoint",
 ];
 
 /// The training section points at a declared target and its values are in range.
@@ -1297,13 +1298,16 @@ mod tests {
     #[test]
     fn axolotl_extra_cannot_replace_typed_or_managed_keys() -> Result<(), config::ConfigError> {
         let toml = format!(
-            "{VALID}\n[training.axolotl_extra]\nnum_epochs = 5\noutput_dir = \"/tmp/x\"\nwarmup_ratio = 0.05\n"
+            "{VALID}\n[training.axolotl_extra]\nnum_epochs = 5\noutput_dir = \"/tmp/x\"\nwarmup_ratio = 0.05\nresume_from_checkpoint = \"/tmp/c\"\n"
         );
         assert_eq!(
             check(&settings(&toml)?),
             vec![
                 "training.axolotl_extra.num_epochs: set training.epochs instead".to_string(),
                 "training.axolotl_extra.output_dir: managed by overbrainer, cannot be overridden"
+                    .to_string(),
+                "training.axolotl_extra.resume_from_checkpoint: managed by overbrainer, cannot \
+                 be overridden"
                     .to_string(),
             ]
         );
