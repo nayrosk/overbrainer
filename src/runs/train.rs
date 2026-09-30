@@ -894,6 +894,17 @@ mod tests {
     const METRICS: &str = "{\"event\": \"begin\", \"time\": 1}\n";
     const RUN_ID: &str = "20260922-143005-abcd";
 
+    /// How [`Fake`]'s probe answers.
+    #[derive(Debug, Clone)]
+    enum Probe {
+        /// It prints this.
+        Answers(Vec<u8>),
+        /// It fails at once.
+        Fails,
+        /// It never answers.
+        Hangs,
+    }
+
     /// A scripted target. Its job reads `status`, its metrics file holds
     /// `metrics`, and the read numbered `failing_read` (from 0) fails.
     struct Fake {
@@ -911,11 +922,9 @@ mod tests {
         manifest: Vec<FileDigest>,
         reads: AtomicU32,
         cancels: AtomicU32,
-        /// What the probe prints; `None` makes it fail.
-        probe: Option<Vec<u8>>,
+        /// How the probe answers.
+        probe: Probe,
         probes: AtomicU32,
-        /// Whether the probe never answers.
-        probe_hangs: bool,
         /// Status polls answered `Running` before [`Fake::status`].
         running_polls: u32,
         polls: AtomicU32,
@@ -934,9 +943,8 @@ mod tests {
                 manifest: Vec::new(),
                 reads: AtomicU32::new(0),
                 cancels: AtomicU32::new(0),
-                probe: None,
+                probe: Probe::Fails,
                 probes: AtomicU32::new(0),
-                probe_hangs: false,
                 running_polls: 0,
                 polls: AtomicU32::new(0),
             }
@@ -1058,13 +1066,13 @@ mod tests {
 
         fn probe(&self, _script: &str) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
             self.probes.fetch_add(1, Ordering::SeqCst);
-            let answer = self.probe.clone().ok_or_else(|| broken("probe"));
-            let hangs = self.probe_hangs;
+            let probe = self.probe.clone();
             async move {
-                if hangs {
-                    std::future::pending::<()>().await;
+                match probe {
+                    Probe::Answers(output) => Ok(output),
+                    Probe::Fails => Err(broken("probe")),
+                    Probe::Hangs => std::future::pending().await,
                 }
-                answer
             }
         }
     }
@@ -1216,7 +1224,7 @@ mod tests {
         let df = "@df.run\nFilesystem 1024-blocks Used Available Capacity Mounted on\n\
                   /dev/sda1 100 60 40 60% /workspace\n";
         let fake = Fake {
-            probe: Some(df.as_bytes().to_vec()),
+            probe: Probe::Answers(df.as_bytes().to_vec()),
             running_polls: 3,
             ..Fake::new(JobStatus::Exited(0))
         };
@@ -1278,8 +1286,7 @@ mod tests {
     async fn a_sample_that_never_answers_never_holds_the_follow()
     -> Result<(), Box<dyn std::error::Error>> {
         let fake = Fake {
-            probe: Some(Vec::new()),
-            probe_hangs: true,
+            probe: Probe::Hangs,
             ..Fake::new(JobStatus::Exited(0))
         };
         let (outcome, fake) = watch_long(fake).await?;
