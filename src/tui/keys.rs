@@ -99,6 +99,7 @@ const LOGS: &[KeyHelp] = &[
     row("k j, Up Down, PgUp PgDn", "scroll"),
     row("G, End", "follow the newest lines"),
     row("f", "cycle level: error, warn, info, debug, trace"),
+    row("s", "toggle overbrainer / selected run's pod"),
     row("x", "export the shown lines to .overbrainer/"),
 ];
 
@@ -218,6 +219,7 @@ const FOOTER_LOGS: &[Hint] = &[
     hint("j/k", "scroll"),
     hint("G", "follow"),
     hint("f", "level"),
+    hint("s", "source"),
     hint("x", "export"),
 ];
 const FOOTER_FILTER: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "clear")];

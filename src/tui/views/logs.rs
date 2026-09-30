@@ -9,6 +9,7 @@ use tracing::Level;
 use crate::logging::LogLine;
 use crate::tui::app::App;
 use crate::tui::format::clock;
+use crate::tui::pod_logs::LogSource;
 
 /// Draws the Logs view in `area`: no frame, a two-column margin, a title row,
 /// a blank row, then the lines. Records the rows the lines have, which bound
@@ -23,13 +24,18 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     .areas(area);
     app.log_view.height = usize::from(lines.height);
     let theme = &app.theme;
-    let view = app.log_view;
-    let offset = view.offset(&app.logs);
-    let window = app.logs.window(view.min, view.height, offset);
-    let mut title = vec![Span::styled(
-        format!("Logs · {} and above", level_name(view.min)),
-        theme.title,
-    )];
+    let (logs, view) = app.shown_logs();
+    let offset = view.offset(logs);
+    let window = logs.window(view.min, view.height, offset);
+    let pod = view.source == LogSource::Pod;
+    let heading = match (&app.pod_logs.run, pod) {
+        (Some(run), true) => format!("Logs · pod of run {run}"),
+        _ => format!("Logs · {} and above", level_name(view.min)),
+    };
+    let mut title = vec![Span::styled(heading, theme.title)];
+    if pod && let Some(error) = &app.pod_logs.error {
+        title.push(Span::styled(format!("  {error}"), theme.warn));
+    }
     if view.anchor.is_some() {
         title.push(Span::styled(
             format!("  ({offset} newer lines below: G follows)"),
@@ -40,9 +46,20 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut items: Vec<ListItem> = window
         .lines
         .iter()
-        .map(|line| ListItem::new(render_line(line, theme)))
+        .map(|line| {
+            ListItem::new(if pod {
+                render_pod_line(line, theme)
+            } else {
+                render_line(line, theme)
+            })
+        })
         .collect();
-    if items.is_empty() && matches!(view.min, Level::DEBUG | Level::TRACE) {
+    if items.is_empty() && pod {
+        items.push(ListItem::new(Span::styled(
+            "nothing kept yet: the pod's log is kept while overbrainer follows the run",
+            theme.dim,
+        )));
+    } else if items.is_empty() && matches!(view.min, Level::DEBUG | Level::TRACE) {
         items.push(ListItem::new(Span::styled(
             "nothing captured at this level: OVERBRAINER_LOG sets what is captured",
             theme.dim,
@@ -61,6 +78,18 @@ fn render_line<'a>(line: &'a LogLine, theme: &crate::tui::theme::Theme) -> Line<
         ),
         Span::raw(" "),
         Span::styled(format!("{}: ", short_target(&line.target)), theme.dim),
+        Span::raw(line.message.as_str()),
+    ])
+}
+
+/// A line of the pod's log: its time, its source (`sys` or `ctr`) where
+/// overbrainer's lines have their level, then the line.
+fn render_pod_line<'a>(line: &'a LogLine, theme: &crate::tui::theme::Theme) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(clock(line.time), theme.dim),
+        Span::raw(" "),
+        Span::styled(format!("{:<5}", line.target), theme.dim),
+        Span::raw(" "),
         Span::raw(line.message.as_str()),
     ])
 }
