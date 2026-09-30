@@ -581,6 +581,58 @@ async fn the_deadline_asks_for_a_snapshot_and_waits_for_it() -> TestResult {
     Ok(())
 }
 
+/// A request already there (`train stop`, or the client's cost request) near the
+/// deadline gets the same hold as one the watchdog writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_already_there_near_the_deadline_is_waited_for() -> TestResult {
+    if !curl_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let pod = Pod::new()?;
+        let mut job = live_group()?;
+        fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
+        fs::write(pod.file("snapshot.request"), "requested")?;
+        let started = Instant::now();
+        let child = pod.start(
+            shell,
+            &server,
+            &[
+                ("OVERBRAINER_DEADLINE", (unix_now() + 1).to_string()),
+                ("OVERBRAINER_SNAPSHOT_LEAD", "600".into()),
+                ("OVERBRAINER_SNAPSHOT_WAIT", "4".into()),
+            ],
+        )?;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            deletes(&server).await,
+            0,
+            "{shell}: deleted during the snapshot"
+        );
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        job.kill()?;
+        job.wait()?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert!(started.elapsed() >= Duration::from_secs(3), "{shell}");
+        assert_eq!(
+            pod.read("snapshot.request"),
+            "requested",
+            "{shell}: rewritten"
+        );
+        assert_eq!(
+            output.matches("snapshot already requested").count(),
+            1,
+            "{shell}: {output}"
+        );
+        assert!(
+            output.contains("delete reason=deadline"),
+            "{shell}: {output}"
+        );
+    }
+    Ok(())
+}
+
 /// A client following the job holds the deadline off: no snapshot is asked for.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fresh_lease_asks_for_no_snapshot() -> TestResult {

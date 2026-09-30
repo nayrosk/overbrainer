@@ -64,11 +64,18 @@ pod_time() {
   printf '%s' "$value"
 }
 
-# Asks the job for a snapshot for reason $1, unless one was asked for already.
+# Asks the job for a snapshot for reason $1. A request already there (train
+# stop, or the client's cost request) is kept, and waited for from now as if
+# the watchdog had written it. The temporary file is this process's own, never
+# the client's.
 request_snapshot() {
-  [ -f "$RUN_DIR/snapshot.request" ] && return 0
-  printf '%s' "$1" > "$RUN_DIR/snapshot.request.tmp" &&
-    mv -f "$RUN_DIR/snapshot.request.tmp" "$RUN_DIR/snapshot.request" || return 1
+  if [ -f "$RUN_DIR/snapshot.request" ]; then
+    requested_at=$n
+    log "snapshot already requested"
+    return 0
+  fi
+  tmp="$RUN_DIR/snapshot.request.$$.tmp"
+  printf '%s' "$1" > "$tmp" && mv -f "$tmp" "$RUN_DIR/snapshot.request" || return 1
   requested_at=$n
   log "snapshot requested reason=$1"
 }

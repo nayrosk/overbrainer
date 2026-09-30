@@ -252,17 +252,18 @@ impl Executor for SshExecutor {
     }
 }
 
-/// Replaces `path` with `content` through a sibling temporary file, creating
-/// its directory first. The content travels quoted on the command line: it is
-/// never a secret.
+/// Replaces `path` with `content` through a sibling temporary file of the
+/// remote shell's own (`<path>.<pid>.tmp`, never shared with a concurrent
+/// writer such as the pod's watchdog), creating its directory first. The
+/// content travels quoted on the command line: it is never a secret.
 fn put_script(path: &str, content: &str) -> String {
     let dir = path.rsplit_once('/').map_or(".", |(dir, _)| dir);
     let dir = if dir.is_empty() { "/" } else { dir };
+    let tmp = format!("{}.$$.tmp", quote(path));
     format!(
         "mkdir -p -- {dir} && printf '%s' {content} > {tmp} && mv -f {tmp} {path}",
         dir = quote(dir),
         content = quote(content),
-        tmp = quote(&format!("{path}.tmp")),
         path = quote(path)
     )
 }
@@ -559,7 +560,12 @@ mod tests {
             assert!(status.success());
             assert_eq!(fs::read_to_string(&path)?, content);
         }
-        assert!(!Path::new(&format!("{path}.tmp")).exists());
+        let left: Vec<_> = fs::read_dir(dir.path().join("r1/.pod"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "a temporary file is left: {left:?}");
+        assert!(put_script(&path, "x").contains(".$$.tmp"));
         Ok(())
     }
 
