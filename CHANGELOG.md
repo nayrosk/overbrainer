@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/nayrosk/overbrainer/compare/v0.4.0...v0.4.1) - 2026-09-30
+
+### Fixed
+
+- *(tui)* show the recorded pod state and clear failed runs ([#88](https://github.com/nayrosk/overbrainer/pull/88))
+- *(config)* ignore OVERBRAINER_NO_UPDATE_CHECK when loading the configuration ([#87](https://github.com/nayrosk/overbrainer/pull/87))
+- *(runpod)* say max_hours when the watchdog deleted the pod ([#86](https://github.com/nayrosk/overbrainer/pull/86))
+
 ## [0.4.0](https://github.com/nayrosk/overbrainer/compare/v0.3.1...v0.4.0) - 2026-09-29
 
 ### Added
@@ -20,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - tell the user when a newer overbrainer is on crates.io ([#53](https://github.com/nayrosk/overbrainer/pull/53))
 - *(tui)* show the version, GitHub link and live cost, merge the question detail, export logs ([#47](https://github.com/nayrosk/overbrainer/pull/47))
 - record stage history and allow one overbrainer per project ([#44](https://github.com/nayrosk/overbrainer/pull/44))
+
+### Documentation
+
+- *(readme)* add the CodeRabbit badge and the v0.4.0 demo GIFs ([#74](https://github.com/nayrosk/overbrainer/pull/74))
 
 ### Fixed
 
