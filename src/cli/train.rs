@@ -120,7 +120,7 @@ async fn train(
     })
     .await?;
     let runs = Runs::new(project_dir);
-    let record = create(&runs, executor.workdir(), name)?;
+    let record = create(&runs, &settings.project.name, executor.workdir(), name)?;
     started(&record);
     front.run_created(&record.id);
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));

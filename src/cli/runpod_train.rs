@@ -126,7 +126,7 @@ pub(super) async fn train(
     };
     let result = async {
         warn_orphans(&session.ctx()).await;
-        let record = create(&session.runs, spec.workdir(), name)?;
+        let record = create(&session.runs, &settings.project.name, spec.workdir(), name)?;
         started(&record);
         front.run_created(&record.id);
         job.run(&mut interrupt, record, keep, secrets).await

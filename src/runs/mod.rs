@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use id::{compact_utc, is_valid_run_id, new_run_id, parse_rfc3339, rfc3339};
+pub use id::{
+    RUN_ID_MAX, compact_utc, is_safe_name, is_valid_run_id, new_run_id, parse_rfc3339, rfc3339,
+};
 pub use summary::MetricsSummary;
 pub use train::{
     HF_CACHE_DIR, Launch, Outcome, RunCtx, RunError, artifacts_missing, cancel, collect, create,
@@ -152,6 +154,35 @@ impl Runs {
         }
     }
 
+    /// Creates the directory of a new run and returns its ID: `base`, or, when a
+    /// run already has that ID, `base_2`, `base_3` and so on up to `base_99`.
+    /// Each directory is created exclusively, so no existing run is ever
+    /// overwritten, even by another process creating a run at the same second.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunsError::InvalidId`] when `base` is not a valid run ID, and
+    /// [`RunsError::Io`] when a directory cannot be created, or all 99 IDs are
+    /// taken (an `AlreadyExists` error).
+    pub fn claim(&self, base: &str) -> Result<String, RunsError> {
+        self.run_dir(base)?;
+        fs::create_dir_all(&self.dir).map_err(io_error(&self.dir))?;
+        let mut n = 1;
+        loop {
+            let id = if n == 1 {
+                base.to_string()
+            } else {
+                format!("{base}_{n}")
+            };
+            let dir = self.run_dir(&id)?;
+            match fs::create_dir(&dir) {
+                Ok(()) => return Ok(id),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 99 => n += 1,
+                Err(e) => return Err(io_error(&dir)(e)),
+            }
+        }
+    }
+
     /// Writes `record` to its `run.json`, replacing it atomically, and creates the
     /// run directory if needed.
     ///
@@ -237,6 +268,9 @@ impl Runs {
                 Err(error) => return Err(error),
             }
         }
+        // `created` is RFC 3339 UTC to the second, as `rfc3339` writes it: its
+        // text order is its time order.
+        records.sort_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)));
         Ok(records)
     }
 }
@@ -308,6 +342,57 @@ pub(crate) mod tests {
         assert_eq!(runs.load("20260921-000000-aaaa")?, first);
         let json = fs::read_to_string(runs.run_dir(&first.id)?.join(RECORD_FILE))?;
         assert!(json.contains("\"state\": \"succeeded\""), "{json}");
+        Ok(())
+    }
+
+    #[test]
+    fn runs_list_in_creation_order_whatever_their_ids() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let mut old_form = record("20260930-120000-ffff");
+        old_form.created = "2026-09-30T12:00:00Z".to_string();
+        let mut named = record("alpha_20260929-080000");
+        named.created = "2026-09-29T08:00:00Z".to_string();
+        let mut later = record("zeta_20260929-080000");
+        later.created = "2026-09-29T08:00:00Z".to_string();
+        let mut first = record("zeta_20260101-000000");
+        first.created = "2026-01-01T00:00:00Z".to_string();
+        for run in [&old_form, &later, &named, &first] {
+            runs.save(run)?;
+        }
+        let ids: Vec<String> = runs.list()?.into_iter().map(|run| run.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "zeta_20260101-000000",
+                "alpha_20260929-080000",
+                "zeta_20260929-080000",
+                "20260930-120000-ffff",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_claimed_run_directory_is_never_claimed_again() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        assert_eq!(runs.claim("p_20260930-120000")?, "p_20260930-120000");
+        assert_eq!(runs.claim("p_20260930-120000")?, "p_20260930-120000_2");
+        fs::create_dir(runs.dir().join("p_20260930-120000_3"))?;
+        assert_eq!(runs.claim("p_20260930-120000")?, "p_20260930-120000_4");
+        for n in 5..=99 {
+            assert_eq!(
+                runs.claim("p_20260930-120000")?,
+                format!("p_20260930-120000_{n}")
+            );
+        }
+        let full = runs.claim("p_20260930-120000");
+        assert!(
+            matches!(&full, Err(RunsError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists),
+            "{full:?}"
+        );
+        assert!(matches!(runs.claim("../p"), Err(RunsError::InvalidId(_))));
         Ok(())
     }
 

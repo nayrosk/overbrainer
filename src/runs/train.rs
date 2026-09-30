@@ -93,17 +93,24 @@ pub struct Outcome {
     pub retrieved: bool,
 }
 
-/// Creates a run for `target`, whose run directories live in `workdir` on the
-/// target: a new ID, and its record saved as `Preparing`. `workdir` is the
+/// Creates a run of the project named `project` for `target`, whose run
+/// directories live in `workdir` on the target: a new ID (see [`new_run_id`]
+/// and [`Runs::claim`]), and its record saved as `Preparing`. `workdir` is the
 /// executor's [`Executor::workdir`], or, for a target whose executor only exists
 /// later (a Runpod pod), the directory it will have.
 ///
 /// # Errors
 ///
-/// Returns [`RunsError`] when the record cannot be saved.
-pub fn create(runs: &Runs, workdir: &str, target: &str) -> Result<RunRecord, RunsError> {
+/// Returns [`RunsError`] when the run directory cannot be claimed or the record
+/// cannot be saved.
+pub fn create(
+    runs: &Runs,
+    project: &str,
+    workdir: &str,
+    target: &str,
+) -> Result<RunRecord, RunsError> {
     let now = SystemTime::now();
-    let id = new_run_id(now);
+    let id = runs.claim(&new_run_id(project, now))?;
     let record = RunRecord {
         remote_dir: format!("{workdir}/{id}"),
         id,
@@ -1034,6 +1041,21 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn runs_created_in_the_same_second_keep_their_own_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let first = create(&runs, "Demo Project", "/w", "box")?;
+        let second = create(&runs, "Demo Project", "/w", "other")?;
+        assert!(first.id.starts_with("demo_project_"), "{}", first.id);
+        assert_ne!(first.id, second.id);
+        assert_eq!(second.remote_dir, format!("/w/{}", second.id));
+        assert_eq!(runs.load(&first.id)?.target, "box");
+        assert_eq!(runs.load(&second.id)?.target, "other");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_job_whose_run_cannot_be_recorded_is_cancelled()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1041,7 +1063,7 @@ mod tests {
         let runs = Runs::new(project.path());
         let bus = EventBus::new();
         let fake = Fake::new(JobStatus::Running);
-        let created = create(&runs, fake.workdir(), "box")?;
+        let created = create(&runs, "demo", fake.workdir(), "box")?;
         break_saves(&runs, &created.id)?;
         let launch = Launch {
             runtime: &JobRuntime::Native {
@@ -1066,7 +1088,7 @@ mod tests {
             spawn_fails: true,
             ..Fake::new(JobStatus::Running)
         };
-        let created = create(&runs, fake.workdir(), "box")?;
+        let created = create(&runs, "demo", fake.workdir(), "box")?;
         break_saves(&runs, &created.id)?;
         let launch = Launch {
             runtime: &JobRuntime::Native {
