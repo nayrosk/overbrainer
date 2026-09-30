@@ -2,20 +2,26 @@
 //! the logs of its Runpod pod, kept in the run directory and, while the pod
 //! exists, read from Runpod. It never writes: the capture belongs to the
 //! command following the run.
+//!
+//! Every line is redacted and printed on one line, without terminal control
+//! characters. A closed standard output (`runs logs --pod | head`) ends the
+//! command quietly.
 
-use std::fs;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use rustix::fs::{Mode, OFlags};
 
 use super::LogsArgs;
 use crate::config::EnvSource;
 use crate::exec::JOB_LOG;
 use crate::runpod::{
     BOOTSTRAP_LOG, LogError, LogQuery, LogSource, PodId, PodLogLine, PodRecord, PodState,
-    RunpodClient, TAIL_MAX, WATCHDOG_LOG, follow_logs, kept_cursor, kept_lines, one_line, snapshot,
+    RunpodClient, TAIL_MAX, WATCHDOG_LOG, follow_logs, kept_cursor, kept_lines, one_line,
+    read_kept, snapshot,
 };
 use crate::runs::Runs;
 use crate::secrets::redact_line;
@@ -30,6 +36,27 @@ const CATCH_UP: Duration = Duration::from_secs(10);
 /// Returns an error when the run does not exist, a kept log cannot be read,
 /// or Runpod refuses the log stream of a pod that exists.
 pub async fn run(project_dir: &Path, args: &LogsArgs) -> anyhow::Result<()> {
+    match print(project_dir, args).await {
+        Err(error) if broken_pipe(&error) => Ok(()),
+        other => other,
+    }
+}
+
+/// Whether `error` comes from a closed standard output.
+fn broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| io.kind() == io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// Writes `line` and a newline on standard output.
+fn out(line: &str) -> io::Result<()> {
+    writeln!(io::stdout().lock(), "{line}")
+}
+
+async fn print(project_dir: &Path, args: &LogsArgs) -> anyhow::Result<()> {
     let runs = Runs::new(project_dir);
     let dir = runs.run_dir(&args.run_id)?;
     if !dir.is_dir() {
@@ -38,11 +65,13 @@ pub async fn run(project_dir: &Path, args: &LogsArgs) -> anyhow::Result<()> {
     if !args.pod {
         return job_log(&dir, &args.run_id, args.tail);
     }
+    // The cursor first: a line kept meanwhile then prints twice, never not at all.
+    let cursor = kept_cursor(&dir);
     let shown = kept(&dir, args)?;
     let live = live_pod(&runs, &args.run_id);
     let Some(pod_id) = live else {
         if !shown {
-            println!("runs: no pod log kept for run {}", args.run_id);
+            out(&format!("runs: no pod log kept for run {}", args.run_id))?;
         }
         return Ok(());
     };
@@ -56,27 +85,39 @@ pub async fn run(project_dir: &Path, args: &LogsArgs) -> anyhow::Result<()> {
     let query = LogQuery {
         source: args.source,
         tail: Some(args.tail.unwrap_or(TAIL_MAX).min(TAIL_MAX)),
-        cursor: kept_cursor(&dir),
+        since: None,
+        cursor,
     };
     stream(&client, &pod_id, query, args.follow).await
 }
 
-/// Prints the run's `job.log`, its last `tail` lines only when given.
+/// Prints the run's `job.log`, its last `tail` lines only when given. A
+/// `job.log` that is a symbolic link is refused.
 fn job_log(dir: &Path, run_id: &str, tail: Option<u32>) -> anyhow::Result<()> {
     let path = dir.join(JOB_LOG);
-    let text = match fs::read(&path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            println!("runs: no {JOB_LOG} for run {run_id} yet");
+    let opened = rustix::fs::open(
+        &path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    );
+    let mut file = match opened {
+        Ok(fd) => File::from(fd),
+        Err(errno) if errno == rustix::io::Errno::NOENT => {
+            out(&format!("runs: no {JOB_LOG} for run {run_id} yet"))?;
             return Ok(());
         },
-        Err(error) => {
-            return Err(error).with_context(|| format!("cannot read {}", path.display()));
+        Err(errno) => {
+            return Err(io::Error::from(errno))
+                .with_context(|| format!("cannot read {}", path.display()));
         },
     };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     for line in last(&lines, tail) {
-        println!("{}", redact_line(line, &[]));
+        out(&one_line(&redact_line(line, &[])))?;
     }
     Ok(())
 }
@@ -96,15 +137,16 @@ fn kept(dir: &Path, args: &LogsArgs) -> anyhow::Result<bool> {
     let mut shown = false;
     if args.source != Some(LogSource::System) {
         for name in [BOOTSTRAP_LOG, WATCHDOG_LOG] {
-            let path = dir.join(name);
-            let Ok(bytes) = fs::read(&path) else {
+            let bytes = read_kept(dir, name)
+                .with_context(|| format!("cannot read {name} of run {}", args.run_id))?;
+            let Some(bytes) = bytes else {
                 continue;
             };
             let text = String::from_utf8_lossy(&bytes);
             let lines: Vec<&str> = text.lines().collect();
-            println!("== {name} ==");
+            out(&format!("== {name} =="))?;
             for line in last(&lines, args.tail) {
-                println!("{}", one_line(&redact_line(line, &[])));
+                out(&one_line(&redact_line(line, &[])))?;
             }
             shown = true;
         }
@@ -116,10 +158,10 @@ fn kept(dir: &Path, args: &LogsArgs) -> anyhow::Result<bool> {
         .collect();
     if !lines.is_empty() {
         if shown {
-            println!("== pod ==");
+            out("== pod ==")?;
         }
         for line in last(&lines, args.tail) {
-            println!("{}", line.display());
+            out(&line.display())?;
         }
         shown = true;
     }
@@ -154,7 +196,7 @@ async fn stream(
 ) -> anyhow::Result<()> {
     let mut print = |lines: &[PodLogLine], _: Option<&str>| {
         for line in lines {
-            println!("{}", line.display());
+            out(&line.display())?;
         }
         Ok(())
     };

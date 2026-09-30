@@ -217,3 +217,49 @@ async fn a_live_pod_is_caught_up_from_the_kept_cursor() -> TestResult {
     assert!(!kept.contains("step 3"));
     Ok(())
 }
+
+#[test]
+fn terminal_controls_and_forged_fields_are_escaped() -> TestResult {
+    let dir = project(PodState::Deleted)?;
+    std::fs::write(run_dir(dir.path()).join("job.log"), "a\u{1b}[2Jb\n")?;
+    overbrainer(dir.path())?
+        .args(["runs", "logs", RUN])
+        .assert()
+        .success()
+        .stdout("a\\u{1b}[2Jb\n");
+    let pod = run_dir(dir.path()).join(".pod");
+    std::fs::create_dir_all(&pod)?;
+    std::fs::write(
+        pod.join("pod.log"),
+        format!("{}\n", pod_line("\u{1b}]0;title\u{7}", "\u{1b}[31m", "x")),
+    )?;
+    overbrainer(dir.path())?
+        .args(["runs", "logs", RUN, "--pod"])
+        .assert()
+        .success()
+        .stdout(" raw x\n");
+    Ok(())
+}
+
+/// `runs logs | head`: the closed pipe ends the command quietly.
+#[test]
+fn a_closed_standard_output_ends_quietly() -> TestResult {
+    let dir = project(PodState::Deleted)?;
+    let text = "line of the job\n".repeat(50_000);
+    std::fs::write(run_dir(dir.path()).join("job.log"), text)?;
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("overbrainer"))
+        .env_clear()
+        .env("HOME", "/nonexistent")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["runs", "logs", RUN])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    drop(child.stdout.take());
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    Ok(())
+}
