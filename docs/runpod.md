@@ -14,7 +14,7 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 | Key | Default | Meaning |
 |---|---|---|
 | `gpu_types` | required | Runpod GPU type IDs, tried in order until one can be placed, or `"auto"` to try every GPU type in stock, cheapest first, when the run starts (see [`"auto"`](#auto) below). From the environment, one comma-separated value, or `auto`: `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES="NVIDIA GeForce RTX 4090,NVIDIA A40"` or `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. |
-| `min_vram_gb` | none | Least VRAM per GPU, in GB. Only with `gpu_types = "auto"`. At least 1. |
+| `min_vram_gb` | none | Least VRAM per GPU, in GB. Only with `gpu_types = "auto"`. At least 1. Unset, `auto` uses the [VRAM estimate](#vram-estimate) instead, when it can be made. |
 | `max_price_per_hour` | none | Highest Secure Cloud list price of one GPU, in USD per hour. Only with `gpu_types = "auto"`. Greater than 0. |
 | `max_hours` | required | The pod's watchdog deletes the pod this long after it was created, unless overbrainer is following a job that still makes progress ([the watchdog](#the-watchdog)). At most 720. |
 | `gpu_count` | `1` | GPUs per pod. |
@@ -77,7 +77,7 @@ The IDs, names, regions, data centers, images and CUDA versions of the catalog (
 
 `gpu_types = "auto"` and `data_center_ids = "auto"` are resolved once, from the same GPU listing (scoped to the target's `gpu_count`), right before the run's first create call, never at `overbrainer pod gpus` time and never again later in the same run even if several GPU types are tried:
 
-1. `gpu_types = "auto"` picks every Secure Cloud GPU type in stock for `gpu_count` GPUs, within `min_vram_gb` and `max_price_per_hour` when set, and in one of the listed `data_center_ids` when any are listed, cheapest first (ties by more VRAM, then by ID).
+1. `gpu_types = "auto"` picks every Secure Cloud GPU type in stock for `gpu_count` GPUs, within `min_vram_gb` (or, when it is unset, the [VRAM estimate](#vram-estimate)) and `max_price_per_hour` when set, and in one of the listed `data_center_ids` when any are listed, cheapest first (ties by more VRAM, then by ID).
 2. `data_center_ids = "auto"` then picks every data center with one of the chosen GPU types in stock for `gpu_count`, ordered by the cheapest such GPU type it has.
 
 When nothing in stock matches, the run fails before any pod is created, naming what was asked:
@@ -92,9 +92,20 @@ or, once GPU types are chosen but no data center has one of them in stock:
 no data center has A or B in stock for data_center_ids = "auto" (gpu_count = 1)
 ```
 
+## VRAM estimate
+
+Before a run starts on a Runpod target, overbrainer estimates the GPU memory the run needs on each GPU, from the child model's shape on Hugging Face (its parameter count from the model's `safetensors` metadata, its hidden size, layers and vocabulary from `config.json`, read with `OVERBRAINER_HF_TOKEN` when set, for gated models) and the `[training]` settings:
+
+- the weights: 2 bytes per parameter (bf16), about 0.6 with `adapter = "qlora"` (4 bits);
+- the gradients and optimizer state: 16 bytes per trained parameter (10 with an 8-bit `optimizer`, such as `paged_adamw_8bit`); every parameter with `adapter = "full"`, only the adapter's (about `18 x lora_r x hidden size` per layer) with LoRA and QLoRA;
+- the activations kept by gradient checkpointing, `micro_batch_size x sequence_len x hidden size x layers x 2` bytes, and the fp32 logits, `micro_batch_size x sequence_len x vocabulary x 4` bytes;
+- 2 GB of overhead, then 20% on top of it all.
+
+Each GPU holds a whole copy of the model, so the estimate does not change with `gpu_count`. It is rough and on the safe side. When `gpu_types = "auto"` and `min_vram_gb` is unset, `auto` keeps only the GPU types with at least that much VRAM (rounded up to a whole GB); an explicit `min_vram_gb` always wins. When the shape cannot be read (a local path as `base_model`, a model without `safetensors` metadata, a gated model without a token, no network), the run starts as before, without that floor, and a warning says why.
+
 ## The pickers
 
-The [TUI](tui.md)'s Project view lets you set a Runpod target's `gpu_types`, `data_center_ids`, `network_volume_id` and `image` from the live catalog instead of typing them, and the confirmation before a run starts lets you re-pick the GPU types and data centers it will use, saving the choice to `overbrainer.toml` first. `o` sorts the GPU picker by price, VRAM (most first) or the number of data centers with the type in stock (most first), and the data center picker by ID or region. With `network_volume_id` set to a volume the volume listing has, `data_center_ids` holds the volume's data center: changing it in the Project view is refused, pick another volume instead. See [Terminal UI](tui.md) for the keys.
+The [TUI](tui.md)'s Project view lets you set a Runpod target's `gpu_types`, `data_center_ids`, `network_volume_id` and `image` from the live catalog instead of typing them, and the confirmation before a run starts lets you re-pick the GPU types and data centers it will use, saving the choice to `overbrainer.toml` first. The GPU picker has a FIT column from the [VRAM estimate](#vram-estimate): `ok`, `tight` (less than 10% to spare), `small` (less VRAM than the estimate: shown dim and cannot be chosen) or `?` (no estimate); its title says the estimate. `o` sorts the GPU picker by price, VRAM (most first) or the number of data centers with the type in stock (most first), and the data center picker by ID or region. With `network_volume_id` set to a volume the volume listing has, `data_center_ids` holds the volume's data center: changing it in the Project view is refused, pick another volume instead. See [Terminal UI](tui.md) for the keys.
 
 `container_disk_gb` is checked against fixed bounds (at least 20): the Runpod v2 API does not say how much container disk a GPU type allows.
 
