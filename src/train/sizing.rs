@@ -123,18 +123,22 @@ fn float(value: u64) -> f64 {
 }
 
 /// The memory a run of `recipe` on a model of `shape` needs per GPU: the
-/// weights (bf16, or about 0.6 bytes per parameter in 4 bits with QLoRA),
+/// weights (bf16, or about 0.6 bytes per parameter in 4 bits with `QLoRA`),
 /// the gradients and `AdamW` state (16 bytes per trained parameter, 10 with
-/// an 8-bit optimizer; only the adapter's with LoRA), the activations kept by
+/// an 8-bit optimizer; only the adapter's with `LoRA`), the activations kept by
 /// gradient checkpointing (one bf16 hidden state per token and layer), the
-/// fp32 logits, then [`OVERHEAD_GIB`], all raised by [`MARGIN`].
+/// fp32 logits, then 2 GB of overhead, all raised by 20%.
 #[must_use]
 pub fn estimate(shape: &ModelShape, recipe: &Recipe) -> Estimate {
     let params = float(shape.params);
     let hidden = float(shape.hidden_size);
     let layers = float(shape.layers);
     let tokens = f64::from(recipe.micro_batch_size) * f64::from(recipe.sequence_len);
-    let optimizer = if recipe.eight_bit_optimizer { 10.0 } else { 16.0 };
+    let optimizer = if recipe.eight_bit_optimizer {
+        10.0
+    } else {
+        16.0
+    };
     let (weights, trained) = match recipe.adapter {
         Adapter::Full => (2.0 * params, params),
         Adapter::Lora => (2.0 * params, lora_params(shape, recipe)),
@@ -249,7 +253,8 @@ pub async fn fetch_shape(
             model,
         )
         .await?;
-        shape(&info, &config).ok_or_else(|| format!("{model} does not give its size on Hugging Face"))
+        shape(&info, &config)
+            .ok_or_else(|| format!("{model} does not give its size on Hugging Face"))
     };
     tokio::time::timeout(limit, lookup)
         .await

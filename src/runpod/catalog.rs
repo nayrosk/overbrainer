@@ -825,9 +825,7 @@ mod tests {
         auto.min_vram_gb = None;
         let error = picked(&auto, Some(100)).err().unwrap_or_default();
         assert!(
-            error.ends_with(
-                "(gpu_count = 1, at least 100 GB of VRAM estimated for the model)"
-            ),
+            error.ends_with("(gpu_count = 1, at least 100 GB of VRAM estimated for the model)"),
             "{error}"
         );
         let listed = target(list(&["small"]), ListOrAuto::default());

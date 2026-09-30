@@ -1,5 +1,6 @@
 ---
 source: src/tui/snapshots.rs
+assertion_line: 602
 ---
 " ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs                                       rust_expert "
 "╭ runs ────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮"
@@ -18,7 +19,8 @@ source: src/tui/snapshots.rs
 "                        │  model       Qwen/Qwen3-4B, qlora, 3 epochs, lr 2e-4                 │                        "
 "                        │  data        data/train.jsonl 1234 examples, data/eval.jsonl 137     │                        "
 "                        │  warning     qwen2 renders no reasoning_content (see the logs)       │                        "
-"                        │  GPU types   tried in order, list price x 1 GPU, VRAM, stock:        │                        "
+"                        │  vram        estimating from the model...                            │                        "
+"                        │  GPU types   tried in order, list price x 1 GPU, VRAM, stock, fit:   │                        "
 "                        │  - NVIDIA GeForce RTX 4090  looking up the catalog...                │                        "
 "                        │  - NVIDIA RTX A6000         looking up the catalog...                │                        "
 "                        │  - NVIDIA A40               looking up the catalog...                │                        "
@@ -30,7 +32,6 @@ source: src/tui/snapshots.rs
 "                        │                                                y start    n cancel   │                        "
 "                        │                                                                      │                        "
 "                        ╰──────────────────────────────────────────────────────────────────────╯                        "
-"                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "

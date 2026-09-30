@@ -1,7 +1,8 @@
 //! What `t` shows before a training run starts: the target, the model, the data,
-//! and for Runpod the GPU types (configured, chosen with `g`, or what `auto`
-//! picks now) with their list price, VRAM and stock, the data centers, and the
-//! most `max_hours` can cost.
+//! and for Runpod the VRAM the run needs per GPU (estimated from the model's
+//! shape on Hugging Face), the GPU types (configured, chosen with `g`, or what
+//! `auto` picks now) with their list price, VRAM, stock and fit, the data
+//! centers, and the most `max_hours` can cost.
 
 use std::path::Path;
 use std::time::Duration;
@@ -10,7 +11,8 @@ use serde::de::IgnoredAny;
 
 use crate::config::{Adapter, CONFIG_FILE, ListOrAuto, Runtime, Settings, Source, Target};
 use crate::dataset::{DataFiles, read};
-use crate::runpod::{Availability, GpuType, RunpodTarget, resolve};
+use crate::runpod::{Availability, GpuType, RunpodTarget, resolve_with_floor};
+use crate::train::sizing::{Estimate, HF_URL, estimate_model, fit};
 use crate::train::{Outputs, reasoning_template_warning};
 
 /// Total time the GPU catalog may take; the dialog never waits for it.
@@ -136,6 +138,25 @@ pub(super) const AUTO_LIMITS: [&str; 2] = ["min_vram_gb", "max_price_per_hour"];
 /// cannot be.
 pub(super) type Gpus = Result<Vec<GpuType>, String>;
 
+/// The VRAM a run needs per GPU, or why it is unknown.
+pub(super) type Need = Result<Estimate, String>;
+
+/// What the start dialog looks up in the background.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Catalog {
+    /// The GPU types.
+    pub(super) gpus: Gpus,
+    /// The VRAM the run needs per GPU.
+    pub(super) need: Need,
+}
+
+impl Catalog {
+    /// The least VRAM `auto` GPU types need, when the estimate is known.
+    fn floor_gb(&self) -> Option<u32> {
+        self.need.as_ref().ok().map(Estimate::floor_gb)
+    }
+}
+
 /// Entries an `auto` choice shows at most; the others are counted.
 const AUTO_SHOWN: usize = 4;
 
@@ -245,6 +266,51 @@ fn kind(target: &Target) -> String {
     }
 }
 
+/// The GPU types for `gpu_count` GPUs (see [`list_gpus`]) and the VRAM a run
+/// needs per GPU (see [`estimate_need`]), looked up together.
+pub(super) async fn look_up(dir: &Path, source: Source, gpu_count: u32) -> Catalog {
+    let (gpus, need) = tokio::join!(
+        list_gpus(dir, source.clone(), gpu_count),
+        estimate_need(dir, source, HF_URL, START_CATALOG_TIMEOUT),
+    );
+    Catalog { gpus, need }
+}
+
+/// The VRAM a run of the project in `dir` (its settings from `source`) needs
+/// per GPU, its model's shape read from the Hugging Face Hub at `base_url`
+/// with the project's token, giving up after `limit`. Why it is unknown is
+/// logged too, never with the token.
+pub(super) async fn estimate_need(
+    dir: &Path,
+    source: Source,
+    base_url: &str,
+    limit: Duration,
+) -> Need {
+    let lookup = async {
+        let settings = source.load(dir).map_err(|error| format!("{error:#}"))?;
+        let training = settings
+            .training
+            .as_ref()
+            .ok_or("no [training] section in overbrainer.toml")?;
+        let token = match &settings.hf_token {
+            Some(token) => Some(
+                crate::cli::train::hf_token(token)
+                    .await
+                    .map_err(|error| format!("{error:#}"))?,
+            ),
+            None => None,
+        };
+        estimate_model(training, token.as_ref(), base_url, limit).await
+    };
+    let need = tokio::time::timeout(limit, lookup)
+        .await
+        .unwrap_or_else(|_| Err("Hugging Face took too long to answer".to_string()));
+    if let Err(error) = &need {
+        tracing::warn!("cannot estimate the VRAM the run needs: {error}");
+    }
+    need
+}
+
 /// The Secure Cloud GPU types for `gpu_count` GPUs on the Runpod account of
 /// the project in `dir` (its settings from `source`), giving up after
 /// [`START_CATALOG_TIMEOUT`]. Why they cannot be read is logged too, with only the
@@ -292,22 +358,22 @@ fn stock(gpu: &GpuType, centers: &[String]) -> Availability {
 
 /// The confirmation text of `plan`, with the GPU types of the catalog once
 /// looked up.
-pub(super) fn text(plan: &StartPlan, gpus: Option<&Gpus>) -> Vec<String> {
+pub(super) fn text(plan: &StartPlan, catalog: Option<&Catalog>) -> Vec<String> {
     let data = format!(
         "data        data/train.jsonl {} examples, data/eval.jsonl {}",
         plan.train, plan.eval
     );
-    lines(plan, gpus, data)
+    lines(plan, catalog, data)
 }
 
 /// [`text`] for a run started once split has rebuilt the data, which it
 /// cannot count yet.
-pub(super) fn text_after_split(plan: &StartPlan, gpus: Option<&Gpus>) -> Vec<String> {
+pub(super) fn text_after_split(plan: &StartPlan, catalog: Option<&Catalog>) -> Vec<String> {
     let data = "data        rebuilt by split just before the run".to_string();
-    lines(plan, gpus, data)
+    lines(plan, catalog, data)
 }
 
-fn lines(plan: &StartPlan, gpus: Option<&Gpus>, data: String) -> Vec<String> {
+fn lines(plan: &StartPlan, catalog: Option<&Catalog>, data: String) -> Vec<String> {
     let mut text = vec![
         format!("target      {} ({})", plan.target, plan.kind),
         format!("model       {}", plan.model),
@@ -323,7 +389,7 @@ fn lines(plan: &StartPlan, gpus: Option<&Gpus>, data: String) -> Vec<String> {
                 "{CHANGED_LABEL}{changed}: saved to {CONFIG_FILE} on y, then the run starts"
             ));
         }
-        text.extend(runpod_lines(&runpod.spec, gpus));
+        text.extend(runpod_lines(&runpod.spec, catalog));
     }
     text.push(
         "The run keeps going when you leave this view or quit; attach again here or with \
@@ -344,18 +410,20 @@ pub(super) fn pinned(text: &[String]) -> Vec<usize> {
         .collect()
 }
 
-/// The GPU types of `spec`, or those `auto` picks now from `gpus`, each with
-/// its list price times the GPU count, VRAM and stock; the data centers; then
-/// `max_hours` with the most it can cost at the highest listed rate.
-fn runpod_lines(spec: &RunpodTarget, gpus: Option<&Gpus>) -> Vec<String> {
+/// The VRAM the run needs per GPU; then the GPU types of `spec`, or those
+/// `auto` picks now from the catalog, each with its list price times the GPU
+/// count, VRAM, stock and fit; the data centers; then `max_hours` with the
+/// most it can cost at the highest listed rate.
+fn runpod_lines(spec: &RunpodTarget, catalog: Option<&Catalog>) -> Vec<String> {
     let count = spec.gpu_count;
-    let catalog = match gpus {
-        Some(Ok(listed)) => Some(listed.as_slice()),
-        _ => None,
-    };
-    let (header, chosen) = match (&spec.gpu_types, catalog) {
+    let listed = catalog.and_then(|catalog| catalog.gpus.as_deref().ok());
+    // The estimate is the floor of `auto` only without `min_vram_gb`.
+    let floor = catalog
+        .and_then(Catalog::floor_gb)
+        .filter(|_| spec.min_vram_gb.is_none());
+    let (header, chosen) = match (&spec.gpu_types, listed) {
         (ListOrAuto::List(ids), _) => (
-            format!("GPU types   tried in order, list price x {count} GPU, VRAM, stock:"),
+            format!("GPU types   tried in order, list price x {count} GPU, VRAM, stock, fit:"),
             Ok(ids.clone()),
         ),
         (ListOrAuto::Auto, None) => (
@@ -365,15 +433,16 @@ fn runpod_lines(spec: &RunpodTarget, gpus: Option<&Gpus>) -> Vec<String> {
             ),
             Ok(Vec::new()),
         ),
-        (ListOrAuto::Auto, Some(listed)) => match auto_gpus(spec, listed) {
+        (ListOrAuto::Auto, Some(listed)) => match auto_gpus(spec, listed, floor) {
             Ok(ids) => (
-                format!("GPU types   auto picks now, list price x {count} GPU, VRAM, stock:"),
+                format!("GPU types   auto picks now, list price x {count} GPU, VRAM, stock, fit:"),
                 Ok(ids),
             ),
             Err(error) => (format!("GPU types   auto: {error}"), Err(())),
         },
     };
-    let mut lines = vec![header];
+    let auto_floor = floor.filter(|_| spec.gpu_types.is_auto());
+    let mut lines = vec![vram_line(catalog, auto_floor), header];
     let ids = chosen.clone().unwrap_or_default();
     let shown = if spec.gpu_types.is_auto() {
         AUTO_SHOWN
@@ -381,83 +450,141 @@ fn runpod_lines(spec: &RunpodTarget, gpus: Option<&Gpus>) -> Vec<String> {
         ids.len()
     };
     let centers = spec.data_center_ids.list();
-    let width = ids
-        .iter()
-        .take(shown)
-        .map(|id| id.chars().count())
-        .max()
-        .unwrap_or(0);
-    for id in ids.iter().take(shown) {
-        lines.push(gpu_line(id, width, count, centers, gpus));
-    }
+    let shown_ids: Vec<String> = ids.iter().take(shown).cloned().collect();
+    lines.extend(gpu_lines(&shown_ids, count, centers, catalog));
     if ids.len() > shown {
         lines.push(format!("- and {} more", ids.len() - shown));
     }
-    if let Some(Err(error)) = gpus {
+    if let Some(Catalog {
+        gpus: Err(error), ..
+    }) = catalog
+    {
         lines.push(format!("catalog     {error}"));
     }
-    lines.push(center_line(spec, catalog, chosen.is_ok()));
-    lines.push(max_hours_line(spec, catalog, &ids));
+    lines.push(center_line(spec, listed, floor, chosen.is_ok()));
+    lines.push(max_hours_line(spec, listed, &ids));
     lines
 }
 
-/// The GPU types `auto` picks now from `gpus`, in the data centers listed if
-/// any.
-fn auto_gpus(spec: &RunpodTarget, gpus: &[GpuType]) -> Result<Vec<String>, String> {
+/// The VRAM the run needs per GPU, once estimated, and the `floor` of `auto`
+/// GPU types it gives; or why it is unknown.
+fn vram_line(catalog: Option<&Catalog>, floor: Option<u32>) -> String {
+    let need = match catalog.map(|catalog| &catalog.need) {
+        None => "estimating from the model...".to_string(),
+        Some(Ok(need)) => match floor {
+            Some(gb) => format!("{need} per GPU (estimate): auto keeps >= {gb} GB"),
+            None => format!("{need} per GPU (estimate)"),
+        },
+        Some(Err(error)) => format!("unknown: {error}"),
+    };
+    format!("vram        {need}")
+}
+
+/// The GPU types `auto` picks now from `gpus`, with at least `floor` GB of
+/// VRAM when given, in the data centers listed if any.
+fn auto_gpus(
+    spec: &RunpodTarget,
+    gpus: &[GpuType],
+    floor: Option<u32>,
+) -> Result<Vec<String>, String> {
     let mut alone = spec.clone();
     if alone.data_center_ids.is_auto() {
         alone.data_center_ids = ListOrAuto::default();
     }
-    resolve(&alone, gpus).map(|resolved| resolved.gpu_types.list().to_vec())
+    resolve_with_floor(&alone, gpus, floor).map(|resolved| resolved.gpu_types.list().to_vec())
 }
 
-/// The line of the GPU type `id`, padded to `width`: its list price for
-/// `count` GPUs, its VRAM and its stock in `centers`, once `gpus` are read.
-fn gpu_line(id: &str, width: usize, count: u32, centers: &[String], gpus: Option<&Gpus>) -> String {
-    let about = match gpus {
-        None => "looking up the catalog...".to_string(),
-        Some(Err(_)) => "catalog unread".to_string(),
-        Some(Ok(listed)) => match listed.iter().find(|gpu| gpu.id == id) {
-            None => "not in the catalog".to_string(),
-            Some(gpu) => {
-                let price = gpu.secure_price().map_or_else(
-                    || "price unknown".to_string(),
-                    |rate| format!("${:.2}/h", rate * f64::from(count)),
-                );
-                format!(
-                    "{price:<13} {:>3} GB  {}",
-                    gpu.memory,
-                    stock(gpu, centers).name()
-                )
-            },
-        },
+/// The cells of the GPU type `id` once `catalog` is read: its list price for
+/// `count` GPUs, its VRAM, its stock in `centers` and whether it holds the
+/// run; or what is known instead.
+fn gpu_cells(
+    id: &str,
+    count: u32,
+    centers: &[String],
+    catalog: Option<&Catalog>,
+) -> Result<[String; 4], &'static str> {
+    let Some(catalog) = catalog else {
+        return Err("looking up the catalog...");
     };
-    format!("- {id:<width$}  {about}")
+    let listed = catalog.gpus.as_ref().map_err(|_| "catalog unread")?;
+    let gpu = listed
+        .iter()
+        .find(|gpu| gpu.id == id)
+        .ok_or("not in the catalog")?;
+    let price = gpu.secure_price().map_or_else(
+        || "price unknown".to_string(),
+        |rate| format!("${:.2}/h", rate * f64::from(count)),
+    );
+    Ok([
+        price,
+        format!("{:>3} GB", gpu.memory),
+        stock(gpu, centers).name().to_string(),
+        fit(gpu.memory, catalog.need.as_ref().ok())
+            .name()
+            .to_string(),
+    ])
 }
 
-/// The data centers of `spec`, or those `auto` picks now from `gpus` when
-/// `auto` found GPU types (`placed`).
-fn center_line(spec: &RunpodTarget, gpus: Option<&[GpuType]>, placed: bool) -> String {
+/// The lines of the GPU types `ids`, each column as wide as its widest cell.
+fn gpu_lines(
+    ids: &[String],
+    count: u32,
+    centers: &[String],
+    catalog: Option<&Catalog>,
+) -> Vec<String> {
+    let rows: Vec<(&String, Result<[String; 4], &str>)> = ids
+        .iter()
+        .map(|id| (id, gpu_cells(id, count, centers, catalog)))
+        .collect();
+    let widest = |column: usize| {
+        rows.iter()
+            .filter_map(|(_, cells)| cells.as_ref().ok())
+            .map(|cells| cells[column].chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let id_width = ids.iter().map(|id| id.chars().count()).max().unwrap_or(0);
+    let (price_width, stock_width) = (widest(0), widest(2));
+    rows.iter()
+        .map(|(id, cells)| match cells {
+            Ok([price, vram, stock, fit]) => format!(
+                "- {id:<id_width$}  {price:<price_width$}  {vram}  {stock:<stock_width$}  {fit}"
+            ),
+            Err(about) => format!("- {id:<id_width$}  {about}"),
+        })
+        .collect()
+}
+
+/// The data centers of `spec`, or those `auto` picks now from `gpus` (with
+/// GPU types of at least `floor` GB) when `auto` found GPU types (`placed`).
+fn center_line(
+    spec: &RunpodTarget,
+    gpus: Option<&[GpuType]>,
+    floor: Option<u32>,
+    placed: bool,
+) -> String {
     let centers = match (&spec.data_center_ids, gpus) {
         (ListOrAuto::List(ids), _) if ids.is_empty() => "any".to_string(),
         (ListOrAuto::List(ids), _) => ids.join(", "),
-        (ListOrAuto::Auto, Some(listed)) if placed => match resolve(spec, listed) {
-            Ok(resolved) => {
-                let ids = resolved.data_center_ids.list();
-                let more = ids.len().saturating_sub(AUTO_SHOWN);
-                let shown = ids
-                    .iter()
-                    .take(AUTO_SHOWN)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if more > 0 {
-                    format!("auto picks now: {shown} and {more} more")
-                } else {
-                    format!("auto picks now: {shown}")
-                }
-            },
-            Err(error) => format!("auto: {error}"),
+        (ListOrAuto::Auto, Some(listed)) if placed => {
+            match resolve_with_floor(spec, listed, floor) {
+                Ok(resolved) => {
+                    let ids = resolved.data_center_ids.list();
+                    let more = ids.len().saturating_sub(AUTO_SHOWN);
+                    let shown = ids
+                        .iter()
+                        .take(AUTO_SHOWN)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if more > 0 {
+                        format!("auto picks now: {shown} and {more} more")
+                    } else {
+                        format!("auto picks now: {shown}")
+                    }
+                },
+                Err(error) => format!("auto: {error}"),
+            }
         },
         (ListOrAuto::Auto, _) => {
             "auto: those with a chosen GPU type in stock, chosen at the start".to_string()
@@ -517,11 +644,11 @@ pub(super) fn runpod_spec(gpus: ListOrAuto, count: u32) -> RunpodTarget {
 #[cfg(test)]
 mod tests {
     use crate::config::EnvSource;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::tui::snapshots::gpu_types;
+    use crate::tui::snapshots::{gpu_types, looked_up};
 
     /// The position of the `max_hours` line in `text`.
     fn cost_line(text: &[String]) -> Option<usize> {
@@ -563,8 +690,8 @@ mod tests {
             .ok_or_else(|| "no Runpod plan".to_string())
     }
 
-    fn fixture() -> Result<Gpus, serde_json::Error> {
-        gpu_types().map(Ok)
+    fn fixture() -> Result<Catalog, serde_json::Error> {
+        gpu_types().map(|gpus| looked_up(Ok(gpus)))
     }
 
     #[test]
@@ -588,30 +715,57 @@ mod tests {
     }
 
     #[test]
-    fn listed_gpus_show_price_vram_and_stock_and_bound_the_run()
+    fn listed_gpus_show_price_vram_stock_and_fit_and_bound_the_run()
     -> Result<(), Box<dyn std::error::Error>> {
         let gpus = fixture()?;
         let lines = text(&plan(true), Some(&gpus));
-        assert_eq!(
-            lines[3],
-            "GPU types   tried in order, list price x 2 GPU, VRAM, stock:"
-        );
+        assert_eq!(lines[3], "vram        about 19.1 GB per GPU (estimate)");
         assert_eq!(
             lines[4],
-            "- NVIDIA GeForce RTX 4090  $1.38/h        24 GB  MEDIUM"
+            "GPU types   tried in order, list price x 2 GPU, VRAM, stock, fit:"
         );
-        assert_eq!(lines[5], "- NVIDIA B300              not in the catalog");
-        assert_eq!(lines[6], "datacenters any");
         assert_eq!(
-            lines[7],
+            lines[5],
+            "- NVIDIA GeForce RTX 4090  $1.38/h   24 GB  MEDIUM  ok"
+        );
+        assert_eq!(lines[6], "- NVIDIA B300              not in the catalog");
+        assert_eq!(lines[7], "datacenters any");
+        assert_eq!(
+            lines[8],
             "max_hours   6: the watchdog deletes the pod by then, about $8.28 at most at the \
              highest listed rate (some prices unknown)"
         );
-        assert_eq!(cost_line(&lines), Some(7));
+        assert_eq!(cost_line(&lines), Some(8));
         let waiting = text(&plan(true), None);
+        assert_eq!(waiting[3], "vram        estimating from the model...");
         assert!(
-            waiting[4].ends_with("looking up the catalog..."),
+            waiting[5].ends_with("looking up the catalog..."),
             "{waiting:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_estimate_says_why_and_fits_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let catalog = Catalog {
+            gpus: Ok(gpu_types()?),
+            need: Err("Hugging Face answered 401 for Qwen/Qwen3-4B".into()),
+        };
+        let lines = text(&plan(true), Some(&catalog));
+        assert_eq!(
+            lines[3],
+            "vram        unknown: Hugging Face answered 401 for Qwen/Qwen3-4B"
+        );
+        assert!(lines[5].ends_with("MEDIUM  ?"), "{lines:?}");
+        let auto = runpod_spec(ListOrAuto::Auto, 1);
+        let lines = text(&planned(auto), Some(&catalog));
+        assert_eq!(
+            lines[4],
+            "GPU types   auto picks now, list price x 1 GPU, VRAM, stock, fit:"
+        );
+        assert!(
+            lines[5].starts_with("- NVIDIA RTX 2000 Ada Generation"),
+            "no floor: {lines:?}"
         );
         Ok(())
     }
@@ -624,52 +778,66 @@ mod tests {
              "availability": "HIGH"},
             {"id": "NVIDIA B300", "memory": 288, "price": {"secure": -1.0}}
         ]))?;
-        let lines = text(&plan(true), Some(&Ok(gpus)));
-        assert_eq!(
-            lines[4],
-            "- NVIDIA GeForce RTX 4090  price unknown  24 GB  HIGH"
-        );
+        let lines = text(&plan(true), Some(&looked_up(Ok(gpus))));
         assert_eq!(
             lines[5],
-            "- NVIDIA B300              price unknown 288 GB  UNKNOWN"
+            "- NVIDIA GeForce RTX 4090  price unknown   24 GB  HIGH     ok"
         );
         assert_eq!(
-            lines[7],
+            lines[6],
+            "- NVIDIA B300              price unknown  288 GB  UNKNOWN  ok"
+        );
+        assert_eq!(
+            lines[8],
             "max_hours   6: the watchdog deletes the pod by then"
         );
         Ok(())
     }
 
     #[test]
-    fn auto_shows_what_it_picks_now_and_bounds_the_run_by_all_of_it()
+    fn auto_shows_what_it_picks_now_above_the_estimate_and_bounds_the_run_by_all_of_it()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut auto = runpod_spec(ListOrAuto::Auto, 1);
         let lines = text(&planned(auto.clone()), Some(&fixture()?));
         assert_eq!(
             lines[3],
-            "GPU types   auto picks now, list price x 1 GPU, VRAM, stock:"
+            "vram        about 19.1 GB per GPU (estimate): auto keeps >= 20 GB"
         );
         assert_eq!(
             lines[4],
-            "- NVIDIA RTX 2000 Ada Generation  $0.24/h        16 GB  HIGH"
+            "GPU types   auto picks now, list price x 1 GPU, VRAM, stock, fit:"
         );
+        // The 16 GB RTX 2000 Ada, cheapest, is below the estimate.
         assert_eq!(
             lines[5],
-            "- NVIDIA A40                      $0.40/h        48 GB  HIGH"
+            "- NVIDIA A40               $0.40/h   48 GB  HIGH    ok"
         );
-        assert_eq!(lines[8], "- and 3 more");
+        assert_eq!(
+            lines[6],
+            "- NVIDIA L4                $0.43/h   24 GB  HIGH    ok"
+        );
+        assert_eq!(lines[9], "- and 2 more");
         // The dearest picked, the H100, bounds the run even though not shown.
         assert!(
-            lines[10].ends_with("about $17.94 at most at the highest listed rate"),
+            lines[11].ends_with("about $17.94 at most at the highest listed rate"),
+            "{lines:?}"
+        );
+        // An explicit min_vram_gb wins over the estimate.
+        auto.min_vram_gb = Some(10);
+        let lines = text(&planned(auto.clone()), Some(&fixture()?));
+        assert_eq!(lines[3], "vram        about 19.1 GB per GPU (estimate)");
+        assert!(
+            lines[5].starts_with("- NVIDIA RTX 2000 Ada Generation")
+                && lines[5].ends_with("HIGH  small"),
             "{lines:?}"
         );
         auto.min_vram_gb = Some(500);
         let lines = text(&planned(auto), Some(&fixture()?));
         assert!(
-            lines[3].starts_with("GPU types   auto: no GPU type in stock"),
+            lines[4].starts_with("GPU types   auto: no GPU type in stock"),
             "{lines:?}"
         );
-        assert_eq!(lines[4], "datacenters any");
+        assert_eq!(lines[5], "datacenters any");
         Ok(())
     }
 
@@ -692,21 +860,21 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut listed = runpod_spec(list(&["NVIDIA A40", "NVIDIA L40S"]), 2);
         listed.data_center_ids = list(&["US-TX-3"]);
-        let lines = text(&planned(listed.clone()), Some(&Ok(stocked()?)));
-        assert!(lines[4].ends_with("48 GB  NONE"), "{lines:?}");
-        assert!(lines[5].ends_with("48 GB  MEDIUM"), "{lines:?}");
-        assert_eq!(lines[6], "datacenters US-TX-3");
+        let lines = text(&planned(listed.clone()), Some(&looked_up(Ok(stocked()?))));
+        assert!(lines[5].ends_with("48 GB  NONE    ok"), "{lines:?}");
+        assert!(lines[6].ends_with("48 GB  MEDIUM  ok"), "{lines:?}");
+        assert_eq!(lines[7], "datacenters US-TX-3");
         listed.data_center_ids = ListOrAuto::Auto;
         let listed = planned(listed);
-        let lines = text(&listed, Some(&Ok(stocked()?)));
+        let lines = text(&listed, Some(&looked_up(Ok(stocked()?))));
         assert_eq!(
-            lines[6],
+            lines[7],
             "datacenters auto picks now: EU-RO-1, EU-SE-1, US-TX-3"
         );
-        assert!(lines[4].ends_with("HIGH"), "overall stock: {lines:?}");
+        assert!(lines[5].ends_with("HIGH    ok"), "overall stock: {lines:?}");
         let waiting = text(&listed, None);
         assert_eq!(
-            waiting[6],
+            waiting[7],
             "datacenters auto: those with a chosen GPU type in stock, chosen at the start"
         );
         Ok(())
@@ -718,11 +886,11 @@ mod tests {
         let failed: Gpus = Err("unread".into());
         let lines = text(
             &planned(runpod_spec(list(&[long, "NVIDIA A40"]), 1)),
-            Some(&failed),
+            Some(&looked_up(failed)),
         );
-        assert_eq!(lines[4], format!("- {long}  catalog unread"));
+        assert_eq!(lines[5], format!("- {long}  catalog unread"));
         assert_eq!(
-            lines[5],
+            lines[6],
             format!(
                 "- {:<width$}  catalog unread",
                 "NVIDIA A40",
@@ -734,14 +902,14 @@ mod tests {
     #[test]
     fn an_unread_catalog_says_why_and_bounds_nothing() {
         let failed: Gpus = Err("cannot read the Runpod catalog: no Runpod API key".into());
-        let lines = text(&plan(true), Some(&failed));
-        assert_eq!(lines[4], "- NVIDIA GeForce RTX 4090  catalog unread");
+        let lines = text(&plan(true), Some(&looked_up(failed)));
+        assert_eq!(lines[5], "- NVIDIA GeForce RTX 4090  catalog unread");
         assert_eq!(
-            lines[6],
+            lines[7],
             "catalog     cannot read the Runpod catalog: no Runpod API key"
         );
         assert_eq!(
-            lines[8],
+            lines[9],
             "max_hours   6: the watchdog deletes the pod by then"
         );
     }
@@ -762,8 +930,8 @@ mod tests {
             "changed     gpu_types, data_center_ids: saved to overbrainer.toml on y, then the \
              run starts"
         );
-        assert_eq!(cost_line(&lines), Some(7));
-        assert_eq!(pinned(&lines), [3, 7]);
+        assert_eq!(cost_line(&lines), Some(8));
+        assert_eq!(pinned(&lines), [3, 8]);
         Ok(())
     }
 
@@ -853,9 +1021,9 @@ mod tests {
         assert_eq!((runpod.spec.gpu_count, runpod.spec.max_hours), (2, 6.0));
         assert_eq!(runpod.changed(), Vec::<&str>::new());
         let gpus = list_gpus(dir.path(), env.into(), runpod.spec.gpu_count).await;
-        let shown = text(&plan, Some(&gpus)).join("\n");
+        let shown = text(&plan, Some(&looked_up(gpus))).join("\n");
         assert!(
-            shown.contains("- NVIDIA GeForce RTX 4090  $1.48/h        24 GB  LOW"),
+            shown.contains("- NVIDIA GeForce RTX 4090  $1.48/h   24 GB  LOW  ok"),
             "{shown}"
         );
         assert!(shown.contains("- NVIDIA A40               not in the catalog"));
@@ -885,6 +1053,49 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains(KEY), "the key shows");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_estimate_reads_the_model_of_the_training_with_the_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hub = MockServer::start().await;
+        let token = "hf_start_token_77";
+        let bearer = format!("Bearer {token}");
+        Mock::given(method("GET"))
+            .and(path("/api/models/Qwen/Qwen3-4B"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"safetensors": {"total": 4_022_468_096_u64}}),
+                ),
+            )
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/Qwen/Qwen3-4B/resolve/main/config.json"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hidden_size": 2560, "num_hidden_layers": 36, "vocab_size": 151_936
+            })))
+            .mount(&hub)
+            .await;
+        let (dir, _) = runpod_project(None)?;
+        let env = EnvSource::Vars(vec![("OVERBRAINER_HF_TOKEN".into(), token.into())]);
+        let need = estimate_need(dir.path(), env.into(), &hub.uri(), START_CATALOG_TIMEOUT).await?;
+        // qlora on Qwen3-4B, the project's settings.
+        assert_eq!(need.floor_gb(), 13, "{need}");
+        let none = estimate_need(
+            dir.path(),
+            EnvSource::Vars(Vec::new()).into(),
+            &hub.uri(),
+            START_CATALOG_TIMEOUT,
+        )
+        .await;
+        assert_eq!(
+            none,
+            Err("Hugging Face answered 404 for Qwen/Qwen3-4B".to_string())
+        );
         Ok(())
     }
 

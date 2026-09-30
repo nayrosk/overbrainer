@@ -1,5 +1,6 @@
 ---
 source: src/tui/snapshots.rs
+assertion_line: 602
 ---
 " ⠿ o╭ Start a training run? ───────────────────────────────────────────────╮ex… "
 "╭ r │                                                                      │ ──╮"
@@ -12,12 +13,12 @@ source: src/tui/snapshots.rs
 "    │  warning     warning number 4 about this run                         │    "
 "    │  changed     gpu_types: saved to overbrainer.toml on y, then the     │    "
 "    │  run starts                                                          │    "
-"    │  GPU types   auto picks now, list price x 1 GPU, VRAM, stock:        │    "
-"    │  - NVIDIA RTX 2000 Ada Generation  $0.24/h        16 GB  HIGH        │    "
-"    │  - NVIDIA A40                      $0.40/h        48 GB  HIGH        │    "
-"    │  - NVIDIA L4                       $0.43/h        24 GB  HIGH        │    "
-"    │  - NVIDIA RTX A6000                $0.49/h        48 GB  LOW         │    "
-"    │  - and 3 more                                                        │    "
+"    │  vram        about 19.1 GB per GPU (estimate): auto keeps >= 20 GB   │    "
+"    │  GPU types   auto picks now, list price x 1 GPU, VRAM, stock, fit:   │    "
+"    │  - NVIDIA A40               $0.40/h   48 GB  HIGH    ok              │    "
+"    │  - NVIDIA L4                $0.43/h   24 GB  HIGH    ok              │    "
+"    │  - NVIDIA RTX A6000         $0.49/h   48 GB  LOW     ok              │    "
+"    │  - NVIDIA GeForce RTX 4090  $0.69/h   24 GB  MEDIUM  ok              │    "
 "    │  …                                                                   │    "
 "    │  max_hours   6: the watchdog deletes the pod by then, about $17.94   │    "
 "    │  at most at the highest listed rate                                  │    "

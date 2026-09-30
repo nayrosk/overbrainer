@@ -317,11 +317,22 @@ pub(super) async fn secrets(
         }
         return Ok(Vec::new());
     };
-    let token = super::resolver()
+    let token = hf_token(token).await?;
+    Ok(vec![(HF_TOKEN.to_string(), token)])
+}
+
+/// The Hugging Face token `token` of the settings, resolved only now.
+///
+/// # Errors
+///
+/// Returns an error when it cannot be resolved.
+pub(crate) async fn hf_token(
+    token: &secrecy::SecretString,
+) -> anyhow::Result<secrecy::SecretString> {
+    super::resolver()
         .resolve(token)
         .await
-        .context("cannot resolve hf_token")?;
-    Ok(vec![(HF_TOKEN.to_string(), token)])
+        .context("cannot resolve hf_token")
 }
 
 async fn executor(project_dir: &Path, name: &str, target: &Target) -> anyhow::Result<AnyExecutor> {

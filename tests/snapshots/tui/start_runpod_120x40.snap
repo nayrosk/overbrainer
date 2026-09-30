@@ -1,11 +1,11 @@
 ---
 source: src/tui/snapshots.rs
+assertion_line: 602
 ---
 " ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs                                       rust_expert "
 "╭ runs ────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮"
 "│ No runs yet: press t to start one on gpu_cloud.                                                                      │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
-"                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
@@ -18,9 +18,10 @@ source: src/tui/snapshots.rs
 "                        │  model       Qwen/Qwen3-4B, qlora, 3 epochs, lr 2e-4                 │                        "
 "                        │  data        data/train.jsonl 1234 examples, data/eval.jsonl 137     │                        "
 "                        │  warning     qwen2 renders no reasoning_content (see the logs)       │                        "
-"                        │  GPU types   tried in order, list price x 1 GPU, VRAM, stock:        │                        "
-"                        │  - NVIDIA GeForce RTX 4090  $0.69/h        24 GB  MEDIUM             │                        "
-"                        │  - NVIDIA RTX A6000         $0.49/h        48 GB  LOW                │                        "
+"                        │  vram        about 19.1 GB per GPU (estimate)                        │                        "
+"                        │  GPU types   tried in order, list price x 1 GPU, VRAM, stock, fit:   │                        "
+"                        │  - NVIDIA GeForce RTX 4090  $0.69/h   24 GB  MEDIUM  ok              │                        "
+"                        │  - NVIDIA RTX A6000         $0.49/h   48 GB  LOW     ok              │                        "
 "                        │  - NVIDIA A40               not in the catalog                       │                        "
 "                        │  datacenters any                                                     │                        "
 "                        │  max_hours   6: the watchdog deletes the pod by then, about $4.14    │                        "

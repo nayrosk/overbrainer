@@ -20,7 +20,7 @@ use crossterm::event::KeyCode;
 
 use super::app::{Action, App, Confirm, Effect, Exit, NoteOf, Overlay, Severity, View};
 use super::auto;
-use super::start::{self, Gpus, StartPlan};
+use super::start::{self, Catalog, StartPlan};
 use super::tasks::{Msg, Task, TaskId, TrainJob};
 use super::training::{Detach, Ended, Follow, Job, Listing, RunActivity};
 use crate::cli::front::Report;
@@ -314,7 +314,7 @@ impl App {
 
     /// The GPU catalog of the start dialog arrived: kept while the dialog or
     /// its picker is open, and shown in the dialog.
-    pub(super) fn start_catalog_read(&mut self, gpus: Gpus) {
+    pub(super) fn start_catalog_read(&mut self, gpus: Catalog) {
         self.start_catalog = None;
         self.start_gpus = Some(gpus);
         if let Some(Overlay::Confirm(confirm)) = &mut self.overlay {
@@ -830,7 +830,7 @@ pub(super) const NOT_STARTED: &str = "a new training run was not started: the TU
 
 /// The dialog asking to start the run of `plan`, with the GPU catalog `gpus`
 /// once read.
-pub(super) fn start_dialog(plan: Box<StartPlan>, gpus: Option<&Gpus>) -> Confirm {
+pub(super) fn start_dialog(plan: Box<StartPlan>, gpus: Option<&Catalog>) -> Confirm {
     Confirm {
         title: " Start a training run? ".to_string(),
         text: start::text(&plan, gpus),

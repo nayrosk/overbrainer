@@ -13,9 +13,7 @@ use anyhow::{Context, bail};
 use secrecy::SecretString;
 
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
-use super::train::{
-    HF_TOKEN, POLL, finish, prepare, reattach, secrets, started, training, warn,
-};
+use super::train::{HF_TOKEN, POLL, finish, prepare, reattach, secrets, started, training, warn};
 use crate::config::{Settings, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};

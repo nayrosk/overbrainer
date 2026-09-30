@@ -2505,7 +2505,14 @@ mod tests {
     /// The picker open lists `entries` (and `gpus`), read by `id`; the write
     /// it starts is run.
     fn listed(app: &mut App, id: TaskId, entries: Vec<Entry>, gpus: Vec<GpuType>) {
-        let effects = app.on_done(id, Ok(Done::Catalog(Ok(Listed { entries, gpus }))));
+        let effects = app.on_done(
+            id,
+            Ok(Done::Catalog(Ok(Listed {
+                entries,
+                gpus,
+                note: None,
+            }))),
+        );
         run_saves(app, effects);
     }
 
