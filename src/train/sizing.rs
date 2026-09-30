@@ -43,6 +43,47 @@ const FULL_ACTIVATION_BYTES: u128 = 34;
 /// The `axolotl_extra` keys that shard the model across the GPUs.
 const SHARDING: [&str; 3] = ["deepspeed", "fsdp", "fsdp_config"];
 
+/// Why there is no estimate. A message names the model and a status at most,
+/// never the Hugging Face token.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SizingError {
+    /// `axolotl_extra` shards the model across the GPUs with this key.
+    #[error("axolotl_extra shards the model ({0}): each GPU holds only part of it")]
+    Sharded(&'static str),
+    /// This `axolotl_extra` key is not a whole number that fits a `u32`.
+    #[error("axolotl_extra.{0} is not a count")]
+    NotACount(&'static str),
+    /// `axolotl_extra.optimizer` is not a string.
+    #[error("axolotl_extra.optimizer is not a name")]
+    NotAnOptimizer,
+    /// `base_model` is not a Hugging Face repo ID, such as a path.
+    #[error("{0} is not a Hugging Face repo ID")]
+    NotARepoId(String),
+    /// The HTTP client could not be built.
+    #[error("cannot build an HTTP client")]
+    Client,
+    /// The Hub could not be reached for this model.
+    #[error("cannot reach Hugging Face for {0}")]
+    Unreachable(String),
+    /// The Hub answered this HTTP status for the model.
+    #[error("Hugging Face answered {status} for {model}")]
+    Status {
+        /// The model asked for.
+        model: String,
+        /// The HTTP status.
+        status: u16,
+    },
+    /// The Hub's answer about the model is not JSON.
+    #[error("cannot read what Hugging Face says of {0}")]
+    Unreadable(String),
+    /// The model's safetensors metadata or config lacks a size.
+    #[error("{0} does not give its size on Hugging Face")]
+    NoSize(String),
+    /// The Hub did not answer in time for the model.
+    #[error("Hugging Face took too long to describe {0}")]
+    TooSlow(String),
+}
+
 /// The VRAM floor of a run's `auto` GPU types, as whoever starts the run
 /// knows it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -95,7 +136,7 @@ impl Recipe {
     /// Returns why there is no estimate: `axolotl_extra` shards the model
     /// (`deepspeed`, `fsdp` or `fsdp_config`), or sets one of those fields to
     /// a value of the wrong type.
-    pub fn of(training: &Training) -> Result<Self, String> {
+    pub fn of(training: &Training) -> Result<Self, SizingError> {
         let extra = |key: &str| {
             training
                 .axolotl_extra
@@ -103,22 +144,18 @@ impl Recipe {
                 .filter(|value| !value.is_null())
         };
         if let Some(key) = SHARDING.into_iter().find(|key| extra(key).is_some()) {
-            return Err(format!(
-                "axolotl_extra shards the model ({key}): each GPU holds only part of it"
-            ));
+            return Err(SizingError::Sharded(key));
         }
-        let count = |key: &str, default: u32| match extra(key) {
+        let count = |key: &'static str, default: u32| match extra(key) {
             None => Ok(default),
             Some(value) => value
                 .as_u64()
                 .and_then(|count| u32::try_from(count).ok())
-                .ok_or_else(|| format!("axolotl_extra.{key} is not a count")),
+                .ok_or(SizingError::NotACount(key)),
         };
         let optimizer = match extra("optimizer") {
             None => training.optimizer.as_str(),
-            Some(value) => value
-                .as_str()
-                .ok_or("axolotl_extra.optimizer is not a name")?,
+            Some(value) => value.as_str().ok_or(SizingError::NotAnOptimizer)?,
         };
         let gradient_checkpointing =
             extra("gradient_checkpointing").is_none_or(|value| *value != Value::Bool(false));
@@ -263,15 +300,15 @@ pub async fn fetch_shape(
     model: &str,
     token: Option<&SecretString>,
     limit: Duration,
-) -> Result<ModelShape, String> {
+) -> Result<ModelShape, SizingError> {
     if !is_repo_id(model) {
-        return Err(format!("{model} is not a Hugging Face repo ID"));
+        return Err(SizingError::NotARepoId(model.to_string()));
     }
     let lookup = async {
         let http = reqwest::Client::builder()
             .user_agent(concat!("overbrainer/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|_| "cannot build an HTTP client".to_string())?;
+            .map_err(|_| SizingError::Client)?;
         let base = base_url.trim_end_matches('/');
         let info = get_json(
             &http,
@@ -287,12 +324,11 @@ pub async fn fetch_shape(
             model,
         )
         .await?;
-        shape(&info, &config)
-            .ok_or_else(|| format!("{model} does not give its size on Hugging Face"))
+        shape(&info, &config).ok_or_else(|| SizingError::NoSize(model.to_string()))
     };
     tokio::time::timeout(limit, lookup)
         .await
-        .unwrap_or_else(|_| Err(format!("Hugging Face took too long to describe {model}")))
+        .unwrap_or_else(|_| Err(SizingError::TooSlow(model.to_string())))
 }
 
 /// The JSON at `url`, or why not, in words naming `model`.
@@ -301,24 +337,24 @@ async fn get_json(
     url: &str,
     token: Option<&SecretString>,
     model: &str,
-) -> Result<Value, String> {
+) -> Result<Value, SizingError> {
     let mut request = http.get(url);
     if let Some(token) = token {
         request = request.bearer_auth(token.expose_secret());
     }
-    let unreachable = |_| format!("cannot reach Hugging Face for {model}");
+    let unreachable = |_| SizingError::Unreachable(model.to_string());
     let response = request.send().await.map_err(unreachable)?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!(
-            "Hugging Face answered {} for {model}",
-            status.as_u16()
-        ));
+        return Err(SizingError::Status {
+            model: model.to_string(),
+            status: status.as_u16(),
+        });
     }
     response
         .json()
         .await
-        .map_err(|_| format!("cannot read what Hugging Face says of {model}"))
+        .map_err(|_| SizingError::Unreadable(model.to_string()))
 }
 
 /// The shape from the model's Hub `info` (`safetensors.total`) and its
@@ -349,7 +385,7 @@ pub async fn estimate_model(
     token: Option<&SecretString>,
     base_url: &str,
     limit: Duration,
-) -> Result<Estimate, String> {
+) -> Result<Estimate, SizingError> {
     let recipe = Recipe::of(training)?;
     let shape = fetch_shape(base_url, &training.base_model, token, limit).await?;
     Ok(estimate(&shape, &recipe))
@@ -488,7 +524,8 @@ mod tests {
         let unsloth = Recipe::of(&training(&json!({"gradient_checkpointing": "unsloth"}))?)?;
         assert!(unsloth.gradient_checkpointing);
         assert_eq!(
-            Recipe::of(&training(&json!({"micro_batch_size": "eight"}))?),
+            Recipe::of(&training(&json!({"micro_batch_size": "eight"}))?)
+                .map_err(|e| e.to_string()),
             Err("axolotl_extra.micro_batch_size is not a count".to_string())
         );
         Ok(())
@@ -497,7 +534,8 @@ mod tests {
     #[test]
     fn a_sharded_run_has_no_estimate() -> Result<(), Box<dyn std::error::Error>> {
         for key in ["deepspeed", "fsdp", "fsdp_config"] {
-            let recipe = Recipe::of(&training(&json!({key: "zero3.json"}))?);
+            let recipe =
+                Recipe::of(&training(&json!({key: "zero3.json"}))?).map_err(|e| e.to_string());
             assert_eq!(
                 recipe,
                 Err(format!(
@@ -566,7 +604,7 @@ mod tests {
     const LIMIT: Duration = Duration::from_secs(5);
 
     #[tokio::test]
-    async fn the_shape_is_read_from_the_hub() -> Result<(), String> {
+    async fn the_shape_is_read_from_the_hub() -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
         hub(
             &server,
@@ -579,7 +617,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_multimodal_config_gives_its_text_model() -> Result<(), String> {
+    async fn a_multimodal_config_gives_its_text_model() -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
         hub(
             &server,
@@ -593,7 +631,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_multimodal_config_may_keep_its_vocabulary_at_the_top() -> Result<(), String> {
+    async fn a_multimodal_config_may_keep_its_vocabulary_at_the_top()
+    -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
         hub(
             &server,
@@ -607,7 +646,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_token_goes_as_a_bearer_and_never_in_an_error() -> Result<(), String> {
+    async fn the_token_goes_as_a_bearer_and_never_in_an_error()
+    -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
         let secret = "hf_sizing_secret_42";
         Mock::given(method("GET"))
@@ -620,13 +660,14 @@ mod tests {
         let error = fetch_shape(&server.uri(), "Qwen/Qwen3-4B", Some(&token), LIMIT)
             .await
             .err()
-            .ok_or("no error")?;
+            .ok_or("no error")?
+            .to_string();
         assert_eq!(error, "Hugging Face answered 401 for Qwen/Qwen3-4B");
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_model_without_safetensors_has_no_shape() -> Result<(), String> {
+    async fn a_model_without_safetensors_has_no_shape() -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/models/Qwen/Qwen3-4B"))
@@ -638,7 +679,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
             .mount(&server)
             .await;
-        let error = fetch_shape(&server.uri(), "Qwen/Qwen3-4B", None, LIMIT).await;
+        let error = fetch_shape(&server.uri(), "Qwen/Qwen3-4B", None, LIMIT)
+            .await
+            .map_err(|e| e.to_string());
         assert_eq!(
             error,
             Err("Qwen/Qwen3-4B does not give its size on Hugging Face".to_string())
@@ -649,7 +692,9 @@ mod tests {
     #[tokio::test]
     async fn a_path_is_never_asked_for() {
         let server = MockServer::start().await;
-        let error = fetch_shape(&server.uri(), "/models/qwen", None, LIMIT).await;
+        let error = fetch_shape(&server.uri(), "/models/qwen", None, LIMIT)
+            .await
+            .map_err(|e| e.to_string());
         assert_eq!(
             error,
             Err("/models/qwen is not a Hugging Face repo ID".to_string())
@@ -671,7 +716,8 @@ mod tests {
             None,
             Duration::from_millis(200),
         )
-        .await;
+        .await
+        .map_err(|e| e.to_string());
         assert_eq!(
             error,
             Err("Hugging Face took too long to describe Qwen/Qwen3-4B".to_string())

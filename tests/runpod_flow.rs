@@ -15,9 +15,9 @@ use overbrainer::events::EventBus;
 use overbrainer::exec::{Executor, JobCommand, LocalExecutor};
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
-    AttemptResult, DeletedBy, LEASE_FILE, PodCtx, PodError, PodRecord, PodState, RunpodClient,
-    RunpodTarget, Timing, Watched, follow, reconnect, settle_watch, start_pod, watch_leased,
-    watch_on_pod,
+    AttemptResult, DeletedBy, LEASE_FILE, PodCtx, PodError, PodRecord, PodState, ResolveError,
+    RunpodClient, RunpodTarget, Timing, Watched, follow, reconnect, settle_watch, start_pod,
+    watch_leased, watch_on_pod,
 };
 use overbrainer::runs::{RunCtx, RunRecord, RunState, Runs, create};
 use overbrainer::train::{Artifacts, TrainError, Trainer};
@@ -149,24 +149,21 @@ fn target() -> RunpodTarget {
     }
 }
 
-fn keygen_available() -> bool {
-    let available = std::process::Command::new("ssh-keygen")
+/// Fails the test when `ssh-keygen`, which generates the run's keys, is not
+/// installed: a test that skipped would pass without asserting anything.
+fn require_keygen() -> Result<(), String> {
+    std::process::Command::new("ssh-keygen")
         .arg("-?")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok();
-    if !available {
-        eprintln!("skipped: ssh-keygen is not installed");
-    }
-    available
+        .map(drop)
+        .map_err(|error| format!("setup: ssh-keygen is needed to generate the run's keys: {error}"))
 }
 
 #[tokio::test]
 async fn a_run_whose_pod_cannot_be_placed_is_failed() -> TestResult {
-    if !keygen_available() {
-        return Ok(());
-    }
+    require_keygen()?;
     let harness = Harness::new().await?;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({"detail": CAPACITY})))
@@ -197,9 +194,7 @@ async fn a_run_whose_pod_cannot_be_placed_is_failed() -> TestResult {
 
 #[tokio::test]
 async fn a_run_with_nothing_in_stock_fails_without_a_pod() -> TestResult {
-    if !keygen_available() {
-        return Ok(());
-    }
+    require_keygen()?;
     let harness = Harness::new().await?;
     Mock::given(method("GET"))
         .and(path("/v2/catalog/gpus"))
@@ -243,9 +238,7 @@ async fn a_run_with_nothing_in_stock_fails_without_a_pod() -> TestResult {
 /// `min_vram_gb`: a 48 GB GPU in stock is too small for 60 GB.
 #[tokio::test]
 async fn auto_keeps_the_estimated_vram_floor() -> TestResult {
-    if !keygen_available() {
-        return Ok(());
-    }
+    require_keygen()?;
     let harness = Harness::new().await?;
     Mock::given(method("GET"))
         .and(path("/v2/catalog/gpus"))
@@ -259,12 +252,14 @@ async fn auto_keeps_the_estimated_vram_floor() -> TestResult {
     auto.gpu_types = ListOrAuto::Auto;
     let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
     let result = start_pod(&harness.ctx(), &auto, run.clone(), false, Some(60)).await;
-    let Err(PodError::NotInStock(message)) = result else {
+    let Err(PodError::NotInStock(error)) = result else {
         return Err(format!("{result:?}").into());
     };
-    assert!(
-        message.ends_with("(gpu_count = 1, at least 60 GB of VRAM estimated for the model)"),
-        "{message}"
+    assert_eq!(
+        error,
+        ResolveError::NoGpuType {
+            asked: "gpu_count = 1, at least 60 GB of VRAM estimated for the model".into()
+        }
     );
     Ok(())
 }
@@ -273,9 +268,7 @@ async fn auto_keeps_the_estimated_vram_floor() -> TestResult {
 /// that reaches it stays.
 #[tokio::test]
 async fn a_failed_provisioning_keeps_the_client_key_while_a_pod_may_remain() -> TestResult {
-    if !keygen_available() {
-        return Ok(());
-    }
+    require_keygen()?;
     let harness = Harness::new().await?;
     Mock::given(method("POST"))
         .and(path("/v2/pods"))
@@ -309,9 +302,7 @@ async fn a_failed_provisioning_keeps_the_client_key_while_a_pod_may_remain() -> 
 
 #[tokio::test]
 async fn ctrl_c_before_the_pod_fails_the_run_as_interrupted() -> TestResult {
-    if !keygen_available() {
-        return Ok(());
-    }
+    require_keygen()?;
     let harness = Harness::new().await?;
     harness.interrupted.store(true, Ordering::SeqCst);
     let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;

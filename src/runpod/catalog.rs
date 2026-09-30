@@ -371,6 +371,30 @@ fn gpu_stock_at(chosen_gpus: &[&GpuType], gpu_id: &str, center_id: &str) -> Stoc
     }
 }
 
+/// Why an `auto` choice of a Runpod target found nothing: each message says
+/// what was asked.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResolveError {
+    /// No GPU type in stock matches `gpu_types = "auto"`.
+    #[error("no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" ({asked})")]
+    NoGpuType {
+        /// The target's fields that narrowed the choice, as `name = value`.
+        asked: String,
+    },
+    /// No data center has a chosen GPU type in stock for
+    /// `data_center_ids = "auto"`.
+    #[error(
+        "no data center has {gpu_types} in stock for data_center_ids = \"auto\" \
+         (gpu_count = {gpu_count})"
+    )]
+    NoDataCenter {
+        /// The chosen GPU types, as `a, b or c`.
+        gpu_types: String,
+        /// GPUs per pod.
+        gpu_count: u32,
+    },
+}
+
 /// `target` with its `auto` choices replaced by lists, from the catalog's
 /// `gpus`, listed for the target's `gpu_count`; listed choices are kept as
 /// they are.
@@ -384,8 +408,9 @@ fn gpu_stock_at(chosen_gpus: &[&GpuType], gpu_id: &str, center_id: &str) -> Stoc
 ///
 /// # Errors
 ///
-/// Returns a message saying what was asked when nothing in stock matches.
-pub fn resolve(target: &RunpodTarget, gpus: &[GpuType]) -> Result<RunpodTarget, String> {
+/// Returns a [`ResolveError`] saying what was asked when nothing in stock
+/// matches.
+pub fn resolve(target: &RunpodTarget, gpus: &[GpuType]) -> Result<RunpodTarget, ResolveError> {
     resolve_with_floor(target, gpus, None)
 }
 
@@ -396,12 +421,13 @@ pub fn resolve(target: &RunpodTarget, gpus: &[GpuType]) -> Result<RunpodTarget, 
 ///
 /// # Errors
 ///
-/// Returns a message saying what was asked when nothing in stock matches.
+/// Returns a [`ResolveError`] saying what was asked when nothing in stock
+/// matches.
 pub fn resolve_with_floor(
     target: &RunpodTarget,
     gpus: &[GpuType],
     floor_gb: Option<u32>,
-) -> Result<RunpodTarget, String> {
+) -> Result<RunpodTarget, ResolveError> {
     let mut resolved = target.clone();
     let floor = floor_gb.filter(|_| target.min_vram_gb.is_none());
     if target.gpu_types.is_auto() {
@@ -424,10 +450,9 @@ pub fn resolve_with_floor(
             .map(|gpu| gpu.id)
             .collect();
         if chosen.is_empty() {
-            return Err(format!(
-                "no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" ({})",
-                asked(target, floor)
-            ));
+            return Err(ResolveError::NoGpuType {
+                asked: asked(target, floor),
+            });
         }
         resolved.gpu_types = ListOrAuto::List(chosen);
     }
@@ -438,11 +463,10 @@ pub fn resolve_with_floor(
             .map(|row| row.id)
             .collect();
         if centers.is_empty() {
-            return Err(format!(
-                "no data center has {} in stock for data_center_ids = \"auto\" (gpu_count = {})",
-                or_list(chosen),
-                target.gpu_count
-            ));
+            return Err(ResolveError::NoDataCenter {
+                gpu_types: or_list(chosen),
+                gpu_count: target.gpu_count,
+            });
         }
         resolved.data_center_ids = ListOrAuto::List(centers);
     }
@@ -823,10 +847,11 @@ mod tests {
         auto.min_vram_gb = Some(10);
         assert_eq!(picked(&auto, Some(60)), Ok(list(&["small", "mid", "dear"])));
         auto.min_vram_gb = None;
-        let error = picked(&auto, Some(100)).err().unwrap_or_default();
-        assert!(
-            error.ends_with("(gpu_count = 1, at least 100 GB of VRAM estimated for the model)"),
-            "{error}"
+        assert_eq!(
+            picked(&auto, Some(100)),
+            Err(ResolveError::NoGpuType {
+                asked: "gpu_count = 1, at least 100 GB of VRAM estimated for the model".into()
+            })
         );
         let listed = target(list(&["small"]), ListOrAuto::default());
         assert_eq!(picked(&listed, Some(60)), Ok(list(&["small"])));
@@ -895,7 +920,7 @@ mod tests {
         auto.min_vram_gb = Some(48);
         auto.max_price_per_hour = Some(0.5);
         assert_eq!(
-            resolve(&auto, &gpus),
+            resolve(&auto, &gpus).map_err(|error| error.to_string()),
             Err(
                 "no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" \
                  (gpu_count = 2, min_vram_gb = 48, max_price_per_hour = 0.5, \
@@ -905,7 +930,7 @@ mod tests {
         );
         let plain = target(ListOrAuto::Auto, ListOrAuto::default());
         assert_eq!(
-            resolve(&plain, &[]),
+            resolve(&plain, &[]).map_err(|error| error.to_string()),
             Err(
                 "no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" \
                  (gpu_count = 1)"
@@ -916,7 +941,7 @@ mod tests {
         a.data_centers = vec![stock("EU-RO-1", Availability::None)];
         let listed = target(list(&["A", "B"]), ListOrAuto::Auto);
         assert_eq!(
-            resolve(&listed, &[a]),
+            resolve(&listed, &[a]).map_err(|error| error.to_string()),
             Err(
                 "no data center has A or B in stock for data_center_ids = \"auto\" \
                  (gpu_count = 1)"
@@ -1231,7 +1256,9 @@ mod tests {
         ]))?;
         assert_eq!(gpus[0].id, "odd gpu", "cleaned when parsed");
         assert_eq!(gpus[0].data_centers[0].id, "EU-RO-1");
-        let error = resolve(&target(list(&["odd gpu"]), ListOrAuto::Auto), &gpus).err();
+        let error = resolve(&target(list(&["odd gpu"]), ListOrAuto::Auto), &gpus)
+            .err()
+            .map(|error| error.to_string());
         assert_eq!(
             error.as_deref(),
             Some(

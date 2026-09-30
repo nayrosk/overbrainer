@@ -220,8 +220,7 @@ pub async fn resolve_target(
         return Ok(target.clone());
     }
     let gpus = client.list_gpu_types(target.gpu_count).await?;
-    let resolved =
-        super::resolve_with_floor(target, &gpus, floor_gb).map_err(PodError::NotInStock)?;
+    let resolved = super::resolve_with_floor(target, &gpus, floor_gb)?;
     log_picks(target, &resolved);
     Ok(resolved)
 }

@@ -11,7 +11,7 @@ use serde::de::IgnoredAny;
 
 use crate::config::{Adapter, CONFIG_FILE, ListOrAuto, Runtime, Settings, Source, Target};
 use crate::dataset::{DataFiles, read};
-use crate::runpod::{Availability, GpuType, RunpodTarget, resolve_with_floor};
+use crate::runpod::{Availability, GpuType, ResolveError, RunpodTarget, resolve_with_floor};
 use crate::train::sizing::{Estimate, Fit, HF_URL, estimate_model, fit};
 use crate::train::{Outputs, reasoning_template_warning};
 
@@ -303,7 +303,9 @@ pub(super) async fn estimate_need(
             ),
             None => None,
         };
-        estimate_model(training, token.as_ref(), base_url, limit).await
+        estimate_model(training, token.as_ref(), base_url, limit)
+            .await
+            .map_err(|error| error.to_string())
     };
     let need = tokio::time::timeout(limit, lookup)
         .await
@@ -519,7 +521,7 @@ fn auto_gpus(
     spec: &RunpodTarget,
     gpus: &[GpuType],
     floor: Option<u32>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ResolveError> {
     let mut alone = spec.clone();
     if alone.data_center_ids.is_auto() {
         alone.data_center_ids = ListOrAuto::default();

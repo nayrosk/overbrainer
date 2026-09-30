@@ -1192,7 +1192,7 @@ async fn nothing_in_stock_fails_before_any_create_call() -> TestResult {
         return Err(format!("expected NotInStock, got {result:?}").into());
     };
     assert_eq!(
-        message,
+        message.to_string(),
         "no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" (gpu_count = 1, min_vram_gb = 40)"
     );
     assert!(harness.calls("POST").await.is_empty());
