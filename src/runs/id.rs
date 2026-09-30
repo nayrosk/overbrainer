@@ -20,14 +20,46 @@ fn utc(time: SystemTime) -> [u64; 6] {
     [year, month, day, rest / 3_600, rest % 3_600 / 60, rest % 60]
 }
 
-/// A new run ID: UTC date and time of `now`, then four random hex digits, for example
-/// `20260922-143005-a1b2`. IDs sort by creation time.
+/// Longest project part of a run ID, from [`project_slug`].
+const SLUG_MAX: usize = 40;
+/// Longest run ID [`is_valid_run_id`] accepts.
+pub const RUN_ID_MAX: usize = 64;
+
+/// The project part of a run ID: `name` in lowercase snake case. ASCII letters
+/// and digits are kept, every other run of characters becomes one `_`, and the
+/// result is trimmed and capped at 40 characters; `run` when nothing is left.
 #[must_use]
-pub fn new_run_id(now: SystemTime) -> String {
+pub fn project_slug(name: &str) -> String {
+    let mut slug = String::new();
+    let mut gap = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            if gap && !slug.is_empty() {
+                slug.push('_');
+            }
+            gap = false;
+            slug.push(c.to_ascii_lowercase());
+        } else {
+            gap = true;
+        }
+    }
+    slug.truncate(SLUG_MAX);
+    let slug = slug.trim_end_matches('_');
+    if slug.is_empty() {
+        "run".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+/// A new run ID: the [`project_slug`] of `project`, then the UTC date and time
+/// of `now`, for example `malware_development_20260922-143005`.
+#[must_use]
+pub fn new_run_id(project: &str, now: SystemTime) -> String {
     let [year, month, day, hour, minute, second] = utc(now);
     format!(
-        "{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}-{:04x}",
-        fastrand::u16(..)
+        "{}_{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}",
+        project_slug(project)
     )
 }
 
@@ -82,11 +114,24 @@ pub fn compact_utc(now: SystemTime) -> String {
     format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
 }
 
-/// Whether `id` can name a run directory: letters, digits and `-` only, so it
-/// never leaves `runs/`.
+/// Whether `id` can name a run directory: ASCII letters, digits, `_` and `-`,
+/// starting with a letter or a digit, at most [`RUN_ID_MAX`] characters. Such a
+/// name never leaves `runs/`, and is also safe in an ssh alias, a container name
+/// and a pod name. IDs of the older `20260922-143005-a1b2` form stay valid.
 #[must_use]
 pub fn is_valid_run_id(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    is_safe_name(id, RUN_ID_MAX)
+}
+
+/// Whether `name` is non-empty, at most `max` characters of ASCII letters,
+/// digits, `_` and `-`, and starts with a letter or a digit.
+#[must_use]
+pub fn is_safe_name(name: &str, max: usize) -> bool {
+    name.len() <= max
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 #[cfg(test)]
@@ -142,11 +187,40 @@ mod tests {
     }
 
     #[test]
-    fn run_ids_start_with_the_time() {
-        let id = new_run_id(at(1_790_000_000));
-        assert!(id.starts_with("20260921-141320-"), "{id}");
-        assert_eq!(id.len(), 20);
+    fn run_ids_are_the_project_then_the_time() {
+        let id = new_run_id("Malware Development", at(1_790_000_000));
+        assert_eq!(id, "malware_development_20260921-141320");
         assert!(is_valid_run_id(&id));
+    }
+
+    #[test]
+    fn project_slugs_keep_lowercase_ascii_letters_and_digits() {
+        assert_eq!(project_slug("Malware Development"), "malware_development");
+        assert_eq!(project_slug("  GPT-4o mini!! v2 "), "gpt_4o_mini_v2");
+        assert_eq!(project_slug("Café Über"), "caf_ber");
+        assert_eq!(project_slug("already_snake_case"), "already_snake_case");
+        assert_eq!(project_slug("模型"), "run");
+        assert_eq!(project_slug("  --  "), "run");
+        assert_eq!(project_slug(""), "run");
+    }
+
+    #[test]
+    fn project_slugs_are_capped_without_a_trailing_underscore() {
+        let long = "a".repeat(100);
+        assert_eq!(project_slug(&long), "a".repeat(40));
+        let cut_at_a_gap = format!("{} b", "a".repeat(39));
+        assert_eq!(project_slug(&cut_at_a_gap), "a".repeat(39));
+        let longest = new_run_id(&format!("{long}_{long}"), at(1_790_000_000));
+        // With the `_99` a collision may add, an ID stays within the limit.
+        assert!(is_valid_run_id(&format!("{longest}_99")), "{longest}");
+    }
+
+    #[test]
+    fn old_run_ids_stay_valid() {
+        assert!(is_valid_run_id("20260921-141320-a1b2"));
+        assert!(is_valid_run_id("r1"));
+        assert!(is_valid_run_id("malware_development_20260921-141320_2"));
+        assert!(is_valid_run_id(&"a".repeat(64)));
     }
 
     #[test]
@@ -155,5 +229,19 @@ mod tests {
         assert!(!is_valid_run_id("a/b"));
         assert!(!is_valid_run_id(""));
         assert!(!is_valid_run_id("."));
+        assert!(!is_valid_run_id("a.b"));
+        assert!(!is_valid_run_id("_x"));
+        assert!(!is_valid_run_id("-x"));
+        assert!(!is_valid_run_id("a b"));
+        assert!(!is_valid_run_id("é"));
+        assert!(!is_valid_run_id(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn safe_names_take_their_own_length_limit() {
+        assert!(is_safe_name("overbrainer-a_b", 15));
+        assert!(!is_safe_name("overbrainer-a_b", 14));
+        assert!(!is_safe_name("", 10));
+        assert!(!is_safe_name("_a", 10));
     }
 }

@@ -172,7 +172,7 @@ async fn a_run_whose_pod_cannot_be_placed_is_failed() -> TestResult {
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({"detail": CAPACITY})))
         .mount(&harness.server)
         .await;
-    let run = create(&harness.runs, "/workspace/overbrainer", "gpu_cloud")?;
+    let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
     let result = start_pod(&harness.ctx(), &target(), run.clone(), false).await;
     assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
     let saved = harness.runs.load(&run.id)?;
@@ -212,7 +212,7 @@ async fn a_run_with_nothing_in_stock_fails_without_a_pod() -> TestResult {
     let mut auto = target();
     auto.gpu_types = ListOrAuto::Auto;
     auto.max_price_per_hour = Some(0.5);
-    let run = create(&harness.runs, "/workspace/overbrainer", "gpu_cloud")?;
+    let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
     let result = start_pod(&harness.ctx(), &auto, run.clone(), false).await;
     assert!(matches!(result, Err(PodError::NotInStock(_))), "{result:?}");
     let saved = harness.runs.load(&run.id)?;
@@ -267,7 +267,7 @@ async fn a_failed_provisioning_keeps_the_client_key_while_a_pod_may_remain() -> 
         .respond_with(ResponseTemplate::new(204))
         .mount(&harness.server)
         .await;
-    let run = create(&harness.runs, "/workspace/overbrainer", "gpu_cloud")?;
+    let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
     let result = start_pod(&harness.ctx(), &target(), run.clone(), false).await;
     assert!(matches!(result, Err(PodError::NotDeleted(_))), "{result:?}");
     let pod = PodRecord::load(&harness.runs, &run.id)?.ok_or("no pod.json")?;
@@ -284,7 +284,7 @@ async fn ctrl_c_before_the_pod_fails_the_run_as_interrupted() -> TestResult {
     }
     let harness = Harness::new().await?;
     harness.interrupted.store(true, Ordering::SeqCst);
-    let run = create(&harness.runs, "/workspace/overbrainer", "gpu_cloud")?;
+    let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
     let result = start_pod(&harness.ctx(), &target(), run.clone(), false).await;
     assert!(matches!(result, Err(PodError::Interrupted)), "{result:?}");
     let saved = harness.runs.load(&run.id)?;
@@ -428,7 +428,7 @@ async fn the_client_deletes_a_pod_past_its_deadline() -> TestResult {
     let harness = Harness::new().await?;
     serve_p1(&harness.server, false).await;
     let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
-    let mut run = create(&harness.runs, executor.workdir(), "gpu_cloud")?;
+    let mut run = create(&harness.runs, "demo", executor.workdir(), "gpu_cloud")?;
     let job = executor
         .spawn(&JobCommand {
             dir: run.remote_dir.clone(),
@@ -472,7 +472,7 @@ async fn a_watch_past_its_deadline_deletes_nothing_until_settled() -> TestResult
     let harness = Harness::new().await?;
     serve_p1(&harness.server, false).await;
     let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
-    let mut run = create(&harness.runs, executor.workdir(), "gpu_cloud")?;
+    let mut run = create(&harness.runs, "demo", executor.workdir(), "gpu_cloud")?;
     let job = executor
         .spawn(&JobCommand {
             dir: run.remote_dir.clone(),
@@ -509,7 +509,7 @@ async fn a_watch_past_its_deadline_deletes_nothing_until_settled() -> TestResult
 
 /// A started run whose job cannot be found: its watch fails at once.
 fn broken_run(runs: &Runs) -> Result<RunRecord, Box<dyn std::error::Error>> {
-    let mut run = create(runs, "/nonexistent/pod", "gpu_cloud")?;
+    let mut run = create(runs, "demo", "/nonexistent/pod", "gpu_cloud")?;
     run.state = RunState::Running;
     runs.save(&run)?;
     Ok(run)
@@ -746,7 +746,7 @@ async fn a_followed_job_holds_its_pod_past_the_deadline_with_a_lease() -> TestRe
     let harness = Harness::new().await?;
     serve_p1(&harness.server, false).await;
     let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
-    let mut run = create(&harness.runs, executor.workdir(), "gpu_cloud")?;
+    let mut run = create(&harness.runs, "demo", executor.workdir(), "gpu_cloud")?;
     let job = executor
         .spawn(&JobCommand {
             dir: run.remote_dir.clone(),
@@ -782,7 +782,7 @@ async fn a_kept_pod_past_a_deadline_is_never_deleted() -> TestResult {
     let harness = Harness::new().await?;
     serve_p1(&harness.server, false).await;
     let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
-    let mut run = create(&harness.runs, executor.workdir(), "gpu_cloud")?;
+    let mut run = create(&harness.runs, "demo", executor.workdir(), "gpu_cloud")?;
     let job = executor
         .spawn(&JobCommand {
             dir: run.remote_dir.clone(),

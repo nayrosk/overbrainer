@@ -15,14 +15,16 @@
 
 ## Runs
 
-A run gets an ID such as `20260922-143005-a1b2` and a directory `runs/<run-id>/`. It holds `axolotl.yaml`, copies of the train and eval files, the metrics plugin and `run.json` (target, job, state). Once the job has ended, it also holds `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. After a run that succeeded, `train`, `train attach` and `run` print these paths (`train: adapter in runs/<run-id>/output`, then `train: merged model in runs/<run-id>/output/merged`). Intermediate `checkpoint-*` directories stay on the target.
+A run gets an ID made of the project name and the UTC time it was created, such as `malware_development_20260922-143005`. The project name is lowercased, every run of characters other than ASCII letters and digits becomes one `_`, and it is cut to 40 characters (`run` when nothing is left). A second run created in the same second gets `_2`, then `_3`, and so on. The run directory on the target is claimed as well, with a `.claim` file created exclusively, so a run started in the same second from another checkout of the project against the same work directory also moves on to the next ID instead of overwriting the other run. On Runpod the ID is fixed before the pod exists, so the pod's bootstrap claims the directory itself, before it writes anything there. When a run from another checkout already owns the directory on a shared network volume, the pod leaves it untouched and its watchdog deletes the pod; the run fails without touching the other run's files, and starting it again gives it a new ID. Runs created before v0.5.0 keep their IDs, such as `20260922-143005-a1b2`. `runs ls` and the TUI list runs by creation time.
+
+Each run has a directory `runs/<run-id>/`. It holds `axolotl.yaml`, copies of the train and eval files, the metrics plugin and `run.json` (target, job, state). Once the job has ended, it also holds `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. After a run that succeeded, `train`, `train attach` and `run` print these paths (`train: adapter in runs/<run-id>/output`, then `train: merged model in runs/<run-id>/output/merged`). Intermediate `checkpoint-*` directories stay on the target.
 
 The job runs detached from overbrainer. Once it has started, Ctrl-C, a closed terminal or a lost SSH connection stop overbrainer from following it; the training goes on. Starting a run is never interrupted: a Ctrl-C pressed while a run is starting is only acted on once the job has actually started, so the command always finishes starting before it detaches. After Ctrl-C, overbrainer prints the `overbrainer train attach` command that follows the run again and exits with an error status. It does the same after six failed attempts in a row to reach the target.
 
 `overbrainer runs ls` shows the state last recorded in `run.json`; `train attach` refreshes it. Progress (step, epoch, loss, learning rate, every evaluation) goes to stderr, and the final summary to stdout:
 
 ```
-train: run 20260922-143005-a1b2 succeeded; step 1200/1200, epoch 3.00, loss 0.4123, eval_loss 0.5012; output in runs/20260922-143005-a1b2/output
+train: run malware_development_20260922-143005 succeeded; step 1200/1200, epoch 3.00, loss 0.4123, eval_loss 0.5012; output in runs/malware_development_20260922-143005/output
 ```
 
 A run fails when the job exits with a non-zero code, or when it writes no metric line at all, which means Axolotl did not load the metrics plugin. `runs/<run-id>/job.log` holds the job's output.

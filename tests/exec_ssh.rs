@@ -95,6 +95,21 @@ async fn probe(
 }
 
 #[tokio::test]
+async fn a_run_directory_is_claimed_once_over_ssh() -> TestResult {
+    let Some(executor) = connect("claim").await? else {
+        skip();
+        return Ok(());
+    };
+    let dir = format!("{}/demo_20260930-120000", executor.workdir());
+    assert!(executor.claim(&dir, "mine").await?);
+    assert!(executor.claim(&dir, "mine").await?);
+    assert!(!executor.claim(&dir, "other").await?);
+    let marker = executor.read_from(&format!("{dir}/.claim"), 0, 16).await?;
+    assert_eq!(marker, b"mine\n");
+    Ok(())
+}
+
+#[tokio::test]
 async fn connect_resolves_the_workdir_under_home() -> TestResult {
     let Some(executor) = connect("workdir").await? else {
         skip();

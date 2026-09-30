@@ -24,7 +24,7 @@ use crate::runpod::{
 };
 use crate::runs::{
     Launch, Outcome, RunCtx, RunRecord, RunState, Runs, artifacts_missing, cancel as cancel_job,
-    collect, create, start, watch,
+    collect, create, reserve, start, watch,
 };
 use crate::train::{Axolotl, reasoning_template_warning};
 
@@ -126,7 +126,7 @@ pub(super) async fn train(
     };
     let result = async {
         warn_orphans(&session.ctx()).await;
-        let record = create(&session.runs, spec.workdir(), name)?;
+        let record = create(&session.runs, &settings.project.name, spec.workdir(), name)?;
         started(&record);
         front.run_created(&record.id);
         job.run(&mut interrupt, record, keep, secrets).await
@@ -185,13 +185,18 @@ impl Job<'_> {
         };
         // Starting is never interrupted: dropped after the job is spawned and
         // before its record is saved, it would leave a job nothing finds again.
+        // The run directory is claimed before anything is copied: on a network
+        // volume, a run from another checkout could own it.
+        let run_ctx = self.run_ctx(&executor);
+        // The run's own value, the one its pod's bootstrap claimed the directory
+        // with: the pod's public host key, unique to the run.
+        let owner = pod.host_key.clone();
         let started_run = interrupt
-            .shield(start(
-                &self.run_ctx(&executor),
-                self.trainer,
-                launch,
-                record,
-            ))
+            .shield(async {
+                let mut record = record;
+                reserve(&run_ctx, &mut record, &owner).await?;
+                start(&run_ctx, self.trainer, launch, record).await
+            })
             .await;
         let started_run = match started_run {
             Ok(run) => run,

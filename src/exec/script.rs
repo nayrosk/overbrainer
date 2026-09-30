@@ -2,7 +2,7 @@
 //! which is `bash` on Arch and macOS, `dash` on Debian and Ubuntu and `busybox ash`
 //! on Alpine, so nothing here may rely on one shell's extensions.
 
-use super::{CANCEL_FILE, CANCELLING_FILE, Container, EXIT_FILE, JobStatus, PID_FILE};
+use super::{CANCEL_FILE, CANCELLING_FILE, CLAIM_FILE, Container, EXIT_FILE, JobStatus, PID_FILE};
 
 /// `text` as one single-quoted shell word.
 #[must_use]
@@ -82,6 +82,26 @@ pub fn status_script(dir: &str, pid: u32) -> String {
          elif [ \"$alive\" -eq 1 ]; then echo running\n\
          else echo lost; fi\n",
         dir = quote(dir)
+    )
+}
+
+/// Claims the run directory `dir` for `owner`, as
+/// [`Executor::claim`](super::Executor::claim) does: creates `dir` and its
+/// parents, then [`CLAIM_FILE`] holding `owner` with `set -C`, whose `O_EXCL`
+/// open fails when the file exists. Prints `claimed` when it made the marker or
+/// the marker already holds `owner`, `taken` when it holds anything else; exits
+/// `1` with a message when neither can be made.
+#[must_use]
+pub fn claim_script(dir: &str, owner: &str) -> String {
+    format!(
+        "mkdir -p -- {dir} || exit 1\n\
+         if (set -C; printf '%s\\n' {owner} > {marker}) 2>/dev/null; then echo claimed\n\
+         elif [ -f {marker} ]; then\n\
+         if [ \"$(cat {marker})\" = {owner} ]; then echo claimed; else echo taken; fi\n\
+         else echo \"cannot create {CLAIM_FILE} in the run directory\" >&2; exit 1; fi\n",
+        dir = quote(dir),
+        owner = quote(owner),
+        marker = quote(&format!("{dir}/{CLAIM_FILE}"))
     )
 }
 
@@ -715,6 +735,40 @@ mod tests {
                 String::from_utf8_lossy(&cancel_output.stderr)
             );
             reaper.join().map_err(|_| "reaper thread panicked")??;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_run_directory_is_claimed_once() -> TestResult {
+        for &shell in shells() {
+            let dir = tempdir()?;
+            let run = dir.path().join("a b/run_1");
+            let run = run.to_string_lossy();
+            let claim = |owner: &str| -> Result<String, Box<dyn std::error::Error>> {
+                let output = shell.run(&claim_script(&run, owner)).output()?;
+                assert!(output.status.success(), "{shell}");
+                Ok(String::from_utf8(output.stdout)?)
+            };
+            let owner = "ssh-ed25519 AAAA'x";
+            assert_eq!(claim(owner)?, "claimed\n", "{shell}");
+            // The same run again, such as a pod restarted on its volume.
+            assert_eq!(claim(owner)?, "claimed\n", "{shell}");
+            assert_eq!(claim("other")?, "taken\n", "{shell}");
+            assert_eq!(
+                fs::read_to_string(dir.path().join("a b/run_1").join(CLAIM_FILE))?,
+                format!("{owner}\n"),
+                "{shell}"
+            );
+            // A directory where the marker cannot be made at all is an error,
+            // never a claim.
+            let blocked = dir.path().join("file");
+            fs::write(&blocked, b"")?;
+            let failed = shell
+                .run(&claim_script(&blocked.join("run").to_string_lossy(), owner))
+                .output()?;
+            assert!(!failed.status.success(), "{shell}");
+            assert!(failed.stdout.is_empty(), "{shell}");
         }
         Ok(())
     }

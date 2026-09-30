@@ -910,18 +910,18 @@ mod tests {
     fn the_runpod_spend_comes_from_the_pod_records() -> TestResult {
         let dir = tempfile::tempdir()?;
         let runs = Runs::new(dir.path());
-        let gone = crate::runs::create(&runs, "/workspace", "cloud")?;
+        let gone = crate::runs::create(&runs, "demo", "/workspace", "cloud")?;
         let mut pod = PodRecord::new(&gone.id, false, 1, "ssh-ed25519 AAAA");
         pod.state = PodState::Deleted;
         pod.estimated_spend = Some(0.64);
         pod.save(&runs)?;
-        let live = crate::runs::create(&runs, "/workspace", "cloud")?;
+        let live = crate::runs::create(&runs, "demo", "/workspace", "cloud")?;
         let mut pod = PodRecord::new(&live.id, false, 1, "ssh-ed25519 AAAA");
         pod.state = PodState::Running;
         pod.cost_per_hour = Some(0.5);
         pod.created_unix = Some(1000);
         pod.save(&runs)?;
-        let local = crate::runs::create(&runs, "/work", "local")?;
+        let local = crate::runs::create(&runs, "demo", "/work", "local")?;
         let metrics = Metrics::new(&[]).with_runs(runs.clone());
         let now = UNIX_EPOCH + Duration::from_secs(1000 + 2 * 3600);
         metrics.read_spend(now);

@@ -2,10 +2,12 @@
 # entrypoint. It installs the run's host key and authorized key, writes the job's
 # environment file and the watchdog, starts sshd, then becomes the watchdog.
 #
-# The run directory and the watchdog file are created FIRST, before anything else
-# is touched: if a later step fails, `fail` can still exec into the watchdog it
-# already wrote, so the pod always ends up guarded, even one that never reaches
-# sshd. A handful of the paths bootstrap_main writes to are overridable through
+# The run directory is claimed FIRST, before anything is written in it: on a
+# network volume, another checkout of the project may have started a run with
+# the same ID, whose files must stay untouched. Then the watchdog file is
+# written, before anything else: if a later step fails, `fail` can still exec
+# into the watchdog it already wrote, so the pod always ends up guarded, even
+# one that never reaches sshd. A handful of the paths bootstrap_main writes to are overridable through
 # OVERBRAINER_* variables, defaulting to the real pod's paths, so tests can point
 # them at a temporary directory instead of the real /etc and /root.
 #
@@ -38,6 +40,18 @@ fail() {
     OVERBRAINER_BOOT_FAILED=1 exec bash "$watchdog_file"
   fi
   exit 1
+}
+
+# claim_run_dir DIR OWNER: creates DIR and its parents, then DIR/.claim holding
+# OWNER with `set -C` (an O_EXCL open), as overbrainer's own claim does. Returns
+# 0 when it made the marker or the marker already holds OWNER (an earlier pod of
+# the same run), 2 when it holds anything else (another run owns DIR), 1 when
+# neither can be made.
+claim_run_dir() {
+  mkdir -p "$1" || return 1
+  if (set -C; printf '%s\n' "$2" > "$1/.claim") 2>/dev/null; then return 0; fi
+  [ -f "$1/.claim" ] || return 1
+  [ "$(cat "$1/.claim")" = "$2" ] || return 2
 }
 
 # install_host_key DIR: replaces every host key in DIR with the run's ed25519 key
@@ -93,6 +107,20 @@ bootstrap_main() {
   authorized_keys_dir=${OVERBRAINER_AUTHORIZED_KEYS_DIR:-/root/.ssh}
   job_env_file=${OVERBRAINER_JOB_ENV_FILE:-/etc/overbrainer/job.env}
   cuda_env_script=${OVERBRAINER_CUDA_ENV_SCRIPT:-/workspace/axolotl/scripts/cuda13_env.sh}
+  claimed=0
+  claim_run_dir "$OVERBRAINER_RUN_DIR" "${OVERBRAINER_CLAIM:?OVERBRAINER_CLAIM is not set}" ||
+    claimed=$?
+  if [ "$claimed" = 2 ]; then
+    # Another run owns the directory: nothing is written there. The watchdog
+    # and the failure go to a directory of this pod's own, and the watchdog
+    # deletes the pod.
+    OVERBRAINER_RUN_DIR=${OVERBRAINER_REFUSED_RUN_DIR:-/root/overbrainer-refused-run}
+    export OVERBRAINER_RUN_DIR
+    mkdir -p "$OVERBRAINER_RUN_DIR/.pod" || fail "cannot create the run directory"
+    write_watchdog "$watchdog_file" || fail "cannot write the watchdog"
+    fail "the run directory belongs to another run"
+  fi
+  [ "$claimed" = 0 ] || fail "cannot create the run directory"
   mkdir -p "$OVERBRAINER_RUN_DIR/.pod" || fail "cannot create the run directory"
   # A verdict left by an earlier pod (a network volume outlives it) must never be
   # read as this pod's: it goes before sshd can serve it.

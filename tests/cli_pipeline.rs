@@ -690,7 +690,7 @@ async fn run_trains_after_split_when_training_is_configured() -> TestResult {
             "succeeded; step 1/1, epoch 1.00, loss 0.7500; output in runs/",
         ))
         .stdout(predicate::str::is_match(
-            r"\ntrain: adapter in runs/[0-9a-f-]+/output\n",
+            r"\ntrain: adapter in runs/demo_[0-9]{8}-[0-9]{6}/output\n",
         )?)
         .stdout(predicate::str::contains("merged model").not());
     Ok(())
@@ -720,7 +720,7 @@ async fn run_prints_the_merged_model_when_merge_is_set() -> TestResult {
         .assert()
         .success()
         .stdout(predicate::str::is_match(
-            r"\ntrain: adapter in runs/[0-9a-f-]+/output\ntrain: merged model in runs/[0-9a-f-]+/output/merged\n",
+            r"\ntrain: adapter in runs/demo_[0-9]{8}-[0-9]{6}/output\ntrain: merged model in runs/demo_[0-9]{8}-[0-9]{6}/output/merged\n",
         )?);
     Ok(())
 }

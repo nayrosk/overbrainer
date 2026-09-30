@@ -809,6 +809,10 @@ struct FailingBootstrap {
     // Held only for its `Drop`: removes the temporary tree once the test is done.
     _root: tempfile::TempDir,
     run_dir: PathBuf,
+    /// Where the bootstrap goes when another run owns `run_dir`.
+    refused_dir: PathBuf,
+    /// The run's claim value.
+    claim: String,
     env: Vec<(&'static str, String)>,
 }
 
@@ -828,6 +832,7 @@ impl FailingBootstrap {
         fs::set_permissions(&readonly_root, fs::Permissions::from_mode(0o500))?;
         let authorized_keys_dir = readonly_root.join("ssh");
         let keys = PodKeys::generate(&root.path().join("ssh-keys"), "overbrainer-r1")?;
+        let refused_dir = root.path().join("refused");
         let env = vec![
             ("OVERBRAINER_RUN_ID", "r1".to_string()),
             (
@@ -859,6 +864,11 @@ impl FailingBootstrap {
                 keys.host_private().expose_secret().to_string(),
             ),
             ("OVERBRAINER_AUTHORIZED_KEY", keys.client_public.clone()),
+            ("OVERBRAINER_CLAIM", keys.host_public.clone()),
+            (
+                "OVERBRAINER_REFUSED_RUN_DIR",
+                refused_dir.to_string_lossy().into_owned(),
+            ),
             ("RUNPOD_API_KEY", KEY.to_string()),
             ("RUNPOD_POD_ID", POD.to_string()),
             ("OVERBRAINER_API_URL", format!("{}/v2", server.uri())),
@@ -869,6 +879,8 @@ impl FailingBootstrap {
         Ok(Self {
             _root: root,
             run_dir,
+            refused_dir,
+            claim: keys.host_public,
             env,
         })
     }
@@ -920,6 +932,109 @@ async fn a_bootstrap_failure_still_deletes_a_guarded_pod() -> TestResult {
         );
         assert_eq!(deletes(&server).await, 1, "{shell}: {output}");
         assert!(!output.contains(KEY), "{shell}: {output}");
+        assert_eq!(
+            setup.read(".claim"),
+            format!("{}\n", setup.claim),
+            "{shell}"
+        );
+    }
+    Ok(())
+}
+
+/// A run directory another run owns on a shared network volume stays exactly
+/// as it was: no stale-verdict removal, no failure note, no watchdog log. The
+/// pod still gets its watchdog, elsewhere, which deletes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_directory_another_run_owns_is_never_touched() -> TestResult {
+    if !curl_available() || !keygen_available() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let setup = FailingBootstrap::new(&server)?;
+        fs::create_dir_all(setup.run_dir.join(".pod"))?;
+        fs::write(setup.run_dir.join(".claim"), "ssh-ed25519 AAAAother\n")?;
+        fs::write(setup.run_dir.join(".pod/watchdog"), "ready\n")?;
+        let child = start_bootstrap(shell, &setup.env, ":")?;
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        assert_eq!(setup.read(".claim"), "ssh-ed25519 AAAAother\n", "{shell}");
+        assert_eq!(setup.read(".pod/watchdog"), "ready\n", "{shell}");
+        let mut left: Vec<String> = fs::read_dir(setup.run_dir.join(".pod"))?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, _>>()?;
+        left.sort();
+        assert_eq!(left, vec!["watchdog"], "{shell}: {output}");
+        assert_eq!(
+            fs::read_to_string(setup.refused_dir.join(".pod/bootstrap_failed"))?,
+            "the run directory belongs to another run\n",
+            "{shell}: {output}"
+        );
+        assert!(
+            output.contains("delete reason=bootstrap_failed"),
+            "{shell}: {output}"
+        );
+        assert_eq!(deletes(&server).await, 1, "{shell}: {output}");
+    }
+    Ok(())
+}
+
+/// A pod of the same run, such as the next GPU type's on the same network
+/// volume, finds its own claim and goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_directory_the_run_already_claimed_is_used() -> TestResult {
+    if !curl_available() || !keygen_available() || running_as_root() {
+        return Ok(());
+    }
+    for &shell in shells() {
+        let server = stub(200, 204).await;
+        let setup = FailingBootstrap::new(&server)?;
+        fs::create_dir_all(&setup.run_dir)?;
+        fs::write(setup.run_dir.join(".claim"), format!("{}\n", setup.claim))?;
+        let child = start_bootstrap(shell, &setup.env, ":")?;
+        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        assert_eq!(code, 0, "{shell}: {output}");
+        // It went past the claim, to the step that fails in this setup.
+        assert_eq!(
+            setup.read(".pod/bootstrap_failed"),
+            "cannot install the authorized key\n",
+            "{shell}: {output}"
+        );
+        assert!(!setup.refused_dir.exists(), "{shell}");
+    }
+    Ok(())
+}
+
+#[test]
+fn claim_run_dir_tells_a_fresh_an_own_and_a_foreign_claim_apart() -> TestResult {
+    for &shell in shells() {
+        let root = tempfile::tempdir()?;
+        let dir = root.path().join("volume/run_1");
+        let dir = dir.to_string_lossy();
+        let claim = |owner: &str| -> Result<Option<i32>, Box<dyn std::error::Error>> {
+            let output = bootstrap(
+                shell,
+                "claim_run_dir \"$DIR\" \"$OWNER\"",
+                &[("DIR", &dir), ("OWNER", owner)],
+            )?;
+            Ok(output.status.code())
+        };
+        assert_eq!(claim("ssh-ed25519 AAAAmine")?, Some(0), "{shell}");
+        assert_eq!(claim("ssh-ed25519 AAAAmine")?, Some(0), "{shell}");
+        assert_eq!(claim("ssh-ed25519 AAAAother")?, Some(2), "{shell}");
+        assert_eq!(
+            fs::read_to_string(root.path().join("volume/run_1/.claim"))?,
+            "ssh-ed25519 AAAAmine\n",
+            "{shell}"
+        );
+        let blocked = root.path().join("file");
+        fs::write(&blocked, "")?;
+        let output = bootstrap(
+            shell,
+            "claim_run_dir \"$DIR\" x",
+            &[("DIR", &blocked.join("run").to_string_lossy())],
+        )?;
+        assert_eq!(output.status.code(), Some(1), "{shell}");
     }
     Ok(())
 }

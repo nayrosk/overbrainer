@@ -66,6 +66,9 @@ pub struct PodSettings<'a> {
     pub api_url: &'a str,
     /// The run's client public key.
     pub authorized_key: &'a str,
+    /// The value the bootstrap claims the run directory with: the run's public
+    /// host key, the same on every pod of the run.
+    pub claim: &'a str,
 }
 
 /// The pod's plain `env` (the host key is added by [`CreateEnv`](super::CreateEnv)).
@@ -103,6 +106,7 @@ pub fn pod_env(settings: &PodSettings<'_>) -> BTreeMap<String, String> {
         "OVERBRAINER_AUTHORIZED_KEY",
         settings.authorized_key.to_string(),
     );
+    set("OVERBRAINER_CLAIM", settings.claim.to_string());
     set("OVERBRAINER_VERSION", env!("CARGO_PKG_VERSION").to_string());
     set("JUPYTER_DISABLE", "1".to_string());
     env
@@ -161,6 +165,7 @@ mod tests {
             keep: false,
             api_url: "https://api.runpod.io/v2",
             authorized_key: "ssh-ed25519 AAAAclient overbrainer-r1",
+            claim: "ssh-ed25519 AAAAhost",
         };
         let env = pod_env(&settings);
         let get = |name: &str| env.get(name).map(String::as_str);
@@ -172,6 +177,7 @@ mod tests {
         assert_eq!(get("OVERBRAINER_BOOT_GRACE"), Some("1800"));
         assert_eq!(get("OVERBRAINER_KEEP_POD"), Some("0"));
         assert_eq!(get("JUPYTER_DISABLE"), Some("1"));
+        assert_eq!(get("OVERBRAINER_CLAIM"), Some("ssh-ed25519 AAAAhost"));
         assert!(!env.contains_key(HOST_KEY_ENV));
         assert!(!env.contains_key("HF_TOKEN"));
         assert!(!env.contains_key("PUBLIC_KEY"));

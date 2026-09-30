@@ -138,7 +138,7 @@ async fn a_run_trains_merges_and_records_its_outcome() -> TestResult {
     };
     let training = fixture.settings.training.as_ref().ok_or("training")?;
     let trainer = Axolotl::new(training, &DataFiles::new(fixture.project()));
-    let created = create(&runs, executor.workdir(), "box")?;
+    let created = create(&runs, "demo", executor.workdir(), "box")?;
     assert_eq!(created.state, RunState::Preparing);
     let launch = Launch {
         runtime: &fixture.runtime,
@@ -236,7 +236,7 @@ async fn run_to_end(mode: &str) -> Result<overbrainer::runs::Outcome, Box<dyn st
         &ctx,
         &trainer,
         launch,
-        create(&runs, executor.workdir(), "box")?,
+        create(&runs, "demo", executor.workdir(), "box")?,
     )
     .await?;
     Ok(watch(&ctx, &trainer, record).await?)
@@ -284,7 +284,7 @@ async fn a_running_job_can_be_cancelled() -> TestResult {
         &ctx,
         &trainer,
         launch,
-        create(&runs, executor.workdir(), "box")?,
+        create(&runs, "demo", executor.workdir(), "box")?,
     )
     .await?;
     let local_log = runs.run_dir(&record.id)?.join("job.log");
@@ -324,7 +324,7 @@ async fn the_run_keys_and_the_pod_record_are_never_uploaded() -> TestResult {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
     };
-    let created = create(&runs, executor.workdir(), "box")?;
+    let created = create(&runs, "demo", executor.workdir(), "box")?;
     let local = runs.run_dir(&created.id)?;
     fs::create_dir_all(local.join("ssh"))?;
     fs::write(local.join("ssh/id_ed25519"), "private key")?;
@@ -362,7 +362,7 @@ async fn cancelling_an_ended_job_leaves_the_run_running() -> TestResult {
         &ctx,
         &trainer,
         launch,
-        create(&runs, executor.workdir(), "box")?,
+        create(&runs, "demo", executor.workdir(), "box")?,
     )
     .await?;
     let job = record.job.clone().ok_or("no job")?;
@@ -403,7 +403,7 @@ async fn a_run_whose_directory_vanished_records_why_nothing_was_retrieved() -> T
         &ctx,
         &trainer,
         launch,
-        create(&runs, executor.workdir(), "box")?,
+        create(&runs, "demo", executor.workdir(), "box")?,
     )
     .await?;
     let job = record.job.clone().ok_or("no job")?;
@@ -453,7 +453,7 @@ async fn a_start_without_data_is_recorded_as_failed() -> TestResult {
         &ctx,
         &trainer,
         launch,
-        create(&runs, executor.workdir(), "box")?,
+        create(&runs, "demo", executor.workdir(), "box")?,
     )
     .await
     .err()

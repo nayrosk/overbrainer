@@ -12,9 +12,9 @@ use tokio::process::{Child, Command};
 
 use super::tar;
 use super::{
-    CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, FileDigest, JOB_LOG, JobCommand,
-    JobId, JobStatus, PID_FILE, Pid, cancel_script, check_job_env, job_script, local_manifest,
-    parse_status, status_script,
+    CANCEL_FILE, CANCELLING_FILE, CLAIM_FILE, EXIT_FILE, ExecError, Executor, FileDigest, JOB_LOG,
+    JobCommand, JobId, JobStatus, PID_FILE, Pid, cancel_script, check_job_env, job_script,
+    local_manifest, parse_status, status_script,
 };
 
 /// How often this process reaps its exited jobs while a status or cancel script runs.
@@ -201,9 +201,39 @@ impl LocalExecutor {
     }
 }
 
+/// [`Executor::claim`] on this machine.
+fn claim_dir(dir: &Path, owner: &str) -> Result<bool, ExecError> {
+    use std::io::Write as _;
+    fs::create_dir_all(dir).map_err(io_error(dir))?;
+    let marker = dir.join(CLAIM_FILE);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(mut file) => {
+            writeln!(file, "{owner}").map_err(io_error(&marker))?;
+            Ok(true)
+        },
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let held = fs::read_to_string(&marker).map_err(io_error(&marker))?;
+            Ok(held.strip_suffix('\n') == Some(owner))
+        },
+        Err(e) => Err(io_error(&marker)(e)),
+    }
+}
+
 impl Executor for LocalExecutor {
     fn workdir(&self) -> &str {
         &self.workdir
+    }
+
+    fn claim(
+        &self,
+        dir: &str,
+        owner: &str,
+    ) -> impl Future<Output = Result<bool, ExecError>> + Send {
+        ready(claim_dir(Path::new(dir), owner))
     }
 
     async fn upload(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {

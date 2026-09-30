@@ -11,11 +11,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use id::{compact_utc, is_valid_run_id, new_run_id, parse_rfc3339, rfc3339};
+pub use id::{
+    RUN_ID_MAX, compact_utc, is_safe_name, is_valid_run_id, new_run_id, parse_rfc3339,
+    project_slug, rfc3339,
+};
 pub use summary::MetricsSummary;
 pub use train::{
     HF_CACHE_DIR, Launch, Outcome, RunCtx, RunError, artifacts_missing, cancel, collect, create,
-    start, watch,
+    create_on, reserve, start, watch,
 };
 
 use crate::exec::JobId;
@@ -116,6 +119,10 @@ pub struct RunRecord {
     pub message: Option<String>,
 }
 
+/// Most runs [`Runs::claim`] makes with one base ID: `base`, then `base_2` to
+/// `base_99`.
+const MAX_CLAIMS: u32 = 99;
+
 /// The `runs/` directory of a project.
 #[derive(Debug, Clone)]
 pub struct Runs {
@@ -149,6 +156,57 @@ impl Runs {
             Ok(self.dir.join(id))
         } else {
             Err(RunsError::InvalidId(id.to_string()))
+        }
+    }
+
+    /// Creates the directory of a new run and returns its ID with its number:
+    /// `base` is 1, `base_2` is 2, and so on up to `base_99`. Only numbers past
+    /// `after` are tried, and a number whose directory exists is skipped. Each
+    /// directory is created exclusively, so no existing run is ever overwritten,
+    /// even by another process creating a run at the same second.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunsError::InvalidId`] when `base` is not a valid run ID, and
+    /// [`RunsError::Io`] when a directory cannot be created, or no number up to
+    /// 99 is left (an `AlreadyExists` error).
+    pub fn claim(&self, base: &str, after: u32) -> Result<(String, u32), RunsError> {
+        let first = self.run_dir(base)?;
+        fs::create_dir_all(&self.dir).map_err(io_error(&self.dir))?;
+        for n in after + 1..=MAX_CLAIMS {
+            let id = if n == 1 {
+                base.to_string()
+            } else {
+                format!("{base}_{n}")
+            };
+            let dir = self.run_dir(&id)?;
+            match fs::create_dir(&dir) {
+                Ok(()) => return Ok((id, n)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {},
+                Err(e) => return Err(io_error(&dir)(e)),
+            }
+        }
+        Err(RunsError::Io {
+            path: first,
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("runs {base} to {base}_{MAX_CLAIMS} all exist"),
+            ),
+        })
+    }
+
+    /// Removes the directory of run `id` made by [`Runs::claim`] when the run
+    /// cannot use it after all. Only an empty directory is removed; a failure is
+    /// logged, since an empty directory without a record is never listed.
+    pub(crate) fn release(&self, id: &str) {
+        let Ok(dir) = self.run_dir(id) else {
+            return;
+        };
+        if let Err(error) = fs::remove_dir(&dir) {
+            tracing::warn!(
+                "cannot remove the unused run directory {}: {error}",
+                dir.display()
+            );
         }
     }
 
@@ -237,6 +295,9 @@ impl Runs {
                 Err(error) => return Err(error),
             }
         }
+        // `created` is RFC 3339 UTC to the second, as `rfc3339` writes it: its
+        // text order is its time order.
+        records.sort_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)));
         Ok(records)
     }
 }
@@ -308,6 +369,64 @@ pub(crate) mod tests {
         assert_eq!(runs.load("20260921-000000-aaaa")?, first);
         let json = fs::read_to_string(runs.run_dir(&first.id)?.join(RECORD_FILE))?;
         assert!(json.contains("\"state\": \"succeeded\""), "{json}");
+        Ok(())
+    }
+
+    #[test]
+    fn runs_list_in_creation_order_whatever_their_ids() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let mut old_form = record("20260930-120000-ffff");
+        old_form.created = "2026-09-30T12:00:00Z".to_string();
+        let mut named = record("alpha_20260929-080000");
+        named.created = "2026-09-29T08:00:00Z".to_string();
+        let mut later = record("zeta_20260929-080000");
+        later.created = "2026-09-29T08:00:00Z".to_string();
+        let mut first = record("zeta_20260101-000000");
+        first.created = "2026-01-01T00:00:00Z".to_string();
+        for run in [&old_form, &later, &named, &first] {
+            runs.save(run)?;
+        }
+        let ids: Vec<String> = runs.list()?.into_iter().map(|run| run.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "zeta_20260101-000000",
+                "alpha_20260929-080000",
+                "zeta_20260929-080000",
+                "20260930-120000-ffff",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_claimed_run_directory_is_never_claimed_again() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let base = "p_20260930-120000";
+        assert_eq!(runs.claim(base, 0)?, (base.to_string(), 1));
+        assert_eq!(runs.claim(base, 0)?, (format!("{base}_2"), 2));
+        fs::create_dir(runs.dir().join(format!("{base}_3")))?;
+        assert_eq!(runs.claim(base, 0)?, (format!("{base}_4"), 4));
+        // Past `after` only: 5 is skipped although it is free.
+        assert_eq!(runs.claim(base, 5)?, (format!("{base}_6"), 6));
+        assert_eq!(runs.claim(base, 0)?, (format!("{base}_5"), 5));
+        for n in 7..=99 {
+            assert_eq!(runs.claim(base, 0)?, (format!("{base}_{n}"), n));
+        }
+        let full = runs.claim(base, 0);
+        assert!(
+            matches!(&full, Err(RunsError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists),
+            "{full:?}"
+        );
+        assert!(runs.claim(base, 99).is_err());
+        assert!(matches!(
+            runs.claim("../p", 0),
+            Err(RunsError::InvalidId(_))
+        ));
+        runs.release(&format!("{base}_99"));
+        assert_eq!(runs.claim(base, 0)?, (format!("{base}_99"), 99));
         Ok(())
     }
 

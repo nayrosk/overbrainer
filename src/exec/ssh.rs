@@ -12,8 +12,8 @@ use tokio::process::Child;
 use super::tar;
 use super::{
     CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, FileDigest, JOB_LOG, JobCommand,
-    JobId, JobStatus, PID_FILE, Pid, cancel_script, check_job_env, job_script, manifest_script,
-    parse_manifest, parse_status, quote, shell_path, status_script,
+    JobId, JobStatus, PID_FILE, Pid, cancel_script, check_job_env, claim_script, job_script,
+    manifest_script, parse_manifest, parse_status, quote, shell_path, status_script,
 };
 
 /// Runs jobs on a remote Linux machine through the user's `ssh`: `~/.ssh/config`, the
@@ -197,6 +197,18 @@ impl SshExecutor {
 impl Executor for SshExecutor {
     fn workdir(&self) -> &str {
         &self.workdir
+    }
+
+    async fn claim(&self, dir: &str, owner: &str) -> Result<bool, ExecError> {
+        let script = claim_script(dir, owner);
+        let output = run(&self.session, &script, "claim the run directory").await?;
+        match String::from_utf8_lossy(&output).trim() {
+            "claimed" => Ok(true),
+            "taken" => Ok(false),
+            other => Err(ExecError::Protocol(format!(
+                "`{other}` is not an answer to a claim"
+            ))),
+        }
     }
 
     async fn upload(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {
