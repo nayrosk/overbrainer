@@ -52,6 +52,10 @@ BOOT_FAILED=${OVERBRAINER_BOOT_FAILED:-0}
 VOLUME_DIR=${OVERBRAINER_VOLUME_DIR:-}
 VOLUME_GB=${OVERBRAINER_VOLUME_GB:-}
 DISK_ACT=97
+# The commands the disk rule runs. Tests point them at stubs by path: busybox sh
+# may run its own df and du applets whatever PATH says.
+DF=${OVERBRAINER_DF:-df}
+DU=${OVERBRAINER_DU:-du}
 VOLUME_USABLE=94
 API=${OVERBRAINER_API_URL:-https://api.runpod.io/v2}
 AGENT="overbrainer-watchdog/${OVERBRAINER_VERSION:-unknown}"
@@ -103,7 +107,7 @@ measure_volume() {
   (
     limit=
     command -v timeout >/dev/null 2>&1 && limit='timeout -k 5 30'
-    kib=$($limit du -sk -- "$VOLUME_DIR" 2>/dev/null | cut -f 1)
+    kib=$($limit "$DU" -sk -- "$VOLUME_DIR" 2>/dev/null | cut -f 1)
     case $kib in
       '' | *[!0-9]*) ;;
       *) printf '%s' "$kib" > "$POD_DIR/du.tmp" && mv -f "$POD_DIR/du.tmp" "$POD_DIR/du" ;;
@@ -129,7 +133,7 @@ disk_full() {
     measure_volume
     used=$(cat "$POD_DIR/du" 2>/dev/null)
   else
-    line=$(df -Pk -- "$RUN_DIR" 2>/dev/null | tail -n 1)
+    line=$("$DF" -Pk -- "$RUN_DIR" 2>/dev/null | tail -n 1)
     read -r _ _ used avail _ <<DF
 $line
 DF

@@ -705,12 +705,17 @@ async fn the_cost_cap_asks_for_a_snapshot_then_deletes_the_pod() -> TestResult {
     Ok(())
 }
 
-/// A directory on `PATH` whose `df` reports a file system `df_percent` full and
-/// whose `du` runs `du_body`, and that `PATH`.
+/// Environment variables of the watchdog, name and value.
+type Settings = Vec<(&'static str, String)>;
+
+/// A directory holding a `df` that reports a file system `df_percent` full and
+/// a `du` that runs `du_body`, and the watchdog settings that make it run them.
+/// They are given by path, never through `PATH`: busybox sh may run its own
+/// applets whatever `PATH` says.
 fn fake_disk(
     df_percent: u64,
     du_body: &str,
-) -> Result<(tempfile::TempDir, String), Box<dyn std::error::Error>> {
+) -> Result<(tempfile::TempDir, Settings), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let scripts = [
         (
@@ -723,17 +728,19 @@ fn fake_disk(
         ),
         ("du", format!("#!/bin/sh\n{du_body}\n")),
     ];
+    let mut env = Vec::new();
     for (name, script) in scripts {
         let path = dir.path().join(name);
         fs::write(&path, script)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        let setting = if name == "df" {
+            "OVERBRAINER_DF"
+        } else {
+            "OVERBRAINER_DU"
+        };
+        env.push((setting, path.display().to_string()));
     }
-    let path = format!(
-        "{}:{}",
-        dir.path().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    Ok((dir, path))
+    Ok((dir, env))
 }
 
 /// A `du` body printing `kib` for its path.
@@ -755,13 +762,13 @@ async fn disk_rule(
     for &shell in shells() {
         let server = stub(200, 204).await;
         let pod = Pod::new()?;
-        let (_bin, path) = fake_disk(df_percent, &du_prints(du_kib))?;
+        let (_bin, stubs) = fake_disk(df_percent, &du_prints(du_kib))?;
         let mut job = live_group()?;
         fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
         if let Some(gb) = volume_gb {
             fs::write(pod.file(".pod/volume_gb"), gb)?;
         }
-        let mut all = vec![("PATH", path)];
+        let mut all = stubs;
         all.extend(env.iter().cloned());
         let mut child = pod.start(shell, &server, &all)?;
         until(Duration::from_secs(5), || {
@@ -863,21 +870,15 @@ async fn a_hanging_du_never_holds_up_the_watchdog() -> TestResult {
         let server = stub(200, 204).await;
         let pod = Pod::new()?;
         let volume = tempfile::tempdir()?;
-        let (_bin, path) = fake_disk(10, "exec sleep 60")?;
+        let (_bin, mut env) = fake_disk(10, "exec sleep 60")?;
+        env.push((
+            "OVERBRAINER_VOLUME_DIR",
+            volume.path().display().to_string(),
+        ));
         let mut job = live_group()?;
         fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
         fs::write(pod.file(".pod/volume_gb"), "1")?;
-        let child = pod.start(
-            shell,
-            &server,
-            &[
-                ("PATH", path),
-                (
-                    "OVERBRAINER_VOLUME_DIR",
-                    volume.path().display().to_string(),
-                ),
-            ],
-        )?;
+        let child = pod.start(shell, &server, &env)?;
         // The first loop starts du, the next ones only read its result.
         tokio::time::sleep(Duration::from_millis(2500)).await;
         fs::write(pod.file(".pod/cost_cap_at"), (unix_now() - 1).to_string())?;
