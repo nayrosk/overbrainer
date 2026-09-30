@@ -132,16 +132,15 @@ fn render_top(frame: &mut Frame, area: Rect, app: &App) -> Rect {
     let view = &app.training;
     let theme = &app.theme;
     let shown = u16::try_from(view.runs.len().min(5)).unwrap_or(5);
-    // The system panel of the selected run, right of the runs, where it fits.
-    let panel = area.width >= system::PANEL_FROM;
     let samples = view
         .selected_run()
         .and_then(|row| view.system.get(&row.record.id));
-    let top = if panel {
-        (shown + 3).max(system::height(samples).saturating_add(2))
-    } else {
-        shown + 3
-    };
+    // The system panel of the selected run, right of the runs, where it fits
+    // and leaves the detail enough rows.
+    let with_panel = (shown + 3).max(system::height(samples).saturating_add(2));
+    let panel = area.width >= system::PANEL_FROM
+        && area.height >= with_panel.saturating_add(system::MIN_DETAIL);
+    let top = if panel { with_panel } else { shown + 3 };
     let [list, detail] =
         Layout::vertical([Constraint::Length(top), Constraint::Fill(1)]).areas(area);
     let list = if panel {

@@ -146,7 +146,7 @@ or `OVERBRAINER_METRICS__LISTEN=127.0.0.1:9464`. `listen` is an IP address and a
 
 The endpoint serves only while a command holds the project: the stage commands, `run`, `train` and its subcommands, `pod rm` and `tui`, for as long as they run. The read-only commands (`history`, `runs ls`, `runs logs`, `pod ls`, `config check`) and `migrate` serve nothing. `GET /metrics` answers in the OpenMetrics text format (`application/openmetrics-text; version=1.0.0`); any other path or method gets a 404. The endpoint has no authentication, so keep it on a loopback address: any other address logs a warning. When the address cannot be bound (a port already in use), the command logs a warning and goes on without metrics.
 
-The counters are cumulative per project: they start from `.overbrainer/history.jsonl` (see [Project state](pipeline.md#project-state)), then follow the running command. `overbrainer_item_retries_total` is not in the history, so it restarts at zero with each command. The training gauges show the runs followed by the current command; the Runpod spend is read from every run's pod record at each scrape. The `target` and `gpu` gauges describe the machine of a run while the command follows it: sampled every 10 seconds (see [Training](training.md)), they disappear once the command stops following the run. A figure the target does not report (no GPU, no `/proc`) has no series.
+The counters are cumulative per project: they start from `.overbrainer/history.jsonl` (see [Project state](pipeline.md#project-state)), then follow the running command. `overbrainer_item_retries_total` is not in the history, so it restarts at zero with each command. The training gauges show the runs followed by the current command; the Runpod spend is read from every run's pod record at each scrape. The `target` and `gpu` gauges describe the machine of a run while the command follows it: sampled every 10 seconds (see [Training](training.md)), they are removed when the run's bus closes (the command stops following the run) or when that bus follows another run. A figure the target does not report (no GPU, no `/proc`) has no series. A network file system, such as a Runpod network volume, has no disk series: `df` reports the whole shared cluster there, not the volume, whose usage is measured separately.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -160,10 +160,10 @@ The counters are cumulative per project: they start from `.overbrainer/history.j
 | `overbrainer_eval_loss` | gauge | `run_id` | Last evaluation loss. |
 | `overbrainer_learning_rate` | gauge | `run_id` | Last learning rate. |
 | `overbrainer_runpod_spend_usd` | gauge | `run_id` | Estimated Runpod spend: the pod's rate times its uptime, final once deleted. |
-| `overbrainer_target_disk_used_bytes` | gauge | `run_id`, `mount` | Bytes used on the file system of the run directory, and on `/` when it is another. |
+| `overbrainer_target_disk_used_bytes` | gauge | `run_id`, `mount` | Bytes used on the file system of the run directory, and on `/` when it is another; a network file system is left out. |
 | `overbrainer_target_disk_size_bytes` | gauge | `run_id`, `mount` | Size of that file system. |
 | `overbrainer_target_cpu_usage_ratio` | gauge | `run_id` | Share of the CPUs busy since the previous sample, 0 to 1. |
-| `overbrainer_target_cpu_load1` | gauge | `run_id` | Load average over one minute. |
+| `overbrainer_target_cpu_load1` | gauge | `run_id` | Load average over one minute: the host's, even inside a container. |
 | `overbrainer_target_cpus` | gauge | `run_id` | CPUs: the container's quota when it has one, else `nproc`. |
 | `overbrainer_target_memory_used_bytes` | gauge | `run_id` | Memory used, page cache the kernel can drop left out. |
 | `overbrainer_target_memory_limit_bytes` | gauge | `run_id` | Memory: the container's limit when it has one, else the machine's. |
@@ -177,7 +177,7 @@ The counters are cumulative per project: they start from `.overbrainer/history.j
 | `overbrainer_gpu_info` | gauge | `run_id`, `gpu`, `name` | Always 1; `name` is the GPU model. |
 | `overbrainer_build_info` | gauge | `version` | Always 1. |
 
-Labels only ever hold stage names, model names, run IDs and the version: never a prompt, an answer or a secret.
+Labels only ever hold stage names, model names, run IDs, the version, mount points, GPU indices and GPU model names: never a prompt, an answer or a secret.
 
 ## Secrets and Vault
 

@@ -1250,9 +1250,10 @@ fn training_of_a_run_nothing_follows() -> TestResult {
     Ok(())
 }
 
-/// Samples of a pod's machine, one every 10 seconds up to [`NOW`]: the volume
-/// filling up, the CPU busier each time, and `gpus` GPUs, the first nearly
-/// out of memory and the second at full use.
+/// Samples of a pod's machine, one every 10 seconds up to [`NOW`]: the
+/// network volume on the whole shared cluster, the container's disk filling
+/// up, half its 8 CPUs busy, and `gpus` GPUs, the first nearly out of memory
+/// and the second at full use.
 fn machine(count: u64, gpus: u32) -> std::collections::VecDeque<crate::system::SystemSample> {
     use std::fmt::Write as _;
 
@@ -1274,14 +1275,17 @@ fn machine(count: u64, gpus: u32) -> std::collections::VecDeque<crate::system::S
         }
         write!(
             output,
-            "@loadavg\n6.40 5.00 4.00 1/1 1\n@stat\ncpu {busy} 0 0 {idle} 0 0 0 0\n\
-             @nproc\n16\n@meminfo\nMemTotal: 134217728 kB\nMemAvailable: 83886080 kB\n\
-             @df.run\nh\nmfs 104857600 {used} {free} 0% /workspace\n\
-             @df.root\nh\noverlay 20971520 5242880 15728640 25% /\n",
-            busy = index * index * 40,
-            idle = index * 800,
-            used = 80_000_000 + index * 1_000_000,
-            free = 24_857_600 - index * 1_000_000,
+            "@loadavg\n96.40 90.00 80.00 1/1 1\n@uptime\n{uptime}.00 1.00\n\
+             @cpu.max\n800000 100000\n@cpu.stat\nusage_usec {usage}\n\
+             @nproc\n128\n@meminfo\nMemTotal: 134217728 kB\nMemAvailable: 83886080 kB\n\
+             @df.run\nFilesystem Type 1024-blocks Used Available Capacity Mounted on\n\
+             mfs#euro-3.runpod.net:9421 fuse.mfs 2343372656 1827830672 515542000 78% /workspace\n\
+             @df.root\nFilesystem Type 1024-blocks Used Available Capacity Mounted on\n\
+             overlay overlay 20971520 {used} {free} 0% /\n",
+            uptime = 1000 + index * 10,
+            usage = index * 40_000_000,
+            used = 17_150_000 + index * 100_000,
+            free = 3_821_520 - index * 100_000,
         )
         .ok();
         let at = crate::tui::snapshots::at(NOW - (count - 1 - index) * 10);
@@ -1298,9 +1302,36 @@ fn training_with_the_system_panel() -> TestResult {
     snapshot_at("training_system_120x40", &mut app, 120, 40)?;
     let shown = text(&draw(&mut app, 120, 40)?).join("\n");
     assert!(shown.contains("gpu1 ██████  99%"), "{shown}");
+    // Inside a container: its cores busy, not the host's load.
+    assert!(shown.contains("4.0/8.0 cores"), "{shown}");
+    assert!(!shown.contains("load"), "{shown}");
     // Too narrow: no panel, as before.
     let narrow = text(&draw(&mut app, 80, 24)?).join("\n");
     assert!(!narrow.contains("system"), "{narrow}");
+    Ok(())
+}
+
+#[test]
+fn the_system_panel_shows_only_where_it_fits() -> TestResult {
+    let mut app = training_app()?;
+    // Two disks and four GPUs: the tallest panel without folding.
+    app.training.system.insert(FOLLOWED.into(), machine(12, 4));
+    for (width, height) in [(100, 30), (100, 24), (120, 24), (120, 30)] {
+        snapshot_at(
+            &format!("training_system_gpus_{width}x{height}"),
+            &mut app,
+            width,
+            height,
+        )?;
+        let shown = text(&draw(&mut app, width, height)?).join("\n");
+        // From 120 columns, and only with rows left for the run's detail.
+        let expected = width >= 120 && height >= 30;
+        assert_eq!(
+            shown.contains("╭ system"),
+            expected,
+            "{width}x{height}\n{shown}"
+        );
+    }
     Ok(())
 }
 
@@ -1325,8 +1356,11 @@ fn the_system_panel_warns_as_its_gauges_fill() -> TestResult {
         Ok(cell.style())
     };
     let theme = app.theme;
-    // The volume at 87%, the second GPU at 99%, the CPU below both.
+    // The container's disk at 87%, the second GPU at 99%, the CPU below both.
     assert_eq!(style_of("87%")?.fg, theme.warn.fg);
+    // The network volume: the whole cluster's share, dim, marked shared.
+    assert_eq!(style_of("78%")?.fg, theme.dim.fg);
+    assert_eq!(style_of("shared")?.fg, theme.dim.fg);
     assert_eq!(style_of("99%")?.fg, theme.error.fg);
     assert_eq!(style_of("cpu  ")?.fg, theme.dim.fg);
     // The first GPU's memory is nearly full: its figures turn red.
@@ -1335,7 +1369,7 @@ fn the_system_panel_warns_as_its_gauges_fill() -> TestResult {
 }
 
 #[test]
-fn the_system_panel_of_a_run_nothing_follows_shows_its_age() -> TestResult {
+fn the_system_panel_shows_the_age_of_an_old_sample() -> TestResult {
     let mut app = training_app()?;
     app.training.selected = 2;
     let shown = text(&draw(&mut app, 120, 40)?).join("\n");
@@ -1350,10 +1384,24 @@ fn the_system_panel_of_a_run_nothing_follows_shows_its_age() -> TestResult {
     assert!(shown.contains("rest"), "{shown}");
     assert!(shown.contains("avg of 3"), "{shown}");
     assert!(!shown.contains("gpu3"), "{shown}");
+    // Not followed, but sampled a moment ago: no age.
+    for sample in app.training.system.get_mut(LEFT).into_iter().flatten() {
+        sample.at += Duration::from_secs(300);
+    }
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains("╭ system ─"), "{shown}");
     // Followed, before the first sample.
     app.training.selected = 0;
     let shown = text(&draw(&mut app, 120, 40)?).join("\n");
     assert!(shown.contains("waiting for the first sample"), "{shown}");
+    // Followed, but no sample for two rounds: the age shows.
+    let mut late = machine(3, 1);
+    for sample in &mut late {
+        sample.at -= Duration::from_secs(25);
+    }
+    app.training.system.insert(FOLLOWED.into(), late);
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains(" system · 25s ago "), "{shown}");
     Ok(())
 }
 
