@@ -28,8 +28,11 @@ const MAX_FAILURES: u32 = 5;
 /// Time between two samples of the target's machine while a job is followed.
 pub const PROBE_EVERY: Duration = Duration::from_secs(10);
 
-/// How long one sample may take before it is given up.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long one sample may take before it is given up: longer than the probe
+/// script's own bound (see [`probe_script`]), so a sample is only abandoned
+/// when the connection itself hangs, and the next one waits for it: probes
+/// never run side by side.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Start of the note added to a run's message when its artifacts could not be
 /// retrieved.
@@ -911,6 +914,8 @@ mod tests {
         /// What the probe prints; `None` makes it fail.
         probe: Option<Vec<u8>>,
         probes: AtomicU32,
+        /// Whether the probe never answers.
+        probe_hangs: bool,
         /// Status polls answered `Running` before [`Fake::status`].
         running_polls: u32,
         polls: AtomicU32,
@@ -931,6 +936,7 @@ mod tests {
                 cancels: AtomicU32::new(0),
                 probe: None,
                 probes: AtomicU32::new(0),
+                probe_hangs: false,
                 running_polls: 0,
                 polls: AtomicU32::new(0),
             }
@@ -1052,7 +1058,14 @@ mod tests {
 
         fn probe(&self, _script: &str) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
             self.probes.fetch_add(1, Ordering::SeqCst);
-            ready(self.probe.clone().ok_or_else(|| broken("probe")))
+            let answer = self.probe.clone().ok_or_else(|| broken("probe"));
+            let hangs = self.probe_hangs;
+            async move {
+                if hangs {
+                    std::future::pending::<()>().await;
+                }
+                answer
+            }
         }
     }
 
@@ -1230,21 +1243,51 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn a_failing_sample_never_counts_against_the_follow()
-    -> Result<(), Box<dyn std::error::Error>> {
+    /// Watches a run whose job runs for 80 polls of a second each on `fake`,
+    /// on the paused clock: long enough for several samples.
+    async fn watch_long(fake: Fake) -> Result<(Outcome, Fake), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
         let bus = EventBus::new();
         let fake = Fake {
-            running_polls: 3,
-            ..Fake::new(JobStatus::Exited(0))
+            running_polls: 80,
+            ..fake
         };
         let record = running()?;
         runs.save(&record)?;
-        let outcome = watch(&ctx(&runs, &fake, &bus), &NoFiles, record).await?;
+        let ctx = RunCtx {
+            poll: Duration::from_secs(1),
+            ..ctx(&runs, &fake, &bus)
+        };
+        let outcome = watch(&ctx, &NoFiles, record).await?;
+        Ok((outcome, fake))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failing_samples_never_count_against_the_follow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (outcome, fake) = watch_long(Fake::new(JobStatus::Exited(0))).await?;
         assert_eq!(outcome.record.state, RunState::Succeeded);
-        assert_eq!(fake.probes.load(Ordering::SeqCst), 1);
+        // Every sample failed, far more than the follow's retries allow.
+        let probes = fake.probes.load(Ordering::SeqCst);
+        assert!(probes > MAX_FAILURES + 2, "{probes}");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sample_that_never_answers_never_holds_the_follow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fake = Fake {
+            probe: Some(Vec::new()),
+            probe_hangs: true,
+            ..Fake::new(JobStatus::Exited(0))
+        };
+        let (outcome, fake) = watch_long(fake).await?;
+        assert_eq!(outcome.record.state, RunState::Succeeded);
+        // Each one given up after its timeout, the next started only then: at
+        // most one every 20 seconds over the job's 80, never side by side.
+        let probes = fake.probes.load(Ordering::SeqCst);
+        assert!((2..=5).contains(&probes), "{probes}");
         Ok(())
     }
 

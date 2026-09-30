@@ -38,11 +38,17 @@ impl SystemSample {
     }
 }
 
-/// A mounted file system, as `df -Pk` reports it.
+/// A mounted file system, as `df -PkT` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Disk {
     /// Where it is mounted.
     pub mount: String,
+    /// Its type (`ext4`, `overlay`, `fuse.mfs`), when `df` can tell it.
+    pub fstype: Option<String>,
+    /// Whether it is a network file system shared with other machines, such as
+    /// a Runpod network volume (a `MooseFS` cluster). Its figures are then the whole
+    /// cluster's, not what this run may use: they say nothing about a quota.
+    pub shared: bool,
     /// Its size.
     pub size_bytes: u64,
     /// Bytes in use.
@@ -70,10 +76,14 @@ pub struct Cpu {
     /// Share of the CPUs busy since the previous sample, between 0 and 1; `None`
     /// on the first sample.
     pub usage: Option<f64>,
-    /// Load average over the last minute.
+    /// Load average over the last minute. Inside a container it is the
+    /// host's, not the container's.
     pub load1: Option<f64>,
     /// CPUs available: the container's quota when it has one, else `nproc`.
     pub cpus: Option<f64>,
+    /// Whether the figures are the container's (its cgroup has a `cpu.max`):
+    /// `load1` then describes another, larger machine.
+    pub container: bool,
     /// The counters the next sample's usage is computed from.
     pub(crate) times: Option<CpuTimes>,
 }
@@ -90,7 +100,8 @@ pub(crate) struct CpuTimes {
     cgroup: bool,
 }
 
-/// The memory of the target, or the limit of its container.
+/// The memory of the target, or the limit of its container when that is
+/// lower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Memory {
     /// Bytes in use, the page cache the kernel can drop left out.
@@ -151,16 +162,21 @@ pub fn float(value: u64) -> f64 {
 
 /// The script printing everything [`parse`] reads, one `@name` line before each
 /// part. Each command's errors are dropped and the script always succeeds, so a
-/// target without `nvidia-smi` or `/proc` still answers the rest. `run_dir` is
+/// target without `nvidia-smi` or `/proc` still answers the rest. `nvidia-smi`
+/// and `df`, which can hang on a stuck driver or network mount, get 5 seconds
+/// each where `timeout` exists, so a stuck probe never piles up on the target.
+/// `df -T` (the file system type) falls back to plain `df` where it is not
+/// supported (macOS), but not after a timeout (exit code 124): the whole
+/// script ends within 15 seconds. `run_dir` is
 /// the run directory on the target, whose file system comes first.
 #[must_use]
 pub fn probe_script(run_dir: &str) -> String {
     format!(
         r#"part() {{ printf '\n@%s\n' "$1"; }}
+limit=
+command -v timeout >/dev/null 2>&1 && limit='timeout 5'
 part gpu
 if command -v nvidia-smi >/dev/null 2>&1; then
-  limit=
-  command -v timeout >/dev/null 2>&1 && limit='timeout 5'
   $limit nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits 2>/dev/null
 fi
 part loadavg; cat /proc/loadavg 2>/dev/null
@@ -173,8 +189,9 @@ part memory.stat; grep '^inactive_file ' /sys/fs/cgroup/memory.stat 2>/dev/null
 part cpu.max; cat /sys/fs/cgroup/cpu.max 2>/dev/null
 part cpu.stat; grep '^usage_usec ' /sys/fs/cgroup/cpu.stat 2>/dev/null
 part nproc; nproc 2>/dev/null
-part df.run; df -Pk -- {dir} 2>/dev/null
-part df.root; df -Pk -- / 2>/dev/null
+disk() {{ $limit df -PkT -- "$1" 2>/dev/null || {{ [ "$?" -ne 124 ] && $limit df -Pk -- "$1" 2>/dev/null; }}; }}
+part df.run; disk {dir}
+part df.root; disk /
 exit 0
 "#,
         dir = quote(run_dir)
@@ -229,26 +246,81 @@ fn first_number<T: std::str::FromStr>(lines: &[&str]) -> Option<T> {
     lines.first()?.split_whitespace().next()?.parse().ok()
 }
 
-/// The file system `df -Pk` describes in `lines`: its header, then one line.
+/// The file system `df -Pk` or `df -PkT` describes in `lines`: its header,
+/// then one line. The header says whether a type column is there.
 fn disk(lines: &[&str]) -> Option<Disk> {
+    let typed = lines
+        .first()?
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|column| column == "Type");
     let fields: Vec<&str> = lines.get(1)?.split_whitespace().collect();
-    let kib =
-        |index: usize| -> Option<u64> { fields.get(index)?.parse::<u64>().ok()?.checked_mul(1024) };
+    let (source, rest) = fields.split_first()?;
+    let (fstype, figures) = if typed {
+        let (fstype, figures) = rest.split_first()?;
+        (Some((*fstype).to_string()), figures)
+    } else {
+        (None, rest)
+    };
+    let kib = |index: usize| -> Option<u64> {
+        figures.get(index)?.parse::<u64>().ok()?.checked_mul(1024)
+    };
     // A mount point may hold spaces: it is everything after the capacity.
-    let mount = fields.get(5..).filter(|rest| !rest.is_empty())?.join(" ");
+    let mount = figures.get(4..).filter(|rest| !rest.is_empty())?.join(" ");
     Some(Disk {
         mount,
-        size_bytes: kib(1)?,
-        used_bytes: kib(2)?,
-        available_bytes: kib(3)?,
+        shared: is_shared(source, fstype.as_deref()),
+        fstype,
+        size_bytes: kib(0)?,
+        used_bytes: kib(1)?,
+        available_bytes: kib(2)?,
     })
 }
 
+/// Types of network file systems.
+const NETWORK_TYPES: [&str; 9] = [
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "ceph",
+    "glusterfs",
+    "lustre",
+    "9p",
+];
+
+/// FUSE file systems that are local.
+const LOCAL_FUSE: [&str; 3] = ["fuse.fuse-overlayfs", "fuse.lxcfs", "fuse.gvfsd-fuse"];
+
+/// Whether the file system mounted from `source`, of type `fstype`, is a
+/// network one: a network type, a FUSE file system other than the local ones
+/// (`fuse.mfs` of a Runpod network volume, `fuse.sshfs`), or a remote source
+/// (`host:/path`, `mfs#host:port`).
+fn is_shared(source: &str, fstype: Option<&str>) -> bool {
+    let typed = fstype.is_some_and(|fstype| {
+        NETWORK_TYPES.contains(&fstype)
+            || (fstype.starts_with("fuse.") && !LOCAL_FUSE.contains(&fstype))
+    });
+    typed || source.contains(':') || source.starts_with("mfs#")
+}
+
 /// The memory: the cgroup's limit and use when it has a limit, else
-/// `/proc/meminfo`.
+/// `/proc/meminfo`. A cgroup limit above the machine's memory counts as the
+/// machine's.
 fn memory<'a>(part: &impl Fn(&str) -> &'a [&'a str]) -> Option<Memory> {
+    let field = |name: &str| -> Option<u64> {
+        let line = part("meminfo").iter().find(|line| line.starts_with(name))?;
+        line.split_whitespace()
+            .nth(1)?
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(1024)
+    };
+    let total = field("MemTotal:");
     let cgroup = || {
-        let limit: u64 = first_number(part("memory.max"))?;
+        let max: u64 = first_number(part("memory.max"))?;
+        let limit = total.map_or(max, |total| max.min(total));
         let current: u64 = first_number(part("memory.current"))?;
         let inactive: u64 = part("memory.stat")
             .first()
@@ -260,15 +332,7 @@ fn memory<'a>(part: &impl Fn(&str) -> &'a [&'a str]) -> Option<Memory> {
         })
     };
     cgroup().or_else(|| {
-        let field = |name: &str| -> Option<u64> {
-            let line = part("meminfo").iter().find(|line| line.starts_with(name))?;
-            line.split_whitespace()
-                .nth(1)?
-                .parse::<u64>()
-                .ok()?
-                .checked_mul(1024)
-        };
-        let total = field("MemTotal:")?;
+        let total = total?;
         let available = field("MemAvailable:")?;
         Some(Memory {
             used_bytes: total.saturating_sub(available),
@@ -288,6 +352,7 @@ fn cpu<'a>(part: &impl Fn(&str) -> &'a [&'a str], before: Option<CpuTimes>) -> O
         (period > 0.0).then_some(quota / period)
     });
     let cpus = quota.or(nproc);
+    let container = !part("cpu.max").is_empty();
     let times = cgroup_times(part, cpus).or_else(|| proc_times(part("stat")));
     if load1.is_none() && cpus.is_none() && times.is_none() {
         return None;
@@ -295,7 +360,9 @@ fn cpu<'a>(part: &impl Fn(&str) -> &'a [&'a str], before: Option<CpuTimes>) -> O
     let usage = match (before, times) {
         (Some(before), Some(now)) if before.cgroup == now.cgroup => {
             let total = now.total - before.total;
-            (total > 0.0).then(|| ((now.busy - before.busy) / total).clamp(0.0, 1.0))
+            let busy = now.busy - before.busy;
+            // Counters that went back (a reboot, a new container) say nothing.
+            (total > 0.0 && busy >= 0.0).then(|| (busy / total).clamp(0.0, 1.0))
         },
         _ => None,
     };
@@ -303,6 +370,7 @@ fn cpu<'a>(part: &impl Fn(&str) -> &'a [&'a str], before: Option<CpuTimes>) -> O
         usage,
         load1,
         cpus,
+        container,
         times,
     })
 }
@@ -425,12 +493,12 @@ usage_usec 200000000
 128
 
 @df.run
-Filesystem     1024-blocks      Used Available Capacity Mounted on
-mfs#runpod   104857600  83886080  20971520      80% /workspace
+Filesystem     Type     1024-blocks      Used Available Capacity Mounted on
+mfs#euro-3.runpod.net:9421 fuse.mfs 2343372656 1827830672 515542000 78% /workspace
 
 @df.root
-Filesystem     1024-blocks      Used Available Capacity Mounted on
-overlay         52428800  10485760  41943040      20% /
+Filesystem     Type     1024-blocks      Used Available Capacity Mounted on
+overlay        overlay     52428800  10485760  41943040      20% /
 ";
 
     /// A plain host: no GPU, no cgroup limit, the run directory on `/`.
@@ -494,15 +562,23 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
         );
         let cpu = sample.cpu.ok_or("no cpu")?;
         assert_eq!(
-            (cpu.load1, cpu.cpus, cpu.usage),
-            (Some(3.25), Some(8.0), None)
+            (cpu.load1, cpu.cpus, cpu.usage, cpu.container),
+            (Some(3.25), Some(8.0), None, true)
         );
         let mounts: Vec<&str> = sample.disks.iter().map(|d| d.mount.as_str()).collect();
         assert_eq!(mounts, ["/workspace", "/"]);
+        // The network volume: its figures are the whole cluster's.
         let run = sample.disks.first().ok_or("no disk")?;
-        assert_eq!(run.size_bytes, 104_857_600 * 1024);
-        assert_eq!(run.available_bytes, 20_971_520 * 1024);
-        assert_eq!(run.used_ratio(), Some(0.8));
+        assert_eq!(run.size_bytes, 2_343_372_656 * 1024);
+        assert_eq!(run.available_bytes, 515_542_000 * 1024);
+        assert_eq!(run.fstype.as_deref(), Some("fuse.mfs"));
+        assert!(run.shared);
+        let root = sample.disks.get(1).ok_or("no root")?;
+        assert_eq!(
+            (root.fstype.as_deref(), root.shared),
+            (Some("overlay"), false)
+        );
+        assert_eq!(root.used_ratio(), Some(0.2));
         Ok(())
     }
 
@@ -518,7 +594,13 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
             })
         );
         let cpu = sample.cpu.as_ref().ok_or("no cpu")?;
-        assert_eq!((cpu.load1, cpu.cpus), (Some(0.5), Some(8.0)));
+        assert_eq!(
+            (cpu.load1, cpu.cpus, cpu.container),
+            (Some(0.5), Some(8.0), false)
+        );
+        let disk = sample.run_disk().ok_or("no disk")?;
+        // `df` without `-T` (macOS): no type, and a local device.
+        assert_eq!((disk.fstype.as_deref(), disk.shared), (None, false));
         // One file system for the run directory and `/`: listed once.
         assert_eq!(sample.disks.len(), 1);
         assert_eq!(sample.run_disk().map(|d| d.mount.as_str()), Some("/"));
@@ -571,6 +653,94 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
     }
 
     #[test]
+    fn a_container_without_a_quota_counts_nproc_cpus() -> Result<(), String> {
+        let output = POD.replace("800000 100000", "max 100000");
+        let cpu = parse(&output, at(0), None).cpu.ok_or("no cpu")?;
+        assert_eq!((cpu.cpus, cpu.container), (Some(128.0), true));
+        Ok(())
+    }
+
+    #[test]
+    fn counters_that_went_back_give_no_usage() -> Result<(), String> {
+        let first = parse(HOST, at(0), None);
+        let reset = HOST.replace("cpu  2000 0 1000 6000 1000", "cpu  20 0 10 60 10");
+        let second = parse(&reset, at(10), Some(&first));
+        assert_eq!(second.cpu.ok_or("no cpu")?.usage, None);
+        let first = parse(POD, at(0), None);
+        let restarted = POD.replace("usage_usec 200000000", "usage_usec 1000");
+        let second = parse(&restarted, at(10), Some(&first));
+        assert_eq!(second.cpu.ok_or("no cpu")?.usage, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_memory_limit_above_the_machine_is_the_machine() {
+        let output = POD.replace("68719476736", "9223372036854771712");
+        let memory = parse(&output, at(0), None).memory;
+        assert_eq!(memory.map(|m| m.limit_bytes), Some(2_097_152_000 * 1024));
+    }
+
+    #[test]
+    fn what_nvidia_smi_says_instead_of_figures_is_no_gpu() {
+        for said in [
+            "No devices were found",
+            "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver. \
+             Make sure that the latest NVIDIA driver is installed and running.",
+            "Failed to initialize NVML: Driver/library version mismatch",
+        ] {
+            let sample = parse(&format!("@gpu\n{said}\n"), at(0), None);
+            assert!(sample.gpus.is_empty(), "{said}");
+        }
+    }
+
+    #[test]
+    fn unsupported_gpu_figures_are_unknown() -> Result<(), String> {
+        let gpu = gpu("0, Tesla T4, [Not Supported], 100, 15360, 40, [Not Supported], [N/A]")
+            .ok_or("no gpu")?;
+        assert_eq!(
+            (gpu.utilization, gpu.power_watts, gpu.power_limit_watts),
+            (None, None, None)
+        );
+        assert_eq!(gpu.memory_total_bytes, Some(15_360 * MIB));
+        Ok(())
+    }
+
+    #[test]
+    fn a_truncated_df_line_is_no_disk() {
+        let header = "Filesystem Type 1024-blocks Used Available Capacity Mounted on";
+        assert_eq!(disk(&[header, "/dev/sda1 ext4 100 60"]), None);
+        assert_eq!(
+            disk(&["Filesystem 1024-blocks Used", "/dev/sda1 100"]),
+            None
+        );
+        assert_eq!(disk(&[header]), None);
+    }
+
+    #[test]
+    fn network_file_systems_are_shared() {
+        for (source, fstype) in [
+            ("mfs#euro-3.runpod.net:9421", Some("fuse.mfs")),
+            ("mfs#host:9421", Some("fuse")),
+            ("nas:/export/home", Some("nfs4")),
+            ("//nas/share", Some("cifs")),
+            ("s3fs", Some("fuse.s3fs")),
+            ("10.0.0.2:/data", None),
+        ] {
+            assert!(is_shared(source, fstype), "{source} {fstype:?}");
+        }
+        for (source, fstype) in [
+            ("/dev/nvme0n1p2", Some("ext4")),
+            ("overlay", Some("overlay")),
+            ("tmpfs", Some("tmpfs")),
+            ("/dev/sdb1", Some("fuseblk")),
+            ("fuse-overlayfs", Some("fuse.fuse-overlayfs")),
+            ("/dev/disk3s1", None),
+        ] {
+            assert!(!is_shared(source, fstype), "{source} {fstype:?}");
+        }
+    }
+
+    #[test]
     fn an_empty_answer_is_an_empty_sample() {
         let sample = parse("", at(0), None);
         assert!(sample.disks.is_empty() && sample.gpus.is_empty());
@@ -579,8 +749,17 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
 
     #[test]
     fn a_mount_point_keeps_its_spaces_and_a_name_its_commas() -> Result<(), String> {
-        let disk = disk(&["header", "/dev/sdb1 100 25 75 25% /mnt/my data"]).ok_or("no disk")?;
-        assert_eq!(disk.mount, "/mnt/my data");
+        let spaced = disk(&["header", "/dev/sdb1 100 25 75 25% /mnt/my data"]).ok_or("no disk")?;
+        assert_eq!(spaced.mount, "/mnt/my data");
+        let typed = disk(&[
+            "Filesystem Type 1024-blocks Used Available Capacity Mounted on",
+            "/dev/sdb1 ext4 100 25 75 25% /mnt/my data",
+        ])
+        .ok_or("no disk")?;
+        assert_eq!(
+            (typed.mount.as_str(), typed.used_bytes),
+            ("/mnt/my data", 25 * 1024)
+        );
         let odd = gpu("2, Odd, GPU\u{7}, 5, 1, 2, 30, 50.5, 100").ok_or("no gpu")?;
         assert_eq!((odd.index, odd.name.as_str()), (2, "Odd,GPU"));
         assert_eq!(gpu("garbage"), None);
@@ -597,7 +776,12 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
     #[test]
     fn the_script_quotes_the_run_directory() {
         let script = probe_script("/w/it's");
-        assert!(script.contains("df -Pk -- '/w/it'\\''s'"), "{script}");
+        assert!(script.contains("disk '/w/it'\\''s'\n"), "{script}");
+        // Every command that can hang on the target is bounded.
+        assert!(script.contains("$limit df -PkT -- \"$1\""), "{script}");
+        assert!(script.contains("$limit df -Pk -- \"$1\""), "{script}");
+        assert!(script.contains("$limit nvidia-smi"), "{script}");
+        assert!(script.find("limit=") < script.find("part gpu"), "{script}");
         assert!(script.ends_with("exit 0\n"));
     }
 }
