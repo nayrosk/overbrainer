@@ -841,3 +841,70 @@ async fn export_pods_are_listed_with_their_export_and_removed_by_its_id() -> Tes
     assert_eq!(record.state, PodState::Deleted);
     Ok(())
 }
+
+const SWEPT_EXPORT: &str = "export_20261001-140000";
+
+/// Each export pod's secret is named after its export and goes with it: once
+/// its pod is confirmed gone, by the startup sweep once the export ended
+/// without a pod, and by `pod rm <export-id>`; a listed pod keeps it, and the
+/// run's own secret is never touched by an export.
+#[tokio::test]
+async fn export_pod_secrets_follow_their_export() -> TestResult {
+    let account = Account::default()
+        .with("x1", Some(EXPORT), true)
+        .with("p1", Some(RUN), false);
+    let harness = Harness::new(account).await?;
+    harness.recorded(RUN, RunState::Running, "p1", PodState::Running)?;
+    let exports = harness.runs.exports(RUN)?;
+    export_recorded(
+        &exports,
+        EXPORT,
+        RunState::Succeeded,
+        "x1",
+        PodState::Running,
+    )?;
+    export_recorded(
+        &exports,
+        GONE_EXPORT,
+        RunState::Running,
+        "x2",
+        PodState::Running,
+    )?;
+    export_recorded(
+        &exports,
+        SWEPT_EXPORT,
+        RunState::Failed,
+        "x3",
+        PodState::Deleted,
+    )?;
+    for (id, owner) in [
+        ("k0", RUN),
+        ("k1", EXPORT),
+        ("k2", GONE_EXPORT),
+        ("k3", SWEPT_EXPORT),
+    ] {
+        harness.secrets.hold(id, &host_key_secret(owner));
+    }
+    // p1 is not listed but answers: the run keeps its secret.
+    pod_rows(&harness.ctx()).await?;
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(GONE_EXPORT)]);
+    let rows = listed_rows(&harness.ctx()).await?;
+    let warnings = sweep_host_keys(&harness.ctx(), &rows).await?;
+    assert_eq!(warnings, Vec::<String>::new());
+    assert_eq!(
+        harness.secrets.deleted(),
+        [host_key_secret(GONE_EXPORT), host_key_secret(SWEPT_EXPORT)]
+    );
+    let found = harness.runs.holding(EXPORT);
+    let ctx = PodCtx {
+        runs: &found,
+        ..harness.ctx()
+    };
+    remove_run_pods(&ctx, EXPORT, false).await.result?;
+    assert_eq!(
+        harness.secrets.names(),
+        [host_key_secret(RUN)],
+        "only the run's secret is left"
+    );
+    Ok(())
+}

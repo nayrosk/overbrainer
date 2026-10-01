@@ -481,7 +481,8 @@ pub fn orphan_warnings(rows: &[PodRow]) -> Vec<String> {
         .collect()
 }
 
-/// Sweeps the run host key secrets (`overbrainer_host_key_<run>`) that no pod
+/// Sweeps the run host key secrets (`overbrainer_host_key_<run>`, or
+/// `overbrainer_host_key_<export-id>` for an export's pod) that no pod
 /// needs any more, given `rows`, the pods of one list of the account (see
 /// [`listed_rows`]): a secret whose run has a listed pod is kept, and so is
 /// one of a run of this project still in progress (it may be creating its
@@ -532,7 +533,8 @@ async fn delete_swept(ctx: &PodCtx<'_>, secret: &Secret, run_id: &str) -> Option
 /// [`sweep_host_keys`]). Returns a warning when it cannot, or should not.
 async fn sweep_host_key(ctx: &PodCtx<'_>, secret: &Secret, run_id: &str) -> Option<String> {
     let name = &secret.name;
-    match ctx.runs.load(run_id) {
+    // An export's pod holds a secret named after the export, recorded with it.
+    match ctx.runs.holding(run_id).load(run_id) {
         Ok(run) if matches!(run.state, RunState::Preparing | RunState::Running) => None,
         Ok(_) => delete_swept(ctx, secret, run_id).await,
         Err(RunsError::NotFound(_)) => Some(format!(

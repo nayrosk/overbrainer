@@ -944,3 +944,47 @@ async fn a_kept_pod_past_a_deadline_is_never_deleted() -> TestResult {
     assert_eq!(deletes(&harness.server).await, 0);
     Ok(())
 }
+
+/// An export's pod gets a host key secret of its own, named after the export,
+/// which a failed start deletes without touching the run's secret, held while
+/// the run's own pod may still need it.
+#[tokio::test]
+async fn an_export_pod_has_its_own_secret_which_a_failed_start_deletes() -> TestResult {
+    require_keygen()?;
+    let harness = Harness::new().await?;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"detail": CAPACITY})))
+        .mount(&harness.server)
+        .await;
+    let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
+    harness.secrets.hold("k-run", &host_key_secret(&run.id));
+    let exports = harness.runs.exports(&run.id)?;
+    let export = create(&exports, "export", "/workspace/overbrainer", "gpu_cloud")?;
+    let ctx = PodCtx {
+        runs: &exports,
+        ..harness.ctx()
+    };
+    let result = start_pod(&ctx, &target(), export.clone(), false, None).await;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    assert_eq!(exports.load(&export.id)?.state, RunState::Failed);
+    assert_eq!(harness.runs.load(&run.id)?.state, RunState::Preparing);
+    let pod = PodRecord::load(&exports, &export.id)?.ok_or("no export pod.json")?;
+    assert_eq!(pod.run_id, export.id);
+    assert!(PodRecord::load(&harness.runs, &run.id)?.is_none());
+    let requests = harness.server.received_requests().await.unwrap_or_default();
+    let create_call = requests
+        .iter()
+        .find(|request| request.url.path() == "/v2/pods")
+        .ok_or("no create call")?;
+    let body: Value = serde_json::from_slice(&create_call.body)?;
+    assert_eq!(
+        body["env"]["OVERBRAINER_HOST_KEY"],
+        host_key_placeholder(&export.id)
+    );
+    assert_eq!(body["env"]["OVERBRAINER_RUN_ID"], export.id.as_str());
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(&export.id)]);
+    assert_eq!(harness.secrets.names(), [host_key_secret(&run.id)]);
+    let ssh = exports.run_dir(&export.id)?.join("ssh");
+    assert!(!ssh.join("id_ed25519").exists());
+    Ok(())
+}
