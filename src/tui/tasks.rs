@@ -32,8 +32,8 @@ use crate::events::{Event, EventBus, Observer, Stage};
 use crate::history::{self, Cost, Entry, Total};
 use crate::pipeline::{Ctx, SplitReport};
 use crate::prompts::Prompts;
-use crate::train::TrainMetric;
 use crate::train::sizing::VramFloor;
+use crate::train::{Phases, TrainMetric};
 
 /// Events kept for a TUI task's forwarder when it falls behind. `watch` publishes
 /// every line of one tail read at once, at most 1 MiB, and a metrics line is at
@@ -224,8 +224,8 @@ pub(super) enum Done {
     Series {
         /// The run.
         run: String,
-        /// Its metrics.
-        series: Option<Vec<TrainMetric>>,
+        /// Its metrics, and what its lines say of its phase.
+        series: Option<(Vec<TrainMetric>, Phases)>,
     },
     /// What a read of a run's kept pod log found.
     PodLog(PodLogRead),
@@ -1030,7 +1030,7 @@ mod tests {
         let Some((TaskId(2), Ok(Done::Series { series, .. }))) = next else {
             return Err(format!("unexpected end: {next:?}").into());
         };
-        assert_eq!(series.map(|s| s.len()), Some(1));
+        assert_eq!(series.map(|(s, _)| s.len()), Some(1));
         Ok(())
     }
 

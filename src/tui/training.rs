@@ -7,10 +7,11 @@ use std::time::{Duration, SystemTime};
 
 use super::tasks::TaskId;
 use crate::events::Event;
+use crate::exec::JobStatus;
 use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, RunState, Runs};
 use crate::system::SystemSample;
-use crate::train::{METRICS_FILE, MetricLine, Pace, TrainMetric, parse_line};
+use crate::train::{METRICS_FILE, MetricLine, Pace, Phase, Phases, TrainMetric, parse_line};
 
 /// Samples of a run's machine kept for the system panel: ten minutes at one
 /// sample every 10 seconds.
@@ -95,6 +96,9 @@ pub(super) struct Follow {
     pub(super) run_id: String,
     /// Whether its job's status was seen: its watch began.
     pub(super) watching: bool,
+    /// The latest status of its job: once it exited, the run's results are
+    /// being retrieved.
+    pub(super) status: Option<JobStatus>,
     /// The latest status of its pod.
     pub(super) pod: Option<PodStatus>,
     /// The lines the command line would print.
@@ -119,6 +123,7 @@ impl Follow {
             job,
             run_id: run_id.to_string(),
             watching: false,
+            status: None,
             pod: None,
             lines: Vec::new(),
             skipped: 0,
@@ -280,6 +285,9 @@ pub(super) struct TrainingView {
     pub(super) error: Option<String>,
     /// Metrics of each run shown, by run ID.
     pub(super) series: BTreeMap<String, Vec<TrainMetric>>,
+    /// What the metric lines of each run shown say of its phase, by run ID;
+    /// a run with a series but none reads its phase from the series alone.
+    pub(super) phases: BTreeMap<String, Phases>,
     /// The training tasks running.
     pub(super) tasks: BTreeMap<TaskId, Follow>,
     /// How the last task of each run ended.
@@ -342,20 +350,21 @@ pub(super) fn float(count: u64) -> f64 {
     f64::from(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
-/// The metrics in `runs/<id>/metrics.jsonl` of the project in `dir`, malformed
-/// lines skipped; `None` when the file cannot be read.
-pub(super) fn read_series(dir: &Path, id: &str) -> Option<Vec<TrainMetric>> {
+/// The metrics in `runs/<id>/metrics.jsonl` of the project in `dir`, and what
+/// its lines say of the run's phase, malformed lines skipped; `None` when the
+/// file cannot be read.
+pub(super) fn read_series(dir: &Path, id: &str) -> Option<(Vec<TrainMetric>, Phases)> {
     let path = Runs::new(dir).run_dir(id).ok()?.join(METRICS_FILE);
     let content = std::fs::read_to_string(path).ok()?;
-    Some(
-        content
-            .lines()
-            .filter_map(|line| match parse_line(line) {
-                Ok(MetricLine::Log(metric)) => Some(metric),
-                _ => None,
-            })
-            .collect(),
-    )
+    let mut series = Vec::new();
+    let mut phases = Phases::default();
+    for line in content.lines().filter_map(|line| parse_line(line).ok()) {
+        phases.line(&line);
+        if let MetricLine::Log(metric) = line {
+            series.push(metric);
+        }
+    }
+    Some((series, phases))
 }
 
 impl TrainingView {
@@ -435,6 +444,25 @@ impl TrainingView {
         Some((float(now.step) / float(max)).min(1.0))
     }
 
+    /// What the job of `row` does, while its run is recorded running: from its
+    /// metric lines, and from the latest job status of the task following it.
+    pub(super) fn phase(&self, row: &RunRow) -> Phase {
+        let id = &row.record.id;
+        let exited = self
+            .task_of(id)
+            .and_then(|(_, follow)| follow.status)
+            .is_some_and(JobStatus::is_finished)
+            && row.record.state == RunState::Running;
+        let phases = self.phases.get(id).copied().unwrap_or_else(|| {
+            let mut phases = Phases::default();
+            for metric in self.series.get(id).into_iter().flatten() {
+                phases.metric(metric);
+            }
+            phases
+        });
+        phases.phase(exited)
+    }
+
     /// What the task on run `id`, if any, does to it.
     pub(super) fn activity(&self, id: &str) -> RunActivity {
         RunActivity::of(self.task_of(id).map(|(_, follow)| follow))
@@ -488,14 +516,27 @@ impl TrainingView {
         };
         match event {
             Event::Metric(metric) => {
+                self.phases
+                    .entry(follow.run_id.clone())
+                    .or_default()
+                    .metric(&metric);
                 self.series
                     .entry(follow.run_id.clone())
                     .or_default()
                     .push(metric);
             },
-            Event::JobStatus(_) if !follow.watching => {
-                follow.watching = true;
-                return true;
+            Event::Mark(mark) => {
+                self.phases
+                    .entry(follow.run_id.clone())
+                    .or_default()
+                    .mark(mark);
+            },
+            Event::JobStatus(status) => {
+                follow.status = Some(status);
+                if !follow.watching {
+                    follow.watching = true;
+                    return true;
+                }
             },
             Event::PodStatus(status) => follow.pod = Some(status),
             Event::System(sample) => {
@@ -615,6 +656,40 @@ mod tests {
     }
 
     #[test]
+    fn the_latest_job_status_and_marks_tell_the_phase() -> Result<(), serde_json::Error> {
+        let mut view = TrainingView::default();
+        let mut record: RunRecord = serde_json::from_value(serde_json::json!({
+            "id": "run-a",
+            "target": "box",
+            "remote_dir": "/w/run-a",
+            "state": "running",
+            "created": "2026-09-21T14:00:00Z",
+        }))?;
+        view.runs.push(RunRow {
+            record: record.clone(),
+            pod: None,
+        });
+        view.tasks
+            .insert(TaskId(1), Follow::new(Job::Attach, "run-a"));
+        let row = |view: &TrainingView| view.runs[0].clone();
+        assert!(view.event(TaskId(1), Event::JobStatus(JobStatus::Running)));
+        assert!(!view.event(TaskId(1), Event::Metric(log(1.0, 400, Some(1.0)))));
+        assert_eq!(view.phase(&row(&view)), Phase::Finalizing);
+        view.event(
+            TaskId(1),
+            Event::Mark(crate::train::Mark::Stage(crate::train::JobStage::Merge)),
+        );
+        assert_eq!(view.phase(&row(&view)), Phase::Merging);
+        assert!(!view.event(TaskId(1), Event::JobStatus(JobStatus::Exited(0))));
+        assert_eq!(view.phase(&row(&view)), Phase::Retrieving);
+        // Once the run is recorded ended, nothing is being retrieved.
+        record.state = RunState::Succeeded;
+        view.runs[0].record = record;
+        assert_eq!(view.phase(&row(&view)), Phase::Merging);
+        Ok(())
+    }
+
+    #[test]
     fn a_series_is_read_from_the_local_metrics_file() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let run = dir.path().join("runs/20260921-140000-a1b2");
@@ -622,10 +697,14 @@ mod tests {
         std::fs::write(
             run.join(METRICS_FILE),
             "{\"event\": \"begin\", \"time\": 1, \"max_steps\": 2}\nnot json\n\
-             {\"event\": \"log\", \"time\": 2, \"step\": 1, \"loss\": 1.5}\n",
+             {\"event\": \"log\", \"time\": 2, \"step\": 1, \"loss\": 1.5}\n\
+             {\"event\": \"end\", \"time\": 3, \"step\": 1}\n",
         )?;
         let series = read_series(dir.path(), "20260921-140000-a1b2");
-        assert_eq!(series.map(|s| s.len()), Some(1));
+        assert_eq!(
+            series.map(|(s, phases)| (s.len(), phases.phase(false))),
+            Some((1, Phase::Finalizing))
+        );
         assert_eq!(read_series(dir.path(), "20260921-140000-ffff"), None);
         Ok(())
     }

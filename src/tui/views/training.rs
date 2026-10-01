@@ -16,7 +16,7 @@ use ratatui::widgets::{
 
 use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, RunState};
-use crate::train::TrainMetric;
+use crate::train::{Phase, TrainMetric};
 use crate::tui::app::App;
 use crate::tui::format::{cut, duration};
 use crate::tui::motion::Bar;
@@ -72,7 +72,17 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Op
     let shown = app
         .motion
         .bar(Bar::Step, view.selected_ratio().unwrap_or(0.0), STEP_BAR);
-    let head = head_line(&row.record, series, (activity, shown), theme);
+    let head = fit(
+        head_line(
+            &row.record,
+            series,
+            (activity, shown),
+            (view.phase(row), app.motion.spinner()),
+            theme,
+        ),
+        inner.width,
+    );
+    let head_rows = u16::try_from(head.len()).unwrap_or(1);
     let facts = facts_line(
         (series, &row.record),
         (follow, ended),
@@ -82,7 +92,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Op
     let facts_rows = u16::from(!facts.spans.is_empty());
     let gap = u16::from(area.height >= GAPS_FROM);
     let [status, facts_area, _, pod_area, _, chart, lr, grad, notes] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(head_rows),
         Constraint::Length(facts_rows),
         Constraint::Length(gap),
         Constraint::Length(pod_rows),
@@ -267,12 +277,15 @@ fn pod_summary(record: &PodRecord) -> String {
 }
 
 /// The selected run's first status line: `●` when a task follows it, its ID,
-/// its step with a bar filled to `shown` and a percentage, and its ETA while
-/// its job runs.
+/// its step with a bar filled to `shown` and a percentage, and while its job
+/// runs, its ETA, or once it does more than training steps (an evaluation, the
+/// work after the last step, the retrieval of its results), that `phase` after
+/// the `spinner`.
 fn head_line(
     record: &RunRecord,
     series: &[TrainMetric],
     (activity, shown): (RunActivity, f64),
+    (phase, spinner): (Phase, &str),
     theme: &Theme,
 ) -> Line<'static> {
     // No stand-in for the marker: the ID of a run nothing follows starts in
@@ -282,27 +295,45 @@ fn head_line(
         head.push(Span::styled("● ", theme.title));
     }
     head.push(Span::styled(record.id.clone(), theme.title));
-    let Some(now) = progress(series) else {
-        return Line::from(head);
-    };
-    match now.max_steps {
-        Some(max) if max > 0 => {
-            head.push(Span::raw(format!("  step {}/{max} ", now.step)));
-            head.push(Span::styled(bar(shown, STEP_BAR), theme.gauge));
-            head.push(Span::raw(format!(
-                " {}%",
-                (now.step.saturating_mul(100) / max).min(100)
-            )));
-        },
-        _ => head.push(Span::raw(format!("  step {}", now.step))),
+    let now = progress(series);
+    if let Some(now) = now {
+        match now.max_steps {
+            Some(max) if max > 0 => {
+                head.push(Span::raw(format!("  step {}/{max} ", now.step)));
+                head.push(Span::styled(bar(shown, STEP_BAR), theme.gauge));
+                head.push(Span::raw(format!(
+                    " {}%",
+                    (now.step.saturating_mul(100) / max).min(100)
+                )));
+            },
+            _ => head.push(Span::raw(format!("  step {}", now.step))),
+        }
     }
-    if matches!(record.state, RunState::Preparing | RunState::Running) {
-        head.push(Span::raw(match now.eta {
+    if !matches!(record.state, RunState::Preparing | RunState::Running) {
+        return Line::from(head);
+    }
+    match (phase, now) {
+        (Phase::Training, None) => {},
+        (Phase::Training, Some(now)) => head.push(Span::raw(match now.eta {
             Some(eta) => format!("  ETA {}", duration(eta)),
             None => "  ETA unknown".to_string(),
-        }));
+        })),
+        (phase, _) => head.push(Span::styled(
+            format!("  {spinner} {}", phase.label()),
+            theme.accent,
+        )),
     }
     Line::from(head)
+}
+
+/// `line` on one row when it fits `width`, else its last part (the ETA or the
+/// phase) on a row of its own under the rest.
+fn fit(mut line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    if line.width() <= usize::from(width) || line.spans.len() < 2 {
+        return vec![line];
+    }
+    let last = line.spans.pop().map(Line::from);
+    std::iter::once(line).chain(last).collect()
 }
 
 /// The selected run's second status line: its epoch, the run it resumed from,

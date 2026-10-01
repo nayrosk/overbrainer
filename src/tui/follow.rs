@@ -29,8 +29,8 @@ use super::training::{Detach, Ended, Follow, Job, Listing, RunActivity};
 use crate::cli::front::Report;
 use crate::events::Event;
 use crate::runs::RunState;
-use crate::train::TrainMetric;
 use crate::train::sizing::{Estimate, VramFloor};
+use crate::train::{Phases, TrainMetric};
 
 /// Time between two reads of `runs/` while the Training view is shown, and of
 /// the data files while the Dataset view is shown during a stage.
@@ -110,16 +110,17 @@ impl App {
         &mut self,
         id: TaskId,
         run: String,
-        series: Option<Vec<TrainMetric>>,
+        series: Option<(Vec<TrainMetric>, Phases)>,
     ) -> Vec<Effect> {
         if self.training.reading.get(&run) != Some(&id) {
             return Vec::new();
         }
         self.training.reading.remove(&run);
-        if let Some(series) = series {
+        if let Some((series, phases)) = series {
             if let Some(ended) = self.training.ended.get_mut(&run) {
                 ended.healed = true;
             }
+            self.training.phases.insert(run.clone(), phases);
             self.training.series.insert(run, series);
             self.dirty = true;
         }
@@ -262,6 +263,7 @@ impl App {
             return Vec::new();
         }
         self.training.series.remove(&id);
+        self.training.phases.remove(&id);
         self.training.ended.remove(&id);
         self.train(Job::Attach, &id)
     }
@@ -662,7 +664,15 @@ impl App {
         let healed = self.training.ended.get(&run).is_some_and(|e| e.healed);
         match message {
             Msg::Event(_, Event::Metric(metric)) if !healed => {
+                self.training
+                    .phases
+                    .entry(run.clone())
+                    .or_default()
+                    .metric(&metric);
                 self.training.series.entry(run).or_default().push(metric);
+            },
+            Msg::Event(_, Event::Mark(mark)) if !healed => {
+                self.training.phases.entry(run).or_default().mark(mark);
             },
             Msg::Lagged(_, skipped) => {
                 if let Some(ended) = self.training.ended.get_mut(&run) {

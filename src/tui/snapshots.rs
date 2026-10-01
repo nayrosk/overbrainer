@@ -1271,6 +1271,104 @@ fn training_of_a_run_nothing_follows() -> TestResult {
     Ok(())
 }
 
+/// The followed run of [`training_app`] with `marks` after its metrics; with
+/// `last`, its 1200 steps are all it has.
+fn phased(last: bool, marks: &[crate::train::Mark]) -> Result<App, serde_json::Error> {
+    let mut app = training_app()?;
+    let mut metrics = series();
+    if last {
+        for metric in &mut metrics {
+            metric.max_steps = Some(1200);
+        }
+    }
+    let mut phases = crate::train::Phases::default();
+    for metric in &metrics {
+        phases.metric(metric);
+    }
+    for mark in marks {
+        phases.mark(*mark);
+    }
+    app.training.series.insert(FOLLOWED.into(), metrics);
+    app.training.phases.insert(FOLLOWED.into(), phases);
+    Ok(app)
+}
+
+const EVAL: crate::train::Mark = crate::train::Mark::Eval {
+    step: 340,
+    total: Some(1200),
+};
+
+#[test]
+fn training_of_a_run_evaluating_mid_training() -> TestResult {
+    let mut app = phased(false, &[EVAL])?;
+    snapshot("training_evaluating", &mut app)?;
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains("evaluating 340/1200"), "{shown}");
+    assert!(!shown.contains("ETA"), "{shown}");
+    Ok(())
+}
+
+#[test]
+fn training_of_a_run_in_its_final_evaluation() -> TestResult {
+    let mut app = phased(true, &[EVAL])?;
+    snapshot("training_final_evaluation", &mut app)?;
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(
+        shown.contains("finalizing (evaluation 340/1200)"),
+        "{shown}"
+    );
+    assert!(!shown.contains("ETA"), "{shown}");
+    Ok(())
+}
+
+#[test]
+fn training_of_a_run_saving_its_model() -> TestResult {
+    let mut app = phased(true, &[crate::train::Mark::End { step: 1200 }])?;
+    snapshot("training_finalizing", &mut app)?;
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains("finalizing (saving model)"), "{shown}");
+    assert!(!shown.contains("ETA"), "{shown}");
+    Ok(())
+}
+
+#[test]
+fn training_of_a_run_merging_its_adapter() -> TestResult {
+    let mut app = phased(
+        true,
+        &[
+            crate::train::Mark::End { step: 1200 },
+            crate::train::Mark::Stage(crate::train::JobStage::Merge),
+        ],
+    )?;
+    snapshot("training_merging", &mut app)?;
+    Ok(())
+}
+
+#[test]
+fn training_of_a_run_whose_results_are_retrieved() -> TestResult {
+    let mut app = phased(true, &[crate::train::Mark::End { step: 1200 }])?;
+    if let Some(follow) = app.training.tasks.get_mut(&TaskId(3)) {
+        follow.status = Some(crate::exec::JobStatus::Exited(0));
+    }
+    snapshot("training_retrieving", &mut app)?;
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains("retrieving results"), "{shown}");
+    Ok(())
+}
+
+#[test]
+fn a_run_from_before_the_phase_events_finalizes_at_its_last_step() -> TestResult {
+    // A v0.5 job writes logs only: the step count alone says the loop ended.
+    let mut app = phased(true, &[])?;
+    app.training.phases.clear();
+    snapshot("training_finalizing_legacy", &mut app)?;
+    let shown = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(shown.contains("step 1200/1200"), "{shown}");
+    assert!(shown.contains("finalizing (saving model)"), "{shown}");
+    assert!(!shown.contains("ETA"), "{shown}");
+    Ok(())
+}
+
 /// Samples of a pod's machine, one every 10 seconds up to [`NOW`]: the
 /// network volume on the whole shared cluster, the container's disk filling
 /// up, half its 8 CPUs busy, and `gpus` GPUs, the first nearly out of memory
