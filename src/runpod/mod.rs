@@ -11,6 +11,7 @@ use std::path::PathBuf;
 mod bootstrap;
 mod catalog;
 mod client;
+mod disk;
 mod flow;
 mod keys;
 mod logs;
@@ -30,6 +31,11 @@ pub use catalog::{
     template_table, volume_table,
 };
 pub use client::{ApiError, RunpodClient, USER_AGENT};
+pub use disk::{
+    ACT_PERCENT, Assessment, Critical, DISK_PROBE_EVERY, DiskProbe, DiskWatch, GROW_WINDOW, Usage,
+    VOLUME_SIZE_FILE, VOLUME_USABLE_PERCENT, VolumeDisk, WARN_PERCENT, WARN_STEP,
+    WATCHDOG_ACT_PERCENT, assess, disk_probe_script, grown_size, parse_disk_probe,
+};
 pub use flow::{
     COST_CAP_FILE, DEADLINE_MARGIN, Ending, LEASE_FILE, LEASE_TTL, MAX_COST_REACHED,
     MAX_HOURS_REACHED, RETRIEVED_MARKER, SNAPSHOT_AT_FILE, WATCHDOG_LOG, Watched, arm_cost_cap,
@@ -104,6 +110,18 @@ pub enum PodError {
     /// catalog; no pod was asked for. Says what was asked.
     #[error(transparent)]
     NotInStock(#[from] ResolveError),
+    /// The size of the target's network volume cannot be read, even after
+    /// retries: the pod's watchdog could not tell when it fills, so no pod is
+    /// asked for.
+    #[error(
+        "cannot read the size of network volume {id} ({reason}): no pod was created, since its watchdog could not watch the volume's disk space"
+    )]
+    VolumeSize {
+        /// The volume's ID.
+        id: String,
+        /// Why: Runpod's status or a fixed message, never Runpod's own text.
+        reason: String,
+    },
     /// Runpod asks for credits (402).
     #[error(
         "Runpod refused for lack of credits (402): deploying needs at least one hour of credits"

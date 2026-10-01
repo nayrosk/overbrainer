@@ -154,6 +154,7 @@ fn runpod_summary(target: &Target) -> String {
         retrieve_grace_minutes,
         data_center_ids,
         network_volume_id,
+        max_volume_gb,
     } = target
     else {
         return String::new();
@@ -176,10 +177,11 @@ fn runpod_summary(target: &Target) -> String {
         format!(" ({})", limits.join(", "))
     };
     let cost = max_cost_usd.map_or_else(String::new, |usd| format!(", max ${usd}"));
+    let grow = max_volume_gb.map_or_else(String::new, |gb| format!(" (grows up to {gb} GB)"));
     format!(
         "runpod {gpu_count}x [{gpu_types}]{limits}, max {max_hours}h{cost}, image {}, venv {}, disk {container_disk_gb} GB, \
          boot grace {boot_grace_minutes} min, retrieve grace {retrieve_grace_minutes} min, \
-         data centers {data_centers}, network volume {}",
+         data centers {data_centers}, network volume {}{grow}",
         image.as_deref().unwrap_or(DEFAULT_RUNPOD_IMAGE),
         venv.as_deref().unwrap_or(DEFAULT_RUNPOD_VENV),
         network_volume_id.as_deref().unwrap_or("none"),

@@ -88,6 +88,7 @@ output_dir: "/workspace/run/output"
 plugins:
   - "overbrainer_metrics.OverbrainerMetricsPlugin"
 sample_packing: true
+save_total_limit: 2
 saves_per_epoch: 1
 sequence_len: 4096
 special_tokens:
@@ -138,6 +139,20 @@ fn full_fine_tuning_has_no_adapter_keys_and_no_eval_without_eval_data() -> TestR
             "axolotl.yaml".into()
         ]]
     );
+    Ok(())
+}
+
+#[test]
+fn two_checkpoints_are_kept_unless_axolotl_extra_says_otherwise() -> TestResult {
+    let (dir, plain) =
+        settings("[training]\ntarget = \"box\"\nbase_model = \"m\"\nadapter = \"lora\"\n")?;
+    let trainer = Axolotl::new(training(&plain)?, &DataFiles::new(dir.path()));
+    assert_eq!(trainer.config("/r", false)["save_total_limit"], 2);
+    let (dir, extra) = settings(
+        "[training]\ntarget = \"box\"\nbase_model = \"m\"\nadapter = \"lora\"\n[training.axolotl_extra]\nsave_total_limit = 5\n",
+    )?;
+    let trainer = Axolotl::new(training(&extra)?, &DataFiles::new(dir.path()));
+    assert_eq!(trainer.config("/r", false)["save_total_limit"], 5);
     Ok(())
 }
 

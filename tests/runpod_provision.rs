@@ -136,6 +136,7 @@ fn target(gpu_types: &[&str]) -> RunpodTarget {
         retrieve_grace: Duration::from_secs(3600),
         data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
+        max_volume_gb: None,
     }
 }
 
@@ -216,6 +217,7 @@ impl Harness {
             workdir: "/workspace/overbrainer",
             api_url: self.client.base_url(),
             vram_floor_gb: None,
+            volume_gb: None,
         };
         let result = provision(&self.ctx(), &plan, &mut record).await.map(drop);
         assert_eq!(PodRecord::load(&self.runs, RUN)?.as_ref(), Some(&record));
@@ -669,6 +671,11 @@ async fn the_create_carries_the_target_and_the_watchdog_settings() -> TestResult
         .respond_with(ResponseTemplate::new(400))
         .mount(&harness.server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/network-volumes/vol1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "vol1", "size": 200})))
+        .mount(&harness.server)
+        .await;
     let mut target = target(&["NVIDIA A40"]);
     target.data_center_ids = ListOrAuto::List(vec!["EU-RO-1".into()]);
     target.network_volume_id = Some("vol1".into());
@@ -707,12 +714,48 @@ async fn the_create_carries_the_target_and_the_watchdog_settings() -> TestResult
         format!("{}/v2", harness.server.uri())
     );
     assert_eq!(env["OVERBRAINER_KEEP_POD"], "0");
+    // The watchdog's disk rule works on the volume from the start.
+    assert_eq!(env["OVERBRAINER_VOLUME_DIR"], "/workspace/data");
+    assert_eq!(env["OVERBRAINER_VOLUME_GB"], "200");
     let deadline: u64 = env["OVERBRAINER_DEADLINE"]
         .as_str()
         .unwrap_or("0")
         .parse()?;
     assert!((before + 6 * 3600..=before + 6 * 3600 + 5).contains(&deadline));
     assert!(env.get("HF_TOKEN").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_network_volume_of_unknown_size_is_refused_before_any_create() -> TestResult {
+    for (answer, reason) in [
+        (ResponseTemplate::new(500), "Runpod answered 500"),
+        (gone(), "Runpod does not know it"),
+        (
+            ResponseTemplate::new(200).set_body_json(json!({"id": "vol1", "size": 0})),
+            "Runpod gave no size",
+        ),
+    ] {
+        let harness = Harness::new().await?;
+        Mock::given(method("GET"))
+            .and(path("/v2/network-volumes/vol1"))
+            .respond_with(answer)
+            .mount(&harness.server)
+            .await;
+        let mut target = target(&["NVIDIA A40"]);
+        target.network_volume_id = Some("vol1".into());
+        let (result, record) = harness.provision(&target).await?;
+        let error = result.err().ok_or("provisioning succeeded")?.to_string();
+        assert_eq!(
+            error,
+            format!(
+                "cannot read the size of network volume vol1 ({reason}): no pod was created, \
+                 since its watchdog could not watch the volume's disk space"
+            )
+        );
+        assert!(harness.calls("POST").await.is_empty());
+        assert!(record.attempts.is_empty());
+    }
     Ok(())
 }
 
@@ -1067,6 +1110,7 @@ async fn a_pod_is_still_deleted_when_pod_json_cannot_be_saved() -> TestResult {
         workdir: "/workspace/overbrainer",
         api_url: harness.client.base_url(),
         vram_floor_gb: None,
+        volume_gb: None,
     };
     let result = provision(&harness.ctx(), &plan, &mut record).await;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;

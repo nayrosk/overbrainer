@@ -128,6 +128,9 @@ pub struct PodPlan<'a> {
     /// `min_vram_gb`: the estimate of what the run needs (see
     /// [`resolve_with_floor`](super::resolve_with_floor)).
     pub vram_floor_gb: Option<u32>,
+    /// The network volume's size in GB, for the watchdog's disk rule; when
+    /// `None`, [`provision`] reads it from the API.
+    pub volume_gb: Option<u32>,
 }
 
 /// A pod ready for the run: reachable over SSH with its pinned host key, with a
@@ -170,7 +173,9 @@ enum Created {
 /// # Errors
 ///
 /// Returns [`PodError::NotInStock`] when an `auto` choice finds nothing in
-/// stock (no create call is made), [`PodError::NoCapacity`] when no GPU type
+/// stock and [`PodError::VolumeSize`] when the size of the target's network
+/// volume cannot be read (no create call is made in both cases),
+/// [`PodError::NoCapacity`] when no GPU type
 /// could be placed or gave a ready pod,
 /// [`PodError::Unanswered`] when no create call got a clear answer,
 /// [`PodError::NoCredits`] on a 402, [`PodError::Rejected`] on a 422 or a 400
@@ -190,8 +195,13 @@ pub async fn provision(
 ) -> Result<Provisioned, PodError> {
     ctx.check()?;
     let target = resolve_target(ctx.client, plan.target, plan.vram_floor_gb).await?;
+    let volume_gb = match (plan.volume_gb, &target.network_volume_id) {
+        (None, Some(id)) => Some(volume_size(ctx.client, id).await?),
+        (known, _) => known,
+    };
     let plan = &PodPlan {
         target: &target,
+        volume_gb,
         ..*plan
     };
     let result = walk(ctx, plan, record).await;
@@ -199,6 +209,32 @@ pub async fn provision(
         after_failure(ctx, record).await;
     }
     result
+}
+
+/// The size in GB of the network volume `id`, which the pod's watchdog needs
+/// to watch the volume's disk space from the start.
+///
+/// # Errors
+///
+/// Returns [`PodError::VolumeSize`] when Runpod does not give a size once
+/// the client's retries are spent.
+async fn volume_size(client: &RunpodClient, id: &str) -> Result<u32, PodError> {
+    let reason = match client.get_network_volume(id).await {
+        Ok(Some(volume)) if volume.size > 0 => return Ok(volume.size),
+        Ok(Some(_)) => "Runpod gave no size".to_string(),
+        Ok(None) => "Runpod does not know it".to_string(),
+        Err(error) => {
+            tracing::warn!("cannot read network volume {id}: {error}");
+            error.status().map_or_else(
+                || error.to_string(),
+                |status| format!("Runpod answered {status}"),
+            )
+        },
+    };
+    Err(PodError::VolumeSize {
+        id: id.to_string(),
+        reason,
+    })
 }
 
 /// `target` with its `auto` choices resolved from the Runpod catalog (see
@@ -442,6 +478,8 @@ fn request(plan: &PodPlan<'_>, keep: bool, attempt: &Attempt) -> CreatePod {
         boot_grace: target.boot_grace,
         retrieve_grace: target.retrieve_grace,
         keep,
+        volume_dir: target.network_volume_id.as_ref().map(|_| VOLUME_MOUNT),
+        volume_gb: plan.volume_gb,
         api_url: plan.api_url,
         authorized_key: &plan.keys.client_public,
         claim: &plan.keys.host_public,
@@ -1209,6 +1247,7 @@ mod tests {
                     retrieve_grace: Duration::from_secs(3600),
                     data_center_ids: crate::config::ListOrAuto::default(),
                     network_volume_id: None,
+                    max_volume_gb: None,
                 },
                 keys: PodKeys::new(
                     std::path::PathBuf::from("/nonexistent/id_ed25519"),
@@ -1239,6 +1278,7 @@ mod tests {
                 workdir: "/workspace/overbrainer",
                 api_url: self.client.base_url(),
                 vram_floor_gb: None,
+                volume_gb: None,
             }
         }
 

@@ -41,6 +41,10 @@ const EVENT_STREAM: &str = "text/event-stream";
 const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Items asked for per page of `GET /pods` (the v2 maximum).
 const PODS_PAGE_SIZE: &str = "1000";
+/// Retries of a network volume resize after its first attempt. Few, so a
+/// failing grow soon hands over to the snapshot instead of holding the disk
+/// policy for minutes while the disk fills.
+const RESIZE_RETRIES: u32 = 1;
 /// Items asked for per page of `GET /templates` (the v2 maximum).
 const TEMPLATES_PAGE_SIZE: &str = "100";
 /// The GPU types of the catalog (v2 reference: `GET /v2/catalog/gpus`).
@@ -401,6 +405,76 @@ impl RunpodClient {
         let url = self.list_url(NETWORK_VOLUMES_PATH, &[])?;
         let list: NetworkVolumeList = self.get_json(&url).await?;
         Ok(list.network_volumes)
+    }
+
+    /// The network volume `id` (`GET /network-volumes/{id}`), or `None` when
+    /// Runpod says in its own error shape that it does not know it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
+    pub async fn get_network_volume(&self, id: &str) -> Result<Option<NetworkVolume>, ApiError> {
+        let url = self.volume_url(id)?;
+        with_retry(
+            &self.policy,
+            || async {
+                let (status, body, retry_after) = self
+                    .fetch(self.http.request(Method::GET, url.clone()))
+                    .await?;
+                if status.is_success() {
+                    return decode(&body, false).map(Some);
+                }
+                if status == StatusCode::NOT_FOUND && is_runpod_error_shape(status, &body) {
+                    return Ok(None);
+                }
+                Err(self.status_error(status, &body, retry_after, false))
+            },
+            log_retry,
+        )
+        .await
+    }
+
+    /// Sets the size of the network volume `id` to `size_gb` (`PATCH
+    /// /network-volumes/{id}`), which Runpod only allows to grow, and returns
+    /// the volume as Runpod answers. Asking twice for the same size changes
+    /// nothing more, but it is retried at most `RESIZE_RETRIES` times: the
+    /// disk policy waits on it while the disk fills, and it stops the job with
+    /// a snapshot when the grow fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
+    pub async fn resize_network_volume(
+        &self,
+        id: &str,
+        size_gb: u32,
+    ) -> Result<NetworkVolume, ApiError> {
+        let url = self.volume_url(id)?;
+        let body = serde_json::json!({ "size": size_gb });
+        let policy = RetryPolicy {
+            max_retries: self.policy.max_retries.min(RESIZE_RETRIES),
+            ..self.policy
+        };
+        with_retry(
+            &policy,
+            || async {
+                let answer = self
+                    .send(self.http.request(Method::PATCH, url.clone()).json(&body))
+                    .await?;
+                decode(&answer, false)
+            },
+            log_retry,
+        )
+        .await
+    }
+
+    /// The URL of the network volume `id`, the ID escaped as one path segment.
+    fn volume_url(&self, id: &str) -> Result<reqwest::Url, ApiError> {
+        let mut url = self.list_url(NETWORK_VOLUMES_PATH, &[])?;
+        url.path_segments_mut()
+            .map_err(|()| ApiError::InvalidResponse("the Runpod base URL has no path".into()))?
+            .push(id);
+        Ok(url)
     }
 
     /// The account's pod templates (serverless ones are left out), following

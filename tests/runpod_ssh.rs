@@ -320,6 +320,7 @@ async fn provision_against(
         workdir: &workdir,
         api_url: client.base_url(),
         vram_floor_gb: None,
+        volume_gb: None,
     };
     let mut record = PodRecord::new(&run_id, false, 1, &keys.host_public);
     let result = provision(&ctx, &plan, &mut record).await;
@@ -841,6 +842,7 @@ fn a40_target() -> RunpodTarget {
         retrieve_grace: Duration::from_secs(3600),
         data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
+        max_volume_gb: None,
     }
 }
 
@@ -886,6 +888,7 @@ async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestRes
         workdir: &workdir,
         api_url: client.base_url(),
         vram_floor_gb: None,
+        volume_gb: None,
     };
     let mut pod = PodRecord::new(&run_id, false, 1, &keys.host_public);
     let provisioned = provision(&ctx, &plan, &mut pod).await?;

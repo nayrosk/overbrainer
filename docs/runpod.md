@@ -26,6 +26,7 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 | `retrieve_grace_minutes` | `60` | The watchdog deletes a pod whose ended job was not retrieved after this. |
 | `data_center_ids` | any | Data centers the pod may be placed in, for example `["EU-RO-1"]`, or `"auto"` for those with a chosen GPU type in stock when the run starts (see [`"auto"`](#auto) below). Cannot be `"auto"` together with `network_volume_id`: list the volume's data center instead. |
 | `network_volume_id` | none | Network volume mounted at `/workspace/data`; runs and the Hugging Face cache then live on it. Needs exactly one `data_center_ids` entry, the volume's data center, never `"auto"`. overbrainer never deletes anything on it. |
+| `max_volume_gb` | none | Largest size, in GB, overbrainer may grow the network volume to when the run fills it ([disk space](#disk-space)). A grow is permanent: a volume cannot shrink, it is billed per GB each month after the pod is gone, and every pod sharing it sees the new size. At least 1, and only with `network_volume_id`. Without it, a full disk stops the job with a snapshot. |
 
 `gpu_type` became `gpu_types`: a configuration with the old key is rejected as `unknown field`.
 
@@ -155,9 +156,26 @@ The copy stops at 20 MiB, with a last line saying so. Every line is cleaned befo
 Before a pod is lost to a limit, its job is stopped with a snapshot, as `overbrainer train stop` does (see [Training](training.md#stopping-with-a-snapshot)), so the steps done so far can be resumed with `overbrainer train --resume-from RUN_ID`:
 
 - 15 minutes before `max_hours`, when nothing holds the lease: the watchdog asks for the snapshot (reason `deadline`) and holds the deadline off while the checkpoint is saved: 15 minutes in total from the request, or up to 15 minutes past the deadline when the request came later (the lease ran out after the deadline);
+- when the run's disk is nearly full (reason `disk`, see [disk space](#disk-space));
 - at 95% of `max_cost_usd`, and 15 minutes before 100% at the latest (with a small cap, 5% can be only minutes): once the pod exists, overbrainer writes on it when that is, from the pod's creation time and hourly rate (`.pod/snapshot_at`, and `.pod/cost_cap_at` for 100%). The watchdog asks for the snapshot then (reason `cost`), and so does overbrainer while it follows the job. A run whose cap cannot be handed to the pod (Runpod gave no hourly rate, or the files cannot be written) is refused before its job starts, and its pod deleted.
 
 When overbrainer follows the job, it retrieves the snapshot and deletes the pod as usual. When nothing follows it, the pod stays after the job ended, so `overbrainer train attach RUN_ID` can still collect the snapshot: until the retrieve grace ends, and at most `retrieve_grace_minutes` past the deadline. At 100% of `max_cost_usd` the pod is deleted whatever happens, by the watchdog and by overbrainer while it follows the job: a cost snapshot nobody collected by then is deleted with it. A run whose pod was deleted there fails with `max_cost_usd reached: the pod was deleted before the job ended`.
+
+### Disk space
+
+A run that fills its disk would fail and lose its steps, so while overbrainer follows the job it watches the disk of the run directory, every 10 seconds from the [system sample](training.md), and once a minute for what `du` reads:
+
+- without a network volume, that disk is the container disk (`container_disk_gb`), as `df` reports it;
+- on a network volume, `df` reports the whole shared cluster rather than the volume, so overbrainer reads what the volume holds with `du` and weighs it against the volume's size from the API. Runpod refuses writes a little before that size, so only 94% of it counts: a 100 GB volume is full at 94 GB. The system panel still shows `df`.
+
+At 85% used overbrainer warns, then again at 90%, 95% and 100%. At 92% used, or once the free space is less than 1.5 times the size of the newest `checkpoint-*` (the next save would not fit), it acts:
+
+- on a network volume with `max_volume_gb` set, it grows the volume through the API to half again its size, at least 50 GB more, never past `max_volume_gb`. Runpod grows a mounted volume without restarting the pod: writes work again within seconds. When the API does not report the new size within two minutes, the job is stopped with a snapshot. Once the volume is at `max_volume_gb`, or when Runpod refuses the grow, the next full disk stops the job. A grow cannot be undone: the volume keeps its new size, and its monthly bill, after the run, and other pods using it see it too;
+- otherwise it stops the job with a snapshot (reason `disk`), as `overbrainer train stop` does. The container disk of a running pod cannot grow without restarting it. A snapshot already asked for (for example at the cost cap) keeps its reason.
+
+overbrainer reads the volume's size before it asks for a pod, and refuses the run, with no pod created, when Runpod does not give it once its retries are spent. The volume's size is read again every minute, so a volume grown elsewhere (from another pod, or the Runpod console) is weighed against its new size.
+
+The watchdog applies a backstop of its own at 97%, once a minute, so a full disk stops the job with a snapshot even when nothing follows it, while a grow overbrainer makes at 92% comes first. It reads `df` of the run directory, or on a network volume the last `du` of the volume, run in the background so a slow network mount never delays its other rules, against the volume's size: the one overbrainer writes in `.pod/volume_gb` while it follows the job and right after a grow, or else the size when the pod was created. A run started before overbrainer kept the volume's ID in `pod.json` is not measured at all on a network volume. Generated Axolotl configs keep only the two newest checkpoints (`save_total_limit: 2`, see [Training](training.md)), which keeps the disk use of a long run flat.
 
 ### Retrieval
 

@@ -179,6 +179,13 @@ pub struct PodRecord {
     /// kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
+    /// The target's `network_volume_id` when the run started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_volume_id: Option<String>,
+    /// The target's `max_volume_gb` when the run started: how far the disk
+    /// policy may grow the network volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_volume_gb: Option<u32>,
 }
 
 /// Share of `max_cost_usd` at which the job is stopped with a snapshot.
@@ -240,6 +247,8 @@ impl PodRecord {
             estimated_spend: None,
             stray_pods: Vec::new(),
             max_cost_usd: None,
+            network_volume_id: None,
+            max_volume_gb: None,
         }
     }
 

@@ -794,3 +794,55 @@ fn the_client_debug_output_hides_the_key() -> TestResult {
     ));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_network_volume_is_read_and_resized() -> TestResult {
+    let server = MockServer::start().await;
+    let volume = json!({"id": "vol1", "name": "data", "size": 100, "dataCenterId": "EU-RO-1"});
+    Mock::given(method("GET"))
+        .and(path("/v2/network-volumes/vol1"))
+        .and(header("authorization", format!("Bearer {KEY}").as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&volume))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/network-volumes/gone"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "detail": "network volume not found", "status": 404, "title": "Not Found"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v2/network-volumes/vol1"))
+        .and(body_json(json!({"size": 150})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "vol1", "name": "data", "size": 150, "dataCenterId": "EU-RO-1"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = client(&server)?;
+    let read = client
+        .get_network_volume("vol1")
+        .await?
+        .ok_or("no volume")?;
+    assert_eq!((read.id.as_str(), read.size), ("vol1", 100));
+    assert!(client.get_network_volume("gone").await?.is_none());
+    let grown = client.resize_network_volume("vol1", 150).await?;
+    assert_eq!(grown.size, 150);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failing_volume_resize_is_retried_once() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/v2/network-volumes/vol1"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = client(&server)?;
+    assert!(client.resize_network_volume("vol1", 150).await.is_err());
+    Ok(())
+}

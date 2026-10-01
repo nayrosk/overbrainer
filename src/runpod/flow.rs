@@ -16,11 +16,13 @@ use crate::exec::{ExecError, Executor, SshExecutor};
 use crate::runs::{Outcome, RunCtx, RunError, RunRecord, RunState, Runs, SnapshotReason, watch};
 use crate::train::{Pace, SNAPSHOT_REQUEST, Trainer};
 
+use super::disk::{DiskWatch, VolumeDisk};
 use super::provision::note_strays;
 use super::{
     BOOTSTRAP_LOG, CLIENT_KEY, CostCap, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId,
     PodKeys, PodPlan, PodRecord, PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget,
-    SSH_DIR, SshEndpoint, alias, keep_file, provision, remove, sweep, with_pod_logs, write_config,
+    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, keep_file, provision, remove, sweep,
+    with_pod_logs, write_config,
 };
 use crate::secrets::Redactor;
 
@@ -146,6 +148,10 @@ async fn provision_run(
     let keys = PodKeys::generate(&ssh_dir, &alias(&run.id))?;
     let mut record = PodRecord::new(&run.id, keep, target.gpu_count, &keys.host_public);
     record.max_cost_usd = target.max_cost_usd.filter(|_| !keep);
+    record
+        .network_volume_id
+        .clone_from(&target.network_volume_id);
+    record.max_volume_gb = target.max_volume_gb;
     record.save(ctx.runs)?;
     let plan = PodPlan {
         run_id: &run.id,
@@ -155,6 +161,7 @@ async fn provision_run(
         workdir: target.workdir(),
         api_url: ctx.client.base_url(),
         vram_floor_gb,
+        volume_gb: None,
     };
     let provisioned = provision(ctx, &plan, &mut record).await?;
     Ok((record, provisioned))
@@ -239,7 +246,7 @@ pub async fn follow<E: Executor, T: Trainer>(
     pod: &mut PodRecord,
 ) -> Result<Outcome, PodError> {
     let id = record.id.clone();
-    let watched = with_pod_logs(ctx, pod, watch_on_pod(run_ctx, trainer, record, pod)).await;
+    let watched = with_pod_logs(ctx, pod, watch_on_pod(ctx, run_ctx, trainer, record, pod)).await;
     settle_watch(ctx, pod, &id, watched).await
 }
 
@@ -257,26 +264,54 @@ pub enum Watched {
 /// Watches the started run `record` until its job ends or the client's deadline
 /// (the watchdog's plus [`DEADLINE_MARGIN`]; none for a kept pod) passes, and
 /// warns once when the job's pace cannot end it before the watchdog's deadline.
-/// It never calls the Runpod API, so dropping it (on Ctrl-C) loses nothing:
-/// what it found is acted on by [`settle_watch`].
+/// The [disk policy](DiskWatch) runs beside it. It never deletes anything, so
+/// dropping it (on Ctrl-C) loses nothing: what it found is acted on by
+/// [`settle_watch`].
 pub async fn watch_on_pod<E: Executor, T: Trainer>(
+    ctx: &PodCtx<'_>,
     run_ctx: &RunCtx<'_, E>,
     trainer: &T,
     record: RunRecord,
     pod: &PodRecord,
 ) -> Watched {
-    match until_deadline(pod) {
-        Some(wait) => {
-            let events = run_ctx.bus.subscribe();
-            tokio::select! {
-                outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
-                () = tokio::time::sleep(wait) => Watched::DeadlinePassed,
-                // Never ends: it only warns.
-                () = warn_overrun(events, pod) => Watched::DeadlinePassed,
-            }
-        },
-        None => Watched::Ended(Box::new(watch(run_ctx, trainer, record).await)),
+    let run = record.clone();
+    let disk = Box::pin(disk_watch(ctx, run_ctx.executor, &run, pod).run(run_ctx.bus.subscribe()));
+    let Some(wait) = until_deadline(pod) else {
+        return tokio::select! {
+            outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
+            never = disk => match never {},
+        };
+    };
+    let events = run_ctx.bus.subscribe();
+    tokio::select! {
+        outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
+        () = tokio::time::sleep(wait) => Watched::DeadlinePassed,
+        // Never ends: it only warns.
+        () = warn_overrun(events, pod) => Watched::DeadlinePassed,
+        never = disk => match never {},
     }
+}
+
+/// The disk policy of the run `run` on `pod`.
+fn disk_watch<'a, E: Executor>(
+    ctx: &'a PodCtx<'_>,
+    executor: &'a E,
+    run: &'a RunRecord,
+    pod: &'a PodRecord,
+) -> DiskWatch<'a, E> {
+    let volume = pod.network_volume_id.as_deref().map(|id| VolumeDisk {
+        id,
+        mount: VOLUME_MOUNT,
+        max_gb: pod.max_volume_gb,
+    });
+    let watch = DiskWatch::new(executor, ctx.client, run, volume);
+    // A run on a network volume whose ID `pod.json` does not hold (written
+    // before overbrainer kept it) cannot be measured: `df` there is the whole
+    // shared cluster.
+    if volume.is_none() && run.remote_dir.starts_with(VOLUME_WORKDIR) {
+        return watch.idle();
+    }
+    watch
 }
 
 /// [`watch_on_pod`] for a client that stays with the job: while the job keeps
@@ -287,15 +322,23 @@ pub async fn watch_on_pod<E: Executor, T: Trainer>(
 /// applies again. It warns once, as information, when the job ends after the
 /// deadline. Once the pod has spent [`SNAPSHOT_SHARE`](super::SNAPSHOT_SHARE) of
 /// its cost cap, it asks the job for a snapshot, as the watchdog does. A kept
-/// pod has no deadline and needs no lease.
+/// pod has no deadline and needs no lease. The [disk policy](DiskWatch) runs
+/// beside it, kept pod or not.
 pub async fn watch_leased<E: Executor, T: Trainer>(
+    ctx: &PodCtx<'_>,
     run_ctx: &RunCtx<'_, E>,
     trainer: &T,
     record: RunRecord,
     pod: &PodRecord,
 ) -> Watched {
+    let run = record.clone();
+    // Boxed: its state would otherwise weigh on every caller's future.
+    let disk = Box::pin(disk_watch(ctx, run_ctx.executor, &run, pod).run(run_ctx.bus.subscribe()));
     if until_deadline(pod).is_none() {
-        return Watched::Ended(Box::new(watch(run_ctx, trainer, record).await));
+        return tokio::select! {
+            outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
+            never = disk => match never {},
+        };
     }
     let events = run_ctx.bus.subscribe();
     let remote_dir = record.remote_dir.clone();
@@ -303,6 +346,7 @@ pub async fn watch_leased<E: Executor, T: Trainer>(
         outcome = watch(run_ctx, trainer, record) => Watched::Ended(Box::new(outcome)),
         // Boxed: its state would otherwise weigh on every caller's future.
         watched = Box::pin(hold_lease(run_ctx.executor, &remote_dir, events, pod)) => watched,
+        never = disk => match never {},
     }
 }
 

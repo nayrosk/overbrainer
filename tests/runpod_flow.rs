@@ -147,6 +147,7 @@ fn target() -> RunpodTarget {
         retrieve_grace: Duration::from_secs(3600),
         data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
+        max_volume_gb: None,
     }
 }
 
@@ -513,7 +514,7 @@ async fn a_watch_past_its_deadline_deletes_nothing_until_settled() -> TestResult
         bus: &harness.bus,
         poll: Duration::from_millis(50),
     };
-    let watched = watch_on_pod(&run_ctx, &Nothing, run.clone(), &pod).await;
+    let watched = watch_on_pod(&harness.ctx(), &run_ctx, &Nothing, run.clone(), &pod).await;
     assert!(matches!(watched, Watched::DeadlinePassed));
     assert_eq!(deletes(&harness.server).await, 0);
     assert_eq!(harness.runs.load(&run.id)?.state, RunState::Running);
@@ -789,7 +790,7 @@ async fn a_followed_job_holds_its_pod_past_the_deadline_with_a_lease() -> TestRe
         bus: &harness.bus,
         poll: Duration::from_millis(50),
     };
-    let watched = watch_leased(&run_ctx, &Nothing, run.clone(), &pod).await;
+    let watched = watch_leased(&harness.ctx(), &run_ctx, &Nothing, run.clone(), &pod).await;
     let Watched::Ended(ended) = watched else {
         return Err("the guard fired under a fresh lease".into());
     };

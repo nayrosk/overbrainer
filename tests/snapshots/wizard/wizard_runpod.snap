@@ -80,6 +80,7 @@ max_hours = 6                # the pod watchdog deletes the pod after this, what
 # retrieve_grace_minutes = 60  # the watchdog deletes a pod whose ended job was not retrieved
 # data_center_ids = ["EU-RO-1"]  # any when unset; "auto": those with a chosen GPU in stock
 # network_volume_id = "..."    # mounted at /workspace/data; needs exactly one data_center_ids entry, not "auto"
+# max_volume_gb = 200          # grow the network volume up to this size in GB when the run fills it (permanent, billed monthly)
 
 # [targets.homelab]
 # kind = "ssh"                 # host comes from OVERBRAINER_TARGETS__HOMELAB__HOST

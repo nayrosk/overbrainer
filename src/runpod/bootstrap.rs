@@ -62,6 +62,12 @@ pub struct PodSettings<'a> {
     /// `--keep-pod`: once the job exists, the watchdog never deletes the pod
     /// (before that, the boot grace and a failed bootstrap still do).
     pub keep: bool,
+    /// Where the network volume is mounted, when the pod has one: the
+    /// watchdog's disk rule reads it with `du` rather than `df`.
+    pub volume_dir: Option<&'a str>,
+    /// The network volume's size in GB when the pod is created, when known;
+    /// the client's `.pod/volume_gb` replaces it once written.
+    pub volume_gb: Option<u32>,
     /// Base URL of the Runpod API, for the watchdog.
     pub api_url: &'a str,
     /// The run's client public key.
@@ -101,6 +107,12 @@ pub fn pod_env(settings: &PodSettings<'_>) -> BTreeMap<String, String> {
         "OVERBRAINER_KEEP_POD",
         if settings.keep { "1" } else { "0" }.to_string(),
     );
+    if let Some(volume_dir) = settings.volume_dir {
+        set("OVERBRAINER_VOLUME_DIR", volume_dir.to_string());
+    }
+    if let Some(volume_gb) = settings.volume_gb {
+        set("OVERBRAINER_VOLUME_GB", volume_gb.to_string());
+    }
     set("OVERBRAINER_API_URL", settings.api_url.to_string());
     set(
         "OVERBRAINER_AUTHORIZED_KEY",
@@ -163,6 +175,8 @@ mod tests {
             boot_grace: Duration::from_secs(1800),
             retrieve_grace: Duration::from_secs(3600),
             keep: false,
+            volume_dir: None,
+            volume_gb: None,
             api_url: "https://api.runpod.io/v2",
             authorized_key: "ssh-ed25519 AAAAclient overbrainer-r1",
             claim: "ssh-ed25519 AAAAhost",
@@ -192,5 +206,27 @@ mod tests {
             Some("1")
         );
         assert!(!kept.contains_key("OVERBRAINER_DEADLINE"));
+        assert!(!kept.contains_key("OVERBRAINER_VOLUME_DIR"));
+    }
+
+    #[test]
+    fn a_network_volume_hands_its_mount_and_size_to_the_watchdog() {
+        let settings = PodSettings {
+            run_id: "r1",
+            workdir: "/workspace/overbrainer",
+            deadline_unix: Some(1_790_021_600),
+            boot_grace: Duration::from_secs(1800),
+            retrieve_grace: Duration::from_secs(3600),
+            keep: false,
+            volume_dir: Some("/workspace/data"),
+            volume_gb: Some(200),
+            api_url: "https://api.runpod.io/v2",
+            authorized_key: "ssh-ed25519 AAAAclient overbrainer-r1",
+            claim: "ssh-ed25519 AAAAhost",
+        };
+        let env = pod_env(&settings);
+        let get = |name: &str| env.get(name).map(String::as_str);
+        assert_eq!(get("OVERBRAINER_VOLUME_DIR"), Some("/workspace/data"));
+        assert_eq!(get("OVERBRAINER_VOLUME_GB"), Some("200"));
     }
 }

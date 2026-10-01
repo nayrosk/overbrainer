@@ -49,6 +49,8 @@ pub struct RunpodTarget {
     pub data_center_ids: ListOrAuto,
     /// Network volume, if any.
     pub network_volume_id: Option<String>,
+    /// Largest size, in GB, the network volume may be grown to.
+    pub max_volume_gb: Option<u32>,
 }
 
 impl RunpodTarget {
@@ -69,6 +71,7 @@ impl RunpodTarget {
             retrieve_grace_minutes,
             data_center_ids,
             network_volume_id,
+            max_volume_gb,
         } = target
         else {
             return None;
@@ -91,6 +94,7 @@ impl RunpodTarget {
             retrieve_grace: Duration::from_secs(u64::from(*retrieve_grace_minutes) * 60),
             data_center_ids: data_center_ids.clone(),
             network_volume_id: network_volume_id.clone(),
+            max_volume_gb: *max_volume_gb,
         })
     }
 
@@ -134,6 +138,7 @@ mod tests {
             retrieve_grace_minutes: 60,
             data_center_ids: ListOrAuto::List(vec!["EU-RO-1".into()]),
             network_volume_id: volume.map(str::to_string),
+            max_volume_gb: None,
         }
     }
 
