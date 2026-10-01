@@ -21,8 +21,8 @@ use super::provision::note_strays;
 use super::{
     BOOTSTRAP_LOG, CLIENT_KEY, CostCap, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId,
     PodKeys, PodPlan, PodRecord, PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget,
-    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, drop_host_key_or_warn, forget_keys,
-    keep_file, provision, remove, short_cap_warning, sweep, with_pod_logs, write_config,
+    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, forget_keys, keep_file, provision,
+    remove, short_cap_warning, sweep, with_pod_logs, write_config,
 };
 use crate::secrets::Redactor;
 
@@ -97,28 +97,9 @@ pub async fn start_pod(
         if let Err(save_error) = ctx.runs.save(&run) {
             tracing::warn!("cannot record run {} as failed: {save_error}", run.id);
         }
-        if no_pod_left(ctx.runs, &run.id) {
-            forget_keys(ctx, &run.id).await;
-        }
+        forget_keys(ctx, &run.id).await;
     }
     result
-}
-
-/// Whether `pod.json` shows no pod of the run that may still exist: no pod, or
-/// one confirmed deleted, and no stray. A `pod.json` that cannot be read shows
-/// nothing for sure; none at all means no pod was ever asked for.
-fn no_pod_left(runs: &Runs, run_id: &str) -> bool {
-    match PodRecord::load(runs, run_id) {
-        Ok(Some(record)) => {
-            record.stray_pods.is_empty()
-                && (record.pod_id.is_none() || record.state == PodState::Deleted)
-        },
-        Ok(None) => true,
-        Err(error) => {
-            tracing::warn!("cannot read the pod record of run {run_id}: {error}");
-            false
-        },
-    }
 }
 
 /// The reason a failed provisioning gives in `run.json`: the error's message,
@@ -615,23 +596,24 @@ pub(super) fn until_deadline_at(pod: &PodRecord, now: SystemTime) -> Option<Dura
 }
 
 /// The pod outlived its deadline: deletes it (confirmed; recorded deleted by the
-/// watchdog when it was already gone), and fails the run.
+/// watchdog when it was already gone), forgets the run's keys (see
+/// [`forget_keys`]) and fails the run.
 async fn deadline_reached(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> PodError {
     if let Err(error) = remove(ctx, pod, DeleteReason::Deadline, DeletedBy::Client).await {
         return error;
     }
-    drop_host_key_or_warn(ctx.client, run_id).await;
+    forget_keys(ctx, run_id).await;
     fail_run(ctx.runs, run_id, MAX_HOURS_REACHED);
     PodError::DeadlineReached
 }
 
 /// The pod spent its cost cap: deletes it (confirmed), as its watchdog does
-/// too, and fails the run.
+/// too, forgets the run's keys (see [`forget_keys`]) and fails the run.
 async fn cost_cap_reached(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> PodError {
     if let Err(error) = remove(ctx, pod, DeleteReason::CostCap, DeletedBy::Client).await {
         return error;
     }
-    drop_host_key_or_warn(ctx.client, run_id).await;
+    forget_keys(ctx, run_id).await;
     fail_run(ctx.runs, run_id, MAX_COST_REACHED);
     PodError::CostCapReached
 }
@@ -903,8 +885,9 @@ pub enum Ending {
 /// is the "retrieved" marker written on the pod, first (so its watchdog deletes
 /// it even if this client's delete fails), then the pod is deleted unless kept
 /// and its deletion confirmed, other pods of the run are swept (any whose
-/// deletion cannot be confirmed is recorded in `pod.json`), and the run's
-/// private client key is removed and its host key secret deleted. Otherwise the pod is left to its watchdog's
+/// deletion cannot be confirmed is recorded in `pod.json`), and, when none
+/// is, the run's private client key is removed and its host key secret
+/// deleted. Otherwise the pod is left to its watchdog's
 /// retrieve grace (a kept pod stays kept), with a warning telling how to
 /// retrieve the results again or remove the pod.
 ///
@@ -940,10 +923,21 @@ pub async fn end_pod(
         return Ok(Ending::Kept);
     }
     remove(ctx, pod, DeleteReason::Retrieved, DeletedBy::Client).await?;
-    let stray = sweep(ctx, &run.id, None).await;
-    note_strays(ctx, pod, stray);
-    forget_keys(ctx, &run.id).await;
+    sweep_then_forget(ctx, pod, &run.id).await;
     Ok(Ending::Deleted)
+}
+
+/// Sweeps the other pods of the run `run_id`, records in `pod.json` those whose
+/// deletion cannot be confirmed, and forgets the run's keys when there is none
+/// (see [`forget_keys`]): a stray keeps them even when `pod.json` cannot
+/// record it.
+async fn sweep_then_forget(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) {
+    let stray = sweep(ctx, run_id, None).await;
+    let strays_left = !stray.is_empty();
+    note_strays(ctx, pod, stray);
+    if !strays_left {
+        forget_keys(ctx, run_id).await;
+    }
 }
 
 /// The results of the run `run_id` were not retrieved: the pod stays, for its

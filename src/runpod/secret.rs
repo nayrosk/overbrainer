@@ -7,8 +7,8 @@ use secrecy::SecretString;
 
 use super::client::SECRETS_FORBIDDEN_MESSAGE;
 use super::flow::forget_client_key;
-use super::{ApiError, NewSecret, PodCtx, PodError, RunpodClient};
-use crate::runs::is_valid_run_id;
+use super::{ApiError, NewSecret, PodCtx, PodError, PodRecord, PodState, RunpodClient};
+use crate::runs::{Runs, is_valid_run_id};
 
 /// Prefix of the name of every run's host key secret.
 pub const HOST_KEY_SECRET_PREFIX: &str = "overbrainer_host_key_";
@@ -114,11 +114,36 @@ pub async fn drop_host_key_or_warn(client: &RunpodClient, run_id: &str) {
     }
 }
 
-/// Once no pod of the run `run_id` is left: removes its private client key
-/// and deletes its host key secret, best effort.
+/// Removes the private client key of the run `run_id` and deletes its host key
+/// secret, best effort, once its `pod.json` shows no pod of it that may still
+/// exist (no pod, or one confirmed deleted, and no stray): a stray pod
+/// restarted later boots with the same secret. Callers save `pod.json` first, strays included. Keys kept here
+/// go once the strays are deleted: by `overbrainer pod rm`, or by the sweep of
+/// the secrets of ended runs at the next start.
 pub async fn forget_keys(ctx: &PodCtx<'_>, run_id: &str) {
+    if !no_pod_left(ctx.runs, run_id) {
+        tracing::debug!("keeping the keys of run {run_id}: a pod of it may still exist");
+        return;
+    }
     forget_client_key(ctx.runs, run_id);
     drop_host_key_or_warn(ctx.client, run_id).await;
+}
+
+/// Whether `pod.json` shows no pod of the run that may still exist: no pod, or
+/// one confirmed deleted, and no stray. A `pod.json` that cannot be read shows
+/// nothing for sure; none at all means no pod was ever asked for.
+fn no_pod_left(runs: &Runs, run_id: &str) -> bool {
+    match PodRecord::load(runs, run_id) {
+        Ok(Some(record)) => {
+            record.stray_pods.is_empty()
+                && (record.pod_id.is_none() || record.state == PodState::Deleted)
+        },
+        Ok(None) => true,
+        Err(error) => {
+            tracing::warn!("cannot read the pod record of run {run_id}: {error}");
+            false
+        },
+    }
 }
 
 #[cfg(test)]

@@ -699,3 +699,58 @@ async fn the_sweep_deletes_only_the_secrets_no_pod_needs() -> TestResult {
     assert_eq!(harness.deletes().await, Vec::<String>::new());
     Ok(())
 }
+
+/// The private client key of the run `id`, written so its removal shows.
+fn client_key(
+    harness: &Harness,
+    id: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let key = harness.runs.run_dir(id)?.join("ssh/id_ed25519");
+    std::fs::create_dir_all(key.parent().ok_or("no ssh dir")?)?;
+    std::fs::write(&key, "private")?;
+    Ok(key)
+}
+
+/// A run whose recorded pod is confirmed gone keeps its keys while a stray of
+/// it remains, since a restarted stray boots with the same secret; `pod rm`
+/// deleting the stray then forgets them.
+#[tokio::test]
+async fn a_stray_keeps_the_keys_of_a_run_whose_pod_is_gone_until_pod_rm() -> TestResult {
+    let account = Account::default().with("s1", Some(RUN), true);
+    let harness = Harness::new(account).await?;
+    harness.recorded(RUN, RunState::Failed, "p1", PodState::Running)?;
+    harness.strays(RUN, &["s1"])?;
+    harness.secrets.hold("k1", &host_key_secret(RUN));
+    let key = client_key(&harness, RUN)?;
+    pod_rows(&harness.ctx()).await?;
+    assert_eq!(harness.pod_json(RUN)?.state, PodState::Deleted);
+    assert_eq!(harness.secrets.names(), [host_key_secret(RUN)]);
+    assert_eq!(harness.secrets.deleted(), Vec::<String>::new());
+    assert!(key.is_file());
+    let removal = remove_run_pods(&harness.ctx(), RUN, false).await;
+    removal.result?;
+    assert_eq!(harness.deletes().await, vec!["s1"]);
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(RUN)]);
+    assert!(!key.exists());
+    Ok(())
+}
+
+/// The startup sweep keeps the secret of an ended run while a stray of it is
+/// listed, and deletes it once that stray is gone.
+#[tokio::test]
+async fn the_sweep_deletes_the_secret_once_the_last_stray_is_gone() -> TestResult {
+    let account = Account::default().with("s1", Some(ENDED), true);
+    let harness = Harness::new(account).await?;
+    harness.recorded(ENDED, RunState::Failed, "p2", PodState::Deleted)?;
+    harness.strays(ENDED, &["s1"])?;
+    harness.secrets.hold("k2", &host_key_secret(ENDED));
+    let rows = listed_rows(&harness.ctx()).await?;
+    sweep_host_keys(&harness.ctx(), &rows).await?;
+    assert_eq!(harness.secrets.deleted(), Vec::<String>::new());
+    // Deleted from elsewhere (its watchdog, the console).
+    harness.client.delete_pod(&PodId::new("s1")?).await?;
+    let rows = listed_rows(&harness.ctx()).await?;
+    sweep_host_keys(&harness.ctx(), &rows).await?;
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(ENDED)]);
+    Ok(())
+}
