@@ -110,6 +110,18 @@ pub enum PodError {
     /// catalog; no pod was asked for. Says what was asked.
     #[error(transparent)]
     NotInStock(#[from] ResolveError),
+    /// The size of the target's network volume cannot be read, even after
+    /// retries: the pod's watchdog could not tell when it fills, so no pod is
+    /// asked for.
+    #[error(
+        "cannot read the size of network volume {id} ({reason}): no pod was created, since its watchdog could not watch the volume's disk space"
+    )]
+    VolumeSize {
+        /// The volume's ID.
+        id: String,
+        /// Why: Runpod's status or a fixed message, never Runpod's own text.
+        reason: String,
+    },
     /// Runpod asks for credits (402).
     #[error(
         "Runpod refused for lack of credits (402): deploying needs at least one hour of credits"

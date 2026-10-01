@@ -173,7 +173,9 @@ enum Created {
 /// # Errors
 ///
 /// Returns [`PodError::NotInStock`] when an `auto` choice finds nothing in
-/// stock (no create call is made), [`PodError::NoCapacity`] when no GPU type
+/// stock and [`PodError::VolumeSize`] when the size of the target's network
+/// volume cannot be read (no create call is made in both cases),
+/// [`PodError::NoCapacity`] when no GPU type
 /// could be placed or gave a ready pod,
 /// [`PodError::Unanswered`] when no create call got a clear answer,
 /// [`PodError::NoCredits`] on a 402, [`PodError::Rejected`] on a 422 or a 400
@@ -194,7 +196,7 @@ pub async fn provision(
     ctx.check()?;
     let target = resolve_target(ctx.client, plan.target, plan.vram_floor_gb).await?;
     let volume_gb = match (plan.volume_gb, &target.network_volume_id) {
-        (None, Some(id)) => volume_size(ctx.client, id).await,
+        (None, Some(id)) => Some(volume_size(ctx.client, id).await?),
         (known, _) => known,
     };
     let plan = &PodPlan {
@@ -209,19 +211,30 @@ pub async fn provision(
     result
 }
 
-/// The size in GB of the network volume `id`, `None` when the API does not
-/// tell: the watchdog's disk rule then waits for the client to write it.
-async fn volume_size(client: &RunpodClient, id: &str) -> Option<u32> {
-    let size = match client.get_network_volume(id).await {
-        Ok(Some(volume)) if volume.size > 0 => return Some(volume.size),
-        Ok(_) => "Runpod gave no size".to_string(),
-        Err(error) => error.to_string(),
+/// The size in GB of the network volume `id`, which the pod's watchdog needs
+/// to watch the volume's disk space from the start.
+///
+/// # Errors
+///
+/// Returns [`PodError::VolumeSize`] when Runpod does not give a size once
+/// the client's retries are spent.
+async fn volume_size(client: &RunpodClient, id: &str) -> Result<u32, PodError> {
+    let reason = match client.get_network_volume(id).await {
+        Ok(Some(volume)) if volume.size > 0 => return Ok(volume.size),
+        Ok(Some(_)) => "Runpod gave no size".to_string(),
+        Ok(None) => "Runpod does not know it".to_string(),
+        Err(error) => {
+            tracing::warn!("cannot read network volume {id}: {error}");
+            error.status().map_or_else(
+                || error.to_string(),
+                |status| format!("Runpod answered {status}"),
+            )
+        },
     };
-    tracing::warn!(
-        "cannot read the size of network volume {id} ({size}): the pod's watchdog checks \
-         the volume's disk space only once overbrainer follows the job"
-    );
-    None
+    Err(PodError::VolumeSize {
+        id: id.to_string(),
+        reason,
+    })
 }
 
 /// `target` with its `auto` choices resolved from the Runpod catalog (see

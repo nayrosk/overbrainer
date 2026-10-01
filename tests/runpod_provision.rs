@@ -727,6 +727,39 @@ async fn the_create_carries_the_target_and_the_watchdog_settings() -> TestResult
 }
 
 #[tokio::test]
+async fn a_network_volume_of_unknown_size_is_refused_before_any_create() -> TestResult {
+    for (answer, reason) in [
+        (ResponseTemplate::new(500), "Runpod answered 500"),
+        (gone(), "Runpod does not know it"),
+        (
+            ResponseTemplate::new(200).set_body_json(json!({"id": "vol1", "size": 0})),
+            "Runpod gave no size",
+        ),
+    ] {
+        let harness = Harness::new().await?;
+        Mock::given(method("GET"))
+            .and(path("/v2/network-volumes/vol1"))
+            .respond_with(answer)
+            .mount(&harness.server)
+            .await;
+        let mut target = target(&["NVIDIA A40"]);
+        target.network_volume_id = Some("vol1".into());
+        let (result, record) = harness.provision(&target).await?;
+        let error = result.err().ok_or("provisioning succeeded")?.to_string();
+        assert_eq!(
+            error,
+            format!(
+                "cannot read the size of network volume vol1 ({reason}): no pod was created, \
+                 since its watchdog could not watch the volume's disk space"
+            )
+        );
+        assert!(harness.calls("POST").await.is_empty());
+        assert!(record.attempts.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_delete_is_confirmed_by_the_api_and_priced() -> TestResult {
     let harness = Harness::new().await?;
     serve_pod(&harness.server, "p1", pod("p1", "n1", "RUNNING")).await;
