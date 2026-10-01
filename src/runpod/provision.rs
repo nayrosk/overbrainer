@@ -297,7 +297,7 @@ async fn after_failure(ctx: &PodCtx<'_>, record: &mut PodRecord) {
         return;
     }
     let stray = sweep(ctx, &record.run_id.clone(), None).await;
-    note_strays(ctx, record, stray);
+    note_strays(ctx, record, stray.unwrap_or_default());
     warn(&format!(
         "the create calls {} got no clear answer from Runpod: a pod may still appear; check `overbrainer pod ls`",
         unclear.join(", ")
@@ -680,7 +680,7 @@ async fn ready(
         deadline: record.deadline.clone(),
     });
     let stray = sweep(ctx, plan.run_id, Some(id)).await;
-    note_strays(ctx, record, stray);
+    note_strays(ctx, record, stray.unwrap_or_default());
     Ok(Provisioned {
         pod_id: id.clone(),
         executor,
@@ -1025,13 +1025,14 @@ async fn nap(ctx: &PodCtx<'_>, wait: Duration) {
 
 /// Deletes every pod carrying the marker of `run_id` but `keep`: a pod left over
 /// by an ambiguous create that showed up late. Returns the pods whose deletion
-/// could not be confirmed, for `pod.json`.
-pub async fn sweep(ctx: &PodCtx<'_>, run_id: &str, keep: Option<&PodId>) -> Vec<PodId> {
+/// could not be confirmed, for `pod.json`, or `None` when the pods could not be
+/// listed, so nothing is known about leftovers.
+pub async fn sweep(ctx: &PodCtx<'_>, run_id: &str, keep: Option<&PodId>) -> Option<Vec<PodId>> {
     let pods = match ctx.client.list_pods().await {
         Ok(pods) => pods,
         Err(error) => {
             tracing::warn!("cannot look for duplicate pods of run {run_id}: {error}");
-            return Vec::new();
+            return None;
         },
     };
     let mut stray = Vec::new();
@@ -1043,7 +1044,7 @@ pub async fn sweep(ctx: &PodCtx<'_>, run_id: &str, keep: Option<&PodId>) -> Vec<
             stray.push(pod.id);
         }
     }
-    stray
+    Some(stray)
 }
 
 /// Deletes the duplicate pod `id` and confirms it is gone; false when that

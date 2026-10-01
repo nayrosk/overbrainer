@@ -930,13 +930,14 @@ pub async fn end_pod(
 /// Sweeps the other pods of the run `run_id`, records in `pod.json` those whose
 /// deletion cannot be confirmed, and forgets the run's keys when there is none
 /// (see [`forget_keys`]): a stray keeps them even when `pod.json` cannot
-/// record it.
+/// record it, and so does a pod list that fails, since a stray may hide there.
 async fn sweep_then_forget(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) {
-    let stray = sweep(ctx, run_id, None).await;
-    let strays_left = !stray.is_empty();
-    note_strays(ctx, pod, stray);
-    if !strays_left {
-        forget_keys(ctx, run_id).await;
+    match sweep(ctx, run_id, None).await {
+        Some(stray) if stray.is_empty() => forget_keys(ctx, run_id).await,
+        Some(stray) => note_strays(ctx, pod, stray),
+        None => tracing::debug!(
+            "keeping the keys of run {run_id}: its pods could not be listed; the startup sweep deletes the secret later"
+        ),
     }
 }
 

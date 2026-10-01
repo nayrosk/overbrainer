@@ -711,6 +711,60 @@ async fn a_duplicate_pod_whose_delete_fails_is_recorded_as_stray() -> TestResult
     Ok(())
 }
 
+/// A pod list that fails after the retrieval may hide a stray: the run keeps
+/// its host key secret, which the startup sweep deletes once no pod is listed.
+#[tokio::test]
+async fn a_failed_pod_list_at_the_end_keeps_the_host_key_secret() -> TestResult {
+    let Some(sshd) = sshd().await? else {
+        skip();
+        return Ok(());
+    };
+    let project = tempfile::tempdir()?;
+    let runs = Runs::new(project.path());
+    let (run, mut pod, executor) = started_run(&sshd, &runs, false).await?;
+    let server = MockServer::start().await;
+    let secrets = SecretStore::mount(&server).await;
+    secrets.hold("k1", &format!("overbrainer_host_key_{}", run.id));
+    let deleted = Arc::new(AtomicBool::new(false));
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Get {
+            deleted: Arc::clone(&deleted),
+            body: json!({"id": "p1", "status": "RUNNING", "cost": 0.25}),
+            looks: AtomicUsize::new(0),
+            dies_after: None,
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(Delete(deleted))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let client = client(&server)?;
+    let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
+    let ctx = PodCtx {
+        client: &client,
+        runs: &runs,
+        bus: &bus,
+        timing: &timing,
+        interrupted: &interrupted,
+    };
+    let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
+    assert_eq!(ending, Ending::Deleted);
+    assert_eq!(secrets.deleted(), Vec::<String>::new());
+    assert_eq!(
+        secrets.names(),
+        [format!("overbrainer_host_key_{}", run.id)]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_unretrieved_run_leaves_its_pod_to_the_watchdog_or_kept() -> TestResult {
     let Some(sshd) = sshd().await? else {
