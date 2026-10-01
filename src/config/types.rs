@@ -33,6 +33,9 @@ pub struct Settings {
     /// Credentials for the Runpod API.
     #[serde(default)]
     pub runpod: Runpod,
+    /// Export of a trained model to GGUF, and its Ollama Modelfile.
+    #[serde(default)]
+    pub export: Export,
     /// The Prometheus endpoint, off unless `metrics.listen` is set.
     #[serde(default)]
     pub metrics: Metrics,
@@ -663,6 +666,63 @@ pub struct Runpod {
     /// Env only. Base URL of the REST API, [`DEFAULT_RUNPOD_BASE_URL`] when unset.
     /// Must be `https`, or `http` on a loopback host (a test stub).
     pub base_url: Option<String>,
+}
+
+/// The llama-quantize types `export.quantize` accepts. `F16` and `BF16` skip
+/// the quantization: the GGUF keeps 16-bit weights.
+pub const QUANTIZE_TYPES: [&str; 10] = [
+    "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "Q3_K_M", "Q2_K", "F16", "BF16",
+];
+
+/// `export.quantize` when unset.
+pub const DEFAULT_QUANTIZE: &str = "Q4_K_M";
+
+/// Export of a trained model to GGUF with llama.cpp, and its Ollama Modelfile.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Export {
+    /// Whether a training job exports its model at its end, after the merge.
+    #[serde(default)]
+    pub after_training: bool,
+    /// The llama-quantize type of the GGUF, one of [`QUANTIZE_TYPES`].
+    #[serde(default = "default_quantize")]
+    pub quantize: String,
+    /// The Ollama model `ollama create` makes from the Modelfile once an
+    /// export in a training job is retrieved, when `ollama` is on `PATH`.
+    pub ollama_name: Option<String>,
+}
+
+impl Default for Export {
+    fn default() -> Self {
+        Self {
+            after_training: false,
+            quantize: default_quantize(),
+            ollama_name: None,
+        }
+    }
+}
+
+fn default_quantize() -> String {
+    DEFAULT_QUANTIZE.to_string()
+}
+
+/// Longest Ollama model name [`is_ollama_name`] accepts.
+pub const OLLAMA_NAME_MAX: usize = 128;
+
+/// Whether `name` can name an Ollama model, `[namespace/]model[:tag]`: ASCII
+/// letters, digits, `.`, `_`, `-` and `/`, starting with a letter or a digit,
+/// with at most one `:` before a tag, and at most [`OLLAMA_NAME_MAX`]
+/// characters. Such a name is also safe on a command line.
+#[must_use]
+pub fn is_ollama_name(name: &str) -> bool {
+    let (model, tag) = name.split_once(':').unwrap_or((name, "x"));
+    let part = |text: &str| {
+        text.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+    };
+    name.len() <= OLLAMA_NAME_MAX && part(model) && part(tag) && !tag.contains('/')
 }
 
 /// The Prometheus endpoint.

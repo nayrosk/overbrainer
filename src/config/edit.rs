@@ -74,6 +74,8 @@ pub enum FieldPath {
         /// The key.
         field: &'static str,
     },
+    /// `export.<field>`.
+    Export(&'static str),
     /// `metrics.<field>`.
     Metrics(&'static str),
 }
@@ -151,6 +153,7 @@ impl FieldPath {
             Self::Project(field)
             | Self::Pipeline(field)
             | Self::Training(field)
+            | Self::Export(field)
             | Self::Metrics(field)
             | Self::Topic { field, .. }
             | Self::Provider { field, .. }
@@ -170,6 +173,7 @@ impl FieldPath {
             Self::Pipeline(_) => "pipeline".to_string(),
             Self::Training(_) => "training".to_string(),
             Self::Target { name, .. } => format!("targets.{name}"),
+            Self::Export(_) => "export".to_string(),
             Self::Metrics(_) => "metrics".to_string(),
         }
     }
@@ -581,6 +585,7 @@ impl ConfigDoc {
             FieldPath::Role { .. } => Section::Role,
             FieldPath::Pipeline(_) => Section::Pipeline,
             FieldPath::Training(_) => Section::Training,
+            FieldPath::Export(_) => Section::Export,
             FieldPath::Metrics(_) => Section::Metrics,
             FieldPath::Target { name, .. } => {
                 if self.entry(path).is_none() {
@@ -645,6 +650,7 @@ impl ConfigDoc {
             FieldPath::Role { role, .. } => root.get("roles")?.get(role.as_str()),
             FieldPath::Pipeline(_) => root.get("pipeline"),
             FieldPath::Training(_) => root.get("training"),
+            FieldPath::Export(_) => root.get("export"),
             FieldPath::Metrics(_) => root.get("metrics"),
             FieldPath::Target { name, .. } => root.get("targets")?.get(name.as_str()),
         }
@@ -663,6 +669,7 @@ impl ConfigDoc {
             FieldPath::Role { role, .. } => root.get_mut("roles")?.get_mut(role.as_str()),
             FieldPath::Pipeline(_) => root.get_mut("pipeline"),
             FieldPath::Training(_) => root.get_mut("training"),
+            FieldPath::Export(_) => root.get_mut("export"),
             FieldPath::Metrics(_) => root.get_mut("metrics"),
             FieldPath::Target { name, .. } => root.get_mut("targets")?.get_mut(name.as_str()),
         }
@@ -682,6 +689,7 @@ impl ConfigDoc {
             FieldPath::Project(_) => ensure_table(root, "project"),
             FieldPath::Pipeline(_) => ensure_table(root, "pipeline"),
             FieldPath::Training(_) => ensure_table(root, "training"),
+            FieldPath::Export(_) => ensure_table(root, "export"),
             FieldPath::Metrics(_) => ensure_table(root, "metrics"),
             FieldPath::Role { role, .. } => {
                 let roles = ensure_table(root, "roles")?.as_table_like_mut()?;
@@ -1448,6 +1456,7 @@ runtime = "native"
             },
             Section::Pipeline => FieldPath::Pipeline(field),
             Section::Training => FieldPath::Training(field),
+            Section::Export => FieldPath::Export(field),
             Section::Metrics => FieldPath::Metrics(field),
             Section::Target(TargetKind::Runpod) => FieldPath::Target {
                 name: "cloud".to_string(),

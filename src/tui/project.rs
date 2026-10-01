@@ -306,6 +306,13 @@ pub(super) fn rows(config: &ProjectConfig, locks: &Locks) -> Vec<Row> {
         lock: None,
     });
     training_and_targets(&mut rows, settings, locks);
+    rows.heading("export");
+    rows.fields(&Table {
+        section: Section::Export,
+        path: &|field| FieldPath::Export(field),
+        value: &|field| export_value(&settings.export, field),
+        lock: None,
+    });
     rows.heading("metrics");
     rows.fields(&Table {
         section: Section::Metrics,
@@ -645,6 +652,15 @@ fn pipeline_value(pipeline: &Pipeline, field: &str) -> Option<String> {
         "request_timeout_secs" => pipeline.request_timeout_secs.to_string(),
         _ => return None,
     })
+}
+
+fn export_value(export: &crate::config::Export, field: &str) -> Option<String> {
+    match field {
+        "after_training" => Some(export.after_training.to_string()),
+        "quantize" => Some(export.quantize.clone()),
+        "ollama_name" => export.ollama_name.clone(),
+        _ => None,
+    }
 }
 
 fn training_value(training: &Training, field: &str) -> Option<String> {
@@ -1124,6 +1140,7 @@ mod tests {
                 "pipeline",
                 "training",
                 "targets.gpu_cloud (runpod)",
+                "export",
                 "metrics",
                 "runpod",
                 "other",
