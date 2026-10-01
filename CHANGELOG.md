@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/nayrosk/overbrainer/compare/v0.4.1...v0.5.0) - 2026-10-01
+
+### Added
+
+- *(runpod)* grow a pod's disk or stop with a snapshot when it fills ([#99](https://github.com/nayrosk/overbrainer/pull/99))
+- *(training)* stop a run with a snapshot and resume a new run from it ([#98](https://github.com/nayrosk/overbrainer/pull/98))
+- *(tui)* add a live system panel to the Training view ([#97](https://github.com/nayrosk/overbrainer/pull/97))
+- *(runpod)* show and keep the pod logs next to overbrainer's own ([#96](https://github.com/nayrosk/overbrainer/pull/96))
+- *(tui)* list Runpod GPUs by price and model fit ([#93](https://github.com/nayrosk/overbrainer/pull/93))
+- *(tui)* save a Project field on Enter, as typed ([#92](https://github.com/nayrosk/overbrainer/pull/92))
+- *(runs)* name runs after the project with a timestamp ([#91](https://github.com/nayrosk/overbrainer/pull/91))
+- *(tui)* draw the training chart's x axis up to max_steps ([#90](https://github.com/nayrosk/overbrainer/pull/90))
+
+### Fixed
+
+- *(training)* never ask a run started before v0.5.0 for a snapshot ([#110](https://github.com/nayrosk/overbrainer/pull/110))
+- *(runpod)* say why the cost cap snapshot is due and warn about a cap too small to train ([#108](https://github.com/nayrosk/overbrainer/pull/108))
+- *(training)* say a stopped run's output holds a partial model ([#107](https://github.com/nayrosk/overbrainer/pull/107))
+- *(training)* let train stop request a snapshot while another process follows the run ([#106](https://github.com/nayrosk/overbrainer/pull/106))
+- *(tui)* read the cgroup v1 limits in the system probe ([#105](https://github.com/nayrosk/overbrainer/pull/105))
+
 ## [0.4.1](https://github.com/nayrosk/overbrainer/compare/v0.4.0...v0.4.1) - 2026-09-30
 
 ### Fixed
