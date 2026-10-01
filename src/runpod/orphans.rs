@@ -156,11 +156,14 @@ struct Unlisted {
     stray: bool,
 }
 
-/// What `runs/` holds, read once.
+/// What `runs/` holds, read once: the runs, and the exports inside them.
 struct Known<'a> {
     runs: &'a Runs,
     run_records: HashMap<String, RunRecord>,
     pod_records: HashMap<String, PodRecord>,
+    /// The exports, by ID: the run each exports, and the runs holding it
+    /// (`runs/<run-id>/exports/`).
+    exports: HashMap<String, (String, Runs)>,
 }
 
 impl<'a> Known<'a> {
@@ -168,14 +171,27 @@ impl<'a> Known<'a> {
     /// An unreadable `pod.json` is warned about and omitted so account pods can
     /// still be listed and classified from the remaining evidence.
     fn load(runs: &'a Runs) -> Result<Self, PodError> {
-        let run_records: HashMap<String, RunRecord> = runs
+        let mut run_records: HashMap<String, RunRecord> = runs
             .list()?
             .into_iter()
             .map(|run| (run.id.clone(), run))
             .collect();
+        let mut exports = HashMap::new();
+        for run_id in run_records.keys() {
+            let held = runs.exports(run_id)?;
+            for export in held.list()? {
+                exports.insert(export.id.clone(), (run_id.clone(), held.clone()));
+            }
+        }
+        for (id, (_, held)) in &exports {
+            if let Ok(record) = held.load(id) {
+                run_records.insert(id.clone(), record);
+            }
+        }
         let mut pod_records = HashMap::new();
         for id in run_records.keys() {
-            match PodRecord::load(runs, id) {
+            let home = exports.get(id).map_or(runs, |(_, held)| held);
+            match PodRecord::load(home, id) {
                 Ok(Some(record)) => {
                     pod_records.insert(id.clone(), record);
                 },
@@ -189,7 +205,13 @@ impl<'a> Known<'a> {
             runs,
             run_records,
             pod_records,
+            exports,
         })
+    }
+
+    /// The runs holding the run or export `id`.
+    fn home(&self, id: &str) -> &Runs {
+        self.exports.get(id).map_or(self.runs, |(_, held)| held)
     }
 
     /// The rows of the pods of `pods` that overbrainer created: those with a run
@@ -237,7 +259,8 @@ impl<'a> Known<'a> {
 
     /// What `runs/` says about the pod `id` of the run `run`.
     fn classify(&self, run: Option<&str>, id: &PodId) -> (RowKind, String) {
-        let Some((run, dir)) = run.and_then(|run| Some((run, self.runs.run_dir(run).ok()?))) else {
+        let Some((run, dir)) = run.and_then(|run| Some((run, self.home(run).run_dir(run).ok()?)))
+        else {
             return (RowKind::NoMarker, NO_MARKER.to_string());
         };
         let Some(record) = self.run_records.get(run) else {
@@ -271,7 +294,7 @@ impl<'a> Known<'a> {
             };
             return (kind, STRAY.to_string());
         }
-        match (pod_state, record.state) {
+        let (kind, note) = match (pod_state, record.state) {
             (Some(PodState::Kept), _) => (RowKind::Kept, "kept".to_string()),
             (Some(PodState::AwaitingRetrieval), _) => {
                 (RowKind::AwaitingRetrieval, "awaiting retrieval".to_string())
@@ -280,6 +303,13 @@ impl<'a> Known<'a> {
                 (RowKind::InProgress, format!("run {}", state.name()))
             },
             (_, ended) => (RowKind::Ended, format!("run {}, not deleted", ended.name())),
+        };
+        match self.exports.get(run) {
+            Some((parent, _)) => {
+                let note = note.strip_prefix("run ").unwrap_or(&note);
+                (kind, format!("export of run {parent}: {note}"))
+            },
+            None => (kind, note),
         }
     }
 
@@ -333,11 +363,15 @@ async fn settle(
     match look {
         Look::Found(pod) => Ok(Some(known.row(Some(&entry.run_id), &pod))),
         Look::Gone if entry.stray => {
-            forget_stray(ctx.runs, &entry.run_id, &entry.id)?;
+            forget_stray(known.home(&entry.run_id), &entry.run_id, &entry.id)?;
             Ok(None)
         },
         Look::Gone => {
-            record_gone(ctx, &entry.run_id, &entry.id).await?;
+            let home = PodCtx {
+                runs: known.home(&entry.run_id),
+                ..*ctx
+            };
+            record_gone(&home, &entry.run_id, &entry.id).await?;
             let row = known.recorded_row(entry, "GONE", RowKind::Gone, "gone".to_string());
             Ok(Some(row))
         },
