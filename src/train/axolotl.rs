@@ -105,11 +105,8 @@ impl Outputs {
     #[must_use]
     pub fn recorded(run_dir: &Path) -> Option<Self> {
         let config = fs::read_to_string(run_dir.join(CONFIG_FILE)).ok()?;
-        let adapter = config
-            .lines()
-            .find_map(|line| line.strip_prefix("adapter:"))
-            .map(|value| value.trim().trim_matches(['"', '\'']));
-        let adapter = match adapter {
+        let adapter = super::top_level_scalar(&config, "adapter");
+        let adapter = match adapter.as_deref() {
             None => Adapter::Full,
             Some("lora") => Adapter::Lora,
             Some("qlora") => Adapter::Qlora,

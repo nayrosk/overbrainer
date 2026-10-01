@@ -26,6 +26,7 @@ pub use llama_cpp::{
 
 use crate::train::{
     Artifacts, CONFIG_FILE, JobStage, METRICS_ENV, METRICS_FILE, OUTPUT_DIR, TrainError, Trainer,
+    top_level_scalar,
 };
 
 /// The export script, written into the job directory.
@@ -477,9 +478,7 @@ fn remove_any(path: &Path) -> Result<(), ExportError> {
 /// `sequence_len` of the Axolotl config at `path`, as `to_yaml` writes it.
 fn sequence_len(path: &Path) -> Option<u32> {
     let text = fs::read_to_string(path).ok()?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("sequence_len:"))
-        .and_then(|value| value.trim().parse().ok())
+    top_level_scalar(&text, "sequence_len")?.parse().ok()
 }
 
 /// The Modelfile of the GGUF `file` beside it: Ollama takes the chat template

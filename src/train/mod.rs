@@ -17,7 +17,7 @@ pub use metrics::{
     SNAPSHOT_ENV, SNAPSHOT_FILE, SNAPSHOT_REQUEST, TrainMetric, parse_line,
 };
 pub use phase::{Phase, Phases};
-pub use yaml::to_yaml;
+pub use yaml::{to_yaml, top_level_scalar};
 
 /// Errors while preparing the files of a run.
 #[derive(Debug, thiserror::Error)]

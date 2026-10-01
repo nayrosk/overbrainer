@@ -300,13 +300,7 @@ async fn export_sizing(
 /// The `base_model` the run in `run_dir` trained, from its `axolotl.yaml`.
 fn recorded_base_model(run_dir: &Path) -> Option<String> {
     let config = std::fs::read_to_string(run_dir.join(CONFIG_FILE)).ok()?;
-    let value = config
-        .lines()
-        .find_map(|line| line.strip_prefix("base_model:"))?
-        .trim();
-    serde_json::from_str(value)
-        .ok()
-        .or_else(|| Some(value.to_string()))
+    crate::train::top_level_scalar(&config, "base_model")
 }
 
 /// Warns, without a network volume, when the container disk of `spec` may be
@@ -1063,6 +1057,22 @@ mod tests {
 
     /// The floor asks Hugging Face only for `auto` GPU types without
     /// `min_vram_gb`.
+    #[test]
+    fn the_base_model_is_read_from_the_run_s_own_config() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let run = tempfile::tempdir()?;
+        assert_eq!(recorded_base_model(run.path()), None, "no axolotl.yaml");
+        std::fs::write(
+            run.path().join(CONFIG_FILE),
+            "datasets:\n  - base_model: nested\nbase_model: 'Qwen/Qwen3-0.6B'  # edited\n",
+        )?;
+        assert_eq!(
+            recorded_base_model(run.path()).as_deref(),
+            Some("Qwen/Qwen3-0.6B")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn the_vram_floor_is_estimated_only_when_auto_uses_it()
     -> Result<(), Box<dyn std::error::Error>> {
