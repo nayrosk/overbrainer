@@ -101,7 +101,14 @@ async fn train(
             vram_floor: args.vram_floor,
             trainer: &trainer,
         };
-        return super::runpod_train::train(project_dir, settings, start, front).await;
+        // Boxed: the Runpod flow would otherwise weigh on every caller's future.
+        return Box::pin(super::runpod_train::train(
+            project_dir,
+            settings,
+            start,
+            front,
+        ))
+        .await;
     }
     if keep_pod {
         bail!("--keep-pod only applies to a runpod target");
