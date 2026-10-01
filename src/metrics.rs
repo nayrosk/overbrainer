@@ -35,7 +35,7 @@ use crate::history::Entry;
 use crate::llm::Usage;
 use crate::runpod::PodRecord;
 use crate::runs::Runs;
-use crate::train::TrainMetric;
+use crate::train::{Phase, Phases, TrainMetric};
 
 /// Content type of the exposition `prometheus_client` writes.
 pub const CONTENT_TYPE_VALUE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
@@ -85,6 +85,12 @@ struct RunLabels {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct PhaseLabels {
+    run_id: String,
+    phase: &'static str,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct VersionLabels {
     version: &'static str,
 }
@@ -100,6 +106,10 @@ struct Followed {
     run_id: Option<String>,
     /// The series the last [`Event::System`] set.
     system: Option<SystemSeries>,
+    /// What the run's lines said of its phase.
+    phases: Phases,
+    /// Whether the run's job exited.
+    exited: bool,
 }
 
 /// The metric families of a project and their registry.
@@ -112,6 +122,8 @@ pub struct Metrics {
     running: Family<StageLabels, Gauge>,
     retries: Family<StageLabels, Counter>,
     train_step: Family<RunLabels, Gauge>,
+    train_max_steps: Family<RunLabels, Gauge>,
+    train_phase: Family<PhaseLabels, Gauge>,
     train_loss: Family<RunLabels, FloatGauge>,
     eval_loss: Family<RunLabels, FloatGauge>,
     learning_rate: Family<RunLabels, FloatGauge>,
@@ -161,6 +173,16 @@ impl Metrics {
             "overbrainer_train_step",
             "Last optimizer step of a training run",
         );
+        let train_max_steps = register(
+            &mut registry,
+            "overbrainer_train_max_steps",
+            "Total optimizer steps of a training run, once known",
+        );
+        let train_phase = register(
+            &mut registry,
+            "overbrainer_train_phase",
+            "What the job of a followed training run does: 1 for the current phase, 0 for the others",
+        );
         let train_loss = register(
             &mut registry,
             "overbrainer_train_loss",
@@ -200,6 +222,8 @@ impl Metrics {
             running,
             retries,
             train_step,
+            train_max_steps,
+            train_phase,
             train_loss,
             eval_loss,
             learning_rate,
@@ -209,19 +233,24 @@ impl Metrics {
             buses: Mutex::default(),
             scrape: Mutex::default(),
         };
-        // Every stage shows, running or not.
+        metrics.seeded(history)
+    }
+
+    /// The metrics with every stage shown, running or not, and the items,
+    /// tokens and cost of `history` counted.
+    fn seeded(self, history: &[Entry]) -> Self {
         for stage in [
             Stage::Subtopics,
             Stage::Questions,
             Stage::Answers,
             Stage::Split,
         ] {
-            metrics.stage_running(stage).set(0);
+            self.stage_running(stage).set(0);
         }
         for entry in history {
-            metrics.seed(entry);
+            self.seed(entry);
         }
-        metrics
+        self
     }
 
     /// Also shows the Runpod spend of the pods recorded in `runs`, read at each
@@ -329,11 +358,29 @@ impl Metrics {
                 if let Some(series) = followed.system.take() {
                     self.system.remove(&series);
                 }
-                followed.run_id = Some(run_id.clone());
+                if let Some(previous) = followed.run_id.replace(run_id.clone()) {
+                    self.forget_phase(&previous);
+                }
+                followed.phases = Phases::default();
+                followed.exited = false;
             },
             Event::Metric(metric) => {
+                followed.phases.metric(metric);
                 if let Some(run_id) = &followed.run_id {
                     self.train(run_id, metric);
+                    self.set_phase(run_id, followed.phases.phase(followed.exited));
+                }
+            },
+            Event::Mark(mark) => {
+                followed.phases.mark(*mark);
+                if let Some(run_id) = &followed.run_id {
+                    self.set_phase(run_id, followed.phases.phase(followed.exited));
+                }
+            },
+            Event::JobStatus(status) => {
+                followed.exited = status.is_finished();
+                if let Some(run_id) = &followed.run_id {
+                    self.set_phase(run_id, followed.phases.phase(followed.exited));
                 }
             },
             Event::System(sample) => {
@@ -342,11 +389,7 @@ impl Metrics {
                     followed.system = Some(set);
                 }
             },
-            Event::ItemDone { .. }
-            | Event::ItemFailed { .. }
-            | Event::Mark(_)
-            | Event::JobStatus(_)
-            | Event::PodStatus(_) => {},
+            Event::ItemDone { .. } | Event::ItemFailed { .. } | Event::PodStatus(_) => {},
         }
     }
 
@@ -363,6 +406,11 @@ impl Metrics {
         self.train_step
             .get_or_create(&labels)
             .set(i64::try_from(metric.step).unwrap_or(i64::MAX));
+        if let Some(max_steps) = metric.max_steps {
+            self.train_max_steps
+                .get_or_create(&labels)
+                .set(i64::try_from(max_steps).unwrap_or(i64::MAX));
+        }
         for (family, value) in [
             (&self.train_loss, metric.loss),
             (&self.eval_loss, metric.eval_loss),
@@ -371,6 +419,29 @@ impl Metrics {
             if let Some(value) = value {
                 family.get_or_create(&labels).set(value);
             }
+        }
+    }
+
+    /// Shows `phase` as the current one of run `run_id`: 1 for it, 0 for every
+    /// other phase.
+    fn set_phase(&self, run_id: &str, phase: Phase) {
+        for name in Phase::NAMES {
+            self.train_phase
+                .get_or_create(&PhaseLabels {
+                    run_id: run_id.to_string(),
+                    phase: name,
+                })
+                .set(i64::from(name == phase.name()));
+        }
+    }
+
+    /// Removes the phase series of run `run_id`: nothing follows it any more.
+    fn forget_phase(&self, run_id: &str) {
+        for name in Phase::NAMES {
+            self.train_phase.remove(&PhaseLabels {
+                run_id: run_id.to_string(),
+                phase: name,
+            });
         }
     }
 
@@ -414,9 +485,13 @@ impl Observer for Metrics {
         for stage in followed.running {
             self.stage_running(stage).dec();
         }
-        // The machine of a run nothing watches any more is not shown as it was.
+        // The machine of a run nothing watches any more is not shown as it was,
+        // nor is its phase.
         if let Some(series) = &followed.system {
             self.system.remove(series);
+        }
+        if let Some(run_id) = &followed.run_id {
+            self.forget_phase(run_id);
         }
     }
 }
@@ -879,6 +954,76 @@ mod tests {
         assert_value(&text, &format!("overbrainer_eval_loss{run}"), 1.25);
         assert_value(&text, &format!("overbrainer_learning_rate{run}"), 2e-5);
         assert_eq!(text.matches("overbrainer_train_step{").count(), 1, "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_phase_of_a_followed_run_shows_until_its_bus_closes() -> TestResult {
+        use crate::exec::JobStatus;
+        use crate::train::{JobStage, Mark};
+
+        let metrics = Metrics::new(&[]);
+        let run = "20260928-100000-a1b2";
+        let phase = |text: &str, name: &str| {
+            value(
+                text,
+                &format!("overbrainer_train_phase{{run_id=\"{run}\",phase=\"{name}\"}}"),
+            )
+        };
+        metrics.event(4, &Event::RunWatched { run_id: run.into() });
+        metrics.event(
+            4,
+            &Event::Metric(TrainMetric {
+                max_steps: Some(10),
+                ..metric(4, Some(1.5), None)
+            }),
+        );
+        let text = metrics.encode()?;
+        assert_value(
+            &text,
+            &format!("overbrainer_train_max_steps{{run_id=\"{run}\"}}"),
+            10.0,
+        );
+        assert_eq!(phase(&text, "training"), Some(1.0));
+        assert_eq!(phase(&text, "finalizing"), Some(0.0));
+        for (event, current) in [
+            (
+                Event::Mark(Mark::Eval {
+                    step: 3,
+                    total: None,
+                }),
+                "evaluating",
+            ),
+            (Event::Mark(Mark::End { step: 10 }), "evaluating"),
+            (
+                Event::Metric(TrainMetric {
+                    max_steps: Some(10),
+                    ..metric(10, None, Some(1.25))
+                }),
+                "finalizing",
+            ),
+            (Event::Mark(Mark::Stage(JobStage::Merge)), "merging"),
+            (Event::JobStatus(JobStatus::Exited(0)), "retrieving"),
+        ] {
+            metrics.event(4, &event);
+            let text = metrics.encode()?;
+            for name in Phase::NAMES {
+                let expected = if name == current { 1.0 } else { 0.0 };
+                assert_eq!(
+                    phase(&text, name),
+                    Some(expected),
+                    "{event:?} {name}\n{text}"
+                );
+            }
+        }
+        metrics.closed(4);
+        let text = metrics.encode()?;
+        assert!(!text.contains("overbrainer_train_phase{"), "{text}");
+        assert_value(
+            &text,
+            &format!("overbrainer_train_max_steps{{run_id=\"{run}\"}}"),
+            10.0,
+        );
         Ok(())
     }
 
