@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use super::metrics::{
-    METRICS_ENV, METRICS_PLUGIN, PLUGIN_CLASS, PLUGIN_FILE, SNAPSHOT_ENV, SNAPSHOT_FILE,
+    JobStage, METRICS_ENV, METRICS_PLUGIN, PLUGIN_CLASS, PLUGIN_FILE, SNAPSHOT_ENV, SNAPSHOT_FILE,
     SNAPSHOT_REQUEST,
 };
 use super::{Artifacts, TrainError, Trainer, to_yaml};
@@ -429,11 +429,14 @@ impl Trainer for Axolotl<'_> {
     }
 
     fn commands(&self) -> Vec<Vec<String>> {
-        let mut commands = vec![command("train")];
-        if self.training.merge {
-            commands.push(command("merge-lora"));
-        }
-        commands
+        self.steps()
+            .into_iter()
+            .map(|(_, subcommand)| command(subcommand))
+            .collect()
+    }
+
+    fn stages(&self) -> Vec<JobStage> {
+        self.steps().into_iter().map(|(stage, _)| stage).collect()
     }
 
     fn env(&self, root: &str) -> Vec<(String, String)> {
@@ -459,6 +462,17 @@ impl Trainer for Axolotl<'_> {
             exclude: vec!["checkpoint-*".into()],
             required: Some(OUTPUT_DIR.into()),
         }
+    }
+}
+
+impl Axolotl<'_> {
+    /// The job's commands, as stage and `axolotl` subcommand.
+    fn steps(&self) -> Vec<(JobStage, &'static str)> {
+        let mut steps = vec![(JobStage::Train, "train")];
+        if self.training.merge {
+            steps.push((JobStage::Merge, "merge-lora"));
+        }
+        steps
     }
 }
 

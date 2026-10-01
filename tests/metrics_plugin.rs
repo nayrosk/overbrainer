@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use overbrainer::train::{METRICS_PLUGIN, MetricLine, PLUGIN_FILE, TrainMetric, parse_line};
+use overbrainer::train::{METRICS_PLUGIN, Mark, MetricLine, PLUGIN_FILE, TrainMetric, parse_line};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -350,5 +350,85 @@ fn a_request_at_the_last_step_lets_the_run_end_as_usual() -> TestResult {
     };
     assert_eq!(printed, "5 []");
     assert!(proof.is_null(), "{proof}");
+    Ok(())
+}
+
+/// Drives the metrics callback through two evaluations on a fake clock: the
+/// first prediction step of each is written at once, the next ones at most
+/// every 2 seconds, with the loader's length as total when it has one; a
+/// loader whose length fails, another rank, or a broken file never raise.
+const EVAL_DRIVER: &str = r#"
+import overbrainer_metrics
+from types import SimpleNamespace
+
+clock = [100.0]
+overbrainer_metrics.time = SimpleNamespace(time=lambda: clock[0])
+
+class Iterable:
+    def __iter__(self):
+        return iter(())
+
+class Broken:
+    def __len__(self):
+        raise TypeError("no length")
+
+callback = overbrainer_metrics.OverbrainerMetricsPlugin().add_callbacks_pre_trainer(cfg=None, model=None)[0]
+main = SimpleNamespace(is_world_process_zero=True, max_steps=10, global_step=10, epoch=1.0)
+other = SimpleNamespace(is_world_process_zero=False, max_steps=10, global_step=10, epoch=1.0)
+loader = [0] * 1200
+for tick in (0.0, 1.0, 1.5, 2.5, 3.0):
+    clock[0] = 100.0 + tick
+    callback.on_prediction_step(None, main, None, eval_dataloader=loader)
+    callback.on_prediction_step(None, other, None, eval_dataloader=loader)
+callback.on_evaluate(None, main, None)
+clock[0] = 104.0
+callback.on_prediction_step(None, main, None, eval_dataloader=Iterable())
+callback.on_evaluate(None, main, None)
+callback.on_prediction_step(None, main, None, eval_dataloader=Broken())
+callback.on_prediction_step(None, main, None)
+callback.on_train_end(None, other, None)
+callback.on_train_end(None, main, None)
+callback.path = "/nonexistent/dir/metrics.jsonl"
+callback.on_evaluate(None, main, None)
+callback.on_prediction_step(None, main, None, eval_dataloader=loader)
+callback.on_train_end(None, main, None)
+"#;
+
+#[test]
+fn evaluations_report_their_progress_and_the_end_of_training_is_said() -> TestResult {
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: python3 is not installed");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let python_path = stage_plugin(dir.path())?;
+    let metrics = dir.path().join("metrics.jsonl");
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(EVAL_DRIVER)
+        .env("PYTHONPATH", python_path)
+        .env("OVERBRAINER_METRICS", &metrics)
+        .env_remove("OVERBRAINER_SNAPSHOT")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let marks: Vec<Option<Mark>> = fs::read_to_string(&metrics)?
+        .lines()
+        .map(|line| parse_line(line).map(|line| line.mark()))
+        .collect::<Result<_, _>>()?;
+    let eval = |step, total| Some(Mark::Eval { step, total });
+    assert_eq!(
+        marks,
+        [
+            eval(1, Some(1200)),
+            eval(4, Some(1200)),
+            eval(1, None),
+            eval(1, None),
+            Some(Mark::End { step: 10 }),
+        ]
+    );
     Ok(())
 }

@@ -30,6 +30,19 @@ The job runs detached from overbrainer. Once it has started, Ctrl-C, a closed te
 train: run malware_development_20260922-143005 succeeded; step 1200/1200, epoch 3.00, loss 0.4123, eval_loss 0.5012; output in runs/malware_development_20260922-143005/output
 ```
 
+The last training step is not the end of the job: the trainer then runs its final evaluation and saves the model, `merge-lora` merges the adapter, and overbrainer retrieves the results. To show that work, the job writes a `stage` line into `metrics.jsonl` before each command (`train`, `merge`), and the metrics plugin adds an `eval` line at most every 2 seconds while an evaluation runs (its step and, when the evaluation's length is known, its total) and an `end` line once the training loop is over. From these, `train` and `train attach` print a line when the phase changes, and every tenth of an evaluation:
+
+```
+train: evaluating 120/1200
+train: training
+train: finalizing (evaluation 340/1200)
+train: finalizing (saving model)
+train: merging adapter
+train: retrieving results
+```
+
+A run started before 0.6.0 writes none of these lines: it reads `finalizing (saving model)` once its step reaches `max_steps`. Older versions of overbrainer skip the new lines, with a warning, as they skip any line they do not know.
+
 While it follows a job, overbrainer also samples the machine the job runs on every 10 seconds, over the same connection: one shell script reads `nvidia-smi`, `/proc` (load, CPU time, memory), the cgroup files of a container, v2 or else v1 (its memory limit and CPU quota come first, since `/proc` shows the host inside a Runpod pod; `/proc` is used only when no cgroup limits the container) and `df` on the run directory and `/`. `nvidia-smi` and `df` get 5 seconds each, so a stuck driver or network mount cannot hold the probe. On a network volume (a Runpod network volume is a shared MooseFS cluster), `df` reports the whole cluster, not the volume: those figures are shown as shared and never warn, and the volume's own usage is measured separately. The samples feed the TUI's system panel and the [metrics](configuration.md#metrics); a sample that fails is skipped, logged at debug level, and never stops the follow. A target without `nvidia-smi` simply shows no GPU.
 
 A run fails when the job exits with a non-zero code, or when it writes no metric line at all, which means Axolotl did not load the metrics plugin. `runs/<run-id>/job.log` holds the job's output.

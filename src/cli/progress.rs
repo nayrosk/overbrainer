@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::events::{Event, Stage, StageStats};
 use crate::exec::JobStatus;
 use crate::runpod::PodStatus;
-use crate::train::TrainMetric;
+use crate::train::{Phase, Phases, TrainMetric};
 
 /// Training logs come at every step: at most one is shown per interval, plus every
 /// evaluation.
@@ -72,6 +72,14 @@ struct Progress {
     finished: usize,
     next_tenth: usize,
     last_metric: Option<Instant>,
+    /// What the followed run's lines said of its phase.
+    phases: Phases,
+    /// Whether the followed run's job exited.
+    exited: bool,
+    /// The phase last told, if any.
+    phase: Option<Phase>,
+    /// The next tenth of the evaluation told to tell.
+    eval_tenth: u64,
 }
 
 impl Progress {
@@ -90,11 +98,16 @@ impl Progress {
                 if self.show_metric(metric, Instant::now()) {
                     training(metric);
                 }
+                self.tell_phase(event);
             },
-            Event::JobStatus(status) => job(*status),
+            Event::JobStatus(status) => {
+                job(*status);
+                self.tell_phase(event);
+            },
+            Event::Mark(_) | Event::RunWatched { .. } => self.tell_phase(event),
             Event::PodStatus(status) => tracing::info!("pod: {}", pod_line(status)),
             // Only the metrics and the TUI use them.
-            Event::StageModel { .. } | Event::RunWatched { .. } | Event::System(_) => {},
+            Event::StageModel { .. } | Event::System(_) => {},
         }
     }
 
@@ -103,7 +116,7 @@ impl Progress {
             total,
             finished: 0,
             next_tenth: 1,
-            last_metric: None,
+            ..Self::default()
         };
         tracing::info!("{stage}: {total} to process");
     }
@@ -140,6 +153,65 @@ impl Progress {
         }
         self.last_metric = Some(now);
         true
+    }
+
+    fn tell_phase(&mut self, event: &Event) {
+        if let Some(phase) = self.follow_phase(event) {
+            tracing::info!("train: {}", phase.label());
+        }
+    }
+
+    /// Takes `event` into account for the followed run's phase; returns the
+    /// phase when it is to be told (see [`Progress::phase_change`]).
+    fn follow_phase(&mut self, event: &Event) -> Option<Phase> {
+        match event {
+            Event::Metric(metric) => self.phases.metric(metric),
+            Event::Mark(mark) => self.phases.mark(*mark),
+            Event::JobStatus(status) => self.exited = status.is_finished(),
+            Event::RunWatched { .. } => {
+                self.phases = Phases::default();
+                self.exited = false;
+                self.phase = None;
+                return None;
+            },
+            _ => return None,
+        }
+        self.phase_change()
+    }
+
+    /// The followed run's phase, when it is to be told: at each change but the
+    /// first `training`, and while an evaluation of known length runs, at each
+    /// further tenth of it.
+    fn phase_change(&mut self) -> Option<Phase> {
+        let phase = self.phases.phase(self.exited);
+        let previous = self.phase.replace(phase);
+        let fresh = match (previous, phase) {
+            (None, Phase::Training) => return None,
+            (
+                Some(Phase::Evaluating {
+                    step: before,
+                    last: was_last,
+                    ..
+                }),
+                Phase::Evaluating { step, last, .. },
+            ) => step < before || last != was_last,
+            (Some(previous), phase) => previous.name() != phase.name(),
+            (None, _) => true,
+        };
+        let Phase::Evaluating {
+            step,
+            total: Some(total),
+            ..
+        } = phase
+        else {
+            return fresh.then_some(phase);
+        };
+        let total = total.max(1);
+        if fresh || step.saturating_mul(10) >= self.eval_tenth.saturating_mul(total) {
+            self.eval_tenth = step.saturating_mul(10) / total + 1;
+            return Some(phase);
+        }
+        None
     }
 
     /// Counts one finished item. Returns the count to log when it reaches the next
@@ -371,6 +443,60 @@ mod tests {
             ..metric(3, Some(1.0))
         };
         assert_eq!(metric_line(&bare), "step 3, eval_loss 1.0000");
+    }
+
+    #[test]
+    fn the_phase_is_told_as_it_changes() {
+        use crate::train::{JobStage, Mark};
+
+        let eval = |step| {
+            Event::Mark(Mark::Eval {
+                step,
+                total: Some(100),
+            })
+        };
+        let events = [
+            Event::RunWatched {
+                run_id: "r1".into(),
+            },
+            Event::JobStatus(JobStatus::Running),
+            Event::Mark(Mark::Stage(JobStage::Train)),
+            Event::Metric(metric(20, None)),
+            eval(1),
+            eval(5),
+            eval(12),
+            eval(19),
+            eval(35),
+            Event::Metric(metric(20, Some(1.0))),
+            Event::Metric(metric(30, None)),
+            Event::Metric(metric(40, None)),
+            eval(1),
+            Event::Mark(Mark::End { step: 40 }),
+            Event::Metric(metric(40, Some(1.0))),
+            Event::Mark(Mark::End { step: 40 }),
+            Event::Mark(Mark::Stage(JobStage::Merge)),
+            Event::JobStatus(JobStatus::Exited(0)),
+        ];
+        let mut progress = Progress::default();
+        let told: Vec<String> = events
+            .iter()
+            .filter_map(|event| progress.follow_phase(event))
+            .map(Phase::label)
+            .collect();
+        assert_eq!(
+            told,
+            [
+                "evaluating 1/100",
+                "evaluating 12/100",
+                "evaluating 35/100",
+                "training",
+                "finalizing (saving model)",
+                "finalizing (evaluation 1/100)",
+                "finalizing (saving model)",
+                "merging adapter",
+                "retrieving results",
+            ]
+        );
     }
 
     #[test]

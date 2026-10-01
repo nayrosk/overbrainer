@@ -2,6 +2,7 @@
 
 mod axolotl;
 mod metrics;
+mod phase;
 pub mod sizing;
 mod yaml;
 
@@ -12,9 +13,10 @@ pub use axolotl::{
     reasoning_template_warning,
 };
 pub use metrics::{
-    METRICS_ENV, METRICS_PLUGIN, MetricLine, PLUGIN_CLASS, PLUGIN_FILE, Pace, SNAPSHOT_ENV,
-    SNAPSHOT_FILE, SNAPSHOT_REQUEST, TrainMetric, parse_line,
+    JobStage, METRICS_ENV, METRICS_PLUGIN, Mark, MetricLine, PLUGIN_CLASS, PLUGIN_FILE, Pace,
+    SNAPSHOT_ENV, SNAPSHOT_FILE, SNAPSHOT_REQUEST, TrainMetric, parse_line,
 };
+pub use phase::{Phase, Phases};
 pub use yaml::to_yaml;
 
 /// Errors while preparing the files of a run.
@@ -97,5 +99,12 @@ pub trait Trainer {
     /// the trainer never stops that way.
     fn stop_marker(&self) -> Option<&'static str> {
         None
+    }
+
+    /// The stage of each command of [`Trainer::commands`], in order: the job
+    /// writes its event into [`Trainer::metrics_file`] before the command
+    /// starts. Empty when the trainer writes no stage events.
+    fn stages(&self) -> Vec<JobStage> {
+        Vec::new()
     }
 }

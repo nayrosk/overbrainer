@@ -3978,7 +3978,7 @@ mod tests {
             return Err(format!("{reading:?}").into());
         };
         attach(&mut app)?;
-        let old = Some(vec![metric(1)]);
+        let old = Some((vec![metric(1)], crate::train::Phases::default()));
         app.on_done(
             *read_id,
             Ok(Done::Series {

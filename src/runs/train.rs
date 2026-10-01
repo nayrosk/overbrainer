@@ -10,7 +10,7 @@ use super::{MetricsSummary, RunRecord, RunState, Runs, RunsError, new_run_id, rf
 use crate::events::{Event, EventBus};
 use crate::exec::{
     ExecError, Executor, FileDigest, JOB_LOG, JobId, JobRuntime, JobSpec, JobStatus, LineStream,
-    local_manifest,
+    Stages, local_manifest,
 };
 use crate::runpod::{POD_FILE, SSH_DIR, chain};
 use crate::system::{self, SystemSample, probe_script};
@@ -324,6 +324,10 @@ async fn launch_job<E: Executor, T: Trainer>(
         commands: &trainer.commands(),
         env: &trainer.env(&root),
         stop_marker: trainer.stop_marker(),
+        stages: Some(Stages {
+            file: trainer.metrics_file(),
+            names: &trainer.stages(),
+        }),
         secrets: launch.secrets,
     });
     Ok(ctx.executor.spawn(&job).await?)
@@ -789,8 +793,8 @@ async fn poll<E: Executor>(
 
 fn publish(bus: &EventBus, lines: Vec<String>, summary: &mut MetricsSummary) {
     for line in lines {
-        if let Some(metric) = summary.add(&line) {
-            bus.publish(Event::Metric(metric));
+        if let Some(event) = summary.add(&line) {
+            bus.publish(event);
         }
     }
 }

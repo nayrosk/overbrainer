@@ -156,6 +156,8 @@ The counters are cumulative per project: they start from `.overbrainer/history.j
 | `overbrainer_stage_running` | gauge | `stage` | Stages running now. |
 | `overbrainer_item_retries_total` | counter | `stage` | Failed attempts retried, since the command started. |
 | `overbrainer_train_step` | gauge | `run_id` | Last optimizer step of a run. |
+| `overbrainer_train_max_steps` | gauge | `run_id` | Total optimizer steps of a run, once known. |
+| `overbrainer_train_phase` | gauge | `run_id`, `phase` | 1 for what the job of a followed run does now, 0 for the other phases: `training`, `evaluating`, `finalizing`, `merging`, `exporting`, `retrieving`. Removed once nothing follows the run. |
 | `overbrainer_train_loss` | gauge | `run_id` | Last training loss. |
 | `overbrainer_eval_loss` | gauge | `run_id` | Last evaluation loss. |
 | `overbrainer_learning_rate` | gauge | `run_id` | Last learning rate. |

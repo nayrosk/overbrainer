@@ -4,7 +4,7 @@ use std::process::Command;
 use overbrainer::config::{EnvSource, Settings, Training, load};
 use overbrainer::dataset::DataFiles;
 use overbrainer::train::{
-    Artifacts, Axolotl, Resume, TrainError, Trainer, reasoning_template_warning, to_yaml,
+    Artifacts, Axolotl, JobStage, Resume, TrainError, Trainer, reasoning_template_warning, to_yaml,
 };
 use serde_json::Value;
 
@@ -131,6 +131,7 @@ fn full_fine_tuning_has_no_adapter_keys_and_no_eval_without_eval_data() -> TestR
         assert!(config.get(key).is_none(), "{key} present");
     }
     assert_eq!(config["saves_per_epoch"], 1);
+    assert_eq!(trainer.stages(), [JobStage::Train]);
     assert_eq!(
         trainer.commands(),
         vec![vec![
@@ -200,6 +201,8 @@ fn commands_env_and_artifacts() -> TestResult {
     // The merge is skipped once the job stopped with a snapshot.
     assert_eq!(trainer.stop_marker(), Some("snapshot.json"));
     assert_eq!(trainer.metrics_file(), "metrics.jsonl");
+    // Each command writes its stage event first.
+    assert_eq!(trainer.stages(), [JobStage::Train, JobStage::Merge]);
     assert_eq!(
         trainer.artifacts(),
         Artifacts {
