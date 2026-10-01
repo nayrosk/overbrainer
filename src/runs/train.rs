@@ -1027,6 +1027,8 @@ mod tests {
         polls: AtomicU32,
         /// Every file written with `put_file`, with its content.
         puts: std::sync::Mutex<Vec<(String, String)>>,
+        /// How reads of the snapshot request answer.
+        request_reads: RequestReads,
     }
 
     impl Fake {
@@ -1048,8 +1050,18 @@ mod tests {
                 running_polls: 0,
                 polls: AtomicU32::new(0),
                 puts: std::sync::Mutex::new(Vec::new()),
+                request_reads: RequestReads::Answered,
             }
         }
+    }
+
+    /// How the fake answers reads of the snapshot request.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RequestReads {
+        /// With what `put_file` wrote there, or nothing.
+        Answered,
+        /// Never: the read hangs.
+        Hung,
     }
 
     fn broken(action: &'static str) -> ExecError {
@@ -1106,16 +1118,20 @@ mod tests {
             offset: u64,
             limit: u64,
         ) -> impl Future<Output = Result<Vec<u8>, ExecError>> + Send {
+            use futures::future::{Either, pending};
             if path.ends_with(SNAPSHOT_FILE) {
-                return ready(Ok(self.proof.clone().into_bytes()));
+                return Either::Right(ready(Ok(self.proof.clone().into_bytes())));
             }
             if path.ends_with(crate::train::SNAPSHOT_REQUEST) {
+                if self.request_reads == RequestReads::Hung {
+                    return Either::Left(pending());
+                }
                 let request = self.puts.lock().ok().and_then(|puts| {
                     puts.iter()
                         .rfind(|(put, _)| put == path)
                         .map(|(_, content)| content.clone().into_bytes())
                 });
-                return ready(Ok(request.unwrap_or_default()));
+                return Either::Right(ready(Ok(request.unwrap_or_default())));
             }
             let read = self.reads.fetch_add(1, Ordering::SeqCst);
             let start = usize::try_from(offset).unwrap_or(self.metrics.len());
@@ -1126,11 +1142,11 @@ mod tests {
                 .unwrap_or_default()
                 .to_vec();
             bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-            ready(if self.failing_read == Some(read) {
+            Either::Right(ready(if self.failing_read == Some(read) {
                 Err(broken("read"))
             } else {
                 Ok(bytes)
-            })
+            }))
         }
 
         fn status(
@@ -2308,6 +2324,27 @@ mod tests {
                 "{written:?} {lasts}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_follow_ends_with_its_job_while_a_request_read_hangs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::runs::{StopLimits, with_request_watch};
+        let job = job()?;
+        let mut fake = Fake::new(JobStatus::Running);
+        fake.request_reads = RequestReads::Hung;
+        let limits = StopLimits {
+            proof: Duration::from_secs(100),
+            end: Duration::from_secs(50),
+        };
+        let flow = async {
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            Ok::<_, ExecError>(())
+        };
+        let watched = with_request_watch(&fake, &job, limits, Duration::from_secs(10), flow);
+        tokio::time::timeout(Duration::from_secs(60), watched).await??;
+        assert_eq!(fake.cancels.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
