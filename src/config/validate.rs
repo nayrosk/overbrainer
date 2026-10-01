@@ -259,8 +259,8 @@ fn check_export(settings: &Settings, problems: &mut Vec<String>) {
         .is_some_and(|name| !is_ollama_name(name))
     {
         problems.push(
-            "export.ollama_name: not an Ollama model name ([namespace/]model[:tag] of letters, \
-             digits, '.', '_' and '-')"
+            "export.ollama_name: not an Ollama model name ([host/][namespace/]model[:tag], each part \
+             of letters, digits, '_', '-' and '.')"
                 .to_string(),
         );
     }
@@ -1397,8 +1397,8 @@ mod tests {
                 "export.quantize: unknown type `Q4`; one of Q4_K_M, Q4_K_S, Q5_K_M, Q5_K_S, Q6_K, \
                  Q8_0, Q3_K_M, Q2_K, F16, BF16"
                     .to_string(),
-                "export.ollama_name: not an Ollama model name ([namespace/]model[:tag] of \
-                 letters, digits, '.', '_' and '-')"
+                "export.ollama_name: not an Ollama model name ([host/][namespace/]model[:tag], \
+                 each part of letters, digits, '_', '-' and '.')"
                     .to_string(),
             ]
         );
@@ -1411,13 +1411,38 @@ mod tests {
 
     #[test]
     fn ollama_names_follow_ollama_s_rules() {
-        for name in ["mentor", "me/mentor:q4", "mentor:latest", "a.b_c-d"] {
+        for name in [
+            "mentor",
+            "me/mentor:q4",
+            "mentor:latest",
+            "a.b_c-d",
+            "_x",
+            "registry.ollama.ai/library/mentor:q4",
+            "https://localhost:11434/me/mentor:v1.2",
+        ] {
             assert!(is_ollama_name(name), "{name}");
         }
-        for name in ["", ":tag", "-x", "a b", "a:b:c", "a:b/c", "x;rm"] {
+        for name in [
+            "",
+            ":tag",
+            "-x",
+            "a b",
+            "a:b:c",
+            "a:b/c",
+            "x;rm",
+            "a//b",
+            "a/",
+            "/a",
+            "a:",
+            "a/../b",
+            "a/b/c/d",
+            "my.ns/mentor",
+            "a/b:c:d",
+        ] {
             assert!(!is_ollama_name(name), "{name}");
         }
-        assert!(!is_ollama_name(&"a".repeat(129)));
+        assert!(is_ollama_name(&"a".repeat(80)));
+        assert!(!is_ollama_name(&"a".repeat(81)));
     }
 
     #[test]

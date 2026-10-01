@@ -313,8 +313,8 @@ fn ollama_name(text: &str) -> Result<String, String> {
         Ok(text.to_string())
     } else {
         Err(
-            "not an Ollama model name ([namespace/]model[:tag] of letters, digits, '.', '_' \
-             and '-')"
+            "not an Ollama model name ([host/][namespace/]model[:tag], each part of letters, \
+             digits, '_', '-' and '.')"
                 .to_string(),
         )
     }
@@ -826,6 +826,7 @@ mod tests {
         assert_eq!((defaults.quantize, defaults.ollama), (None, None));
         assert!(command(&["export", "r1", "--quantize", "Q4"]).is_err());
         assert!(command(&["export", "r1", "--ollama", "bad name"]).is_err());
+        assert!(command(&["export", "r1", "--ollama", "a//b"]).is_err());
         assert!(command(&["export"]).is_err());
         Ok(())
     }

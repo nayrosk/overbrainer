@@ -706,23 +706,62 @@ fn default_quantize() -> String {
     DEFAULT_QUANTIZE.to_string()
 }
 
-/// Longest Ollama model name [`is_ollama_name`] accepts.
-pub const OLLAMA_NAME_MAX: usize = 128;
+/// A part of an Ollama model name, as Ollama's `types/model/name.go` tells
+/// them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OllamaPart {
+    Host,
+    Namespace,
+    Model,
+    Tag,
+}
 
-/// Whether `name` can name an Ollama model, `[namespace/]model[:tag]`: ASCII
-/// letters, digits, `.`, `_`, `-` and `/`, starting with a letter or a digit,
-/// with at most one `:` before a tag, and at most [`OLLAMA_NAME_MAX`]
-/// characters. Such a name is also safe on a command line.
+/// Whether `text` is a valid `kind` part of an Ollama model name, by
+/// `isValidPart` of Ollama's `types/model/name.go`: 1 to 80 characters (350
+/// for a host), the first an ASCII letter, digit or `_`, the others also `-`,
+/// `.` (not in a namespace) or `:` (in a host only).
+fn ollama_part(kind: OllamaPart, text: &str) -> bool {
+    let max = if kind == OllamaPart::Host { 350 } else { 80 };
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    (1..=max).contains(&text.len())
+        && text.starts_with(word)
+        && text.chars().all(|c| {
+            word(c)
+                || c == '-'
+                || (c == '.' && kind != OllamaPart::Namespace)
+                || (c == ':' && kind == OllamaPart::Host)
+        })
+}
+
+/// Whether `name` is a valid Ollama model name, `[host/][namespace/]model[:tag]`,
+/// split and checked as Ollama's `types/model/name.go` does: the tag after
+/// the last `:` when it comes after the last `/`, the model after the last
+/// `/`, then the namespace, then the host (an optional `scheme://` before it
+/// is dropped). Each part present must be valid (see `ollama_part`): an
+/// empty one, such as in `a//b` or `a/`, is refused. Such a name is also
+/// safe on a command line.
 #[must_use]
 pub fn is_ollama_name(name: &str) -> bool {
-    let (model, tag) = name.split_once(':').unwrap_or((name, "x"));
-    let part = |text: &str| {
-        text.starts_with(|c: char| c.is_ascii_alphanumeric())
-            && text
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+    let (rest, tag) = match (name.rfind(':'), name.rfind('/')) {
+        (Some(colon), slash) if slash.is_none_or(|slash| colon > slash) => {
+            (&name[..colon], Some(&name[colon + 1..]))
+        },
+        _ => (name, None),
     };
-    name.len() <= OLLAMA_NAME_MAX && part(model) && part(tag) && !tag.contains('/')
+    let (rest, model) = match rest.rsplit_once('/') {
+        Some((rest, model)) => (Some(rest), model),
+        None => (None, rest),
+    };
+    let (host, namespace) = match rest.map(|rest| rest.rsplit_once('/')) {
+        None => (None, None),
+        Some(None) => (None, rest),
+        Some(Some((host, namespace))) => (Some(host), Some(namespace)),
+    };
+    let host = host.map(|host| host.split_once("://").map_or(host, |(_, host)| host));
+    ollama_part(OllamaPart::Model, model)
+        && tag.is_none_or(|tag| ollama_part(OllamaPart::Tag, tag))
+        && namespace.is_none_or(|namespace| ollama_part(OllamaPart::Namespace, namespace))
+        && host.is_none_or(|host| ollama_part(OllamaPart::Host, host))
 }
 
 /// The Prometheus endpoint.
