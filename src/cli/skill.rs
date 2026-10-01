@@ -141,7 +141,7 @@ mod tests {
     fn frontmatter_follows_the_agent_skills_specification() -> Result<(), String> {
         assert_eq!(field("name"), Some("overbrainer"));
         let description = field("description").ok_or("no description")?;
-        assert!(!description.is_empty());
+        assert_ne!(description, "");
         assert!(description.chars().count() <= 1024);
         // A plain YAML scalar cannot hold ": ".
         assert!(!description.contains(": "));
@@ -293,7 +293,7 @@ mod tests {
             .match_indices("https://github.com/nayrosk/overbrainer/blob/")
             .map(|(i, _)| &SKILL[i..])
             .collect();
-        assert!(!links.is_empty());
+        assert_ne!(links, [] as [&str; 0]);
         for link in links {
             let link = &link[..link.find(')').unwrap_or(link.len())];
             assert!(link.contains(&tag), "{link}");

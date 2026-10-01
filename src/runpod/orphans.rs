@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn the_table_aligns_its_columns() {
-        assert!(table(&[]).is_empty());
+        assert_eq!(table(&[]), [] as [String; 0]);
         let lines = table(&[row(
             "20260921-090000-ffff",
             RowKind::Ended,

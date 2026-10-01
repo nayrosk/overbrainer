@@ -735,7 +735,7 @@ mod tests {
             Id::question(&borrowing_id(), "What is a shared borrow?")
         );
         assert_eq!(data.questions[0].subtopic_id, borrowing_id());
-        assert!(data.answers.is_empty());
+        assert_eq!(data.answers, [] as [crate::dataset::types::Example; 0]);
         assert_eq!(change.touched, Touched::QUESTIONS.and(Touched::ANSWERS));
         assert_eq!(
             change.message,
@@ -1096,8 +1096,8 @@ mod tests {
         };
         let change = data.delete(&Deletion::Subtopic(borrowing_id()), expected)?;
         assert_eq!(data.subtopics, [subtopic("Lifetimes")]);
-        assert!(data.questions.is_empty());
-        assert!(data.answers.is_empty());
+        assert_eq!(data.questions, [] as [crate::dataset::types::Question; 0]);
+        assert_eq!(data.answers, [] as [crate::dataset::types::Example; 0]);
         assert_eq!(
             change.append,
             [Rejected::Subtopic {
@@ -1128,7 +1128,7 @@ mod tests {
         };
         let change = data.delete(&Deletion::Question(answered_id()), expected)?;
         assert_eq!(data.questions.len(), 1);
-        assert!(data.answers.is_empty());
+        assert_eq!(data.answers, [] as [crate::dataset::types::Example; 0]);
         assert_eq!(
             change.append,
             [Rejected::Question {
@@ -1166,8 +1166,8 @@ mod tests {
         };
         let change = data.delete(&Deletion::Answer(answered_id()), expected)?;
         assert_eq!(data.questions.len(), 2);
-        assert!(data.answers.is_empty());
-        assert!(change.append.is_empty());
+        assert_eq!(data.answers, [] as [crate::dataset::types::Example; 0]);
+        assert_eq!(change.append, [] as [crate::dataset::rejected::Rejected; 0]);
         assert_eq!(change.touched, Touched::ANSWERS);
         assert_eq!(
             change.message,
@@ -1185,9 +1185,9 @@ mod tests {
             answers: 1,
         };
         let change = data.delete(&Deletion::MissingSubtopic(TOPIC.into()), expected)?;
-        assert!(data.questions.is_empty());
-        assert!(data.answers.is_empty());
-        assert!(change.append.is_empty());
+        assert_eq!(data.questions, [] as [crate::dataset::types::Question; 0]);
+        assert_eq!(data.answers, [] as [crate::dataset::types::Example; 0]);
+        assert_eq!(change.append, [] as [crate::dataset::rejected::Rejected; 0]);
         assert_eq!(
             change.message,
             "2 questions whose subtopic no longer exists deleted, and their 1 answer"
@@ -1281,7 +1281,7 @@ mod tests {
         let change = data.delete(&Deletion::MissingSubtopic(TOPIC.into()), expected)?;
         assert_eq!(data.questions, [orphan_question]);
         assert_eq!(data.answers, [orphan_answer]);
-        assert!(change.append.is_empty());
+        assert_eq!(change.append, [] as [crate::dataset::rejected::Rejected; 0]);
         Ok(())
     }
 
@@ -1328,8 +1328,11 @@ mod tests {
         data.save(&files, &change)?;
         let on_disk = Dataset::read(&files)?;
         assert_eq!(on_disk.subtopics, [subtopic("Lifetimes")]);
-        assert!(on_disk.questions.is_empty());
-        assert!(on_disk.answers.is_empty());
+        assert_eq!(
+            on_disk.questions,
+            [] as [crate::dataset::types::Question; 0]
+        );
+        assert_eq!(on_disk.answers, [] as [crate::dataset::types::Example; 0]);
         assert_eq!(
             on_disk.rejected,
             [Rejected::Subtopic {

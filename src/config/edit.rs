@@ -1275,7 +1275,7 @@ runtime = "native"
         validate(&doc)?;
 
         assert!(doc.remove_topic(0));
-        assert!(doc.topic_names().is_empty());
+        assert_eq!(doc.topic_names(), [] as [String; 0]);
         assert!(!doc.text().contains("[[topics]]"));
         Ok(())
     }

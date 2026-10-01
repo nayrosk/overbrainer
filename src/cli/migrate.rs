@@ -424,7 +424,7 @@ mod tests {
             std::fs::read_to_string(dir.path().join(GITIGNORE))?,
             "/.overbrainer/\n"
         );
-        assert!(history::read(dir.path())?.is_empty());
+        assert_eq!(history::read(dir.path())?, [] as [crate::history::Entry; 0]);
         Ok(())
     }
 
@@ -467,7 +467,7 @@ mod tests {
             ),
             Ok(lines) => return Err(format!("expected a refusal, got {lines:?}").into()),
         }
-        assert!(history::read(dir.path())?.is_empty());
+        assert_eq!(history::read(dir.path())?, [] as [crate::history::Entry; 0]);
         Ok(())
     }
 

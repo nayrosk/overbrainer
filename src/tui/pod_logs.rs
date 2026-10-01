@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(read.offset, first.len() as u64);
         assert!(!read.restarted);
         let again = read_pod_log(dir.path(), RUN, read.offset);
-        assert!(again.lines.is_empty());
+        assert_eq!(again.lines, [] as [crate::runpod::PodLogLine; 0]);
         // Shorter than the offset: read from the start again.
         let restarted = read_pod_log(dir.path(), RUN, 10_000);
         assert!(restarted.restarted);
@@ -307,7 +307,10 @@ mod tests {
         let mut app = app();
         app.view = View::Logs;
         // No run selected: nothing to show, the source stays.
-        assert!(app.on_input(&key(KeyCode::Char('s'))).is_empty());
+        assert_eq!(
+            app.on_input(&key(KeyCode::Char('s'))),
+            [] as [crate::tui::app::Effect; 0]
+        );
         assert_eq!(app.log_view.source, LogSource::Overbrainer);
         app.training.runs = vec![RunRow {
             record: run(RUN, "gpu_cloud", RunState::Running),
@@ -320,7 +323,10 @@ mod tests {
         assert_eq!(run, RUN);
         assert_eq!(app.log_view.source, LogSource::Pod);
         // One read at a time.
-        assert!(app.read_pod_log_when_due().is_empty());
+        assert_eq!(
+            app.read_pod_log_when_due(),
+            [] as [crate::tui::app::Effect; 0]
+        );
         let read = PodLogRead {
             run: RUN.into(),
             offset: 300,

@@ -1000,7 +1000,7 @@ async fn a_rejected_key_stops_the_answers_stage() -> TestResult {
     let result = pipeline::answers(&project.ctx(false), Arc::clone(&parent)).await;
     assert!(matches!(result, Err(PipelineError::Llm { .. })));
     let examples: Vec<Example> = read(&project.files.answers)?;
-    assert!(examples.is_empty());
+    assert_eq!(examples, [] as [overbrainer::dataset::Example; 0]);
     Ok(())
 }
 
@@ -1303,7 +1303,10 @@ async fn a_fully_filled_topic_is_not_embedded_again() -> TestResult {
     })
     .await?;
     assert_eq!((stats.done, stats.skipped), (0, 2));
-    assert!(generator.client.requests().is_empty());
+    assert_eq!(
+        generator.client.requests(),
+        [] as [overbrainer::llm::CompletionRequest; 0]
+    );
     assert_eq!(
         embedder.calls.load(Ordering::SeqCst),
         0,

@@ -5254,7 +5254,7 @@ mod tests {
         );
         assert_eq!(app.gpu_catalog, None, "nor kept");
         app.on_done(id, Ok(Done::Catalog(Ok(gpus_listed()?))));
-        assert!(app.work().is_empty());
+        assert_eq!(app.work(), [] as [String; 0]);
         assert!(app.gpu_catalog.is_some(), "kept for the hints");
         let effects = press(&mut app, &[KeyCode::Char('J'), KeyCode::Enter]);
         assert_eq!(app.overlay, None);

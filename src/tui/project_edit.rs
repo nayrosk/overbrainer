@@ -2057,7 +2057,10 @@ mod tests {
             assert_eq!(app.project_view.form, None, "{code}");
             assert_eq!(status(&app), "refused: overbrainer.toml is being saved");
         }
-        assert!(app.on_input(&key(KeyCode::Enter)).is_empty());
+        assert_eq!(
+            app.on_input(&key(KeyCode::Enter)),
+            [] as [crate::tui::app::Effect; 0]
+        );
         assert_eq!(app.project_view.form, None);
         assert_eq!(written(dir.path())?, PROJECT_CONFIG, "the task writes");
         Ok(())
@@ -2262,7 +2265,10 @@ mod tests {
         let (_dir, mut app) = editing_app()?;
         app.pipeline_task = Some(TaskId(7));
         app.pipeline.started(Command::Split, 8);
-        assert!(press(&mut app, &[KeyCode::Char('E')]).is_empty());
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('E')]),
+            [] as [crate::tui::app::Effect; 0]
+        );
         assert!(
             status(&app).ends_with("; E edits the whole file"),
             "{}",
@@ -2328,7 +2334,7 @@ mod tests {
         let targets: Vec<&str> = TargetKind::ALL.iter().map(|kind| kind.as_str()).collect();
         assert_eq!(Addable::Target.kinds(), targets.as_slice());
         assert_eq!(Addable::Provider.kinds(), ["openai", "anthropic"]);
-        assert!(Addable::Topic.kinds().is_empty());
+        assert_eq!(Addable::Topic.kinds(), [] as [&str; 0]);
     }
 
     #[test]
@@ -2490,7 +2496,10 @@ mod tests {
             crate::tui::training::Follow::new(crate::tui::training::Job::Attach, "20260921-a1");
         follow.watching = true;
         app.training.tasks.insert(TaskId(9), follow);
-        assert!(press(&mut app, &[KeyCode::Char('E')]).is_empty());
+        assert_eq!(
+            press(&mut app, &[KeyCode::Char('E')]),
+            [] as [crate::tui::app::Effect; 0]
+        );
         assert_eq!(
             status(&app),
             "refused: run 20260921-a1 uses the training table; E edits the whole file"
@@ -3026,7 +3035,10 @@ mod tests {
         follow.watching = true;
         app.training.tasks.insert(TaskId(9), follow);
         select(&mut app, "targets.gpu_cloud.gpu_types")?;
-        assert!(press(&mut app, &[KeyCode::Enter]).is_empty());
+        assert_eq!(
+            press(&mut app, &[KeyCode::Enter]),
+            [] as [crate::tui::app::Effect; 0]
+        );
         assert!(!picker_open(&app));
         assert_eq!(
             status(&app),
@@ -3085,7 +3097,10 @@ mod tests {
         chars(&mut app, "box");
         press(&mut app, &[KeyCode::Enter, KeyCode::Enter]);
         select(&mut app, "targets.box.image")?;
-        assert!(press(&mut app, &[KeyCode::Enter]).is_empty());
+        assert_eq!(
+            press(&mut app, &[KeyCode::Enter]),
+            [] as [crate::tui::app::Effect; 0]
+        );
         assert!(!picker_open(&app));
         assert!(matches!(app.project_view.form, Some(Form::Value { .. })));
         Ok(())
@@ -3213,7 +3228,10 @@ mod tests {
         let config = ProjectConfig::new(PROJECT_CONFIG, &app.env)?;
         app.set_config(config);
         select(&mut app, "targets.gpu_cloud.gpu_types")?;
-        assert!(press(&mut app, &[KeyCode::Enter]).is_empty());
+        assert_eq!(
+            press(&mut app, &[KeyCode::Enter]),
+            [] as [crate::tui::app::Effect; 0]
+        );
         assert!(!picker_open(&app));
         assert_eq!(
             status(&app),

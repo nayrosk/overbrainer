@@ -788,7 +788,7 @@ mod tests {
         let back: PodRecord = serde_json::from_value(json)?;
         assert_eq!(back, record);
         let old: PodRecord = serde_json::from_value(empty)?;
-        assert!(old.stray_pods.is_empty());
+        assert_eq!(old.stray_pods, [] as [crate::runpod::types::PodId; 0]);
         Ok(())
     }
 

@@ -265,7 +265,7 @@ async fn an_answer_that_is_not_an_event_stream_is_refused() -> TestResult {
         matches!(result, Err(LogError::Api(ApiError::InvalidResponse(_)))),
         "{result:?}"
     );
-    assert!(kept.lines.is_empty());
+    assert_eq!(kept.lines, [] as [overbrainer::runpod::PodLogLine; 0]);
     Ok(())
 }
 

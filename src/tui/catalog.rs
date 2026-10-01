@@ -916,7 +916,7 @@ mod tests {
         let ranks: Vec<&[usize]> = entries.iter().map(|entry| entry.ranks.as_slice()).collect();
         assert_eq!(ranks, [&[1][..], &[0], &[2]]);
         assert_eq!(CatalogKind::DataCenters.spec().orders, ["ID", "region"]);
-        assert!(CatalogKind::Volumes.spec().orders.is_empty());
+        assert_eq!(CatalogKind::Volumes.spec().orders, [] as [&str; 0]);
         Ok(())
     }
 

@@ -185,7 +185,7 @@ async fn a_detached_job_gets_its_secret_and_reports_its_exit_code() -> TestResul
     let mut tail = executor.tail(&format!("{dir}/metrics.jsonl"), 4);
     assert_eq!(tail.read().await?, vec!["two".to_string()]);
     assert_eq!(tail.offset(), 8);
-    assert!(tail.read().await?.is_empty());
+    assert_eq!(tail.read().await?, [] as [String; 0]);
     Ok(())
 }
 
@@ -323,11 +323,9 @@ async fn read_from_honours_the_limit() -> TestResult {
     assert_eq!(executor.read_from(&path, 8, 100).await?, b"89");
     assert_eq!(executor.read_from(&path, 0, 0).await?, b"");
     assert_eq!(executor.read_from(&path, 20, 5).await?, b"");
-    assert!(
-        executor
-            .read_from(&format!("{path}.missing"), 0, 5)
-            .await?
-            .is_empty()
+    assert_eq!(
+        executor.read_from(&format!("{path}.missing"), 0, 5).await?,
+        [] as [u8; 0]
     );
     Ok(())
 }

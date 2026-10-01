@@ -591,7 +591,10 @@ mod tests {
             };
             id = next;
         }
-        assert!(end(&mut app, id, Ok(())).is_empty());
+        assert_eq!(
+            end(&mut app, id, Ok(())),
+            [] as [(crate::tui::tasks::TaskId, crate::tui::tasks::Task); 0]
+        );
         assert_eq!(
             status(&app),
             "✓ auto done after split: no [training] in overbrainer.toml"

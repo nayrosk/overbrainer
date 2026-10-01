@@ -288,7 +288,7 @@ async fn pod_ls_prints_the_table_on_stdout() -> TestResult {
     let ended = row(ENDED).ok_or("no ended row")?;
     assert!(ended.ends_with("run succeeded, not deleted"), "{ended}");
     assert!(!stdout.contains("rp_cli_key_4411"));
-    assert!(deletes(&server).await.is_empty());
+    assert_eq!(deletes(&server).await, [] as [String; 0]);
     Ok(())
 }
 
@@ -309,7 +309,7 @@ async fn pod_ls_says_when_the_account_has_no_overbrainer_pod() -> TestResult {
         String::from_utf8(output.stdout)?,
         "pod: no overbrainer pod on this account\n"
     );
-    assert!(deletes(&server).await.is_empty());
+    assert_eq!(deletes(&server).await, [] as [String; 0]);
     Ok(())
 }
 
@@ -328,8 +328,8 @@ async fn pod_rm_keeps_the_training_pod_of_a_running_run_unless_forced() -> TestR
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
-    assert!(refused.stdout.is_empty());
-    assert!(deletes(&server).await.is_empty());
+    assert_eq!(refused.stdout, [] as [u8; 0]);
+    assert_eq!(deletes(&server).await, [] as [String; 0]);
 
     let mut cmd = overbrainer(dir.path(), &server)?;
     cmd.args(["pod", "rm", RUNNING, "--force"]);
@@ -703,7 +703,7 @@ async fn pod_catalog_commands_need_the_api_key() -> TestResult {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     Ok(())
 }
 

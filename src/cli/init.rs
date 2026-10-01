@@ -227,6 +227,9 @@ mod tests {
             missing_entries("target/\n .env \n", ".env\n/data/\n\n/runs/\n"),
             vec!["/data/", "/runs/"]
         );
-        assert!(missing_entries(".env\n/data/\n/runs/\n", ".env\n/data/\n/runs/\n").is_empty());
+        assert_eq!(
+            missing_entries(".env\n/data/\n/runs/\n", ".env\n/data/\n/runs/\n"),
+            [] as [&str; 0]
+        );
     }
 }
