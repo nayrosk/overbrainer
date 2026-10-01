@@ -1,7 +1,9 @@
 """Axolotl plugin shipped by overbrainer.
 
 Appends one JSON line per Trainer log to the file named by $OVERBRAINER_METRICS,
-from the main process only. overbrainer tails that file for live metrics.
+from the main process only. overbrainer tails that file for live metrics. While an
+evaluation runs, an "eval" line says how far it got, at most every 2 seconds; once
+the training loop ends, an "end" line says the trainer's final work began.
 
 When the file named by $OVERBRAINER_SNAPSHOT appears (the snapshot request),
 saves a checkpoint at the end of the current step, stops training, and writes
@@ -24,6 +26,8 @@ except ImportError:
 
 FIELDS = ("loss", "eval_loss", "learning_rate", "grad_norm")
 
+EVAL_EVERY = 2.0
+
 SNAPSHOT_FILE = "snapshot.json"
 REASONS = ("requested", "deadline", "cost", "disk")
 
@@ -36,10 +40,21 @@ def _number(value):
     return value if math.isfinite(value) else None
 
 
+def _length(loader):
+    """The number of batches of `loader`, None when it cannot tell."""
+    try:
+        length = len(loader)
+    except Exception:
+        return None
+    return length if isinstance(length, int) and length > 0 else None
+
+
 class OverbrainerMetricsCallback(TrainerCallback):
     def __init__(self, path):
         self.path = path
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self.eval_step = 0
+        self.eval_written = None
 
     def _write(self, record):
         with open(self.path, "a", encoding="utf-8") as file:
@@ -66,6 +81,45 @@ class OverbrainerMetricsCallback(TrainerCallback):
             if field in logs:
                 record[field] = _number(logs[field])
         self._write(record)
+
+    # The progress lines below are a convenience: they never raise, so a
+    # failure to write them never stops a training.
+
+    def on_prediction_step(self, args, state, control, **kwargs):
+        try:
+            if not state.is_world_process_zero:
+                return
+            self.eval_step += 1
+            now = time.time()
+            if self.eval_written is not None and now - self.eval_written < EVAL_EVERY:
+                return
+            self.eval_written = now
+            record = {"event": "eval", "time": now, "step": self.eval_step}
+            total = _length(kwargs.get("eval_dataloader"))
+            if total is not None:
+                record["total"] = total
+            self._write(record)
+        except Exception:
+            pass
+
+    def _evaluated(self):
+        self.eval_step = 0
+        self.eval_written = None
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        self._evaluated()
+
+    def on_predict(self, args, state, control, **kwargs):
+        self._evaluated()
+
+    def on_train_end(self, args, state, control, **kwargs):
+        try:
+            if state.is_world_process_zero:
+                self._write(
+                    {"event": "end", "time": time.time(), "step": state.global_step}
+                )
+        except Exception:
+            pass
 
 
 def _reason(path):
