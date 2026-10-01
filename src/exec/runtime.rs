@@ -4,6 +4,7 @@ use secrecy::SecretString;
 
 use super::{Container, JobCommand, quote};
 use crate::config::{DEFAULT_IMAGE, Engine, Runtime, Target};
+use crate::train::JobStage;
 
 /// Where a container sees the run directory.
 pub const CONTAINER_ROOT: &str = "/workspace/run";
@@ -52,8 +53,34 @@ pub struct JobSpec<'a> {
     /// command ended skips the others (see
     /// [`Trainer::stop_marker`](crate::train::Trainer::stop_marker)).
     pub stop_marker: Option<&'a str>,
+    /// The stage of each command, written into a metrics file before it starts;
+    /// `None` writes nothing.
+    pub stages: Option<Stages<'a>>,
     /// Secret environment, passed through without its values on any command line.
     pub secrets: Vec<(String, SecretString)>,
+}
+
+/// The stage events of a job: one line in `file` before each command.
+#[derive(Debug, Clone, Copy)]
+pub struct Stages<'a> {
+    /// The metrics file, relative to the run directory (the job's working
+    /// directory in every runtime).
+    pub file: &'a str,
+    /// The stage of each command, in order; a command without one writes none.
+    pub names: &'a [JobStage],
+}
+
+/// A shell command appending the stage event of `stage` to `file`, a path
+/// relative to the job's working directory or absolute:
+/// `{"event":"stage","name":"merge","time":1790000000}`. It never fails: a
+/// line that cannot be written must not stop the job.
+#[must_use]
+pub fn stage_command(stage: JobStage, file: &str) -> String {
+    format!(
+        "{{ printf '{{\"event\":\"stage\",\"name\":\"%s\",\"time\":%s}}\\n' {} \"$(date +%s)\" >> {} || :; }}",
+        stage.name(),
+        shell_path(file)
+    )
 }
 
 impl JobRuntime {
@@ -169,10 +196,7 @@ fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>)
             .map(|(name, _)| format!("-e {}", quote(name))),
     );
     words.push(quote(image));
-    words.push(format!(
-        "sh -c {}",
-        quote(&chain(spec.commands, spec.stop_marker, quote))
-    ));
+    words.push(format!("sh -c {}", quote(&chain(spec, quote))));
     format!(
         "mkdir -p -- {} && {}",
         quote(spec.cache_dir),
@@ -197,7 +221,7 @@ fn native_script(venv: Option<&str>, env_file: Option<&str>, spec: &JobSpec<'_>)
             .collect();
         parts.push(format!("export {}", exports.join(" ")));
     }
-    parts.push(chain(spec.commands, spec.stop_marker, resolve));
+    parts.push(chain(spec, resolve));
     parts.join(" && ")
 }
 
@@ -216,24 +240,30 @@ fn export_word(name: &str, value: &str) -> String {
     }
 }
 
-/// `commands` joined with `&&`, each program resolved by `program` and each argument
-/// quoted. With a `stop_marker`, the commands after the first run only when that
-/// file does not exist once the first ended; the job then exits 0 without them.
-fn chain(
-    commands: &[Vec<String>],
-    stop_marker: Option<&str>,
-    program: impl Fn(&str) -> String,
-) -> String {
-    let lines: Vec<String> = commands
+/// The commands of `spec` joined with `&&`, each program resolved by `program`
+/// and each argument quoted, each after its stage event when `spec` has stages.
+/// With a stop marker, the commands after the first run only when that file
+/// does not exist once the first ended; the job then exits 0 without them.
+fn chain(spec: &JobSpec<'_>, program: impl Fn(&str) -> String) -> String {
+    let lines: Vec<String> = spec
+        .commands
         .iter()
-        .filter_map(|command| {
+        .enumerate()
+        .filter_map(|(index, command)| {
             let (first, args) = command.split_first()?;
             let mut words = vec![program(first)];
             words.extend(args.iter().map(|arg| quote(arg)));
-            Some(words.join(" "))
+            let line = words.join(" ");
+            let stage = spec
+                .stages
+                .and_then(|stages| Some((stages.file, *stages.names.get(index)?)));
+            Some(match stage {
+                Some((file, stage)) => format!("{} && {line}", stage_command(stage, file)),
+                None => line,
+            })
         })
         .collect();
-    match (stop_marker, lines.split_first()) {
+    match (spec.stop_marker, lines.split_first()) {
         (Some(marker), Some((first, rest))) if !rest.is_empty() => format!(
             "{first} && {{ [ -f {} ] || {{ {}; }}; }}",
             quote(marker),
@@ -265,6 +295,7 @@ mod tests {
             commands,
             env: &[],
             stop_marker: None,
+            stages: None,
             secrets: Vec::new(),
         }
     }
@@ -474,6 +505,123 @@ mod tests {
             ),
             "{script}"
         );
+        Ok(())
+    }
+
+    const STAGES: [JobStage; 2] = [JobStage::Train, JobStage::Merge];
+
+    fn staged(commands: &[Vec<String>]) -> JobSpec<'_> {
+        JobSpec {
+            stages: Some(Stages {
+                file: "metrics.jsonl",
+                names: &STAGES,
+            }),
+            ..spec(commands)
+        }
+    }
+
+    #[test]
+    fn a_stage_event_comes_before_each_command() {
+        let commands = commands();
+        let native = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        };
+        assert_eq!(
+            native.job(staged(&commands)).script,
+            "{ printf '{\"event\":\"stage\",\"name\":\"%s\",\"time\":%s}\\n' train \"$(date +%s)\" >> 'metrics.jsonl' || :; } && 'axolotl' 'train' 'axolotl.yaml' && { printf '{\"event\":\"stage\",\"name\":\"%s\",\"time\":%s}\\n' merge \"$(date +%s)\" >> 'metrics.jsonl' || :; } && 'axolotl' 'merge-lora' 'axolotl.yaml'"
+        );
+        let docker = JobRuntime::Container {
+            engine: Engine::Docker,
+            image: "img:1".into(),
+        };
+        let script = docker
+            .job(JobSpec {
+                stop_marker: Some("snapshot.json"),
+                ..staged(&commands)
+            })
+            .script;
+        assert!(
+            script.ends_with(
+                "sh -c '{ printf '\\''{\"event\":\"stage\",\"name\":\"%s\",\"time\":%s}\\n'\\'' train \"$(date +%s)\" >> '\\''metrics.jsonl'\\'' || :; } && '\\''axolotl'\\'' '\\''train'\\'' '\\''axolotl.yaml'\\'' && { [ -f '\\''snapshot.json'\\'' ] || { { printf '\\''{\"event\":\"stage\",\"name\":\"%s\",\"time\":%s}\\n'\\'' merge \"$(date +%s)\" >> '\\''metrics.jsonl'\\'' || :; } && '\\''axolotl'\\'' '\\''merge-lora'\\'' '\\''axolotl.yaml'\\''; }; }'"
+            ),
+            "{script}"
+        );
+        // A command past the stages given writes none.
+        let three = [commands.clone(), vec![vec!["true".to_string()]]].concat();
+        let script = native.job(staged(&three)).script;
+        assert!(script.ends_with("'axolotl.yaml' && 'true'"), "{script}");
+    }
+
+    #[test]
+    fn stage_events_land_in_the_metrics_file_as_parseable_lines()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if !sh_available() {
+            eprintln!("skipped: sh is not installed");
+            return Ok(());
+        }
+        let step = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let steps = vec![
+            step("[ -z \"$STOP\" ] || : > snapshot.json"),
+            step("printf b >> trail"),
+        ];
+        let job = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        }
+        .job(JobSpec {
+            stop_marker: Some("snapshot.json"),
+            ..staged(&steps)
+        });
+        for (stop, expected) in [
+            (false, vec![JobStage::Train, JobStage::Merge]),
+            (true, vec![JobStage::Train]),
+        ] {
+            let dir = tempfile::tempdir()?;
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(&job.script).current_dir(dir.path());
+            if stop {
+                command.env("STOP", "1");
+            } else {
+                command.env_remove("STOP");
+            }
+            assert!(command.status()?.success(), "{}", job.script);
+            let written = std::fs::read_to_string(dir.path().join("metrics.jsonl"))?;
+            let stages: Vec<JobStage> = written
+                .lines()
+                .map(|line| match crate::train::parse_line(line)? {
+                    crate::train::MetricLine::Stage { name, time } => {
+                        assert!(time > 1_000_000_000.0, "{line}");
+                        Ok(name)
+                    },
+                    other => Err(format!("not a stage line: {other:?}").into()),
+                })
+                .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+            assert_eq!(stages, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_stage_event_that_cannot_be_written_does_not_stop_the_job()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if !sh_available() {
+            eprintln!("skipped: sh is not installed");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let script = format!(
+            "{} && printf ran > trail",
+            stage_command(JobStage::Train, "missing/dir/metrics.jsonl")
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(dir.path())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        assert!(status.success(), "{script}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("trail"))?, "ran");
         Ok(())
     }
 

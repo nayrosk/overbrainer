@@ -100,4 +100,11 @@ pub trait Trainer {
     fn stop_marker(&self) -> Option<&'static str> {
         None
     }
+
+    /// The stage of each command of [`Trainer::commands`], in order: the job
+    /// writes its event into [`Trainer::metrics_file`] before the command
+    /// starts. Empty when the trainer writes no stage events.
+    fn stages(&self) -> Vec<JobStage> {
+        Vec::new()
+    }
 }

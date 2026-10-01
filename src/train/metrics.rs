@@ -71,8 +71,8 @@ pub enum MetricLine {
     },
     /// A training or evaluation log.
     Log(TrainMetric),
-    /// The job starts one of its commands; written by the job itself, not the
-    /// plugin (see [`stage_command`](crate::exec::stage_command)).
+    /// The job starts one of its commands; written by the job's own shell
+    /// before the command, not by the plugin.
     Stage {
         /// Unix time, in seconds.
         time: f64,
