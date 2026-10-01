@@ -677,7 +677,9 @@ async fn the_cost_cap_asks_for_a_snapshot_then_deletes_the_pod() -> TestResult {
         fs::write(pod.file("job.pid"), format!("{}\n", job.id()))?;
         fs::write(pod.file(".pod/lease"), "")?;
         fs::write(pod.file(".pod/snapshot_at"), (unix_now() - 1).to_string())?;
-        fs::write(pod.file(".pod/cost_cap_at"), (unix_now() + 3).to_string())?;
+        // 10 s ahead: a slow start of the watchdog still leaves it within the
+        // minute it logs, and the deletion comes soon after.
+        fs::write(pod.file(".pod/cost_cap_at"), (unix_now() + 10).to_string())?;
         let child = pod.start(
             shell,
             &server,
@@ -688,12 +690,16 @@ async fn the_cost_cap_asks_for_a_snapshot_then_deletes_the_pod() -> TestResult {
         })
         .await;
         assert!(asked, "{shell}: no snapshot request");
-        let (code, output) = finished(child, Duration::from_secs(15)).await?;
+        let (code, output) = finished(child, Duration::from_secs(30)).await?;
         job.kill()?;
         job.wait()?;
         assert_eq!(code, 0, "{shell}: {output}");
         assert!(
             output.contains("snapshot requested reason=cost"),
+            "{shell}: {output}"
+        );
+        assert!(
+            output.contains("max_cost_usd reached in 1 min: the pod is deleted then"),
             "{shell}: {output}"
         );
         assert!(

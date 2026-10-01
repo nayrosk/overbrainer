@@ -21,8 +21,8 @@ use super::provision::note_strays;
 use super::{
     BOOTSTRAP_LOG, CLIENT_KEY, CostCap, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId,
     PodKeys, PodPlan, PodRecord, PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget,
-    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, keep_file, provision, remove, sweep,
-    with_pod_logs, write_config,
+    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, keep_file, provision, remove,
+    short_cap_warning, sweep, with_pod_logs, write_config,
 };
 use crate::secrets::Redactor;
 
@@ -169,7 +169,8 @@ async fn provision_run(
 
 /// Hands the cost cap of `pod` to its watchdog before the job of `run` starts:
 /// when to stop the job with a snapshot and when to delete the pod, in files
-/// the watchdog reads every minute. Nothing to do without a cap, or for a kept
+/// the watchdog reads every minute, with a warning when the cap buys too little
+/// training ([`short_cap_warning`]). Nothing to do without a cap, or for a kept
 /// pod.
 ///
 /// # Errors
@@ -182,6 +183,11 @@ pub async fn arm_cost_cap<E: Executor>(
     pod: &PodRecord,
     run: &RunRecord,
 ) -> Result<(), PodError> {
+    if let (Some(usd), Some(rate), false) = (pod.max_cost_usd, pod.cost_per_hour, pod.keep)
+        && let Some(warning) = short_cap_warning(usd, rate)
+    {
+        tracing::warn!("{warning}");
+    }
     match pod.cost_cap() {
         Some(cap) => write_cost_cap(executor, cap, &run.remote_dir)
             .await
@@ -455,14 +461,36 @@ impl<'a> Lease<'a> {
         let written = executor.put_file(&path, SnapshotReason::Cost.name()).await;
         self.capped = written.is_ok();
         let note = match written {
-            Ok(()) => format!(
-                "the pod spent {:.0}% of max_cost_usd: its job is stopped with a snapshot",
-                super::SNAPSHOT_SHARE * 100.0
-            ),
+            Ok(()) => cap_snapshot_note(self.pod, unix_secs(SystemTime::now())),
             Err(error) => format!("cannot ask for the cost cap's snapshot: {error}"),
         };
         tracing::warn!("{note}");
     }
+}
+
+/// Why the job on `pod` is stopped with a snapshot for its cost cap at `now`
+/// (Unix seconds): it spent [`SNAPSHOT_SHARE`](super::SNAPSHOT_SHARE) of the
+/// cap, or the cap is [`SNAPSHOT_LEAD`](super::SNAPSHOT_LEAD) away at most,
+/// with what it spent so far.
+fn cap_snapshot_note(pod: &PodRecord, now: u64) -> String {
+    let (Some(cap), Some(usd), Some(spent)) = (pod.cost_cap(), pod.max_cost_usd, pod.spent_at(now))
+    else {
+        return "the pod neared max_cost_usd: its job is stopped with a snapshot".to_string();
+    };
+    let lead = super::SNAPSHOT_LEAD.as_secs();
+    if cap.delete_at.saturating_sub(cap.snapshot_at) > lead {
+        return format!(
+            "the pod spent ${spent:.2} of max_cost_usd ${usd:.2} ({:.0}%): its job is stopped \
+             with a snapshot",
+            super::SNAPSHOT_SHARE * 100.0
+        );
+    }
+    format!(
+        "the pod reaches max_cost_usd ${usd:.2} in {} min (${spent:.2} spent so far): its job \
+         is stopped with a snapshot {} min before the cap",
+        cap.delete_at.saturating_sub(now).div_ceil(60),
+        lead / 60
+    )
 }
 
 /// Whether the job on `pod` is due for its cost cap's snapshot at `now`.
@@ -1238,6 +1266,36 @@ mod tests {
         pod.max_cost_usd = None;
         assert_eq!(limit_reached(&pod, hours(6.0)), Some(MAX_HOURS_REACHED));
         assert_eq!(gone_by(&pod, hours(1.0)), DeletedBy::Unknown);
+    }
+
+    #[test]
+    fn the_cost_snapshot_says_why_it_is_due_with_the_amounts() {
+        let now = SystemTime::now();
+        let secs = unix_secs(now);
+        // The live test: $0.05 at $0.24/h buys 12.5 min, less than the lead,
+        // so the snapshot is due at once, at about 12% spent.
+        let mut pod = billed_pod(now, Some(0.05));
+        pod.cost_per_hour = Some(0.24);
+        pod.created_unix = Some(secs - 90);
+        assert_eq!(
+            cap_snapshot_note(&pod, secs),
+            "the pod reaches max_cost_usd $0.05 in 11 min ($0.01 spent so far): its job is \
+             stopped with a snapshot 15 min before the cap"
+        );
+        // $20 at $1/h: 95% comes first, 1 hour before the cap.
+        pod.max_cost_usd = Some(20.0);
+        pod.cost_per_hour = Some(1.0);
+        pod.created_unix = Some(secs - 68_400);
+        assert_eq!(
+            cap_snapshot_note(&pod, secs),
+            "the pod spent $19.00 of max_cost_usd $20.00 (95%): its job is stopped with a \
+             snapshot"
+        );
+        pod.cost_per_hour = None;
+        assert_eq!(
+            cap_snapshot_note(&pod, secs),
+            "the pod neared max_cost_usd: its job is stopped with a snapshot"
+        );
     }
 
     #[test]

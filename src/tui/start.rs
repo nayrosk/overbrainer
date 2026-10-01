@@ -11,7 +11,9 @@ use serde::de::IgnoredAny;
 
 use crate::config::{Adapter, CONFIG_FILE, ListOrAuto, Runtime, Settings, Source, Target};
 use crate::dataset::{DataFiles, read};
-use crate::runpod::{Availability, GpuType, ResolveError, RunpodTarget, resolve_with_floor};
+use crate::runpod::{
+    Availability, GpuType, ResolveError, RunpodTarget, resolve_with_floor, short_cap_warning,
+};
 use crate::runs::Runs;
 use crate::train::sizing::{Estimate, Fit, HF_URL, estimate_model, fit};
 use crate::train::{Outputs, reasoning_template_warning};
@@ -543,15 +545,37 @@ fn runpod_lines(spec: &RunpodTarget, catalog: Option<&Catalog>) -> Vec<String> {
     lines.push(center_line(spec, listed, floor, chosen.is_ok()));
     lines.push(max_hours_line(spec, listed, &ids));
     if let Some(usd) = spec.max_cost_usd {
+        let short = highest_rate(listed, &ids)
+            .0
+            .and_then(|rate| short_cap_warning(usd, rate * f64::from(count)))
+            .map_or_else(String::new, |warning| {
+                format!("; at the highest listed rate, {warning}")
+            });
         lines.push(format!(
             "{COST_CAP_LABEL}${usd:.2}: the job stops with a snapshot at {:.0}% ({} min before \
              the cap at the latest); the pod is deleted at 100%, with a snapshot nobody \
-             collected by then",
+             collected by then{short}",
             crate::runpod::SNAPSHOT_SHARE * 100.0,
             crate::runpod::SNAPSHOT_LEAD.as_secs() / 60
         ));
     }
     lines
+}
+
+/// The highest list price of the GPU types `ids` once `gpus` are read, and
+/// whether some of their prices are unknown.
+fn highest_rate(gpus: Option<&[GpuType]>, ids: &[String]) -> (Option<f64>, bool) {
+    let rates: Vec<Option<f64>> = ids
+        .iter()
+        .map(|id| {
+            gpus.and_then(|listed| listed.iter().find(|gpu| gpu.id == *id))
+                .and_then(GpuType::secure_price)
+        })
+        .collect();
+    (
+        rates.iter().flatten().copied().reduce(f64::max),
+        rates.contains(&None),
+    )
 }
 
 /// A warning naming the `chosen` GPU types with less VRAM than the estimate
@@ -711,15 +735,8 @@ fn center_line(
 /// `max_hours` of `spec`, with the most the run can cost at the highest list
 /// price of the GPU types `ids` once `gpus` are read.
 fn max_hours_line(spec: &RunpodTarget, gpus: Option<&[GpuType]>, ids: &[String]) -> String {
-    let rates: Vec<Option<f64>> = ids
-        .iter()
-        .map(|id| {
-            gpus.and_then(|listed| listed.iter().find(|gpu| gpu.id == *id))
-                .and_then(GpuType::secure_price)
-        })
-        .collect();
-    let highest = rates.iter().flatten().copied().reduce(f64::max);
-    let some_unknown = if rates.contains(&None) {
+    let (highest, unknown) = highest_rate(gpus, ids);
+    let some_unknown = if unknown {
         " (some prices unknown)"
     } else {
         ""
@@ -1096,6 +1113,45 @@ mod tests {
         });
         assert!(cap.is_some(), "{lines:?}");
         assert!(cap.is_some_and(|at| pinned(&lines).contains(&at)));
+    }
+
+    #[test]
+    fn a_cost_cap_too_small_for_the_listed_rate_is_warned_about()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let gpus = fixture()?;
+        let mut small = plan(true);
+        // $0.50 at $1.38/h buys about 22 min: 7 of training before the lead.
+        runpod(&mut small)?.spec.max_cost_usd = Some(0.5);
+        let lines = text(&small, Some(&gpus));
+        let cap = lines.iter().find(|line| line.starts_with(COST_CAP_LABEL));
+        assert_eq!(
+            cap.map(String::as_str),
+            Some(
+                "max_cost    $0.50: the job stops with a snapshot at 95% (15 min before the cap \
+                 at the latest); the pod is deleted at 100%, with a snapshot nobody collected by \
+                 then; at the highest listed rate, max_cost_usd $0.50 buys 22 min at $1.38/h: \
+                 the job is stopped with a snapshot 15 min before the cap, so it trains 7 min at \
+                 most; set max_cost_usd to $0.69 or more"
+            )
+        );
+        runpod(&mut small)?.spec.max_cost_usd = Some(0.69);
+        let lines = text(&small, Some(&gpus));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with(COST_CAP_LABEL) && line.ends_with("by then")),
+            "{lines:?}"
+        );
+        // No price yet: nothing to warn about.
+        runpod(&mut small)?.spec.max_cost_usd = Some(0.5);
+        let lines = text(&small, None);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with(COST_CAP_LABEL) && line.ends_with("by then")),
+            "{lines:?}"
+        );
+        Ok(())
     }
 
     #[test]

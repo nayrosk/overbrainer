@@ -60,8 +60,8 @@ pub use provision::{
     PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, resolve_target, sweep,
 };
 pub use record::{
-    Attempt, AttemptResult, CostCap, DeletedBy, POD_FILE, POD_RECORD_VERSION, PodRecord, PodState,
-    SNAPSHOT_LEAD, SNAPSHOT_SHARE, SshEndpoint, hours,
+    Attempt, AttemptResult, CostCap, DeletedBy, MIN_CAP_TIME, POD_FILE, POD_RECORD_VERSION,
+    PodRecord, PodState, SNAPSHOT_LEAD, SNAPSHOT_SHARE, SshEndpoint, hours, short_cap_warning,
 };
 pub use status::{DeleteReason, PodStatus};
 pub use target::{MIN_CUDA_VERSION, RunpodTarget, VOLUME_MOUNT, VOLUME_WORKDIR, WORKDIR};
