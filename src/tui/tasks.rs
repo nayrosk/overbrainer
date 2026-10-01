@@ -1202,7 +1202,7 @@ mod tests {
         Ok(())
     }
 
-    /// A fake `axolotl` (from `tests/cli_train.rs`): `train` waits for a
+    /// A fake `axolotl` (from `tests/it/cli_train.rs`): `train` waits for a
     /// `release` file next to `bin/`, then writes three metrics lines and an
     /// adapter.
     const FAKE_AXOLOTL: &str = r#"#!/bin/sh

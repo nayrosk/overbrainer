@@ -1,7 +1,7 @@
 //! Provisioning a run's pod against a local stub of the Runpod API: the ordered
 //! GPU list, `pod.json` written before each create, reconciliation of ambiguous
 //! creates, pods that never become ready, interruption, confirmed deletes. SSH
-//! readiness itself is covered against a real sshd in `tests/runpod_ssh.rs`.
+//! readiness itself is covered against a real sshd in `tests/it/runpod_ssh.rs`.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -23,9 +23,7 @@ use tokio::sync::broadcast::Receiver;
 use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-mod common;
-
-use common::SecretStore;
+use crate::common::SecretStore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
