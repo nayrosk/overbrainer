@@ -578,6 +578,12 @@ mod tests {
         assert_eq!(gguf_bits_tenths("Q8_0"), 85);
         assert_eq!(gguf_bits_tenths("BF16"), 160);
         assert_eq!(export_estimate(&QWEN3_4B).floor_gb(), 13);
+        // Qwen3-0.6B, its Hub size: any GPU of 8 GB or more holds its merge.
+        let small = ModelShape {
+            params: 751_632_384,
+            ..QWEN3_4B
+        };
+        assert_eq!(export_estimate(&small).floor_gb(), 5);
     }
 
     #[test]
