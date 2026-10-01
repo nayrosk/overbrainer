@@ -621,7 +621,7 @@ async fn nothing_is_created_after_ctrl_c() -> TestResult {
     harness.interrupted.store(true, Ordering::SeqCst);
     let (result, record) = harness.provision(&target(&["A"])).await?;
     assert!(matches!(result, Err(PodError::Interrupted)), "{result:?}");
-    assert!(record.attempts.is_empty());
+    assert_eq!(record.attempts, [] as [overbrainer::runpod::Attempt; 0]);
     assert!(
         harness
             .server
@@ -754,7 +754,7 @@ async fn a_network_volume_of_unknown_size_is_refused_before_any_create() -> Test
             )
         );
         assert!(harness.calls("POST").await.is_empty());
-        assert!(record.attempts.is_empty());
+        assert_eq!(record.attempts, [] as [overbrainer::runpod::Attempt; 0]);
     }
     Ok(())
 }
@@ -1241,7 +1241,7 @@ async fn nothing_in_stock_fails_before_any_create_call() -> TestResult {
         "no GPU type in stock on Runpod's Secure Cloud for gpu_types = \"auto\" (gpu_count = 1, min_vram_gb = 40)"
     );
     assert!(harness.calls("POST").await.is_empty());
-    assert!(record.attempts.is_empty());
+    assert_eq!(record.attempts, [] as [overbrainer::runpod::Attempt; 0]);
     Ok(())
 }
 

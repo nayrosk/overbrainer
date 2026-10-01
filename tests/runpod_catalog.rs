@@ -97,7 +97,10 @@ async fn a_gpu_count_below_one_asks_for_one() -> TestResult {
         .expect(1)
         .mount(&server)
         .await;
-    assert!(client(&server)?.list_gpu_types(0).await?.is_empty());
+    assert_eq!(
+        client(&server)?.list_gpu_types(0).await?,
+        [] as [overbrainer::runpod::GpuType; 0]
+    );
     Ok(())
 }
 
@@ -156,7 +159,10 @@ async fn data_centers_are_listed_with_their_gpu_availability() -> TestResult {
         centers[0].gpu_availability[1].availability,
         Availability::None
     );
-    assert!(centers[1].gpu_availability.is_empty());
+    assert_eq!(
+        centers[1].gpu_availability,
+        [] as [overbrainer::runpod::Stock; 0]
+    );
     Ok(())
 }
 

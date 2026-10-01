@@ -372,7 +372,10 @@ mod tests {
         buffer.push(line(Level::WARN, "w2"));
         assert_eq!(messages(&buffer.since(Level::WARN, 1)), ["e1", "w2"]);
         assert_eq!(messages(&buffer.since(Level::TRACE, 0)).len(), 4);
-        assert!(buffer.since(Level::WARN, 4).is_empty());
+        assert_eq!(
+            buffer.since(Level::WARN, 4),
+            [] as [crate::logging::LogLine; 0]
+        );
     }
 
     #[test]

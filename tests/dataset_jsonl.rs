@@ -17,7 +17,7 @@ fn subtopic(name: &str) -> Subtopic {
 fn missing_file_reads_as_empty() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let items: Vec<Subtopic> = read(&dir.path().join("none.jsonl"))?;
-    assert!(items.is_empty());
+    assert_eq!(items, [] as [overbrainer::dataset::Subtopic; 0]);
     Ok(())
 }
 

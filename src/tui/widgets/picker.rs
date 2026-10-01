@@ -900,7 +900,7 @@ mod tests {
         assert_eq!(ids(&picker), [AUTO, "b", "a", "c"]);
         assert!(picker.filter.is_none());
         keys(&mut picker, &[KeyCode::Char('/'), KeyCode::Char('z')]);
-        assert!(ids(&picker).is_empty());
+        assert_eq!(ids(&picker), [] as [String; 0]);
         keys(&mut picker, &[KeyCode::Backspace, KeyCode::Enter]);
         assert!(picker.filter.is_none(), "an empty filter goes");
     }

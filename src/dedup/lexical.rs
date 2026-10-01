@@ -148,7 +148,7 @@ mod tests {
         let again = lexical
             .admit(texts(&["How does the borrow checker handle loops?"]))
             .await?;
-        assert!(again.is_empty());
+        assert_eq!(again, [] as [String; 0]);
         Ok(())
     }
 }

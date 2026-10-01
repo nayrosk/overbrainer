@@ -439,7 +439,7 @@ pub(crate) mod tests {
     fn records_round_trip_and_list_in_order() -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
-        assert!(runs.list()?.is_empty());
+        assert_eq!(runs.list()?, [] as [crate::runs::RunRecord; 0]);
         runs.save(&record("20260922-143005-bbbb"))?;
         let mut first = record("20260921-000000-aaaa");
         first.state = RunState::Succeeded;

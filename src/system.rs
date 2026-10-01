@@ -731,7 +731,7 @@ total_inactive_file 1073741824
     #[test]
     fn a_host_without_gpu_or_cgroup_falls_back_to_proc() -> Result<(), String> {
         let sample = parse(HOST, at(0), None);
-        assert!(sample.gpus.is_empty());
+        assert_eq!(sample.gpus, [] as [crate::system::Gpu; 0]);
         assert_eq!(
             sample.memory,
             Some(Memory {

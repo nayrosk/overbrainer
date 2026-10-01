@@ -954,7 +954,7 @@ mod tests {
 
     #[test]
     fn gpu_table_is_empty_without_rows() {
-        assert!(gpu_table(&[], None).is_empty());
+        assert_eq!(gpu_table(&[], None), [] as [String; 0]);
     }
 
     #[test]
@@ -997,7 +997,7 @@ mod tests {
 
     #[test]
     fn data_center_table_is_empty_without_rows() {
-        assert!(data_center_table(&[]).is_empty());
+        assert_eq!(data_center_table(&[]), [] as [String; 0]);
     }
 
     #[test]
@@ -1033,7 +1033,7 @@ mod tests {
 
     #[test]
     fn volume_table_is_empty_without_rows() {
-        assert!(volume_table(&[]).is_empty());
+        assert_eq!(volume_table(&[]), [] as [String; 0]);
     }
 
     #[test]
@@ -1073,7 +1073,7 @@ mod tests {
 
     #[test]
     fn template_table_is_empty_without_rows() {
-        assert!(template_table(&[]).is_empty());
+        assert_eq!(template_table(&[]), [] as [String; 0]);
     }
 
     #[test]

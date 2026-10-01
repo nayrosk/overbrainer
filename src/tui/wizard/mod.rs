@@ -1580,7 +1580,7 @@ mod tests {
         assert_eq!(wizard.topics().len(), 1);
 
         press(&mut wizard, &[KeyCode::Char('d')]);
-        assert!(wizard.topics().is_empty());
+        assert_eq!(wizard.topics(), []);
         press(&mut wizard, &[KeyCode::Enter]);
         assert_eq!(wizard.screen(), Screen::Topics);
         assert_eq!(wizard.error(), Some("add at least one topic with a"));

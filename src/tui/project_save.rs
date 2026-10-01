@@ -283,7 +283,7 @@ mod tests {
         let path = dir.path().join(CONFIG_FILE);
         assert_eq!(fs::read_to_string(&path)?, NEW, "the comment is kept");
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o7777, 0o640);
-        assert!(leftover_temp_files(dir.path())?.is_empty());
+        assert_eq!(leftover_temp_files(dir.path())?, [] as [String; 0]);
         Ok(())
     }
 
@@ -292,7 +292,7 @@ mod tests {
         let dir = project()?;
         drop(ok(stage(dir.path(), NEW, BASE))?);
         assert_eq!(fs::read_to_string(dir.path().join(CONFIG_FILE))?, BASE);
-        assert!(leftover_temp_files(dir.path())?.is_empty());
+        assert_eq!(leftover_temp_files(dir.path())?, [] as [String; 0]);
         Ok(())
     }
 

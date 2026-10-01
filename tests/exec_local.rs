@@ -76,7 +76,7 @@ async fn a_job_runs_detached_and_reports_its_exit_code() -> TestResult {
     );
     assert_eq!(tail.offset(), 8);
     fs::write(dir.join("metrics.jsonl"), "one\ntwo\nthr")?;
-    assert!(tail.read().await?.is_empty());
+    assert_eq!(tail.read().await?, [] as [String; 0]);
     fs::write(dir.join("metrics.jsonl"), "one\ntwo\nthree\n")?;
     assert_eq!(tail.read().await?, vec!["three".to_string()]);
     let mut resumed = executor.tail(&metrics, 4);
@@ -85,7 +85,7 @@ async fn a_job_runs_detached_and_reports_its_exit_code() -> TestResult {
         vec!["two".to_string(), "three".to_string()]
     );
     let mut missing = executor.tail(&format!("{metrics}.missing"), 0);
-    assert!(missing.read().await?.is_empty());
+    assert_eq!(missing.read().await?, [] as [String; 0]);
     Ok(())
 }
 
@@ -250,11 +250,9 @@ async fn read_from_honours_the_limit() -> TestResult {
     assert_eq!(executor.read_from(&path, 8, 100).await?, b"89");
     assert_eq!(executor.read_from(&path, 0, 0).await?, b"");
     assert_eq!(executor.read_from(&path, 20, 5).await?, b"");
-    assert!(
-        executor
-            .read_from(&format!("{path}.missing"), 0, 5)
-            .await?
-            .is_empty()
+    assert_eq!(
+        executor.read_from(&format!("{path}.missing"), 0, 5).await?,
+        [] as [u8; 0]
     );
     Ok(())
 }

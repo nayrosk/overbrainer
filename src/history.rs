@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn appended_entries_read_back_in_order() -> TestResult {
         let dir = tempfile::tempdir()?;
-        assert!(read(dir.path())?.is_empty());
+        assert_eq!(read(dir.path())?, [] as [crate::history::Entry; 0]);
         let first = entry(Stage::Subtopics, Some(0.5));
         let second = entry(Stage::Answers, None);
         append(dir.path(), &first)?;

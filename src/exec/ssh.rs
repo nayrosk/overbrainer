@@ -758,7 +758,10 @@ mod tests {
         let listing = String::from_utf8(listing)?;
         assert!(listing.contains("output/adapter.bin"), "{listing}");
         assert!(!listing.contains("checkpoint"), "{listing}");
-        assert!(sh(&archive_script(&remote, &["missing".into()], &[]), b"")?.is_empty());
+        assert_eq!(
+            sh(&archive_script(&remote, &["missing".into()], &[]), b"")?,
+            [] as [u8; 0]
+        );
 
         let gone = format!("{remote}/never-created");
         let output = StdCommand::new("sh")
@@ -766,7 +769,7 @@ mod tests {
             .arg(archive_script(&gone, &["output".into()], &[]))
             .output()?;
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout, [] as [u8; 0]);
         assert_eq!(
             String::from_utf8(output.stderr)?,
             format!("{gone} does not exist\n")

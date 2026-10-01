@@ -290,7 +290,7 @@ async fn unlisted_recorded_pods_are_gone_only_after_three_404s_and_one_list() ->
         assert_eq!(record.state, PodState::Deleted);
         assert_eq!(record.deleted_by, Some(DeletedBy::Unknown));
     }
-    assert!(harness.deletes().await.is_empty());
+    assert_eq!(harness.deletes().await, [] as [String; 0]);
     Ok(())
 }
 
@@ -388,7 +388,7 @@ async fn an_extra_marker_pod_is_a_stray_and_an_orphan() -> TestResult {
                 "{warnings:?}"
             );
         }
-        assert!(harness.deletes().await.is_empty());
+        assert_eq!(harness.deletes().await, [] as [String; 0]);
     }
     Ok(())
 }
@@ -420,7 +420,7 @@ async fn strays_are_shown_and_dropped_once_confirmed_gone() -> TestResult {
         .map(ToString::to_string)
         .collect();
     assert_eq!(strays, vec!["s1", "s2"]);
-    assert!(harness.deletes().await.is_empty());
+    assert_eq!(harness.deletes().await, [] as [String; 0]);
     Ok(())
 }
 
@@ -505,7 +505,7 @@ async fn pod_rm_of_a_running_run_keeps_its_training_pod_and_deletes_the_others()
     assert_eq!(harness.deletes().await, vec!["s1", "x2"]);
     let record = harness.pod_json(RUN)?;
     assert_eq!(record.state, PodState::Running);
-    assert!(record.stray_pods.is_empty());
+    assert_eq!(record.stray_pods, [] as [overbrainer::runpod::PodId; 0]);
     assert_eq!(harness.runs.load(RUN)?.state, state);
     Ok(())
 }
@@ -535,8 +535,8 @@ async fn pod_rm_leaves_a_run_still_starting_its_pod_alone_unless_forced() -> Tes
                 "run {RUN} is still starting its pod; wait for it, or use `overbrainer train cancel {RUN}` once it runs, or `pod rm {RUN} --force`"
             )
         );
-        assert!(refused.removed.is_empty());
-        assert!(harness.deletes().await.is_empty());
+        assert_eq!(refused.removed, [] as [overbrainer::runpod::Removed; 0]);
+        assert_eq!(harness.deletes().await, [] as [String; 0]);
         assert_eq!(harness.pod_json(RUN)?.stray_pods.len(), 1);
         assert_eq!(harness.runs.load(RUN)?.state, state);
 
@@ -568,8 +568,8 @@ async fn pod_rm_leaves_a_running_run_whose_pod_is_not_recorded_alone() -> TestRe
                 "run {RUN} is in progress but its pod is not recorded, so its pods are left alone; if the run is really dead, use `overbrainer pod rm {RUN} --force`"
             )
         );
-        assert!(refused.removed.is_empty());
-        assert!(harness.deletes().await.is_empty());
+        assert_eq!(refused.removed, [] as [overbrainer::runpod::Removed; 0]);
+        assert_eq!(harness.deletes().await, [] as [String; 0]);
         assert_eq!(harness.runs.load(RUN)?.state, RunState::Running);
 
         remove_run_pods(&harness.ctx(), RUN, true).await.result?;
@@ -604,8 +604,8 @@ async fn pod_rm_of_a_run_not_in_runs_needs_force() -> TestResult {
     let harness = Harness::new(Account::default().with("p9", Some(ELSEWHERE), true)).await?;
     let refused = remove_run_pods(&harness.ctx(), ELSEWHERE, false).await;
     assert!(matches!(refused.result, Err(PodError::NotInRuns(_))));
-    assert!(refused.removed.is_empty());
-    assert!(harness.deletes().await.is_empty());
+    assert_eq!(refused.removed, [] as [overbrainer::runpod::Removed; 0]);
+    assert_eq!(harness.deletes().await, [] as [String; 0]);
     let forced = remove_run_pods(&harness.ctx(), ELSEWHERE, true).await;
     forced.result?;
     assert_eq!(forced.removed.len(), 1);
