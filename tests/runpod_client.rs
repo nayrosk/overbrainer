@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
-    ApiError, CreateEnv, CreatePod, GpuRequest, PodId, RemoteStatus, RunpodClient, USER_AGENT,
+    ApiError, CreatePod, GpuRequest, NewSecret, PodId, RemoteStatus, RunpodClient,
+    SECRETS_FORBIDDEN_MESSAGE, USER_AGENT,
 };
 use secrecy::SecretString;
 use serde_json::json;
@@ -104,11 +105,10 @@ fn request() -> CreatePod {
         start_ssh: false,
         data_center_ids: None,
         mounts: None,
-        env: CreateEnv {
-            plain: BTreeMap::from([("OVERBRAINER_RUN_ID".to_string(), "r1".to_string())]),
-            host_key_name: "OVERBRAINER_HOST_KEY",
-            host_key: SecretString::from(HOST_KEY),
-        },
+        env: BTreeMap::from([
+            ("OVERBRAINER_RUN_ID".to_string(), "r1".to_string()),
+            ("OVERBRAINER_HOST_KEY".to_string(), HOST_KEY.to_string()),
+        ]),
         cmd: vec!["bash".into(), "-c".into(), "true".into()],
     }
 }
@@ -126,7 +126,9 @@ async fn create_status_error(
         .mount(&server)
         .await;
     let mut create = request();
-    create.env.host_key = SecretString::from(key.to_string());
+    create
+        .env
+        .insert("OVERBRAINER_HOST_KEY".to_string(), key.to_string());
     client(&server)?
         .create_pod(&create)
         .await
@@ -560,7 +562,9 @@ async fn a_create_decode_failure_shows_no_server_text() -> TestResult {
         .mount(&server)
         .await;
     let mut create = request();
-    create.env.host_key = SecretString::from(key.clone());
+    create
+        .env
+        .insert("OVERBRAINER_HOST_KEY".to_string(), key.clone());
     let error = client(&server)?
         .create_pod(&create)
         .await
@@ -844,5 +848,162 @@ async fn a_failing_volume_resize_is_retried_once() -> TestResult {
         .await;
     let client = client(&server)?;
     assert!(client.resize_network_volume("vol1", 150).await.is_err());
+    Ok(())
+}
+
+const SECRET_NAME: &str = "overbrainer_host_key_r1";
+
+fn new_secret(value: &str) -> NewSecret {
+    NewSecret {
+        name: SECRET_NAME.to_string(),
+        value: SecretString::from(value.to_string()),
+        description: "host key of r1".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn a_secret_is_created_with_its_value_and_found_by_name() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/account/secrets"))
+        .and(header("authorization", format!("Bearer {KEY}").as_str()))
+        .and(body_json(
+            json!({"name": SECRET_NAME, "value": HOST_KEY, "description": "host key of r1"}),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "s1", "name": SECRET_NAME, "description": "host key of r1",
+            "createdAt": "2026-10-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/account/secrets"))
+        .and(query_param("name", SECRET_NAME))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "secrets": [{"id": "s1", "name": SECRET_NAME, "createdAt": "2026-10-01T00:00:00Z"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/account/secrets"))
+        .and(query_param_is_missing("name"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"secrets": null})))
+        .mount(&server)
+        .await;
+    let client = client(&server)?;
+    let created = client.create_secret(&new_secret(HOST_KEY)).await?;
+    assert_eq!(
+        (created.id.as_str(), created.name.as_str()),
+        ("s1", SECRET_NAME)
+    );
+    let found = client.list_secrets(Some(SECRET_NAME)).await?;
+    assert_eq!(
+        found
+            .iter()
+            .map(|secret| secret.id.as_str())
+            .collect::<Vec<_>>(),
+        ["s1"]
+    );
+    assert_eq!(client.list_secrets(None).await?, Vec::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_secret_value_is_rotated_and_a_secret_deleted() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/v2/account/secrets/s1"))
+        .and(body_json(json!({"value": HOST_KEY})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"id": "s1", "name": SECRET_NAME})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/account/secrets/s1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/account/secrets/s2"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(
+            json!({"detail": "secret not found", "status": 404, "title": "Not Found"}),
+        ))
+        .mount(&server)
+        .await;
+    let client = client(&server)?;
+    client
+        .update_secret_value("s1", &SecretString::from(HOST_KEY))
+        .await?;
+    assert!(client.delete_secret("s1").await?);
+    assert!(!client.delete_secret("s2").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_secret_write_error_never_shows_the_value() -> TestResult {
+    let value = generated_host_key(400);
+    for status in [400, 401, 403, 404, 409, 422, 500] {
+        let server = MockServer::start().await;
+        let echo = json!({
+            "title": "Bad Request",
+            "status": status,
+            "detail": format!("value {value} rejected"),
+            "errors": [format!("$.value: {}", chunk_join(&value, 20, " "))]
+        });
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(&echo))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(&echo))
+            .mount(&server)
+            .await;
+        let client = client(&server)?;
+        let created = client.create_secret(&new_secret(&value)).await;
+        let rotated = client
+            .update_secret_value("s1", &SecretString::from(value.clone()))
+            .await;
+        for result in [created, rotated] {
+            let error = result.err().ok_or("no error")?;
+            assert_eq!(error.status(), Some(status));
+            assert_no_piece_of(&error, &value);
+            if status == 403 {
+                assert!(
+                    error.to_string().ends_with(SECRETS_FORBIDDEN_MESSAGE),
+                    "{error}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_new_secret_never_shows_its_value_in_debug() {
+    let value = generated_host_key(200);
+    let text = format!("{:?}", new_secret(&value));
+    assert!(!text.contains(&value[..16]), "{text}");
+    assert!(text.contains(SECRET_NAME), "{text}");
+}
+
+#[tokio::test]
+async fn a_read_error_never_shows_a_secret_the_client_redacts() -> TestResult {
+    let server = MockServer::start().await;
+    let value = generated_host_key(300);
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "title": "Bad Request", "status": 400, "detail": format!("env holds {value}")
+        })))
+        .mount(&server)
+        .await;
+    let client = client(&server)?;
+    client.redact_also(SecretString::from(value.clone()));
+    // A clone shares the list, as `PodCtx` users do.
+    let error = client.clone().list_pods().await.err().ok_or("no error")?;
+    assert_no_piece_of(&error, &value);
     Ok(())
 }

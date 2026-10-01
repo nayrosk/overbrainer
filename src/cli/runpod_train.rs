@@ -22,9 +22,9 @@ use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{
     DeleteReason, DeletedBy, Ending, LEASE_TTL, PodCtx, PodError, PodRecord, PodState,
-    RunpodClient, RunpodTarget, Timing, arm_cost_cap, chain, end_pod, forget_client_key,
-    job_started, limit_reached, listed_rows, orphan_warnings, reconnect, remove, settle_watch,
-    ssh_command, start_pod, watch_leased, with_pod_logs,
+    RunpodClient, RunpodTarget, Timing, arm_cost_cap, chain, end_pod, forget_keys, job_started,
+    limit_reached, listed_rows, orphan_warnings, reconnect, remove, settle_watch, ssh_command,
+    start_pod, sweep_host_keys, watch_leased, with_pod_logs,
 };
 use crate::runs::{
     Launch, Outcome, REQUEST_POLL, RunCtx, RunRecord, RunState, Runs, STOP_LIMITS, SnapshotReason,
@@ -540,7 +540,7 @@ async fn release(
         .shield(remove(ctx, pod, reason, DeletedBy::Client))
         .await;
     match removed {
-        Ok(()) => forget_client_key(ctx.runs, &pod.run_id),
+        Ok(()) => forget_keys(ctx, &pod.run_id).await,
         Err(error) => warn(&format!(
             "{}; remove the pod with `overbrainer pod rm {}`",
             chain(&error),
@@ -570,15 +570,29 @@ fn interrupted_before_job(runs: &Runs, id: &str) -> String {
 }
 
 /// Warns about the pods nothing will delete, from one list of the account's
-/// pods, best effort. Never deletes anything.
+/// pods, best effort, and sweeps the run host key secrets no pod needs any
+/// more (see [`sweep_host_keys`]). Never deletes a pod.
 async fn warn_orphans(ctx: &PodCtx<'_>) {
-    match listed_rows(ctx).await {
-        Ok(rows) => {
-            for warning in orphan_warnings(&rows) {
+    let rows = match listed_rows(ctx).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn(&format!("cannot look for leftover pods: {}", chain(&error)));
+            return;
+        },
+    };
+    for warning in orphan_warnings(&rows) {
+        warn(&warning);
+    }
+    match sweep_host_keys(ctx, &rows).await {
+        Ok(warnings) => {
+            for warning in warnings {
                 warn(&warning);
             }
         },
-        Err(error) => warn(&format!("cannot look for leftover pods: {}", chain(&error))),
+        Err(error) => warn(&format!(
+            "cannot look for leftover host key secrets: {}",
+            chain(&error)
+        )),
     }
 }
 

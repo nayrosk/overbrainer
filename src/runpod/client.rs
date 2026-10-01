@@ -2,6 +2,7 @@
 //! retries and error messages that never carry a secret.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
@@ -13,7 +14,8 @@ use super::logs::LogQuery;
 use super::target::MIN_CUDA_VERSION;
 use super::types::{
     CreatePod, DataCenter, DataCenterList, GpuType, GpuTypeList, NetworkVolume, NetworkVolumeList,
-    Pagination, Pod, PodId, PodPage, Template, TemplatePage,
+    NewSecret, Pagination, Pod, PodId, PodPage, Secret, SecretList, SecretValue, Template,
+    TemplatePage,
 };
 use crate::retry::{RetryPolicy, Retryable, with_retry};
 
@@ -55,6 +57,9 @@ const DATA_CENTERS_PATH: &str = "catalog/datacenters";
 const NETWORK_VOLUMES_PATH: &str = "network-volumes";
 /// The account's templates, paginated (v2 reference: `GET /v2/templates`).
 const TEMPLATES_PATH: &str = "templates";
+/// The account's secrets (v2 reference: `GET/POST /v2/account/secrets`,
+/// `PATCH/DELETE /v2/account/secrets/{id}`).
+const SECRETS_PATH: &str = "account/secrets";
 /// Length of the substring windows checked against the account key, so a value
 /// Runpod echoes only in part still disappears.
 const REDACT_WINDOW: usize = 16;
@@ -93,7 +98,17 @@ const INVALID_CREATE_ANSWER_MESSAGE: &str = "Runpod's answer to the create call 
 /// A non-create call succeeded (2xx) but its body was not the shape overbrainer
 /// expected. Followed only by serde's error category and position.
 const INVALID_ANSWER_MESSAGE: &str = "Runpod's answer does not have the expected shape";
-/// A GPU catalog read failed: its answer's text is never shown.
+/// A secret write was refused with a 403: the API key lacks the permission.
+pub const SECRETS_FORBIDDEN_MESSAGE: &str = "the Runpod API key may not manage secrets (403): give it read and write access to the account's secrets";
+/// A secret write was answered 404.
+const SECRET_UNKNOWN_MESSAGE: &str = "Runpod does not know the secret";
+/// A secret create was answered 409.
+const SECRET_EXISTS_MESSAGE: &str = "a Runpod secret with this name already exists";
+/// A secret write was answered another 4xx.
+const SECRET_INVALID_MESSAGE: &str =
+    "Runpod rejected the secret (please report it: overbrainer built an invalid request)";
+/// A secret write was answered a 5xx or another status.
+const SECRET_SERVER_ERROR_MESSAGE: &str = "Runpod failed to process the secret request";
 /// Errors of the Runpod API. No variant ever holds the API key or a pod's host
 /// key. A create call's error never holds any text from Runpod's answer either,
 /// however that text was shaped: its message is chosen only from the HTTP
@@ -225,8 +240,9 @@ pub struct RunpodClient {
     stream: reqwest::Client,
     base_url: String,
     api_key: SecretString,
-    /// Other secrets the pod log redaction looks for (the job's).
-    secrets: Vec<SecretString>,
+    /// Other secrets the redaction looks for (the job's, and the pod's host
+    /// key once stored), shared by every clone of this client.
+    secrets: Arc<Mutex<Vec<SecretString>>>,
     policy: RetryPolicy,
 }
 
@@ -267,7 +283,7 @@ impl RunpodClient {
             stream,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.clone(),
-            secrets: Vec::new(),
+            secrets: Arc::new(Mutex::new(Vec::new())),
             policy: RetryPolicy::new(5),
         })
     }
@@ -470,7 +486,12 @@ impl RunpodClient {
 
     /// The URL of the network volume `id`, the ID escaped as one path segment.
     fn volume_url(&self, id: &str) -> Result<reqwest::Url, ApiError> {
-        let mut url = self.list_url(NETWORK_VOLUMES_PATH, &[])?;
+        self.segment_url(NETWORK_VOLUMES_PATH, id)
+    }
+
+    /// The URL of `path` followed by `id`, escaped as one path segment.
+    fn segment_url(&self, path: &str, id: &str) -> Result<reqwest::Url, ApiError> {
+        let mut url = self.list_url(path, &[])?;
         url.path_segments_mut()
             .map_err(|()| ApiError::InvalidResponse("the Runpod base URL has no path".into()))?
             .push(id);
@@ -586,17 +607,131 @@ impl RunpodClient {
     /// This client with `secrets` (the values the run's job gets, such as
     /// its Hugging Face token), which the pod's logs never show.
     #[must_use]
-    pub fn with_secrets(mut self, secrets: Vec<SecretString>) -> Self {
-        self.secrets = secrets;
+    pub fn with_secrets(self, secrets: Vec<SecretString>) -> Self {
+        *self.extra_secrets() = secrets;
         self
     }
 
+    /// Adds `secret` to what this client and its clones redact: the pod logs
+    /// and the text of Runpod's error answers never show it.
+    pub fn redact_also(&self, secret: SecretString) {
+        self.extra_secrets().push(secret);
+    }
+
+    /// The secrets of [`RunpodClient::with_secrets`] and
+    /// [`RunpodClient::redact_also`]. A poisoned lock still holds a usable list.
+    fn extra_secrets(&self) -> std::sync::MutexGuard<'_, Vec<SecretString>> {
+        self.secrets.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The secrets the pod log redaction looks for: the account API key,
-    /// then those of [`RunpodClient::with_secrets`].
+    /// then those of [`RunpodClient::with_secrets`] and
+    /// [`RunpodClient::redact_also`].
     pub(super) fn log_secrets(&self) -> Vec<SecretString> {
         std::iter::once(self.api_key.clone())
-            .chain(self.secrets.iter().cloned())
+            .chain(self.extra_secrets().iter().cloned())
             .collect()
+    }
+
+    /// The account's secrets, or only the one named `name` (Runpod matches the
+    /// name without regard to case): `GET /account/secrets[?name=]`. Their
+    /// values are never returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
+    pub async fn list_secrets(&self, name: Option<&str>) -> Result<Vec<Secret>, ApiError> {
+        let query: Vec<(&str, &str)> = name.map(|name| ("name", name)).into_iter().collect();
+        let list: SecretList = self.get_json(&self.list_url(SECRETS_PATH, &query)?).await?;
+        Ok(list.secrets)
+    }
+
+    /// Creates the secret `secret` (`POST /account/secrets`). Retried like a
+    /// read: a retry after a create that went through answers 409, which the
+    /// caller handles like any other 409 (the name is taken).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] whose message is chosen from the status alone
+    /// (see `secret_write_message`): never anything Runpod said, which could
+    /// echo the value.
+    pub async fn create_secret(&self, secret: &NewSecret) -> Result<Secret, ApiError> {
+        let url = self.list_url(SECRETS_PATH, &[])?;
+        with_retry(
+            &self.policy,
+            || async {
+                let builder = self.http.request(Method::POST, url.clone()).json(secret);
+                self.write_secret(builder).await
+            },
+            log_retry,
+        )
+        .await
+    }
+
+    /// Sets the value of the secret `id` (`PATCH /account/secrets/{id}`).
+    ///
+    /// # Errors
+    ///
+    /// As [`RunpodClient::create_secret`].
+    pub async fn update_secret_value(
+        &self,
+        id: &str,
+        value: &SecretString,
+    ) -> Result<Secret, ApiError> {
+        let url = self.segment_url(SECRETS_PATH, id)?;
+        let body = SecretValue(value);
+        with_retry(
+            &self.policy,
+            || async {
+                let builder = self.http.request(Method::PATCH, url.clone()).json(&body);
+                self.write_secret(builder).await
+            },
+            log_retry,
+        )
+        .await
+    }
+
+    /// Deletes the secret `id` (`DELETE /account/secrets/{id}`): `true` when
+    /// Runpod deleted it, `false` when it already did not know it (a 404 in its
+    /// own error shape).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] once retries are exhausted or on a fatal answer.
+    pub async fn delete_secret(&self, id: &str) -> Result<bool, ApiError> {
+        let url = self.segment_url(SECRETS_PATH, id)?;
+        with_retry(
+            &self.policy,
+            || async {
+                let (status, body, retry_after) = self
+                    .fetch(self.http.request(Method::DELETE, url.clone()))
+                    .await?;
+                if status.is_success() {
+                    return Ok(true);
+                }
+                if status == StatusCode::NOT_FOUND && is_runpod_error_shape(status, &body) {
+                    return Ok(false);
+                }
+                Err(self.status_error(status, &body, retry_after, false))
+            },
+            log_retry,
+        )
+        .await
+    }
+
+    /// Sends a secret write and reads the secret Runpod answers with. A failed
+    /// answer's message is fixed by its status: see `secret_write_message`.
+    async fn write_secret(&self, builder: reqwest::RequestBuilder) -> Result<Secret, ApiError> {
+        let (status, body, retry_after) = self.fetch(builder).await?;
+        if status.is_success() {
+            return decode(&body, false);
+        }
+        Err(ApiError::Status {
+            status: status.as_u16(),
+            message: secret_write_message(status).to_string(),
+            retry_after,
+            capacity: false,
+        })
     }
 
     /// Opens the log stream of the pod `id` (`GET /pods/{id}/logs`, an event
@@ -734,7 +869,9 @@ impl RunpodClient {
         let message = if is_create {
             create_failure_message(status, body).to_string()
         } else {
-            build_message(status, body, self.api_key.expose_secret())
+            let secrets = self.log_secrets();
+            let secrets: Vec<&str> = secrets.iter().map(ExposeSecret::expose_secret).collect();
+            build_message(status, body, &secrets)
         };
         ApiError::Status {
             status: status.as_u16(),
@@ -828,6 +965,21 @@ fn create_failure_message(status: StatusCode, body: &str) -> &'static str {
     }
 }
 
+/// The fixed message for a secret write's failed answer, chosen only from
+/// `status`: a secret write's answer is never shown, since Runpod could echo
+/// the value in it. A 403 names the permission the API key lacks.
+fn secret_write_message(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED => AUTH_REJECTED_MESSAGE,
+        StatusCode::FORBIDDEN => SECRETS_FORBIDDEN_MESSAGE,
+        StatusCode::NOT_FOUND => SECRET_UNKNOWN_MESSAGE,
+        StatusCode::CONFLICT => SECRET_EXISTS_MESSAGE,
+        StatusCode::TOO_MANY_REQUESTS => RATE_LIMITED_MESSAGE,
+        status if status.is_client_error() => SECRET_INVALID_MESSAGE,
+        _ => SECRET_SERVER_ERROR_MESSAGE,
+    }
+}
+
 /// Whether `body`'s `detail` is Runpod's capacity failure (identified by
 /// [`CAPACITY_SIGNATURE`]). Only a boolean ever leaves this function: `detail`
 /// itself is never shown, even for a capacity failure, since it is still text
@@ -840,15 +992,21 @@ fn is_capacity_failure(body: &str) -> bool {
 }
 
 /// The extracted, doubly-redacted, capped message for a non-create call's
-/// failed answer. `account_key` is redacted in two passes: JSON-decoding while
+/// failed answer. Each of `secrets` (the account key first) is redacted in
+/// two passes: JSON-decoding while
 /// extracting the message (`error_text`) can rejoin a value an escape sequence
 /// split (for example `\/` becomes `/`), so redacting only the raw body is not
 /// enough; capping happens only after both passes, so a truncation can never
 /// leave a partial key behind.
-fn build_message(status: StatusCode, body: &str, account_key: &str) -> String {
-    let first_pass = redact(body, account_key);
+fn build_message(status: StatusCode, body: &str, secrets: &[&str]) -> String {
+    let redact_all = |text: &str| {
+        secrets
+            .iter()
+            .fold(text.to_string(), |text, secret| redact(&text, secret))
+    };
+    let first_pass = redact_all(body);
     let extracted = error_text(status, &first_pass);
-    let second_pass = redact(&extracted, account_key);
+    let second_pass = redact_all(&extracted);
     cap(&second_pass)
 }
 
@@ -905,9 +1063,9 @@ fn cap(text: &str) -> String {
 
 /// `text` with every occurrence of `secret` replaced by `***`: first every
 /// exact occurrence, then every [`REDACT_WINDOW`]-character piece of it at any
-/// offset, so a value Runpod echoes only in part still disappears. Used only
-/// for the account API key, the only secret a non-create call's answer could
-/// ever echo (a create call never shows any of its answer at all).
+/// offset, so a value Runpod echoes only in part still disappears. Used for
+/// the account API key and the client's other secrets in a non-create call's
+/// answer (a create call never shows any of its answer at all).
 fn redact(text: &str, secret: &str) -> String {
     if secret.is_empty() {
         return text.to_string();
@@ -1011,7 +1169,7 @@ mod tests {
             .collect();
         let escaped = key.replace('/', "\\/");
         let body = format!(r#"{{"detail": "bad key {escaped}"}}"#);
-        let message = build_message(StatusCode::BAD_REQUEST, &body, &key);
+        let message = build_message(StatusCode::BAD_REQUEST, &body, &[&key]);
         assert!(!message.contains(&key), "{message}");
     }
 

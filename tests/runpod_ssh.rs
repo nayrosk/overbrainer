@@ -30,6 +30,10 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+mod common;
+
+use common::SecretStore;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Tests using the test sshd at once. Its `MaxStartups` (10 by default) drops
@@ -205,9 +209,11 @@ impl Respond for Delete {
     }
 }
 
-/// A stub whose pod `p1` is the test sshd, dying after `dies_after` looks.
-async fn stub(sshd: &Sshd, run_id: &str, dies_after: Option<usize>) -> MockServer {
+/// A stub whose pod `p1` is the test sshd, dying after `dies_after` looks, and
+/// its account secrets.
+async fn stub(sshd: &Sshd, run_id: &str, dies_after: Option<usize>) -> (MockServer, SecretStore) {
     let server = MockServer::start().await;
+    let secrets = SecretStore::mount(&server).await;
     let body = json!({
         "id": "p1",
         "name": format!("overbrainer-{run_id}-1"),
@@ -245,7 +251,7 @@ async fn stub(sshd: &Sshd, run_id: &str, dies_after: Option<usize>) -> MockServe
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": []})))
         .mount(&server)
         .await;
-    server
+    (server, secrets)
 }
 
 /// Writes the watchdog's verdict for `run_id` under `workdir` on the test sshd.
@@ -291,7 +297,7 @@ async fn provision_against(
     if let Some(verdict) = verdict {
         write_verdict(sshd, &workdir, &run_id, verdict).await?;
     }
-    let server = stub(sshd, &run_id, dies_after).await;
+    let (server, _) = stub(sshd, &run_id, dies_after).await;
     let project = tempfile::tempdir()?;
     let runs = Runs::new(project.path());
     let client = client(&server)?;
@@ -514,7 +520,9 @@ async fn a_retrieved_run_marks_its_pod_then_deletes_it_unless_kept() -> TestResu
         let key = runs.run_dir(&run.id)?.join("ssh/id_ed25519");
         fs::create_dir_all(key.parent().ok_or("no ssh dir")?)?;
         fs::write(&key, "private")?;
-        let server = stub(&sshd, &run.id, None).await;
+        let (server, secrets) = stub(&sshd, &run.id, None).await;
+        let secret = format!("overbrainer_host_key_{}", run.id);
+        secrets.hold("k1", &secret);
         let client = client(&server)?;
         let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
         let ctx = PodCtx {
@@ -533,18 +541,22 @@ async fn a_retrieved_run_marks_its_pod_then_deletes_it_unless_kept() -> TestResu
             .await
             .unwrap_or_default()
             .iter()
-            .filter(|request| request.method.as_str() == "DELETE")
+            .filter(|request| {
+                request.method.as_str() == "DELETE" && request.url.path().starts_with("/v2/pods/")
+            })
             .count();
         if keep {
             assert_eq!(ending, Ending::Kept);
             assert_eq!(pod.state, PodState::Kept);
             assert_eq!(deletes, 0);
             assert!(key.is_file(), "the key of a kept pod is removed");
+            assert_eq!(secrets.names(), [secret]);
         } else {
             assert_eq!(ending, Ending::Deleted);
             assert_eq!(pod.state, PodState::Deleted);
             assert_eq!(deletes, 1);
             assert!(!key.exists(), "the key of a deleted pod is kept");
+            assert_eq!(secrets.deleted(), [secret]);
         }
         assert_eq!(PodRecord::load(&runs, &run.id)?, Some(pod));
     }
@@ -709,7 +721,7 @@ async fn an_unretrieved_run_leaves_its_pod_to_the_watchdog_or_kept() -> TestResu
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
         let (run, mut pod, executor) = started_run(&sshd, &runs, keep).await?;
-        let server = stub(&sshd, &run.id, None).await;
+        let (server, _) = stub(&sshd, &run.id, None).await;
         let client = client(&server)?;
         let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
         let ctx = PodCtx {
@@ -765,7 +777,7 @@ async fn attach_reconnects_through_a_fresh_endpoint() -> TestResult {
     )?;
     pod.ssh = Some(stale);
     pod.save(&runs)?;
-    let server = stub(&sshd, &run.id, None).await;
+    let (server, _) = stub(&sshd, &run.id, None).await;
     let client = client(&server)?;
     let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
     let ctx = PodCtx {
@@ -861,7 +873,7 @@ async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestRes
     let run_id = new_run_id();
     let workdir = format!("overbrainer-tests/runpod-{run_id}");
     write_verdict(&sshd, &workdir, &run_id, "ready").await?;
-    let server = stub(&sshd, &run_id, None).await;
+    let (server, _) = stub(&sshd, &run_id, None).await;
     let project = tempfile::tempdir()?;
     let runs = Runs::new(project.path());
     let client = client(&server)?;

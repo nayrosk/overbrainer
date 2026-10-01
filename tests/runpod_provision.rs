@@ -23,6 +23,10 @@ use tokio::sync::broadcast::Receiver;
 use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+mod common;
+
+use common::SecretStore;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const RUN: &str = "20260922-143005-a1b2";
@@ -151,11 +155,13 @@ struct Harness {
     interrupted: Arc<AtomicBool>,
     keys: PodKeys,
     client: RunpodClient,
+    secrets: SecretStore,
 }
 
 impl Harness {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
+        let secrets = SecretStore::mount(&server).await;
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
         let ssh_dir = runs.run_dir(RUN)?.join("ssh");
@@ -190,6 +196,7 @@ impl Harness {
                 SecretString::from(HOST_KEY),
             ),
             client,
+            secrets,
         })
     }
 
@@ -224,13 +231,16 @@ impl Harness {
         Ok((result, record))
     }
 
+    /// The `verb` requests made to the pods (`/v2/pods...`).
     async fn calls(&self, verb: &str) -> Vec<Request> {
         self.server
             .received_requests()
             .await
             .unwrap_or_default()
             .into_iter()
-            .filter(|request| request.method.as_str() == verb)
+            .filter(|request| {
+                request.method.as_str() == verb && request.url.path().starts_with("/v2/pods")
+            })
             .collect()
     }
 }
@@ -704,7 +714,19 @@ async fn the_create_carries_the_target_and_the_watchdog_settings() -> TestResult
     assert_eq!(body["cmd"][0], "bash");
     let env = &body["env"];
     assert_eq!(env["OVERBRAINER_RUN_ID"], RUN);
-    assert_eq!(env["OVERBRAINER_HOST_KEY"], HOST_KEY);
+    // Only a reference to the run's secret, which holds the key.
+    assert_eq!(
+        env["OVERBRAINER_HOST_KEY"],
+        "{{ RUNPOD_SECRET_overbrainer_host_key_20260922-143005-a1b2 }}"
+    );
+    assert_eq!(harness.secrets.values(), [HOST_KEY]);
+    assert_eq!(
+        harness.secrets.names(),
+        ["overbrainer_host_key_20260922-143005-a1b2"]
+    );
+    for request in harness.calls("POST").await {
+        assert!(!String::from_utf8_lossy(&request.body).contains(HOST_KEY));
+    }
     assert_eq!(
         env["OVERBRAINER_AUTHORIZED_KEY"],
         "ssh-ed25519 AAAAclient overbrainer"

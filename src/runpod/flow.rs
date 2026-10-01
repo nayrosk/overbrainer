@@ -21,8 +21,8 @@ use super::provision::note_strays;
 use super::{
     BOOTSTRAP_LOG, CLIENT_KEY, CostCap, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId,
     PodKeys, PodPlan, PodRecord, PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget,
-    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, keep_file, provision, remove,
-    short_cap_warning, sweep, with_pod_logs, write_config,
+    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, drop_host_key_or_warn, forget_keys,
+    keep_file, provision, remove, short_cap_warning, sweep, with_pod_logs, write_config,
 };
 use crate::secrets::Redactor;
 
@@ -75,7 +75,8 @@ const GONE_LOOKS: u32 = 3;
 /// ready: keys in `runs/<id>/ssh/`, then `pod.json`, then provisioning. When that
 /// fails, the run is saved `Failed` with the reason (`interrupted before the job
 /// started` after Ctrl-C), whatever pod was created is deleted, and once every
-/// pod of the run is confirmed deleted, the run's private client key is removed.
+/// pod of the run is confirmed deleted, the run's private client key is removed
+/// and its host key secret deleted.
 /// `vram_floor_gb` is the least VRAM `auto` GPU types need when the target sets
 /// no `min_vram_gb` (see [`PodPlan::vram_floor_gb`]).
 ///
@@ -97,7 +98,7 @@ pub async fn start_pod(
             tracing::warn!("cannot record run {} as failed: {save_error}", run.id);
         }
         if no_pod_left(ctx.runs, &run.id) {
-            forget_client_key(ctx.runs, &run.id);
+            forget_keys(ctx, &run.id).await;
         }
     }
     result
@@ -619,6 +620,7 @@ async fn deadline_reached(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -
     if let Err(error) = remove(ctx, pod, DeleteReason::Deadline, DeletedBy::Client).await {
         return error;
     }
+    drop_host_key_or_warn(ctx.client, run_id).await;
     fail_run(ctx.runs, run_id, MAX_HOURS_REACHED);
     PodError::DeadlineReached
 }
@@ -629,6 +631,7 @@ async fn cost_cap_reached(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -
     if let Err(error) = remove(ctx, pod, DeleteReason::CostCap, DeletedBy::Client).await {
         return error;
     }
+    drop_host_key_or_warn(ctx.client, run_id).await;
     fail_run(ctx.runs, run_id, MAX_COST_REACHED);
     PodError::CostCapReached
 }
@@ -679,7 +682,7 @@ async fn gone(ctx: &PodCtx<'_>, pod: &mut PodRecord) -> Result<bool, PodError> {
     if ctx.client.get_pod(&id).await?.is_some() || look_again(ctx, &id).await?.is_some() {
         return Ok(false);
     }
-    mark_gone(ctx, pod, id, gone_by(pod, SystemTime::now()))?;
+    mark_gone(ctx, pod, id, gone_by(pod, SystemTime::now())).await?;
     Ok(true)
 }
 
@@ -848,8 +851,9 @@ async fn look_again_all(
     }
 }
 
-/// Records the pod `id` as deleted by `by`.
-pub(super) fn mark_gone(
+/// Records the pod `id` as deleted by `by`, then forgets the run's keys (see
+/// [`forget_keys`]).
+pub(super) async fn mark_gone(
     ctx: &PodCtx<'_>,
     pod: &mut PodRecord,
     id: PodId,
@@ -859,7 +863,7 @@ pub(super) fn mark_gone(
     let uptime = pod.uptime(now);
     pod.deleted(by, now);
     pod.save(ctx.runs)?;
-    forget_client_key(ctx.runs, &pod.run_id);
+    forget_keys(ctx, &pod.run_id).await;
     ctx.bus.publish(Event::PodStatus(PodStatus::Deleted {
         pod_id: id,
         uptime,
@@ -900,7 +904,7 @@ pub enum Ending {
 /// it even if this client's delete fails), then the pod is deleted unless kept
 /// and its deletion confirmed, other pods of the run are swept (any whose
 /// deletion cannot be confirmed is recorded in `pod.json`), and the run's
-/// private client key is removed. Otherwise the pod is left to its watchdog's
+/// private client key is removed and its host key secret deleted. Otherwise the pod is left to its watchdog's
 /// retrieve grace (a kept pod stays kept), with a warning telling how to
 /// retrieve the results again or remove the pod.
 ///
@@ -938,7 +942,7 @@ pub async fn end_pod(
     remove(ctx, pod, DeleteReason::Retrieved, DeletedBy::Client).await?;
     let stray = sweep(ctx, &run.id, None).await;
     note_strays(ctx, pod, stray);
-    forget_client_key(ctx.runs, &run.id);
+    forget_keys(ctx, &run.id).await;
     Ok(Ending::Deleted)
 }
 
@@ -1053,7 +1057,7 @@ pub async fn reconnect(
         return Ok(None);
     }
     let Some(remote) = look_up(ctx, &id).await? else {
-        mark_gone(ctx, pod, id, gone_by(pod, SystemTime::now()))?;
+        mark_gone(ctx, pod, id, gone_by(pod, SystemTime::now())).await?;
         return Ok(None);
     };
     if remote.status == RemoteStatus::Exited {

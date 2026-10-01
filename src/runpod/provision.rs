@@ -12,10 +12,10 @@ use crate::exec::{ExecError, Executor, SshExecutor};
 use crate::runs::Runs;
 
 use super::{
-    ApiError, Attempt, AttemptResult, CreateEnv, CreatePod, DeleteReason, DeletedBy, GpuRequest,
-    HOST_KEY_ENV, MIN_CUDA_VERSION, Mounts, NetworkMount, Pod, PodError, PodId, PodKeys, PodRecord,
-    PodSettings, PodStatus, RunpodClient, RunpodTarget, SshEndpoint, VOLUME_MOUNT, alias,
-    pod_command, pod_env, write_config,
+    ApiError, Attempt, AttemptResult, CreatePod, DeleteReason, DeletedBy, GpuRequest,
+    MIN_CUDA_VERSION, Mounts, NetworkMount, Pod, PodError, PodId, PodKeys, PodRecord, PodSettings,
+    PodStatus, RunpodClient, RunpodTarget, SshEndpoint, VOLUME_MOUNT, alias, pod_command, pod_env,
+    store_host_key, write_config,
 };
 
 /// Ambiguous creates tried per GPU type before moving to the next one.
@@ -165,7 +165,9 @@ enum Created {
 
 /// Creates the run's pod, trying `plan.target.gpu_types` in order (its `auto`
 /// choices resolved first, see [`resolve_target`]), and waits until it is
-/// ready. `record` (`pod.json`) is saved before every create call and after
+/// ready. Before the first create call, the pod's host key is stored as the
+/// run's Runpod secret (see [`store_host_key`]), which every pod of the run
+/// refers to; the caller deletes it once no pod of the run is left. `record` (`pod.json`) is saved before every create call and after
 /// every answer. A pod that dies or stays unreachable is deleted and the
 /// next GPU type tried. When provisioning fails after a create call got no clear
 /// answer, every pod of the run still listed is deleted (see [`sweep`]).
@@ -173,8 +175,9 @@ enum Created {
 /// # Errors
 ///
 /// Returns [`PodError::NotInStock`] when an `auto` choice finds nothing in
-/// stock and [`PodError::VolumeSize`] when the size of the target's network
-/// volume cannot be read (no create call is made in both cases),
+/// stock, [`PodError::VolumeSize`] when the size of the target's network
+/// volume cannot be read, and [`PodError::HostKeySecret`] when the host key
+/// cannot be stored (no create call is made in these cases),
 /// [`PodError::NoCapacity`] when no GPU type
 /// could be placed or gave a ready pod,
 /// [`PodError::Unanswered`] when no create call got a clear answer,
@@ -204,6 +207,8 @@ pub async fn provision(
         volume_gb,
         ..*plan
     };
+    ctx.check()?;
+    store_host_key(ctx.client, plan.run_id, plan.keys.host_private()).await?;
     let result = walk(ctx, plan, record).await;
     if result.is_err() {
         after_failure(ctx, record).await;
@@ -504,11 +509,7 @@ fn request(plan: &PodPlan<'_>, keep: bool, attempt: &Attempt) -> CreatePod {
                 path: VOLUME_MOUNT.to_string(),
             }],
         }),
-        env: CreateEnv {
-            plain: env,
-            host_key_name: HOST_KEY_ENV,
-            host_key: plan.keys.host_private().clone(),
-        },
+        env,
         cmd: pod_command(),
     }
 }

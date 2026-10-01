@@ -16,8 +16,9 @@ use overbrainer::exec::{Executor, JobCommand, LocalExecutor};
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
     AttemptResult, DeletedBy, LEASE_FILE, PodCtx, PodError, PodRecord, PodState, ResolveError,
-    RunpodClient, RunpodTarget, Timing, Watched, follow, reconnect, settle_watch, start_pod,
-    watch_leased, watch_on_pod,
+    RunpodClient, RunpodTarget, SECRETS_FORBIDDEN_MESSAGE, Timing, Watched, follow,
+    host_key_placeholder, host_key_secret, reconnect, settle_watch, start_pod, watch_leased,
+    watch_on_pod,
 };
 use overbrainer::runs::{RunCtx, RunRecord, RunState, Runs, create};
 use overbrainer::train::{Artifacts, TrainError, Trainer};
@@ -25,6 +26,10 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+mod common;
+
+use common::SecretStore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -90,6 +95,7 @@ struct Harness {
     timing: Timing,
     interrupted: AtomicBool,
     client: RunpodClient,
+    secrets: SecretStore,
 }
 
 impl Harness {
@@ -97,6 +103,7 @@ impl Harness {
         let server = MockServer::start().await;
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
+        let secrets = SecretStore::mount(&server).await;
         let client = RunpodClient::new(&format!("{}/v2", server.uri()), &SecretString::from("k"))?
             .with_policy(RetryPolicy {
                 max_retries: 1,
@@ -118,6 +125,7 @@ impl Harness {
             },
             interrupted: AtomicBool::new(false),
             client,
+            secrets,
         })
     }
 
@@ -187,10 +195,29 @@ async fn a_run_whose_pod_cannot_be_placed_is_failed() -> TestResult {
     let pod = PodRecord::load(&harness.runs, &run.id)?.ok_or("no pod.json")?;
     assert_eq!(pod.attempts[0].result, AttemptResult::Unavailable);
     assert!(pod.host_key.starts_with("ssh-ed25519 "));
-    // No pod was left: the private client key has nothing left to reach.
+    // No pod was left: the private client key has nothing left to reach,
+    // and no pod needs the host key secret any more.
     let ssh = harness.runs.run_dir(&run.id)?.join("ssh");
     assert!(!ssh.join("id_ed25519").exists());
     assert!(!ssh.join("host_ed25519").exists());
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(&run.id)]);
+    assert_eq!(harness.secrets.names(), Vec::<String>::new());
+    // The create call only refers to the secret.
+    let requests = harness.server.received_requests().await.unwrap_or_default();
+    let create = requests
+        .iter()
+        .find(|request| request.url.path() == "/v2/pods")
+        .ok_or("no create call")?;
+    let body: Value = serde_json::from_slice(&create.body)?;
+    assert_eq!(
+        body["env"]["OVERBRAINER_HOST_KEY"],
+        host_key_placeholder(&run.id)
+    );
+    let values = harness.secrets.values();
+    let [value] = &values[..] else {
+        return Err("expected one stored value".into());
+    };
+    assert!(!String::from_utf8_lossy(&create.body).contains(value.as_str()));
     Ok(())
 }
 
@@ -229,6 +256,7 @@ async fn a_run_with_nothing_in_stock_fails_without_a_pod() -> TestResult {
         .filter(|request| request.method.as_str() == "POST")
         .count();
     assert_eq!(posts, 0);
+    assert_eq!(harness.secrets.values(), Vec::<String>::new());
     let pod = PodRecord::load(&harness.runs, &run.id)?.ok_or("no pod.json")?;
     assert!(pod.attempts.is_empty() && pod.pod_id.is_none());
     let ssh = harness.runs.run_dir(&run.id)?.join("ssh");
@@ -299,6 +327,72 @@ async fn a_failed_provisioning_keeps_the_client_key_while_a_pod_may_remain() -> 
     assert_eq!(pod.state, PodState::Deleting);
     let ssh = harness.runs.run_dir(&run.id)?.join("ssh");
     assert!(ssh.join("id_ed25519").is_file());
+    // The pod may restart and run its bootstrap again: its secret stays.
+    assert_eq!(harness.secrets.names(), [host_key_secret(&run.id)]);
+    assert_eq!(harness.secrets.deleted(), Vec::<String>::new());
+    Ok(())
+}
+
+/// An API key that may not manage secrets stops the start before any pod is
+/// asked for, with a message naming the permission.
+#[tokio::test]
+async fn a_key_without_the_secrets_permission_creates_no_pod() -> TestResult {
+    require_keygen()?;
+    let harness = Harness::new().await?;
+    Mock::given(method("POST"))
+        .and(path("/v2/account/secrets"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(
+                json!({"detail": "access denied", "status": 403, "title": "Forbidden"}),
+            ),
+        )
+        .with_priority(1)
+        .mount(&harness.server)
+        .await;
+    let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
+    let result = start_pod(&harness.ctx(), &target(), run.clone(), false, None).await;
+    let Err(error @ PodError::HostKeySecret(_)) = result else {
+        return Err(format!("{result:?}").into());
+    };
+    assert!(
+        error.to_string().contains(SECRETS_FORBIDDEN_MESSAGE),
+        "{error}"
+    );
+    let requests = harness.server.received_requests().await.unwrap_or_default();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path() == "/v2/pods")
+    );
+    assert_eq!(harness.runs.load(&run.id)?.state, RunState::Failed);
+    Ok(())
+}
+
+/// A create retried after an answer that got lost finds its name taken: the
+/// secret of that name gets the run's value instead.
+#[tokio::test]
+async fn a_taken_secret_name_gets_the_new_value() -> TestResult {
+    require_keygen()?;
+    let harness = Harness::new().await?;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"detail": CAPACITY})))
+        .mount(&harness.server)
+        .await;
+    let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
+    harness.secrets.hold("s9", &host_key_secret(&run.id));
+    let result = start_pod(&harness.ctx(), &target(), run.clone(), false, None).await;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    let requests = harness.server.received_requests().await.unwrap_or_default();
+    let rotated = requests.iter().any(|request| {
+        request.method.as_str() == "PATCH" && request.url.path() == "/v2/account/secrets/s9"
+    });
+    assert!(rotated);
+    // Two values sent: the refused create, then the rotation.
+    let values = harness.secrets.values();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0], values[1]);
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(&run.id)]);
     Ok(())
 }
 
@@ -350,14 +444,16 @@ impl Trainer for Nothing {
     }
 }
 
-/// How many deletes the stub received.
+/// How many pod deletes the stub received.
 async fn deletes(server: &MockServer) -> usize {
     server
         .received_requests()
         .await
         .unwrap_or_default()
         .iter()
-        .filter(|request| request.method.as_str() == "DELETE")
+        .filter(|request| {
+            request.method.as_str() == "DELETE" && request.url.path().starts_with("/v2/pods/")
+        })
         .count()
 }
 
@@ -464,6 +560,7 @@ async fn the_client_deletes_a_pod_past_its_deadline() -> TestResult {
     run.state = RunState::Running;
     harness.runs.save(&run)?;
     let mut pod = pod_record(&run.id, false, Duration::from_secs(600))?;
+    harness.secrets.hold("k1", &host_key_secret(&run.id));
     let run_ctx = RunCtx {
         runs: &harness.runs,
         executor: &executor,
@@ -476,6 +573,7 @@ async fn the_client_deletes_a_pod_past_its_deadline() -> TestResult {
         matches!(result, Err(PodError::DeadlineReached)),
         "{result:?}"
     );
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(&run.id)]);
     assert_eq!(pod.state, PodState::Deleted);
     let saved = harness.runs.load(&run.id)?;
     assert_eq!(saved.state, RunState::Failed);
@@ -731,8 +829,10 @@ async fn reconnect_records_a_pod_confirmed_gone_without_deleting_it() -> TestRes
     let key = harness.runs.run_dir(&run.id)?.join("ssh/id_ed25519");
     std::fs::create_dir_all(key.parent().ok_or("no ssh dir")?)?;
     std::fs::write(&key, "private")?;
+    harness.secrets.hold("k1", &host_key_secret(&run.id));
     let executor = reconnect(&harness.ctx(), &mut pod, &run).await?;
     assert!(executor.is_none());
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(&run.id)]);
     assert_eq!(pod.state, PodState::Deleted);
     assert_eq!(pod.deleted_by, Some(DeletedBy::Unknown));
     assert_eq!(PodRecord::load(&harness.runs, &run.id)?, Some(pod));

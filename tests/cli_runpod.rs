@@ -15,6 +15,10 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+mod common;
+
+use common::SecretStore;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const KEY: &str = "rp_cli_train_key_7731";
@@ -139,6 +143,13 @@ async fn a_run_without_capacity_fails_with_its_attempts_recorded() -> TestResult
         return Ok(());
     }
     let server = MockServer::start().await;
+    let secrets = SecretStore::mount(&server).await;
+    // Left by runs: one with a pod still listed, one ended here, one from
+    // another checkout; and a secret that is not overbrainer's.
+    secrets.hold("k1", "overbrainer_host_key_20260101-000000-dead");
+    secrets.hold("k2", &format!("overbrainer_host_key_{ENDED}"));
+    secrets.hold("k3", "overbrainer_host_key_elsewhere_20260101-000000_1");
+    secrets.hold("k4", "hf-token");
     Mock::given(method("GET"))
         .and(path("/v2/pods"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": [{
@@ -201,9 +212,12 @@ async fn a_run_without_capacity_fails_with_its_attempts_recorded() -> TestResult
         .await
         .unwrap_or_default()
         .iter()
-        .filter(|request| request.method.as_str() == "GET" && request.url.path() != "/v2/pods")
+        .filter(|request| {
+            request.method.as_str() == "GET" && request.url.path().starts_with("/v2/pods/")
+        })
         .count();
     assert_eq!(looked_up, 0, "the orphan warning looked a pod up");
+    assert_secrets_swept(dir.path(), &secrets, &stderr, &stdout)?;
     let runs = Runs::new(dir.path());
     let run = runs
         .list()?
@@ -357,6 +371,48 @@ async fn train_options_are_refused_with_attach_and_cancel() -> TestResult {
 
 /// `POST /pods` creates pod `p1`, which never offers an SSH endpoint; a DELETE
 /// removes it, and the stub counts the calls.
+/// What `train` did with the secrets of [`a_run_without_capacity_fails_with_its_attempts_recorded`]:
+/// the ended run's secret went at startup, the failed run's own once its
+/// start failed; the others stay, one with a warning.
+fn assert_secrets_swept(
+    dir: &Path,
+    secrets: &SecretStore,
+    stderr: &str,
+    stdout: &str,
+) -> TestResult {
+    let own = format!(
+        "overbrainer_host_key_{}",
+        Runs::new(dir)
+            .list()?
+            .into_iter()
+            .find(|run| run.id != ENDED)
+            .ok_or("no run")?
+            .id
+    );
+    assert_eq!(
+        secrets.deleted(),
+        [format!("overbrainer_host_key_{ENDED}"), own]
+    );
+    assert_eq!(
+        secrets.names(),
+        [
+            "overbrainer_host_key_20260101-000000-dead",
+            "overbrainer_host_key_elsewhere_20260101-000000_1",
+            "hf-token"
+        ]
+    );
+    assert!(
+        stderr.contains(
+            "the Runpod secret overbrainer_host_key_elsewhere_20260101-000000_1 holds the pod host key of run elsewhere_20260101-000000_1, which is not in this project's runs/; if no other checkout owns it, `overbrainer pod rm elsewhere_20260101-000000_1 --force`"
+        ),
+        "{stderr}"
+    );
+    let stored = secrets.values();
+    assert_eq!(stored.len(), 1);
+    assert!(!stderr.contains(stored[0].as_str()) && !stdout.contains(stored[0].as_str()));
+    Ok(())
+}
+
 async fn serve_unreachable_pod(server: &MockServer) {
     let deleted = Arc::new(AtomicBool::new(false));
     let body = json!({
@@ -415,13 +471,16 @@ impl Respond for Deleted {
     }
 }
 
+/// The `verb` requests made to the pods (`/v2/pods...`).
 async fn count(server: &MockServer, verb: &str) -> usize {
     server
         .received_requests()
         .await
         .unwrap_or_default()
         .iter()
-        .filter(|request| request.method.as_str() == verb)
+        .filter(|request| {
+            request.method.as_str() == verb && request.url.path().starts_with("/v2/pods")
+        })
         .count()
 }
 
@@ -431,6 +490,7 @@ async fn ctrl_c_while_the_pod_starts_deletes_it_and_fails_the_run() -> TestResul
         return Ok(());
     }
     let server = MockServer::start().await;
+    let secrets = SecretStore::mount(&server).await;
     serve_unreachable_pod(&server).await;
     let dir = project()?;
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("overbrainer"));
@@ -489,6 +549,10 @@ async fn ctrl_c_while_the_pod_starts_deletes_it_and_fails_the_run() -> TestResul
     let pod = PodRecord::load(&runs, &run.id)?.ok_or("no pod.json")?;
     assert_eq!(pod.state, PodState::Deleted);
     assert_eq!(pod.pod_id.as_ref().map(PodId::as_str), Some("p1"));
+    assert_eq!(
+        secrets.deleted(),
+        [format!("overbrainer_host_key_{}", run.id)]
+    );
     Ok(())
 }
 

@@ -66,8 +66,13 @@ claim_run_dir() {
 }
 
 # install_host_key DIR: replaces every host key in DIR with the run's ed25519 key
-# (OVERBRAINER_HOST_KEY, the base64 of its OpenSSH private key file).
+# (OVERBRAINER_HOST_KEY, the base64 of its OpenSSH private key file, which
+# Runpod puts there from the run's secret). Returns 2 when Runpod left the
+# secret reference unresolved (the secret is gone).
 install_host_key() {
+  case $OVERBRAINER_HOST_KEY in
+    '{{'*) return 2 ;;
+  esac
   mkdir -p "$1" || return 1
   rm -f "$1"/ssh_host_* || return 1
   printf '%s' "$OVERBRAINER_HOST_KEY" | base64 -d > "$1/ssh_host_ed25519_key" || return 1
@@ -140,7 +145,10 @@ bootstrap_main() {
   # read as this pod's: it goes before sshd can serve it.
   rm -f "$OVERBRAINER_RUN_DIR/.pod/watchdog" || fail "cannot remove a stale verdict"
   write_watchdog "$watchdog_file" || fail "cannot write the watchdog"
-  install_host_key "$etc_ssh_dir" || fail "cannot install the host key"
+  installed=0
+  install_host_key "$etc_ssh_dir" || installed=$?
+  [ "$installed" != 2 ] || fail "the host key secret was not resolved"
+  [ "$installed" = 0 ] || fail "cannot install the host key"
   install_authorized_key "$authorized_keys_dir" || fail "cannot install the authorized key"
   write_job_env "$job_env_file" "$cuda_env_script" ||
     fail "cannot write the job environment"

@@ -9,8 +9,8 @@ use crate::runs::{RECORD_FILE, RunRecord, RunState, Runs, RunsError};
 use super::flow::{Look, look_up_all, mark_gone};
 use super::provision::{delete_confirmed, one_line};
 use super::{
-    DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId, PodRecord, PodState, forget_client_key,
-    remove,
+    DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId, PodRecord, PodState, Secret,
+    forget_keys, host_key_run, remove,
 };
 
 /// Characters kept of a table cell taken from the Runpod account.
@@ -126,7 +126,7 @@ pub async fn pod_rows(ctx: &PodCtx<'_>) -> Result<Vec<PodRow>, PodError> {
     let ids: Vec<PodId> = unlisted.iter().map(|entry| entry.id.clone()).collect();
     let looks = look_up_all(ctx, &ids).await;
     for (entry, look) in unlisted.iter().zip(looks) {
-        if let Some(row) = settle(ctx, &known, entry, look)? {
+        if let Some(row) = settle(ctx, &known, entry, look).await? {
             rows.push(row);
         }
     }
@@ -324,7 +324,7 @@ impl<'a> Known<'a> {
 
 /// The row of an unlisted recorded pod once looked up, recording it gone (or
 /// dropping it from `stray_pods`) when it is.
-fn settle(
+async fn settle(
     ctx: &PodCtx<'_>,
     known: &Known<'_>,
     entry: &Unlisted,
@@ -337,7 +337,7 @@ fn settle(
             Ok(None)
         },
         Look::Gone => {
-            record_gone(ctx, &entry.run_id, &entry.id)?;
+            record_gone(ctx, &entry.run_id, &entry.id).await?;
             let row = known.recorded_row(entry, "GONE", RowKind::Gone, "gone".to_string());
             Ok(Some(row))
         },
@@ -355,12 +355,12 @@ fn settle(
 
 /// Records the pod `id` of the run `run_id` gone, on a fresh `pod.json`, when it
 /// is still the run's pod.
-fn record_gone(ctx: &PodCtx<'_>, run_id: &str, id: &PodId) -> Result<(), PodError> {
+async fn record_gone(ctx: &PodCtx<'_>, run_id: &str, id: &PodId) -> Result<(), PodError> {
     if let Some(mut record) = PodRecord::load(ctx.runs, run_id)?
         && record.pod_id.as_ref() == Some(id)
         && record.state != PodState::Deleted
     {
-        mark_gone(ctx, &mut record, id.clone(), DeletedBy::Unknown)?;
+        mark_gone(ctx, &mut record, id.clone(), DeletedBy::Unknown).await?;
     }
     Ok(())
 }
@@ -447,6 +447,70 @@ pub fn orphan_warnings(rows: &[PodRow]) -> Vec<String> {
         .collect()
 }
 
+/// Sweeps the run host key secrets (`overbrainer_host_key_<run>`) that no pod
+/// needs any more, given `rows`, the pods of one list of the account (see
+/// [`listed_rows`]): a secret whose run has a listed pod is kept, and so is
+/// one of a run of this project still in progress (it may be creating its
+/// pod) or whose record cannot be read. The secret of an ended run of this
+/// project is deleted; one of a run that is not in this project's `runs/`
+/// only gets a warning saying how to remove it, as its pods would, since
+/// another checkout may be starting that run. Returns the warnings.
+///
+/// # Errors
+///
+/// Returns a [`PodError`] when the secrets cannot be listed. A secret that
+/// cannot be deleted is only warned about.
+pub async fn sweep_host_keys(ctx: &PodCtx<'_>, rows: &[PodRow]) -> Result<Vec<String>, PodError> {
+    let mut warnings = Vec::new();
+    for secret in ctx.client.list_secrets(None).await? {
+        let Some(run_id) = host_key_run(&secret.name) else {
+            continue;
+        };
+        if rows.iter().any(|row| row.run == run_id) {
+            continue;
+        }
+        if let Some(warning) = sweep_host_key(ctx, &secret, run_id).await {
+            warnings.push(warning);
+        }
+    }
+    Ok(warnings)
+}
+
+/// Deletes `secret`, the host key secret of the ended run `run_id`; a warning
+/// when that fails.
+async fn delete_swept(ctx: &PodCtx<'_>, secret: &Secret, run_id: &str) -> Option<String> {
+    let name = &secret.name;
+    match ctx.client.delete_secret(&secret.id).await {
+        Ok(_) => {
+            tracing::info!(
+                "deleted the Runpod secret {name} of run {run_id}, which has no pod left"
+            );
+            None
+        },
+        Err(error) => Some(format!(
+            "cannot delete the Runpod secret {name} of run {run_id} ({error}); `overbrainer pod rm {run_id}` tries again"
+        )),
+    }
+}
+
+/// Deletes `secret`, the host key secret of the run `run_id`, which no listed
+/// pod carries the marker of, when that run of this project has ended (see
+/// [`sweep_host_keys`]). Returns a warning when it cannot, or should not.
+async fn sweep_host_key(ctx: &PodCtx<'_>, secret: &Secret, run_id: &str) -> Option<String> {
+    let name = &secret.name;
+    match ctx.runs.load(run_id) {
+        Ok(run) if matches!(run.state, RunState::Preparing | RunState::Running) => None,
+        Ok(_) => delete_swept(ctx, secret, run_id).await,
+        Err(RunsError::NotFound(_)) => Some(format!(
+            "the Runpod secret {name} holds the pod host key of run {run_id}, which is not in this project's runs/; if no other checkout owns it, `overbrainer pod rm {run_id} --force`"
+        )),
+        Err(error) => {
+            tracing::debug!("keeping the Runpod secret {name}: {error}");
+            None
+        },
+    }
+}
+
 /// A pod `pod rm` deleted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Removed {
@@ -490,8 +554,8 @@ pub struct Removal {
 /// with [`PodError::PodNotRecorded`]: nothing is deleted. For a running run
 /// without `force`, its training pod (the one in `pod.json`) is kept, every other
 /// pod is deleted, and [`PodError::RunStillRunning`] says so. Forced, the run is
-/// saved `Failed` once a pod was deleted. The run's private client key is removed
-/// once every pod is.
+/// saved `Failed` once a pod was deleted. The run's private client key is removed,
+/// and its host key secret deleted, once every pod is.
 #[must_use]
 pub async fn remove_run_pods(ctx: &PodCtx<'_>, run_id: &str, force: bool) -> Removal {
     let mut removed = Vec::new();
@@ -552,7 +616,7 @@ async fn remove_checked(
             kept: kept_words(training.as_ref(), removed),
         });
     }
-    forget_client_key(ctx.runs, run_id);
+    forget_keys(ctx, run_id).await;
     Ok(())
 }
 

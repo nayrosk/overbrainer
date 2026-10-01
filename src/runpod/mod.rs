@@ -18,6 +18,7 @@ mod logs;
 mod orphans;
 mod provision;
 mod record;
+mod secret;
 mod status;
 mod target;
 mod types;
@@ -30,7 +31,7 @@ pub use catalog::{
     gpu_table, printable, resolve, resolve_with_floor, select_gpus, stocked_data_centers,
     template_table, volume_table,
 };
-pub use client::{ApiError, RunpodClient, USER_AGENT};
+pub use client::{ApiError, RunpodClient, SECRETS_FORBIDDEN_MESSAGE, USER_AGENT};
 pub use disk::{
     ACT_PERCENT, Assessment, Critical, DISK_PROBE_EVERY, DiskProbe, DiskWatch, GROW_WINDOW, Usage,
     VOLUME_SIZE_FILE, VOLUME_USABLE_PERCENT, VolumeDisk, WARN_PERCENT, WARN_STEP,
@@ -54,7 +55,7 @@ pub use logs::{
 };
 pub use orphans::{
     PodRow, Removal, Removed, RowKind, listed_rows, orphan_warnings, pod_rows, remove_run_pods,
-    table,
+    sweep_host_keys, table,
 };
 pub use provision::{
     PodCtx, PodPlan, Provisioned, Timing, chain, provision, remove, resolve_target, sweep,
@@ -63,13 +64,17 @@ pub use record::{
     Attempt, AttemptResult, CostCap, DeletedBy, MIN_CAP_TIME, POD_FILE, POD_RECORD_VERSION,
     PodRecord, PodState, SNAPSHOT_LEAD, SNAPSHOT_SHARE, SshEndpoint, hours, short_cap_warning,
 };
+pub use secret::{
+    HOST_KEY_SECRET_PREFIX, drop_host_key, drop_host_key_or_warn, forget_keys,
+    host_key_placeholder, host_key_run, host_key_secret, store_host_key,
+};
 pub use status::{DeleteReason, PodStatus};
 pub use target::{MIN_CUDA_VERSION, RunpodTarget, VOLUME_MOUNT, VOLUME_WORKDIR, WORKDIR};
 pub use types::{
-    Availability, CreateEnv, CreatePod, CudaVersion, DataCenter, DataCenterList, GpuMaxCount,
-    GpuPrice, GpuRequest, GpuType, GpuTypeList, InvalidPodId, Mounts, NetworkMount, NetworkVolume,
-    NetworkVolumeList, Pagination, Pod, PodEnv, PodGpu, PodId, PodPage, PodSsh, RemoteStatus,
-    SshDirect, Stock, Template, TemplatePage,
+    Availability, CreatePod, CudaVersion, DataCenter, DataCenterList, GpuMaxCount, GpuPrice,
+    GpuRequest, GpuType, GpuTypeList, InvalidPodId, Mounts, NetworkMount, NetworkVolume,
+    NetworkVolumeList, NewSecret, Pagination, Pod, PodEnv, PodGpu, PodId, PodPage, PodSsh,
+    RemoteStatus, Secret, SecretList, SshDirect, Stock, Template, TemplatePage,
 };
 
 /// Errors of a Runpod run's pod: provisioning, keys, readiness, deletion.
@@ -167,6 +172,10 @@ pub enum PodError {
         /// Why the connection failed, with the tail of ssh's log.
         reason: String,
     },
+    /// The pod's host key cannot be stored as a Runpod secret: no pod was
+    /// created. Holds the client's fixed message, never Runpod's text.
+    #[error("cannot store the pod's host key as a Runpod secret: {0}; no pod was created")]
+    HostKeySecret(String),
     /// Ctrl-C before the job started.
     #[error("interrupted before the job started")]
     Interrupted,
