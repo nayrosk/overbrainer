@@ -719,7 +719,10 @@ async fn the_create_carries_the_target_and_the_watchdog_settings() -> TestResult
         env["OVERBRAINER_HOST_KEY"],
         "{{ RUNPOD_SECRET_overbrainer_host_key_20260922-143005-a1b2 }}"
     );
-    assert_eq!(harness.secrets.values(), [HOST_KEY]);
+    assert!(
+        harness.secrets.values() == [HOST_KEY],
+        "the secret holds another value"
+    );
     assert_eq!(
         harness.secrets.names(),
         ["overbrainer_host_key_20260922-143005-a1b2"]

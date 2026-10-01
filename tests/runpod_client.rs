@@ -588,8 +588,14 @@ fn assert_no_piece_of(error: &ApiError, secret: &str) {
     let chars: Vec<char> = secret.chars().collect();
     for window in chars.windows(8) {
         let piece: String = window.iter().collect();
-        assert!(!display.contains(&piece), "{piece} in {display}");
-        assert!(!debug.contains(&piece), "{piece} in {debug}");
+        assert!(
+            !display.contains(&piece),
+            "a piece of the secret shows in the error"
+        );
+        assert!(
+            !debug.contains(&piece),
+            "a piece of the secret shows in the error's Debug"
+        );
     }
 }
 
@@ -981,12 +987,14 @@ async fn a_secret_write_error_never_shows_the_value() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn a_new_secret_never_shows_its_value_in_debug() {
+#[test]
+fn a_new_secret_never_shows_its_value_in_debug() -> TestResult {
     let value = generated_host_key(200);
+    let start = value.get(..16).ok_or("a value too short")?;
     let text = format!("{:?}", new_secret(&value));
-    assert!(!text.contains(&value[..16]), "Debug shows the secret value");
+    assert!(!text.contains(start), "Debug shows the secret value");
     assert!(text.contains(SECRET_NAME), "Debug hides the secret name");
+    Ok(())
 }
 
 #[tokio::test]

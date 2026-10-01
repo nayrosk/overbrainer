@@ -256,7 +256,10 @@ async fn a_run_with_nothing_in_stock_fails_without_a_pod() -> TestResult {
         .filter(|request| request.method.as_str() == "POST")
         .count();
     assert_eq!(posts, 0);
-    assert_eq!(harness.secrets.values(), Vec::<String>::new());
+    assert!(
+        harness.secrets.values().is_empty(),
+        "a secret value was stored"
+    );
     let pod = PodRecord::load(&harness.runs, &run.id)?.ok_or("no pod.json")?;
     assert!(pod.attempts.is_empty() && pod.pod_id.is_none());
     let ssh = harness.runs.run_dir(&run.id)?.join("ssh");
@@ -391,7 +394,7 @@ async fn a_taken_secret_name_gets_the_new_value() -> TestResult {
     // Two values sent: the refused create, then the rotation.
     let values = harness.secrets.values();
     assert_eq!(values.len(), 2);
-    assert_eq!(values[0], values[1]);
+    assert!(values[0] == values[1], "the rotation sent another value");
     assert_eq!(harness.secrets.deleted(), [host_key_secret(&run.id)]);
     Ok(())
 }
