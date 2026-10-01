@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/nayrosk/overbrainer/compare/v0.5.0...v0.6.0) - 2026-10-01
+
+### Added
+
+- *(export)* export a run to GGUF and an Ollama Modelfile ([#118](https://github.com/nayrosk/overbrainer/pull/118))
+
+### Fixed
+
+- *(runpod)* pass the pod host key through a Runpod secret ([#117](https://github.com/nayrosk/overbrainer/pull/117))
+- *(training)* show a finalizing phase instead of 100% and ETA 0s ([#114](https://github.com/nayrosk/overbrainer/pull/114))
+
 ## [0.5.0](https://github.com/nayrosk/overbrainer/compare/v0.4.1...v0.5.0) - 2026-10-01
 
 ### Added

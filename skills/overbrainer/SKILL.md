@@ -49,7 +49,7 @@ It fails with the key and the reason when a value is invalid. A missing URL, key
 
 Every command also checks crates.io once a day for a newer overbrainer release and prints a note on stderr, but only when stderr is a terminal, so it never runs when you drive overbrainer as a subprocess.
 
-Details: [configuration](https://github.com/nayrosk/overbrainer/blob/v0.5.0/docs/configuration.md).
+Details: [configuration](https://github.com/nayrosk/overbrainer/blob/v0.6.0/docs/configuration.md).
 
 ## Build the dataset
 
@@ -76,7 +76,7 @@ split: 90 train, 10 eval, 3 excluded (truncated 3), 2 orphaned
 
 Answers from a parent that never returns raw reasoning are excluded as `no_raw_reasoning` when `reasoning = true` (see the rules above). overbrainer only warns about it once `answers` has started, and then keeps going.
 
-Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.5.0/docs/pipeline.md).
+Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.6.0/docs/pipeline.md).
 
 ## Train
 
@@ -112,7 +112,7 @@ To get a model Ollama or llama.cpp can run, export it: `overbrainer export RUN_I
 
 Once `train` has stopped following a run, only `overbrainer train attach RUN_ID` retrieves its results. On Runpod, the watchdog deletes the pod `retrieve_grace_minutes` (60 by default) after the job ends if its results were not retrieved, and the results are lost with it. Attach well before that.
 
-Details: [training](https://github.com/nayrosk/overbrainer/blob/v0.5.0/docs/training.md) and [Runpod](https://github.com/nayrosk/overbrainer/blob/v0.5.0/docs/runpod.md).
+Details: [training](https://github.com/nayrosk/overbrainer/blob/v0.6.0/docs/training.md) and [Runpod](https://github.com/nayrosk/overbrainer/blob/v0.6.0/docs/runpod.md).
 
 ## Follow long commands
 
