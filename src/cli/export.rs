@@ -209,7 +209,14 @@ async fn on_target(
         Ok(record) => {
             let follow = interrupt.race(watch(&ctx, &job, record.clone())).await;
             if let Some(outcome) = follow {
-                outcome.map_err(anyhow::Error::from)
+                outcome.map_err(|error| {
+                    anyhow::Error::from(error).context(format!(
+                        "export {id} of run {} may still run on target `{}`; {}",
+                        run.id,
+                        run.target,
+                        exports.follow_hint(&id)
+                    ))
+                })
             } else {
                 interrupt
                     .shield(cancel(&exports, &executor, &job, record))

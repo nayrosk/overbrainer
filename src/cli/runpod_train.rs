@@ -15,8 +15,8 @@ use secrecy::SecretString;
 use super::export::{Delivery, EXPORT_PREFIX, Plan, finish_export, started_line};
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
 use super::train::{
-    HF_TOKEN, POLL, exporting, finish, prepare, reattach, resumed, secrets, started,
-    stop_requested, stoppable, training, warn,
+    HF_TOKEN, POLL, exporting, finish, prepare, resumed, secrets, started, stop_requested,
+    stoppable, training, warn,
 };
 use crate::config::{Settings, Training};
 use crate::dataset::DataFiles;
@@ -467,16 +467,17 @@ impl<T: Trainer + Sync> Job<'_, T> {
         };
         if keep {
             // Only now: until the job started, Ctrl-C or a failure deleted the pod.
-            warn(&keep_warning(&pod, &id));
+            warn(&keep_warning(&pod, &self.session.runs, &id));
         }
         // The job runs on a billed pod: the error says how to reach or remove it.
         job_started(&self.session.runs, &mut pod).with_context(|| {
             format!(
-                "the job of run {id} runs on pod {}{}; {}, or delete the pod with \
+                "the job of {} runs on pod {}{}; {}, or delete the pod with \
                  `overbrainer pod rm {id}`",
+                self.session.runs.subject(&id),
                 pod_name(&pod),
                 rate(&pod),
-                reattach(&id)
+                self.session.runs.follow_hint(&id)
             )
         })?;
         if interrupt.caught() {
@@ -485,7 +486,7 @@ impl<T: Trainer + Sync> Job<'_, T> {
                     .abort(interrupt, &executor, started_run, &mut pod)
                     .await;
             }
-            bail!(detached(&pod, &id, self.spec));
+            bail!(detached(&pod, &id, self.spec, &self.session.runs));
         }
         self.follow(interrupt, &executor, started_run, &mut pod)
             .await
@@ -516,8 +517,11 @@ impl<T: Trainer + Sync> Job<'_, T> {
         ended(
             pod,
             ending,
-            &id,
-            Err(anyhow!("interrupted: {id} cancelled")),
+            (&self.session.runs, &id),
+            Err(anyhow!(
+                "interrupted: {} cancelled",
+                self.session.runs.subject(&id)
+            )),
         )
     }
 
@@ -560,14 +564,14 @@ impl<T: Trainer + Sync> Job<'_, T> {
             if self.cancel_on_interrupt {
                 return self.abort(interrupt, executor, interrupted, pod).await;
             }
-            bail!(detached(pod, &id, self.spec));
+            bail!(detached(pod, &id, self.spec, &self.session.runs));
         };
         let settled = interrupt
             .shield(settle_watch(&ctx, pod, &id, watched))
             .await;
         let outcome = match settled {
             Err(error @ PodError::Run(_)) => {
-                return Err(anyhow::Error::new(error).context(reattach(&id)));
+                return Err(anyhow::Error::new(error).context(self.session.runs.follow_hint(&id)));
             },
             Err(error) => return Err(error.into()),
             Ok(outcome) => outcome,
@@ -601,7 +605,7 @@ impl<T: Trainer + Sync> Job<'_, T> {
             Ok(Some(outcome)),
             self.session.front,
         );
-        ended(pod, ending, &id, finished)
+        ended(pod, ending, (&self.session.runs, &id), finished)
     }
 
     /// `train attach` of the started run `record` on its pod.
@@ -686,7 +690,7 @@ impl<T: Trainer + Sync> Job<'_, T> {
             Some(message) => front.line(&format!("train: run {id} cancelled ({message})")),
             None => front.line(&format!("train: run {id} cancelled")),
         }
-        ended(pod, ending, &id, Ok(()))
+        ended(pod, ending, (&self.session.runs, &id), Ok(()))
     }
 }
 
@@ -696,19 +700,20 @@ impl<T: Trainer + Sync> Job<'_, T> {
 fn ended(
     pod: &PodRecord,
     ending: Result<Ending, PodError>,
-    id: &str,
+    (runs, id): (&Runs, &str),
     finished: anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     match ending {
         Ok(ending) => {
-            report(pod, ending, id);
+            report(pod, ending, runs, id);
             finished
         },
         Err(error) => {
             if let Err(run_error) = finished {
                 warn(&format!("{run_error:#}"));
             }
-            Err(anyhow::Error::new(error).context(format!("run {id} ended, but not its pod")))
+            Err(anyhow::Error::new(error)
+                .context(format!("{} ended, but not its pod", runs.subject(id))))
         },
     }
 }
@@ -776,13 +781,14 @@ fn interrupted_before_job(runs: &Runs, id: &str) -> String {
         Ok(None) => false,
         Err(_) => true,
     };
+    let subject = runs.subject(id);
     if left {
         format!(
-            "interrupted: run {id} stopped before its job started, but a pod of it may be left: \
+            "interrupted: {subject} stopped before its job started, but a pod of it may be left: \
              check `overbrainer pod ls`"
         )
     } else {
-        format!("interrupted: run {id} stopped before its job started; it has no pod left")
+        format!("interrupted: {subject} stopped before its job started; it has no pod left")
     }
 }
 
@@ -824,24 +830,29 @@ fn pod_name(pod: &PodRecord) -> String {
         .map_or_else(|| "(none)".to_string(), ToString::to_string)
 }
 
-fn keep_warning(pod: &PodRecord, id: &str) -> String {
+fn keep_warning(pod: &PodRecord, runs: &Runs, id: &str) -> String {
     let rate = pod.cost_per_hour.map_or_else(
         || "at an hourly rate Runpod did not give".to_string(),
         |rate| format!("at ${rate:.2}/h"),
     );
+    let ends = if runs.export_of().is_some() {
+        "the export"
+    } else {
+        "the run"
+    };
     format!(
-        "--keep-pod: pod {} is kept with no time limit, {rate}, even once the run ends; \
+        "--keep-pod: pod {} is kept with no time limit, {rate}, even once {ends} ends; \
          nothing deletes it but `overbrainer pod rm {id}`",
         pod_name(pod)
     )
 }
 
 /// The message of a run left running on its pod after Ctrl-C.
-fn detached(pod: &PodRecord, id: &str, spec: &RunpodTarget) -> String {
+fn detached(pod: &PodRecord, id: &str, spec: &RunpodTarget, runs: &Runs) -> String {
     let guard = if pod.keep {
         format!(
             "The pod is kept with no time limit (--keep-pod): `{}`.",
-            ssh_command(id)
+            ssh_command(runs, id)
         )
     } else {
         format!(
@@ -852,17 +863,18 @@ fn detached(pod: &PodRecord, id: &str, spec: &RunpodTarget) -> String {
         )
     };
     format!(
-        "interrupted: run {id} keeps running on pod {}{}; {}, or delete the pod with \
+        "interrupted: {} keeps running on pod {}{}; {}, or delete the pod with \
          `overbrainer pod rm {id}`. {guard}",
+        runs.subject(id),
         pod_name(pod),
         rate(pod),
-        reattach(id)
+        runs.follow_hint(id)
     )
 }
 
 /// Says what became of the pod once the job ended: see [`report_line`].
-fn report(pod: &PodRecord, ending: Ending, id: &str) {
-    if let Some(line) = report_line(pod, ending, id) {
+fn report(pod: &PodRecord, ending: Ending, runs: &Runs, id: &str) {
+    if let Some(line) = report_line(pod, ending, runs, id) {
         warn(&line);
     }
 }
@@ -870,14 +882,14 @@ fn report(pod: &PodRecord, ending: Ending, id: &str) {
 /// What to say of the pod once the job ended. Nothing for a deleted pod, which
 /// its events already reported, nor for one awaiting retrieval, which `end_pod`
 /// reported: how to reach a kept pod, its results retrieved or not, is said here.
-fn report_line(pod: &PodRecord, ending: Ending, id: &str) -> Option<String> {
+fn report_line(pod: &PodRecord, ending: Ending, runs: &Runs, id: &str) -> Option<String> {
     match ending {
         Ending::Deleted | Ending::AwaitingRetrieval => None,
         Ending::Kept => Some(format!(
             "pod {} kept (--keep-pod): `{}`; remove it with `overbrainer pod rm {id}`; \
              nothing deletes it automatically",
             pod_name(pod),
-            ssh_command(id)
+            ssh_command(runs, id)
         )),
     }
 }
@@ -1113,6 +1125,44 @@ mod tests {
         }
     }
 
+    /// The runs of a project in `project`, relative paths only.
+    fn runs() -> Runs {
+        Runs::new(Path::new("project"))
+    }
+
+    #[test]
+    fn an_export_s_messages_name_the_export_and_never_train_attach()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let exports = runs().exports("r1")?;
+        let kept = pod(true)?;
+        let warning = keep_warning(&kept, &exports, "e1");
+        assert!(warning.contains("even once the export ends"), "{warning}");
+        assert!(warning.ends_with("`overbrainer pod rm e1`"), "{warning}");
+        assert_eq!(
+            report_line(&kept, Ending::Kept, &exports, "e1").as_deref(),
+            Some(
+                "pod k3x9abc kept (--keep-pod): `ssh -F runs/r1/exports/e1/ssh/config \
+                 overbrainer-e1`; remove it with `overbrainer pod rm e1`; nothing deletes it \
+                 automatically"
+            )
+        );
+        let detached = detached(&kept, "e1", &target(), &exports);
+        assert!(
+            detached.starts_with("interrupted: export e1 of run r1 keeps running on pod k3x9abc"),
+            "{detached}"
+        );
+        assert!(detached.contains("`overbrainer export r1`"), "{detached}");
+        let interrupted = interrupted_before_job(&exports, "e1");
+        assert_eq!(
+            interrupted,
+            "interrupted: export e1 of run r1 stopped before its job started; it has no pod left"
+        );
+        for message in [warning, detached, interrupted] {
+            assert!(!message.contains("train attach"), "{message}");
+        }
+        Ok(())
+    }
+
     fn pod(keep: bool) -> Result<PodRecord, serde_json::Error> {
         let mut pod = PodRecord::new("r1", keep, 1, "ssh-ed25519 AAAAhost");
         let remote: Pod = serde_json::from_value(
@@ -1126,7 +1176,7 @@ mod tests {
     #[test]
     fn keep_pod_warns_of_no_time_limit_with_the_rate_and_pod_rm() -> Result<(), serde_json::Error> {
         assert_eq!(
-            keep_warning(&pod(true)?, "r1"),
+            keep_warning(&pod(true)?, &runs(), "r1"),
             "--keep-pod: pod k3x9abc is kept with no time limit, at $0.53/h, even once the run \
              ends; nothing deletes it but `overbrainer pod rm r1`"
         );
@@ -1139,7 +1189,7 @@ mod tests {
         let guarded = pod(false)?;
         let deadline = guarded.deadline.clone().unwrap_or_default();
         assert_eq!(
-            detached(&guarded, "r1", &target()),
+            detached(&guarded, "r1", &target(), &runs()),
             format!(
                 "interrupted: run r1 keeps running on pod k3x9abc ($0.53/h); follow it again \
                  with `overbrainer train attach r1`, or delete the pod with `overbrainer pod rm \
@@ -1148,7 +1198,7 @@ mod tests {
                  runs out), whichever is later."
             )
         );
-        assert!(detached(&pod(true)?, "r1", &target()).ends_with(
+        assert!(detached(&pod(true)?, "r1", &target(), &runs()).ends_with(
             "The pod is kept with no time limit (--keep-pod): \
              `ssh -F runs/r1/ssh/config overbrainer-r1`."
         ));
@@ -1161,11 +1211,14 @@ mod tests {
                     remove it with `overbrainer pod rm r1`; nothing deletes it automatically";
         let (keep, guarded) = (pod(true)?, pod(false)?);
         assert_eq!(
-            report_line(&keep, Ending::Kept, "r1").as_deref(),
+            report_line(&keep, Ending::Kept, &runs(), "r1").as_deref(),
             Some(kept)
         );
-        assert_eq!(report_line(&guarded, Ending::AwaitingRetrieval, "r1"), None);
-        assert_eq!(report_line(&guarded, Ending::Deleted, "r1"), None);
+        assert_eq!(
+            report_line(&guarded, Ending::AwaitingRetrieval, &runs(), "r1"),
+            None
+        );
+        assert_eq!(report_line(&guarded, Ending::Deleted, &runs(), "r1"), None);
         Ok(())
     }
 }

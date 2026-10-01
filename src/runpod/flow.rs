@@ -962,10 +962,22 @@ fn unretrieved(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> Result<En
         )
     };
     pod.save(ctx.runs)?;
-    tracing::warn!(
-        "the results of run {run_id} were not retrieved: pod {name} {stays}; retrieve them with `overbrainer train attach {run_id}`, or remove the pod with `overbrainer pod rm {run_id}`"
-    );
+    tracing::warn!("{}", unretrieved_line(ctx.runs, run_id, &name, stays));
     Ok(ending)
+}
+
+/// The warning when the results of `run_id`, a run or an export of `runs`, were
+/// not retrieved from its pod `name`, which `stays`.
+fn unretrieved_line(runs: &Runs, run_id: &str, name: &str, stays: &str) -> String {
+    let subject = runs.subject(run_id);
+    let retry = match runs.export_of() {
+        Some(run) => format!("export again with `overbrainer export {run}`"),
+        None => format!("retrieve them with `overbrainer train attach {run_id}`"),
+    };
+    format!(
+        "the results of {subject} were not retrieved: pod {name} {stays}; {retry}, or remove the \
+         pod with `overbrainer pod rm {run_id}`"
+    )
 }
 
 /// The watchdog's log on the pod, in the run directory on the pod.
@@ -1118,11 +1130,13 @@ fn pod_workdir(run: &RunRecord) -> &str {
         .map_or(run.remote_dir.as_str(), |(parent, _)| parent)
 }
 
-/// The command reaching a kept pod: `ssh -F runs/<id>/ssh/config overbrainer-<id>`.
+/// The command reaching a kept pod of the run or export `run_id` of `runs`:
+/// `ssh -F runs/<id>/ssh/config overbrainer-<id>`.
 #[must_use]
-pub fn ssh_command(run_id: &str) -> String {
+pub fn ssh_command(runs: &Runs, run_id: &str) -> String {
     format!(
-        "ssh -F runs/{run_id}/{SSH_DIR}/{} {}",
+        "ssh -F {}/{SSH_DIR}/{} {}",
+        runs.relative_dir(run_id),
         super::SSH_CONFIG,
         alias(run_id)
     )
@@ -1135,6 +1149,33 @@ mod tests {
     use crate::runpod::ApiError;
     use crate::runpod::{RunpodClient, Timing};
     use crate::train::TrainMetric;
+
+    #[test]
+    fn an_export_s_pod_messages_name_the_export_and_its_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let exports = runs.exports("r1")?;
+        assert_eq!(
+            unretrieved_line(&runs, "r1", "p1", "stays"),
+            "the results of run r1 were not retrieved: pod p1 stays; retrieve them with \
+             `overbrainer train attach r1`, or remove the pod with `overbrainer pod rm r1`"
+        );
+        assert_eq!(
+            unretrieved_line(&exports, "e1", "p1", "stays"),
+            "the results of export e1 of run r1 were not retrieved: pod p1 stays; export again \
+             with `overbrainer export r1`, or remove the pod with `overbrainer pod rm e1`"
+        );
+        assert_eq!(
+            ssh_command(&exports, "e1"),
+            "ssh -F runs/r1/exports/e1/ssh/config overbrainer-e1"
+        );
+        assert_eq!(
+            ssh_command(&runs, "r1"),
+            "ssh -F runs/r1/ssh/config overbrainer-r1"
+        );
+        Ok(())
+    }
 
     /// A pace of 1 step per 10 s at step 100 of 7300: 20 hours left.
     fn slow_pace() -> Pace {
