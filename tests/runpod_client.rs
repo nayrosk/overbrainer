@@ -985,8 +985,8 @@ async fn a_secret_write_error_never_shows_the_value() -> TestResult {
 async fn a_new_secret_never_shows_its_value_in_debug() {
     let value = generated_host_key(200);
     let text = format!("{:?}", new_secret(&value));
-    assert!(!text.contains(&value[..16]), "{text}");
-    assert!(text.contains(SECRET_NAME), "{text}");
+    assert!(!text.contains(&value[..16]), "Debug shows the secret value");
+    assert!(text.contains(SECRET_NAME), "Debug hides the secret name");
 }
 
 #[tokio::test]

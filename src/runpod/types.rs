@@ -680,8 +680,14 @@ mod tests {
             description: "d".into(),
         };
         let text = format!("{secret:?}");
-        assert!(!text.contains("c2VjcmV0LWhvc3Qta2V5"), "{text}");
-        assert!(text.contains("overbrainer_host_key_r1"), "{text}");
+        assert!(
+            !text.contains("c2VjcmV0LWhvc3Qta2V5"),
+            "Debug shows the secret value"
+        );
+        assert!(
+            text.contains("overbrainer_host_key_r1"),
+            "Debug hides the secret name"
+        );
         let json = serde_json::to_value(&secret)?;
         assert_eq!(json["value"], "c2VjcmV0LWhvc3Qta2V5");
         let patch = serde_json::to_value(SecretValue(&secret.value))?;
