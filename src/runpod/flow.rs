@@ -1051,14 +1051,44 @@ pub async fn reconnect(
     );
     let alias = alias(&run.id);
     let config = write_config(&ssh_dir, &alias, &endpoint, &keys)?;
-    let workdir = run
-        .remote_dir
-        .rsplit_once('/')
-        .map_or(run.remote_dir.as_str(), |(parent, _)| parent);
-    let executor = SshExecutor::connect(&alias, workdir, Some(&config)).await?;
+    let executor = SshExecutor::connect(&alias, pod_workdir(run), Some(&config)).await?;
     pod.ssh = Some(endpoint);
     pod.save(ctx.runs)?;
     Ok(Some(executor))
+}
+
+/// Connects to the pod of the run `run` through the ssh config the process
+/// following it wrote, for `train stop` while that process holds the project:
+/// no Runpod API call, and nothing written locally, so the run directory stays
+/// that process's alone. `None` when the run has no pod left or no ssh config
+/// yet.
+///
+/// # Errors
+///
+/// Returns a [`PodError`] when the run directory is invalid or the connection
+/// fails.
+pub async fn connect_followed(
+    runs: &Runs,
+    pod: &PodRecord,
+    run: &RunRecord,
+) -> Result<Option<SshExecutor>, PodError> {
+    if pod.pod_id.is_none() || pod.state == PodState::Deleted {
+        return Ok(None);
+    }
+    let config = runs.run_dir(&run.id)?.join(SSH_DIR).join(super::SSH_CONFIG);
+    if !config.is_file() {
+        return Ok(None);
+    }
+    let executor = SshExecutor::connect(&alias(&run.id), pod_workdir(run), Some(&config)).await?;
+    Ok(Some(executor))
+}
+
+/// The work directory on the pod of the run `run`: the parent of its run
+/// directory there.
+fn pod_workdir(run: &RunRecord) -> &str {
+    run.remote_dir
+        .rsplit_once('/')
+        .map_or(run.remote_dir.as_str(), |(parent, _)| parent)
 }
 
 /// The command reaching a kept pod: `ssh -F runs/<id>/ssh/config overbrainer-<id>`.

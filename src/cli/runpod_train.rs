@@ -27,9 +27,9 @@ use crate::runpod::{
     ssh_command, start_pod, watch_leased, with_pod_logs,
 };
 use crate::runs::{
-    Launch, Outcome, RunCtx, RunRecord, RunState, Runs, STOP_LIMITS, SnapshotReason,
+    Launch, Outcome, REQUEST_POLL, RunCtx, RunRecord, RunState, Runs, STOP_LIMITS, SnapshotReason,
     artifacts_missing, cancel as cancel_job, collect, create, request_snapshot, reserve, start,
-    watch, with_stop_fallback,
+    watch, with_request_watch, with_stop_fallback,
 };
 use crate::train::sizing::{HF_URL, VramFloor, estimate_model};
 use crate::train::{Axolotl, reasoning_template_warning};
@@ -319,7 +319,8 @@ impl Job<'_> {
     ) -> anyhow::Result<()> {
         let ctx = self.session.ctx();
         let id = record.id.clone();
-        let job = record.job.clone().filter(|_| self.stopping);
+        let job = record.job.clone();
+        let stopping = self.stopping;
         // Only the watch is raced: it never changes the pod, so Ctrl-C drops
         // nothing half done (the capture of the pod's logs resumes from its
         // cursor). Acting on it (deleting the pod past the deadline)
@@ -329,7 +330,14 @@ impl Job<'_> {
         let leased = Box::pin(watch_leased(&ctx, &run_ctx, self.trainer, record, pod));
         let watch = async move {
             match job {
-                Some(job) => with_stop_fallback(executor, &job, STOP_LIMITS, leased).await,
+                Some(job) if stopping => {
+                    with_stop_fallback(executor, &job, STOP_LIMITS, leased).await
+                },
+                // A request written by another process, `train stop` or the
+                // pod's watchdog, is held to the same limits from when it is seen.
+                Some(job) => {
+                    with_request_watch(executor, &job, STOP_LIMITS, REQUEST_POLL, leased).await
+                },
                 None => leased.await,
             }
         };

@@ -33,6 +33,7 @@ use crate::config::{DotenvKeys, EnvSource, Source};
 use crate::events::Observer;
 use crate::logging::{LOG_LINES, LogBuffer, LogMode};
 use crate::metrics::{Metrics, MetricsServer};
+use crate::project_lock::{LockError, ProjectLock};
 use crate::secrets::{Resolver, SecretError, SecretSource, VaultRef, VaultSettings, VaultSource};
 use crate::update::{self, CheckEnv, Newer};
 
@@ -148,6 +149,18 @@ impl Command {
     #[must_use]
     pub fn serves_metrics(&self) -> bool {
         self.writes_project() && !matches!(self, Self::Migrate(_))
+    }
+
+    /// The run `train stop` asks a snapshot of; `None` for any other command.
+    #[must_use]
+    pub fn stopped_run(&self) -> Option<&str> {
+        match self {
+            Self::Train(TrainArgs {
+                command: Some(TrainCommand::Stop { run_id }),
+                ..
+            }) => Some(run_id),
+            _ => None,
+        }
     }
 
     /// Whether this command writes to the project, and so must hold the project
@@ -489,7 +502,20 @@ async fn dispatch(
     // Only a project takes the lock: without `overbrainer.toml` the command fails
     // with its usual error and leaves nothing behind.
     let lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
-        Some(crate::project_lock::ProjectLock::acquire(dir)?)
+        match ProjectLock::acquire(dir) {
+            Ok(lock) => Some(lock),
+            // `train stop` only asks for the snapshot then: the process holding
+            // the project, most likely following the run, collects it.
+            Err(LockError::Held { pid }) => match cli.command.stopped_run() {
+                Some(run_id) => {
+                    let source = Source::from(EnvSource::Process);
+                    let front = Frontend::Cli(None);
+                    return train::request_stop(dir, run_id, pid, &front, &source).await;
+                },
+                None => return Err(LockError::Held { pid }.into()),
+            },
+            Err(error) => return Err(error.into()),
+        }
     } else {
         None
     };
@@ -723,6 +749,24 @@ mod tests {
             &cli(&["overbrainer", "-C", &path, "tui"])?,
             true
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn only_train_stop_names_a_stopped_run() -> Result<(), clap::Error> {
+        let stopped = |args: &[&str]| -> Result<Option<String>, clap::Error> {
+            let cli =
+                Cli::try_parse_from(std::iter::once("overbrainer").chain(args.iter().copied()))?;
+            Ok(cli.command.stopped_run().map(str::to_string))
+        };
+        assert_eq!(stopped(&["train", "stop", "x"])?.as_deref(), Some("x"));
+        for args in [
+            &["train"][..],
+            &["train", "attach", "x"],
+            &["train", "cancel", "x"],
+        ] {
+            assert_eq!(stopped(args)?, None, "{args:?}");
+        }
         Ok(())
     }
 

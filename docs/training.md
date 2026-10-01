@@ -38,11 +38,13 @@ A run fails when the job exits with a non-zero code, or when it writes no metric
 
 `overbrainer train stop RUN_ID` stops a running job without losing what it trained. It writes `snapshot.request` in the run directory on the target; the metrics plugin sees it at the end of the current step, saves a full checkpoint (the adapter or model, the optimizer and scheduler state, the random state), stops training, and writes `snapshot.json` with the checkpoint and its step. `merge-lora` is skipped. The command then follows the job as `train attach` does until it ends, records the run `stopped`, and retrieves the checkpoint (`runs/<run-id>/output/checkpoint-N/`) in a second pass, checked against the target's SHA-256 manifest like the other artifacts. On Runpod the pod is then deleted.
 
+While another overbrainer process holds the project (`train`, `run`, `train attach` or the TUI following the run), `train stop` does not follow the run itself: it writes `snapshot.request` on the target, says which process holds the project, and exits. The process following the run then records it `stopped` and retrieves the checkpoint as above. `train stop` reads `run.json` and `pod.json` then, and writes nothing else in the run directory; on Runpod it reaches the pod through the `runs/<run-id>/ssh/config` that process wrote, with no Runpod API call. If the holder does not follow that run, `overbrainer train attach RUN_ID` collects the snapshot once it is free.
+
 ```
 train: run 20260922-143005-a1b2 stopped at step 1240 (requested): snapshot in runs/20260922-143005-a1b2/output/checkpoint-1240; resume with `overbrainer train --resume-from 20260922-143005-a1b2`
 ```
 
-A job that neither saves its snapshot nor ends within 30 minutes of the request is cancelled. One that saved it but has not ended 10 minutes later is cancelled too, and still recorded `stopped` with its snapshot. A request that lands after the last step changes nothing: the run succeeds as usual. Under distributed training, rank 0 reads the request and tells the other ranks, so they all stop at the same step.
+A job that neither saves its snapshot nor ends within 30 minutes of the request is cancelled. A process that follows a run without having asked for the snapshot (`train attach`, or the holder above) looks for a request every 30 seconds and applies the same limits from when it sees one. One that saved it but has not ended 10 minutes later is cancelled too, and still recorded `stopped` with its snapshot. A request that lands after the last step changes nothing: the run succeeds as usual. Under distributed training, rank 0 reads the request and tells the other ranks, so they all stop at the same step.
 
 `run.json` of a stopped run holds `snapshot`: `checkpoint`, `step` and `reason`, which is `requested` for `train stop` and the TUI, `deadline`, `cost` or `disk` for the automatic snapshots of a Runpod run (see [Runpod](runpod.md)).
 

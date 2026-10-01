@@ -200,18 +200,82 @@ pub async fn with_stop_fallback<E: Executor, F: Future>(
     flow: F,
 ) -> F::Output {
     let mut flow = std::pin::pin!(flow);
-    tokio::select! {
-        output = &mut flow => return output,
-        () = tokio::time::sleep(limits.proof) => {},
+    if let Err(output) = beside(&mut flow, tokio::time::sleep(limits.proof)).await {
+        return output;
     }
-    if late_check(executor, job, limits.proof).await {
-        tokio::select! {
-            output = &mut flow => return output,
-            () = tokio::time::sleep(limits.end) => {},
-        }
-        late_stop(executor, job).await;
+    match beside(&mut flow, late_check(executor, job, limits.proof)).await {
+        Err(output) => return output,
+        Ok(false) => {},
+        Ok(true) => {
+            if let Err(output) = beside(&mut flow, tokio::time::sleep(limits.end)).await {
+                return output;
+            }
+            if let Err(output) = beside(&mut flow, late_stop(executor, job)).await {
+                return output;
+            }
+        },
     }
     flow.await
+}
+
+/// How often a follow that did not ask for a snapshot looks for a request
+/// someone else wrote: `train stop` from another process, the cost cap or the
+/// pod's watchdog.
+pub const REQUEST_POLL: Duration = Duration::from_secs(30);
+
+/// Runs `flow`, which follows the job `job`, and returns what it returns.
+/// Every `every`, it looks for a snapshot request in the job's run directory;
+/// once one is there, the job is handled as [`with_stop_fallback`] does, with
+/// `limits` counted from then. A job asked for no snapshot is never cancelled.
+pub async fn with_request_watch<E: Executor, F: Future>(
+    executor: &E,
+    job: &JobId,
+    limits: StopLimits,
+    every: Duration,
+    flow: F,
+) -> F::Output {
+    let mut flow = std::pin::pin!(flow);
+    let request = async {
+        let mut ticks = tokio::time::interval(every);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            if requested(executor, &job.dir).await {
+                break;
+            }
+        }
+    };
+    if let Err(output) = beside(&mut flow, request).await {
+        return output;
+    }
+    with_stop_fallback(executor, job, limits, flow).await
+}
+
+/// Runs `work` while `flow` keeps being polled, so a slow or hung read of the
+/// target never holds the follow up: `Err` with what `flow` returns when it
+/// ends first, in which case `work` is dropped.
+async fn beside<F: Future + Unpin, W: Future>(
+    flow: &mut F,
+    work: W,
+) -> Result<W::Output, F::Output> {
+    tokio::select! {
+        biased;
+        output = flow => Err(output),
+        done = work => Ok(done),
+    }
+}
+
+/// Whether a snapshot was asked of the job of `run_dir`: its request holds a
+/// reason. A failure to read it counts as no request and is only logged.
+async fn requested<E: Executor>(executor: &E, run_dir: &str) -> bool {
+    let path = format!("{run_dir}/{SNAPSHOT_REQUEST}");
+    match executor.read_from(&path, 0, 1).await {
+        Ok(content) => !content.is_empty(),
+        Err(error) => {
+            tracing::debug!("cannot look for a snapshot request: {error}");
+            false
+        },
+    }
 }
 
 /// Where a stop stands once `waited` passed: a job still running without a
