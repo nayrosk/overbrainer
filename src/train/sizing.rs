@@ -237,6 +237,55 @@ pub fn estimate(shape: &ModelShape, recipe: &Recipe) -> Estimate {
     }
 }
 
+/// Bits per weight of a GGUF quantized to `quantize`, in tenths, about: what
+/// llama.cpp reports for its k-quants on recent models; 16 bits for `F16` and
+/// `BF16`, and for an unknown type.
+#[must_use]
+pub fn gguf_bits_tenths(quantize: &str) -> u64 {
+    match quantize {
+        "Q2_K" => 26,
+        "Q3_K_M" => 39,
+        "Q4_K_S" => 46,
+        "Q4_K_M" => 49,
+        "Q5_K_S" => 55,
+        "Q5_K_M" => 57,
+        "Q6_K" => 66,
+        "Q8_0" => 85,
+        _ => 160,
+    }
+}
+
+/// The disk an export of a model of `params` parameters to `quantize` needs
+/// beside the run's own files, in bytes: when `merge`, the base model in the
+/// Hugging Face cache and the merged copy (bf16, 2 bytes per parameter each);
+/// the 16-bit GGUF the quantization starts from, unless `quantize` is `F16`
+/// or `BF16`; and the GGUF itself. Raised by 10%.
+#[must_use]
+pub fn export_disk_bytes(params: u64, merge: bool, quantize: &str) -> u64 {
+    let params = u128::from(params);
+    let bf16 = params.saturating_mul(2);
+    let merged = if merge { bf16.saturating_mul(2) } else { 0 };
+    let bits = u128::from(gguf_bits_tenths(quantize));
+    let start = if bits < 160 { bf16 } else { 0 };
+    let gguf = params.saturating_mul(bits) / 80;
+    let bytes = [merged, start, gguf]
+        .into_iter()
+        .fold(0, u128::saturating_add);
+    u64::try_from(bytes.saturating_mul(11) / 10).unwrap_or(u64::MAX)
+}
+
+/// What an export of a model of `shape` needs per GPU: the merge holds the
+/// base model in bf16, then the overhead, all raised by 20%.
+#[must_use]
+pub fn export_estimate(shape: &ModelShape) -> Estimate {
+    let bytes = u128::from(shape.params)
+        .saturating_mul(2)
+        .saturating_add(u128::from(OVERHEAD));
+    Estimate {
+        bytes: u64::try_from(bytes.saturating_mul(12) / 10).unwrap_or(u64::MAX),
+    }
+}
+
 /// The product of `factors`, saturating at `u128::MAX`: Hub metadata or
 /// `axolotl_extra` values far beyond any real model never overflow.
 fn product(factors: &[u128]) -> u128 {
@@ -517,6 +566,18 @@ mod tests {
         let most = Estimate { bytes: u64::MAX };
         assert_eq!(fit(u32::MAX, Some(&Estimate { bytes: 0 })), Fit::Ok);
         assert_eq!(most.floor_gb(), u32::MAX);
+    }
+
+    #[test]
+    fn an_export_needs_the_merge_the_16_bit_gguf_and_the_quantized_one() {
+        let params = 1_000_000_000;
+        // Merged: 2 GB base + 2 GB merged, 2 GB f16 GGUF, 0.6125 GB Q4_K_M; +10%.
+        assert_eq!(export_disk_bytes(params, true, "Q4_K_M"), 7_273_750_000);
+        // A merged model already there, and F16: the GGUF only.
+        assert_eq!(export_disk_bytes(params, false, "F16"), 2_200_000_000);
+        assert_eq!(gguf_bits_tenths("Q8_0"), 85);
+        assert_eq!(gguf_bits_tenths("BF16"), 160);
+        assert_eq!(export_estimate(&QWEN3_4B).floor_gb(), 13);
     }
 
     #[test]

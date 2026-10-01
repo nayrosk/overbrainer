@@ -628,6 +628,22 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
     }
 }
 
+/// The warning when the container disk of `container_disk_gb` GB, without a
+/// network volume, may be too small for an export needing `need_bytes` (see
+/// [`export_disk_bytes`](crate::train::sizing::export_disk_bytes)) beside
+/// the run: more than 90% of the disk. `None` when it fits.
+#[must_use]
+pub fn export_room_warning(container_disk_gb: u32, need_bytes: u64) -> Option<String> {
+    let disk = u128::from(container_disk_gb).saturating_mul(u128::from(GB));
+    (u128::from(need_bytes).saturating_mul(10) > disk.saturating_mul(9)).then(|| {
+        format!(
+            "the export needs about {} of disk for the merged model and the GGUF files, \
+             beside the run: container_disk_gb = {container_disk_gb} may be too small",
+            gb(need_bytes)
+        )
+    })
+}
+
 /// `bytes` in GB, one decimal.
 fn gb(bytes: u64) -> String {
     format!("{:.1} GB", system::float(bytes) / system::float(GB))
@@ -644,6 +660,18 @@ mod tests {
             used_bytes: percent * GIB,
             capacity_bytes: 100 * GIB,
         }
+    }
+
+    #[test]
+    fn an_export_warns_when_it_would_fill_the_container_disk() {
+        assert_eq!(export_room_warning(50, 44 * GB), None);
+        assert_eq!(
+            export_room_warning(50, 46 * GB).as_deref(),
+            Some(
+                "the export needs about 46.0 GB of disk for the merged model and the GGUF \
+                 files, beside the run: container_disk_gb = 50 may be too small"
+            )
+        );
     }
 
     #[test]

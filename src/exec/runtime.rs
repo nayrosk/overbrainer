@@ -10,6 +10,10 @@ use crate::train::JobStage;
 pub const CONTAINER_ROOT: &str = "/workspace/run";
 /// Where a container sees the Hugging Face cache.
 const CONTAINER_CACHE: &str = "/workspace/hf-cache";
+/// Where a container sees the tools cache of [`JobSpec::tools_dir`].
+const CONTAINER_TOOLS: &str = "/workspace/cache";
+/// The job's environment variable naming the tools cache as it sees it.
+pub const TOOLS_ENV: &str = "OVERBRAINER_CACHE";
 
 /// The runtime of a target, with its defaults applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +62,11 @@ pub struct JobSpec<'a> {
     pub stages: Option<Stages<'a>>,
     /// Secret environment, passed through without its values on any command line.
     pub secrets: Vec<(String, SecretString)>,
+    /// A directory on the target where the job caches the tools it downloads
+    /// (llama.cpp for an export), shared by the runs; `None` for a job that
+    /// downloads none. A container mounts it; either runtime names it, as the
+    /// job sees it, in [`TOOLS_ENV`].
+    pub tools_dir: Option<&'a str>,
 }
 
 /// The stage events of a job: one line in `file` before each command.
@@ -182,9 +191,18 @@ fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>)
                 spec.cache_dir
             ))
         ),
+    ];
+    if let Some(tools) = spec.tools_dir {
+        words.push(format!(
+            "-v {}",
+            quote(&format!("{tools}:{CONTAINER_TOOLS}{cache_label}"))
+        ));
+        words.push(format!("-e {TOOLS_ENV}={CONTAINER_TOOLS}"));
+    }
+    words.extend([
         format!("-w {CONTAINER_ROOT}"),
         format!("-e HF_HOME={CONTAINER_CACHE}"),
-    ];
+    ]);
     words.extend(
         spec.env
             .iter()
@@ -197,11 +215,11 @@ fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>)
     );
     words.push(quote(image));
     words.push(format!("sh -c {}", quote(&chain(spec, quote))));
-    format!(
-        "mkdir -p -- {} && {}",
-        quote(spec.cache_dir),
-        words.join(" ")
-    )
+    let dirs: Vec<String> = std::iter::once(spec.cache_dir)
+        .chain(spec.tools_dir)
+        .map(quote)
+        .collect();
+    format!("mkdir -p -- {} && {}", dirs.join(" "), words.join(" "))
 }
 
 fn native_script(venv: Option<&str>, env_file: Option<&str>, spec: &JobSpec<'_>) -> String {
@@ -213,9 +231,12 @@ fn native_script(venv: Option<&str>, env_file: Option<&str>, spec: &JobSpec<'_>)
     if let Some(env_file) = env_file {
         parts.push(format!(". {}", shell_path(env_file)));
     }
-    if !spec.env.is_empty() {
-        let exports: Vec<String> = spec
-            .env
+    let tools = spec
+        .tools_dir
+        .map(|tools| (TOOLS_ENV.to_string(), tools.to_string()));
+    let env: Vec<&(String, String)> = spec.env.iter().chain(tools.as_ref()).collect();
+    if !env.is_empty() {
+        let exports: Vec<String> = env
             .iter()
             .map(|(name, value)| export_word(name, value))
             .collect();
@@ -297,6 +318,7 @@ mod tests {
             stop_marker: None,
             stages: None,
             secrets: Vec::new(),
+            tools_dir: None,
         }
     }
 
@@ -444,6 +466,50 @@ mod tests {
         let probe = format!("{} && printf '%s|%s' \"$HF_HOME\" \"$ODD\"", job.script);
         assert_eq!(run_probe(&probe, None)?, "/w/.hf-cache|it's a value");
         Ok(())
+    }
+
+    #[test]
+    fn the_tools_cache_is_mounted_and_named_only_when_the_job_needs_it() {
+        let commands = commands();
+        let docker = JobRuntime::Container {
+            engine: Engine::Podman,
+            image: "img:1".into(),
+        };
+        let tools = JobSpec {
+            tools_dir: Some("/w/.cache"),
+            ..spec(&commands)
+        };
+        let script = docker.job(tools).script;
+        assert!(
+            script.starts_with("mkdir -p -- '/w/.hf-cache' '/w/.cache' && podman run"),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "-v '/w/.cache:/workspace/cache:z' -e OVERBRAINER_CACHE=/workspace/cache -w /workspace/run"
+            ),
+            "{script}"
+        );
+        assert!(
+            !docker
+                .job(spec(&commands))
+                .script
+                .contains("OVERBRAINER_CACHE")
+        );
+        let native = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        };
+        let script = native
+            .job(JobSpec {
+                tools_dir: Some("/w/.cache"),
+                ..spec(&commands[..1])
+            })
+            .script;
+        assert_eq!(
+            script,
+            "export 'OVERBRAINER_CACHE=/w/.cache' && 'axolotl' 'train' 'axolotl.yaml'"
+        );
     }
 
     #[test]

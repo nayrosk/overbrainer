@@ -22,8 +22,8 @@ pub use snapshot::{
 };
 pub use summary::MetricsSummary;
 pub use train::{
-    HF_CACHE_DIR, Launch, Outcome, PROBE_EVERY, RunCtx, RunError, artifacts_missing, cancel,
-    collect, create, create_on, reserve, start, watch,
+    HF_CACHE_DIR, Launch, Outcome, PROBE_EVERY, RunCtx, RunError, TOOLS_CACHE_DIR,
+    artifacts_missing, cancel, collect, create, create_on, reserve, start, start_mounted, watch,
 };
 
 use crate::exec::JobId;
@@ -163,6 +163,32 @@ impl Runs {
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The export jobs of run `id`, `runs/<id>/exports/`, kept as runs of
+    /// their own: each has its record, job log and metrics, and on Runpod its
+    /// pod, in `runs/<id>/exports/<export-id>/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunsError::InvalidId`] when `id` is not a valid run ID.
+    pub fn exports(&self, id: &str) -> Result<Self, RunsError> {
+        Ok(Self {
+            dir: self.run_dir(id)?.join(crate::export::EXPORTS_DIR),
+        })
+    }
+
+    /// The export jobs holding the export `id`, from any run, when one does.
+    #[must_use]
+    pub fn find_export(&self, id: &str) -> Option<Self> {
+        if !is_valid_run_id(id) {
+            return None;
+        }
+        let entries = fs::read_dir(&self.dir).ok()?;
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| self.exports(&entry.file_name().to_string_lossy()).ok())
+            .find(|exports| exports.dir.join(id).join(RECORD_FILE).is_file())
     }
 
     /// Local directory of the run `id`.
@@ -361,6 +387,32 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> RunsError + '_ {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn exports_are_runs_of_their_own_inside_their_run() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        assert!(runs.exports("../x").is_err());
+        let exports = runs.exports("r1")?;
+        assert_eq!(exports.dir(), project.path().join("runs/r1/exports"));
+        let (id, _) = exports.claim("export_20261001-120000", 0)?;
+        assert_eq!(
+            runs.find_export(&id).map(|found| found.dir),
+            None,
+            "no record yet"
+        );
+        fs::write(exports.run_dir(&id)?.join(RECORD_FILE), "{}")?;
+        assert_eq!(
+            runs.find_export(&id).map(|found| found.dir),
+            Some(exports.dir().to_path_buf())
+        );
+        assert!(runs.find_export("../r1").is_none());
+        assert!(
+            runs.list()?.is_empty(),
+            "an export is not a run of the project"
+        );
+        Ok(())
+    }
 
     fn record(id: &str) -> RunRecord {
         RunRecord {

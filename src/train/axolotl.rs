@@ -12,6 +12,7 @@ use super::metrics::{
 use super::{Artifacts, TrainError, Trainer, to_yaml};
 use crate::config::{Adapter, Training};
 use crate::dataset::DataFiles;
+use crate::export::ExportJob;
 
 /// The Axolotl config, relative to the run directory.
 pub const CONFIG_FILE: &str = "axolotl.yaml";
@@ -162,12 +163,13 @@ impl Resume {
 }
 
 /// Fine-tunes with Axolotl from `data/train.jsonl`, evaluating on `data/eval.jsonl`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Axolotl<'a> {
     training: &'a Training,
     train: PathBuf,
     eval: PathBuf,
     resume: Option<Resume>,
+    export: Option<ExportJob>,
 }
 
 impl<'a> Axolotl<'a> {
@@ -179,7 +181,25 @@ impl<'a> Axolotl<'a> {
             train: files.train.clone(),
             eval: files.eval.clone(),
             resume: None,
+            export: None,
         }
+    }
+
+    /// The same trainer exporting the model of run `run_id` to GGUF at the
+    /// end of its job, quantized to `quantize`, after the merge (and, like
+    /// it, not once the job stopped with a snapshot).
+    #[must_use]
+    pub fn exporting(self, run_id: &str, quantize: &str) -> Self {
+        Self {
+            export: Some(ExportJob::in_job(run_id, quantize)),
+            ..self
+        }
+    }
+
+    /// The export at the end of the job, if any.
+    #[must_use]
+    pub fn export(&self) -> Option<&ExportJob> {
+        self.export.as_ref()
     }
 
     /// The same trainer resuming from `resume`: it trains on the data of the
@@ -418,6 +438,9 @@ impl Trainer for Axolotl<'_> {
             copy(&self.eval, &run_dir.join(EVAL_FILE))?;
         }
         write(&run_dir.join(PLUGIN_DIR).join(PLUGIN_FILE), METRICS_PLUGIN)?;
+        if self.export.is_some() {
+            ExportJob::write_script(run_dir)?;
+        }
         if let Some(resume) = &self.resume {
             let into = run_dir.join(RESUME_DIR).join(resume.name());
             link_tree(&resume.dir.join(&resume.checkpoint), &into)?;
@@ -429,23 +452,40 @@ impl Trainer for Axolotl<'_> {
     }
 
     fn commands(&self) -> Vec<Vec<String>> {
-        self.steps()
+        let mut commands: Vec<Vec<String>> = self
+            .steps()
             .into_iter()
             .map(|(_, subcommand)| command(subcommand))
-            .collect()
+            .collect();
+        if let Some(export) = &self.export {
+            commands.push(export.command());
+        }
+        commands
     }
 
     fn stages(&self) -> Vec<JobStage> {
-        self.steps().into_iter().map(|(stage, _)| stage).collect()
+        let mut stages: Vec<JobStage> = self.steps().into_iter().map(|(stage, _)| stage).collect();
+        if self.export.is_some() {
+            stages.push(JobStage::Export);
+        }
+        stages
     }
 
     fn env(&self, root: &str) -> Vec<(String, String)> {
-        vec![
+        let mut env = vec![
             ("AXOLOTL_DO_NOT_TRACK".into(), "1".into()),
             ("PYTHONPATH".into(), format!("{root}/{PLUGIN_DIR}")),
             (METRICS_ENV.into(), format!("{root}/{METRICS_FILE}")),
             (SNAPSHOT_ENV.into(), format!("{root}/{SNAPSHOT_REQUEST}")),
-        ]
+        ];
+        if let Some(export) = &self.export {
+            env.extend(export.script_env());
+        }
+        env
+    }
+
+    fn caches_tools(&self) -> bool {
+        self.export.is_some()
     }
 
     fn stop_marker(&self) -> Option<&'static str> {
@@ -457,6 +497,7 @@ impl Trainer for Axolotl<'_> {
     }
 
     fn artifacts(&self) -> Artifacts {
+        // `output/` holds the GGUF of an export too, in `output/gguf/`.
         Artifacts {
             entries: vec![OUTPUT_DIR.into(), METRICS_FILE.into()],
             exclude: vec!["checkpoint-*".into()],
@@ -622,6 +663,34 @@ mod tests {
         assert_eq!(full, Some(Adapter::Full));
         fs::write(dir.path().join(CONFIG_FILE), "adapter: dora\n")?;
         assert_eq!(Outputs::recorded(dir.path()), None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_exporting_trainer_exports_after_the_merge() -> Result<(), Box<dyn std::error::Error>> {
+        let training: Training = serde_json::from_value(json!({
+            "target": "local", "base_model": "m", "adapter": "lora", "merge": true
+        }))?;
+        let project = tempfile::tempdir()?;
+        let files = DataFiles::new(project.path());
+        std::fs::create_dir_all(project.path().join("data"))?;
+        std::fs::write(&files.train, "{}\n")?;
+        let plain = Axolotl::new(&training, &files);
+        assert_eq!(plain.commands().len(), 2);
+        assert!(!plain.caches_tools());
+        let trainer = plain.exporting("r1", "Q8_0");
+        let commands = trainer.commands();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[1][1], "merge-lora");
+        assert_eq!(commands[2], ExportJob::in_job("r1", "Q8_0").command());
+        assert!(trainer.caches_tools());
+        assert_eq!(trainer.stop_marker(), Some(SNAPSHOT_FILE));
+        let env = trainer.env("/w/r1");
+        assert!(env.contains(&("OVERBRAINER_EXPORT_QUANTIZE".into(), "Q8_0".into())));
+        assert!(env.contains(&(METRICS_ENV.into(), "/w/r1/metrics.jsonl".into())));
+        let run = tempfile::tempdir()?;
+        trainer.prepare(run.path(), "/w/r1")?;
+        assert!(run.path().join(crate::export::SCRIPT_FILE).is_file());
         Ok(())
     }
 

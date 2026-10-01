@@ -57,6 +57,13 @@ async fn with_pods(
     command: Pods<'_>,
 ) -> anyhow::Result<()> {
     let runs = Runs::new(project_dir);
+    // An export's pod is recorded with the export, inside its run.
+    let runs = match command {
+        Pods::Rm { run_id, .. } if runs.run_dir(run_id).is_ok_and(|dir| !dir.is_dir()) => {
+            runs.find_export(run_id).unwrap_or(runs)
+        },
+        _ => runs,
+    };
     let bus = EventBus::new();
     let renderer = tokio::spawn(super::progress::render(bus.subscribe()));
     let timing = Timing::standard();

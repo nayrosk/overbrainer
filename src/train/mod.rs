@@ -107,4 +107,16 @@ pub trait Trainer {
     fn stages(&self) -> Vec<JobStage> {
         Vec::new()
     }
+
+    /// Whether a job that exits 0 must also have written a metric line to
+    /// have succeeded: proof that a training job loaded its metrics plugin.
+    fn metrics_required(&self) -> bool {
+        true
+    }
+
+    /// Whether the job downloads tools it caches on the target, under the
+    /// work directory (see [`JobSpec::tools_dir`](crate::exec::JobSpec::tools_dir)).
+    fn caches_tools(&self) -> bool {
+        false
+    }
 }
