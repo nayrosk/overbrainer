@@ -1131,7 +1131,9 @@ pub fn ssh_command(run_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventBus;
     use crate::runpod::ApiError;
+    use crate::runpod::{RunpodClient, Timing};
     use crate::train::TrainMetric;
 
     /// A pace of 1 step per 10 s at step 100 of 7300: 20 hours left.
@@ -1404,5 +1406,93 @@ mod tests {
             run_message(&PodError::Interrupted),
             "interrupted before the job started"
         );
+    }
+
+    /// The secret requests `server` received.
+    async fn secret_calls(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path().starts_with("/v2/account/secrets"))
+            .map(|request| format!("{} {}", request.method, request.url.path()))
+            .collect()
+    }
+
+    /// `sweep_then_forget` against a pod list answering `listed`: what it asked
+    /// of the secrets API.
+    async fn forget_after_sweep(
+        listed: wiremock::ResponseTemplate,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/pods"))
+            .respond_with(listed)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/account/secrets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "secrets": [{"id": "s1", "name": "overbrainer_host_key_r1",
+                             "createdAt": "2026-10-01T00:00:00Z"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v2/account/secrets/s1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = RunpodClient::new(
+            &format!("{}/v2", server.uri()),
+            &secrecy::SecretString::from("rp_key"),
+        )?
+        .with_policy(crate::retry::RetryPolicy {
+            max_retries: 0,
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(2),
+        });
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let (bus, interrupted) = (EventBus::new(), std::sync::atomic::AtomicBool::new(false));
+        let timing = Timing {
+            poll: Duration::from_millis(5),
+            ready_timeout: Duration::from_millis(400),
+            preflight_timeout: Duration::from_millis(300),
+            reconcile_waits: [Duration::from_millis(5); 2],
+            delete_timeout: Duration::from_millis(200),
+            gone_interval: Duration::from_millis(5),
+        };
+        let ctx = PodCtx {
+            client: &client,
+            runs: &runs,
+            bus: &bus,
+            timing: &timing,
+            interrupted: &interrupted,
+        };
+        let mut pod = PodRecord::new("r1", false, 1, "ssh-ed25519 AAAAhost");
+        sweep_then_forget(&ctx, &mut pod, "r1").await;
+        Ok(secret_calls(&server).await)
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_run_drops_its_secret_only_once_its_pods_are_listed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty =
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"pods": []}));
+        let calls = forget_after_sweep(empty).await?;
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "DELETE /v2/account/secrets/s1"),
+            "{calls:?}"
+        );
+        // A pod list that fails may hide a stray: the secret is left alone.
+        let calls = forget_after_sweep(wiremock::ResponseTemplate::new(500)).await?;
+        assert_eq!(calls, Vec::<String>::new());
+        Ok(())
     }
 }
