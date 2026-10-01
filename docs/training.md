@@ -9,7 +9,7 @@
 | `overbrainer train attach RUN_ID` | Follow a run again, then retrieve its results. |
 | `overbrainer train stop RUN_ID` | Stop the job of a run with a snapshot, then retrieve it with the results. |
 | `overbrainer train cancel RUN_ID` | Stop the job of a run and retrieve its artifacts. |
-| `overbrainer runs ls` | List the runs: ID, state, target, creation time, the step of a stopped run's snapshot, and the pod of a Runpod run. |
+| `overbrainer runs ls` | List the runs: ID, state, target, creation time, the step of a stopped run's snapshot (`step N (reason): partial model in output/`), and the pod of a Runpod run. |
 | `overbrainer runs logs RUN_ID [--tail N]` | Print the run's `job.log`. With `--pod [--source container\|system] [--follow]`, the logs of its Runpod pod instead (see [Runpod](runpod.md#pod-logs)). |
 | `overbrainer pod ls` | List the Runpod pods overbrainer created, with their run. |
 | `overbrainer pod rm RUN_ID [--force]` | Delete every pod of a run and wait until Runpod no longer shows them. |
@@ -20,7 +20,7 @@
 
 A run gets an ID made of the project name and the UTC time it was created, such as `malware_development_20260922-143005`. The project name is lowercased, every run of characters other than ASCII letters and digits becomes one `_`, and it is cut to 40 characters (`run` when nothing is left). A second run created in the same second gets `_2`, then `_3`, and so on. The run directory on the target is claimed as well, with a `.claim` file created exclusively, so a run started in the same second from another checkout of the project against the same work directory also moves on to the next ID instead of overwriting the other run. On Runpod the ID is fixed before the pod exists, so the pod's bootstrap claims the directory itself, before it writes anything there. When a run from another checkout already owns the directory on a shared network volume, the pod leaves it untouched and its watchdog deletes the pod; the run fails without touching the other run's files, and starting it again gives it a new ID. Runs created before v0.5.0 keep their IDs, such as `20260922-143005-a1b2`. `runs ls` and the TUI list runs by creation time.
 
-Each run has a directory `runs/<run-id>/`. It holds `axolotl.yaml`, copies of the train and eval files, the metrics plugin and `run.json` (target, job, state). Once the job has ended, it also holds `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. After a run that succeeded, `train`, `train attach` and `run` print these paths (`train: adapter in runs/<run-id>/output`, then `train: merged model in runs/<run-id>/output/merged`). Intermediate `checkpoint-*` directories stay on the target, except the snapshot of a stopped run (see below).
+Each run has a directory `runs/<run-id>/`. It holds `axolotl.yaml`, copies of the train and eval files, the metrics plugin and `run.json` (target, job, state). Once the job has ended, it also holds `metrics.jsonl`, `job.log` and `output/`. `output/` holds the LoRA adapter (or the full model with `adapter = "full"`) and, with `merge = true`, the merged model in `output/merged/`. After a run that succeeded, `train`, `train attach` and `run` print these paths (`train: adapter in runs/<run-id>/output`, then `train: merged model in runs/<run-id>/output/merged`). Intermediate `checkpoint-*` directories stay on the target, except the snapshot of a stopped run (see below). The adapter or model in the `output/` of a stopped run is partial.
 
 The job runs detached from overbrainer. Once it has started, Ctrl-C, a closed terminal or a lost SSH connection stop overbrainer from following it; the training goes on. Starting a run is never interrupted: a Ctrl-C pressed while a run is starting is only acted on once the job has actually started, so the command always finishes starting before it detaches. After Ctrl-C, overbrainer prints the `overbrainer train attach` command that follows the run again and exits with an error status. It does the same after six failed attempts in a row to reach the target.
 
@@ -40,9 +40,14 @@ A run fails when the job exits with a non-zero code, or when it writes no metric
 
 While another overbrainer process holds the project (`train`, `run`, `train attach` or the TUI following the run), `train stop` does not follow the run itself: it writes `snapshot.request` on the target, says which process holds the project, and exits. The process following the run then records it `stopped` and retrieves the checkpoint as above. `train stop` reads `run.json` and `pod.json` then, and writes nothing else in the run directory; on Runpod it reaches the pod through the `runs/<run-id>/ssh/config` that process wrote, with no Runpod API call. If the holder does not follow that run, `overbrainer train attach RUN_ID` collects the snapshot once it is free.
 
+When training ends early, Axolotl still saves the adapter (or the model with `adapter = "full"`) at the top of `output/`, as it does at the end of a full run. After a stop that model is partial: it holds the training up to the snapshot's step, not a finished model. overbrainer leaves it where Axolotl put it and says so:
+
 ```
 train: run 20260922-143005-a1b2 stopped at step 1240 (requested): snapshot in runs/20260922-143005-a1b2/output/checkpoint-1240; resume with `overbrainer train --resume-from 20260922-143005-a1b2`
+train: runs/20260922-143005-a1b2/output also holds the partial model at step 1240, not a finished one
 ```
+
+`runs ls` shows `step 1240 (requested): partial model in output/` for that run, and the TUI's Training view `snapshot at step 1240 (requested), output/ partial: T resumes it`. To get a finished model, resume the run.
 
 A job that neither saves its snapshot nor ends within 30 minutes of the request is cancelled. A process that follows a run without having asked for the snapshot (`train attach`, or the holder above) looks for a request every 30 seconds and applies the same limits from when it sees one. One that saved it but has not ended 10 minutes later is cancelled too, and still recorded `stopped` with its snapshot. A request that lands after the last step changes nothing: the run succeeds as usual. Under distributed training, rank 0 reads the request and tells the other ranks, so they all stop at the same step.
 

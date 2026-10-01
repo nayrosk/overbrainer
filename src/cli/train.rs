@@ -436,7 +436,8 @@ async fn cancel_run(
 }
 
 /// Prints the runs in `runs/`, oldest first: ID, state, target, creation time,
-/// the step and reason of a stopped run's snapshot, and, for a Runpod run, what
+/// the step and reason of a stopped run's snapshot (the model its `output/`
+/// holds is partial, from that step), and, for a Runpod run, what
 /// `pod.json` says of its pod (no API call).
 ///
 /// # Errors
@@ -466,7 +467,11 @@ pub fn list(project_dir: &Path) -> anyhow::Result<()> {
             .snapshot
             .as_ref()
             .map_or_else(String::new, |snapshot| {
-                format!("  step {} ({})", snapshot.step, snapshot.reason.name())
+                format!(
+                    "  step {} ({}): partial model in {OUTPUT_DIR}/",
+                    snapshot.step,
+                    snapshot.reason.name()
+                )
             });
         println!(
             "{:<width$}  {:<9}  {}  {}{snapshot}{pod}",
@@ -620,7 +625,7 @@ pub(super) fn finish(
             Ok(())
         },
         RunState::Stopped => {
-            if let Some(line) = stopped_line(record) {
+            for line in stopped_lines(record) {
                 front.line(&line);
             }
             if let Some(snapshot) = &record.snapshot {
@@ -639,17 +644,28 @@ pub(super) fn finish(
     }
 }
 
-/// What a stopped run says: where its snapshot is, and how to resume from it.
-pub(crate) fn stopped_line(record: &RunRecord) -> Option<String> {
-    let snapshot = record.snapshot.as_ref()?;
+/// What a stopped run says: where its snapshot is, how to resume from it, and
+/// that the model Axolotl saved in `output/` when training ended early is
+/// partial, from the snapshot's step. Nothing without a snapshot.
+pub(crate) fn stopped_lines(record: &RunRecord) -> Vec<String> {
+    let Some(snapshot) = record.snapshot.as_ref() else {
+        return Vec::new();
+    };
     let id = &record.id;
-    Some(format!(
-        "train: run {id} stopped at step {} ({}): snapshot in {RUNS_DIR}/{id}/{}; resume with \
-         `overbrainer train --resume-from {id}`",
-        snapshot.step,
-        snapshot.reason.name(),
-        snapshot.checkpoint
-    ))
+    vec![
+        format!(
+            "train: run {id} stopped at step {} ({}): snapshot in {RUNS_DIR}/{id}/{}; resume with \
+             `overbrainer train --resume-from {id}`",
+            snapshot.step,
+            snapshot.reason.name(),
+            snapshot.checkpoint
+        ),
+        format!(
+            "train: {RUNS_DIR}/{id}/{OUTPUT_DIR} also holds the partial model at step {}, not a \
+             finished one",
+            snapshot.step
+        ),
+    ]
 }
 
 /// After Ctrl-C, which only stops following a started job: it keeps running. A

@@ -4223,7 +4223,7 @@ mod tests {
         assert_eq!(run, STOPPED);
         let rows = text(&draw(&mut app, 120, 40)?).join("\n");
         assert!(
-            rows.contains("snapshot at step 120 (requested): T resumes from it"),
+            rows.contains("snapshot at step 120 (requested), output/ partial: T resumes it"),
             "{rows}"
         );
         let plan = crate::tui::start::StartPlan {

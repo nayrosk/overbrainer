@@ -1222,6 +1222,24 @@ fn the_run_column_fits_the_longest_run_id() -> TestResult {
 }
 
 #[test]
+fn training_of_a_stopped_run() -> TestResult {
+    let mut app = training_app()?;
+    app.training.selected = 1;
+    let mut stopped = run(FINISHED, "homelab", RunState::Stopped);
+    stopped.snapshot = Some(crate::runs::Snapshot {
+        checkpoint: "output/checkpoint-400".into(),
+        step: 400,
+        reason: crate::runs::SnapshotReason::Requested,
+    });
+    app.training.runs[1].record = stopped;
+    let mut metrics = series();
+    metrics.truncate(40);
+    app.training.series.insert(FINISHED.into(), metrics);
+    snapshot("training_stopped", &mut app)?;
+    Ok(())
+}
+
+#[test]
 fn training_of_a_finished_local_run() -> TestResult {
     let mut app = training_app()?;
     app.training.selected = 1;
