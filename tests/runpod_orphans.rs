@@ -11,13 +11,18 @@ use overbrainer::events::EventBus;
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
     AttemptResult, DeletedBy, Pod, PodCtx, PodError, PodId, PodRecord, PodRow, PodState, RowKind,
-    RunpodClient, Timing, listed_rows, orphan_warnings, pod_rows, remove_run_pods,
+    RunpodClient, Timing, host_key_secret, listed_rows, orphan_warnings, pod_rows, remove_run_pods,
+    sweep_host_keys,
 };
 use overbrainer::runs::{RunRecord, RunState, Runs};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+mod common;
+
+use common::SecretStore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -157,11 +162,13 @@ struct Harness {
     timing: Timing,
     interrupted: AtomicBool,
     client: RunpodClient,
+    secrets: SecretStore,
 }
 
 impl Harness {
     async fn new(account: Account) -> Result<Self, Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
+        let secrets = SecretStore::mount(&server).await;
         Mock::given(any())
             .respond_with(Api(Arc::new(account)))
             .mount(&server)
@@ -189,6 +196,7 @@ impl Harness {
             },
             interrupted: AtomicBool::new(false),
             client,
+            secrets,
         })
     }
 
@@ -258,7 +266,9 @@ impl Harness {
             .await
             .unwrap_or_default()
             .iter()
-            .filter(|request| request.method.as_str() == "DELETE")
+            .filter(|request| {
+                request.method.as_str() == "DELETE" && request.url.path().starts_with("/v2/pods/")
+            })
             .filter_map(|request| request.url.path().rsplit('/').next().map(str::to_string))
             .collect();
         ids.sort();
@@ -485,6 +495,7 @@ async fn pod_rm_of_a_running_run_keeps_its_training_pod_and_deletes_the_others()
         .with("s1", Some(RUN), true)
         .with("x2", Some(RUN), true);
     let harness = Harness::new(account).await?;
+    harness.secrets.hold("k1", &host_key_secret(RUN));
     harness.recorded(RUN, state, "p1", PodState::Running)?;
     harness.strays(RUN, &["s1"])?;
     let removal = remove_run_pods(&harness.ctx(), RUN, false).await;
@@ -507,6 +518,8 @@ async fn pod_rm_of_a_running_run_keeps_its_training_pod_and_deletes_the_others()
     assert_eq!(record.state, PodState::Running);
     assert_eq!(record.stray_pods, [] as [overbrainer::runpod::PodId; 0]);
     assert_eq!(harness.runs.load(RUN)?.state, state);
+    // The training pod may restart and need its host key again.
+    assert_eq!(harness.secrets.names(), [host_key_secret(RUN)]);
     Ok(())
 }
 
@@ -585,10 +598,12 @@ async fn a_forced_pod_rm_of_a_running_run_deletes_everything_and_fails_it() -> T
         .with("p1", Some(RUN), true)
         .with("x2", Some(RUN), true);
     let harness = Harness::new(account).await?;
+    harness.secrets.hold("k1", &host_key_secret(RUN));
     harness.recorded(RUN, RunState::Running, "p1", PodState::Running)?;
     let removal = remove_run_pods(&harness.ctx(), RUN, true).await;
     removal.result?;
     assert_eq!(harness.deletes().await, vec!["p1", "x2"]);
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(RUN)]);
     let run = harness.runs.load(RUN)?;
     assert_eq!(run.state, RunState::Failed);
     let record = harness.pod_json(RUN)?;
@@ -644,5 +659,98 @@ async fn pod_rm_tries_every_pod_and_records_a_failed_marker_pod_as_stray() -> Te
     assert_eq!(record.state, PodState::Deleted);
     let strays: Vec<String> = record.stray_pods.iter().map(ToString::to_string).collect();
     assert_eq!(strays, vec!["s3", "x2"]);
+    Ok(())
+}
+
+/// The startup sweep deletes the host key secret of an ended run of this
+/// project without a pod, keeps those a pod may still need, and only warns
+/// about a run of another checkout.
+#[tokio::test]
+async fn the_sweep_deletes_only_the_secrets_no_pod_needs() -> TestResult {
+    let account = Account::default().with("p1", Some(RUN), true);
+    let harness = Harness::new(account).await?;
+    harness.recorded(RUN, RunState::Succeeded, "p1", PodState::Running)?;
+    harness.recorded(ENDED, RunState::Failed, "p2", PodState::Deleted)?;
+    harness.recorded(
+        "20260923-100000-beef",
+        RunState::Running,
+        "p3",
+        PodState::Running,
+    )?;
+    for (id, run) in [
+        ("k1", RUN),
+        ("k2", ENDED),
+        ("k3", "20260923-100000-beef"),
+        ("k4", ELSEWHERE),
+    ] {
+        harness.secrets.hold(id, &host_key_secret(run));
+    }
+    harness.secrets.hold("k5", "hf-token");
+    let rows = listed_rows(&harness.ctx()).await?;
+    let warnings = sweep_host_keys(&harness.ctx(), &rows).await?;
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(ENDED)]);
+    assert_eq!(
+        warnings,
+        [format!(
+            "the Runpod secret {} holds the pod host key of run {ELSEWHERE}, which is not in this project's runs/; if no other checkout owns it, `overbrainer pod rm {ELSEWHERE} --force`",
+            host_key_secret(ELSEWHERE)
+        )]
+    );
+    assert_eq!(harness.deletes().await, Vec::<String>::new());
+    Ok(())
+}
+
+/// The private client key of the run `id`, written so its removal shows.
+fn client_key(
+    harness: &Harness,
+    id: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let key = harness.runs.run_dir(id)?.join("ssh/id_ed25519");
+    std::fs::create_dir_all(key.parent().ok_or("no ssh dir")?)?;
+    std::fs::write(&key, "private")?;
+    Ok(key)
+}
+
+/// A run whose recorded pod is confirmed gone keeps its keys while a stray of
+/// it remains, since a restarted stray boots with the same secret; `pod rm`
+/// deleting the stray then forgets them.
+#[tokio::test]
+async fn a_stray_keeps_the_keys_of_a_run_whose_pod_is_gone_until_pod_rm() -> TestResult {
+    let account = Account::default().with("s1", Some(RUN), true);
+    let harness = Harness::new(account).await?;
+    harness.recorded(RUN, RunState::Failed, "p1", PodState::Running)?;
+    harness.strays(RUN, &["s1"])?;
+    harness.secrets.hold("k1", &host_key_secret(RUN));
+    let key = client_key(&harness, RUN)?;
+    pod_rows(&harness.ctx()).await?;
+    assert_eq!(harness.pod_json(RUN)?.state, PodState::Deleted);
+    assert_eq!(harness.secrets.names(), [host_key_secret(RUN)]);
+    assert_eq!(harness.secrets.deleted(), Vec::<String>::new());
+    assert!(key.is_file());
+    let removal = remove_run_pods(&harness.ctx(), RUN, false).await;
+    removal.result?;
+    assert_eq!(harness.deletes().await, vec!["s1"]);
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(RUN)]);
+    assert!(!key.exists());
+    Ok(())
+}
+
+/// The startup sweep keeps the secret of an ended run while a stray of it is
+/// listed, and deletes it once that stray is gone.
+#[tokio::test]
+async fn the_sweep_deletes_the_secret_once_the_last_stray_is_gone() -> TestResult {
+    let account = Account::default().with("s1", Some(ENDED), true);
+    let harness = Harness::new(account).await?;
+    harness.recorded(ENDED, RunState::Failed, "p2", PodState::Deleted)?;
+    harness.strays(ENDED, &["s1"])?;
+    harness.secrets.hold("k2", &host_key_secret(ENDED));
+    let rows = listed_rows(&harness.ctx()).await?;
+    sweep_host_keys(&harness.ctx(), &rows).await?;
+    assert_eq!(harness.secrets.deleted(), Vec::<String>::new());
+    // Deleted from elsewhere (its watchdog, the console).
+    harness.client.delete_pod(&PodId::new("s1")?).await?;
+    let rows = listed_rows(&harness.ctx()).await?;
+    sweep_host_keys(&harness.ctx(), &rows).await?;
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(ENDED)]);
     Ok(())
 }

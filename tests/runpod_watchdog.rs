@@ -1594,6 +1594,31 @@ fn the_bootstrap_installs_the_run_keys() -> TestResult {
 }
 
 #[test]
+fn an_unresolved_host_key_secret_is_told_apart() -> TestResult {
+    for &shell in shells() {
+        let root = tempfile::tempdir()?;
+        let etc = root.path().join("etc/ssh");
+        fs::create_dir_all(&etc)?;
+        fs::write(etc.join("ssh_host_rsa_key"), "baked")?;
+        let output = bootstrap(
+            shell,
+            "install_host_key \"$ETC\"; echo \"status $?\"",
+            &[
+                (
+                    "OVERBRAINER_HOST_KEY",
+                    "{{ RUNPOD_SECRET_overbrainer_host_key_r1 }}",
+                ),
+                ("ETC", &etc.to_string_lossy()),
+            ],
+        )?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("status 2"), "{shell}: {stdout}");
+        assert!(!etc.join("ssh_host_ed25519_key").exists(), "{shell}");
+    }
+    Ok(())
+}
+
+#[test]
 fn the_job_env_survives_quotes_and_spaces() -> TestResult {
     for &shell in shells() {
         let root = tempfile::tempdir()?;

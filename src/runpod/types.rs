@@ -502,8 +502,9 @@ pub struct CreatePod {
     /// The network volume, when one is configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mounts: Option<Mounts>,
-    /// The pod's environment.
-    pub env: CreateEnv,
+    /// The pod's environment. It never holds a secret: the host key is a
+    /// `{{ RUNPOD_SECRET_<name> }}` reference that Runpod resolves at boot.
+    pub env: BTreeMap<String, String>,
     /// The pod's command, run after the image's entrypoint.
     pub cmd: Vec<String>,
 }
@@ -537,40 +538,62 @@ pub struct NetworkMount {
     pub path: String,
 }
 
-/// The environment of a new pod: plain variables, plus the pod's private host key,
-/// which only the JSON serializer ever sees. `Debug` shows variable names only.
-#[derive(Clone)]
-pub struct CreateEnv {
-    /// Variables that hold no secret.
-    pub plain: BTreeMap<String, String>,
-    /// Name of the variable holding the host key.
-    pub host_key_name: &'static str,
-    /// The base64 of the OpenSSH private host key.
-    pub host_key: SecretString,
+/// A secret of the account (`/account/secrets`). Runpod never returns its
+/// value.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Secret {
+    /// Secret ID.
+    pub id: String,
+    /// Its unique name, the `<name>` of `{{ RUNPOD_SECRET_<name> }}`.
+    pub name: String,
 }
 
-impl Serialize for CreateEnv {
+/// The answer of `GET /account/secrets`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SecretList {
+    /// The secrets.
+    #[serde(default, deserialize_with = "nullable")]
+    pub secrets: Vec<Secret>,
+}
+
+/// The body of `POST /account/secrets`. Only the JSON serializer ever sees the
+/// value: `Debug` shows the name only.
+#[derive(Clone)]
+pub struct NewSecret {
+    /// Unique name.
+    pub name: String,
+    /// The value, write-only on Runpod's side.
+    pub value: SecretString,
+    /// What the secret is for.
+    pub description: String,
+}
+
+impl Serialize for NewSecret {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(self.plain.len() + 1))?;
-        for (name, value) in &self.plain {
-            map.serialize_entry(name, value)?;
-        }
-        map.serialize_entry(self.host_key_name, self.host_key.expose_secret())?;
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("value", self.value.expose_secret())?;
+        map.serialize_entry("description", &self.description)?;
         map.end()
     }
 }
 
-impl fmt::Debug for CreateEnv {
+impl fmt::Debug for NewSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let names: Vec<&str> = self
-            .plain
-            .keys()
-            .map(String::as_str)
-            .chain([self.host_key_name])
-            .collect();
-        f.debug_struct("CreateEnv")
-            .field("names", &names)
+        f.debug_struct("NewSecret")
+            .field("name", &self.name)
             .finish_non_exhaustive()
+    }
+}
+
+/// The body of `PATCH /account/secrets/{id}` that sets a new value.
+pub(crate) struct SecretValue<'a>(pub &'a SecretString);
+
+impl Serialize for SecretValue<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("value", self.0.expose_secret())?;
+        map.end()
     }
 }
 
@@ -595,11 +618,13 @@ mod tests {
             start_ssh: false,
             data_center_ids: None,
             mounts: None,
-            env: CreateEnv {
-                plain: BTreeMap::from([("OVERBRAINER_RUN_ID".into(), "r1".into())]),
-                host_key_name: "OVERBRAINER_HOST_KEY",
-                host_key: SecretString::from("c2VjcmV0LWhvc3Qta2V5"),
-            },
+            env: BTreeMap::from([
+                ("OVERBRAINER_RUN_ID".into(), "r1".into()),
+                (
+                    "OVERBRAINER_HOST_KEY".into(),
+                    "{{ RUNPOD_SECRET_overbrainer_host_key_r1 }}".into(),
+                ),
+            ]),
             cmd: vec!["bash".into(), "-c".into(), "true".into()],
         }
     }
@@ -620,7 +645,10 @@ mod tests {
             ]
         );
         assert_eq!(json["gpu"]["minCudaVersion"], "13.0");
-        assert_eq!(json["env"]["OVERBRAINER_HOST_KEY"], "c2VjcmV0LWhvc3Qta2V5");
+        assert_eq!(
+            json["env"]["OVERBRAINER_HOST_KEY"],
+            "{{ RUNPOD_SECRET_overbrainer_host_key_r1 }}"
+        );
         for v1 in [
             "imageName",
             "gpuTypeIds",
@@ -645,10 +673,26 @@ mod tests {
     }
 
     #[test]
-    fn debug_never_shows_the_host_key() {
-        let text = format!("{:?}", request());
-        assert!(!text.contains("c2VjcmV0LWhvc3Qta2V5"), "{text}");
-        assert!(text.contains("OVERBRAINER_HOST_KEY"), "{text}");
+    fn a_new_secret_shows_its_value_to_the_serializer_only() -> TestResult {
+        let secret = NewSecret {
+            name: "overbrainer_host_key_r1".into(),
+            value: SecretString::from("c2VjcmV0LWhvc3Qta2V5"),
+            description: "d".into(),
+        };
+        let text = format!("{secret:?}");
+        assert!(
+            !text.contains("c2VjcmV0LWhvc3Qta2V5"),
+            "Debug shows the secret value"
+        );
+        assert!(
+            text.contains("overbrainer_host_key_r1"),
+            "Debug hides the secret name"
+        );
+        let json = serde_json::to_value(&secret)?;
+        assert_eq!(json["value"], "c2VjcmV0LWhvc3Qta2V5");
+        let patch = serde_json::to_value(SecretValue(&secret.value))?;
+        assert_eq!(patch, serde_json::json!({"value": "c2VjcmV0LWhvc3Qta2V5"}));
+        Ok(())
     }
 
     #[test]

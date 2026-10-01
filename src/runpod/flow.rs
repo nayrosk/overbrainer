@@ -21,8 +21,8 @@ use super::provision::note_strays;
 use super::{
     BOOTSTRAP_LOG, CLIENT_KEY, CostCap, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId,
     PodKeys, PodPlan, PodRecord, PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget,
-    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, keep_file, provision, remove,
-    short_cap_warning, sweep, with_pod_logs, write_config,
+    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, forget_keys, keep_file, provision,
+    remove, short_cap_warning, sweep, with_pod_logs, write_config,
 };
 use crate::secrets::Redactor;
 
@@ -75,7 +75,8 @@ const GONE_LOOKS: u32 = 3;
 /// ready: keys in `runs/<id>/ssh/`, then `pod.json`, then provisioning. When that
 /// fails, the run is saved `Failed` with the reason (`interrupted before the job
 /// started` after Ctrl-C), whatever pod was created is deleted, and once every
-/// pod of the run is confirmed deleted, the run's private client key is removed.
+/// pod of the run is confirmed deleted, the run's private client key is removed
+/// and its host key secret deleted.
 /// `vram_floor_gb` is the least VRAM `auto` GPU types need when the target sets
 /// no `min_vram_gb` (see [`PodPlan::vram_floor_gb`]).
 ///
@@ -96,28 +97,9 @@ pub async fn start_pod(
         if let Err(save_error) = ctx.runs.save(&run) {
             tracing::warn!("cannot record run {} as failed: {save_error}", run.id);
         }
-        if no_pod_left(ctx.runs, &run.id) {
-            forget_client_key(ctx.runs, &run.id);
-        }
+        forget_keys(ctx, &run.id).await;
     }
     result
-}
-
-/// Whether `pod.json` shows no pod of the run that may still exist: no pod, or
-/// one confirmed deleted, and no stray. A `pod.json` that cannot be read shows
-/// nothing for sure; none at all means no pod was ever asked for.
-fn no_pod_left(runs: &Runs, run_id: &str) -> bool {
-    match PodRecord::load(runs, run_id) {
-        Ok(Some(record)) => {
-            record.stray_pods.is_empty()
-                && (record.pod_id.is_none() || record.state == PodState::Deleted)
-        },
-        Ok(None) => true,
-        Err(error) => {
-            tracing::warn!("cannot read the pod record of run {run_id}: {error}");
-            false
-        },
-    }
 }
 
 /// The reason a failed provisioning gives in `run.json`: the error's message,
@@ -614,21 +596,24 @@ pub(super) fn until_deadline_at(pod: &PodRecord, now: SystemTime) -> Option<Dura
 }
 
 /// The pod outlived its deadline: deletes it (confirmed; recorded deleted by the
-/// watchdog when it was already gone), and fails the run.
+/// watchdog when it was already gone), forgets the run's keys (see
+/// [`forget_keys`]) and fails the run.
 async fn deadline_reached(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> PodError {
     if let Err(error) = remove(ctx, pod, DeleteReason::Deadline, DeletedBy::Client).await {
         return error;
     }
+    forget_keys(ctx, run_id).await;
     fail_run(ctx.runs, run_id, MAX_HOURS_REACHED);
     PodError::DeadlineReached
 }
 
 /// The pod spent its cost cap: deletes it (confirmed), as its watchdog does
-/// too, and fails the run.
+/// too, forgets the run's keys (see [`forget_keys`]) and fails the run.
 async fn cost_cap_reached(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> PodError {
     if let Err(error) = remove(ctx, pod, DeleteReason::CostCap, DeletedBy::Client).await {
         return error;
     }
+    forget_keys(ctx, run_id).await;
     fail_run(ctx.runs, run_id, MAX_COST_REACHED);
     PodError::CostCapReached
 }
@@ -679,7 +664,7 @@ async fn gone(ctx: &PodCtx<'_>, pod: &mut PodRecord) -> Result<bool, PodError> {
     if ctx.client.get_pod(&id).await?.is_some() || look_again(ctx, &id).await?.is_some() {
         return Ok(false);
     }
-    mark_gone(ctx, pod, id, gone_by(pod, SystemTime::now()))?;
+    mark_gone(ctx, pod, id, gone_by(pod, SystemTime::now())).await?;
     Ok(true)
 }
 
@@ -848,8 +833,9 @@ async fn look_again_all(
     }
 }
 
-/// Records the pod `id` as deleted by `by`.
-pub(super) fn mark_gone(
+/// Records the pod `id` as deleted by `by`, then forgets the run's keys (see
+/// [`forget_keys`]).
+pub(super) async fn mark_gone(
     ctx: &PodCtx<'_>,
     pod: &mut PodRecord,
     id: PodId,
@@ -859,7 +845,7 @@ pub(super) fn mark_gone(
     let uptime = pod.uptime(now);
     pod.deleted(by, now);
     pod.save(ctx.runs)?;
-    forget_client_key(ctx.runs, &pod.run_id);
+    forget_keys(ctx, &pod.run_id).await;
     ctx.bus.publish(Event::PodStatus(PodStatus::Deleted {
         pod_id: id,
         uptime,
@@ -899,8 +885,9 @@ pub enum Ending {
 /// is the "retrieved" marker written on the pod, first (so its watchdog deletes
 /// it even if this client's delete fails), then the pod is deleted unless kept
 /// and its deletion confirmed, other pods of the run are swept (any whose
-/// deletion cannot be confirmed is recorded in `pod.json`), and the run's
-/// private client key is removed. Otherwise the pod is left to its watchdog's
+/// deletion cannot be confirmed is recorded in `pod.json`), and, when none
+/// is, the run's private client key is removed and its host key secret
+/// deleted. Otherwise the pod is left to its watchdog's
 /// retrieve grace (a kept pod stays kept), with a warning telling how to
 /// retrieve the results again or remove the pod.
 ///
@@ -936,10 +923,22 @@ pub async fn end_pod(
         return Ok(Ending::Kept);
     }
     remove(ctx, pod, DeleteReason::Retrieved, DeletedBy::Client).await?;
-    let stray = sweep(ctx, &run.id, None).await;
-    note_strays(ctx, pod, stray);
-    forget_client_key(ctx.runs, &run.id);
+    sweep_then_forget(ctx, pod, &run.id).await;
     Ok(Ending::Deleted)
+}
+
+/// Sweeps the other pods of the run `run_id`, records in `pod.json` those whose
+/// deletion cannot be confirmed, and forgets the run's keys when there is none
+/// (see [`forget_keys`]): a stray keeps them even when `pod.json` cannot
+/// record it, and so does a pod list that fails, since a stray may hide there.
+async fn sweep_then_forget(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) {
+    match sweep(ctx, run_id, None).await {
+        Some(stray) if stray.is_empty() => forget_keys(ctx, run_id).await,
+        Some(stray) => note_strays(ctx, pod, stray),
+        None => tracing::debug!(
+            "keeping the keys of run {run_id}: its pods could not be listed; the startup sweep deletes the secret later"
+        ),
+    }
 }
 
 /// The results of the run `run_id` were not retrieved: the pod stays, for its
@@ -1053,7 +1052,7 @@ pub async fn reconnect(
         return Ok(None);
     }
     let Some(remote) = look_up(ctx, &id).await? else {
-        mark_gone(ctx, pod, id, gone_by(pod, SystemTime::now()))?;
+        mark_gone(ctx, pod, id, gone_by(pod, SystemTime::now())).await?;
         return Ok(None);
     };
     if remote.status == RemoteStatus::Exited {
@@ -1132,7 +1131,9 @@ pub fn ssh_command(run_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventBus;
     use crate::runpod::ApiError;
+    use crate::runpod::{RunpodClient, Timing};
     use crate::train::TrainMetric;
 
     /// A pace of 1 step per 10 s at step 100 of 7300: 20 hours left.
@@ -1405,5 +1406,93 @@ mod tests {
             run_message(&PodError::Interrupted),
             "interrupted before the job started"
         );
+    }
+
+    /// The secret requests `server` received.
+    async fn secret_calls(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path().starts_with("/v2/account/secrets"))
+            .map(|request| format!("{} {}", request.method, request.url.path()))
+            .collect()
+    }
+
+    /// `sweep_then_forget` against a pod list answering `listed`: what it asked
+    /// of the secrets API.
+    async fn forget_after_sweep(
+        listed: wiremock::ResponseTemplate,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/pods"))
+            .respond_with(listed)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/account/secrets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "secrets": [{"id": "s1", "name": "overbrainer_host_key_r1",
+                             "createdAt": "2026-10-01T00:00:00Z"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v2/account/secrets/s1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = RunpodClient::new(
+            &format!("{}/v2", server.uri()),
+            &secrecy::SecretString::from("rp_key"),
+        )?
+        .with_policy(crate::retry::RetryPolicy {
+            max_retries: 0,
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(2),
+        });
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let (bus, interrupted) = (EventBus::new(), std::sync::atomic::AtomicBool::new(false));
+        let timing = Timing {
+            poll: Duration::from_millis(5),
+            ready_timeout: Duration::from_millis(400),
+            preflight_timeout: Duration::from_millis(300),
+            reconcile_waits: [Duration::from_millis(5); 2],
+            delete_timeout: Duration::from_millis(200),
+            gone_interval: Duration::from_millis(5),
+        };
+        let ctx = PodCtx {
+            client: &client,
+            runs: &runs,
+            bus: &bus,
+            timing: &timing,
+            interrupted: &interrupted,
+        };
+        let mut pod = PodRecord::new("r1", false, 1, "ssh-ed25519 AAAAhost");
+        sweep_then_forget(&ctx, &mut pod, "r1").await;
+        Ok(secret_calls(&server).await)
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_run_drops_its_secret_only_once_its_pods_are_listed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty =
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"pods": []}));
+        let calls = forget_after_sweep(empty).await?;
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "DELETE /v2/account/secrets/s1"),
+            "{calls:?}"
+        );
+        // A pod list that fails may hide a stray: the secret is left alone.
+        let calls = forget_after_sweep(wiremock::ResponseTemplate::new(500)).await?;
+        assert_eq!(calls, Vec::<String>::new());
+        Ok(())
     }
 }

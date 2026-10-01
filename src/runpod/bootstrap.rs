@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use super::host_key_placeholder;
 use crate::exec::GROUP_SIGNAL;
 
 /// The bootstrap's functions, embedded in the binary.
@@ -16,7 +17,8 @@ const HEREDOC_END: &str = "OVERBRAINER_WATCHDOG_END";
 /// Where the bootstrap writes the jobs' environment on the pod.
 pub const JOB_ENV: &str = "/etc/overbrainer/job.env";
 
-/// The create call's variable holding the base64 of the pod's private host key.
+/// The create call's variable holding the base64 of the pod's private host key:
+/// a reference to the run's host key secret, which Runpod resolves at boot.
 pub const HOST_KEY_ENV: &str = "OVERBRAINER_HOST_KEY";
 
 /// The watchdog as the pod runs it: the `group_signal` helper of the job scripts,
@@ -77,9 +79,10 @@ pub struct PodSettings<'a> {
     pub claim: &'a str,
 }
 
-/// The pod's plain `env` (the host key is added by [`CreateEnv`](super::CreateEnv)).
-/// It never holds `HF_TOKEN` (the job gets it over SSH) nor the account API key
-/// (the pod has its own pod-scoped key).
+/// The pod's `env`. It holds no secret: the host key is only a reference to
+/// the run's host key secret (see [`host_key_placeholder`]), `HF_TOKEN` never
+/// goes there (the job gets it over SSH), nor does the account API key (the
+/// pod has its own pod-scoped key).
 #[must_use]
 pub fn pod_env(settings: &PodSettings<'_>) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
@@ -87,6 +90,7 @@ pub fn pod_env(settings: &PodSettings<'_>) -> BTreeMap<String, String> {
         env.insert(name.to_string(), value);
     };
     set("OVERBRAINER_RUN_ID", settings.run_id.to_string());
+    set(HOST_KEY_ENV, host_key_placeholder(settings.run_id));
     set("OVERBRAINER_WORKDIR", settings.workdir.to_string());
     set(
         "OVERBRAINER_RUN_DIR",
@@ -192,7 +196,10 @@ mod tests {
         assert_eq!(get("OVERBRAINER_KEEP_POD"), Some("0"));
         assert_eq!(get("JUPYTER_DISABLE"), Some("1"));
         assert_eq!(get("OVERBRAINER_CLAIM"), Some("ssh-ed25519 AAAAhost"));
-        assert!(!env.contains_key(HOST_KEY_ENV));
+        assert_eq!(
+            get(HOST_KEY_ENV),
+            Some("{{ RUNPOD_SECRET_overbrainer_host_key_r1 }}")
+        );
         assert!(!env.contains_key("HF_TOKEN"));
         assert!(!env.contains_key("PUBLIC_KEY"));
         assert!(env.len() <= 50);

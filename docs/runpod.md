@@ -9,7 +9,7 @@ gpu_types = ["NVIDIA GeForce RTX 4090", "NVIDIA RTX A6000", "NVIDIA A40"]  # tri
 max_hours = 6
 ```
 
-It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), resolved only when a Runpod command runs, and `ssh-keygen` next to `ssh` on this machine.
+It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), resolved only when a Runpod command runs, and `ssh-keygen` next to `ssh` on this machine. A restricted API key needs read and write access to pods and to the account's secrets (see [SSH access](#ssh-access)); without the latter, `train` stops before creating any pod and says so.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -121,7 +121,7 @@ Before every create call, `runs/<run-id>/pod.json` records it, so a pod created 
 
 ### SSH access
 
-Each run gets its own client key and its own pod host key in `runs/<run-id>/ssh/`. The pod's host key is generated here, sent in the create call's environment (which anyone holding the account API key can read) and pinned in `runs/<run-id>/ssh/known_hosts`; the image's own host keys are never trusted. overbrainer connects with `ssh -F runs/<run-id>/ssh/config`, which ignores `~/.ssh/config` and the agent. Neither `ssh/` nor `pod.json` is ever uploaded with the run directory. The pod is ready once SSH answers with that key, usually a few minutes after creation (the image is 8.5 GB). After 15 minutes it is deleted and the next GPU type tried.
+Each run gets its own client key and its own pod host key in `runs/<run-id>/ssh/`. The pod's host key is generated here and pinned in `runs/<run-id>/ssh/known_hosts`; the image's own host keys are never trusted. Its private half goes to Runpod as an account secret named `overbrainer_host_key_<run-id>`, created before the first create call: the pod's environment only holds the reference `{{ RUNPOD_SECRET_overbrainer_host_key_<run-id> }}`, which Runpod replaces with the key when the container starts, so the pod details the API returns never show the key. The secret stays while a pod of the run may exist (a restarted container runs its bootstrap again and needs it), and is deleted with the run's last pod, stray pods included: while a stray of the run is left, the secret and the private client key stay until `pod rm` or the next `train` finds it gone. Otherwise they go at the end of the run, after a failed or interrupted start, at `max_hours` or `max_cost_usd` when overbrainer deletes the pod, by `pod rm`, and once a pod deleted by its watchdog is found gone. A secret left over by a crash is cleaned up by the next `train` (see [Stray pods and `pod rm`](#stray-pods-and-pod-rm)). overbrainer connects with `ssh -F runs/<run-id>/ssh/config`, which ignores `~/.ssh/config` and the agent. Neither `ssh/` nor `pod.json` is ever uploaded with the run directory. The pod is ready once SSH answers with that key, usually a few minutes after creation (the image is 8.5 GB). After 15 minutes it is deleted and the next GPU type tried.
 
 ### The watchdog
 
@@ -198,6 +198,8 @@ Before the job exists, the pod is deleted and the run fails as interrupted. Once
 ## Stray pods and `pod rm`
 
 Every `train` on a Runpod target first lists the account's pods and warns about overbrainer pods that nothing will delete: their run ended, is a stray left by an ambiguous create, is not in `runs/`, or has no run marker. It never deletes them itself. A pod named like overbrainer's but without a usable run marker is out of reach of `pod rm`: delete it from the Runpod console.
+
+The same check looks at the account's `overbrainer_host_key_<run-id>` secrets. One whose run has no pod in the list and has ended in this project is deleted. One of a run still in progress is kept, as its pod may be on its way. One of a run that is not in this project's `runs/` is only warned about, like its pods would be: `overbrainer pod rm RUN_ID --force` deletes it if no other checkout owns the run.
 
 `overbrainer pod rm RUN_ID` takes only a run ID, never a pod ID. Without `--force`, it refuses to delete anything for a run absent from this project's `runs/` (another checkout may own it) or a run still starting its pod. For a run in progress with a recorded pod, it deletes every other pod of the run (strays, and any extra pod left by an ambiguous create), keeps the training pod, and still fails, naming what it kept and deleted. `--force` also deletes the training pod and marks the run failed. A run in progress whose pod is not recorded needs `--force` too, since any pod of the run could be the one training.
 
