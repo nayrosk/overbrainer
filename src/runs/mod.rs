@@ -132,6 +132,12 @@ pub struct RunRecord {
     /// The run this one resumed from, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_from: Option<String>,
+    /// Whether the job can be asked for a snapshot: it was started by an
+    /// overbrainer whose metrics plugin reads `snapshot.request` (0.5.0 or
+    /// later). A record older versions wrote has no such field: its job
+    /// would ignore the request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub snapshots: bool,
 }
 
 /// Most runs [`Runs::claim`] makes with one base ID: `base`, then `base_2` to
@@ -367,6 +373,7 @@ pub(crate) mod tests {
             message: None,
             snapshot: None,
             resumed_from: None,
+            snapshots: false,
         }
     }
 
@@ -397,6 +404,34 @@ pub(crate) mod tests {
             "{json}"
         );
         assert_eq!(runs.load(&plain.id)?, plain);
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_says_whether_its_job_can_snapshot_and_an_old_one_cannot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let mut started = record("20260922-143005-bbbb");
+        started.state = RunState::Running;
+        started.snapshots = true;
+        runs.save(&started)?;
+        let json = fs::read_to_string(runs.run_dir(&started.id)?.join(RECORD_FILE))?;
+        assert!(json.contains("\"snapshots\": true"), "{json}");
+        assert_eq!(runs.load(&started.id)?, started);
+        // `run.json` as overbrainer 0.4.1 wrote it.
+        let old = runs.run_dir("20260921-000000-aaaa")?;
+        fs::create_dir_all(&old)?;
+        fs::write(
+            old.join(RECORD_FILE),
+            r#"{"id": "20260921-000000-aaaa", "target": "pod", "created": "2026-09-21T00:00:00Z",
+                "remote_dir": "/workspace/overbrainer/20260921-000000-aaaa",
+                "job": {"dir": "/workspace/overbrainer/20260921-000000-aaaa", "pid": 42, "container": null},
+                "state": "running", "message": null}"#,
+        )?;
+        let loaded = runs.load("20260921-000000-aaaa")?;
+        assert_eq!(loaded.state, RunState::Running);
+        assert!(!loaded.snapshots);
         Ok(())
     }
 

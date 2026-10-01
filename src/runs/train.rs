@@ -62,6 +62,13 @@ pub enum RunError {
     /// A snapshot was asked for a run whose job already ended.
     #[error("run {0} is not running ({1}): there is nothing to snapshot")]
     NotRunning(String, String),
+    /// A snapshot was asked for a run whose job cannot save one: it was
+    /// started by an overbrainer older than 0.5.0, whose metrics plugin does
+    /// not read the request.
+    #[error(
+        "run {0} was started by an overbrainer older than 0.5.0: its job cannot save a snapshot; cancel it with `overbrainer train cancel {0}`, or let it finish"
+    )]
+    NoSnapshots(String),
     /// [`collect`] was asked for a run that has not ended yet.
     #[error(
         "run {0} has not ended yet: watch or attach it, not collect, while it is preparing or running"
@@ -233,6 +240,7 @@ fn preparing(id: String, workdir: &str, target: &str, now: SystemTime) -> RunRec
         message: None,
         snapshot: None,
         resumed_from: None,
+        snapshots: false,
     }
 }
 
@@ -276,6 +284,8 @@ async fn record_started<E: Executor>(
 ) -> Result<RunRecord, RunError> {
     record.job = Some(job.clone());
     record.state = RunState::Running;
+    // The job runs this version's metrics plugin, which reads snapshot requests.
+    record.snapshots = true;
     let Err(error) = ctx.runs.save(&record) else {
         return Ok(record);
     };
@@ -1299,6 +1309,7 @@ mod tests {
             message: None,
             snapshot: None,
             resumed_from: None,
+            snapshots: true,
         })
     }
 
@@ -1641,6 +1652,28 @@ mod tests {
         let result = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await;
         assert!(matches!(result, Err(RunError::Runs(_))), "{result:?}");
         assert_eq!(fake.cancels.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_started_run_is_recorded_as_able_to_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let bus = EventBus::new();
+        let fake = Fake::new(JobStatus::Running);
+        let created = create(&runs, "demo", fake.workdir(), "box")?;
+        assert!(!created.snapshots, "no job yet");
+        let launch = Launch {
+            runtime: &JobRuntime::Native {
+                venv: None,
+                env_file: None,
+            },
+            secrets: Vec::new(),
+        };
+        let started = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await?;
+        assert!(started.snapshots);
+        assert!(runs.load(&started.id)?.snapshots);
         Ok(())
     }
 
@@ -2258,6 +2291,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_started_before_snapshots_is_never_asked_for_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::runs::{SnapshotReason, request_snapshot};
+        let fake = Fake::new(JobStatus::Running);
+        let mut old = running()?;
+        old.snapshots = false;
+        let refused = request_snapshot(&fake, &old, SnapshotReason::Disk).await;
+        let Err(error @ RunError::NoSnapshots(_)) = refused else {
+            return Err(format!("{refused:?}").into());
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "run {RUN_ID} was started by an overbrainer older than 0.5.0: its job cannot \
+                 save a snapshot; cancel it with `overbrainer train cancel {RUN_ID}`, or let it \
+                 finish"
+            )
+        );
+        assert!(fake.puts.lock().map_err(|_| "poisoned")?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_stop_with_no_snapshot_in_time_cancels_the_job()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::runs::{StopLimits, with_stop_fallback};
@@ -2294,17 +2350,25 @@ mod tests {
     async fn a_follow_cancels_a_job_only_from_a_request_it_sees()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::runs::{SnapshotReason, StopLimits, with_request_watch};
-        let job = job()?;
-        let request = format!("{}/{}", job.dir, crate::train::SNAPSHOT_REQUEST);
+        let run = running()?;
+        let request = format!("{}/{}", run.remote_dir, crate::train::SNAPSHOT_REQUEST);
         let limits = StopLimits {
             proof: Duration::from_secs(100),
             end: Duration::from_secs(50),
         };
         let every = Duration::from_secs(10);
-        // (when the request is written, how long the flow takes, cancels): no
-        // request cancels nothing; the limits count from the request seen, not
-        // from the start of the follow.
-        for (written, lasts, cancels) in [(None, 500, 0), (Some(80), 150, 0), (Some(80), 250, 1)] {
+        let mut old = run.clone();
+        old.snapshots = false;
+        // (run, when the request is written, how long the flow takes, cancels):
+        // no request cancels nothing; the limits count from the request seen,
+        // not from the start of the follow; the job of a run started before
+        // snapshots ignores a request, so it is never cancelled for one.
+        for (run, written, lasts, cancels) in [
+            (&run, None, 500, 0),
+            (&run, Some(80), 150, 0),
+            (&run, Some(80), 250, 1),
+            (&old, Some(80), 250, 0),
+        ] {
             let fake = Fake::new(JobStatus::Running);
             let flow = async {
                 if let Some(at) = written {
@@ -2317,11 +2381,12 @@ mod tests {
                 }
                 Ok::<_, ExecError>(())
             };
-            with_request_watch(&fake, &job, limits, every, flow).await?;
+            with_request_watch(&fake, run, limits, every, flow).await?;
             assert_eq!(
                 fake.cancels.load(Ordering::SeqCst),
                 cancels,
-                "{written:?} {lasts}"
+                "{} {written:?} {lasts}",
+                run.snapshots
             );
         }
         Ok(())
@@ -2331,7 +2396,7 @@ mod tests {
     async fn a_follow_ends_with_its_job_while_a_request_read_hangs()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::runs::{StopLimits, with_request_watch};
-        let job = job()?;
+        let run = running()?;
         let mut fake = Fake::new(JobStatus::Running);
         fake.request_reads = RequestReads::Hung;
         let limits = StopLimits {
@@ -2342,7 +2407,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(25)).await;
             Ok::<_, ExecError>(())
         };
-        let watched = with_request_watch(&fake, &job, limits, Duration::from_secs(10), flow);
+        let watched = with_request_watch(&fake, &run, limits, Duration::from_secs(10), flow);
         tokio::time::timeout(Duration::from_secs(60), watched).await??;
         assert_eq!(fake.cancels.load(Ordering::SeqCst), 0);
         Ok(())

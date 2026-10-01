@@ -108,6 +108,7 @@ impl Setup {
             json!({"dir": run.remote_dir, "pid": 424_242}),
         )?);
         run.state = RunState::Running;
+        run.snapshots = true;
         Ok(Self {
             server,
             client,
@@ -300,6 +301,21 @@ async fn an_earlier_snapshot_request_keeps_its_reason() -> TestResult {
     disk.read_size().await;
     disk.check(full(200, 95), None).await;
     assert_eq!(setup.read(SNAPSHOT_REQUEST), "cost");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_full_disk_of_a_run_started_before_snapshots_only_warns() -> TestResult {
+    let mut setup = Setup::new(true).await?;
+    // Started by overbrainer 0.4.1: its job ignores a snapshot request.
+    setup.run.snapshots = false;
+    let mut disk = setup.watch(Some(300));
+    disk.read_size().await;
+    disk.check(full(200, 93), None).await;
+    assert_eq!(setup.volume.state().size, 300, "a grow is still made");
+    disk.check(full(300, 93), None).await;
+    disk.check(full(300, 99), None).await;
+    assert_eq!(setup.read(SNAPSHOT_REQUEST), "");
     Ok(())
 }
 

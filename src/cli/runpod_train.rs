@@ -319,7 +319,7 @@ impl Job<'_> {
     ) -> anyhow::Result<()> {
         let ctx = self.session.ctx();
         let id = record.id.clone();
-        let job = record.job.clone();
+        let run = record.clone();
         let stopping = self.stopping;
         // Only the watch is raced: it never changes the pod, so Ctrl-C drops
         // nothing half done (the capture of the pod's logs resumes from its
@@ -329,16 +329,14 @@ impl Job<'_> {
         // Boxed: its state would otherwise weigh on every caller's future.
         let leased = Box::pin(watch_leased(&ctx, &run_ctx, self.trainer, record, pod));
         let watch = async move {
-            match job {
+            match &run.job {
                 Some(job) if stopping => {
-                    with_stop_fallback(executor, &job, STOP_LIMITS, leased).await
+                    with_stop_fallback(executor, job, STOP_LIMITS, leased).await
                 },
                 // A request written by another process, `train stop` or the
-                // pod's watchdog, is held to the same limits from when it is seen.
-                Some(job) => {
-                    with_request_watch(executor, &job, STOP_LIMITS, REQUEST_POLL, leased).await
-                },
-                None => leased.await,
+                // pod's watchdog, is held to the same limits from when it is
+                // seen; never for a run whose job cannot save a snapshot.
+                _ => with_request_watch(executor, &run, STOP_LIMITS, REQUEST_POLL, leased).await,
             }
         };
         let watched = interrupt

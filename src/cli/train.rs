@@ -191,18 +191,17 @@ async fn attach(
 
 /// Follows `record` as [`watch`] does. A snapshot request written on the
 /// target meanwhile, by `train stop` from another process for instance, is
-/// then held to [`STOP_LIMITS`] as `train stop` holds its own.
+/// then held to [`STOP_LIMITS`] as `train stop` holds its own (never for a run
+/// whose job cannot save a snapshot).
 async fn watch_requests<E: Executor>(
     ctx: &RunCtx<'_, E>,
     trainer: &Axolotl<'_>,
     record: RunRecord,
 ) -> Result<Outcome, RunError> {
-    let Some(job) = record.job.clone() else {
-        return watch(ctx, trainer, record).await;
-    };
+    let run = record.clone();
     // Boxed: its state would otherwise weigh on every caller's future.
     let watched = Box::pin(watch(ctx, trainer, record));
-    with_request_watch(ctx.executor, &job, STOP_LIMITS, REQUEST_POLL, watched).await
+    with_request_watch(ctx.executor, &run, STOP_LIMITS, REQUEST_POLL, watched).await
 }
 
 /// The trainer of a new run of `training`: resuming from the stopped run
@@ -366,10 +365,14 @@ fn left_to_holder(run_id: &str, holder: Option<u32>) -> String {
     )
 }
 
-/// The job of `record` when a snapshot can be asked of it: the run is running.
+/// The job of `record` when a snapshot can be asked of it: the run is running,
+/// and its job can save one (an older overbrainer's cannot).
 pub(super) fn stoppable(record: &RunRecord) -> anyhow::Result<crate::exec::JobId> {
     let id = &record.id;
     match (&record.job, record.state) {
+        (Some(_), RunState::Running) if !record.snapshots => {
+            Err(RunError::NoSnapshots(id.clone()).into())
+        },
         (Some(job), RunState::Running) => Ok(job.clone()),
         (None, _) | (_, RunState::Preparing) => {
             bail!("run {id} has not started: there is no job to snapshot yet")
