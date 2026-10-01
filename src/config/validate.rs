@@ -1,4 +1,7 @@
-use super::types::{Adapter, ListOrAuto, Protocol, Runtime, Settings, Target, Training};
+use super::types::{
+    Adapter, ListOrAuto, Protocol, QUANTIZE_TYPES, Runtime, Settings, Target, Training,
+    is_ollama_name,
+};
 
 /// Highest `pipeline.concurrency`: far above what providers allow, and well within
 /// what a semaphore can hold.
@@ -24,6 +27,7 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
     check_topics(settings, &mut problems);
     check_pipeline(settings, &mut problems);
     check_training(settings, &mut problems);
+    check_export(settings, &mut problems);
     check_targets(settings, &mut problems);
     check_runpod(settings, &mut problems);
     problems
@@ -237,6 +241,29 @@ fn check_training(settings: &Settings, problems: &mut Vec<String>) {
     check_training_counts(training, problems);
     check_training_rates(training, problems);
     check_axolotl_extra(training, problems);
+}
+
+/// `quantize` is a llama-quantize type, and `ollama_name` an Ollama model name.
+fn check_export(settings: &Settings, problems: &mut Vec<String>) {
+    let export = &settings.export;
+    if !QUANTIZE_TYPES.contains(&export.quantize.as_str()) {
+        problems.push(format!(
+            "export.quantize: unknown type `{}`; one of {}",
+            export.quantize,
+            QUANTIZE_TYPES.join(", ")
+        ));
+    }
+    if export
+        .ollama_name
+        .as_deref()
+        .is_some_and(|name| !is_ollama_name(name))
+    {
+        problems.push(
+            "export.ollama_name: not an Ollama model name ([host/][namespace/]model[:tag], each part \
+             of letters, digits, '_', '-' and '.')"
+                .to_string(),
+        );
+    }
 }
 
 /// Counts are at least 1 and names are not empty.
@@ -1343,6 +1370,79 @@ mod tests {
         assert_eq!(training.evals_per_epoch, 4);
         assert_eq!(training.saves_per_epoch, 1);
         Ok(())
+    }
+
+    #[test]
+    fn the_export_section_is_optional_with_defaults() -> Result<(), config::ConfigError> {
+        let defaults = settings(VALID)?;
+        assert!(!defaults.export.after_training);
+        assert_eq!(defaults.export.quantize, "Q4_K_M");
+        assert_eq!(defaults.export.ollama_name, None);
+        let toml = format!(
+            "{VALID}\n[export]\nafter_training = true\nquantize = \"Q8_0\"\nollama_name = \"me/mentor:q8\"\n"
+        );
+        let set = settings(&toml)?;
+        assert_eq!(check(&set), Vec::<String>::new());
+        assert!(set.export.after_training);
+        assert_eq!(set.export.ollama_name.as_deref(), Some("me/mentor:q8"));
+        Ok(())
+    }
+
+    #[test]
+    fn export_values_are_checked() -> Result<(), config::ConfigError> {
+        let toml = format!("{VALID}\n[export]\nquantize = \"Q4\"\nollama_name = \"-bad name\"\n");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "export.quantize: unknown type `Q4`; one of Q4_K_M, Q4_K_S, Q5_K_M, Q5_K_S, Q6_K, \
+                 Q8_0, Q3_K_M, Q2_K, F16, BF16"
+                    .to_string(),
+                "export.ollama_name: not an Ollama model name ([host/][namespace/]model[:tag], \
+                 each part of letters, digits, '_', '-' and '.')"
+                    .to_string(),
+            ]
+        );
+        assert!(
+            settings(&format!("{VALID}\n[export]\nformat = \"gguf\"\n")).is_err(),
+            "unknown fields are refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ollama_names_follow_ollama_s_rules() {
+        for name in [
+            "mentor",
+            "me/mentor:q4",
+            "mentor:latest",
+            "a.b_c-d",
+            "_x",
+            "registry.ollama.ai/library/mentor:q4",
+            "https://localhost:11434/me/mentor:v1.2",
+        ] {
+            assert!(is_ollama_name(name), "{name}");
+        }
+        for name in [
+            "",
+            ":tag",
+            "-x",
+            "a b",
+            "a:b:c",
+            "a:b/c",
+            "x;rm",
+            "a//b",
+            "a/",
+            "/a",
+            "a:",
+            "a/../b",
+            "a/b/c/d",
+            "my.ns/mentor",
+            "a/b:c:d",
+        ] {
+            assert!(!is_ollama_name(name), "{name}");
+        }
+        assert!(is_ollama_name(&"a".repeat(80)));
+        assert!(!is_ollama_name(&"a".repeat(81)));
     }
 
     #[test]

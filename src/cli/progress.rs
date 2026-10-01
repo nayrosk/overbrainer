@@ -80,6 +80,8 @@ struct Progress {
     phase: Option<Phase>,
     /// The next tenth of the evaluation told to tell.
     eval_tenth: u64,
+    /// Whether the followed job is an export: its lines say `export:`.
+    export: bool,
 }
 
 impl Progress {
@@ -95,19 +97,24 @@ impl Progress {
             } => self.failed(*stage, id, error, *retryable),
             Event::StageFinished { stage, stats } => finished(*stage, stats),
             Event::Metric(metric) => {
-                if self.show_metric(metric, Instant::now()) {
-                    training(metric);
-                }
+                self.metric(metric);
                 self.tell_phase(event);
             },
             Event::JobStatus(status) => {
-                job(*status);
+                job(self.subject(), *status);
                 self.tell_phase(event);
             },
             Event::Mark(_) | Event::RunWatched { .. } => self.tell_phase(event),
             Event::PodStatus(status) => tracing::info!("pod: {}", pod_line(status)),
             // Only the metrics and the TUI use them.
             Event::StageModel { .. } | Event::System(_) => {},
+        }
+    }
+
+    /// Logs `metric` when it is to be shown (see [`Progress::show_metric`]).
+    fn metric(&mut self, metric: &TrainMetric) {
+        if self.show_metric(metric, Instant::now()) {
+            tracing::info!("{}: {}", self.subject(), metric_line(metric));
         }
     }
 
@@ -157,8 +164,14 @@ impl Progress {
 
     fn tell_phase(&mut self, event: &Event) {
         if let Some(phase) = self.follow_phase(event) {
-            tracing::info!("train: {}", phase.label());
+            tracing::info!("{}: {}", self.subject(), phase.label());
         }
+    }
+
+    /// What the followed job's lines start with: `export` for an export,
+    /// `train` otherwise.
+    fn subject(&self) -> &'static str {
+        if self.export { "export" } else { "train" }
     }
 
     /// Takes `event` into account for the followed run's phase; returns the
@@ -168,7 +181,8 @@ impl Progress {
             Event::Metric(metric) => self.phases.metric(metric),
             Event::Mark(mark) => self.phases.mark(*mark),
             Event::JobStatus(status) => self.exited = status.is_finished(),
-            Event::RunWatched { .. } => {
+            Event::RunWatched { export, .. } => {
+                self.export = *export;
                 self.phases = Phases::default();
                 self.exited = false;
                 self.phase = None;
@@ -246,12 +260,13 @@ fn finished(stage: Stage, stats: &StageStats) {
     tracing::debug!("{stage}: {stats:?}");
 }
 
-fn training(metric: &TrainMetric) {
-    tracing::info!("train: {}", metric_line(metric));
+fn job(subject: &str, status: JobStatus) {
+    tracing::info!("{}", job_line(subject, status));
 }
 
-fn job(status: JobStatus) {
-    tracing::info!("train: job {}", status_name(status));
+/// The line telling a job's `status`, after `subject` (`train` or `export`).
+fn job_line(subject: &str, status: JobStatus) -> String {
+    format!("{subject}: job {}", status_name(status))
 }
 
 /// A job status in words.
@@ -446,6 +461,32 @@ mod tests {
     }
 
     #[test]
+    fn an_export_s_lines_say_export() {
+        use crate::train::{JobStage, Mark};
+        let mut progress = Progress::default();
+        assert_eq!(progress.subject(), "train");
+        let watched = |export| Event::RunWatched {
+            run_id: "e1".into(),
+            export,
+        };
+        progress.log(&watched(true));
+        assert_eq!(progress.subject(), "export");
+        assert_eq!(
+            job_line(progress.subject(), JobStatus::Running),
+            "export: job running"
+        );
+        let told = progress.follow_phase(&Event::Mark(Mark::Stage(JobStage::Export)));
+        assert_eq!(told.map(Phase::label).as_deref(), Some("exporting GGUF"));
+        // The next run followed on the same bus is a training job again.
+        progress.log(&watched(false));
+        assert_eq!(progress.subject(), "train");
+        assert_eq!(
+            job_line("train", JobStatus::Exited(0)),
+            "train: job exited with code 0"
+        );
+    }
+
+    #[test]
     fn the_phase_is_told_as_it_changes() {
         use crate::train::{JobStage, Mark};
 
@@ -458,6 +499,7 @@ mod tests {
         let events = [
             Event::RunWatched {
                 run_id: "r1".into(),
+                export: false,
             },
             Event::JobStatus(JobStatus::Running),
             Event::Mark(Mark::Stage(JobStage::Train)),

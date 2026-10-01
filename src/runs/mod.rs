@@ -22,8 +22,8 @@ pub use snapshot::{
 };
 pub use summary::MetricsSummary;
 pub use train::{
-    HF_CACHE_DIR, Launch, Outcome, PROBE_EVERY, RunCtx, RunError, artifacts_missing, cancel,
-    collect, create, create_on, reserve, start, watch,
+    HF_CACHE_DIR, Launch, Outcome, PROBE_EVERY, RunCtx, RunError, TOOLS_CACHE_DIR,
+    artifacts_missing, cancel, collect, create, create_on, reserve, start, start_mounted, watch,
 };
 
 use crate::exec::JobId;
@@ -163,6 +163,87 @@ impl Runs {
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The export jobs of run `id`, `runs/<id>/exports/`, kept as runs of
+    /// their own: each has its record, job log and metrics, and on Runpod its
+    /// pod, in `runs/<id>/exports/<export-id>/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunsError::InvalidId`] when `id` is not a valid run ID.
+    pub fn exports(&self, id: &str) -> Result<Self, RunsError> {
+        Ok(Self {
+            dir: self.run_dir(id)?.join(crate::export::EXPORTS_DIR),
+        })
+    }
+
+    /// The run whose exports these are, when these are the exports of a run
+    /// (see [`Runs::exports`]).
+    #[must_use]
+    pub fn export_of(&self) -> Option<String> {
+        if self.dir.file_name()? != crate::export::EXPORTS_DIR {
+            return None;
+        }
+        let run = self.dir.parent()?;
+        let name = run.file_name()?.to_str()?;
+        (run.parent()?.file_name()? == RUNS_DIR && is_valid_run_id(name)).then(|| name.to_string())
+    }
+
+    /// What the record `id` of these runs is, as messages name it: `run <id>`,
+    /// or `export <id> of run <run-id>`.
+    #[must_use]
+    pub fn subject(&self, id: &str) -> String {
+        match self.export_of() {
+            Some(run) => format!("export {id} of run {run}"),
+            None => format!("run {id}"),
+        }
+    }
+
+    /// The directory of the record `id`, relative to the project directory:
+    /// `runs/<id>`, or `runs/<run-id>/exports/<id>`.
+    #[must_use]
+    pub fn relative_dir(&self, id: &str) -> String {
+        match self.export_of() {
+            Some(run) => format!("{RUNS_DIR}/{run}/{}/{id}", crate::export::EXPORTS_DIR),
+            None => format!("{RUNS_DIR}/{id}"),
+        }
+    }
+
+    /// How to go on with the record `id` once overbrainer stopped following
+    /// it: attach the run again, or export the run again.
+    #[must_use]
+    pub fn follow_hint(&self, id: &str) -> String {
+        match self.export_of() {
+            Some(run) => format!(
+                "an export cannot be followed again: export again with `overbrainer export {run}`"
+            ),
+            None => format!("follow it again with `overbrainer train attach {id}`"),
+        }
+    }
+
+    /// The runs holding `id`: these, unless `id` is not a run here but an
+    /// export of one of them, whose own runs hold it (see [`Runs::exports`]).
+    #[must_use]
+    pub fn holding(&self, id: &str) -> Self {
+        let here = self.run_dir(id).is_ok_and(|dir| dir.is_dir());
+        if here {
+            return self.clone();
+        }
+        self.find_export(id).unwrap_or_else(|| self.clone())
+    }
+
+    /// The export jobs holding the export `id`, from any run, when one does.
+    #[must_use]
+    pub fn find_export(&self, id: &str) -> Option<Self> {
+        if !is_valid_run_id(id) {
+            return None;
+        }
+        let entries = fs::read_dir(&self.dir).ok()?;
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| self.exports(&entry.file_name().to_string_lossy()).ok())
+            .find(|exports| exports.dir.join(id).join(RECORD_FILE).is_file())
     }
 
     /// Local directory of the run `id`.
@@ -361,6 +442,55 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> RunsError + '_ {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn messages_name_an_export_and_how_to_redo_it() -> Result<(), RunsError> {
+        let runs = Runs::new(Path::new("project"));
+        let exports = runs.exports("r1")?;
+        assert_eq!(runs.export_of(), None);
+        assert_eq!(exports.export_of().as_deref(), Some("r1"));
+        assert_eq!(runs.subject("r1"), "run r1");
+        assert_eq!(exports.subject("e1"), "export e1 of run r1");
+        assert_eq!(runs.relative_dir("r1"), "runs/r1");
+        assert_eq!(exports.relative_dir("e1"), "runs/r1/exports/e1");
+        assert!(runs.follow_hint("r1").contains("train attach r1"));
+        assert!(
+            exports
+                .follow_hint("e1")
+                .contains("`overbrainer export r1`")
+        );
+        assert!(!exports.follow_hint("e1").contains("attach"));
+        Ok(())
+    }
+
+    #[test]
+    fn exports_are_runs_of_their_own_inside_their_run() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        assert!(runs.exports("../x").is_err());
+        let exports = runs.exports("r1")?;
+        assert_eq!(exports.dir(), project.path().join("runs/r1/exports"));
+        let (id, _) = exports.claim("export_20261001-120000", 0)?;
+        assert_eq!(
+            runs.find_export(&id).map(|found| found.dir),
+            None,
+            "no record yet"
+        );
+        fs::write(exports.run_dir(&id)?.join(RECORD_FILE), "{}")?;
+        assert_eq!(
+            runs.find_export(&id).map(|found| found.dir),
+            Some(exports.dir().to_path_buf())
+        );
+        assert!(runs.find_export("../r1").is_none());
+        assert_eq!(runs.holding(&id).dir(), exports.dir());
+        assert_eq!(runs.holding("r1").dir(), runs.dir());
+        assert_eq!(runs.holding("elsewhere").dir(), runs.dir());
+        assert!(
+            runs.list()?.is_empty(),
+            "an export is not a run of the project"
+        );
+        Ok(())
+    }
 
     fn record(id: &str) -> RunRecord {
         RunRecord {

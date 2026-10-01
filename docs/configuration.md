@@ -133,6 +133,8 @@ Retries wait with exponential backoff and jitter, or as long as the provider's `
 
 The `[training]` section and the `[targets.*]` tables are described in [Training](training.md) and [Runpod](runpod.md). A Runpod target's `gpu_types` and `data_center_ids` take a TOML array, or `"auto"`; from the environment, a comma-separated value or `auto`, for example `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. `min_vram_gb` and `max_price_per_hour` narrow an `auto` choice of GPU types and are rejected otherwise, and `max_volume_gb` needs `network_volume_id`; see [Runpod](runpod.md) for every field.
 
+The optional `[export]` section (`after_training`, `quantize`, `ollama_name`) sets the export of a run's model to GGUF and its Ollama Modelfile, described in [Training](training.md#export-to-gguf-and-ollama), for example `OVERBRAINER_EXPORT__QUANTIZE=Q8_0` from the environment.
+
 ## Metrics
 
 `[metrics]` turns on a Prometheus endpoint. It is off unless `listen` is set:

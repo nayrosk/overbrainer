@@ -9,17 +9,20 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use secrecy::SecretString;
 
+use super::export::{Delivery, EXPORT_PREFIX, Plan, finish_export, started_line};
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
 use super::train::{
-    HF_TOKEN, POLL, finish, prepare, reattach, resumed, secrets, started, stop_requested,
+    HF_TOKEN, POLL, exporting, finish, prepare, resumed, secrets, started, stop_requested,
     stoppable, training, warn,
 };
 use crate::config::{Settings, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
+use crate::export::ExportJob;
+use crate::runpod::export_room_warning;
 use crate::runpod::{
     DeleteReason, DeletedBy, Ending, LEASE_TTL, PodCtx, PodError, PodRecord, PodState,
     RunpodClient, RunpodTarget, Timing, arm_cost_cap, chain, end_pod, forget_keys, job_started,
@@ -31,8 +34,10 @@ use crate::runs::{
     artifacts_missing, cancel as cancel_job, collect, create, request_snapshot, reserve, start,
     watch, with_request_watch, with_stop_fallback,
 };
-use crate::train::sizing::{HF_URL, VramFloor, estimate_model};
-use crate::train::{Axolotl, reasoning_template_warning};
+use crate::train::sizing::{
+    HF_URL, VramFloor, estimate_model, export_disk_bytes, export_estimate, fetch_shape,
+};
+use crate::train::{Axolotl, CONFIG_FILE, Trainer, reasoning_template_warning};
 
 /// What every Runpod command sets up: the API client, the front end's bus and
 /// the interrupted flag provisioning checks between its steps.
@@ -58,13 +63,23 @@ impl<'f> Session<'f> {
         settings: &Settings,
         front: &'f Frontend,
     ) -> anyhow::Result<Self> {
+        Self::open_in(Runs::new(project_dir), settings, front).await
+    }
+
+    /// [`Session::open`] with the runs of `runs`: an export's, whose pod and
+    /// record live in its own directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::open`].
+    async fn open_in(runs: Runs, settings: &Settings, front: &'f Frontend) -> anyhow::Result<Self> {
         let client = super::pod::client(settings).await?;
         // Set up now, so an interruption from here on is seen by provisioning.
         let flag = front.provisioning_flag()?;
         let guard = front.open_bus();
         Ok(Self {
             client,
-            runs: Runs::new(project_dir),
+            runs,
             guard,
             timing: Timing::standard(),
             flag,
@@ -141,29 +156,175 @@ pub(super) async fn train(
                 VramFloor::ToEstimate => vram_floor(training, spec, token, HF_URL).await,
             }
         };
-        let (vram_floor_gb, session) =
-            tokio::join!(floor, Session::open(project_dir, settings, front));
+        let disk = warn_export_disk(training, &settings.export, spec, token, HF_URL);
+        let (vram_floor_gb, (), session) =
+            tokio::join!(floor, disk, Session::open(project_dir, settings, front));
         Ok((secrets, vram_floor_gb, session?))
     })
     .await?;
-    let job = Job {
-        session: &session,
-        spec,
-        trainer,
-        vram_floor_gb,
-        stopping: false,
-    };
+    let ollama = settings.export.ollama_name.as_deref();
+    let report =
+        |runs: &Runs, id: &str, result, front: &Frontend| finish(runs, id, result, front, ollama);
     let result = async {
         warn_orphans(&session.ctx()).await;
         let record = create(&session.runs, &settings.project.name, spec.workdir(), name)?;
         let record = resumed(&session.runs, record, trainer)?;
+        let trainer = exporting(trainer, &record.id, &settings.export);
         started(&record);
         front.run_created(&record.id);
+        let job = Job {
+            session: &session,
+            spec,
+            trainer: &trainer,
+            vram_floor_gb,
+            stopping: false,
+            report: &report,
+            cancel_on_interrupt: false,
+        };
         job.run(&mut interrupt, record, keep, secrets).await
     }
     .await;
     session.close().await;
     result
+}
+
+/// `overbrainer export` of `plan` on the Runpod target `spec`: a new pod with
+/// the target's GPU settings, the run's model and `axolotl.yaml` uploaded with
+/// the export job, its GGUF retrieved, then the pod deleted (kept with
+/// `keep`), under the same lease, deadline and cost cap as a training job.
+/// The export's record and pod live in `runs/<run-id>/exports/<export-id>/`.
+/// Ctrl-C cancels the export and ends its pod.
+///
+/// # Errors
+///
+/// Returns an error when the pod cannot be provisioned, the export fails or
+/// cannot be delivered, or it is interrupted.
+pub(super) async fn export(
+    project_dir: &Path,
+    settings: &Settings,
+    (spec, keep): (&RunpodTarget, bool),
+    plan: &Plan<'_>,
+    front: &Frontend,
+) -> anyhow::Result<()> {
+    let run = plan.run;
+    let runs = Runs::new(project_dir);
+    let exports = runs.exports(&run.id)?;
+    let local_run = runs.run_dir(&run.id)?;
+    // Caught from before the preparation: Ctrl-C stops it without an export.
+    let mut interrupt = front.interrupt();
+    let (secrets, vram_floor_gb, session) = prepare(&mut interrupt, async {
+        let secrets = secrets(settings).await?;
+        let token = secrets
+            .iter()
+            .find(|(name, _)| name == HF_TOKEN)
+            .map(|(_, token)| token);
+        let sizing = export_sizing(&local_run, plan, spec, token, HF_URL);
+        let (floor, session) =
+            tokio::join!(sizing, Session::open_in(exports.clone(), settings, front));
+        Ok((secrets, floor, session?))
+    })
+    .await?;
+    let trainer = ExportJob::staged(&run.id, plan.quantize, &local_run, plan.model);
+    let file = trainer.file_name();
+    let report =
+        |exports: &Runs, id: &str, result: anyhow::Result<Option<Outcome>>, front: &Frontend| {
+            let outcome = result?.with_context(|| format!("interrupted: export {id} stopped"))?;
+            let delivery = Delivery {
+                runs: &runs,
+                exports,
+                plan,
+                file: &file,
+            };
+            finish_export(&delivery, &outcome, front)
+        };
+    let result = async {
+        let record = create(&session.runs, EXPORT_PREFIX, spec.workdir(), &run.target)?;
+        front.line(&started_line(&record.id, plan));
+        let job = Job {
+            session: &session,
+            spec,
+            trainer: &trainer,
+            vram_floor_gb,
+            stopping: false,
+            report: &report,
+            cancel_on_interrupt: true,
+        };
+        job.run(&mut interrupt, record, keep, secrets).await
+    }
+    .await;
+    session.close().await;
+    result
+}
+
+/// What an export of `plan` needs of a pod of `spec`, from its base model's
+/// shape on the Hub at `hub`: the VRAM floor of `auto` GPU types without
+/// `min_vram_gb` (the merge holds the base model), and, without a network
+/// volume, a warning when the container disk may be too small. Without the
+/// shape, a warning says so and there is no floor.
+async fn export_sizing(
+    run_dir: &Path,
+    plan: &Plan<'_>,
+    spec: &RunpodTarget,
+    token: Option<&SecretString>,
+    hub: &str,
+) -> Option<u32> {
+    let wants_floor = spec.gpu_types.is_auto() && spec.min_vram_gb.is_none();
+    let wants_disk = spec.network_volume_id.is_none();
+    if !wants_floor && !wants_disk {
+        return None;
+    }
+    let base_model = recorded_base_model(run_dir)?;
+    match fetch_shape(hub, &base_model, token, ESTIMATE_LIMIT).await {
+        Ok(shape) => {
+            let model = run_dir.join(plan.model);
+            let merge = model.join("adapter_config.json").is_file()
+                && !model.join("merged/config.json").is_file();
+            let need = export_disk_bytes(shape.params, merge, plan.quantize);
+            if let Some(warning) =
+                export_room_warning(spec.container_disk_gb, need).filter(|_| wants_disk)
+            {
+                warn(&warning);
+            }
+            wants_floor.then(|| export_estimate(&shape).floor_gb())
+        },
+        Err(error) => {
+            warn(&format!(
+                "cannot estimate what the export needs ({error}): gpu_types = \"auto\" picks \
+                 without a VRAM floor"
+            ));
+            None
+        },
+    }
+}
+
+/// The `base_model` the run in `run_dir` trained, from its `axolotl.yaml`.
+fn recorded_base_model(run_dir: &Path) -> Option<String> {
+    let config = std::fs::read_to_string(run_dir.join(CONFIG_FILE)).ok()?;
+    crate::train::top_level_scalar(&config, "base_model")
+}
+
+/// Warns, without a network volume, when the container disk of `spec` may be
+/// too small for the export at the end of a training job of `training`, its
+/// model's shape read from the Hub at `hub`. Silent when the shape cannot be
+/// read: the VRAM floor says so already.
+async fn warn_export_disk(
+    training: &Training,
+    export: &crate::config::Export,
+    spec: &RunpodTarget,
+    token: Option<&SecretString>,
+    hub: &str,
+) {
+    if !export.after_training || spec.network_volume_id.is_some() {
+        return;
+    }
+    let Ok(shape) = fetch_shape(hub, &training.base_model, token, ESTIMATE_LIMIT).await else {
+        return;
+    };
+    let merge = training.adapter != crate::config::Adapter::Full;
+    let need = export_disk_bytes(shape.params, merge, &export.quantize);
+    if let Some(warning) = export_room_warning(spec.container_disk_gb, need) {
+        warn(&warning);
+    }
 }
 
 /// How long the model's shape may take to read from Hugging Face.
@@ -203,19 +364,30 @@ async fn vram_floor(
     }
 }
 
-/// A run's job on its pod.
-struct Job<'a> {
+/// How a Runpod command reports a job that ended, from the runs it was
+/// saved in and its ID: `finish` for a training run.
+type Report<'a> = &'a (
+        dyn Fn(&Runs, &str, anyhow::Result<Option<Outcome>>, &Frontend) -> anyhow::Result<()> + Sync
+    );
+
+/// A run's job on its pod: a training job, or an export.
+struct Job<'a, T> {
     session: &'a Session<'a>,
     spec: &'a RunpodTarget,
-    trainer: &'a Axolotl<'a>,
+    trainer: &'a T,
     /// See [`vram_floor`]; used only to start a pod.
     vram_floor_gb: Option<u32>,
     /// Whether a snapshot was asked of it: following it then cancels a job
     /// that gives none within [`STOP_LIMITS`].
     stopping: bool,
+    /// Reports the job once it ended.
+    report: Report<'a>,
+    /// Whether Ctrl-C cancels the job and ends its pod (an export), rather
+    /// than leaving both running (a training job).
+    cancel_on_interrupt: bool,
 }
 
-impl Job<'_> {
+impl<T: Trainer + Sync> Job<'_, T> {
     fn run_ctx<'e>(&'e self, executor: &'e SshExecutor) -> RunCtx<'e, SshExecutor> {
         RunCtx {
             runs: &self.session.runs,
@@ -289,23 +461,62 @@ impl Job<'_> {
         };
         if keep {
             // Only now: until the job started, Ctrl-C or a failure deleted the pod.
-            warn(&keep_warning(&pod, &id));
+            warn(&keep_warning(&pod, &self.session.runs, &id));
         }
         // The job runs on a billed pod: the error says how to reach or remove it.
         job_started(&self.session.runs, &mut pod).with_context(|| {
             format!(
-                "the job of run {id} runs on pod {}{}; {}, or delete the pod with \
+                "the job of {} runs on pod {}{}; {}, or delete the pod with \
                  `overbrainer pod rm {id}`",
+                self.session.runs.subject(&id),
                 pod_name(&pod),
                 rate(&pod),
-                reattach(&id)
+                self.session.runs.follow_hint(&id)
             )
         })?;
         if interrupt.caught() {
-            bail!(detached(&pod, &id, self.spec));
+            if self.cancel_on_interrupt {
+                return self
+                    .abort(interrupt, &executor, started_run, &mut pod)
+                    .await;
+            }
+            bail!(detached(&pod, &id, self.spec, &self.session.runs));
         }
         self.follow(interrupt, &executor, started_run, &mut pod)
             .await
+    }
+
+    /// Cancels the job of `record` after Ctrl-C, retrieves what it left
+    /// best effort, then ends its pod.
+    async fn abort(
+        &self,
+        interrupt: &mut Interrupt,
+        executor: &SshExecutor,
+        record: RunRecord,
+        pod: &mut PodRecord,
+    ) -> anyhow::Result<()> {
+        let ctx = self.session.ctx();
+        let id = record.id.clone();
+        let (record, _, retrieved) = interrupt
+            .shield(cancel_job(
+                &self.session.runs,
+                executor,
+                self.trainer,
+                record,
+            ))
+            .await?;
+        let ending = interrupt
+            .shield(end_pod(&ctx, pod, executor, &record, retrieved))
+            .await;
+        ended(
+            pod,
+            ending,
+            (&self.session.runs, &id),
+            Err(anyhow!(
+                "interrupted: {} cancelled",
+                self.session.runs.subject(&id)
+            )),
+        )
     }
 
     /// Follows a started run, then ends its pod and reports the outcome. Ctrl-C
@@ -320,6 +531,7 @@ impl Job<'_> {
         let ctx = self.session.ctx();
         let id = record.id.clone();
         let run = record.clone();
+        let interrupted = record.clone();
         let stopping = self.stopping;
         // Only the watch is raced: it never changes the pod, so Ctrl-C drops
         // nothing half done (the capture of the pod's logs resumes from its
@@ -343,14 +555,17 @@ impl Job<'_> {
             .race(with_pod_logs(&ctx, pod, Box::pin(watch)))
             .await;
         let Some(watched) = watched else {
-            bail!(detached(pod, &id, self.spec));
+            if self.cancel_on_interrupt {
+                return self.abort(interrupt, executor, interrupted, pod).await;
+            }
+            bail!(detached(pod, &id, self.spec, &self.session.runs));
         };
         let settled = interrupt
             .shield(settle_watch(&ctx, pod, &id, watched))
             .await;
         let outcome = match settled {
             Err(error @ PodError::Run(_)) => {
-                return Err(anyhow::Error::new(error).context(reattach(&id)));
+                return Err(anyhow::Error::new(error).context(self.session.runs.follow_hint(&id)));
             },
             Err(error) => return Err(error.into()),
             Ok(outcome) => outcome,
@@ -378,13 +593,13 @@ impl Job<'_> {
                 outcome.retrieved,
             ))
             .await;
-        let finished = finish(
+        let finished = (self.report)(
             &self.session.runs,
             &id,
             Ok(Some(outcome)),
             self.session.front,
         );
-        ended(pod, ending, &id, finished)
+        ended(pod, ending, (&self.session.runs, &id), finished)
     }
 
     /// `train attach` of the started run `record` on its pod.
@@ -396,7 +611,7 @@ impl Job<'_> {
     ) -> anyhow::Result<()> {
         let ctx = self.session.ctx();
         let Some(executor) = reconnect(&ctx, pod, &record).await? else {
-            return from_local_files(self.session, self.trainer, record, pod).await;
+            return from_local_files(self.session, self.trainer, record, pod, self.report).await;
         };
         if record.state == RunState::Running {
             return self.follow(interrupt, &executor, record, pod).await;
@@ -469,7 +684,7 @@ impl Job<'_> {
             Some(message) => front.line(&format!("train: run {id} cancelled ({message})")),
             None => front.line(&format!("train: run {id} cancelled")),
         }
-        ended(pod, ending, &id, Ok(()))
+        ended(pod, ending, (&self.session.runs, &id), Ok(()))
     }
 }
 
@@ -479,19 +694,20 @@ impl Job<'_> {
 fn ended(
     pod: &PodRecord,
     ending: Result<Ending, PodError>,
-    id: &str,
+    (runs, id): (&Runs, &str),
     finished: anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     match ending {
         Ok(ending) => {
-            report(pod, ending, id);
+            report(pod, ending, runs, id);
             finished
         },
         Err(error) => {
             if let Err(run_error) = finished {
                 warn(&format!("{run_error:#}"));
             }
-            Err(anyhow::Error::new(error).context(format!("run {id} ended, but not its pod")))
+            Err(anyhow::Error::new(error)
+                .context(format!("{} ended, but not its pod", runs.subject(id))))
         },
     }
 }
@@ -559,13 +775,14 @@ fn interrupted_before_job(runs: &Runs, id: &str) -> String {
         Ok(None) => false,
         Err(_) => true,
     };
+    let subject = runs.subject(id);
     if left {
         format!(
-            "interrupted: run {id} stopped before its job started, but a pod of it may be left: \
+            "interrupted: {subject} stopped before its job started, but a pod of it may be left: \
              check `overbrainer pod ls`"
         )
     } else {
-        format!("interrupted: run {id} stopped before its job started; it has no pod left")
+        format!("interrupted: {subject} stopped before its job started; it has no pod left")
     }
 }
 
@@ -607,24 +824,29 @@ fn pod_name(pod: &PodRecord) -> String {
         .map_or_else(|| "(none)".to_string(), ToString::to_string)
 }
 
-fn keep_warning(pod: &PodRecord, id: &str) -> String {
+fn keep_warning(pod: &PodRecord, runs: &Runs, id: &str) -> String {
     let rate = pod.cost_per_hour.map_or_else(
         || "at an hourly rate Runpod did not give".to_string(),
         |rate| format!("at ${rate:.2}/h"),
     );
+    let ends = if runs.export_of().is_some() {
+        "the export"
+    } else {
+        "the run"
+    };
     format!(
-        "--keep-pod: pod {} is kept with no time limit, {rate}, even once the run ends; \
+        "--keep-pod: pod {} is kept with no time limit, {rate}, even once {ends} ends; \
          nothing deletes it but `overbrainer pod rm {id}`",
         pod_name(pod)
     )
 }
 
 /// The message of a run left running on its pod after Ctrl-C.
-fn detached(pod: &PodRecord, id: &str, spec: &RunpodTarget) -> String {
+fn detached(pod: &PodRecord, id: &str, spec: &RunpodTarget, runs: &Runs) -> String {
     let guard = if pod.keep {
         format!(
             "The pod is kept with no time limit (--keep-pod): `{}`.",
-            ssh_command(id)
+            ssh_command(runs, id)
         )
     } else {
         format!(
@@ -635,17 +857,18 @@ fn detached(pod: &PodRecord, id: &str, spec: &RunpodTarget) -> String {
         )
     };
     format!(
-        "interrupted: run {id} keeps running on pod {}{}; {}, or delete the pod with \
+        "interrupted: {} keeps running on pod {}{}; {}, or delete the pod with \
          `overbrainer pod rm {id}`. {guard}",
+        runs.subject(id),
         pod_name(pod),
         rate(pod),
-        reattach(id)
+        runs.follow_hint(id)
     )
 }
 
 /// Says what became of the pod once the job ended: see [`report_line`].
-fn report(pod: &PodRecord, ending: Ending, id: &str) {
-    if let Some(line) = report_line(pod, ending, id) {
+fn report(pod: &PodRecord, ending: Ending, runs: &Runs, id: &str) {
+    if let Some(line) = report_line(pod, ending, runs, id) {
         warn(&line);
     }
 }
@@ -653,14 +876,14 @@ fn report(pod: &PodRecord, ending: Ending, id: &str) {
 /// What to say of the pod once the job ended. Nothing for a deleted pod, which
 /// its events already reported, nor for one awaiting retrieval, which `end_pod`
 /// reported: how to reach a kept pod, its results retrieved or not, is said here.
-fn report_line(pod: &PodRecord, ending: Ending, id: &str) -> Option<String> {
+fn report_line(pod: &PodRecord, ending: Ending, runs: &Runs, id: &str) -> Option<String> {
     match ending {
         Ending::Deleted | Ending::AwaitingRetrieval => None,
         Ending::Kept => Some(format!(
             "pod {} kept (--keep-pod): `{}`; remove it with `overbrainer pod rm {id}`; \
              nothing deletes it automatically",
             pod_name(pod),
-            ssh_command(id)
+            ssh_command(runs, id)
         )),
     }
 }
@@ -689,12 +912,17 @@ pub(super) async fn attach(
     let session = Session::open(project_dir, settings, front).await?;
     let mut interrupt = front.interrupt();
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
+    let ollama = settings.export.ollama_name.as_deref();
+    let report =
+        |runs: &Runs, id: &str, result, front: &Frontend| finish(runs, id, result, front, ollama);
     let job = Job {
         session: &session,
         spec: &spec,
         trainer: &trainer,
         vram_floor_gb: None,
         stopping: false,
+        report: &report,
+        cancel_on_interrupt: false,
     };
     let result = job.attach(&mut interrupt, record, &mut pod).await;
     session.close().await;
@@ -703,11 +931,12 @@ pub(super) async fn attach(
 
 /// Reports a run whose pod is gone from its local files; a run still `Running`
 /// is failed first, since its job went with the pod.
-async fn from_local_files(
+async fn from_local_files<T: Trainer>(
     session: &Session<'_>,
-    trainer: &Axolotl<'_>,
+    trainer: &T,
     mut record: RunRecord,
     pod: &PodRecord,
+    report: Report<'_>,
 ) -> anyhow::Result<()> {
     tracing::info!("pod: {} already deleted", pod_name(pod));
     if record.state == RunState::Running {
@@ -730,7 +959,7 @@ async fn from_local_files(
         poll: POLL,
     };
     let outcome = watch(&run_ctx, trainer, record).await?;
-    finish(&session.runs, &id, Ok(Some(outcome)), session.front)
+    report(&session.runs, &id, Ok(Some(outcome)), session.front)
 }
 
 /// `overbrainer train cancel` on a Runpod run.
@@ -751,12 +980,17 @@ pub(super) async fn cancel(
     let session = Session::open(project_dir, settings, front).await?;
     let mut interrupt = front.interrupt();
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
+    let ollama = settings.export.ollama_name.as_deref();
+    let report =
+        |runs: &Runs, id: &str, result, front: &Frontend| finish(runs, id, result, front, ollama);
     let job = Job {
         session: &session,
         spec: &spec,
         trainer: &trainer,
         vram_floor_gb: None,
         stopping: false,
+        report: &report,
+        cancel_on_interrupt: false,
     };
     let result = job.cancel(&mut interrupt, record, &mut pod).await;
     session.close().await;
@@ -782,12 +1016,17 @@ pub(super) async fn stop(
     let session = Session::open(project_dir, settings, front).await?;
     let mut interrupt = front.interrupt();
     let trainer = Axolotl::new(training, &DataFiles::new(project_dir));
+    let ollama = settings.export.ollama_name.as_deref();
+    let report =
+        |runs: &Runs, id: &str, result, front: &Frontend| finish(runs, id, result, front, ollama);
     let job = Job {
         session: &session,
         spec: &spec,
         trainer: &trainer,
         vram_floor_gb: None,
         stopping: true,
+        report: &report,
+        cancel_on_interrupt: false,
     };
     let result = job.stop(&mut interrupt, record, &mut pod).await;
     session.close().await;
@@ -818,6 +1057,22 @@ mod tests {
 
     /// The floor asks Hugging Face only for `auto` GPU types without
     /// `min_vram_gb`.
+    #[test]
+    fn the_base_model_is_read_from_the_run_s_own_config() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let run = tempfile::tempdir()?;
+        assert_eq!(recorded_base_model(run.path()), None, "no axolotl.yaml");
+        std::fs::write(
+            run.path().join(CONFIG_FILE),
+            "datasets:\n  - base_model: nested\nbase_model: 'Qwen/Qwen3-0.6B'  # edited\n",
+        )?;
+        assert_eq!(
+            recorded_base_model(run.path()).as_deref(),
+            Some("Qwen/Qwen3-0.6B")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn the_vram_floor_is_estimated_only_when_auto_uses_it()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -880,6 +1135,44 @@ mod tests {
         }
     }
 
+    /// The runs of a project in `project`, relative paths only.
+    fn runs() -> Runs {
+        Runs::new(Path::new("project"))
+    }
+
+    #[test]
+    fn an_export_s_messages_name_the_export_and_never_train_attach()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let exports = runs().exports("r1")?;
+        let kept = pod(true)?;
+        let warning = keep_warning(&kept, &exports, "e1");
+        assert!(warning.contains("even once the export ends"), "{warning}");
+        assert!(warning.ends_with("`overbrainer pod rm e1`"), "{warning}");
+        assert_eq!(
+            report_line(&kept, Ending::Kept, &exports, "e1").as_deref(),
+            Some(
+                "pod k3x9abc kept (--keep-pod): `ssh -F runs/r1/exports/e1/ssh/config \
+                 overbrainer-e1`; remove it with `overbrainer pod rm e1`; nothing deletes it \
+                 automatically"
+            )
+        );
+        let detached = detached(&kept, "e1", &target(), &exports);
+        assert!(
+            detached.starts_with("interrupted: export e1 of run r1 keeps running on pod k3x9abc"),
+            "{detached}"
+        );
+        assert!(detached.contains("`overbrainer export r1`"), "{detached}");
+        let interrupted = interrupted_before_job(&exports, "e1");
+        assert_eq!(
+            interrupted,
+            "interrupted: export e1 of run r1 stopped before its job started; it has no pod left"
+        );
+        for message in [warning, detached, interrupted] {
+            assert!(!message.contains("train attach"), "{message}");
+        }
+        Ok(())
+    }
+
     fn pod(keep: bool) -> Result<PodRecord, serde_json::Error> {
         let mut pod = PodRecord::new("r1", keep, 1, "ssh-ed25519 AAAAhost");
         let remote: Pod = serde_json::from_value(
@@ -893,7 +1186,7 @@ mod tests {
     #[test]
     fn keep_pod_warns_of_no_time_limit_with_the_rate_and_pod_rm() -> Result<(), serde_json::Error> {
         assert_eq!(
-            keep_warning(&pod(true)?, "r1"),
+            keep_warning(&pod(true)?, &runs(), "r1"),
             "--keep-pod: pod k3x9abc is kept with no time limit, at $0.53/h, even once the run \
              ends; nothing deletes it but `overbrainer pod rm r1`"
         );
@@ -906,7 +1199,7 @@ mod tests {
         let guarded = pod(false)?;
         let deadline = guarded.deadline.clone().unwrap_or_default();
         assert_eq!(
-            detached(&guarded, "r1", &target()),
+            detached(&guarded, "r1", &target(), &runs()),
             format!(
                 "interrupted: run r1 keeps running on pod k3x9abc ($0.53/h); follow it again \
                  with `overbrainer train attach r1`, or delete the pod with `overbrainer pod rm \
@@ -915,7 +1208,7 @@ mod tests {
                  runs out), whichever is later."
             )
         );
-        assert!(detached(&pod(true)?, "r1", &target()).ends_with(
+        assert!(detached(&pod(true)?, "r1", &target(), &runs()).ends_with(
             "The pod is kept with no time limit (--keep-pod): \
              `ssh -F runs/r1/ssh/config overbrainer-r1`."
         ));
@@ -928,11 +1221,14 @@ mod tests {
                     remove it with `overbrainer pod rm r1`; nothing deletes it automatically";
         let (keep, guarded) = (pod(true)?, pod(false)?);
         assert_eq!(
-            report_line(&keep, Ending::Kept, "r1").as_deref(),
+            report_line(&keep, Ending::Kept, &runs(), "r1").as_deref(),
             Some(kept)
         );
-        assert_eq!(report_line(&guarded, Ending::AwaitingRetrieval, "r1"), None);
-        assert_eq!(report_line(&guarded, Ending::Deleted, "r1"), None);
+        assert_eq!(
+            report_line(&guarded, Ending::AwaitingRetrieval, &runs(), "r1"),
+            None
+        );
+        assert_eq!(report_line(&guarded, Ending::Deleted, &runs(), "r1"), None);
         Ok(())
     }
 }

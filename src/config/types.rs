@@ -33,6 +33,9 @@ pub struct Settings {
     /// Credentials for the Runpod API.
     #[serde(default)]
     pub runpod: Runpod,
+    /// Export of a trained model to GGUF, and its Ollama Modelfile.
+    #[serde(default)]
+    pub export: Export,
     /// The Prometheus endpoint, off unless `metrics.listen` is set.
     #[serde(default)]
     pub metrics: Metrics,
@@ -663,6 +666,102 @@ pub struct Runpod {
     /// Env only. Base URL of the REST API, [`DEFAULT_RUNPOD_BASE_URL`] when unset.
     /// Must be `https`, or `http` on a loopback host (a test stub).
     pub base_url: Option<String>,
+}
+
+/// The llama-quantize types `export.quantize` accepts. `F16` and `BF16` skip
+/// the quantization: the GGUF keeps 16-bit weights.
+pub const QUANTIZE_TYPES: [&str; 10] = [
+    "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "Q3_K_M", "Q2_K", "F16", "BF16",
+];
+
+/// `export.quantize` when unset.
+pub const DEFAULT_QUANTIZE: &str = "Q4_K_M";
+
+/// Export of a trained model to GGUF with llama.cpp, and its Ollama Modelfile.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Export {
+    /// Whether a training job exports its model at its end, after the merge.
+    #[serde(default)]
+    pub after_training: bool,
+    /// The llama-quantize type of the GGUF, one of [`QUANTIZE_TYPES`].
+    #[serde(default = "default_quantize")]
+    pub quantize: String,
+    /// The Ollama model `ollama create` makes from the Modelfile once an
+    /// export in a training job is retrieved, when `ollama` is on `PATH`.
+    pub ollama_name: Option<String>,
+}
+
+impl Default for Export {
+    fn default() -> Self {
+        Self {
+            after_training: false,
+            quantize: default_quantize(),
+            ollama_name: None,
+        }
+    }
+}
+
+fn default_quantize() -> String {
+    DEFAULT_QUANTIZE.to_string()
+}
+
+/// A part of an Ollama model name, as Ollama's `types/model/name.go` tells
+/// them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OllamaPart {
+    Host,
+    Namespace,
+    Model,
+    Tag,
+}
+
+/// Whether `text` is a valid `kind` part of an Ollama model name, by
+/// `isValidPart` of Ollama's `types/model/name.go`: 1 to 80 characters (350
+/// for a host), the first an ASCII letter, digit or `_`, the others also `-`,
+/// `.` (not in a namespace) or `:` (in a host only).
+fn ollama_part(kind: OllamaPart, text: &str) -> bool {
+    let max = if kind == OllamaPart::Host { 350 } else { 80 };
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    (1..=max).contains(&text.len())
+        && text.starts_with(word)
+        && text.chars().all(|c| {
+            word(c)
+                || c == '-'
+                || (c == '.' && kind != OllamaPart::Namespace)
+                || (c == ':' && kind == OllamaPart::Host)
+        })
+}
+
+/// Whether `name` is a valid Ollama model name, `[host/][namespace/]model[:tag]`,
+/// split and checked as Ollama's `types/model/name.go` does: the tag after
+/// the last `:` when it comes after the last `/`, the model after the last
+/// `/`, then the namespace, then the host (an optional `scheme://` before it
+/// is dropped). Each part present must be valid (see `ollama_part`): an
+/// empty one, such as in `a//b` or `a/`, is refused. Such a name is also
+/// safe on a command line.
+#[must_use]
+pub fn is_ollama_name(name: &str) -> bool {
+    let (rest, tag) = match (name.rfind(':'), name.rfind('/')) {
+        (Some(colon), slash) if slash.is_none_or(|slash| colon > slash) => {
+            (&name[..colon], Some(&name[colon + 1..]))
+        },
+        _ => (name, None),
+    };
+    let (rest, model) = match rest.rsplit_once('/') {
+        Some((rest, model)) => (Some(rest), model),
+        None => (None, rest),
+    };
+    let (host, namespace) = match rest.map(|rest| rest.rsplit_once('/')) {
+        None => (None, None),
+        Some(None) => (None, rest),
+        Some(Some((host, namespace))) => (Some(host), Some(namespace)),
+    };
+    let host = host.map(|host| host.split_once("://").map_or(host, |(_, host)| host));
+    ollama_part(OllamaPart::Model, model)
+        && tag.is_none_or(|tag| ollama_part(OllamaPart::Tag, tag))
+        && namespace.is_none_or(|namespace| ollama_part(OllamaPart::Namespace, namespace))
+        && host.is_none_or(|host| ollama_part(OllamaPart::Host, host))
 }
 
 /// The Prometheus endpoint.

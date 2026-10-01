@@ -92,6 +92,11 @@ runtime = "docker"             # native | docker
 # network_volume_id = "..."    # mounted at /workspace/data; needs exactly one data_center_ids entry, not "auto"
 # max_volume_gb = 200          # grow the network volume up to this size in GB when the run fills it (permanent, billed monthly)
 
+# [export]                     # GGUF for llama.cpp and Ollama: `overbrainer export <run-id>`, or at the end of training
+# after_training = false       # export in the training job, after the merge
+# quantize = "Q4_K_M"          # Q4_K_M | Q4_K_S | Q5_K_M | Q5_K_S | Q6_K | Q8_0 | Q3_K_M | Q2_K | F16 | BF16
+# ollama_name = "rust-mentor"  # `ollama create` this model once an export in a training job is retrieved
+
 # [metrics]
 # listen = "127.0.0.1:9464"    # serve Prometheus metrics at /metrics while a command holds the project; no authentication
 --- .env

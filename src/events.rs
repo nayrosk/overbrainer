@@ -143,6 +143,9 @@ pub enum Event {
     RunWatched {
         /// ID of the run.
         run_id: String,
+        /// Whether the job is an export (`run_id` is then the export's ID),
+        /// not a training job.
+        export: bool,
     },
     /// A training or evaluation log of the running job.
     Metric(TrainMetric),

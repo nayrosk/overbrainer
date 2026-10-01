@@ -101,7 +101,14 @@ async fn train(
             vram_floor: args.vram_floor,
             trainer: &trainer,
         };
-        return super::runpod_train::train(project_dir, settings, start, front).await;
+        // Boxed: the Runpod flow would otherwise weigh on every caller's future.
+        return Box::pin(super::runpod_train::train(
+            project_dir,
+            settings,
+            start,
+            front,
+        ))
+        .await;
     }
     if keep_pod {
         bail!("--keep-pod only applies to a runpod target");
@@ -122,6 +129,7 @@ async fn train(
     .await?;
     let record = create_on(&runs, &executor, &settings.project.name, name).await?;
     let record = resumed(&runs, record, &trainer)?;
+    let trainer = exporting(&trainer, &record.id, &settings.export);
     started(&record);
     front.run_created(&record.id);
     let id = record.id.clone();
@@ -154,7 +162,27 @@ async fn train(
         },
     };
     guard.close().await;
-    finish(&runs, &id, result, front)
+    finish(
+        &runs,
+        &id,
+        result,
+        front,
+        settings.export.ollama_name.as_deref(),
+    )
+}
+
+/// `trainer` for the new run `run_id`, exporting its model at the end of its
+/// job when `[export] after_training` is set.
+pub(super) fn exporting<'a>(
+    trainer: &Axolotl<'a>,
+    run_id: &str,
+    export: &crate::config::Export,
+) -> Axolotl<'a> {
+    if export.after_training {
+        trainer.clone().exporting(run_id, &export.quantize)
+    } else {
+        trainer.clone()
+    }
 }
 
 async fn attach(
@@ -186,7 +214,13 @@ async fn attach(
     };
     let result = front.interrupt().race(flow).await.transpose();
     guard.close().await;
-    finish(&runs, run_id, result, front)
+    finish(
+        &runs,
+        run_id,
+        result,
+        front,
+        settings.export.ollama_name.as_deref(),
+    )
 }
 
 /// Follows `record` as [`watch`] does. A snapshot request written on the
@@ -314,7 +348,13 @@ async fn stop(
     };
     let result = front.interrupt().race(flow).await.transpose();
     guard.close().await;
-    finish(&runs, run_id, result, front)
+    finish(
+        &runs,
+        run_id,
+        result,
+        front,
+        settings.export.ollama_name.as_deref(),
+    )
 }
 
 /// `train stop` while another overbrainer process, `holder`, holds the project,
@@ -547,7 +587,17 @@ pub(crate) async fn hf_token(
         .context("cannot resolve hf_token")
 }
 
-async fn executor(project_dir: &Path, name: &str, target: &Target) -> anyhow::Result<AnyExecutor> {
+/// The executor of the local or SSH target `name`.
+///
+/// # Errors
+///
+/// Returns an error for a Runpod target, an SSH target without a host, or
+/// one that cannot be reached.
+pub(super) async fn executor(
+    project_dir: &Path,
+    name: &str,
+    target: &Target,
+) -> anyhow::Result<AnyExecutor> {
     match target {
         Target::Local { .. } => Ok(AnyExecutor::Local(LocalExecutor::new(
             &project_dir.join(RUNS_DIR),
@@ -593,13 +643,15 @@ async fn run_executor(
 /// Emits the outcome through `front` (stdout on the command line), then, for a
 /// run that succeeded, where its model is, read from the run's own files (the
 /// settings may have changed since it started; nothing is said when they
-/// cannot be read), for a stopped one where its snapshot is and how to resume
-/// from it; or explains how to follow an interrupted run.
+/// cannot be read), and the GGUF of an export in its job with its Modelfile,
+/// creating the Ollama model `ollama`; for a stopped one where its snapshot is
+/// and how to resume from it; or explains how to follow an interrupted run.
 pub(super) fn finish(
     runs: &Runs,
     id: &str,
     result: anyhow::Result<Option<Outcome>>,
     front: &Frontend,
+    ollama: Option<&str>,
 ) -> anyhow::Result<()> {
     let Some(outcome) = result? else {
         return interrupted(runs, id);
@@ -625,6 +677,7 @@ pub(super) fn finish(
             for (what, path) in outputs.map(|o| o.paths(&record.id)).unwrap_or_default() {
                 front.line(&format!("train: {what} in {path}"));
             }
+            super::export::deliver_in_job(runs, record, ollama, front);
             Ok(())
         },
         RunState::Stopped => {

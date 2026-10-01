@@ -26,6 +26,65 @@ pub fn to_yaml(value: &Value) -> String {
     out
 }
 
+/// The value of the top-level key `key` of the YAML document `text` when it
+/// is a scalar on the key's own line: a key at the start of a line, so a
+/// nested one of the same name is never taken; double-quoted (with escapes),
+/// single-quoted (`''` for a quote) or plain, a plain one up to a ` #`
+/// comment. `None` when the key is absent, or its value is empty or not
+/// closed. Reads back what [`to_yaml`] writes, and a hand edit of it.
+#[must_use]
+pub fn top_level_scalar(text: &str, key: &str) -> Option<String> {
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))?
+        .trim();
+    if value.starts_with('"') {
+        double_quoted(value)
+    } else if let Some(rest) = value.strip_prefix('\'') {
+        single_quoted(rest)
+    } else {
+        let plain = value.find(" #").map_or(value, |at| &value[..at]).trim();
+        (!plain.is_empty() && !plain.starts_with('#')).then(|| plain.to_string())
+    }
+}
+
+/// The double-quoted scalar `value` starts with, unescaped as JSON when it
+/// can be, else as written between its quotes.
+fn double_quoted(value: &str) -> Option<String> {
+    let mut escaped = false;
+    for (at, c) in value.char_indices().skip(1) {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => {
+                let quoted = &value[..=at];
+                return serde_json::from_str(quoted)
+                    .ok()
+                    .or_else(|| Some(value[1..at].to_string()));
+            },
+            _ => {},
+        }
+    }
+    None
+}
+
+/// The single-quoted scalar `rest` (after its opening quote) starts with.
+fn single_quoted(rest: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            out.push(c);
+        } else if chars.peek() == Some(&'\'') {
+            chars.next();
+            out.push('\'');
+        } else {
+            return Some(out);
+        }
+    }
+    None
+}
+
 fn write_map(out: &mut String, map: &Map<String, Value>, indent: usize, inline_first: bool) {
     for (index, (key, value)) in map.iter().enumerate() {
         if index > 0 || !inline_first {
@@ -168,6 +227,42 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_top_level_scalar_is_read_back_quoted_plain_or_commented() {
+        let yaml = to_yaml(&json!({
+            "base_model": "Qwen/Qwen3-0.6B",
+            "sequence_len": 2048,
+            "nested": {"base_model": "other"},
+        }));
+        assert_eq!(
+            top_level_scalar(&yaml, "base_model").as_deref(),
+            Some("Qwen/Qwen3-0.6B")
+        );
+        assert_eq!(
+            top_level_scalar(&yaml, "sequence_len").as_deref(),
+            Some("2048")
+        );
+        for (text, expected) in [
+            ("base_model: Qwen/Qwen3-4B  # note\n", Some("Qwen/Qwen3-4B")),
+            ("base_model: 'it''s/model' # note\n", Some("it's/model")),
+            (
+                "base_model: \"a \\\"b\\\" #c\" # note\n",
+                Some("a \"b\" #c"),
+            ),
+            ("  base_model: nested\nbase_model: top\n", Some("top")),
+            ("base_model_config: x\n", None),
+            ("base_model: # nothing\n", None),
+            ("base_model: 'open\n", None),
+            ("base_model:\n", None),
+        ] {
+            assert_eq!(
+                top_level_scalar(text, "base_model").as_deref(),
+                expected,
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn mappings_and_sequences_are_block_style() {

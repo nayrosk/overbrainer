@@ -3,6 +3,7 @@
 mod complete;
 mod config_check;
 pub(crate) mod data;
+mod export;
 pub(crate) mod front;
 mod history;
 pub(crate) mod init;
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use clap::builder::PossibleValuesParser;
 use clap::{Args, Parser, Subcommand, ValueHint};
 use clap_complete::engine::ArgValueCandidates;
 use secrecy::SecretString;
@@ -29,7 +31,7 @@ use tokio::task::JoinHandle;
 
 use self::front::Frontend;
 use self::reload::Reloader;
-use crate::config::{DotenvKeys, EnvSource, Source};
+use crate::config::{DotenvKeys, EnvSource, QUANTIZE_TYPES, Source};
 use crate::events::Observer;
 use crate::logging::{LOG_LINES, LogBuffer, LogMode};
 use crate::metrics::{Metrics, MetricsServer};
@@ -102,6 +104,13 @@ pub enum Command {
     /// following it but leaves it running: `overbrainer train attach <run-id>` follows
     /// it again, `overbrainer train cancel <run-id>` stops it.
     Train(TrainArgs),
+    /// Export the model of a finished run to GGUF, with an Ollama Modelfile.
+    ///
+    /// The export runs on the run's target (on Runpod, a new pod): the adapter
+    /// is merged into its base model unless the run merged it, converted with
+    /// llama.cpp and quantized, and the GGUF and its Modelfile land in
+    /// `runs/<run-id>/output/gguf/`. Ctrl-C cancels it.
+    Export(ExportArgs),
     /// Inspect training runs.
     Runs {
         /// The runs subcommand to run.
@@ -175,7 +184,8 @@ impl Command {
             | Self::Split(_)
             | Self::Run
             | Self::Migrate(_)
-            | Self::Train(_) => true,
+            | Self::Train(_)
+            | Self::Export(_) => true,
             Self::Pod { command } => matches!(command, PodCommand::Rm { .. }),
             Self::Init { .. }
             | Self::Config { .. }
@@ -191,9 +201,11 @@ impl Command {
 pub enum PodCommand {
     /// List the pods overbrainer created, with their run and what is known of it.
     Ls,
-    /// Delete every pod of a run, and wait until Runpod no longer shows them.
+    /// Delete every pod of a run, or of an export, and wait until Runpod no
+    /// longer shows them.
     Rm {
-        /// ID of the run, as shown by `overbrainer runs ls` or `overbrainer pod ls`.
+        /// ID of the run, as shown by `overbrainer runs ls` or `overbrainer pod
+        /// ls`, or of an export (`export_<date>-<time>`).
         #[arg(add = ArgValueCandidates::new(complete::run_ids))]
         run_id: String,
         /// Delete even when the run's job is still running (the run is then failed).
@@ -273,6 +285,39 @@ pub struct TrainArgs {
     /// uses what it showed.
     #[arg(skip)]
     pub vram_floor: crate::train::sizing::VramFloor,
+}
+
+/// Options of `overbrainer export`.
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// ID of the run, as shown by `overbrainer runs ls`.
+    #[arg(add = ArgValueCandidates::new(complete::run_ids))]
+    pub run_id: String,
+    /// llama-quantize type of the GGUF; F16 and BF16 keep 16-bit weights.
+    /// Defaults to `export.quantize`.
+    #[arg(long, value_name = "TYPE", value_parser = PossibleValuesParser::new(QUANTIZE_TYPES))]
+    pub quantize: Option<String>,
+    /// Create this Ollama model from the Modelfile once the GGUF is back, when
+    /// `ollama` is on PATH. Defaults to `export.ollama_name`.
+    #[arg(long, value_name = "NAME", value_parser = ollama_name)]
+    pub ollama: Option<String>,
+    /// Runpod target only: keep the export's pod once it ends, with no time
+    /// limit. Nothing deletes it then but `overbrainer pod rm <export-id>`.
+    #[arg(long)]
+    pub keep_pod: bool,
+}
+
+/// Parses an Ollama model name, as `--ollama` takes it.
+fn ollama_name(text: &str) -> Result<String, String> {
+    if crate::config::is_ollama_name(text) {
+        Ok(text.to_string())
+    } else {
+        Err(
+            "not an Ollama model name ([host/][namespace/]model[:tag], each part of letters, \
+             digits, '_', '-' and '.')"
+                .to_string(),
+        )
+    }
 }
 
 /// Subcommands of `overbrainer train`.
@@ -541,19 +586,12 @@ async fn dispatch(
             };
             stage(dir, &front, data::Command::Split, &args).await
         },
-        Command::Run => {
-            let mut reloader = Reloader::new(dir, dotenv);
-            let args = StageArgs::default();
-            let load = data::Load::Reload(&mut reloader);
-            data::run(dir, data::Command::Run, &args, &front, load).await?;
-            // Boxed, as below: the training flows would otherwise weigh on
-            // every command's future.
-            Box::pin(train::after_run(dir, &front, &mut reloader)).await
-        },
+        Command::Run => run_all(dir, &front, dotenv).await,
         Command::Train(args) => {
             let source = Source::from(EnvSource::Process);
             Box::pin(train::run(dir, &args, &front, &source)).await
         },
+        Command::Export(args) => Box::pin(export::run(dir, &args, &front)).await,
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
@@ -572,6 +610,18 @@ async fn dispatch(
             LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),
         },
     }
+}
+
+/// `overbrainer run`: every pipeline stage, then training when `[training]`
+/// is set, reloading the settings whose files changed between them.
+async fn run_all(dir: &Path, front: &Frontend, dotenv: DotenvKeys) -> anyhow::Result<()> {
+    let mut reloader = Reloader::new(dir, dotenv);
+    let args = StageArgs::default();
+    let load = data::Load::Reload(&mut reloader);
+    data::run(dir, data::Command::Run, &args, front, load).await?;
+    // Boxed: the training flows would otherwise weigh on every command's
+    // future.
+    Box::pin(train::after_run(dir, front, &mut reloader)).await
 }
 
 /// Runs a pipeline command on the command line, through `front`.
@@ -753,6 +803,35 @@ mod tests {
     }
 
     #[test]
+    fn export_takes_a_known_type_and_an_ollama_name() -> Result<(), clap::Error> {
+        let Command::Export(args) = command(&[
+            "export",
+            "r1",
+            "--quantize",
+            "Q8_0",
+            "--ollama",
+            "me/mentor:q8",
+            "--keep-pod",
+        ])?
+        else {
+            return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+        };
+        assert_eq!(args.run_id, "r1");
+        assert_eq!(args.quantize.as_deref(), Some("Q8_0"));
+        assert_eq!(args.ollama.as_deref(), Some("me/mentor:q8"));
+        assert!(args.keep_pod);
+        let Command::Export(defaults) = command(&["export", "r1"])? else {
+            return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+        };
+        assert_eq!((defaults.quantize, defaults.ollama), (None, None));
+        assert!(command(&["export", "r1", "--quantize", "Q4"]).is_err());
+        assert!(command(&["export", "r1", "--ollama", "bad name"]).is_err());
+        assert!(command(&["export", "r1", "--ollama", "a//b"]).is_err());
+        assert!(command(&["export"]).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn only_train_stop_names_a_stopped_run() -> Result<(), clap::Error> {
         let stopped = |args: &[&str]| -> Result<Option<String>, clap::Error> {
             let cli =
@@ -788,6 +867,7 @@ mod tests {
             &["train", "attach", "x"],
             &["train", "cancel", "x"],
             &["train", "stop", "x"],
+            &["export", "x"],
             &["pod", "rm", "x"],
             &["migrate"],
             &["migrate", "--dry-run"],

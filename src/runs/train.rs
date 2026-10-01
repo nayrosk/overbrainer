@@ -20,6 +20,11 @@ use crate::train::{SNAPSHOT_FILE, TrainError, Trainer};
 /// by the runs of that target so a base model is downloaded once.
 pub const HF_CACHE_DIR: &str = ".hf-cache";
 
+/// Cache of the tools a job downloads on the target (llama.cpp for an export),
+/// under the executor's work directory. Shared by the runs of that target, and
+/// on a network volume by its pods.
+pub const TOOLS_CACHE_DIR: &str = ".cache";
+
 /// Failures in a row to reach the target that a watch retries: the sixth one in a
 /// row gives up (the job keeps running and can be attached again). A success in the
 /// poll loop starts the count again; the drain that follows the job's end spends
@@ -260,10 +265,40 @@ pub async fn start<E: Executor, T: Trainer>(
     ctx: &RunCtx<'_, E>,
     trainer: &T,
     launch: Launch<'_>,
-    mut record: RunRecord,
+    record: RunRecord,
 ) -> Result<RunRecord, RunError> {
-    match launch_job(ctx, trainer, launch, &record).await {
-        Ok(job) => record_started(ctx, record, job).await,
+    start_in(ctx, trainer, launch, record, None).await
+}
+
+/// [`start`] for a job whose directory, `record.remote_dir`, lies inside the
+/// directory `mount` on the target, whose files the job reads too (an export
+/// reads its run's model): a container mounts `mount` instead of the job
+/// directory alone. The job still runs in, and writes its log, process ID and
+/// exit code to, its own directory.
+///
+/// # Errors
+///
+/// As [`start`]; [`RunError::Exec`] too when `record.remote_dir` is not inside
+/// `mount`.
+pub async fn start_mounted<E: Executor, T: Trainer>(
+    ctx: &RunCtx<'_, E>,
+    trainer: &T,
+    launch: Launch<'_>,
+    record: RunRecord,
+    mount: &str,
+) -> Result<RunRecord, RunError> {
+    start_in(ctx, trainer, launch, record, Some(mount)).await
+}
+
+async fn start_in<E: Executor, T: Trainer>(
+    ctx: &RunCtx<'_, E>,
+    trainer: &T,
+    launch: Launch<'_>,
+    mut record: RunRecord,
+    mount: Option<&str>,
+) -> Result<RunRecord, RunError> {
+    match launch_job(ctx, trainer, launch, &record, mount).await {
+        Ok(job) => record_started(ctx, record, job, trainer.stop_marker().is_some()).await,
         Err(error) => {
             record.state = RunState::Failed;
             record.message = Some(error.to_string());
@@ -281,11 +316,13 @@ async fn record_started<E: Executor>(
     ctx: &RunCtx<'_, E>,
     mut record: RunRecord,
     job: JobId,
+    snapshots: bool,
 ) -> Result<RunRecord, RunError> {
     record.job = Some(job.clone());
     record.state = RunState::Running;
-    // The job runs this version's metrics plugin, which reads snapshot requests.
-    record.snapshots = true;
+    // A job that can stop with a snapshot runs this version's metrics plugin,
+    // which reads snapshot requests.
+    record.snapshots = snapshots;
     let Err(error) = ctx.runs.save(&record) else {
         return Ok(record);
     };
@@ -306,9 +343,25 @@ async fn launch_job<E: Executor, T: Trainer>(
     trainer: &T,
     launch: Launch<'_>,
     record: &RunRecord,
+    mount: Option<&str>,
 ) -> Result<JobId, RunError> {
     let local = ctx.runs.run_dir(&record.id)?;
-    let root = launch.runtime.root(&record.remote_dir);
+    let (run_dir, root) = match mount {
+        None => (
+            record.remote_dir.as_str(),
+            launch.runtime.root(&record.remote_dir),
+        ),
+        Some(mount) => {
+            let inside = record
+                .remote_dir
+                .strip_prefix(mount)
+                .filter(|rest| rest.starts_with('/'))
+                .ok_or_else(|| {
+                    ExecError::Protocol(format!("{} is not inside {mount}", record.remote_dir))
+                })?;
+            (mount, format!("{}{inside}", launch.runtime.root(mount)))
+        },
+    };
     trainer.prepare(&local, &root)?;
     // A Runpod run's private SSH keys and pod record never leave this machine:
     // on a network volume, what the pod receives outlives the pod.
@@ -317,19 +370,29 @@ async fn launch_job<E: Executor, T: Trainer>(
         .upload(&local, &record.remote_dir, &local_only)
         .await?;
     let cache_dir = format!("{}/{HF_CACHE_DIR}", ctx.executor.workdir());
-    let job = launch.runtime.job(JobSpec {
+    let tools_dir = format!("{}/{TOOLS_CACHE_DIR}", ctx.executor.workdir());
+    // A mounted container starts in the mount, not in the job's directory:
+    // its stage events are written at their path as the job sees it.
+    let metrics = match mount {
+        None => trainer.metrics_file().to_string(),
+        Some(_) => format!("{root}/{}", trainer.metrics_file()),
+    };
+    let mut job = launch.runtime.job(JobSpec {
         run_id: &record.id,
-        run_dir: &record.remote_dir,
+        run_dir,
         cache_dir: &cache_dir,
         commands: &trainer.commands(),
         env: &trainer.env(&root),
         stop_marker: trainer.stop_marker(),
         stages: Some(Stages {
-            file: trainer.metrics_file(),
+            file: &metrics,
             names: &trainer.stages(),
         }),
         secrets: launch.secrets,
+        tools_dir: trainer.caches_tools().then_some(tools_dir.as_str()),
     });
+    // Mounted or not, the job's own files are in its own directory.
+    job.dir.clone_from(&record.remote_dir);
     Ok(ctx.executor.spawn(&job).await?)
 }
 
@@ -390,6 +453,7 @@ pub async fn watch<E: Executor, T: Trainer>(
     }
     ctx.bus.publish(Event::RunWatched {
         run_id: record.id.clone(),
+        export: ctx.runs.export_of().is_some(),
     });
     let metrics = format!("{}/{}", record.remote_dir, trainer.metrics_file());
     let mut stream = ctx.executor.tail(&metrics, 0);
@@ -402,7 +466,7 @@ pub async fn watch<E: Executor, T: Trainer>(
         status = follow(ctx, &job, &mut stream, &mut summary) => status?,
         never = sampler => match never {},
     };
-    let (state, message) = outcome(status, &summary, &record.id);
+    let (state, message) = outcome(status, &summary, &record.id, trainer.metrics_required());
     // A job cancelled once its proof was written (a stop whose job did not
     // end in time) saved its checkpoint all the same: it is stopped too.
     let (state, message, snapshot) = if matches!(state, RunState::Succeeded | RunState::Cancelled) {
@@ -813,10 +877,17 @@ fn unreachable_line(error: &ExecError, failures: u32) -> String {
 }
 
 /// The final state of a run whose job ended with `status`.
-fn outcome(status: JobStatus, summary: &MetricsSummary, id: &str) -> (RunState, Option<String>) {
+fn outcome(
+    status: JobStatus,
+    summary: &MetricsSummary,
+    id: &str,
+    metrics_required: bool,
+) -> (RunState, Option<String>) {
     let log = format!("see runs/{id}/{JOB_LOG}");
     match status {
-        JobStatus::Exited(0) if summary.lines > 0 => (RunState::Succeeded, None),
+        JobStatus::Exited(0) if summary.lines > 0 || !metrics_required => {
+            (RunState::Succeeded, None)
+        },
         JobStatus::Exited(0) => (
             RunState::Failed,
             Some(format!(
@@ -962,26 +1033,34 @@ mod tests {
     #[test]
     fn outcomes_follow_the_exit_code_and_the_metrics() {
         let mut summary = MetricsSummary::default();
-        let (state, message) = outcome(JobStatus::Exited(0), &summary, "r1");
+        let (state, message) = outcome(JobStatus::Exited(0), &summary, "r1", true);
         assert_eq!(state, RunState::Failed);
         assert!(message.is_some_and(|message| message.contains("plugin was not loaded")));
+        assert_eq!(
+            outcome(JobStatus::Exited(0), &summary, "r1", false),
+            (RunState::Succeeded, None),
+            "a job without metrics needs only its exit code"
+        );
         summary.add(r#"{"event": "begin", "time": 1}"#);
         assert_eq!(
-            outcome(JobStatus::Exited(0), &summary, "r1"),
+            outcome(JobStatus::Exited(0), &summary, "r1", true),
             (RunState::Succeeded, None)
         );
         assert_eq!(
-            outcome(JobStatus::Exited(2), &summary, "r1"),
+            outcome(JobStatus::Exited(2), &summary, "r1", true),
             (
                 RunState::Failed,
                 Some("the job exited with code 2 (see runs/r1/job.log)".to_string())
             )
         );
         assert_eq!(
-            outcome(JobStatus::Cancelled, &summary, "r1"),
+            outcome(JobStatus::Cancelled, &summary, "r1", true),
             (RunState::Cancelled, None)
         );
-        assert_eq!(outcome(JobStatus::Lost, &summary, "r1").0, RunState::Failed);
+        assert_eq!(
+            outcome(JobStatus::Lost, &summary, "r1", false).0,
+            RunState::Failed
+        );
     }
 
     #[test]
@@ -1043,6 +1122,8 @@ mod tests {
         puts: std::sync::Mutex<Vec<(String, String)>>,
         /// How reads of the snapshot request answer.
         request_reads: RequestReads,
+        /// Every job spawned.
+        spawned: std::sync::Mutex<Vec<JobCommand>>,
     }
 
     impl Fake {
@@ -1065,6 +1146,7 @@ mod tests {
                 polls: AtomicU32::new(0),
                 puts: std::sync::Mutex::new(Vec::new()),
                 request_reads: RequestReads::Answered,
+                spawned: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -1117,8 +1199,11 @@ mod tests {
 
         fn spawn(
             &self,
-            _job: &JobCommand,
+            command: &JobCommand,
         ) -> impl Future<Output = Result<JobId, ExecError>> + Send {
+            if let Ok(mut spawned) = self.spawned.lock() {
+                spawned.push(command.clone());
+            }
             ready(if self.spawn_fails {
                 Err(broken("spawn"))
             } else {
@@ -1299,6 +1384,10 @@ mod tests {
                 exclude: vec!["checkpoint-*".to_string()],
                 required: Some("output".to_string()),
             }
+        }
+
+        fn stop_marker(&self) -> Option<&'static str> {
+            Some(SNAPSHOT_FILE)
         }
     }
 
@@ -1660,24 +1749,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mounted_job_sees_its_parent_but_keeps_its_own_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path()).exports("r1")?;
+        let bus = EventBus::new();
+        let fake = Fake::new(JobStatus::Running);
+        let runtime = JobRuntime::Container {
+            engine: crate::config::Engine::Docker,
+            image: "img:1".into(),
+        };
+        let mount = format!("{}/r1", fake.workdir());
+        let created = create(&runs, "export", &format!("{mount}/exports"), "box")?;
+        let job_dir = created.remote_dir.clone();
+        let launch = Launch {
+            runtime: &runtime,
+            secrets: Vec::new(),
+        };
+        let started =
+            start_mounted(&ctx(&runs, &fake, &bus), &NoFiles, launch, created, &mount).await?;
+        assert_eq!(started.remote_dir, job_dir);
+        let spawned = fake.spawned.lock().map_err(|_| "poisoned")?.clone();
+        let [job] = spawned.as_slice() else {
+            return Err(format!("{spawned:?}").into());
+        };
+        assert_eq!(job.dir, job_dir);
+        assert!(
+            job.script
+                .contains(&format!("-v '{mount}:/workspace/run' ")),
+            "{}",
+            job.script
+        );
+        // Its stage events go to its own metrics file, as the container sees it.
+        let export = crate::export::ExportJob::in_place("r1", "Q8_0", "output", "x".into());
+        let created = create(&runs, "export", &format!("{mount}/exports"), "box")?;
+        let id = created.id.clone();
+        let launch = Launch {
+            runtime: &runtime,
+            secrets: Vec::new(),
+        };
+        start_mounted(&ctx(&runs, &fake, &bus), &export, launch, created, &mount).await?;
+        let spawned = fake.spawned.lock().map_err(|_| "poisoned")?.clone();
+        let script = &spawned.last().ok_or("not spawned")?.script;
+        let file = format!("/workspace/run/exports/{id}/metrics.jsonl");
+        assert!(script.contains(&file), "{script}");
+        assert!(script.contains("export"), "{script}");
+        let outside = create(&runs, "export", "/elsewhere", "box")?;
+        let launch = Launch {
+            runtime: &runtime,
+            secrets: Vec::new(),
+        };
+        let refused =
+            start_mounted(&ctx(&runs, &fake, &bus), &NoFiles, launch, outside, &mount).await;
+        assert!(matches!(refused, Err(RunError::Exec(_))), "{refused:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_started_run_is_recorded_as_able_to_snapshot()
     -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
         let bus = EventBus::new();
         let fake = Fake::new(JobStatus::Running);
-        let created = create(&runs, "demo", fake.workdir(), "box")?;
-        assert!(!created.snapshots, "no job yet");
-        let launch = Launch {
-            runtime: &JobRuntime::Native {
-                venv: None,
-                env_file: None,
-            },
+        let runtime = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        };
+        let launch = || Launch {
+            runtime: &runtime,
             secrets: Vec::new(),
         };
-        let started = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await?;
+        let created = create(&runs, "demo", fake.workdir(), "box")?;
+        assert!(!created.snapshots, "no job yet");
+        let started = start(&ctx(&runs, &fake, &bus), &WithOutput, launch(), created).await?;
         assert!(started.snapshots);
         assert!(runs.load(&started.id)?.snapshots);
+        // A job that never stops with a snapshot (an export) is never asked for one.
+        let created = create(&runs, "other", fake.workdir(), "box")?;
+        let started = start(&ctx(&runs, &fake, &bus), &NoFiles, launch(), created).await?;
+        assert!(!started.snapshots);
         Ok(())
     }
 

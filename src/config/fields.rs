@@ -5,7 +5,7 @@
 //! `training.axolotl_extra` are not listed: a form never writes them. Bounds mirror
 //! `validate.rs`, open or closed ends included; [`FieldKind::describe`] words them.
 
-use crate::config::ListOrAuto;
+use crate::config::{ListOrAuto, QUANTIZE_TYPES};
 
 /// A part of the configuration whose fields share one schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,8 @@ pub enum Section {
     Training,
     /// One `[targets.<name>]` table of the given kind.
     Target(TargetKind),
+    /// `[export]`.
+    Export,
     /// `[metrics]`.
     Metrics,
 }
@@ -671,6 +673,27 @@ const RUNPOD: &[FieldSpec] = &[
     ),
 ];
 
+const EXPORT: &[FieldSpec] = &[
+    spec(
+        "after_training",
+        BOOL,
+        true,
+        "Export the model to GGUF at the end of each training job (default false)",
+    ),
+    spec(
+        "quantize",
+        FieldKind::Choice(&QUANTIZE_TYPES),
+        true,
+        "llama-quantize type of the GGUF, F16 and BF16 unquantized (default Q4_K_M)",
+    ),
+    spec(
+        "ollama_name",
+        TEXT,
+        true,
+        "Ollama model created from an export in a training job, when ollama is on PATH",
+    ),
+];
+
 const METRICS: &[FieldSpec] = &[spec(
     "listen",
     TEXT,
@@ -691,6 +714,7 @@ pub fn for_section(section: Section) -> &'static [FieldSpec] {
         Section::Target(TargetKind::Local) => LOCAL,
         Section::Target(TargetKind::Ssh) => SSH,
         Section::Target(TargetKind::Runpod) => RUNPOD,
+        Section::Export => EXPORT,
         Section::Metrics => METRICS,
     }
 }
@@ -750,6 +774,8 @@ kind = "runpod"
 gpu_types = ["NVIDIA A40"]
 max_hours = 6
 #ZZ runpod
+[export]
+#ZZ export
 [metrics]
 #ZZ metrics
 "#;
@@ -765,7 +791,7 @@ max_hours = 6
         ("training", "axolotl_extra"),
     ];
 
-    const SECTIONS: [(&str, Section); 10] = [
+    const SECTIONS: [(&str, Section); 11] = [
         ("project", Section::Project),
         ("topic", Section::Topic),
         ("provider", Section::Provider),
@@ -775,6 +801,7 @@ max_hours = 6
         ("local", Section::Target(TargetKind::Local)),
         ("ssh", Section::Target(TargetKind::Ssh)),
         ("runpod", Section::Target(TargetKind::Runpod)),
+        ("export", Section::Export),
         ("metrics", Section::Metrics),
     ];
 
@@ -836,6 +863,7 @@ max_hours = 6
                 "pipeline",
                 "training",
                 "targets",
+                "export",
                 "metrics",
             ],
         ),

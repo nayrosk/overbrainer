@@ -12,7 +12,7 @@ use super::{GpuArgs, PodCommand};
 use crate::config::{DEFAULT_RUNPOD_BASE_URL, EnvSource, Settings};
 use crate::events::EventBus;
 use crate::runpod::{
-    GpuFilter, PodCtx, RunpodClient, Timing, data_center_table, gpu_table, pod_rows,
+    GpuFilter, PodCtx, PodError, RunpodClient, Timing, data_center_table, gpu_table, pod_rows,
     remove_run_pods, select_gpus, table, template_table, volume_table,
 };
 use crate::runs::Runs;
@@ -57,6 +57,11 @@ async fn with_pods(
     command: Pods<'_>,
 ) -> anyhow::Result<()> {
     let runs = Runs::new(project_dir);
+    // An export's pod is recorded with the export, inside its run.
+    let runs = match command {
+        Pods::Rm { run_id, .. } => runs.holding(run_id),
+        Pods::Ls => runs,
+    };
     let bus = EventBus::new();
     let renderer = tokio::spawn(super::progress::render(bus.subscribe()));
     let timing = Timing::standard();
@@ -143,7 +148,27 @@ async fn rm(ctx: &PodCtx<'_>, run_id: &str, force: bool) -> anyhow::Result<()> {
             .map_or_else(String::new, |spend| format!(", about ${spend:.2}"));
         println!("pod: {} deleted{after}{spend}", pod.pod_id);
     }
-    Ok(removal.result?)
+    match (removal.result, ctx.runs.export_of()) {
+        (Err(error), Some(run)) => Err(export_refusal(error, run_id, &run)),
+        (result, _) => Ok(result?),
+    }
+}
+
+/// The error of `pod rm` of the export `id` of run `run`: an export is not
+/// stopped with `train cancel`, but by interrupting `overbrainer export`, which
+/// cancels it.
+fn export_refusal(error: PodError, id: &str, run: &str) -> anyhow::Error {
+    match error {
+        PodError::RunStillRunning { kept, .. } => anyhow::anyhow!(
+            "export {id} of run {run} is still running{kept}; stop the `overbrainer export {run}` \
+             following it with Ctrl-C, which cancels it, or pass --force"
+        ),
+        PodError::StillStarting(_) => anyhow::anyhow!(
+            "export {id} of run {run} is still starting its pod; wait for it, or stop the \
+             `overbrainer export {run}` starting it with Ctrl-C, or use `pod rm {id} --force`"
+        ),
+        other => other.into(),
+    }
 }
 
 /// Runs `overbrainer pod gpus`: the Secure Cloud GPU types, filtered by
@@ -202,4 +227,24 @@ async fn templates(client: &RunpodClient) -> anyhow::Result<()> {
         println!("{line}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pod_rm_of_a_running_export_says_how_to_stop_it() {
+        let running = PodError::RunStillRunning {
+            run_id: "e1".into(),
+            kept: ": kept pod p1".into(),
+        };
+        assert_eq!(
+            export_refusal(running, "e1", "r1").to_string(),
+            "export e1 of run r1 is still running: kept pod p1; stop the `overbrainer export r1` \
+             following it with Ctrl-C, which cancels it, or pass --force"
+        );
+        let starting = export_refusal(PodError::StillStarting("e1".into()), "e1", "r1");
+        assert!(!starting.to_string().contains("train cancel"), "{starting}");
+    }
 }

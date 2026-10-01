@@ -17,7 +17,7 @@ pub use metrics::{
     SNAPSHOT_ENV, SNAPSHOT_FILE, SNAPSHOT_REQUEST, TrainMetric, parse_line,
 };
 pub use phase::{Phase, Phases};
-pub use yaml::to_yaml;
+pub use yaml::{to_yaml, top_level_scalar};
 
 /// Errors while preparing the files of a run.
 #[derive(Debug, thiserror::Error)]
@@ -106,5 +106,17 @@ pub trait Trainer {
     /// starts. Empty when the trainer writes no stage events.
     fn stages(&self) -> Vec<JobStage> {
         Vec::new()
+    }
+
+    /// Whether a job that exits 0 must also have written a metric line to
+    /// have succeeded: proof that a training job loaded its metrics plugin.
+    fn metrics_required(&self) -> bool {
+        true
+    }
+
+    /// Whether the job downloads tools it caches on the target, under the
+    /// work directory (see [`JobSpec::tools_dir`](crate::exec::JobSpec::tools_dir)).
+    fn caches_tools(&self) -> bool {
+        false
     }
 }

@@ -754,3 +754,157 @@ async fn the_sweep_deletes_the_secret_once_the_last_stray_is_gone() -> TestResul
     assert_eq!(harness.secrets.deleted(), [host_key_secret(ENDED)]);
     Ok(())
 }
+
+const EXPORT: &str = "export_20261001-120000";
+const GONE_EXPORT: &str = "export_20261001-130000";
+
+/// The export `id` of `RUN`, in `state`, whose `pod.json` (in the export's own
+/// directory) records `pod_id` in `pod_state`.
+fn export_recorded(
+    exports: &Runs,
+    id: &str,
+    state: RunState,
+    pod_id: &str,
+    pod_state: PodState,
+) -> TestResult {
+    exports.save(&RunRecord {
+        id: id.to_string(),
+        target: "gpu_cloud".into(),
+        created: "2026-10-01T12:00:00Z".into(),
+        remote_dir: format!("/workspace/overbrainer/{id}"),
+        job: None,
+        state,
+        message: None,
+        snapshot: None,
+        resumed_from: None,
+        snapshots: false,
+    })?;
+    let mut record = PodRecord::new(id, pod_state == PodState::Kept, 1, "ssh-ed25519 AAAA");
+    let remote: Pod = serde_json::from_value(pod(pod_id, Some(id)))?;
+    record.begin_attempt("NVIDIA A40", SystemTime::now(), 6.0);
+    record.created(&remote, AttemptResult::Created, SystemTime::now());
+    record.state = pod_state;
+    record.save(exports)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn export_pods_are_listed_with_their_export_and_removed_by_its_id() -> TestResult {
+    let harness = Harness::new(Account::default().with("x1", Some(EXPORT), true)).await?;
+    harness.recorded(RUN, RunState::Succeeded, "p1", PodState::Deleted)?;
+    let exports = harness.runs.exports(RUN)?;
+    export_recorded(
+        &exports,
+        EXPORT,
+        RunState::Succeeded,
+        "x1",
+        PodState::Running,
+    )?;
+    export_recorded(
+        &exports,
+        GONE_EXPORT,
+        RunState::Running,
+        "x2",
+        PodState::Running,
+    )?;
+    let rows = pod_rows(&harness.ctx()).await?;
+    let ended = find(&rows, "x1")?;
+    assert_eq!((ended.run.as_str(), ended.kind), (EXPORT, RowKind::Ended));
+    assert_eq!(
+        ended.note,
+        format!("export of run {RUN}: succeeded, not deleted")
+    );
+    assert_eq!(
+        orphan_warnings(&rows),
+        vec![format!(
+            "pod x1 (export of run {RUN}: succeeded, not deleted) is still on Runpod at \
+             $0.53/h: remove it with `overbrainer pod rm {EXPORT}`"
+        )]
+    );
+    // The unlisted export pod is confirmed gone in the export's own pod.json.
+    let gone = find(&rows, "x2")?;
+    assert_eq!((gone.run.as_str(), gone.kind), (GONE_EXPORT, RowKind::Gone));
+    let record = PodRecord::load(&exports, GONE_EXPORT)?.ok_or("no export pod.json")?;
+    assert_eq!(record.state, PodState::Deleted);
+    assert!(PodRecord::load(&harness.runs, GONE_EXPORT)?.is_none());
+
+    // `pod rm <export-id>` works on the export's own runs.
+    let found = harness.runs.find_export(EXPORT).ok_or("export not found")?;
+    let ctx = PodCtx {
+        runs: &found,
+        ..harness.ctx()
+    };
+    let removal = remove_run_pods(&ctx, EXPORT, false).await;
+    removal.result?;
+    assert_eq!(harness.deletes().await, ["x1"]);
+    let record = PodRecord::load(&exports, EXPORT)?.ok_or("no export pod.json")?;
+    assert_eq!(record.state, PodState::Deleted);
+    Ok(())
+}
+
+const SWEPT_EXPORT: &str = "export_20261001-140000";
+
+/// Each export pod's secret is named after its export and goes with it: once
+/// its pod is confirmed gone, by the startup sweep once the export ended
+/// without a pod, and by `pod rm <export-id>`; a listed pod keeps it, and the
+/// run's own secret is never touched by an export.
+#[tokio::test]
+async fn export_pod_secrets_follow_their_export() -> TestResult {
+    let account = Account::default()
+        .with("x1", Some(EXPORT), true)
+        .with("p1", Some(RUN), false);
+    let harness = Harness::new(account).await?;
+    harness.recorded(RUN, RunState::Running, "p1", PodState::Running)?;
+    let exports = harness.runs.exports(RUN)?;
+    export_recorded(
+        &exports,
+        EXPORT,
+        RunState::Succeeded,
+        "x1",
+        PodState::Running,
+    )?;
+    export_recorded(
+        &exports,
+        GONE_EXPORT,
+        RunState::Running,
+        "x2",
+        PodState::Running,
+    )?;
+    export_recorded(
+        &exports,
+        SWEPT_EXPORT,
+        RunState::Failed,
+        "x3",
+        PodState::Deleted,
+    )?;
+    for (id, owner) in [
+        ("k0", RUN),
+        ("k1", EXPORT),
+        ("k2", GONE_EXPORT),
+        ("k3", SWEPT_EXPORT),
+    ] {
+        harness.secrets.hold(id, &host_key_secret(owner));
+    }
+    // p1 is not listed but answers: the run keeps its secret.
+    pod_rows(&harness.ctx()).await?;
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(GONE_EXPORT)]);
+    let rows = listed_rows(&harness.ctx()).await?;
+    let warnings = sweep_host_keys(&harness.ctx(), &rows).await?;
+    assert_eq!(warnings, Vec::<String>::new());
+    assert_eq!(
+        harness.secrets.deleted(),
+        [host_key_secret(GONE_EXPORT), host_key_secret(SWEPT_EXPORT)]
+    );
+    let found = harness.runs.holding(EXPORT);
+    let ctx = PodCtx {
+        runs: &found,
+        ..harness.ctx()
+    };
+    remove_run_pods(&ctx, EXPORT, false).await.result?;
+    assert_eq!(
+        harness.secrets.names(),
+        [host_key_secret(RUN)],
+        "only the run's secret is left"
+    );
+    Ok(())
+}
