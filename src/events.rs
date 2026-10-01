@@ -11,7 +11,7 @@ use crate::llm::Usage;
 use crate::pricing::Price;
 use crate::runpod::PodStatus;
 use crate::system::SystemSample;
-use crate::train::TrainMetric;
+use crate::train::{Mark, TrainMetric};
 
 /// A pipeline stage.
 #[derive(
@@ -146,6 +146,9 @@ pub enum Event {
     },
     /// A training or evaluation log of the running job.
     Metric(TrainMetric),
+    /// A stage, evaluation or end line of the running job: what it does
+    /// besides training steps (see [`Phases`](crate::train::Phases)).
+    Mark(Mark),
     /// The training job is in a new state.
     JobStatus(JobStatus),
     /// The Runpod pod of a run changed.

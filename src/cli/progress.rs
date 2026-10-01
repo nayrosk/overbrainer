@@ -94,7 +94,10 @@ impl Progress {
             Event::JobStatus(status) => job(*status),
             Event::PodStatus(status) => tracing::info!("pod: {}", pod_line(status)),
             // Only the metrics and the TUI use them.
-            Event::StageModel { .. } | Event::RunWatched { .. } | Event::System(_) => {},
+            Event::StageModel { .. }
+            | Event::RunWatched { .. }
+            | Event::System(_)
+            | Event::Mark(_) => {},
         }
     }
 

@@ -344,6 +344,7 @@ impl Metrics {
             },
             Event::ItemDone { .. }
             | Event::ItemFailed { .. }
+            | Event::Mark(_)
             | Event::JobStatus(_)
             | Event::PodStatus(_) => {},
         }

@@ -71,6 +71,88 @@ pub enum MetricLine {
     },
     /// A training or evaluation log.
     Log(TrainMetric),
+    /// The job starts one of its commands; written by the job itself, not the
+    /// plugin (see [`stage_command`](crate::exec::stage_command)).
+    Stage {
+        /// Unix time, in seconds.
+        time: f64,
+        /// The command starting.
+        name: JobStage,
+    },
+    /// An evaluation is under way: at most one line every 2 seconds.
+    Eval {
+        /// Unix time, in seconds.
+        time: f64,
+        /// Prediction steps done in this evaluation, from 1.
+        step: u64,
+        /// Prediction steps of the whole evaluation, when known.
+        #[serde(default)]
+        total: Option<u64>,
+    },
+    /// The training loop ended: what follows is the trainer's final work.
+    End {
+        /// Unix time, in seconds.
+        time: f64,
+        /// Optimizer steps done.
+        step: u64,
+    },
+}
+
+/// A command of a training job, as its stage event names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStage {
+    /// The training itself.
+    Train,
+    /// The merge of the adapter into the base model.
+    Merge,
+    /// The export of the model to GGUF.
+    Export,
+}
+
+impl JobStage {
+    /// The name its stage event carries.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Train => "train",
+            Self::Merge => "merge",
+            Self::Export => "export",
+        }
+    }
+}
+
+/// What a line other than a log says of the job's progress: the stage, the
+/// evaluation and the end lines, without their time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    /// A command starts.
+    Stage(JobStage),
+    /// Step `step` of an evaluation of `total` steps, when known.
+    Eval {
+        /// Prediction steps done.
+        step: u64,
+        /// Prediction steps of the whole evaluation, when known.
+        total: Option<u64>,
+    },
+    /// The training loop ended at `step`.
+    End {
+        /// Optimizer steps done.
+        step: u64,
+    },
+}
+
+impl MetricLine {
+    /// The mark of a stage, evaluation or end line; `None` for the others.
+    #[must_use]
+    pub const fn mark(&self) -> Option<Mark> {
+        match *self {
+            Self::Stage { name, .. } => Some(Mark::Stage(name)),
+            Self::Eval { step, total, .. } => Some(Mark::Eval { step, total }),
+            Self::End { step, .. } => Some(Mark::End { step }),
+            Self::Begin { .. } | Self::Log(_) => None,
+        }
+    }
 }
 
 /// The pace of a training, from its logs in order: steps per second between
@@ -213,8 +295,45 @@ mod tests {
     }
 
     #[test]
+    fn stage_eval_and_end_lines_parse_to_marks() -> Result<(), serde_json::Error> {
+        let marks = [
+            r#"{"event":"stage","name":"train","time":1700000000}"#,
+            r#"{"event":"stage","name":"merge","time":1700000000}"#,
+            r#"{"event":"stage","name":"export","time":1700000000}"#,
+            r#"{"event": "eval", "step": 340, "total": 1200, "time": 1.5}"#,
+            r#"{"event": "eval", "step": 3, "time": 1.5}"#,
+            r#"{"event": "end", "step": 7206, "time": 2.0}"#,
+        ]
+        .map(|line| parse_line(line).map(|line| line.mark()));
+        let marks: Vec<Option<Mark>> = marks.into_iter().collect::<Result<_, _>>()?;
+        assert_eq!(
+            marks,
+            [
+                Some(Mark::Stage(JobStage::Train)),
+                Some(Mark::Stage(JobStage::Merge)),
+                Some(Mark::Stage(JobStage::Export)),
+                Some(Mark::Eval {
+                    step: 340,
+                    total: Some(1200)
+                }),
+                Some(Mark::Eval {
+                    step: 3,
+                    total: None
+                }),
+                Some(Mark::End { step: 7206 }),
+            ]
+        );
+        assert_eq!(
+            parse_line(r#"{"event": "begin", "time": 1.0}"#)?.mark(),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
     fn other_lines_are_errors() {
         assert!(parse_line(r#"{"event": "other"}"#).is_err());
+        assert!(parse_line(r#"{"event": "stage", "name": "deploy", "time": 1}"#).is_err());
         assert!(parse_line("not json").is_err());
     }
 }

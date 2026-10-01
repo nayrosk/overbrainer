@@ -789,8 +789,8 @@ async fn poll<E: Executor>(
 
 fn publish(bus: &EventBus, lines: Vec<String>, summary: &mut MetricsSummary) {
     for line in lines {
-        if let Some(metric) = summary.add(&line) {
-            bus.publish(Event::Metric(metric));
+        if let Some(event) = summary.add(&line) {
+            bus.publish(event);
         }
     }
 }

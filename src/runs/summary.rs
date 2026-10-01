@@ -1,3 +1,4 @@
+use crate::events::Event;
 use crate::train::{MetricLine, TrainMetric, parse_line};
 
 /// What the metric lines of a run add up to.
@@ -5,7 +6,8 @@ use crate::train::{MetricLine, TrainMetric, parse_line};
 pub struct MetricsSummary {
     /// Whether the plugin wrote its start line, proof that it was loaded.
     pub begun: bool,
-    /// Metric lines read, start line included.
+    /// Lines the plugin wrote, start line included; the stage lines the job
+    /// writes itself are not counted.
     pub lines: usize,
     /// Lines that are not metric records, skipped.
     pub malformed: usize,
@@ -20,9 +22,10 @@ pub struct MetricsSummary {
 }
 
 impl MetricsSummary {
-    /// Adds one line of `metrics.jsonl`. Returns the metric it holds, if any; a
-    /// malformed line is counted and logged.
-    pub fn add(&mut self, line: &str) -> Option<TrainMetric> {
+    /// Adds one line of `metrics.jsonl`. Returns the event to publish for it, a
+    /// [`Event::Metric`] or an [`Event::Mark`], if any; a malformed line is
+    /// counted and logged.
+    pub fn add(&mut self, line: &str) -> Option<Event> {
         match parse_line(line) {
             Ok(MetricLine::Begin { max_steps, .. }) => {
                 self.begun = true;
@@ -40,7 +43,12 @@ impl MetricsSummary {
                 if metric.loss.is_some() {
                     self.last_train = Some(metric.clone());
                 }
-                Some(metric)
+                Some(Event::Metric(metric))
+            },
+            Ok(line @ MetricLine::Stage { .. }) => line.mark().map(Event::Mark),
+            Ok(line @ (MetricLine::Eval { .. } | MetricLine::End { .. })) => {
+                self.lines += 1;
+                line.mark().map(Event::Mark)
             },
             Err(error) => {
                 self.malformed += 1;
@@ -79,6 +87,7 @@ fn malformed(error: &serde_json::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::train::{JobStage, Mark};
 
     #[test]
     fn lines_add_up() {
@@ -87,7 +96,7 @@ mod tests {
         let metric = summary.add(
             r#"{"event": "log", "time": 2, "step": 4, "epoch": 0.4, "max_steps": 10, "loss": 1.5}"#,
         );
-        assert_eq!(metric.map(|metric| metric.step), Some(4));
+        assert!(matches!(metric, Some(Event::Metric(m)) if m.step == 4));
         summary.add(r#"{"event": "log", "time": 3, "step": 5, "eval_loss": 1.25}"#);
         summary.add("garbage");
         summary.add(r#"{"event": "log", "time": 4, "step": 10, "epoch": 1.0}"#);
@@ -99,5 +108,17 @@ mod tests {
             "step 10/10, epoch 0.40, loss 1.5000, eval_loss 1.2500"
         );
         assert_eq!(MetricsSummary::default().describe(), "step 0");
+    }
+
+    #[test]
+    fn stage_lines_are_marks_the_plugin_did_not_write() {
+        let mut summary = MetricsSummary::default();
+        let stage = summary.add(r#"{"event":"stage","name":"train","time":1700000000}"#);
+        assert_eq!(stage, Some(Event::Mark(Mark::Stage(JobStage::Train))));
+        // Without the plugin's own lines, the job wrote no metrics.
+        assert_eq!((summary.lines, summary.malformed), (0, 0));
+        let end = summary.add(r#"{"event":"end","time":2,"step":9}"#);
+        assert_eq!(end, Some(Event::Mark(Mark::End { step: 9 })));
+        assert_eq!(summary.lines, 1);
     }
 }

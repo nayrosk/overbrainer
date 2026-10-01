@@ -2,6 +2,7 @@
 
 mod axolotl;
 mod metrics;
+mod phase;
 pub mod sizing;
 mod yaml;
 
@@ -12,9 +13,10 @@ pub use axolotl::{
     reasoning_template_warning,
 };
 pub use metrics::{
-    METRICS_ENV, METRICS_PLUGIN, MetricLine, PLUGIN_CLASS, PLUGIN_FILE, Pace, SNAPSHOT_ENV,
-    SNAPSHOT_FILE, SNAPSHOT_REQUEST, TrainMetric, parse_line,
+    JobStage, METRICS_ENV, METRICS_PLUGIN, Mark, MetricLine, PLUGIN_CLASS, PLUGIN_FILE, Pace,
+    SNAPSHOT_ENV, SNAPSHOT_FILE, SNAPSHOT_REQUEST, TrainMetric, parse_line,
 };
+pub use phase::{Phase, Phases};
 pub use yaml::to_yaml;
 
 /// Errors while preparing the files of a run.
