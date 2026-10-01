@@ -354,7 +354,7 @@ impl Metrics {
                     self.stage_running(*stage).dec();
                 }
             },
-            Event::RunWatched { run_id } => {
+            Event::RunWatched { run_id, .. } => {
                 if let Some(series) = followed.system.take() {
                     self.system.remove(&series);
                 }
@@ -941,6 +941,7 @@ mod tests {
             2,
             &Event::RunWatched {
                 run_id: "20260928-100000-a1b2".into(),
+                export: false,
             },
         );
         metrics.event(2, &Event::Metric(metric(5, Some(1.5), None)));
@@ -970,7 +971,13 @@ mod tests {
                 &format!("overbrainer_train_phase{{run_id=\"{run}\",phase=\"{name}\"}}"),
             )
         };
-        metrics.event(4, &Event::RunWatched { run_id: run.into() });
+        metrics.event(
+            4,
+            &Event::RunWatched {
+                run_id: run.into(),
+                export: false,
+            },
+        );
         metrics.event(
             4,
             &Event::Metric(TrainMetric {
@@ -1053,6 +1060,7 @@ mod tests {
             1,
             &Event::RunWatched {
                 run_id: run_id.into(),
+                export: false,
             },
         );
         metrics.event(1, &Event::Metric(metric(5, Some(1.5), None)));
