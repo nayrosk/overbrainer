@@ -9,12 +9,13 @@
 | `overbrainer train attach RUN_ID` | Follow a run again, then retrieve its results. |
 | `overbrainer train stop RUN_ID` | Stop the job of a run with a snapshot, then retrieve it with the results. |
 | `overbrainer train cancel RUN_ID` | Stop the job of a run and retrieve its artifacts. |
+| `overbrainer export RUN_ID [--quantize TYPE] [--ollama NAME] [--keep-pod]` | Export the model of a succeeded or stopped run to GGUF, with an Ollama Modelfile (see [Export to GGUF and Ollama](#export-to-gguf-and-ollama)). |
 | `overbrainer runs ls` | List the runs: ID, state, target, creation time, the step of a stopped run's snapshot (`step N (reason): partial model in output/`), and the pod of a Runpod run. |
 | `overbrainer runs logs RUN_ID [--tail N]` | Print the run's `job.log`. With `--pod [--source container\|system] [--follow]`, the logs of its Runpod pod instead (see [Runpod](runpod.md#pod-logs)). |
 | `overbrainer pod ls` | List the Runpod pods overbrainer created, with their run. |
 | `overbrainer pod rm RUN_ID [--force]` | Delete every pod of a run and wait until Runpod no longer shows them. |
 
-`train --keep-pod` and the `pod` commands only apply to Runpod targets, described in [Runpod](runpod.md).
+`train --keep-pod`, `export --keep-pod` and the `pod` commands only apply to Runpod targets, described in [Runpod](runpod.md).
 
 ## Runs
 
@@ -79,6 +80,54 @@ A resumed checkpoint only makes sense with the settings it was trained with. The
 `overbrainer train cancel` needs a `[training]` section, because cancelling a run also retrieves its artifacts, as a successful or failed run does. It accepts any run that started a job, whatever its recorded state. A run already recorded as ended prints `run RUN_ID already ended: STATE; stopping any job left on the target` and the cancel runs anyway, which stops a container that outlived its job. A job that had already ended is not signalled: cancel then reports what it found and tells you to run `overbrainer train attach RUN_ID` to collect it.
 
 A run already recorded as cancelled fails with `run RUN_ID already ended: cancelled`, and a run that never started a job fails with `run RUN_ID has not started`. Both exit non-zero without touching anything.
+
+## Export to GGUF and Ollama
+
+A run ends with a Hugging Face directory: the adapter in `output/`, or the model of a full fine-tune. To run it with llama.cpp or Ollama, overbrainer exports it to GGUF on the run's own target, where Axolotl, torch and transformers already are:
+
+1. Without `output/merged/` (a run with `merge = true` has it), the adapter is merged into its base model with `axolotl merge-lora`, in a scratch directory `export-work/`. A full fine-tune is converted as it is.
+2. llama.cpp's `convert_hf_to_gguf.py` converts it to a 16-bit GGUF (`--outtype auto`), which carries the tokenizer and the model's chat template (`tokenizer.chat_template`).
+3. `llama-quantize` quantizes it to the chosen type. `F16` and `BF16` skip this step: the conversion writes them directly.
+4. `export-work/` is removed, even when a step fails.
+
+The result is `runs/<run-id>/output/gguf/<run-id>-<TYPE>.gguf`, with a `Modelfile` beside it:
+
+```
+FROM ./rust_mentor_20261001-120000-Q4_K_M.gguf
+PARAMETER num_ctx 4096
+```
+
+`num_ctx` is the run's `sequence_len`, read from its own `axolotl.yaml`. The Modelfile has no `TEMPLATE`: Ollama takes the chat template from the GGUF. With `--ollama NAME` (or `export.ollama_name`) and `ollama` on `PATH`, overbrainer runs `ollama create NAME -f Modelfile` in that directory once the GGUF is back; without `ollama`, it warns and prints the command. Each export records `export.json` (`quantize`, `llama_cpp`, `file`, `sha256`, `size`, `created`) in its job directory. Older GGUF files of other types stay in `output/gguf/`; the Modelfile names the newest.
+
+There are two ways to export:
+
+- `[export] after_training = true` exports in the training job itself, after the merge, so `output/gguf/` comes back with the rest of `output/`. It is skipped like the merge when the job stops with a snapshot. The TUI shows the export as a stage of the job.
+- `overbrainer export RUN_ID` exports a run that ended: one `succeeded`, or one `stopped` with a snapshot (its partial model in `output/` when Axolotl saved one, else its checkpoint; the export is then of a partial model too). It takes the project lock like `train`. The job gets a directory of its own, `runs/<run-id>/exports/<export-id>/`, with its `run.json`, `job.log`, `metrics.jsonl` and `export.json`; the export ID is `export_<date>-<time>`. On a local or SSH target it runs there, reading the run's `output/` and `axolotl.yaml` where they are (two directories up); when the run directory on an SSH target no longer holds them, the local `output/` (never the checkpoints, but a stopped run's checkpoint when that is the model) and `axolotl.yaml` are uploaded first. On a Runpod target it runs on a new pod, with the target's GPU settings (see [Runpod](runpod.md#exports)). Ctrl-C cancels it: unlike a training job, an export is not left running.
+
+```
+export: export_20261001-121500: runs/rust_mentor_20261001-120000/output to GGUF Q8_0 on target `local`
+export: GGUF in runs/rust_mentor_20261001-120000/output/gguf/rust_mentor_20261001-120000-Q8_0.gguf (Q8_0, 639.4 MB), Modelfile beside it
+export: Ollama model mentor created: `ollama run mentor`
+```
+
+`[export]`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `after_training` | `false` | Export at the end of each training job, after the merge. |
+| `quantize` | `Q4_K_M` | `Q4_K_M`, `Q4_K_S`, `Q5_K_M`, `Q5_K_S`, `Q6_K`, `Q8_0`, `Q3_K_M`, `Q2_K`, `F16` or `BF16`. `--quantize` overrides it. |
+| `ollama_name` | none | Ollama model `ollama create` makes from the Modelfile, when `ollama` is on `PATH`. `--ollama` overrides it. |
+
+### llama.cpp
+
+The export uses one pinned llama.cpp release, `b11320`: the source tarball of the tag (for `convert_hf_to_gguf.py`, its `conversion/` package and `gguf-py/`) and the prebuilt binaries of the target's platform (for `llama-quantize` and its libraries): `ubuntu-x64` on Linux x86_64 (glibc 2.34 or newer), `ubuntu-arm64` on Linux aarch64 (glibc 2.38), `macos-arm64` on macOS with Apple silicon. Any other platform fails with a message naming it, unless the type is `F16` or `BF16`, which need no `llama-quantize`. The job downloads them, checks each against the SHA-256 overbrainer pins before extracting it, and caches them in `<workdir>/.cache/llama.cpp/b11320/` on the target (`runs/.cache/` for a local target), shared by the runs; on a Runpod network volume the cache outlives the pods. A container sees that cache at `/workspace/cache`. The conversion runs with `gguf-py` on `PYTHONPATH` and the target's own Python, which must have `torch`, `numpy`, `transformers` and `yaml` (the Axolotl images do); a missing one fails the export with its name.
+
+Bumping llama.cpp, in `src/export/llama_cpp.rs`:
+
+1. Set `TAG` to the new release tag.
+2. Take the `digest` of `llama-<tag>-bin-ubuntu-x64.tar.gz`, `-ubuntu-arm64` and `-macos-arm64` from `gh api repos/ggml-org/llama.cpp/releases/tags/<tag>`, and set the three `*_SHA256` constants.
+3. Download `https://github.com/ggml-org/llama.cpp/archive/refs/tags/<tag>.tar.gz`, run `sha256sum` on it, and set `SOURCE_SHA256`.
+4. Check that the archives still hold `llama.cpp-<tag>/convert_hf_to_gguf.py` and `llama-<tag>/llama-quantize`, then export a small run on a GPU target and load it in Ollama.
 
 ## Targets
 

@@ -94,18 +94,21 @@ Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.5
 | `overbrainer train stop RUN_ID` | Stop a run's job with a snapshot (a checkpoint), retrieve it and the results. |
 | `overbrainer train --resume-from RUN_ID` | Start a new run from the snapshot of a stopped run, with the same training settings. |
 | `overbrainer train cancel RUN_ID` | Stop a run's job and retrieve its artifacts. |
+| `overbrainer export RUN_ID [--quantize TYPE] [--ollama NAME]` | Export a succeeded (or stopped) run's model to `runs/RUN_ID/output/gguf/RUN_ID-TYPE.gguf` with an Ollama `Modelfile`, on the run's target; `--ollama NAME` also runs `ollama create`. |
 | `overbrainer runs ls` | List runs: ID, state, target, creation time, pod. |
 | `overbrainer runs logs RUN_ID [--pod] [--source container\|system] [--follow] [--tail N]` | Print a run's job log, or with `--pod` its Runpod pod's logs (kept in the run directory, secrets masked). |
 | `overbrainer history [--all]` | Totals per stage (runs, items, tokens, cost), or every execution. |
 | `overbrainer migrate [--dry-run]` | Bring a project from before 0.4.0 up to date, once; `--dry-run` only lists the changes. |
 | `overbrainer pod ls` | List the Runpod pods overbrainer created. |
-| `overbrainer pod rm RUN_ID` | Delete the pods of a run. |
+| `overbrainer pod rm RUN_ID` | Delete the pods of a run, or of an export (`export_...`). |
 | `overbrainer pod gpus` | List Runpod's Secure Cloud GPU types, cheapest first, with price, VRAM and stock. |
 | `overbrainer pod datacenters` | List Runpod's data centers with how many GPU types are in stock there. |
 | `overbrainer pod volumes` | List the account's network volumes. |
 | `overbrainer pod templates` | List the account's pod templates. |
 
 The job runs detached. Ctrl-C, a closed terminal or a lost connection only stop following it; the training goes on. `train` then exits non-zero and prints the `overbrainer train attach RUN_ID` command to use. That does not mean the run failed. A run ends as `succeeded`, `failed`, `cancelled` or `stopped` (stopped with a snapshot: `train --resume-from RUN_ID` goes on from it; prefer `train stop` to `train cancel` when the steps done so far are worth keeping). Its files are in `runs/RUN_ID/`: `job.log` (the job's output, read it when a run fails), `metrics.jsonl`, and `output/` with the LoRA adapter (or the full model, and `output/merged/` with `merge = true`). After a run that succeeded, `train` and `run` print these paths on lines such as `train: adapter in runs/RUN_ID/output`. The `output/` of a stopped run holds a partial model, from the snapshot's step: never use it as a finished one; resume the run instead. Reaching the last step does not end a run: lines such as `train: finalizing (evaluation 340/1200)`, `train: finalizing (saving model)`, `train: merging adapter` and `train: retrieving results` mean the job is still working, and on Runpod the pod still bills; keep following it until the final summary.
+
+To get a model Ollama or llama.cpp can run, export it: `overbrainer export RUN_ID` (default `Q4_K_M`, or `--quantize Q8_0`, `F16`...), or set `[export] after_training = true` so every training job exports at its end. The GGUF and its `Modelfile` land in `runs/RUN_ID/output/gguf/`; `ollama create NAME -f Modelfile` there loads it (overbrainer runs it with `--ollama NAME` or `export.ollama_name`). Ctrl-C cancels an export.
 
 Once `train` has stopped following a run, only `overbrainer train attach RUN_ID` retrieves its results. On Runpod, the watchdog deletes the pod `retrieve_grace_minutes` (60 by default) after the job ends if its results were not retrieved, and the results are lost with it. Attach well before that.
 
