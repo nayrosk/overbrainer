@@ -417,7 +417,11 @@ const CHILD_RUN_DIR: &str = "OB_EXEC_LOCAL_CHILD_RUN_DIR";
 fn private_parent_variables_do_not_reach_a_job() -> TestResult {
     let root = tempfile::tempdir()?;
     let output = Command::new(std::env::current_exe()?)
-        .args(["--exact", "private_parent_variables_child", "--nocapture"])
+        .args([
+            "--exact",
+            "exec_local::private_parent_variables_child",
+            "--nocapture",
+        ])
         .env(CHILD_RUN_DIR, root.path())
         .env("OVERBRAINER_TEST_LEAK", "leak-one")
         .env("VAULT_TOKEN", "leak-two")

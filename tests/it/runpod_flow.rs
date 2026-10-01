@@ -2,7 +2,7 @@
 //! standing in for the pod: a failed or interrupted provisioning fails the run,
 //! the client-side deadline deletes a pod still there, and a watch that loses a
 //! deleted pod fails the run. Ending a pod over SSH is covered in
-//! `tests/runpod_ssh.rs`.
+//! `tests/it/runpod_ssh.rs`.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -27,9 +27,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-mod common;
-
-use common::SecretStore;
+use crate::common::SecretStore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

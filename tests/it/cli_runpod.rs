@@ -1,6 +1,6 @@
 //! `overbrainer train`, `train attach` and `train cancel` on a Runpod target,
 //! against a local stub of the Runpod API. A full run on a pod is not covered
-//! here: it needs an sshd (see `tests/runpod_ssh.rs`) and, for real, a paid pod.
+//! here: it needs an sshd (see `tests/it/runpod_ssh.rs`) and, for real, a paid pod.
 
 use std::path::Path;
 use std::process::{Output, Stdio};
@@ -15,9 +15,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-mod common;
-
-use common::SecretStore;
+use crate::common::SecretStore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -304,7 +302,7 @@ async fn attaching_a_run_whose_pod_outlived_max_hours_says_so() -> TestResult {
 }
 
 /// A pod recorded deleted is never looked up again: finding a pod gone (three
-/// 404s in a row and a list without it) is covered by `tests/runpod_flow.rs`.
+/// 404s in a row and a list without it) is covered by `tests/it/runpod_flow.rs`.
 #[tokio::test]
 async fn a_run_whose_pod_is_gone_has_nothing_to_cancel_and_fails_on_attach() -> TestResult {
     let server = MockServer::start().await;

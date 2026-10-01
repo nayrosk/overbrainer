@@ -20,9 +20,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-mod common;
-
-use common::SecretStore;
+use crate::common::SecretStore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

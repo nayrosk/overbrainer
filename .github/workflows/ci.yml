@@ -121,7 +121,7 @@ jobs:
       - name: Test the SSH executor and Runpod pod access against the sshd
         env:
           OVERBRAINER_TEST_SSH_HOST: overbrainer-test
-        run: cargo test --locked --test exec_ssh --test runpod_ssh
+        run: 'cargo test --locked --test it -- exec_ssh:: runpod_ssh::'
 
   doc:
     runs-on: ubuntu-latest

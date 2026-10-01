@@ -30,9 +30,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-mod common;
-
-use common::SecretStore;
+use crate::common::SecretStore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

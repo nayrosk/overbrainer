@@ -1,5 +1,4 @@
 //! Helpers shared by the Runpod test files. Each file uses only some of them.
-#![allow(dead_code)]
 
 use std::sync::{Arc, Mutex, PoisonError};
 
