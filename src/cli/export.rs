@@ -196,14 +196,11 @@ async fn on_target(
         .shield(async {
             let local_run = runs.run_dir(&run.id)?;
             let stage = exports.run_dir(&id)?.join(".upload");
-            if let Err(error) = upload_missing(&executor, run, plan.model, &local_run, &stage).await
-            {
-                fail(&exports, record, &error);
-                return Err(error);
-            }
+            upload_missing(&executor, run, plan.model, &local_run, &stage).await?;
             Ok(start_mounted(&ctx, &job, launch, record, &run.remote_dir).await?)
         })
-        .await;
+        .await
+        .inspect_err(|error| fail(&exports, &id, error));
     let result = match started {
         Err(error) => Err(error),
         Ok(record) => {
@@ -258,14 +255,27 @@ pub(super) fn started_line(id: &str, plan: &Plan<'_>) -> String {
     )
 }
 
-/// Records the export `record` failed with `error`, best effort.
-fn fail(exports: &Runs, mut record: RunRecord, error: &anyhow::Error) {
+/// Records the export `id` of `exports` failed with `error`, which stopped it
+/// before its job was followed, best effort: whatever step failed (the
+/// upload, the start, or saving its record once the job was spawned), its
+/// record never stays `preparing` or `running`. A record already failed keeps
+/// its own message.
+fn fail(exports: &Runs, id: &str, error: &anyhow::Error) {
+    let mut record = match exports.load(id) {
+        Ok(record) if record.state == RunState::Failed => return,
+        Ok(record) => record,
+        Err(load_error) => {
+            warn(&format!(
+                "cannot record export {id} as failed: {load_error}"
+            ));
+            return;
+        },
+    };
     record.state = RunState::Failed;
     record.message = Some(format!("{error:#}"));
     if let Err(save_error) = exports.save(&record) {
         warn(&format!(
-            "cannot record export {} as failed: {save_error}",
-            record.id
+            "cannot record export {id} as failed: {save_error}"
         ));
     }
 }
@@ -333,7 +343,14 @@ pub(super) fn finish_export(
     let job_dir = format!("{RUNS_DIR}/{}/{EXPORTS_DIR}/{id}", run.id);
     match record.state {
         RunState::Succeeded => {
-            let delivered = deliver(&runs.run_dir(&run.id)?, &exports.run_dir(id)?, file)?;
+            let delivered = match deliver(&runs.run_dir(&run.id)?, &exports.run_dir(id)?, file) {
+                Ok(delivered) => delivered,
+                Err(error) => {
+                    // The model staged for the job is of no use any more.
+                    discard(runs, exports, &run.id, id);
+                    return Err(error.into());
+                },
+            };
             report_delivered(&delivered, &run.id, plan.ollama, front, "export");
             Ok(())
         },
@@ -544,6 +561,72 @@ mod tests {
         // Present now: nothing is uploaded again.
         std::fs::remove_file(local.path().join("axolotl.yaml"))?;
         upload_missing(&executor, &run, "output", local.path(), &stage).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_start_that_fails_records_the_export_failed_once() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let project = tempfile::tempdir()?;
+        let exports = Runs::new(project.path()).exports("r1")?;
+        let mut running = crate::runs::create(&exports, EXPORT_PREFIX, "/w/r1/exports", "box")?;
+        running.state = RunState::Running;
+        exports.save(&running)?;
+        fail(
+            &exports,
+            &running.id,
+            &anyhow::anyhow!("cannot save run.json"),
+        );
+        let failed = exports.load(&running.id)?;
+        assert_eq!(failed.state, RunState::Failed);
+        assert_eq!(failed.message.as_deref(), Some("cannot save run.json"));
+        fail(&exports, &running.id, &anyhow::anyhow!("a later error"));
+        assert_eq!(
+            exports.load(&running.id)?.message.as_deref(),
+            Some("cannot save run.json"),
+            "the first reason is kept"
+        );
+        fail(&exports, "export_missing", &anyhow::anyhow!("no record"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_delivery_that_fails_still_removes_what_was_staged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let exports = runs.exports("r1")?;
+        let mut done = crate::runs::create(&exports, EXPORT_PREFIX, "/w/r1/exports", "box")?;
+        done.state = RunState::Succeeded;
+        exports.save(&done)?;
+        let job_dir = exports.run_dir(&done.id)?;
+        std::fs::create_dir_all(job_dir.join("output"))?;
+        std::fs::write(job_dir.join("output/adapter_model.safetensors"), "staged")?;
+        std::fs::write(job_dir.join("axolotl.yaml"), "staged")?;
+        let run = record(RunState::Succeeded);
+        let plan = Plan {
+            run: &run,
+            model: "output",
+            quantize: "Q4_K_M",
+            ollama: None,
+        };
+        let delivery = Delivery {
+            runs: &runs,
+            exports: &exports,
+            plan: &plan,
+            file: "r1-Q4_K_M.gguf",
+        };
+        let outcome = Outcome {
+            record: done,
+            summary: crate::runs::MetricsSummary::default(),
+            retrieved: true,
+        };
+        let error = finish_export(&delivery, &outcome, &Frontend::Cli(None))
+            .err()
+            .ok_or("delivered without a GGUF")?;
+        assert!(error.to_string().contains("left no GGUF file"), "{error}");
+        assert!(!job_dir.join("output").exists());
+        assert!(!job_dir.join("axolotl.yaml").exists());
         Ok(())
     }
 
