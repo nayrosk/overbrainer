@@ -1109,6 +1109,14 @@ mod tests {
             if path.ends_with(SNAPSHOT_FILE) {
                 return ready(Ok(self.proof.clone().into_bytes()));
             }
+            if path.ends_with(crate::train::SNAPSHOT_REQUEST) {
+                let request = self.puts.lock().ok().and_then(|puts| {
+                    puts.iter()
+                        .rfind(|(put, _)| put == path)
+                        .map(|(_, content)| content.clone().into_bytes())
+                });
+                return ready(Ok(request.unwrap_or_default()));
+            }
             let read = self.reads.fetch_add(1, Ordering::SeqCst);
             let start = usize::try_from(offset).unwrap_or(self.metrics.len());
             let mut bytes = self
@@ -2261,6 +2269,43 @@ mod tests {
                 fake.cancels.load(Ordering::SeqCst),
                 cancels,
                 "{proof:?} {status:?} {lasts}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_follow_cancels_a_job_only_from_a_request_it_sees()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::runs::{SnapshotReason, StopLimits, with_request_watch};
+        let job = job()?;
+        let request = format!("{}/{}", job.dir, crate::train::SNAPSHOT_REQUEST);
+        let limits = StopLimits {
+            proof: Duration::from_secs(100),
+            end: Duration::from_secs(50),
+        };
+        let every = Duration::from_secs(10);
+        // (when the request is written, how long the flow takes, cancels): no
+        // request cancels nothing; the limits count from the request seen, not
+        // from the start of the follow.
+        for (written, lasts, cancels) in [(None, 500, 0), (Some(80), 150, 0), (Some(80), 250, 1)] {
+            let fake = Fake::new(JobStatus::Running);
+            let flow = async {
+                if let Some(at) = written {
+                    tokio::time::sleep(Duration::from_secs(at)).await;
+                    fake.put_file(&request, SnapshotReason::Requested.name())
+                        .await?;
+                    tokio::time::sleep(Duration::from_secs(lasts - at)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_secs(lasts)).await;
+                }
+                Ok::<_, ExecError>(())
+            };
+            with_request_watch(&fake, &job, limits, every, flow).await?;
+            assert_eq!(
+                fake.cancels.load(Ordering::SeqCst),
+                cancels,
+                "{written:?} {lasts}"
             );
         }
         Ok(())

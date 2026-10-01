@@ -44,7 +44,7 @@ While another overbrainer process holds the project (`train`, `run`, `train atta
 train: run 20260922-143005-a1b2 stopped at step 1240 (requested): snapshot in runs/20260922-143005-a1b2/output/checkpoint-1240; resume with `overbrainer train --resume-from 20260922-143005-a1b2`
 ```
 
-A job that neither saves its snapshot nor ends within 30 minutes of the request is cancelled. One that saved it but has not ended 10 minutes later is cancelled too, and still recorded `stopped` with its snapshot. A request that lands after the last step changes nothing: the run succeeds as usual. Under distributed training, rank 0 reads the request and tells the other ranks, so they all stop at the same step.
+A job that neither saves its snapshot nor ends within 30 minutes of the request is cancelled. A process that follows a run without having asked for the snapshot (`train attach`, or the holder above) looks for a request every 30 seconds and applies the same limits from when it sees one. One that saved it but has not ended 10 minutes later is cancelled too, and still recorded `stopped` with its snapshot. A request that lands after the last step changes nothing: the run succeeds as usual. Under distributed training, rank 0 reads the request and tells the other ranks, so they all stop at the same step.
 
 `run.json` of a stopped run holds `snapshot`: `checkpoint`, `step` and `reason`, which is `requested` for `train stop` and the TUI, `deadline`, `cost` or `disk` for the automatic snapshots of a Runpod run (see [Runpod](runpod.md)).
 

@@ -214,6 +214,51 @@ pub async fn with_stop_fallback<E: Executor, F: Future>(
     flow.await
 }
 
+/// How often a follow that did not ask for a snapshot looks for a request
+/// someone else wrote: `train stop` from another process, the cost cap or the
+/// pod's watchdog.
+pub const REQUEST_POLL: Duration = Duration::from_secs(30);
+
+/// Runs `flow`, which follows the job `job`, and returns what it returns.
+/// Every `every`, it looks for a snapshot request in the job's run directory;
+/// once one is there, the job is handled as [`with_stop_fallback`] does, with
+/// `limits` counted from then. A job asked for no snapshot is never cancelled.
+pub async fn with_request_watch<E: Executor, F: Future>(
+    executor: &E,
+    job: &JobId,
+    limits: StopLimits,
+    every: Duration,
+    flow: F,
+) -> F::Output {
+    let mut flow = std::pin::pin!(flow);
+    let mut ticks = tokio::time::interval(every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut flow => return output,
+            _ = ticks.tick() => {},
+        }
+        if requested(executor, &job.dir).await {
+            break;
+        }
+    }
+    with_stop_fallback(executor, job, limits, flow).await
+}
+
+/// Whether a snapshot was asked of the job of `run_dir`: its request holds a
+/// reason. A failure to read it counts as no request and is only logged.
+async fn requested<E: Executor>(executor: &E, run_dir: &str) -> bool {
+    let path = format!("{run_dir}/{SNAPSHOT_REQUEST}");
+    match executor.read_from(&path, 0, 1).await {
+        Ok(content) => !content.is_empty(),
+        Err(error) => {
+            tracing::debug!("cannot look for a snapshot request: {error}");
+            false
+        },
+    }
+}
+
 /// Where a stop stands once `waited` passed: a job still running without a
 /// proof is cancelled, and said so; returns whether it wrote its proof and
 /// still runs, so it gets more time to end. A failure is only logged.

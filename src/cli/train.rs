@@ -13,11 +13,12 @@ use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
 use crate::config::{DEFAULT_WORKDIR, Settings, Source, Target, Training};
 use crate::dataset::DataFiles;
-use crate::exec::{AnyExecutor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
+use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
 use crate::runpod::{PodRecord, RunpodTarget, connect_followed};
 use crate::runs::{
-    Launch, Outcome, RUNS_DIR, RunCtx, RunRecord, RunState, Runs, STOP_LIMITS, SnapshotReason,
-    cancel, create_on, request_snapshot, start, watch, with_stop_fallback,
+    Launch, Outcome, REQUEST_POLL, RUNS_DIR, RunCtx, RunError, RunRecord, RunState, Runs,
+    STOP_LIMITS, SnapshotReason, cancel, create_on, request_snapshot, start, watch,
+    with_request_watch, with_stop_fallback,
 };
 use crate::train::{Axolotl, OUTPUT_DIR, Outputs, Resume, reasoning_template_warning};
 
@@ -145,7 +146,7 @@ async fn train(
         Ok(_) if interrupt.caught() => Ok(None),
         Ok(record) => {
             let flow = async {
-                watch(&ctx, &trainer, record)
+                watch_requests(&ctx, &trainer, record)
                     .await
                     .with_context(|| reattach(&id))
             };
@@ -179,13 +180,29 @@ async fn attach(
         poll: POLL,
     };
     let flow = async {
-        watch(&ctx, &trainer, record)
+        watch_requests(&ctx, &trainer, record)
             .await
             .with_context(|| reattach(run_id))
     };
     let result = front.interrupt().race(flow).await.transpose();
     guard.close().await;
     finish(&runs, run_id, result, front)
+}
+
+/// Follows `record` as [`watch`] does. A snapshot request written on the
+/// target meanwhile, by `train stop` from another process for instance, is
+/// then held to [`STOP_LIMITS`] as `train stop` holds its own.
+async fn watch_requests<E: Executor>(
+    ctx: &RunCtx<'_, E>,
+    trainer: &Axolotl<'_>,
+    record: RunRecord,
+) -> Result<Outcome, RunError> {
+    let Some(job) = record.job.clone() else {
+        return watch(ctx, trainer, record).await;
+    };
+    // Boxed: its state would otherwise weigh on every caller's future.
+    let watched = Box::pin(watch(ctx, trainer, record));
+    with_request_watch(ctx.executor, &job, STOP_LIMITS, REQUEST_POLL, watched).await
 }
 
 /// The trainer of a new run of `training`: resuming from the stopped run
