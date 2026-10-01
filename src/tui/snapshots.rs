@@ -422,6 +422,7 @@ pub(super) fn run(id: &str, target: &str, state: crate::runs::RunState) -> crate
         message: None,
         snapshot: None,
         resumed_from: None,
+        snapshots: true,
     }
 }
 

@@ -121,6 +121,7 @@ fn recorded_run(
         message: None,
         snapshot: None,
         resumed_from: None,
+        snapshots: true,
     })?;
     let mut pod = PodRecord::new(id, false, 1, "ssh-ed25519 AAAAhost");
     let remote: Pod =

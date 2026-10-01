@@ -1327,6 +1327,7 @@ mod tests {
             message: None,
             snapshot: None,
             resumed_from: None,
+            snapshots: true,
         }
     }
 

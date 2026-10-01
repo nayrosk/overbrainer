@@ -551,6 +551,41 @@ fn stop_while_train_follows_the_run_leaves_the_snapshot_to_it() -> TestResult {
 }
 
 #[test]
+fn stop_refuses_a_run_started_before_snapshots() -> TestResult {
+    let dir = project("snapshot")?;
+    let (run, output) = interrupt_train(dir.path(), &["running"], Duration::from_millis(100))?;
+    assert_detached(&run, &output)?;
+    let id = run_id(&run)?;
+    // `run.json` as overbrainer 0.4.1 wrote it: its job's plugin ignores a
+    // snapshot request.
+    let mut record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run.join("run.json"))?)?;
+    let fields = record.as_object_mut().ok_or("run.json is not an object")?;
+    assert_eq!(
+        fields.remove("snapshots"),
+        Some(serde_json::Value::Bool(true))
+    );
+    fs::write(run.join("run.json"), serde_json::to_vec_pretty(&record)?)?;
+
+    overbrainer(dir.path())?
+        .args(["train", "stop", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "run {id} was started by an overbrainer older than 0.5.0: its job cannot save a \
+             snapshot; cancel it with `overbrainer train cancel {id}`, or let it finish"
+        )));
+    assert!(!run.join("snapshot.request").exists());
+    assert!(fs::read_to_string(run.join("run.json"))?.contains("\"state\": \"running\""));
+    overbrainer(dir.path())?
+        .args(["train", "cancel", &id])
+        .assert()
+        .success()
+        .stdout(format!("train: run {id} cancelled\n"));
+    Ok(())
+}
+
+#[test]
 fn ctrl_c_detaches_and_cancel_stops_the_job() -> TestResult {
     let dir = project("slow")?;
     let (run, output) = interrupt_train(dir.path(), &["running"], Duration::from_millis(100))?;

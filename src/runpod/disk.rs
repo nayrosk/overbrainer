@@ -21,7 +21,7 @@ use tokio::sync::broadcast::error::RecvError;
 use super::RunpodClient;
 use crate::events::Event;
 use crate::exec::{Executor, quote};
-use crate::runs::{RunRecord, SnapshotReason, request_snapshot};
+use crate::runs::{RunError, RunRecord, SnapshotReason, request_snapshot};
 use crate::system::{self, Disk, SystemSample};
 use crate::train::{OUTPUT_DIR, SNAPSHOT_REQUEST};
 
@@ -255,6 +255,9 @@ pub struct DiskWatch<'a, E> {
     grow_window: Duration,
     /// Whether Runpod refused a grow: the volume is not grown again.
     cannot_grow: bool,
+    /// Whether it said the job cannot save a snapshot (an older overbrainer
+    /// started it): said once, as it only warns then.
+    said_no_snapshot: bool,
     /// Whether it does nothing more: the snapshot was asked for, or the disk
     /// cannot be measured.
     idle: bool,
@@ -284,6 +287,7 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
             growing: None,
             grow_window: GROW_WINDOW,
             cannot_grow: false,
+            said_no_snapshot: false,
             idle: false,
         }
     }
@@ -586,10 +590,22 @@ impl<'a, E: Executor> DiskWatch<'a, E> {
         }
     }
 
-    /// Stops the job with a snapshot for `why`, unless one was asked for
+    /// Stops the job with a snapshot for `why`. The job of a run an older
+    /// overbrainer started cannot save one: it is only warned about, once, and
+    /// keeps running.
+    async fn stop(&mut self, why: &str) {
+        if self.run.snapshots {
+            self.ask_snapshot(why).await;
+        } else if !self.said_no_snapshot {
+            self.said_no_snapshot = true;
+            tracing::warn!("{why}, but {}", RunError::NoSnapshots(self.run.id.clone()));
+        }
+    }
+
+    /// Asks the job for a snapshot for `why`, unless one was asked for
     /// already (its reason stays); tried again at the next sample when the
     /// request cannot be written.
-    async fn stop(&mut self, why: &str) {
+    async fn ask_snapshot(&mut self, why: &str) {
         let path = format!("{}/{SNAPSHOT_REQUEST}", self.run.remote_dir);
         let asked = self
             .executor

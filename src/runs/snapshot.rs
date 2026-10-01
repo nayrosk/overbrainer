@@ -148,8 +148,10 @@ pub async fn read_proof<E: Executor>(executor: &E, remote_dir: &str) -> Result<P
 /// # Errors
 ///
 /// Returns [`RunError::NotStarted`] for a run without a job,
-/// [`RunError::NotRunning`] for a run that already ended, and
-/// [`RunError::Exec`] when the request cannot be written.
+/// [`RunError::NotRunning`] for a run that already ended,
+/// [`RunError::NoSnapshots`] for a run whose job cannot save a snapshot (one
+/// an older overbrainer started), and [`RunError::Exec`] when the request
+/// cannot be written.
 pub async fn request_snapshot<E: Executor>(
     executor: &E,
     record: &RunRecord,
@@ -163,6 +165,9 @@ pub async fn request_snapshot<E: Executor>(
             record.id.clone(),
             record.state.name().to_string(),
         ));
+    }
+    if !record.snapshots {
+        return Err(RunError::NoSnapshots(record.id.clone()));
     }
     let path = format!("{}/{SNAPSHOT_REQUEST}", record.remote_dir);
     executor.put_file(&path, reason.name()).await?;
@@ -223,17 +228,22 @@ pub async fn with_stop_fallback<E: Executor, F: Future>(
 /// pod's watchdog.
 pub const REQUEST_POLL: Duration = Duration::from_secs(30);
 
-/// Runs `flow`, which follows the job `job`, and returns what it returns.
+/// Runs `flow`, which follows the job of `run`, and returns what it returns.
 /// Every `every`, it looks for a snapshot request in the job's run directory;
 /// once one is there, the job is handled as [`with_stop_fallback`] does, with
-/// `limits` counted from then. A job asked for no snapshot is never cancelled.
+/// `limits` counted from then. A job asked for no snapshot is never cancelled,
+/// and neither is one that cannot save a snapshot (see
+/// [`RunRecord::snapshots`]): it ignores a request, so none is looked for.
 pub async fn with_request_watch<E: Executor, F: Future>(
     executor: &E,
-    job: &JobId,
+    run: &RunRecord,
     limits: StopLimits,
     every: Duration,
     flow: F,
 ) -> F::Output {
+    let Some(job) = run.job.as_ref().filter(|_| run.snapshots) else {
+        return flow.await;
+    };
     let mut flow = std::pin::pin!(flow);
     let request = async {
         let mut ticks = tokio::time::interval(every);

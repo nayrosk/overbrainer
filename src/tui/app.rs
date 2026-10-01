@@ -4185,6 +4185,29 @@ mod tests {
     }
 
     #[test]
+    fn s_refuses_a_run_started_before_snapshots() -> Result<(), Box<dyn std::error::Error>> {
+        let (dir, mut app) = stoppable_app()?;
+        let runs = crate::runs::Runs::new(dir.path());
+        let mut old = runs.load(FIRST)?;
+        old.snapshots = false;
+        runs.save(&old)?;
+        let effects = app.refresh_runs();
+        read(&mut app, effects);
+        assert_eq!(keys(&mut app, &[KeyCode::Char('s')]), []);
+        assert_eq!(app.overlay, None);
+        assert_eq!(
+            status(&app),
+            Some(
+                "refused: run 20260921-133200-a1b2 was started by an overbrainer older than \
+                 0.5.0: its job cannot save a snapshot; cancel it with `overbrainer train cancel \
+                 20260921-133200-a1b2`, or let it finish"
+            )
+        );
+        assert!(!app.training.stopping(FIRST));
+        Ok(())
+    }
+
+    #[test]
     fn stopping_a_followed_run_detaches_it_first() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut app) = stoppable_app()?;
         let follow = attach(&mut app)?;

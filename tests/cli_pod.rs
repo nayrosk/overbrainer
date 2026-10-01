@@ -157,6 +157,7 @@ fn run_record(id: &str, state: RunState, created: &str) -> RunRecord {
         message: None,
         snapshot: None,
         resumed_from: None,
+        snapshots: true,
     }
 }
 

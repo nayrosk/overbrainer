@@ -51,6 +51,8 @@ train: runs/20260922-143005-a1b2/output also holds the partial model at step 124
 
 A job that neither saves its snapshot nor ends within 30 minutes of the request is cancelled. A process that follows a run without having asked for the snapshot (`train attach`, or the holder above) looks for a request every 30 seconds and applies the same limits from when it sees one. One that saved it but has not ended 10 minutes later is cancelled too, and still recorded `stopped` with its snapshot. A request that lands after the last step changes nothing: the run succeeds as usual. Under distributed training, rank 0 reads the request and tells the other ranks, so they all stop at the same step.
 
+A run started by overbrainer before 0.5.0 runs a metrics plugin that ignores `snapshot.request`. `train stop` and `s` in the TUI refuse it before writing anything, and suggest `overbrainer train cancel RUN_ID` or letting it finish; a process that follows it never looks for a request, so nothing cancels it while waiting for a snapshot. overbrainer tells such a run apart by its `run.json`, which lacks the `"snapshots": true` that runs started since 0.5.0 have.
+
 `run.json` of a stopped run holds `snapshot`: `checkpoint`, `step` and `reason`, which is `requested` for `train stop` and the TUI, `deadline`, `cost` or `disk` for the automatic snapshots of a Runpod run (see [Runpod](runpod.md)).
 
 ## Resuming

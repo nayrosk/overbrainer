@@ -214,6 +214,7 @@ impl Harness {
             message: None,
             snapshot: None,
             resumed_from: None,
+            snapshots: true,
         })?;
         let mut record = PodRecord::new(id, pod_state == PodState::Kept, 1, "ssh-ed25519 AAAA");
         let remote: Pod = serde_json::from_value(pod(pod_id, Some(id)))?;

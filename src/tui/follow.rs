@@ -309,13 +309,14 @@ impl App {
     }
 
     /// `s`: asks to stop the selected run's job with a snapshot; only a
-    /// running job can be.
+    /// running job that can save one can be.
     fn ask_stop(&mut self) {
         let Some(row) = self.training.selected_run() else {
             return;
         };
         let (id, target) = (row.record.id.clone(), row.record.target.clone());
         let running = row.record.state == RunState::Running && row.record.job.is_some();
+        let snapshots = row.record.snapshots;
         if self.training.stopping(&id) {
             self.say(Severity::Info, format!("run {id} is being stopped"));
             return;
@@ -329,6 +330,11 @@ impl App {
                 Severity::Info,
                 format!("run {id} has no running job to stop with a snapshot"),
             );
+            return;
+        }
+        if !snapshots {
+            let refused = crate::runs::RunError::NoSnapshots(id);
+            self.say(Severity::Warn, format!("refused: {refused}"));
             return;
         }
         if self.leaving.is_some() {
