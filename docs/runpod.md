@@ -13,7 +13,7 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 
 | Key | Default | Meaning |
 |---|---|---|
-| `gpu_types` | required | Runpod GPU type IDs, tried in order until one can be placed, or `"auto"` to try every GPU type in stock, cheapest first, when the run starts (see [`"auto"`](#auto) below). From the environment, one comma-separated value, or `auto`: `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES="NVIDIA GeForce RTX 4090,NVIDIA A40"` or `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. |
+| `gpu_types` | required | Runpod GPU type IDs, tried in order until one can be placed, or `"auto"` to try every GPU type in stock, cheapest first, after up to 3 cheaper ones reported out of stock (see [`"auto"`](#auto) below). From the environment, one comma-separated value, or `auto`: `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES="NVIDIA GeForce RTX 4090,NVIDIA A40"` or `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. |
 | `min_vram_gb` | none | Least VRAM per GPU, in GB. Only with `gpu_types = "auto"`. At least 1. Unset, `auto` uses the [VRAM estimate](#vram-estimate) instead, when it can be made. |
 | `max_price_per_hour` | none | Highest Secure Cloud list price of one GPU, in USD per hour. Only with `gpu_types = "auto"`. Greater than 0. |
 | `max_hours` | required | The pod's watchdog deletes the pod this long after it was created, unless overbrainer is following a job that still makes progress ([the watchdog](#the-watchdog)). At most 720. |
@@ -77,12 +77,15 @@ The IDs, names, regions, data centers, images and CUDA versions of the catalog (
 
 ## `"auto"`
 
-`gpu_types = "auto"` and `data_center_ids = "auto"` are resolved once, from the same GPU listing (scoped to the target's `gpu_count`), right before the run's first create call, never at `overbrainer pod gpus` time and never again later in the same run even if several GPU types are tried:
+`gpu_types = "auto"` and `data_center_ids = "auto"` are resolved from the same GPU listing (scoped to the target's `gpu_count`), read right before the run's first create call, never at `overbrainer pod gpus` time:
 
 1. `gpu_types = "auto"` picks every Secure Cloud GPU type in stock for `gpu_count` GPUs, within `min_vram_gb` (or, when it is unset, the [VRAM estimate](#vram-estimate)) and `max_price_per_hour` when set, and in one of the listed `data_center_ids` when any are listed, cheapest first (ties by more VRAM, then by ID).
-2. `data_center_ids = "auto"` then picks every data center with one of the chosen GPU types in stock for `gpu_count`, ordered by the cheapest such GPU type it has.
+2. Runpod's stock reports change within seconds, and a type reported out of stock can still be placed. So up to 3 GPU types reported out of stock that are cheaper than the cheapest type in stock, and that meet every other limit (`gpu_count`, `min_vram_gb` or the estimate, `max_price_per_hour`, and the listed `data_center_ids`: a type that names none of them is left out, one that names no data center at all is kept), are tried first, cheapest first. A refusal costs one API call.
+3. `data_center_ids = "auto"` then picks every data center with one of the chosen GPU types in stock for `gpu_count`, ordered by the cheapest such GPU type it has. Runpod names no data center for a type out of stock everywhere, so such a type is created without a data center list under `"auto"`; listed `data_center_ids` (and so a network volume's data center) still bind it.
 
-When nothing in stock matches, the run fails before any pod is created, naming what was asked:
+With `gpu_types = "auto"`, each GPU type that cannot be placed makes overbrainer read the catalog again: the types not tried yet are sorted again by the same rules, so a cheaper type back in stock comes next, and `data_center_ids = "auto"` is picked again from the types left. A type is never tried twice in a run's walk, and the 3 types out of stock are counted over the whole walk. When that read fails, or reports nothing in stock left to try, the types left keep their order and a warning says so. The picks and each new order are logged at info level. A list of GPU types is tried as it is, without these reads.
+
+When nothing in stock matches, the run fails before any pod is created, without trying a type out of stock, naming what was asked:
 
 ```
 no GPU type in stock on Runpod's Secure Cloud for gpu_types = "auto" (gpu_count = 2, min_vram_gb = 48, max_price_per_hour = 1.5)
