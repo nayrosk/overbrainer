@@ -473,6 +473,116 @@ pub fn resolve_with_floor(
     Ok(resolved)
 }
 
+/// Most GPU types reported out of stock that one walk over `auto` GPU types
+/// tries (see [`walk_order`]).
+pub(crate) const MAX_OUT_OF_STOCK: usize = 3;
+
+/// The order in which a walk tries the `auto` GPU types of a target.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WalkOrder {
+    /// The target with its `auto` choices resolved: the GPU types reported out
+    /// of stock first, then those in stock not tried yet.
+    pub target: RunpodTarget,
+    /// The GPU types of `target` reported out of stock.
+    pub out_of_stock: Vec<String>,
+}
+
+/// [`resolve_with_floor`] for a walk that already tried the GPU types `tried`:
+/// with `auto` GPU types, those in stock not tried yet, cheapest first, come
+/// after at most `cap` GPU types reported out of stock that are cheaper than
+/// the cheapest of them and meet every other limit (`max_price_per_hour`,
+/// `min_vram_gb` or `floor_gb`, `gpu_count`), cheapest first. Stock reports
+/// change within seconds, and a type reported out of stock can still be
+/// placed: trying one costs a single refused create call.
+///
+/// With listed data centers, a type out of stock is kept when it lists one of
+/// them or lists none (Runpod gives no data center for a type out of stock
+/// everywhere); the create call still names the listed ones. `auto` data
+/// centers are those with an untried type in stock. A target with listed GPU
+/// types is returned as [`resolve_with_floor`] gives it.
+///
+/// # Errors
+///
+/// Returns a [`ResolveError`] when nothing in stock matches, or when every
+/// type in stock was tried already.
+pub(crate) fn walk_order(
+    target: &RunpodTarget,
+    gpus: &[GpuType],
+    floor_gb: Option<u32>,
+    tried: &[String],
+    cap: usize,
+) -> Result<WalkOrder, ResolveError> {
+    let mut resolved = resolve_with_floor(target, gpus, floor_gb)?;
+    if !target.gpu_types.is_auto() {
+        return Ok(WalkOrder {
+            target: resolved,
+            out_of_stock: Vec::new(),
+        });
+    }
+    let in_stock = resolved.gpu_types.list().to_vec();
+    let untried: Vec<String> = in_stock
+        .iter()
+        .filter(|id| !tried.contains(id))
+        .cloned()
+        .collect();
+    let floor = floor_gb.filter(|_| target.min_vram_gb.is_none());
+    let Some(cheapest) = untried.first() else {
+        return Err(ResolveError::NoGpuType {
+            asked: asked(target, floor),
+        });
+    };
+    let below = gpus
+        .iter()
+        .find(|gpu| &gpu.id == cheapest)
+        .and_then(GpuType::secure_price);
+    let out_of_stock: Vec<String> = match below {
+        None => Vec::new(),
+        Some(below) => {
+            let filter = GpuFilter {
+                min_vram_gb: target.min_vram_gb.or(floor),
+                max_price: target.max_price_per_hour,
+                data_center: None,
+                in_stock: false,
+                gpu_count: Some(target.gpu_count),
+            };
+            let listed = target.data_center_ids.list();
+            select_gpus(gpus, &filter)
+                .into_iter()
+                .filter(|gpu| !in_stock.contains(&gpu.id) && !tried.contains(&gpu.id))
+                .filter(|gpu| gpu.secure_price().is_some_and(|price| price < below))
+                .filter(|gpu| {
+                    listed.is_empty()
+                        || gpu.data_centers.is_empty()
+                        || gpu
+                            .data_centers
+                            .iter()
+                            .any(|entry| listed.contains(&entry.id))
+                })
+                .take(cap)
+                .map(|gpu| gpu.id)
+                .collect()
+        },
+    };
+    if target.data_center_ids.is_auto() {
+        let centers: Vec<String> = stocked_data_centers(gpus, &untried)
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        if centers.is_empty() {
+            return Err(ResolveError::NoDataCenter {
+                gpu_types: or_list(&untried),
+                gpu_count: target.gpu_count,
+            });
+        }
+        resolved.data_center_ids = ListOrAuto::List(centers);
+    }
+    resolved.gpu_types = ListOrAuto::List(out_of_stock.iter().chain(&untried).cloned().collect());
+    Ok(WalkOrder {
+        target: resolved,
+        out_of_stock,
+    })
+}
+
 /// What an `auto` choice of GPU types asked for, as the target's fields,
 /// with the estimated VRAM `floor` when it applied.
 fn asked(target: &RunpodTarget, floor: Option<u32>) -> String {
@@ -1268,5 +1378,156 @@ mod tests {
             )
         );
         Ok(())
+    }
+
+    fn out_of_stock(id: &str, memory: u32, price: f64) -> GpuType {
+        GpuType {
+            availability: Availability::None,
+            ..gpu(id, memory, Some(price))
+        }
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    fn order(
+        target: &RunpodTarget,
+        gpus: &[GpuType],
+        floor: Option<u32>,
+        tried: &[&str],
+        cap: usize,
+    ) -> Result<(ListOrAuto, Vec<String>), ResolveError> {
+        walk_order(target, gpus, floor, &strings(tried), cap)
+            .map(|order| (order.target.gpu_types, order.out_of_stock))
+    }
+
+    #[test]
+    fn cheaper_types_out_of_stock_come_first_cheapest_first_capped() {
+        let gpus = [
+            gpu("stocked", 24, Some(0.5)),
+            gpu("dearer", 24, Some(0.9)),
+            out_of_stock("same", 24, 0.5),
+            out_of_stock("c", 24, 0.3),
+            out_of_stock("a", 24, 0.1),
+            out_of_stock("b", 24, 0.2),
+            out_of_stock("d", 24, 0.4),
+        ];
+        let auto = target(ListOrAuto::Auto, ListOrAuto::default());
+        assert_eq!(
+            order(&auto, &gpus, None, &[], MAX_OUT_OF_STOCK),
+            Ok((
+                list(&["a", "b", "c", "stocked", "dearer"]),
+                strings(&["a", "b", "c"])
+            ))
+        );
+        // Tried types are left out, and the cap is what the walk has left.
+        assert_eq!(
+            order(&auto, &gpus, None, &["a", "stocked"], 1),
+            Ok((list(&["b", "dearer"]), strings(&["b"])))
+        );
+        assert_eq!(
+            order(&auto, &gpus, None, &[], 0),
+            Ok((list(&["stocked", "dearer"]), Vec::new()))
+        );
+    }
+
+    #[test]
+    fn types_out_of_stock_keep_every_limit() {
+        let mut single = out_of_stock("single", 80, 0.1);
+        single.max_count.secure = 1;
+        let mut community = out_of_stock("community", 80, 0.1);
+        community.secure = Some(false);
+        let gpus = [
+            gpu("stocked", 48, Some(0.8)),
+            single,
+            community,
+            out_of_stock("small", 16, 0.1),
+            out_of_stock("over", 80, 0.7),
+            out_of_stock("fits", 48, 0.2),
+        ];
+        let mut auto = target(ListOrAuto::Auto, ListOrAuto::default());
+        auto.gpu_count = 2;
+        auto.max_price_per_hour = Some(0.6);
+        // "stocked" is over the price limit itself: nothing in stock.
+        assert!(matches!(
+            order(&auto, &gpus, Some(40), &[], 3),
+            Err(ResolveError::NoGpuType { .. })
+        ));
+        auto.max_price_per_hour = Some(0.8);
+        // Not "single" (one GPU per pod at most), "community" (not on Secure
+        // Cloud) or "small" (under the floor).
+        assert_eq!(
+            order(&auto, &gpus, Some(40), &[], 3),
+            Ok((list(&["fits", "over", "stocked"]), strings(&["fits", "over"])))
+        );
+        auto.min_vram_gb = Some(60);
+        // An explicit min_vram_gb wins over the floor: "stocked" is too small.
+        assert!(order(&auto, &gpus, Some(10), &[], 3).is_err());
+    }
+
+    #[test]
+    fn nothing_in_stock_or_nothing_left_untried_is_an_error() {
+        let auto = target(ListOrAuto::Auto, ListOrAuto::default());
+        let none = [out_of_stock("a", 24, 0.1)];
+        assert_eq!(
+            order(&auto, &none, None, &[], 3),
+            Err(ResolveError::NoGpuType {
+                asked: "gpu_count = 1".into()
+            })
+        );
+        let gpus = [gpu("stocked", 24, Some(0.5)), out_of_stock("a", 24, 0.1)];
+        assert!(matches!(
+            order(&auto, &gpus, None, &["stocked"], 3),
+            Err(ResolveError::NoGpuType { .. })
+        ));
+    }
+
+    #[test]
+    fn listed_data_centers_bound_the_types_out_of_stock() {
+        let mut stocked = gpu("stocked", 24, Some(0.5));
+        stocked.data_centers = vec![stock("EU-RO-1", Availability::Low)];
+        let mut here = out_of_stock("here", 24, 0.1);
+        here.data_centers = vec![stock("EU-RO-1", Availability::None)];
+        let mut elsewhere = out_of_stock("elsewhere", 24, 0.1);
+        elsewhere.data_centers = vec![stock("US-KS-2", Availability::None)];
+        let unknown = out_of_stock("unknown", 24, 0.2);
+        let gpus = [stocked, here, elsewhere, unknown];
+        let listed = target(ListOrAuto::Auto, list(&["EU-RO-1"]));
+        let walk = walk_order(&listed, &gpus, None, &[], 3);
+        assert_eq!(
+            walk.as_ref().map(|order| &order.target.gpu_types),
+            Ok(&list(&["here", "unknown", "stocked"]))
+        );
+        assert_eq!(
+            walk.map(|order| order.target.data_center_ids),
+            Ok(list(&["EU-RO-1"]))
+        );
+    }
+
+    #[test]
+    fn auto_data_centers_come_from_the_untried_types_in_stock() {
+        let mut cheap = gpu("cheap", 24, Some(0.3));
+        cheap.data_centers = vec![stock("EU-RO-1", Availability::Low)];
+        let mut dear = gpu("dear", 24, Some(0.6));
+        dear.data_centers = vec![stock("US-KS-2", Availability::High)];
+        let gpus = [cheap, dear, out_of_stock("out", 24, 0.1)];
+        let auto = target(ListOrAuto::Auto, ListOrAuto::Auto);
+        let centers = |tried: &[&str]| {
+            walk_order(&auto, &gpus, None, &strings(tried), 3)
+                .map(|order| order.target.data_center_ids)
+        };
+        assert_eq!(centers(&[]), Ok(list(&["EU-RO-1", "US-KS-2"])));
+        assert_eq!(centers(&["cheap"]), Ok(list(&["US-KS-2"])));
+    }
+
+    #[test]
+    fn listed_types_have_no_walk_order_of_their_own() {
+        let gpus = [gpu("stocked", 24, Some(0.5)), out_of_stock("a", 24, 0.1)];
+        let listed = target(list(&["x", "y"]), ListOrAuto::default());
+        assert_eq!(
+            order(&listed, &gpus, None, &["x"], 3),
+            Ok((list(&["x", "y"]), Vec::new()))
+        );
     }
 }
