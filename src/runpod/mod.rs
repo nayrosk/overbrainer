@@ -31,6 +31,7 @@ pub use catalog::{
     gpu_table, printable, resolve, resolve_with_floor, select_gpus, stocked_data_centers,
     template_table, volume_table,
 };
+pub(crate) use catalog::{MAX_OUT_OF_STOCK, WalkOrder, walk_order};
 pub use client::{ApiError, RunpodClient, SECRETS_FORBIDDEN_MESSAGE, USER_AGENT};
 pub use disk::{
     ACT_PERCENT, Assessment, Critical, DISK_PROBE_EVERY, DiskProbe, DiskWatch, GROW_WINDOW, Usage,
