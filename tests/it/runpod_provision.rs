@@ -6,7 +6,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use overbrainer::config::ListOrAuto;
@@ -1204,7 +1204,8 @@ async fn auto_choices_are_resolved_from_the_catalog_before_the_create_calls() ->
         .and(path("/v2/catalog/gpus"))
         .and(query_param("count", "2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "gpus": gpus })))
-        .expect(1)
+        // Once before the first create, then again after each refusal.
+        .expect(5)
         .mount(&harness.server)
         .await;
     Mock::given(method("POST"))
@@ -1226,17 +1227,27 @@ async fn auto_choices_are_resolved_from_the_catalog_before_the_create_calls() ->
         .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap_or_default())
         .collect();
     let gpus: Vec<&Value> = sent.iter().map(|body| &body["gpu"]["id"]).collect();
-    // Cheapest first, ties by more VRAM then ID; out of stock left out.
+    // The L4, out of stock but cheaper than every type in stock, first; then
+    // those in stock, cheapest first, ties by more VRAM then ID.
     assert_eq!(
         gpus,
-        vec!["NVIDIA RTX 4000 Ada", "NVIDIA A40", "NVIDIA RTX A6000"]
+        vec![
+            "NVIDIA L4",
+            "NVIDIA RTX 4000 Ada",
+            "NVIDIA A40",
+            "NVIDIA RTX A6000"
+        ]
     );
-    // Data centers with a chosen GPU in stock, cheapest first.
+    // The catalog names no data center for the L4: any will do. The others
+    // go to the data centers with an untried GPU in stock, cheapest first.
+    assert!(sent[0].get("dataCenterIds").is_none(), "{}", sent[0]);
+    assert_eq!(sent[1]["dataCenterIds"], json!(["EU-RO-1", "US-KS-2"]));
+    assert_eq!(sent[2]["dataCenterIds"], json!(["US-KS-2"]));
+    assert_eq!(sent[3]["dataCenterIds"], json!(["US-KS-2"]));
     for body in &sent {
-        assert_eq!(body["dataCenterIds"], json!(["EU-RO-1", "US-KS-2"]));
         assert_eq!(body["gpu"]["count"], 2);
     }
-    assert_eq!(record.attempts.len(), 3);
+    assert_eq!(record.attempts.len(), 4);
     Ok(())
 }
 
@@ -1275,5 +1286,339 @@ async fn listed_choices_never_read_the_catalog() -> TestResult {
     let (result, _) = harness.provision(&target(&["NVIDIA A40"])).await?;
     assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
     assert!(harness.calls("GET").await.is_empty());
+    Ok(())
+}
+
+/// A GPU type of the catalog, `(id, VRAM, price, band)`, with 8 GPUs per pod
+/// at most: in stock in `EU-RO-1` unless its band is `NONE`, when it lists no
+/// data center, as Runpod sends a type out of stock everywhere.
+fn catalog_gpu((id, memory, price, band): (&str, u32, f64, &str)) -> Value {
+    let mut gpu = json!({
+        "id": id, "memory": memory, "secure": true,
+        "price": {"secure": price}, "maxCount": {"secure": 8},
+        "availability": band
+    });
+    if band != "NONE" {
+        gpu["dataCenters"] = json!([{"id": "EU-RO-1", "availability": band}]);
+    }
+    gpu
+}
+
+/// `GET /catalog/gpus`: each answer in turn, the last one again once they
+/// run out.
+struct Listings {
+    answers: Vec<ResponseTemplate>,
+    next: AtomicUsize,
+}
+
+impl Respond for Listings {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let index = self.next.fetch_add(1, Ordering::SeqCst);
+        self.answers
+            .get(index.min(self.answers.len().saturating_sub(1)))
+            .cloned()
+            .unwrap_or_else(|| ResponseTemplate::new(500))
+    }
+}
+
+/// A catalog listing of `gpus` (see [`catalog_gpu`]).
+fn listing(gpus: &[(&str, u32, f64, &str)]) -> ResponseTemplate {
+    let gpus: Vec<Value> = gpus.iter().copied().map(catalog_gpu).collect();
+    ResponseTemplate::new(200).set_body_json(json!({ "gpus": gpus }))
+}
+
+/// Serves `answers` to `GET /catalog/gpus` for `count` GPUs (see [`Listings`]).
+async fn catalog_listings(server: &MockServer, count: &str, answers: Vec<ResponseTemplate>) {
+    Mock::given(method("GET"))
+        .and(path("/v2/catalog/gpus"))
+        .and(query_param("count", count))
+        .respond_with(Listings {
+            answers,
+            next: AtomicUsize::new(0),
+        })
+        .mount(server)
+        .await;
+}
+
+/// The bodies of the create calls, in order.
+async fn sent(harness: &Harness) -> Vec<Value> {
+    harness
+        .calls("POST")
+        .await
+        .iter()
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap_or_default())
+        .collect()
+}
+
+/// The GPU type of each create call, in order.
+async fn sent_gpus(harness: &Harness) -> Vec<String> {
+    sent(harness)
+        .await
+        .iter()
+        .map(|body| body["gpu"]["id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// How many times the GPU catalog was read.
+async fn catalog_reads(harness: &Harness) -> usize {
+    harness
+        .server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path() == "/v2/catalog/gpus")
+        .count()
+}
+
+fn auto_target() -> RunpodTarget {
+    let mut auto = target(&[]);
+    auto.gpu_types = ListOrAuto::Auto;
+    auto
+}
+
+#[tokio::test]
+async fn a_cheaper_type_out_of_stock_that_runpod_places_is_taken() -> TestResult {
+    let harness = Harness::new().await?;
+    catalog_listings(
+        &harness.server,
+        "1",
+        vec![listing(&[
+            ("STOCKED", 24, 0.4, "HIGH"),
+            ("CHEAP", 24, 0.2, "NONE"),
+        ])],
+    )
+    .await;
+    create_for(
+        &harness.server,
+        "CHEAP",
+        ResponseTemplate::new(201).set_body_json(pod("p1", "n1", "RUNNING")),
+    )
+    .await;
+    serve_pod(&harness.server, "p1", pod("p1", "n1", "RUNNING")).await;
+    create_for(&harness.server, "STOCKED", no_capacity()).await;
+    list(&harness.server, json!([])).await;
+    let mut auto = auto_target();
+    auto.data_center_ids = ListOrAuto::Auto;
+    let (result, record) = harness.provision(&auto).await?;
+    // The stub pod never gets SSH: what matters is that it was created.
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    assert_eq!(sent_gpus(&harness).await, ["CHEAP", "STOCKED"]);
+    assert_eq!(
+        results(&record),
+        [AttemptResult::NotReady, AttemptResult::Unavailable]
+    );
+    let bodies = sent(&harness).await;
+    // `auto` data centers: none for the type out of stock, the picked ones
+    // for the other.
+    assert!(bodies[0].get("dataCenterIds").is_none(), "{}", bodies[0]);
+    assert_eq!(bodies[1]["dataCenterIds"], json!(["EU-RO-1"]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cheaper_type_out_of_stock_that_runpod_refuses_falls_back_to_those_in_stock() -> TestResult
+{
+    let harness = Harness::new().await?;
+    catalog_listings(
+        &harness.server,
+        "1",
+        vec![listing(&[
+            ("DEAR", 24, 0.9, "NONE"),
+            ("STOCKED", 24, 0.4, "HIGH"),
+            ("CHEAP", 24, 0.2, "NONE"),
+        ])],
+    )
+    .await;
+    create_for(&harness.server, "CHEAP", no_capacity()).await;
+    create_for(
+        &harness.server,
+        "STOCKED",
+        ResponseTemplate::new(201).set_body_json(pod("p1", "n1", "RUNNING")),
+    )
+    .await;
+    serve_pod(&harness.server, "p1", pod("p1", "n1", "RUNNING")).await;
+    list(&harness.server, json!([])).await;
+    let (result, record) = harness.provision(&auto_target()).await?;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    // A type out of stock dearer than one in stock is never tried.
+    assert_eq!(sent_gpus(&harness).await, ["CHEAP", "STOCKED"]);
+    assert_eq!(
+        results(&record),
+        [AttemptResult::Unavailable, AttemptResult::NotReady]
+    );
+    // Once before the walk, once after the refusal; not after a pod that
+    // was created.
+    assert_eq!(catalog_reads(&harness).await, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cheaper_type_back_in_stock_after_a_refusal_comes_next() -> TestResult {
+    let harness = Harness::new().await?;
+    catalog_listings(
+        &harness.server,
+        "1",
+        vec![
+            listing(&[
+                ("A", 24, 0.3, "HIGH"),
+                ("B", 24, 0.5, "HIGH"),
+                ("C", 24, 0.4, "NONE"),
+            ]),
+            listing(&[
+                ("A", 24, 0.3, "HIGH"),
+                ("B", 24, 0.5, "HIGH"),
+                ("C", 24, 0.4, "LOW"),
+            ]),
+        ],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(no_capacity())
+        .mount(&harness.server)
+        .await;
+    let (result, record) = harness.provision(&auto_target()).await?;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    // A is still reported in stock after its refusal: it is not tried again.
+    assert_eq!(sent_gpus(&harness).await, ["A", "C", "B"]);
+    assert_eq!(record.attempts.len(), 3);
+    assert_eq!(catalog_reads(&harness).await, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn at_most_three_types_out_of_stock_are_tried() -> TestResult {
+    let harness = Harness::new().await?;
+    catalog_listings(
+        &harness.server,
+        "2",
+        vec![listing(&[
+            ("S", 24, 0.5, "HIGH"),
+            ("O1", 24, 0.1, "NONE"),
+            ("O2", 24, 0.11, "NONE"),
+            ("O3", 24, 0.12, "NONE"),
+            ("O4", 24, 0.13, "NONE"),
+            ("O5", 24, 0.14, "NONE"),
+        ])],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(no_capacity())
+        .mount(&harness.server)
+        .await;
+    let mut auto = auto_target();
+    auto.gpu_count = 2;
+    let (result, _) = harness.provision(&auto).await?;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    assert_eq!(sent_gpus(&harness).await, ["O1", "O2", "O3", "S"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn types_out_of_stock_keep_the_price_vram_and_data_center_limits() -> TestResult {
+    let harness = Harness::new().await?;
+    catalog_listings(
+        &harness.server,
+        "1",
+        vec![listing(&[
+            ("STOCKED", 48, 0.4, "HIGH"),
+            ("SMALL", 16, 0.1, "NONE"),
+            ("FITS", 48, 0.2, "NONE"),
+        ])],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(no_capacity())
+        .mount(&harness.server)
+        .await;
+    let mut auto = auto_target();
+    auto.min_vram_gb = Some(40);
+    auto.max_price_per_hour = Some(0.4);
+    auto.data_center_ids = ListOrAuto::List(vec!["EU-RO-1".into()]);
+    let (result, _) = harness.provision(&auto).await?;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    assert_eq!(sent_gpus(&harness).await, ["FITS", "STOCKED"]);
+    // Listed data centers bound every create, out of stock or not.
+    for body in sent(&harness).await {
+        assert_eq!(body["dataCenterIds"], json!(["EU-RO-1"]));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_catalog_read_keeps_the_types_left_in_their_order() -> TestResult {
+    let harness = Harness::new().await?;
+    catalog_listings(
+        &harness.server,
+        "1",
+        vec![
+            listing(&[("A", 24, 0.3, "HIGH"), ("B", 24, 0.5, "HIGH")]),
+            ResponseTemplate::new(500),
+        ],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(no_capacity())
+        .mount(&harness.server)
+        .await;
+    let (result, _) = harness.provision(&auto_target()).await?;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    assert_eq!(sent_gpus(&harness).await, ["A", "B"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_catalog_read_with_nothing_in_stock_keeps_the_types_left() -> TestResult {
+    let harness = Harness::new().await?;
+    catalog_listings(
+        &harness.server,
+        "1",
+        vec![
+            listing(&[("A", 24, 0.3, "HIGH"), ("B", 24, 0.5, "HIGH")]),
+            listing(&[("A", 24, 0.3, "NONE"), ("B", 24, 0.5, "NONE")]),
+        ],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(no_capacity())
+        .mount(&harness.server)
+        .await;
+    let (result, _) = harness.provision(&auto_target()).await?;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    assert_eq!(sent_gpus(&harness).await, ["A", "B"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_listed_type_refused_reads_no_catalog_and_keeps_the_list() -> TestResult {
+    let harness = Harness::new().await?;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(no_capacity())
+        .mount(&harness.server)
+        .await;
+    let mut listed = target(&["B", "A"]);
+    listed.data_center_ids = ListOrAuto::Auto;
+    catalog_listings(
+        &harness.server,
+        "1",
+        vec![listing(&[
+            ("A", 24, 0.1, "NONE"),
+            ("B", 24, 0.5, "HIGH"),
+            ("C", 24, 0.2, "HIGH"),
+        ])],
+    )
+    .await;
+    let (result, _) = harness.provision(&listed).await?;
+    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+    // Only `auto` data centers read the catalog, once; the list is tried as
+    // it is.
+    assert_eq!(sent_gpus(&harness).await, ["B", "A"]);
+    assert_eq!(catalog_reads(&harness).await, 1);
     Ok(())
 }

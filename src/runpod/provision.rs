@@ -2,20 +2,22 @@
 //! reconciliation of an ambiguous create, SSH readiness, the watchdog's verdict,
 //! and deletes confirmed by the API.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::config::ListOrAuto;
 use crate::events::{Event, EventBus};
 use crate::exec::{ExecError, Executor, SshExecutor};
 use crate::runs::Runs;
 
 use super::{
     ApiError, Attempt, AttemptResult, CreatePod, DeleteReason, DeletedBy, GpuRequest,
-    MIN_CUDA_VERSION, Mounts, NetworkMount, Pod, PodError, PodId, PodKeys, PodRecord, PodSettings,
-    PodStatus, RunpodClient, RunpodTarget, SshEndpoint, VOLUME_MOUNT, alias, pod_command, pod_env,
-    store_host_key, write_config,
+    MAX_OUT_OF_STOCK, MIN_CUDA_VERSION, Mounts, NetworkMount, Pod, PodError, PodId, PodKeys,
+    PodRecord, PodSettings, PodStatus, RunpodClient, RunpodTarget, SshEndpoint, VOLUME_MOUNT,
+    WalkOrder, alias, pod_command, pod_env, store_host_key, write_config,
 };
 
 /// Ambiguous creates tried per GPU type before moving to the next one.
@@ -165,7 +167,10 @@ enum Created {
 
 /// Creates the run's pod, trying `plan.target.gpu_types` in order (its `auto`
 /// choices resolved first, see [`resolve_target`]), and waits until it is
-/// ready. Before the first create call, the pod's host key is stored as the
+/// ready. With `auto` GPU types, up to three cheaper types reported out of
+/// stock are tried before those in stock, and the catalog is read again after
+/// each type that cannot be placed, so the types not tried yet are sorted
+/// again. Before the first create call, the pod's host key is stored as the
 /// run's Runpod secret (see [`store_host_key`]), which every pod of the run
 /// refers to; the caller deletes it once no pod of the run is left. `record` (`pod.json`) is saved before every create call and after
 /// every answer. A pod that dies or stays unreachable is deleted and the
@@ -197,7 +202,16 @@ pub async fn provision(
     record: &mut PodRecord,
 ) -> Result<Provisioned, PodError> {
     ctx.check()?;
-    let target = resolve_target(ctx.client, plan.target, plan.vram_floor_gb).await?;
+    let asked = plan.target;
+    let (target, out_of_stock) = if asked.gpu_types.is_auto() {
+        let order = auto_order(ctx.client, asked, plan.vram_floor_gb).await?;
+        (order.target, order.out_of_stock)
+    } else {
+        (
+            resolve_target(ctx.client, asked, plan.vram_floor_gb).await?,
+            Vec::new(),
+        )
+    };
     let volume_gb = match (plan.volume_gb, &target.network_volume_id) {
         (None, Some(id)) => Some(volume_size(ctx.client, id).await?),
         (known, _) => known,
@@ -209,7 +223,8 @@ pub async fn provision(
     };
     ctx.check()?;
     store_host_key(ctx.client, plan.run_id, plan.keys.host_private()).await?;
-    let result = walk(ctx, plan, record).await;
+    let order = Order::new(target.clone(), out_of_stock);
+    let result = walk(ctx, plan, record, asked, order).await;
     if result.is_err() {
         after_failure(ctx, record).await;
     }
@@ -266,6 +281,31 @@ pub async fn resolve_target(
     Ok(resolved)
 }
 
+/// The order of a walk over the `auto` GPU types of `target` (see
+/// [`walk_order`](super::walk_order), with `floor_gb`), its picks logged at
+/// info level.
+///
+/// # Errors
+///
+/// Returns [`PodError::NotInStock`] when nothing in stock matches, and
+/// [`PodError::Api`] when the catalog cannot be read.
+async fn auto_order(
+    client: &RunpodClient,
+    target: &RunpodTarget,
+    floor_gb: Option<u32>,
+) -> Result<WalkOrder, PodError> {
+    let gpus = client.list_gpu_types(target.gpu_count).await?;
+    let order = super::walk_order(target, &gpus, floor_gb, &[], MAX_OUT_OF_STOCK)?;
+    log_picks(target, &order.target);
+    if !order.out_of_stock.is_empty() {
+        tracing::info!(
+            "gpu_types = \"auto\" tries {} first: reported out of stock, but cheaper than the types in stock",
+            order.out_of_stock.join(", ")
+        );
+    }
+    Ok(order)
+}
+
 /// Logs what the `auto` choices of `target` became in `resolved`.
 fn log_picks(target: &RunpodTarget, resolved: &RunpodTarget) {
     let picks = [
@@ -317,25 +357,121 @@ pub(super) fn note_strays(ctx: &PodCtx<'_>, record: &mut PodRecord, stray: Vec<P
     }
 }
 
-/// Tries the GPU types in order: see [`provision`].
+/// What a walk has left to try, and what it tried.
+struct Order {
+    /// The resolved target the create calls are built from.
+    target: RunpodTarget,
+    /// The GPU types left, in the order they are tried.
+    queue: VecDeque<String>,
+    /// Those the catalog reported out of stock (see
+    /// [`walk_order`](super::walk_order)).
+    out_of_stock: Vec<String>,
+    /// The GPU types tried, never tried again in the walk.
+    tried: Vec<String>,
+    /// How many of them were reported out of stock.
+    extras: usize,
+}
+
+impl Order {
+    /// The order of `target`'s GPU types, `out_of_stock` among them.
+    fn new(target: RunpodTarget, out_of_stock: Vec<String>) -> Self {
+        Self {
+            queue: target.gpu_types.list().iter().cloned().collect(),
+            target,
+            out_of_stock,
+            tried: Vec::new(),
+            extras: 0,
+        }
+    }
+
+    /// The next GPU type not tried yet, now counted as tried, and whether the
+    /// catalog reported it out of stock.
+    fn next(&mut self) -> Option<(String, bool)> {
+        while let Some(gpu) = self.queue.pop_front() {
+            if self.tried.contains(&gpu) {
+                continue;
+            }
+            self.tried.push(gpu.clone());
+            let out = self.out_of_stock.contains(&gpu);
+            if out {
+                self.extras += 1;
+            }
+            return Some((gpu, out));
+        }
+        None
+    }
+
+    /// How many GPU types reported out of stock the walk may still try.
+    fn cap(&self) -> usize {
+        MAX_OUT_OF_STOCK.saturating_sub(self.extras)
+    }
+
+    /// The GPU types left, as `a, b`, or `none`.
+    fn left(&self) -> String {
+        let left: Vec<&str> = self.queue.iter().map(String::as_str).collect();
+        if left.is_empty() {
+            "none".to_string()
+        } else {
+            left.join(", ")
+        }
+    }
+
+    /// Puts first the GPU types of `fresh`, then those left that it no longer
+    /// gives, except those reported out of stock before; `centers` takes its
+    /// data centers too (`data_center_ids = "auto"`).
+    fn resort(&mut self, fresh: WalkOrder, centers: bool) {
+        let mut queue: VecDeque<String> = fresh.target.gpu_types.list().iter().cloned().collect();
+        for gpu in &self.queue {
+            if !queue.contains(gpu) && !self.out_of_stock.contains(gpu) {
+                queue.push_back(gpu.clone());
+            }
+        }
+        self.queue = queue;
+        self.out_of_stock = fresh.out_of_stock;
+        if centers {
+            self.target.data_center_ids = fresh.target.data_center_ids;
+        }
+    }
+}
+
+/// Tries the GPU types of `order` in turn: see [`provision`]. With `auto` GPU
+/// types (`asked`, the target as configured), a type that cannot be placed
+/// makes the walk read the catalog again and sort the types left (see
+/// [`reread`]); a type is tried once per walk, and at most
+/// [`MAX_OUT_OF_STOCK`] types reported out of stock are tried. A type out of
+/// stock under `data_center_ids = "auto"` is created without a data center
+/// list: the catalog names none for it.
 async fn walk(
     ctx: &PodCtx<'_>,
     plan: &PodPlan<'_>,
     record: &mut PodRecord,
+    asked: &RunpodTarget,
+    mut order: Order,
 ) -> Result<Provisioned, PodError> {
     let first = record.attempts.len();
     let mut last_detail = None;
-    for gpu in plan.target.gpu_types.list() {
+    while let Some((gpu, out_of_stock)) = order.next() {
+        let mut target = order.target.clone();
+        if out_of_stock && asked.data_center_ids.is_auto() {
+            target.data_center_ids = ListOrAuto::List(Vec::new());
+        }
+        let plan = &PodPlan {
+            target: &target,
+            ..*plan
+        };
         let mut ambiguous = 0;
         loop {
             ctx.check()?;
-            match create(ctx, plan, record, gpu).await? {
+            match create(ctx, plan, record, &gpu).await? {
                 Created::Pod(pod, result) => match settle(ctx, plan, record, &pod, result).await? {
                     Some(provisioned) => return Ok(provisioned),
                     None => break,
                 },
                 Created::Unavailable(detail) => {
                     last_detail = Some(detail);
+                    if asked.gpu_types.is_auto() {
+                        reread(ctx, asked, plan.vram_floor_gb, &mut order).await;
+                    }
                     break;
                 },
                 Created::Ambiguous => {
@@ -360,6 +496,48 @@ async fn walk(
         last_detail,
         plan.target.network_volume_id.is_some(),
     ))
+}
+
+/// After a GPU type of an `auto` walk could not be placed: reads the catalog
+/// again and sorts the types left (see [`walk_order`](super::walk_order),
+/// with `floor_gb`, and [`Order::resort`]); with `data_center_ids = "auto"`,
+/// the data centers are picked again too. When the catalog cannot be read, or
+/// gives nothing in stock left to try, the types left keep their order, with
+/// a warning.
+async fn reread(ctx: &PodCtx<'_>, asked: &RunpodTarget, floor_gb: Option<u32>, order: &mut Order) {
+    let fresh = match ctx.client.list_gpu_types(asked.gpu_count).await {
+        Ok(gpus) => super::walk_order(asked, &gpus, floor_gb, &order.tried, order.cap())
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(format!("cannot read the GPU catalog again ({error})")),
+    };
+    let fresh = match fresh {
+        Ok(fresh) => fresh,
+        Err(why) => {
+            warn(&format!(
+                "{why}: the GPU types left keep their order: {}",
+                order.left()
+            ));
+            return;
+        },
+    };
+    order.resort(fresh, asked.data_center_ids.is_auto());
+    log_resort(order, asked.data_center_ids.is_auto());
+}
+
+/// Logs the order of the GPU types left after a catalog read, and the data
+/// centers picked again when `centers`.
+fn log_resort(order: &Order, centers: bool) {
+    let mut message = format!(
+        "GPU catalog read again, the GPU types left are tried in this order: {}",
+        order.left()
+    );
+    if centers {
+        message = format!(
+            "{message}; data_center_ids = \"auto\" picked {}",
+            order.target.data_center_ids
+        );
+    }
+    tracing::info!("{message}");
 }
 
 /// The error once every GPU type was tried. `tried` are the attempts of this

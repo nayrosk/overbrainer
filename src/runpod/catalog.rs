@@ -1459,7 +1459,10 @@ mod tests {
         // Cloud) or "small" (under the floor).
         assert_eq!(
             order(&auto, &gpus, Some(40), &[], 3),
-            Ok((list(&["fits", "over", "stocked"]), strings(&["fits", "over"])))
+            Ok((
+                list(&["fits", "over", "stocked"]),
+                strings(&["fits", "over"])
+            ))
         );
         auto.min_vram_gb = Some(60);
         // An explicit min_vram_gb wins over the floor: "stocked" is too small.
