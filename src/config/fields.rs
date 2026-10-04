@@ -26,6 +26,7 @@ pub enum Section {
     Target(TargetKind),
     /// `[export]`.
     Export,
+    /// `[hub]`.
     Hub,
     /// `[metrics]`.
     Metrics,
@@ -695,6 +696,7 @@ const EXPORT: &[FieldSpec] = &[
     ),
 ];
 
+/// `[hub]`: the push of a run to the Hugging Face Hub.
 const HUB: &[FieldSpec] = &[
     spec(
         "repo",

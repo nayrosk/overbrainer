@@ -133,7 +133,7 @@ Bumping llama.cpp, in `src/export/llama_cpp.rs`:
 
 `overbrainer push RUN_ID` uploads the model of a finished run to a Hugging Face model repo, in one commit, with a model card it generates. The run needs its `output/` in `runs/`: a `succeeded` run, or a `stopped` one whose partial model is in `output/` (the card does not say it is partial, so push it knowingly). A run with only a checkpoint is refused, with a hint to export or resume it, and so is one whose results were not retrieved (`train attach` gets them).
 
-Everything in `runs/<run-id>/output/` goes, except `checkpoint-*` directories, `debug.log`, Axolotl's own `README.md` and hidden files. The layout in the repo:
+Everything in `runs/<run-id>/output/` goes, except `checkpoint-*` directories, `debug.log`, hidden files, Axolotl's own `README.md` and any other `README.md` that would land at the repo root, where the card goes. The layout in the repo:
 
 - The adapter or model files (`adapter_config.json`, `adapter_model.safetensors`, the tokenizer files) sit at the root, as they do in `output/`.
 - `merged/` keeps its name.
@@ -159,9 +159,9 @@ A real push ends with the commit URL, and writes `runs/<run-id>/hub/push.json` (
 push: https://huggingface.co/me/my-demo/commit/abc123 (2 files, 0.0 MB)
 ```
 
-Ctrl-C cancels a push: nothing is committed (`push cancelled: nothing was committed, run it again to resume`), and running it again resumes, because Hugging Face skips the chunks it already stored. A token without write access to the namespace fails with `the Hugging Face token needs write access to <namespace>`; the token itself is never printed.
+Ctrl-C cancels a push before its commit: nothing is committed (`push cancelled before its commit finished; run it again to resume`), and running it again resumes, because Hugging Face skips the chunks it already stored. A token without write access to the namespace fails with `the Hugging Face token needs write access to <namespace>`; the token itself is never printed.
 
-`[hub] after_training = true` pushes each run once it succeeded and came back, after the export when `[export] after_training` is on. It applies to `train`, `train attach` and `train stop`, to auto mode and to runs started from the TUI. A failed push does not change the run, which stays `succeeded`: it warns, for example `push failed: ...; run it again with: overbrainer push RUN_ID`. In the TUI, `h` on a run in the Training view pushes it after a confirmation (see [the TUI page](tui.md)).
+`[hub] after_training = true` pushes each run once it succeeded and came back, after the export when `[export] after_training` is on. It applies to `train` and `train attach`, to auto mode and to runs started from the TUI; a run that ends `stopped` is not pushed. A failed push does not change the run, which stays `succeeded`: it warns, for example `push failed: ...; run it again with: overbrainer push RUN_ID`. Ctrl-C during that push stops it the same way (`push cancelled before its commit finished; run it again with: overbrainer push RUN_ID`). Without `OVERBRAINER_HF_TOKEN`, the training start already warns that the push will fail. In the TUI, `h` on a run in the Training view pushes it after a confirmation (see [the TUI page](tui.md)).
 
 `[hub]`:
 

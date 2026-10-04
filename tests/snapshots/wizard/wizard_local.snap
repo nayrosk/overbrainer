@@ -60,7 +60,7 @@ adapter = "lora"              # lora | qlora | full
 # evals_per_epoch = 4
 # saves_per_epoch = 1
 # merge = false                # also write a merged model (lora and qlora only)
-# hub_model_id = "user/model"  # push the adapter to a private Hub repo (needs OVERBRAINER_HF_TOKEN)
+# hub_model_id = "user/model"  # (deprecated, use [hub]) push the adapter to a private Hub repo (needs OVERBRAINER_HF_TOKEN)
 # [training.axolotl_extra]     # merged into the Axolotl YAML
 # warmup_ratio = 0.1
 # attn_implementation = "flash_attention_2"
