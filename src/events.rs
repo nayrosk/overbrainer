@@ -161,6 +161,15 @@ pub enum Event {
     /// [`Event::RunWatched`] on this bus; one comes every
     /// [`PROBE_EVERY`](crate::runs::PROBE_EVERY) while the job is followed.
     System(SystemSample),
+    /// Bytes of run `run_id` uploaded to the Hugging Face Hub so far.
+    Push {
+        /// ID of the run pushed.
+        run_id: String,
+        /// Bytes uploaded.
+        done: u64,
+        /// Bytes to upload.
+        total: u64,
+    },
 }
 
 /// How an item ended, as its event says.

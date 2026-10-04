@@ -5,6 +5,7 @@ mod cli_complete;
 mod cli_metrics;
 mod cli_pipeline;
 mod cli_pod;
+mod cli_push;
 mod cli_runpod;
 mod cli_runs_logs;
 mod cli_skill;

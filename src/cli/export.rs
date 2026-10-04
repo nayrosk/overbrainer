@@ -422,7 +422,7 @@ pub(super) fn report_delivered(
 }
 
 /// `bytes` in MB or GB, one decimal.
-fn size_words(bytes: u64) -> String {
+pub(super) fn size_words(bytes: u64) -> String {
     let mb = bytes / 100_000;
     if mb >= 10_000 {
         format!("{}.{} GB", mb / 10_000, mb % 10_000 / 1_000)

@@ -389,7 +389,10 @@ impl Metrics {
                     followed.system = Some(set);
                 }
             },
-            Event::ItemDone { .. } | Event::ItemFailed { .. } | Event::PodStatus(_) => {},
+            Event::ItemDone { .. }
+            | Event::ItemFailed { .. }
+            | Event::PodStatus(_)
+            | Event::Push { .. } => {},
         }
     }
 

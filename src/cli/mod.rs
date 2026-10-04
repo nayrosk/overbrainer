@@ -11,6 +11,7 @@ mod logs;
 pub(crate) mod migrate;
 pub(crate) mod pod;
 mod progress;
+pub(crate) mod push;
 mod record;
 mod reload;
 mod runpod_train;
@@ -111,6 +112,15 @@ pub enum Command {
     /// llama.cpp and quantized, and the GGUF and its Modelfile land in
     /// `runs/<run-id>/output/gguf/`. Ctrl-C cancels it.
     Export(ExportArgs),
+    /// Push the model of a finished run to a Hugging Face model repo, with a
+    /// generated model card.
+    ///
+    /// Everything the run left in `runs/<run-id>/output/` goes in one commit,
+    /// checkpoints, `debug.log` and Axolotl's README.md aside. The repo is
+    /// created private unless `--public` or `[hub] private = false`. Needs
+    /// `OVERBRAINER_HF_TOKEN`, a token with write access. Ctrl-C cancels it:
+    /// nothing is committed, and a rerun resumes.
+    Push(PushArgs),
     /// Inspect training runs.
     Runs {
         /// The runs subcommand to run.
@@ -185,7 +195,8 @@ impl Command {
             | Self::Run
             | Self::Migrate(_)
             | Self::Train(_)
-            | Self::Export(_) => true,
+            | Self::Export(_)
+            | Self::Push(_) => true,
             Self::Pod { command } => matches!(command, PodCommand::Rm { .. }),
             Self::Init { .. }
             | Self::Config { .. }
@@ -305,6 +316,26 @@ pub struct ExportArgs {
     /// limit. Nothing deletes it then but `overbrainer pod rm <export-id>`.
     #[arg(long)]
     pub keep_pod: bool,
+}
+
+/// Options of `overbrainer push`.
+#[derive(Debug, Args)]
+pub struct PushArgs {
+    /// Run to push.
+    #[arg(add = ArgValueCandidates::new(complete::run_ids))]
+    pub run_id: String,
+    /// Repo, NAMESPACE/NAME (default [hub] repo, else <you>/<project>).
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Create the repo public.
+    #[arg(long)]
+    pub public: bool,
+    /// Replace a README.md the repo already has, even one overbrainer did not write.
+    #[arg(long)]
+    pub overwrite_card: bool,
+    /// Show what would be pushed and write the card to runs/<id>/hub/README.md, push nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Parses an Ollama model name, as `--ollama` takes it.
@@ -536,6 +567,8 @@ async fn settle(mut check: JoinHandle<Option<Newer>>) -> Option<Newer> {
 }
 
 /// Runs `cli`'s command; `tui` takes `check` to show its answer.
+// One arm per command: splitting the table would only hide it.
+#[allow(clippy::cognitive_complexity)]
 async fn dispatch(
     cli: Cli,
     logs: LogMode,
@@ -592,6 +625,7 @@ async fn dispatch(
             Box::pin(train::run(dir, &args, &front, &source)).await
         },
         Command::Export(args) => Box::pin(export::run(dir, &args, &front)).await,
+        Command::Push(args) => Box::pin(push::run(dir, &args, &front)).await,
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
@@ -832,6 +866,32 @@ mod tests {
     }
 
     #[test]
+    fn push_takes_a_repo_and_its_flags() -> Result<(), clap::Error> {
+        let Command::Push(args) = command(&[
+            "push",
+            "r1",
+            "--repo",
+            "me/model",
+            "--public",
+            "--overwrite-card",
+            "--dry-run",
+        ])?
+        else {
+            return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+        };
+        assert_eq!(args.run_id, "r1");
+        assert_eq!(args.repo.as_deref(), Some("me/model"));
+        assert!(args.public && args.overwrite_card && args.dry_run);
+        let Command::Push(defaults) = command(&["push", "r1"])? else {
+            return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+        };
+        assert_eq!(defaults.repo, None);
+        assert!(!defaults.public && !defaults.overwrite_card && !defaults.dry_run);
+        assert!(command(&["push"]).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn only_train_stop_names_a_stopped_run() -> Result<(), clap::Error> {
         let stopped = |args: &[&str]| -> Result<Option<String>, clap::Error> {
             let cli =
@@ -868,6 +928,8 @@ mod tests {
             &["train", "cancel", "x"],
             &["train", "stop", "x"],
             &["export", "x"],
+            &["push", "x"],
+            &["push", "x", "--dry-run"],
             &["pod", "rm", "x"],
             &["migrate"],
             &["migrate", "--dry-run"],

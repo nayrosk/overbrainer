@@ -1,0 +1,863 @@
+//! `overbrainer push RUN_ID`: the model of a finished run, with a generated
+//! model card, to a Hugging Face model repo in one commit.
+//!
+//! Ctrl-C cancels the push: nothing is committed before every upload
+//! finished, and a rerun resumes.
+
+use std::future::{Future, ready};
+use std::iter;
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::{Context as _, anyhow, bail};
+use tokio::sync::mpsc;
+
+use super::PushArgs;
+use super::export::{model_of, size_words};
+use super::front::Frontend;
+use super::train::{hf_token, warn};
+use crate::config::{EnvSource, Settings, Source};
+use crate::events::{Event, EventBus};
+use crate::hub::record::{HUB_DIR, PushRecord};
+use crate::hub::{
+    Commit, HfHub, Hub, HubError, Progress, ProgressSink, RepoId, RepoState, UploadFile, card,
+    files,
+};
+use crate::runs::{RUNS_DIR, Runs, rfc3339, write_atomic};
+use crate::train::OUTPUT_DIR;
+
+/// The card in the repo, and the copy a dry run writes in `runs/<id>/hub/`.
+const CARD_FILE: &str = "README.md";
+
+/// At most one progress event per interval.
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+
+/// What `overbrainer push` was asked, besides the run.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PushOptions {
+    /// `NAMESPACE/NAME`, overriding `[hub] repo`.
+    pub repo: Option<String>,
+    /// Create the repo public whatever `[hub] private` says.
+    pub public: bool,
+    /// Replace a README.md overbrainer did not write.
+    pub overwrite_card: bool,
+    /// Show what would be pushed, push nothing.
+    pub dry_run: bool,
+}
+
+/// What a push did, or would do on a dry run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Pushed {
+    /// The repo pushed to.
+    pub repo: RepoId,
+    /// The commit URL; `None` on a dry run.
+    pub url: Option<String>,
+    /// The run's files pushed, the card aside.
+    pub files: usize,
+    /// Their total size.
+    pub bytes: u64,
+    /// Whether the repo's own README.md was kept.
+    pub card_kept: bool,
+}
+
+/// Runs `overbrainer push`.
+///
+/// # Errors
+///
+/// Returns an error when the run cannot be pushed, the token is missing, or
+/// the push fails or is interrupted.
+pub(super) async fn run(
+    project_dir: &Path,
+    args: &PushArgs,
+    front: &Frontend,
+) -> anyhow::Result<()> {
+    let settings = Source::from(EnvSource::Process).load(project_dir)?;
+    let runs = Runs::new(project_dir);
+    let opts = PushOptions {
+        repo: args.repo.clone(),
+        public: args.public,
+        overwrite_card: args.overwrite_card,
+        dry_run: args.dry_run,
+    };
+    let push = async {
+        match &settings.hf_token {
+            Some(token) => {
+                let token = hf_token(token).await?;
+                let hub = HfHub::new(settings.hub.base_url.as_deref(), &token)?;
+                push_run(&hub, &runs, &settings, &args.run_id, &opts, front).await
+            },
+            None if opts.dry_run => {
+                push_run(&Offline, &runs, &settings, &args.run_id, &opts, front).await
+            },
+            None => bail!(
+                "OVERBRAINER_HF_TOKEN is not set: a Hugging Face token with write access is \
+                 needed to push"
+            ),
+        }
+    };
+    tokio::select! {
+        pushed = push => pushed.map(|_| ()),
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("cannot catch Ctrl-C")?;
+            bail!("push cancelled: nothing was committed, run it again to resume")
+        },
+    }
+}
+
+/// Pushes run `run_id` of `runs` to `hub`; shared by the command, the TUI task
+/// and the push after training. Dropping the future cancels the push before
+/// its commit.
+///
+/// # Errors
+///
+/// Returns an error when the run cannot be pushed, or the Hub refuses it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn push_run<H: Hub>(
+    hub: &H,
+    runs: &Runs,
+    settings: &Settings,
+    run_id: &str,
+    opts: &PushOptions,
+    front: &Frontend,
+) -> anyhow::Result<Pushed> {
+    let record = runs.load(run_id)?;
+    let model = model_of(runs, &record)?;
+    if model != OUTPUT_DIR {
+        bail!(
+            "run {run_id} has no model in {OUTPUT_DIR}/ (only checkpoint {model}): export or \
+             resume it first"
+        );
+    }
+    let run_dir = runs.run_dir(run_id)?;
+    let files = files::select(&run_dir.join(OUTPUT_DIR))?;
+    if files.is_empty() {
+        bail!("run {run_id} has nothing to push in {OUTPUT_DIR}/");
+    }
+    let repo = repo_of(hub, settings, opts).await?;
+    let private = !opts.public && settings.hub.private;
+    let mut input = card::gather(runs, &record, settings, &repo, None, &files)?;
+    // A local base model has no license to look up.
+    if !Path::new(&input.base_model).exists() {
+        input.license = hub
+            .license_of(&input.base_model)
+            .await
+            .unwrap_or_else(|error| {
+                warn(&format!("leaving the license out of the card: {error}"));
+                None
+            });
+    }
+    let card = card::render(&input);
+    let count = files.len();
+    let bytes = files.iter().map(|file| file.size).sum();
+    let pushed = Pushed {
+        repo,
+        url: None,
+        files: count,
+        bytes,
+        card_kept: false,
+    };
+    if opts.dry_run {
+        dry_run(&run_dir, run_id, &files, &card, private, &pushed, front)?;
+        return Ok(pushed);
+    }
+
+    let repo = &pushed.repo;
+    let private = match hub.ensure_repo(repo, private).await.map_err(hub_error)? {
+        RepoState::Created { private } => private,
+        RepoState::Existing { private: kept } => {
+            if kept != private {
+                front.line(&format!(
+                    "repo {repo} exists and stays {}",
+                    visibility(kept)
+                ));
+            }
+            kept
+        },
+    };
+    let remote = hub.remote_card(repo).await.map_err(hub_error)?;
+    let (card, card_kept) = match remote {
+        Some(remote) if !opts.overwrite_card && !card::replaceable(Some(&remote)) => {
+            front.line("kept the repo's own README.md (use --overwrite-card to replace it)");
+            (remote, true)
+        },
+        _ => (card, false),
+    };
+    let paths: Vec<String> = files
+        .iter()
+        .map(|file| file.path_in_repo.clone())
+        .chain(iter::once(CARD_FILE.to_string()))
+        .collect();
+    let message = format!(
+        "Upload run {run_id} with overbrainer {}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let guard = front.open_bus();
+    let commit = upload(hub, repo, files, card, message, run_id, &guard.bus).await;
+    guard.close().await;
+    let commit = commit.map_err(hub_error)?;
+    PushRecord {
+        repo: repo.to_string(),
+        commit: commit.oid,
+        url: commit.url.clone(),
+        files: paths,
+        private,
+        pushed: rfc3339(SystemTime::now()),
+    }
+    .save(&run_dir)?;
+    front.line(&format!(
+        "push: {} ({}, {})",
+        commit.url,
+        files_word(count),
+        size_words(bytes)
+    ));
+    Ok(Pushed {
+        url: Some(commit.url),
+        card_kept,
+        ..pushed
+    })
+}
+
+/// The repo of a push: `--repo`, else `[hub] repo`, else `<whoami>/<project>`
+/// with `_` as `-`. A dry run without a token says `<you>` for the user.
+async fn repo_of<H: Hub>(
+    hub: &H,
+    settings: &Settings,
+    opts: &PushOptions,
+) -> anyhow::Result<RepoId> {
+    let text = if let Some(text) = opts.repo.as_ref().or(settings.hub.repo.as_ref()) {
+        text.clone()
+    } else {
+        let name = settings.project.name.replace('_', "-");
+        match hub.whoami().await {
+            Ok(user) => format!("{user}/{name}"),
+            Err(HubError::Auth) if opts.dry_run => {
+                return Ok(RepoId {
+                    namespace: "<you>".to_string(),
+                    name,
+                });
+            },
+            Err(error) => return Err(hub_error(error)),
+        }
+    };
+    RepoId::parse(&text)
+        .with_context(|| format!("`{text}` is not a Hugging Face repo: use NAMESPACE/NAME"))
+}
+
+/// Says what `pushed` would send and writes its `card` to `runs/<id>/hub/`.
+#[allow(clippy::too_many_arguments)]
+fn dry_run(
+    run_dir: &Path,
+    run_id: &str,
+    files: &[UploadFile],
+    card: &str,
+    private: bool,
+    pushed: &Pushed,
+    front: &Frontend,
+) -> anyhow::Result<()> {
+    front.line(&format!(
+        "push: {}, {} when created; nothing is sent (--dry-run)",
+        pushed.repo,
+        visibility(private)
+    ));
+    for file in files {
+        front.line(&format!("{}  {}", file.path_in_repo, size_words(file.size)));
+    }
+    let dir = run_dir.join(HUB_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    write_atomic(&dir, CARD_FILE, card.as_bytes())?;
+    front.line(&format!(
+        "push: {}, {}; card written to {RUNS_DIR}/{run_id}/{HUB_DIR}/{CARD_FILE}",
+        files_word(pushed.files),
+        size_words(pushed.bytes)
+    ));
+    Ok(())
+}
+
+/// The commit of `files` and `card` to `repo`, its progress published on
+/// `bus` as [`Event::Push`] at most once per [`PROGRESS_EVERY`].
+#[allow(clippy::too_many_arguments)]
+async fn upload<H: Hub>(
+    hub: &H,
+    repo: &RepoId,
+    files: Vec<UploadFile>,
+    card: String,
+    message: String,
+    run_id: &str,
+    bus: &EventBus,
+) -> Result<Commit, HubError> {
+    let (sink, mut progress): (ProgressSink, _) = mpsc::unbounded_channel();
+    let mut upload = std::pin::pin!(hub.upload(repo, files, card, message, sink));
+    let mut last: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            result = &mut upload => return result,
+            Some(Progress { done, total }) = progress.recv() => {
+                if last.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
+                    last = Some(Instant::now());
+                    bus.publish(Event::Push {
+                        run_id: run_id.to_string(),
+                        done,
+                        total,
+                    });
+                }
+            },
+        }
+    }
+}
+
+/// `error` as the user reads it: an auth error names the token's variable,
+/// never its value.
+fn hub_error(error: HubError) -> anyhow::Error {
+    match error {
+        HubError::Auth => anyhow!(
+            "Hugging Face refused the token: set OVERBRAINER_HF_TOKEN to a valid token with \
+             write access"
+        ),
+        HubError::Forbidden { namespace } => anyhow!(
+            "the Hugging Face token needs write access to {namespace}: set OVERBRAINER_HF_TOKEN \
+             to a token that has it"
+        ),
+        other => other.into(),
+    }
+}
+
+fn visibility(private: bool) -> &'static str {
+    if private { "private" } else { "public" }
+}
+
+/// `1 file`, `2 files`.
+fn files_word(count: usize) -> String {
+    if count == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{count} files")
+    }
+}
+
+/// The Hub of a dry run without a token: it knows no user and reaches nothing.
+struct Offline;
+
+impl Hub for Offline {
+    fn whoami(&self) -> impl Future<Output = Result<String, HubError>> + Send {
+        ready(Err(HubError::Auth))
+    }
+
+    fn ensure_repo(
+        &self,
+        _repo: &RepoId,
+        _private: bool,
+    ) -> impl Future<Output = Result<RepoState, HubError>> + Send {
+        ready(Err(HubError::Auth))
+    }
+
+    fn remote_card(
+        &self,
+        _repo: &RepoId,
+    ) -> impl Future<Output = Result<Option<String>, HubError>> + Send {
+        ready(Err(HubError::Auth))
+    }
+
+    fn license_of(
+        &self,
+        _model: &str,
+    ) -> impl Future<Output = Result<Option<String>, HubError>> + Send {
+        ready(Ok(None))
+    }
+
+    fn upload(
+        &self,
+        _repo: &RepoId,
+        _files: Vec<UploadFile>,
+        _card: String,
+        _message: String,
+        _progress: ProgressSink,
+    ) -> impl Future<Output = Result<Commit, HubError>> + Send {
+        ready(Err(HubError::Auth))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::cli::front::Report;
+    use crate::config::{EnvSource, load_str};
+    use crate::events::EventBus;
+    use crate::hub::card::MARKER;
+    use crate::runs::{RunRecord, RunState, Snapshot, SnapshotReason};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const RUN: &str = "r1";
+
+    #[derive(Default)]
+    struct FakeHub {
+        /// The visibility of the repo when it exists already.
+        existing: Option<bool>,
+        remote_card: Option<String>,
+        fail_auth: bool,
+        /// Progress reports per upload, at least one.
+        progress_steps: u64,
+        /// `(repo, private)` of each `ensure_repo`.
+        ensured: Mutex<Vec<(String, bool)>>,
+        /// `(repo, paths, card)` of each upload.
+        uploads: Mutex<Vec<(String, Vec<String>, String)>>,
+    }
+
+    impl Hub for FakeHub {
+        fn whoami(&self) -> impl Future<Output = Result<String, HubError>> + Send {
+            ready(if self.fail_auth {
+                Err(HubError::Auth)
+            } else {
+                Ok("me".into())
+            })
+        }
+
+        fn ensure_repo(
+            &self,
+            repo: &RepoId,
+            private: bool,
+        ) -> impl Future<Output = Result<RepoState, HubError>> + Send {
+            if let Ok(mut ensured) = self.ensured.lock() {
+                ensured.push((repo.to_string(), private));
+            }
+            ready(Ok(match self.existing {
+                Some(private) => RepoState::Existing { private },
+                None => RepoState::Created { private },
+            }))
+        }
+
+        fn remote_card(
+            &self,
+            _repo: &RepoId,
+        ) -> impl Future<Output = Result<Option<String>, HubError>> + Send {
+            ready(Ok(self.remote_card.clone()))
+        }
+
+        fn license_of(
+            &self,
+            _model: &str,
+        ) -> impl Future<Output = Result<Option<String>, HubError>> + Send {
+            ready(Ok(Some("apache-2.0".into())))
+        }
+
+        fn upload(
+            &self,
+            repo: &RepoId,
+            files: Vec<UploadFile>,
+            card: String,
+            _message: String,
+            progress: ProgressSink,
+        ) -> impl Future<Output = Result<Commit, HubError>> + Send {
+            let total: u64 = files.iter().map(|f| f.size).sum();
+            let paths = files.into_iter().map(|f| f.path_in_repo).collect();
+            if let Ok(mut uploads) = self.uploads.lock() {
+                uploads.push((repo.to_string(), paths, card));
+            }
+            let steps = self.progress_steps.max(1);
+            async move {
+                for step in 1..=steps {
+                    let _ = progress.send(Progress {
+                        done: total * step / steps,
+                        total,
+                    });
+                    tokio::task::yield_now().await;
+                }
+                Ok(Commit {
+                    url: "https://hf.co/me/x/commit/1".into(),
+                    oid: "1".into(),
+                })
+            }
+        }
+    }
+
+    impl FakeHub {
+        fn uploads(&self) -> Vec<(String, Vec<String>, String)> {
+            self.uploads.lock().map(|u| u.clone()).unwrap_or_default()
+        }
+
+        fn ensured(&self) -> Vec<(String, bool)> {
+            self.ensured.lock().map(|e| e.clone()).unwrap_or_default()
+        }
+    }
+
+    const CONFIG: &str = r#"[project]
+name = "my_proj"
+
+[providers.mock]
+protocol = "openai"
+
+[roles]
+generator = { provider = "mock", model = "gen" }
+parent = { provider = "mock", model = "parent" }
+"#;
+
+    fn settings(extra: &str) -> Result<Settings, Box<dyn std::error::Error>> {
+        let env = vec![("OVERBRAINER_HF_TOKEN".to_string(), "hf_test".to_string())];
+        Ok(load_str(&format!("{CONFIG}{extra}"), EnvSource::Vars(env))?)
+    }
+
+    fn record(state: RunState) -> RunRecord {
+        RunRecord {
+            id: RUN.into(),
+            target: "box".into(),
+            created: "2026-10-01T12:00:00Z".into(),
+            remote_dir: "/w/r1".into(),
+            job: None,
+            state,
+            message: None,
+            snapshot: None,
+            resumed_from: None,
+            snapshots: true,
+        }
+    }
+
+    /// A project with run [`RUN`] in `state`, its adapter in `output/` unless
+    /// `checkpoint_only`, beside Axolotl's README.md and a checkpoint.
+    fn project(
+        state: RunState,
+        checkpoint_only: bool,
+    ) -> Result<(tempfile::TempDir, Runs), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let mut run = record(state);
+        if checkpoint_only {
+            run.snapshot = Some(Snapshot {
+                checkpoint: "output/checkpoint-10".into(),
+                step: 10,
+                reason: SnapshotReason::Requested,
+            });
+        }
+        runs.save(&run)?;
+        let dir = runs.run_dir(RUN)?;
+        std::fs::create_dir_all(dir.join("output/checkpoint-10"))?;
+        std::fs::write(
+            dir.join("axolotl.yaml"),
+            "base_model: Qwen/Qwen3-0.6B\nadapter: qlora\n",
+        )?;
+        std::fs::write(dir.join("output/checkpoint-10/adapter_config.json"), "{}")?;
+        std::fs::write(dir.join("output/README.md"), "axolotl")?;
+        if !checkpoint_only {
+            std::fs::write(dir.join("output/adapter_config.json"), "{}")?;
+            std::fs::write(dir.join("output/adapter_model.safetensors"), "weights")?;
+        }
+        Ok((project, runs))
+    }
+
+    /// A TUI front end whose lines land in the returned vector.
+    fn front() -> (Frontend, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&lines);
+        let front = Frontend::Tui {
+            bus: EventBus::new(),
+            detach: CancellationToken::new(),
+            abandon: Arc::new(AtomicBool::new(false)),
+            report: Arc::new(move |report| {
+                if let (Report::Line(line), Ok(mut lines)) = (report, seen.lock()) {
+                    lines.push(line);
+                }
+            }),
+        };
+        (front, lines)
+    }
+
+    fn said(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        lines.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    async fn push(
+        hub: &FakeHub,
+        runs: &Runs,
+        settings: &Settings,
+        opts: &PushOptions,
+    ) -> (anyhow::Result<Pushed>, Vec<String>) {
+        let (front, lines) = front();
+        let pushed = push_run(hub, runs, settings, RUN, opts, &front).await;
+        (pushed, said(&lines))
+    }
+
+    #[tokio::test]
+    async fn refuses_a_running_run() -> TestResult {
+        let (_project, runs) = project(RunState::Running, false)?;
+        let hub = FakeHub::default();
+        let (pushed, _) = push(&hub, &runs, &settings("")?, &PushOptions::default()).await;
+        let error = pushed.err().ok_or("pushed a running run")?;
+        assert!(error.to_string().contains("run r1 is running"), "{error}");
+        assert_eq!(hub.uploads().len(), 0, "nothing uploaded");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_a_checkpoint_only_stopped_run() -> TestResult {
+        let (_project, runs) = project(RunState::Stopped, true)?;
+        let hub = FakeHub::default();
+        let (pushed, _) = push(&hub, &runs, &settings("")?, &PushOptions::default()).await;
+        let error = pushed.err().ok_or("pushed a checkpoint")?;
+        assert_eq!(
+            error.to_string(),
+            "run r1 has no model in output/ (only checkpoint output/checkpoint-10): export or \
+             resume it first"
+        );
+        assert_eq!(hub.uploads().len(), 0, "nothing uploaded");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_repo_is_whoami_slash_project() -> TestResult {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let hub = FakeHub::default();
+        let (pushed, lines) = push(&hub, &runs, &settings("")?, &PushOptions::default()).await;
+        let pushed = pushed?;
+        assert_eq!(pushed.repo.to_string(), "me/my-proj");
+        assert_eq!(pushed.url.as_deref(), Some("https://hf.co/me/x/commit/1"));
+        assert_eq!((pushed.files, pushed.bytes), (2, 9));
+        let uploads = hub.uploads();
+        let [(repo, paths, card)] = uploads.as_slice() else {
+            return Err("one upload expected".into());
+        };
+        assert_eq!(repo, "me/my-proj");
+        assert_eq!(paths, &["adapter_config.json", "adapter_model.safetensors"]);
+        assert!(card.contains("license: apache-2.0"), "{card}");
+        assert!(
+            lines.contains(&"push: https://hf.co/me/x/commit/1 (2 files, 0.0 MB)".to_string()),
+            "{lines:?}"
+        );
+        // A configured repo wins over whoami, `--repo` over both.
+        let configured = settings("\n[hub]\nrepo = \"org/model\"\n")?;
+        let (pushed, _) = push(&hub, &runs, &configured, &PushOptions::default()).await;
+        assert_eq!(pushed?.repo.to_string(), "org/model");
+        let opts = PushOptions {
+            repo: Some("org/other".into()),
+            ..PushOptions::default()
+        };
+        let (pushed, _) = push(&hub, &runs, &configured, &opts).await;
+        assert_eq!(pushed?.repo.to_string(), "org/other");
+        let opts = PushOptions {
+            repo: Some("not a repo".into()),
+            ..PushOptions::default()
+        };
+        let (pushed, _) = push(&hub, &runs, &configured, &opts).await;
+        let error = pushed.err().ok_or("pushed to a bad repo")?;
+        assert!(error.to_string().contains("not a repo"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_flag_wins_over_config() -> TestResult {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let hub = FakeHub::default();
+        let private = settings("\n[hub]\nprivate = true\n")?;
+        let opts = PushOptions {
+            public: true,
+            ..PushOptions::default()
+        };
+        push(&hub, &runs, &private, &opts).await.0?;
+        push(&hub, &runs, &private, &PushOptions::default())
+            .await
+            .0?;
+        let public = settings("\n[hub]\nprivate = false\n")?;
+        push(&hub, &runs, &public, &PushOptions::default())
+            .await
+            .0?;
+        assert_eq!(
+            hub.ensured(),
+            [
+                ("me/my-proj".to_string(), false),
+                ("me/my-proj".to_string(), true),
+                ("me/my-proj".to_string(), false),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_writes_the_card_and_uploads_nothing() -> TestResult {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let hub = FakeHub::default();
+        let opts = PushOptions {
+            dry_run: true,
+            ..PushOptions::default()
+        };
+        let (pushed, lines) = push(&hub, &runs, &settings("")?, &opts).await;
+        let pushed = pushed?;
+        assert_eq!(pushed.url, None);
+        assert_eq!((pushed.files, pushed.bytes), (2, 9));
+        assert!(hub.uploads().is_empty() && hub.ensured().is_empty());
+        let card = std::fs::read_to_string(runs.run_dir(RUN)?.join("hub/README.md"))?;
+        assert!(card.contains(MARKER), "{card}");
+        assert!(!runs.run_dir(RUN)?.join("hub/push.json").exists());
+        assert_eq!(
+            lines,
+            [
+                "push: me/my-proj, private when created; nothing is sent (--dry-run)",
+                "adapter_config.json  0.0 MB",
+                "adapter_model.safetensors  0.0 MB",
+                "push: 2 files, 0.0 MB; card written to runs/r1/hub/README.md",
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn foreign_card_is_kept_without_the_flag() -> TestResult {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let hub = FakeHub {
+            existing: Some(false),
+            remote_card: Some("# my own card\n".into()),
+            ..FakeHub::default()
+        };
+        let (pushed, lines) = push(&hub, &runs, &settings("")?, &PushOptions::default()).await;
+        assert!(pushed?.card_kept);
+        let uploads = hub.uploads();
+        let [(_, _, card)] = uploads.as_slice() else {
+            return Err("one upload expected".into());
+        };
+        assert_eq!(card, "# my own card\n");
+        assert!(
+            lines.contains(&"repo me/my-proj exists and stays public".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"kept the repo's own README.md (use --overwrite-card to replace it)".to_string()
+            ),
+            "{lines:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn marked_card_is_replaced() -> TestResult {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let old = format!("old card\n{MARKER}\n");
+        let hub = FakeHub {
+            existing: Some(true),
+            remote_card: Some(old.clone()),
+            ..FakeHub::default()
+        };
+        let (pushed, lines) = push(&hub, &runs, &settings("")?, &PushOptions::default()).await;
+        assert!(!pushed?.card_kept);
+        let uploads = hub.uploads();
+        let [(_, _, card)] = uploads.as_slice() else {
+            return Err("one upload expected".into());
+        };
+        assert_ne!(card, &old);
+        assert!(
+            card.contains(MARKER) && card.contains("me/my-proj"),
+            "{card}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("exists and stays")),
+            "same visibility, nothing to say: {lines:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overwrite_card_replaces_a_foreign_card() -> TestResult {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let hub = FakeHub {
+            existing: Some(true),
+            remote_card: Some("# my own card\n".into()),
+            ..FakeHub::default()
+        };
+        let opts = PushOptions {
+            overwrite_card: true,
+            ..PushOptions::default()
+        };
+        let (pushed, _) = push(&hub, &runs, &settings("")?, &opts).await;
+        assert!(!pushed?.card_kept);
+        let uploads = hub.uploads();
+        let [(_, _, card)] = uploads.as_slice() else {
+            return Err("one upload expected".into());
+        };
+        assert!(card.contains(MARKER), "{card}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_error_names_the_token_variable_not_its_value() -> TestResult {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let hub = FakeHub {
+            fail_auth: true,
+            ..FakeHub::default()
+        };
+        let (pushed, lines) = push(&hub, &runs, &settings("")?, &PushOptions::default()).await;
+        let error = pushed.err().ok_or("pushed with a refused token")?;
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("OVERBRAINER_HF_TOKEN"),
+            "the error must name the variable"
+        );
+        assert!(
+            !text.contains("hf_test"),
+            "the error must not hold the token"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("hf_test")),
+            "no line may hold the token"
+        );
+        assert_eq!(hub.uploads().len(), 0, "nothing uploaded");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn progress_is_published_at_most_once_a_second() -> TestResult {
+        let hub = FakeHub {
+            progress_steps: 5,
+            ..FakeHub::default()
+        };
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let repo = RepoId::parse("me/x").ok_or("bad repo")?;
+        let files = vec![UploadFile {
+            local: "a".into(),
+            path_in_repo: "a".into(),
+            size: 100,
+        }];
+        upload(&hub, &repo, files, String::new(), String::new(), RUN, &bus).await?;
+        let mut pushes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            pushes.push(event);
+        }
+        assert_eq!(
+            pushes,
+            [Event::Push {
+                run_id: RUN.into(),
+                done: 20,
+                total: 100
+            }],
+            "five reports within a second make one event"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn push_record_is_saved() -> TestResult {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let hub = FakeHub::default();
+        push(&hub, &runs, &settings("")?, &PushOptions::default())
+            .await
+            .0?;
+        let text = std::fs::read_to_string(runs.run_dir(RUN)?.join("hub/push.json"))?;
+        let saved: crate::hub::record::PushRecord = serde_json::from_str(&text)?;
+        assert_eq!(saved.repo, "me/my-proj");
+        assert_eq!(saved.commit, "1");
+        assert_eq!(saved.url, "https://hf.co/me/x/commit/1");
+        assert_eq!(
+            saved.files,
+            [
+                "adapter_config.json",
+                "adapter_model.safetensors",
+                "README.md"
+            ]
+        );
+        assert!(saved.private);
+        assert!(crate::runs::parse_rfc3339(&saved.pushed).is_some());
+        Ok(())
+    }
+}

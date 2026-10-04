@@ -106,6 +106,11 @@ impl Progress {
             },
             Event::Mark(_) | Event::RunWatched { .. } => self.tell_phase(event),
             Event::PodStatus(status) => tracing::info!("pod: {}", pod_line(status)),
+            Event::Push {
+                run_id,
+                done,
+                total,
+            } => pushed(run_id, *done, *total),
             // Only the metrics and the TUI use them.
             Event::StageModel { .. } | Event::System(_) => {},
         }
@@ -333,6 +338,19 @@ pub fn pod_line(status: &PodStatus) -> String {
     }
 }
 
+fn pushed(run_id: &str, done: u64, total: u64) {
+    tracing::info!("{}", push_line(run_id, done, total));
+}
+
+/// The upload progress of run `run_id`: `push: <run-id> 1.2 MB/3.4 GB`.
+fn push_line(run_id: &str, done: u64, total: u64) -> String {
+    format!(
+        "push: {run_id} {}/{}",
+        super::export::size_words(done),
+        super::export::size_words(total)
+    )
+}
+
 /// `duration` to the second below a minute, to the second below an hour, to the
 /// minute above: `45s`, `3m41s`, `1h12m`.
 #[must_use]
@@ -392,6 +410,14 @@ mod tests {
             error: "boom".to_string(),
             retryable,
         }
+    }
+
+    #[test]
+    fn a_push_line_shows_the_bytes_uploaded() {
+        assert_eq!(
+            push_line("r1", 412_345_678, 1_234_567_890),
+            "push: r1 412.3 MB/1.2 GB"
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@
 pub mod card;
 pub mod files;
 mod hf;
+pub mod record;
 
 pub use hf::HfHub;
 
