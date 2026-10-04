@@ -140,10 +140,10 @@ async fn a_run_is_pushed_to_a_new_repo_and_recorded() -> TestResult {
     assert!(!leaks(&output.stdout), "stdout must not hold the token");
     assert!(!leaks(&output.stderr), "stderr must not hold the token");
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(output.status.success(), "{stdout}");
-    assert_eq!(
-        stdout,
-        "push: https://hf.co/me/my-demo/commit/abc (2 files, 0.0 MB)\n"
+    assert!(output.status.success(), "the push must succeed");
+    assert!(
+        stdout == "push: https://hf.co/me/my-demo/commit/abc (2 files, 0.0 MB)\n",
+        "stdout must be the push line alone"
     );
     let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
         dir.path().join("runs").join(RUN).join("hub/push.json"),

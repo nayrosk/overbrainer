@@ -13,7 +13,7 @@ use anyhow::{Context as _, anyhow, bail};
 use tokio::sync::mpsc;
 
 use super::PushArgs;
-use super::export::{model_of, size_words};
+use super::export::{Action, model_of, size_words};
 use super::front::Frontend;
 use super::train::{hf_token, warn};
 use crate::config::{EnvSource, Settings, Source};
@@ -121,7 +121,7 @@ pub(crate) async fn push_run<H: Hub>(
     front: &Frontend,
 ) -> anyhow::Result<Pushed> {
     let record = runs.load(run_id)?;
-    let model = model_of(runs, &record)?;
+    let model = model_of(runs, &record, Action::Push)?;
     if model != OUTPUT_DIR {
         bail!(
             "run {run_id} has no model in {OUTPUT_DIR}/ (only checkpoint {model}): export or \
@@ -586,7 +586,35 @@ parent = { provider = "mock", model = "parent" }
         let hub = FakeHub::default();
         let (pushed, _) = push(&hub, &runs, &settings("")?, &PushOptions::default()).await;
         let error = pushed.err().ok_or("pushed a running run")?;
-        assert!(error.to_string().contains("run r1 is running"), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "run r1 is running: only a succeeded or stopped run can be pushed"
+        );
+        let refusal = |record: &RunRecord| -> Result<String, Box<dyn std::error::Error>> {
+            runs.save(record)?;
+            let error = model_of(&runs, record, Action::Push)
+                .err()
+                .ok_or("accepted")?;
+            Ok(error.to_string())
+        };
+        let mut missing = record(RunState::Succeeded);
+        missing.message = Some("artifacts not retrieved: download failed".into());
+        assert_eq!(
+            refusal(&missing)?,
+            "the results of run r1 were not retrieved: retrieve them with `overbrainer train \
+             attach r1`, then push"
+        );
+        let dir = runs.run_dir(RUN)?;
+        std::fs::remove_file(dir.join("output/adapter_config.json"))?;
+        assert_eq!(
+            refusal(&record(RunState::Succeeded))?,
+            "runs/r1/output holds no model: nothing to push"
+        );
+        std::fs::remove_file(dir.join("axolotl.yaml"))?;
+        assert_eq!(
+            refusal(&record(RunState::Succeeded))?,
+            "runs/r1/axolotl.yaml is missing: the push needs it"
+        );
         assert_eq!(hub.uploads().len(), 0, "nothing uploaded");
         Ok(())
     }
