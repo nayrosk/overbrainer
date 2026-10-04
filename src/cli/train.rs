@@ -8,12 +8,14 @@ use anyhow::{Context, anyhow, bail};
 
 use super::front::{Frontend, Interrupt};
 use super::progress::status_name;
+use super::push::{PushOptions, push_run};
 use super::reload::Reloader;
 use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
 use crate::config::{DEFAULT_WORKDIR, Settings, Source, Target, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
+use crate::hub::{HfHub, Hub};
 use crate::runpod::{PodRecord, RunpodTarget, connect_followed};
 use crate::runs::{
     Launch, Outcome, REQUEST_POLL, RUNS_DIR, RunCtx, RunError, RunRecord, RunState, Runs,
@@ -171,7 +173,9 @@ async fn train(
         result,
         front,
         settings.export.ollama_name.as_deref(),
-    )
+    )?;
+    push_after_training(&runs, settings, &id, front).await;
+    Ok(())
 }
 
 /// `trainer` for the new run `run_id`, exporting its model at the end of its
@@ -223,7 +227,9 @@ async fn attach(
         result,
         front,
         settings.export.ollama_name.as_deref(),
-    )
+    )?;
+    push_after_training(&runs, &settings, run_id, front).await;
+    Ok(())
 }
 
 /// Follows `record` as [`watch`] does. A snapshot request written on the
@@ -357,7 +363,9 @@ async fn stop(
         result,
         front,
         settings.export.ollama_name.as_deref(),
-    )
+    )?;
+    push_after_training(&runs, &settings, run_id, front).await;
+    Ok(())
 }
 
 /// `train stop` while another overbrainer process, `holder`, holds the project,
@@ -759,6 +767,61 @@ pub(super) fn warn(message: &str) {
     tracing::warn!("{message}");
 }
 
+/// Pushes run `run_id` to the Hugging Face Hub when it succeeded and `[hub]
+/// after_training` is on. A failure only warns: the run stays succeeded and
+/// the command's outcome does not change.
+pub(super) async fn push_after_training(
+    runs: &Runs,
+    settings: &Settings,
+    run_id: &str,
+    front: &Frontend,
+) {
+    if !push_due(runs, settings, run_id) {
+        return;
+    }
+    let hub = async {
+        let token = settings.hf_token.as_ref().context(
+            "OVERBRAINER_HF_TOKEN is not set: a Hugging Face token with write access is needed \
+                 to push",
+        )?;
+        let token = hf_token(token).await?;
+        HfHub::new(settings.hub.base_url.as_deref(), &token)
+    };
+    match hub.await {
+        Ok(hub) => push_after_training_with(&hub, runs, settings, run_id, front).await,
+        Err(error) => warn(&push_failed(run_id, &error)),
+    }
+}
+
+/// [`push_after_training`] on `hub`.
+async fn push_after_training_with<H: Hub>(
+    hub: &H,
+    runs: &Runs,
+    settings: &Settings,
+    run_id: &str,
+    front: &Frontend,
+) {
+    if !push_due(runs, settings, run_id) {
+        return;
+    }
+    if let Err(error) = push_run(hub, runs, settings, run_id, &PushOptions::default(), front).await
+    {
+        warn(&push_failed(run_id, &error));
+    }
+}
+
+/// Whether the run succeeded, read after `finish`, and the push is on.
+fn push_due(runs: &Runs, settings: &Settings, run_id: &str) -> bool {
+    settings.hub.after_training
+        && runs
+            .load(run_id)
+            .is_ok_and(|record| record.state == RunState::Succeeded)
+}
+
+fn push_failed(run_id: &str, error: &anyhow::Error) -> String {
+    format!("push failed: {error:#}; run it again with: overbrainer push {run_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -769,6 +832,68 @@ mod tests {
 
     use super::*;
     use crate::events::EventBus;
+
+    use crate::cli::push::fixtures::{FakeHub, RUN, front, project, said, settings};
+    use crate::runs::RunState;
+
+    const HUB_ON: &str = "\n[hub]\nafter_training = true\n";
+
+    async fn pushed_after_training(hub: &FakeHub, runs: &Runs, settings: &Settings) -> Vec<String> {
+        let (front, lines) = front();
+        push_after_training_with(hub, runs, settings, RUN, &front).await;
+        said(&lines)
+    }
+
+    #[tokio::test]
+    async fn pushes_a_succeeded_run_when_enabled() -> anyhow::Result<()> {
+        let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
+        let hub = FakeHub::default();
+        let settings = settings(HUB_ON).map_err(|e| anyhow!("{e}"))?;
+        pushed_after_training(&hub, &runs, &settings).await;
+        assert_eq!(hub.uploads().len(), 1, "the run is pushed once");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn does_nothing_when_disabled() -> anyhow::Result<()> {
+        let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
+        let hub = FakeHub::default();
+        let settings = settings("").map_err(|e| anyhow!("{e}"))?;
+        pushed_after_training(&hub, &runs, &settings).await;
+        assert!(hub.uploads().is_empty(), "nothing is pushed");
+        assert!(hub.ensured().is_empty(), "the Hub is not reached");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn does_nothing_for_a_failed_run() -> anyhow::Result<()> {
+        let (_project, runs) = project(RunState::Failed, false).map_err(|e| anyhow!("{e}"))?;
+        let hub = FakeHub::default();
+        let settings = settings(HUB_ON).map_err(|e| anyhow!("{e}"))?;
+        let said = pushed_after_training(&hub, &runs, &settings).await;
+        assert!(hub.uploads().is_empty(), "nothing is pushed");
+        assert!(said.is_empty(), "nothing is said");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_push_warns_and_keeps_the_run_succeeded() -> anyhow::Result<()> {
+        let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
+        let hub = FakeHub {
+            fail_auth: true,
+            ..FakeHub::default()
+        };
+        let settings = settings(HUB_ON).map_err(|e| anyhow!("{e}"))?;
+        pushed_after_training(&hub, &runs, &settings).await;
+        assert!(hub.uploads().is_empty(), "nothing is uploaded");
+        assert_eq!(runs.load(RUN)?.state, RunState::Succeeded);
+        let message = push_failed(RUN, &anyhow!("boom"));
+        assert_eq!(
+            message,
+            "push failed: boom; run it again with: overbrainer push r1"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn an_interruption_stops_the_preparation() -> anyhow::Result<()> {

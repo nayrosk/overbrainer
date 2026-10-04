@@ -376,36 +376,37 @@ impl Hub for Offline {
     }
 }
 
+/// Shared by the tests of the push and of the push after training.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
+    use std::future::{Future, ready};
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use tokio_util::sync::CancellationToken;
 
-    use super::*;
-    use crate::cli::front::Report;
-    use crate::config::{EnvSource, load_str};
+    use crate::cli::front::{Frontend, Report};
+    use crate::config::{EnvSource, Settings, load_str};
     use crate::events::EventBus;
-    use crate::hub::card::MARKER;
-    use crate::runs::{RunRecord, RunState, Snapshot, SnapshotReason};
+    use crate::hub::{
+        Commit, Hub, HubError, Progress, ProgressSink, RepoId, RepoState, UploadFile,
+    };
+    use crate::runs::{RunRecord, RunState, Runs, Snapshot, SnapshotReason};
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-    const RUN: &str = "r1";
+    pub(crate) const RUN: &str = "r1";
 
     #[derive(Default)]
-    struct FakeHub {
+    pub(crate) struct FakeHub {
         /// The visibility of the repo when it exists already.
-        existing: Option<bool>,
-        remote_card: Option<String>,
-        fail_auth: bool,
+        pub existing: Option<bool>,
+        pub remote_card: Option<String>,
+        pub fail_auth: bool,
         /// Progress reports per upload, at least one.
-        progress_steps: u64,
+        pub progress_steps: u64,
         /// `(repo, private)` of each `ensure_repo`.
-        ensured: Mutex<Vec<(String, bool)>>,
+        pub ensured: Mutex<Vec<(String, bool)>>,
         /// `(repo, paths, card)` of each upload.
-        uploads: Mutex<Vec<(String, Vec<String>, String)>>,
+        pub uploads: Mutex<Vec<(String, Vec<String>, String)>>,
     }
 
     impl Hub for FakeHub {
@@ -476,16 +477,16 @@ mod tests {
     }
 
     impl FakeHub {
-        fn uploads(&self) -> Vec<(String, Vec<String>, String)> {
+        pub(crate) fn uploads(&self) -> Vec<(String, Vec<String>, String)> {
             self.uploads.lock().map(|u| u.clone()).unwrap_or_default()
         }
 
-        fn ensured(&self) -> Vec<(String, bool)> {
+        pub(crate) fn ensured(&self) -> Vec<(String, bool)> {
             self.ensured.lock().map(|e| e.clone()).unwrap_or_default()
         }
     }
 
-    const CONFIG: &str = r#"[project]
+    pub(crate) const CONFIG: &str = r#"[project]
 name = "my_proj"
 
 [providers.mock]
@@ -496,12 +497,12 @@ generator = { provider = "mock", model = "gen" }
 parent = { provider = "mock", model = "parent" }
 "#;
 
-    fn settings(extra: &str) -> Result<Settings, Box<dyn std::error::Error>> {
+    pub(crate) fn settings(extra: &str) -> Result<Settings, Box<dyn std::error::Error>> {
         let env = vec![("OVERBRAINER_HF_TOKEN".to_string(), "hf_test".to_string())];
         Ok(load_str(&format!("{CONFIG}{extra}"), EnvSource::Vars(env))?)
     }
 
-    fn record(state: RunState) -> RunRecord {
+    pub(crate) fn record(state: RunState) -> RunRecord {
         RunRecord {
             id: RUN.into(),
             target: "box".into(),
@@ -518,7 +519,7 @@ parent = { provider = "mock", model = "parent" }
 
     /// A project with run [`RUN`] in `state`, its adapter in `output/` unless
     /// `checkpoint_only`, beside Axolotl's README.md and a checkpoint.
-    fn project(
+    pub(crate) fn project(
         state: RunState,
         checkpoint_only: bool,
     ) -> Result<(tempfile::TempDir, Runs), Box<dyn std::error::Error>> {
@@ -549,7 +550,7 @@ parent = { provider = "mock", model = "parent" }
     }
 
     /// A TUI front end whose lines land in the returned vector.
-    fn front() -> (Frontend, Arc<Mutex<Vec<String>>>) {
+    pub(crate) fn front() -> (Frontend, Arc<Mutex<Vec<String>>>) {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&lines);
         let front = Frontend::Tui {
@@ -565,9 +566,20 @@ parent = { provider = "mock", model = "parent" }
         (front, lines)
     }
 
-    fn said(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    pub(crate) fn said(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
         lines.lock().map(|l| l.clone()).unwrap_or_default()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{FakeHub, RUN, front, project, record, said, settings};
+    use super::*;
+    use crate::events::EventBus;
+    use crate::hub::card::MARKER;
+    use crate::runs::{RunRecord, RunState};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     async fn push(
         hub: &FakeHub,

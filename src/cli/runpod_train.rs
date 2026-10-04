@@ -15,8 +15,8 @@ use secrecy::SecretString;
 use super::export::{Delivery, EXPORT_PREFIX, Plan, finish_export, started_line};
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
 use super::train::{
-    HF_TOKEN, POLL, exporting, finish, prepare, resumed, secrets, started, stop_requested,
-    stoppable, training, warn,
+    HF_TOKEN, POLL, exporting, finish, prepare, push_after_training, resumed, secrets, started,
+    stop_requested, stoppable, training, warn,
 };
 use crate::config::{Settings, Training};
 use crate::dataset::DataFiles;
@@ -165,6 +165,7 @@ pub(super) async fn train(
     let ollama = settings.export.ollama_name.as_deref();
     let report =
         |runs: &Runs, id: &str, result, front: &Frontend| finish(runs, id, result, front, ollama);
+    let created = std::sync::Mutex::new(None::<String>);
     let result = async {
         warn_orphans(&session.ctx()).await;
         let record = create(&session.runs, &settings.project.name, spec.workdir(), name)?;
@@ -172,6 +173,9 @@ pub(super) async fn train(
         let trainer = exporting(trainer, &record.id, &settings.export);
         started(&record);
         front.run_created(&record.id);
+        if let Ok(mut created) = created.lock() {
+            *created = Some(record.id.clone());
+        }
         let job = Job {
             session: &session,
             spec,
@@ -185,6 +189,11 @@ pub(super) async fn train(
     }
     .await;
     session.close().await;
+    // After the pod ended and the report: the GGUF of an export is in place.
+    let created = created.lock().ok().and_then(|id| id.clone());
+    if let (Ok(()), Some(id)) = (&result, created) {
+        push_after_training(&Runs::new(project_dir), settings, &id, front).await;
+    }
     result
 }
 
@@ -924,8 +933,12 @@ pub(super) async fn attach(
         report: &report,
         cancel_on_interrupt: false,
     };
+    let id = record.id.clone();
     let result = job.attach(&mut interrupt, record, &mut pod).await;
     session.close().await;
+    if result.is_ok() {
+        push_after_training(&Runs::new(project_dir), settings, &id, front).await;
+    }
     result
 }
 
@@ -1028,8 +1041,12 @@ pub(super) async fn stop(
         report: &report,
         cancel_on_interrupt: false,
     };
+    let id = record.id.clone();
     let result = job.stop(&mut interrupt, record, &mut pod).await;
     session.close().await;
+    if result.is_ok() {
+        push_after_training(&Runs::new(project_dir), settings, &id, front).await;
+    }
     result
 }
 
