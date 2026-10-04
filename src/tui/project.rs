@@ -265,10 +265,10 @@ fn roles_of(command: Command) -> Vec<Role> {
     }
 }
 
-/// The rows of `config`: project, topics,
-/// providers, roles, pipeline, training, targets, then the env-only `runpod`
-/// and the rest. Topics, providers and targets are those of the document,
-/// with the tables only the environment sets.
+/// The rows of `config`: project, topics, providers, roles, pipeline,
+/// training, targets, export, `hub` with its env-only `base_url`, metrics,
+/// then the env-only `runpod` and the rest. Topics, providers and targets are
+/// those of the document, with the tables only the environment sets.
 pub(super) fn rows(config: &ProjectConfig, locks: &Locks) -> Vec<Row> {
     let settings = &config.settings;
     let mut rows = Builder {
@@ -320,6 +320,15 @@ pub(super) fn rows(config: &ProjectConfig, locks: &Locks) -> Vec<Row> {
         value: &|field| hub_value(&settings.hub, field),
         lock: None,
     });
+    rows.env_only(
+        ("hub", "base_url", "Base URL of the Hugging Face Hub"),
+        settings
+            .hub
+            .base_url
+            .clone()
+            .map_or(Shown::Unset, Shown::Value),
+        None,
+    );
     rows.heading("metrics");
     rows.fields(&Table {
         section: Section::Metrics,
@@ -1252,6 +1261,21 @@ mod tests {
         assert_eq!(
             field(&rows, "pipeline.seed")?.detail(None),
             "pipeline.seed: Seed of the train/eval split (default 42)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_hub_base_url_is_an_env_only_row_like_the_runpod_one() -> TestResult {
+        let rows = rows(&config()?, &Locks::default());
+        for key in ["hub.base_url", "runpod.base_url"] {
+            let row = field(&rows, key)?;
+            assert_eq!(row.shown, Shown::Unset, "{key}");
+            assert!(row.path.is_none(), "{key} is env only");
+        }
+        assert_eq!(
+            field(&rows, "hub.base_url")?.detail(None),
+            "hub.base_url: env only, set OVERBRAINER_HUB__BASE_URL in .env"
         );
         Ok(())
     }
