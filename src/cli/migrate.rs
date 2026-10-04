@@ -30,6 +30,9 @@ const STATE_ENTRIES: [&str; 4] = [
     STATE_ENTRY,
 ];
 
+/// The `[hub]` flags a move of `training.hub_model_id` turns on when unset.
+const HUB_FLAGS: [&str; 2] = ["private", "after_training"];
+
 /// One change a migration makes.
 #[derive(Debug, Clone, PartialEq)]
 enum Change {
@@ -42,8 +45,12 @@ enum Change {
     /// Move the deprecated `training.hub_model_id` to `[hub]`. A `[hub] repo`
     /// already set stays, and the old key is only dropped.
     HubModelId {
+        /// The value of `training.hub_model_id`.
         value: String,
+        /// `[hub] repo`, when already set.
         hub_repo: Option<String>,
+        /// The [`HUB_FLAGS`] the move sets, those not set yet.
+        flags: Vec<&'static str>,
     },
 }
 
@@ -55,13 +62,19 @@ impl Change {
             Self::HubModelId {
                 value,
                 hub_repo: None,
-            } => (
-                "moved",
-                "move",
-                format!(
-                    "training.hub_model_id to [hub] repo = \"{value}\" (private, after_training)"
-                ),
-            ),
+                flags,
+            } => {
+                let set = if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", flags.join(", "))
+                };
+                (
+                    "moved",
+                    "move",
+                    format!("training.hub_model_id to [hub] repo = \"{value}\"{set}"),
+                )
+            },
             Self::HubModelId { .. } => ("removed", "remove", "training.hub_model_id".to_string()),
             Self::Gitignore => ("added", "add", format!("{STATE_ENTRY} to {GITIGNORE}")),
             Self::Backfill(entry) => (
@@ -151,6 +164,7 @@ fn plan(project_dir: &Path) -> anyhow::Result<Plan> {
         if let Change::HubModelId {
             value,
             hub_repo: Some(hub_repo),
+            ..
         } = &change
         {
             plan.notes.push(format!(
@@ -222,11 +236,21 @@ fn hub_model_id(project_dir: &Path) -> anyhow::Result<Option<Change>> {
     let Some(doc) = read_config(project_dir)? else {
         return Ok(None);
     };
+    let hub_repo = doc.get(&FieldPath::Hub("repo"));
+    let flags = if hub_repo.is_none() {
+        HUB_FLAGS
+            .into_iter()
+            .filter(|key| doc.get(&FieldPath::Hub(key)).is_none())
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(doc
         .get(&FieldPath::Training("hub_model_id"))
         .map(|value| Change::HubModelId {
             value,
-            hub_repo: doc.get(&FieldPath::Hub("repo")),
+            hub_repo,
+            flags,
         }))
 }
 
@@ -255,7 +279,7 @@ fn move_hub_model_id(project_dir: &Path) -> anyhow::Result<()> {
     if doc.get(&FieldPath::Hub("repo")).is_none() {
         doc.set(&FieldPath::Hub("repo"), FieldValue::Text(value))
             .map_err(edit)?;
-        for key in ["private", "after_training"] {
+        for key in HUB_FLAGS {
             let path = FieldPath::Hub(key);
             if doc.get(&path).is_none() {
                 doc.set(&path, FieldValue::Bool(true)).map_err(edit)?;
@@ -654,10 +678,34 @@ mod tests {
             with_training_key("hub_model_id = \"me/mentor\"")
         );
         let dir = project_with_toml(&toml)?;
-        migrate(dir.path(), false)?;
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            ["moved training.hub_model_id to [hub] repo = \"me/mentor\""],
+            "no flag is set, so none is named"
+        );
         let settings = load_text(&read_toml(dir.path())?)?;
         assert_eq!(settings.hub.repo.as_deref(), Some("me/mentor"));
         assert!(!settings.hub.private && !settings.hub.after_training);
+        Ok(())
+    }
+
+    #[test]
+    fn the_move_names_only_the_flags_it_sets() -> TestResult {
+        let toml = format!(
+            "{}\n[hub]\nprivate = false\n",
+            with_training_key("hub_model_id = \"me/mentor\"")
+        );
+        let dir = project_with_toml(&toml)?;
+        assert_eq!(
+            migrate(dir.path(), true)?,
+            ["would move training.hub_model_id to [hub] repo = \"me/mentor\" (after_training)"]
+        );
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            ["moved training.hub_model_id to [hub] repo = \"me/mentor\" (after_training)"]
+        );
+        let settings = load_text(&read_toml(dir.path())?)?;
+        assert!(!settings.hub.private && settings.hub.after_training);
         Ok(())
     }
 
