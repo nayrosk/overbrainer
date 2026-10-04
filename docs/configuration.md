@@ -135,6 +135,8 @@ The `[training]` section and the `[targets.*]` tables are described in [Training
 
 The optional `[export]` section (`after_training`, `quantize`, `ollama_name`) sets the export of a run's model to GGUF and its Ollama Modelfile, described in [Training](training.md#export-to-gguf-and-ollama), for example `OVERBRAINER_EXPORT__QUANTIZE=Q8_0` from the environment.
 
+The optional `[hub]` section (`repo`, `private`, `after_training`) sets the push of a run to Hugging Face, described in [Training](training.md#push-to-hugging-face), for example `OVERBRAINER_HUB__PRIVATE=false` from the environment. `training.hub_model_id` is deprecated in its favor: the load warns, and `overbrainer migrate` moves it to `[hub] repo`.
+
 ## Metrics
 
 `[metrics]` turns on a Prometheus endpoint. It is off unless `listen` is set:

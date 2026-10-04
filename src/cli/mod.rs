@@ -324,7 +324,7 @@ pub struct PushArgs {
     /// Run to push.
     #[arg(add = ArgValueCandidates::new(complete::run_ids))]
     pub run_id: String,
-    /// Repo, NAMESPACE/NAME (default [hub] repo, else <you>/<project>).
+    /// Repo, NAMESPACE/NAME (default `[hub] repo`, else `<you>/<project>`).
     #[arg(long)]
     pub repo: Option<String>,
     /// Create the repo public.
@@ -333,7 +333,7 @@ pub struct PushArgs {
     /// Replace a README.md the repo already has, even one overbrainer did not write.
     #[arg(long)]
     pub overwrite_card: bool,
-    /// Show what would be pushed and write the card to runs/<id>/hub/README.md, push nothing.
+    /// Show what would be pushed and write the card to `runs/<id>/hub/README.md`, push nothing.
     #[arg(long)]
     pub dry_run: bool,
 }

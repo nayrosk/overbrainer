@@ -214,6 +214,8 @@ The same check looks at the account's `overbrainer_host_key_<run-id>` secrets. O
 
 Without a network volume, a training run with `[export] after_training = true` and an export pod warn when `container_disk_gb` may be too small for what the export writes beside the run: the base model and the merged copy (bf16) unless the run already merged it, the 16-bit GGUF the quantization starts from, and the quantized GGUF, raised by 10%.
 
+`overbrainer push` never runs on a pod: it uploads the run's `output/` from your machine, after the results came back, so it needs no pod and bills nothing on Runpod (see [Training](training.md#push-to-hugging-face)).
+
 ## Custom images
 
 A custom `image` must keep an entrypoint that ends with `exec "$@"`, and provide `bash`, `sshd` (started with `service ssh`), `ssh-keygen`, `base64`, `curl`, `setsid`, `nohup`, `tar`, `find`, `sha256sum` and Axolotl in `venv`. Jobs on the pod start from `/etc/overbrainer/job.env`, which the pod writes with the image's `PATH`, its CUDA library path and `HF_HOME`, since an SSH session does not see the image's environment.
