@@ -27,8 +27,8 @@ const fn row(keys: &'static str, action: &'static str) -> KeyHelp {
 
 /// The note under the keys: what the data lock refuses, and the project lock the
 /// TUI holds.
-pub(super) const NOTE: &str = "e, d, r, A and t are refused while a stage, an edit or a training \
-                               start runs in this TUI; the TUI also holds the project lock, \
+pub(super) const NOTE: &str = "e, d, r, A, t and h are refused while a stage, an edit or a \
+                               training start runs in this TUI; the TUI also holds the project lock, \
                                so no other overbrainer command writes to the project \
                                meanwhile.";
 
@@ -78,12 +78,12 @@ const DATASET: &[KeyHelp] = &[
 
 const TRAINING: &[KeyHelp] = &[
     row("k j, Up Down", "select a run"),
-    row("a", "attach: follow the selected run again"),
+    row("a, p", "attach the run again; p hides or shows its pod"),
     row("c", "cancel the job; abandons a Runpod start (asks)"),
     row("t", "start a training run (asks first)"),
     row("s, T", "stop with a snapshot; T resumes it (asks first)"),
     row("x", "hide the failed runs until restart (asks first)"),
-    row("p", "dismiss the selected run's pod, or show it"),
+    row("h", "push to Hugging Face (asks first)"),
     row(
         "g c, starting on Runpod",
         "choose GPU types, data centers (saved on y)",
@@ -204,7 +204,8 @@ const FOOTER_TRAINING: &[Hint] = &[
     hint("a", "attach"),
     hint("c", "cancel"),
     locking("t", "start"),
-    hint("x", "clear failed"),
+    locking("h", "push"),
+    hint("x", "clear"),
     hint("p", "pod"),
 ];
 const FOOTER_ABANDON: &[Hint] = &[
@@ -212,7 +213,8 @@ const FOOTER_ABANDON: &[Hint] = &[
     hint("a", "attach"),
     hint("c", "abandon"),
     locking("t", "start"),
-    hint("x", "clear failed"),
+    locking("h", "push"),
+    hint("x", "clear"),
     hint("p", "pod"),
 ];
 const FOOTER_LOGS: &[Hint] = &[
@@ -310,6 +312,27 @@ pub(super) fn of(view: View) -> &'static [KeyHelp] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `h` is in the Training view's help and footer, as a locking key.
+    #[test]
+    fn h_pushes_to_hugging_face() {
+        assert!(
+            TRAINING
+                .iter()
+                .any(|row| row.keys == "h" && row.action.starts_with("push to Hugging Face")),
+            "h in the help"
+        );
+        for context in [Context::View(View::Training), Context::Abandon] {
+            assert!(
+                footer(context).contains(&locking("h", "push")),
+                "{context:?}"
+            );
+        }
+        assert!(
+            NOTE.starts_with("e, d, r, A, t and h are refused"),
+            "{NOTE}"
+        );
+    }
 
     /// Every row fits the overlay, so no text is cut at the minimum terminal size
     /// (80 columns, wider than the overlay) and up.

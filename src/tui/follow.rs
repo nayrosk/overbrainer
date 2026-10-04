@@ -25,8 +25,9 @@ use super::app::{Action, App, Confirm, Effect, Exit, NoteOf, Overlay, Severity, 
 use super::auto;
 use super::start::{self, Catalog, StartPlan};
 use super::tasks::{Msg, Task, TaskId, TrainJob};
-use super::training::{Detach, Ended, Follow, Job, Listing, RunActivity};
+use super::training::{Detach, Ended, Follow, Job, Listing, Pushing, RunActivity};
 use crate::cli::front::Report;
+use crate::cli::push::{PushPlan, files_word, size_words};
 use crate::events::Event;
 use crate::runs::RunState;
 use crate::train::sizing::{Estimate, VramFloor};
@@ -166,6 +167,7 @@ impl App {
                 self.toggle_pod();
                 return Vec::new();
             },
+            KeyCode::Char('h') => return self.prepare_push(),
             _ => return Vec::new(),
         }
         self.read_selected()
@@ -193,6 +195,153 @@ impl App {
             no,
             action: Action::ClearFailed(failed),
         }));
+    }
+
+    /// `h`: prepares the confirmation of a push of the selected run to the
+    /// Hugging Face Hub, in a task; refused while the data is locked, the TUI
+    /// is quitting, or another push runs.
+    fn prepare_push(&mut self) -> Vec<Effect> {
+        let Some(run) = self
+            .training
+            .selected_run()
+            .map(|row| row.record.id.clone())
+        else {
+            return Vec::new();
+        };
+        if self.push_refused() {
+            return Vec::new();
+        }
+        if self.training.push_prepare.is_some() {
+            self.say(Severity::Info, "already preparing a push");
+            return Vec::new();
+        }
+        let id = self.task_id();
+        self.training.push_prepare = Some(id);
+        vec![Effect::Spawn(id, Task::PreparePush(run))]
+    }
+
+    /// Refuses a push while the data is locked, the TUI is quitting or
+    /// another push runs; says why.
+    fn push_refused(&mut self) -> bool {
+        if self.refuse_new("one task at a time", "push") {
+            return true;
+        }
+        if let Some(pushing) = &self.training.pushing {
+            let said = format!("run {} is being pushed: one push at a time", pushing.run);
+            self.say(Severity::Info, said);
+            return true;
+        }
+        false
+    }
+
+    /// Preparation `id` of a push found `plan`: asks to push, or says why the
+    /// run cannot be pushed, as the command says it.
+    pub(super) fn push_prepared(
+        &mut self,
+        id: TaskId,
+        plan: Result<PushPlan, String>,
+    ) -> Vec<Effect> {
+        if self.training.push_prepare != Some(id) {
+            return Vec::new();
+        }
+        self.training.push_prepare = None;
+        if self.leaving.is_some() {
+            return Vec::new();
+        }
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.say(Severity::Warn, error);
+                return Vec::new();
+            },
+        };
+        if self.overlay.is_some() || self.dataset.input.is_some() {
+            self.say(Severity::Info, "a push is prepared: press h again to push");
+            return Vec::new();
+        }
+        let visibility = if plan.private { "private" } else { "public" };
+        self.overlay = Some(Overlay::Confirm(Confirm {
+            title: format!(" Push run {}? ", plan.run_id),
+            text: vec![
+                format!("repo {}", plan.repo),
+                format!("visibility {visibility}"),
+                format!("{}, {}", files_word(plan.files), size_words(plan.bytes)),
+            ],
+            yes: "push",
+            no: "cancel",
+            action: Action::Push(plan.run_id),
+        }));
+        Vec::new()
+    }
+
+    /// The push of run `run` was confirmed: starts it, unless it is refused
+    /// now.
+    pub(super) fn confirm_push(&mut self, run: String) -> Vec<Effect> {
+        if self.push_refused() {
+            return Vec::new();
+        }
+        let task = self.task_id();
+        self.training.pushing = Some(Pushing {
+            task,
+            run: run.clone(),
+            progress: None,
+        });
+        vec![Effect::Spawn(task, Task::Push(run))]
+    }
+
+    /// A message of the push task: its progress shows in the run's head
+    /// line, its lines go to the log.
+    pub(super) fn on_push_message(&mut self, message: Msg) -> Vec<Effect> {
+        match message {
+            Msg::Event(
+                _,
+                Event::Push {
+                    run_id,
+                    done,
+                    total,
+                },
+            ) => {
+                if let Some(pushing) = &mut self.training.pushing
+                    && pushing.run == run_id
+                {
+                    pushing.progress = Some((done, total));
+                }
+            },
+            Msg::Report(_, Report::Line(line)) => tracing::info!("{line}"),
+            _ => {},
+        }
+        Vec::new()
+    }
+
+    /// Whether task `id` is the push running.
+    pub(super) fn is_push(&self, id: TaskId) -> bool {
+        self.training
+            .pushing
+            .as_ref()
+            .is_some_and(|pushing| pushing.task == id)
+    }
+
+    /// Push task `id` ended with the commit URL, or why it failed.
+    pub(super) fn pushed(&mut self, id: TaskId, result: Result<String, String>) -> Vec<Effect> {
+        if !self.is_push(id) {
+            return Vec::new();
+        }
+        let run = self
+            .training
+            .pushing
+            .take()
+            .map(|pushing| pushing.run)
+            .unwrap_or_default();
+        let (severity, said) = match result {
+            Ok(url) => (Severity::Info, format!("pushed to {url}")),
+            Err(error) => (Severity::Error, format!("push failed: {error}")),
+        };
+        if self.leaving.is_some() {
+            self.exit_notes.push(format!("run {run}: {said}"));
+        }
+        self.say(severity, said);
+        self.leave_when_idle();
+        Vec::new()
     }
 
     /// Leaves runs `runs`, failed, out of the list until the TUI restarts; the

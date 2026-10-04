@@ -36,8 +36,13 @@ pub(in crate::tui) fn destructive(action: &Action, stage_running: bool) -> bool 
         | Action::Remove(_)
         | Action::CancelAuto => true,
         Action::Quit => stage_running,
-        // A stop keeps what the job did: its snapshot.
-        Action::Start(_) | Action::Auto(_) | Action::ClearFailed(_) | Action::Stop(_) => false,
+        // A stop keeps what the job did: its snapshot. A push only adds a
+        // commit to the repo.
+        Action::Start(_)
+        | Action::Auto(_)
+        | Action::ClearFailed(_)
+        | Action::Stop(_)
+        | Action::Push(_) => false,
     }
 }
 

@@ -17,7 +17,7 @@ use super::app::{App, Effect, Overlay, Project, View};
 use super::dataset::{Node, TopicInfo};
 use super::motion::MotionLevel;
 use super::project::ProjectConfig;
-use super::tasks::{Done, History, TaskId};
+use super::tasks::{Done, History, Task, TaskId};
 use super::theme::{ColorLevel, LookEnv, Theme};
 use super::ui;
 use super::widgets::status::VERSION;
@@ -1632,6 +1632,28 @@ fn p_dismisses_the_pod_of_a_run_nothing_follows() -> TestResult {
     Ok(())
 }
 
+/// `h` on the finished run: once its push is prepared, the dialog says where
+/// it goes, how visible it is and how much it sends.
+#[test]
+fn the_push_dialog_of_a_finished_run() -> TestResult {
+    let mut app = training_app()?;
+    app.training.selected = 1;
+    let effects = app.on_input(&key(KeyCode::Char('h')));
+    let [Effect::Spawn(prepare, Task::PreparePush(_))] = effects.as_slice() else {
+        return Err(format!("no preparation: {effects:?}").into());
+    };
+    let plan = crate::cli::push::PushPlan {
+        run_id: FINISHED.into(),
+        repo: "<you>/rust-expert".into(),
+        private: true,
+        files: 2,
+        bytes: 1_234_000_000,
+    };
+    app.on_done(*prepare, Ok(Done::PushPrepared(Ok(plan))));
+    snapshot("training_push_confirm", &mut app)?;
+    Ok(())
+}
+
 #[test]
 fn the_cancel_dialog_and_the_quit_dialog_of_a_followed_run() -> TestResult {
     let mut app = training_app()?;
@@ -1822,7 +1844,7 @@ fn the_help_note_fits_every_view_at_80x24() -> TestResult {
         app.view = view;
         let rows = text(&draw(&mut app, 80, 24)?).join("\n");
         assert!(
-            rows.contains("e, d, r, A and t are refused"),
+            rows.contains("e, d, r, A, t and h are refused"),
             "{view:?}\n{rows}"
         );
         assert!(

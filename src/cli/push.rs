@@ -6,14 +6,15 @@
 
 use std::future::{Future, ready};
 use std::iter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, anyhow, bail};
 use tokio::sync::mpsc;
 
 use super::PushArgs;
-use super::export::{Action, model_of, size_words};
+pub(crate) use super::export::size_words;
+use super::export::{Action, model_of};
 use super::front::Frontend;
 use super::train::{hf_token, warn};
 use crate::config::{EnvSource, Settings, Source};
@@ -23,7 +24,7 @@ use crate::hub::{
     Commit, HfHub, Hub, HubError, Progress, ProgressSink, RepoId, RepoState, UploadFile, card,
     files,
 };
-use crate::runs::{RUNS_DIR, Runs, rfc3339, write_atomic};
+use crate::runs::{RUNS_DIR, RunRecord, Runs, rfc3339, write_atomic};
 use crate::train::OUTPUT_DIR;
 
 /// The card in the repo, and the copy a dry run writes in `runs/<id>/hub/`.
@@ -80,19 +81,10 @@ pub(super) async fn run(
         dry_run: args.dry_run,
     };
     let push = async {
-        match &settings.hf_token {
-            Some(token) => {
-                let token = hf_token(token).await?;
-                let hub = HfHub::new(settings.hub.base_url.as_deref(), &token)?;
-                push_run(&hub, &runs, &settings, &args.run_id, &opts, front).await
-            },
-            None if opts.dry_run => {
-                push_run(&Offline, &runs, &settings, &args.run_id, &opts, front).await
-            },
-            None => bail!(
-                "OVERBRAINER_HF_TOKEN is not set: a Hugging Face token with write access is \
-                 needed to push"
-            ),
+        if settings.hf_token.is_none() && opts.dry_run {
+            push_run(&Offline, &runs, &settings, &args.run_id, &opts, front).await
+        } else {
+            push_with_token(&runs, &settings, &args.run_id, &opts, front).await
         }
     };
     tokio::select! {
@@ -102,6 +94,92 @@ pub(super) async fn run(
             bail!("push cancelled: nothing was committed, run it again to resume")
         },
     }
+}
+
+/// What a push of a run would send, read from its files alone: no network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushPlan {
+    /// The run.
+    pub run_id: String,
+    /// `[hub] repo`, else `<you>/<project>` with `_` as `-`.
+    pub repo: String,
+    /// Whether the repo is created private.
+    pub private: bool,
+    /// The run's files pushed, the card aside.
+    pub files: usize,
+    /// Their total size.
+    pub bytes: u64,
+}
+
+/// What a push of run `run_id` with the default options would send, for the
+/// TUI's confirmation.
+///
+/// # Errors
+///
+/// Returns the same refusals as [`push_run`] for a run that cannot be pushed.
+pub(crate) fn plan(runs: &Runs, settings: &Settings, run_id: &str) -> anyhow::Result<PushPlan> {
+    let (_, _, files) = pushable(runs, run_id)?;
+    let repo = settings
+        .hub
+        .repo
+        .clone()
+        .unwrap_or_else(|| format!("<you>/{}", settings.project.name.replace('_', "-")));
+    Ok(PushPlan {
+        run_id: run_id.to_string(),
+        repo,
+        private: settings.hub.private,
+        files: files.len(),
+        bytes: files.iter().map(|file| file.size).sum(),
+    })
+}
+
+/// The record of run `run_id`, its directory and the files of its `output/`
+/// to push.
+///
+/// # Errors
+///
+/// Returns an error when the run cannot be pushed: its state, its files, a
+/// checkpoint without a model in `output/`, or nothing to push.
+fn pushable(runs: &Runs, run_id: &str) -> anyhow::Result<(RunRecord, PathBuf, Vec<UploadFile>)> {
+    let record = runs.load(run_id)?;
+    let model = model_of(runs, &record, Action::Push)?;
+    if model != OUTPUT_DIR {
+        bail!(
+            "run {run_id} has no model in {OUTPUT_DIR}/ (only checkpoint {model}): export or \
+             resume it first"
+        );
+    }
+    let run_dir = runs.run_dir(run_id)?;
+    let files = files::select(&run_dir.join(OUTPUT_DIR))?;
+    if files.is_empty() {
+        bail!("run {run_id} has nothing to push in {OUTPUT_DIR}/");
+    }
+    Ok((record, run_dir, files))
+}
+
+/// Pushes run `run_id` of `runs` to the Hugging Face Hub with the token of
+/// `settings`, resolved only now; shared by the command and the TUI task.
+///
+/// # Errors
+///
+/// Returns an error when the token is missing or cannot be resolved, the run
+/// cannot be pushed, or the Hub refuses it.
+pub(crate) async fn push_with_token(
+    runs: &Runs,
+    settings: &Settings,
+    run_id: &str,
+    opts: &PushOptions,
+    front: &Frontend,
+) -> anyhow::Result<Pushed> {
+    let Some(token) = &settings.hf_token else {
+        bail!(
+            "OVERBRAINER_HF_TOKEN is not set: a Hugging Face token with write access is needed \
+             to push"
+        );
+    };
+    let token = hf_token(token).await?;
+    let hub = HfHub::new(settings.hub.base_url.as_deref(), &token)?;
+    push_run(&hub, runs, settings, run_id, opts, front).await
 }
 
 /// Pushes run `run_id` of `runs` to `hub`; shared by the command, the TUI task
@@ -120,19 +198,7 @@ pub(crate) async fn push_run<H: Hub>(
     opts: &PushOptions,
     front: &Frontend,
 ) -> anyhow::Result<Pushed> {
-    let record = runs.load(run_id)?;
-    let model = model_of(runs, &record, Action::Push)?;
-    if model != OUTPUT_DIR {
-        bail!(
-            "run {run_id} has no model in {OUTPUT_DIR}/ (only checkpoint {model}): export or \
-             resume it first"
-        );
-    }
-    let run_dir = runs.run_dir(run_id)?;
-    let files = files::select(&run_dir.join(OUTPUT_DIR))?;
-    if files.is_empty() {
-        bail!("run {run_id} has nothing to push in {OUTPUT_DIR}/");
-    }
+    let (record, run_dir, files) = pushable(runs, run_id)?;
     let repo = repo_of(hub, settings, opts).await?;
     let private = !opts.public && settings.hub.private;
     let mut input = card::gather(runs, &record, settings, &repo, None, &files)?;
@@ -326,7 +392,7 @@ fn visibility(private: bool) -> &'static str {
 }
 
 /// `1 file`, `2 files`.
-fn files_word(count: usize) -> String {
+pub(crate) fn files_word(count: usize) -> String {
     if count == 1 {
         "1 file".to_string()
     } else {
@@ -575,6 +641,7 @@ parent = { provider = "mock", model = "parent" }
 mod tests {
     use super::fixtures::{FakeHub, RUN, front, project, record, said, settings};
     use super::*;
+    use crate::config::load_str;
     use crate::events::EventBus;
     use crate::hub::card::MARKER;
     use crate::runs::{RunRecord, RunState};
@@ -872,6 +939,63 @@ mod tests {
                 total: 100
             }],
             "five reports within a second make one event"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_says_what_a_push_sends_without_the_network() -> TestResult {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let planned = plan(&runs, &settings("")?, RUN)?;
+        assert_eq!(
+            planned,
+            PushPlan {
+                run_id: RUN.into(),
+                repo: "<you>/my-proj".into(),
+                private: true,
+                files: 2,
+                bytes: 9,
+            }
+        );
+        let configured = settings("\n[hub]\nrepo = \"org/model\"\nprivate = false\n")?;
+        let planned = plan(&runs, &configured, RUN)?;
+        assert_eq!(
+            (planned.repo.as_str(), planned.private),
+            ("org/model", false)
+        );
+        runs.save(&record(RunState::Running))?;
+        let error = plan(&runs, &configured, RUN)
+            .err()
+            .ok_or("planned a running run")?;
+        assert_eq!(
+            error.to_string(),
+            "run r1 is running: only a succeeded or stopped run can be pushed"
+        );
+        let (_project, runs) = project(RunState::Stopped, true)?;
+        let error = plan(&runs, &configured, RUN)
+            .err()
+            .ok_or("planned a checkpoint")?;
+        assert_eq!(
+            error.to_string(),
+            "run r1 has no model in output/ (only checkpoint output/checkpoint-10): export or \
+             resume it first"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn push_with_token_refuses_without_a_token() -> TestResult {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let settings = load_str(super::fixtures::CONFIG, EnvSource::Vars(Vec::new()))?;
+        let (front, _) = front();
+        let error = push_with_token(&runs, &settings, RUN, &PushOptions::default(), &front)
+            .await
+            .err()
+            .ok_or("pushed without a token")?;
+        assert_eq!(
+            error.to_string(),
+            "OVERBRAINER_HF_TOKEN is not set: a Hugging Face token with write access is needed \
+             to push"
         );
         Ok(())
     }

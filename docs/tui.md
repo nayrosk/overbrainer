@@ -79,6 +79,7 @@ Training:
 | `s` | Stop the selected run's job with a snapshot (asks first). |
 | `T` | Start a training run resuming the selected stopped run (asks first). |
 | `x` | Hide the failed runs from the list until the TUI restarts (asks first). Nothing is deleted. |
+| `h` | Push the selected run to Hugging Face, as `overbrainer push` does (asks first, showing the repo, its visibility and the size). Refused while a stage, an edit or a training start runs. |
 | `p` | Dismiss the selected run's pod from the view, or show it again. Refused while the run is followed. |
 | `g` `c`, in the start confirmation for a Runpod target | Choose the GPU types or the data centers from the catalog instead of what `overbrainer.toml` has; the choice is saved to `overbrainer.toml` when the run starts. |
 

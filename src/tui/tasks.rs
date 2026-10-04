@@ -25,6 +25,7 @@ use super::start::{AutoPlan, Catalog, StartPlan, look_up, prepare, prepare_auto,
 use super::training::{Listing, list_runs, read_series};
 use crate::cli::data::{Command, Load};
 use crate::cli::front::{Frontend, Report};
+use crate::cli::push::{self, PushOptions, PushPlan};
 use crate::cli::{StageArgs, TrainArgs, TrainCommand};
 use crate::config::{DotenvKeys, EnvSource, ReloadError, Source, Stamp, reload, stamp};
 use crate::dataset::{Counts, DataFiles, Dataset, Deletion};
@@ -32,6 +33,7 @@ use crate::events::{Event, EventBus, Observer, Stage};
 use crate::history::{self, Cost, Entry, Total};
 use crate::pipeline::{Ctx, SplitReport};
 use crate::prompts::Prompts;
+use crate::runs::Runs;
 use crate::train::sizing::VramFloor;
 use crate::train::{Phases, TrainMetric};
 
@@ -78,6 +80,11 @@ pub(super) enum Task {
     PrepareResume(String),
     /// What auto mode run now would do after split.
     PrepareAuto,
+    /// What a push of run `0` to the Hugging Face Hub would send, read from
+    /// its files: no network.
+    PreparePush(String),
+    /// `overbrainer push <run-id>`, with the default options.
+    Push(String),
     /// The Runpod GPU catalog for this many GPUs per pod, for the start
     /// dialog (list prices, VRAM and stock), and the VRAM the run needs.
     StartCatalog(u32),
@@ -233,6 +240,10 @@ pub(super) enum Done {
     Prepared(Result<StartPlan, String>),
     /// What auto mode would do after split, or why it cannot run.
     PreparedAuto(Result<AutoPlan, String>),
+    /// What a push would send, or why the run cannot be pushed.
+    PushPrepared(Result<PushPlan, String>),
+    /// The commit URL of a push, or why it failed.
+    Pushed(Result<String, String>),
     /// The GPU catalog of the start dialog and the VRAM the run needs, or
     /// why they cannot be read.
     StartCatalog(Catalog),
@@ -616,6 +627,8 @@ impl Tasks {
             Task::Prepare => self.spawn_prepare(false),
             Task::PrepareResume(run) => self.spawn_prepare_resume(run),
             Task::PrepareAuto => self.spawn_prepare(true),
+            Task::PreparePush(run) => self.spawn_prepare_push(run),
+            Task::Push(run) => self.spawn_push(id, run),
             Task::StartCatalog(gpu_count) => {
                 let dir = self.project_dir.clone();
                 let source = self.source.clone();
@@ -716,6 +729,51 @@ impl Tasks {
             let result = crate::cli::train::run(&dir, &job.args(), &front, &source).await;
             forwarded(front, forwarder, "training").await;
             Done::Trained(result.map_err(|error| format!("{error:#}")))
+        })
+    }
+
+    /// Reads what a push of run `run` would send, off the async threads.
+    fn spawn_prepare_push(&mut self, run: String) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        let source = self.source.clone();
+        self.set.spawn(async move {
+            let plan = tokio::task::spawn_blocking(move || {
+                let settings = source.load(&dir)?;
+                push::plan(&Runs::new(&dir), &settings, &run)
+            })
+            .await;
+            Done::PushPrepared(match plan {
+                Ok(plan) => plan.map_err(|error| format!("{error:#}")),
+                Err(error) => Err(format!("cannot prepare the push: {error}")),
+            })
+        })
+    }
+
+    /// Starts the push of run `run` as `id`: its token stops the push before
+    /// its commit, as Ctrl-C does on the command line.
+    fn spawn_push(&mut self, id: TaskId, run: String) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        let source = self.source.clone();
+        let token = CancellationToken::new();
+        let abandon = Arc::new(AtomicBool::new(false));
+        let (front, forwarder) = front_end(id, &self.messages, &token, &abandon, None);
+        self.tokens.insert(id, token.clone());
+        self.set.spawn(async move {
+            let push = async {
+                let settings = source.load(&dir)?;
+                let opts = PushOptions::default();
+                push::push_with_token(&Runs::new(&dir), &settings, &run, &opts, &front).await
+            };
+            let pushed = tokio::select! {
+                pushed = push => pushed
+                    .map(|pushed| pushed.url.unwrap_or_else(|| pushed.repo.to_string()))
+                    .map_err(|error| format!("{error:#}")),
+                () = token.cancelled() => Err(
+                    "push cancelled: nothing was committed, run it again to resume".to_string()
+                ),
+            };
+            forwarded(front, forwarder, "push").await;
+            Done::Pushed(pushed)
         })
     }
 
@@ -999,6 +1057,43 @@ mod tests {
             return Err(format!("unexpected end: {next:?}").into());
         };
         assert_eq!(error, format!("run {run} has not started"));
+        assert!(tasks.is_empty());
+        Ok(())
+    }
+
+    /// A push is prepared and run in tasks: a running run is refused as the
+    /// command refuses it, and a push without a token fails before reaching
+    /// the network.
+    #[tokio::test]
+    async fn push_tasks_refuse_as_the_command_does() -> TestResult {
+        let dir = project()?;
+        let run = "20260921-133200-a1b2";
+        crate::runs::Runs::new(dir.path()).save(&crate::tui::snapshots::run(
+            run,
+            "homelab",
+            crate::runs::RunState::Running,
+        ))?;
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
+        tasks.use_config(Source::from(EnvSource::Vars(Vec::new())));
+        tasks.spawn(TaskId(1), Task::PreparePush(run.into()));
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        let Some((TaskId(1), Ok(Done::PushPrepared(Err(error))))) = next else {
+            return Err(format!("unexpected end: {next:?}").into());
+        };
+        assert_eq!(
+            error,
+            format!("run {run} is running: only a succeeded or stopped run can be pushed")
+        );
+        tasks.spawn(TaskId(2), Task::Push(run.into()));
+        let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+        let Some((TaskId(2), Ok(Done::Pushed(Err(error))))) = next else {
+            return Err(format!("unexpected end: {next:?}").into());
+        };
+        assert_eq!(
+            error,
+            "OVERBRAINER_HF_TOKEN is not set: a Hugging Face token with write access is needed \
+             to push"
+        );
         assert!(tasks.is_empty());
         Ok(())
     }
