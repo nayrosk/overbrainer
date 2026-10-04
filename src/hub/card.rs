@@ -58,25 +58,39 @@ pub enum CardError {
 /// What the card says of a run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardInput {
+    /// The repo the card is pushed to.
     pub repo: RepoId,
+    /// The base model the run trained, a Hub id or a local path.
     pub base_model: String,
+    /// How the run trained it.
     pub adapter: Adapter,
+    /// The base model's license, `None` when unknown.
     pub license: Option<String>,
+    /// The parent model whose answers the run trained on.
     pub parent: String,
+    /// The model that wrote the questions.
     pub generator: String,
     /// Name and description, empty when the topic has none.
     pub topics: Vec<(String, String)>,
+    /// Number of training examples, `None` when unknown.
     pub train_examples: Option<usize>,
+    /// Number of evaluation examples, `None` when unknown.
     pub eval_examples: Option<usize>,
+    /// Number of epochs.
     pub epochs: Option<f64>,
     /// As written in the run's `axolotl.yaml`.
     pub learning_rate: Option<String>,
+    /// Maximum sequence length, in tokens.
     pub sequence_len: Option<u32>,
+    /// The last training loss.
     pub train_loss: Option<f64>,
+    /// The last evaluation loss.
     pub eval_loss: Option<f64>,
+    /// Training time, from the first training log to the last.
     pub duration: Option<Duration>,
     /// Quantization types of the GGUF files pushed, sorted.
     pub gguf: Vec<String>,
+    /// Where a Runpod run trained and what it cost, `None` for other targets.
     pub runpod: Option<RunpodLine>,
     /// The non-secret part of `overbrainer.toml`.
     pub reproduce_toml: String,
@@ -85,7 +99,9 @@ pub struct CardInput {
 /// Where a Runpod run trained, and what it cost.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunpodLine {
+    /// The GPU type of the pod.
     pub gpu: String,
+    /// The estimated spend, in US dollars.
     pub spend_usd: f64,
 }
 

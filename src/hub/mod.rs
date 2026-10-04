@@ -14,7 +14,9 @@ use crate::train::sizing::is_repo_id;
 /// `NAMESPACE/NAME`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoId {
+    /// The user or organization that owns the repo.
     pub namespace: String,
+    /// The repo's name within its namespace.
     pub name: String,
 }
 
@@ -43,42 +45,67 @@ impl fmt::Display for RepoId {
 /// One file to upload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadFile {
+    /// The file on disk.
     pub local: PathBuf,
+    /// Where it goes in the repo, `/`-separated.
     pub path_in_repo: String,
+    /// Its size, in bytes.
     pub size: u64,
 }
 
 /// What `ensure_repo` found or made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoState {
-    Created { private: bool },
-    Existing { private: bool },
+    /// The repo did not exist and was created.
+    Created {
+        /// Whether it was created private.
+        private: bool,
+    },
+    /// The repo existed already and keeps its visibility.
+    Existing {
+        /// Whether it is private.
+        private: bool,
+    },
 }
 
+/// A commit the Hub made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
+    /// The commit's page on the Hub.
     pub url: String,
+    /// The commit id.
     pub oid: String,
 }
 
 /// Upload progress, bytes over the files that go through Xet/LFS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
+    /// Bytes uploaded so far.
     pub done: u64,
+    /// Bytes to upload in all.
     pub total: u64,
 }
 
+/// Where [`Hub::upload`] sends its [`Progress`].
 pub type ProgressSink = tokio::sync::mpsc::UnboundedSender<Progress>;
 
+/// Errors of a [`Hub`]. No message ever holds the token.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum HubError {
+    /// The token is missing or the Hub rejected it.
     #[error("the Hugging Face token is missing or invalid")]
     Auth,
+    /// The token cannot write to the namespace.
     #[error("the Hugging Face token needs write access to {namespace}")]
-    Forbidden { namespace: String },
+    Forbidden {
+        /// The namespace the token cannot write to.
+        namespace: String,
+    },
+    /// The Hub asked to slow down.
     #[error("Hugging Face rate limit, retry later")]
     RateLimited,
+    /// Any other failure, with the Hub's message unless it held the token.
     #[error("Hugging Face request failed: {0}")]
     Other(String),
     /// The HTTP client could not be built. The message never holds the token.
