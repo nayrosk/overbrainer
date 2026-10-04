@@ -1,5 +1,6 @@
 //! Publishing to the Hugging Face Hub.
 
+pub mod card;
 pub mod files;
 mod hf;
 
