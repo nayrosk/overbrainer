@@ -15,6 +15,7 @@ use super::{TrainArgs, TrainCommand};
 use crate::config::{DEFAULT_WORKDIR, Settings, Source, Target, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
+use crate::hub::record::{HUB_DIR, PUSH_FILE};
 use crate::runpod::{PodRecord, RunpodTarget, connect_followed};
 use crate::runs::{
     Launch, Outcome, REQUEST_POLL, RUNS_DIR, RunCtx, RunError, RunRecord, RunState, Runs,
@@ -769,8 +770,8 @@ pub(super) fn warn(message: &str) {
     tracing::warn!("{message}");
 }
 
-/// Pushes run `run_id` to the Hugging Face Hub when it succeeded and `[hub]
-/// after_training` is on. A failure or an interruption only warns: the run
+/// Pushes run `run_id` to the Hugging Face Hub when it succeeded, `[hub]
+/// after_training` is on and it has no push record yet. A failure or an interruption only warns: the run
 /// stays succeeded and the command's outcome does not change.
 pub(super) async fn push_after_training(
     runs: &Runs,
@@ -799,6 +800,13 @@ async fn push_after(
     if !push_due(runs, settings, run_id) {
         return None;
     }
+    if already_pushed(runs, run_id) {
+        tracing::info!(
+            "run {run_id} is already on the Hugging Face Hub; push it again with: overbrainer \
+             push {run_id}"
+        );
+        return None;
+    }
     match front.interrupt().race(push).await {
         None => Some(format!(
             "push cancelled before its commit finished; run it again with: overbrainer push \
@@ -815,6 +823,13 @@ fn push_due(runs: &Runs, settings: &Settings, run_id: &str) -> bool {
         && runs
             .load(run_id)
             .is_ok_and(|record| record.state == RunState::Succeeded)
+}
+
+/// Whether run `run_id` has a push record, `runs/<id>/hub/push.json`: a new
+/// attach of a run pushed already must not commit it again.
+fn already_pushed(runs: &Runs, run_id: &str) -> bool {
+    runs.run_dir(run_id)
+        .is_ok_and(|dir| dir.join(HUB_DIR).join(PUSH_FILE).is_file())
 }
 
 fn push_failed(run_id: &str, error: &anyhow::Error) -> String {
@@ -868,6 +883,22 @@ mod tests {
             said.iter().any(|line| line.starts_with("push: https://")),
             "{said:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_already_pushed_is_not_pushed_again() -> anyhow::Result<()> {
+        let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
+        let hub = FakeHub::default();
+        let settings = settings(HUB_ON).map_err(|e| anyhow!("{e}"))?;
+        let (warning, _) = pushed_after_training(&hub, &runs, &settings).await;
+        assert_eq!(warning, None);
+        // A second attach of the same succeeded run finds its push record.
+        let (warning, said) = pushed_after_training(&hub, &runs, &settings).await;
+        assert_eq!(warning, None, "nothing failed");
+        assert!(said.is_empty(), "nothing is said: {said:?}");
+        assert_eq!(hub.uploads().len(), 1, "the run is pushed once");
+        assert_eq!(hub.ensured().len(), 1, "the Hub is not reached again");
         Ok(())
     }
 
