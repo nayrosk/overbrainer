@@ -1,5 +1,6 @@
 //! Publishing to the Hugging Face Hub.
 
+pub mod files;
 mod hf;
 
 pub use hf::HfHub;
