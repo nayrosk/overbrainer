@@ -26,7 +26,7 @@ const USER_AGENT: &str = concat!(
 );
 const TIMEOUT: Duration = Duration::from_secs(3);
 /// A cached answer younger than this skips the request.
-const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+const MAX_AGE: Duration = Duration::from_hours(24);
 /// An attempt that gave no answer (yet) skips the request this long.
 const RETRY_AFTER: Duration = Duration::from_secs(3600);
 const CACHE_FILE: &str = "latest-version.json";
@@ -322,7 +322,7 @@ mod tests {
         "versions":[{"num":"0.5.0-rc.1"},{"num":"0.4.2"}]}"#;
 
     fn now() -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+        SystemTime::UNIX_EPOCH + Duration::from_hours(500_000)
     }
 
     fn unix(time: SystemTime) -> u64 {

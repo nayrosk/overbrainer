@@ -574,7 +574,7 @@ mod tests {
         assert_eq!(
             pod_line(&PodStatus::Deleted {
                 pod_id: pod_id.clone(),
-                uptime: Some(Duration::from_secs(4_320)),
+                uptime: Some(Duration::from_mins(72)),
                 estimated_spend: Some(0.636),
             }),
             "k3x9abc deleted after 1h12m, about $0.64"
@@ -601,6 +601,6 @@ mod tests {
         assert_eq!(duration_words(Duration::from_secs(45)), "45s");
         assert_eq!(duration_words(Duration::from_secs(60)), "1m00s");
         assert_eq!(duration_words(Duration::from_secs(3_599)), "59m59s");
-        assert_eq!(duration_words(Duration::from_secs(10_920)), "3h02m");
+        assert_eq!(duration_words(Duration::from_mins(182)), "3h02m");
     }
 }

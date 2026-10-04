@@ -194,7 +194,7 @@ pub const SNAPSHOT_SHARE: f64 = 0.95;
 /// How long before the pod is deleted at the latest its job is asked for a
 /// snapshot: the watchdog's `OVERBRAINER_SNAPSHOT_LEAD` default, for the cost
 /// cap as for the deadline.
-pub const SNAPSHOT_LEAD: Duration = Duration::from_secs(15 * 60);
+pub const SNAPSHOT_LEAD: Duration = Duration::from_mins(15);
 
 /// Least time `max_cost_usd` should buy for a run to train before its cost
 /// snapshot: [`SNAPSHOT_LEAD`] twice.

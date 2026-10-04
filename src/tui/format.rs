@@ -104,6 +104,6 @@ mod tests {
     fn durations_show_hours_and_minutes_or_seconds() {
         assert_eq!(duration(Duration::from_secs(35)), "35s");
         assert_eq!(duration(Duration::from_secs(41 * 60 + 5)), "41m");
-        assert_eq!(duration(Duration::from_secs(3720)), "1h02m");
+        assert_eq!(duration(Duration::from_mins(62)), "1h02m");
     }
 }

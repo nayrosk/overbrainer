@@ -72,8 +72,8 @@ impl Timing {
     pub fn standard() -> Self {
         Self {
             poll: Duration::from_secs(5),
-            ready_timeout: Duration::from_secs(15 * 60),
-            preflight_timeout: Duration::from_secs(3 * 60),
+            ready_timeout: Duration::from_mins(15),
+            preflight_timeout: Duration::from_mins(3),
             reconcile_waits: [Duration::from_secs(5), Duration::from_secs(15)],
             delete_timeout: Duration::from_secs(60),
             gone_interval: Duration::from_secs(10),
@@ -1423,7 +1423,7 @@ mod tests {
                     container_disk_gb: 50,
                     max_hours: 6.0,
                     max_cost_usd: None,
-                    boot_grace: Duration::from_secs(1800),
+                    boot_grace: Duration::from_mins(30),
                     retrieve_grace: Duration::from_secs(3600),
                     data_center_ids: crate::config::ListOrAuto::default(),
                     network_volume_id: None,

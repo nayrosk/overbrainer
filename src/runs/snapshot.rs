@@ -19,7 +19,7 @@ use crate::train::{OUTPUT_DIR, SNAPSHOT_FILE, SNAPSHOT_REQUEST};
 
 /// How long a stop waits for the snapshot before it cancels the job instead:
 /// a job that neither wrote its proof nor ended by then will not.
-pub const STOP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub const STOP_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// Largest `snapshot.json` read from the target.
 const PROOF_LIMIT: u64 = 64 * 1024;
@@ -189,7 +189,7 @@ pub struct StopLimits {
 /// minutes for the job to end.
 pub const STOP_LIMITS: StopLimits = StopLimits {
     proof: STOP_TIMEOUT,
-    end: Duration::from_secs(10 * 60),
+    end: Duration::from_mins(10),
 };
 
 /// Runs `flow`, which follows the job `job` after its snapshot was asked for,
