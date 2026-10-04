@@ -764,13 +764,13 @@ impl Tasks {
                 let opts = PushOptions::default();
                 push::push_with_token(&Runs::new(&dir), &settings, &run, &opts, &front).await
             };
+            // A push whose commit is done wins over a cancel that came with it.
             let pushed = tokio::select! {
+                biased;
                 pushed = push => pushed
                     .map(|pushed| pushed.url.unwrap_or_else(|| pushed.repo.to_string()))
                     .map_err(|error| format!("{error:#}")),
-                () = token.cancelled() => Err(
-                    "push cancelled: nothing was committed, run it again to resume".to_string()
-                ),
+                () = token.cancelled() => Err(push::PUSH_CANCELLED.to_string()),
             };
             forwarded(front, forwarder, "push").await;
             Done::Pushed(pushed)

@@ -71,6 +71,7 @@ pub struct Progress {
 pub type ProgressSink = tokio::sync::mpsc::UnboundedSender<Progress>;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HubError {
     #[error("the Hugging Face token is missing or invalid")]
     Auth,
@@ -125,18 +126,22 @@ pub trait Hub: Send + Sync {
         model: &str,
     ) -> impl Future<Output = Result<Option<String>, HubError>> + Send;
 
-    /// One commit with every file plus README.md = `card`; nothing is committed
-    /// unless every upload finished.
+    /// One commit with every file plus README.md = `card`, the repo's README.md
+    /// left as it is when `card` is `None`; nothing is committed unless every
+    /// upload finished.
     ///
     /// # Errors
     ///
     /// Returns a [`HubError`] when an upload or the commit fails.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one commit's parts; the trait mirrors the Hub's commit call"
+    )]
     fn upload(
         &self,
         repo: &RepoId,
         files: Vec<UploadFile>,
-        card: String,
+        card: Option<String>,
         message: String,
         progress: ProgressSink,
     ) -> impl Future<Output = Result<Commit, HubError>> + Send;

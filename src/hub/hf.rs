@@ -18,10 +18,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The Hugging Face Hub, reached through `hf-hub`.
 pub struct HfHub {
     client: HFClient,
+    /// Only to keep it out of error messages.
+    token: SecretString,
 }
 
 impl HfHub {
-    /// A client for `base_url` (`[hub] base_url`, default `https://huggingface.co`).
+    /// A client for `base_url`, from the `OVERBRAINER_HUB__BASE_URL` environment
+    /// variable (no `overbrainer.toml` key), default `https://huggingface.co`.
     ///
     /// The token is always passed explicitly, so `hf-hub` never reads `HF_TOKEN`
     /// or the token file. There is no total timeout: uploads are long.
@@ -40,21 +43,37 @@ impl HfHub {
             .cache_enabled(false)
             .client(http)
             .build()?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            token: token.clone(),
+        })
     }
 }
 
-/// Maps a crate error. `namespace` names the owner for [`HubError::Forbidden`].
-/// The crate's `Display` never carries the token; `Debug` carries response
-/// bodies, so it is never used.
-fn map(error: &HFError, namespace: &str) -> HubError {
-    match error {
-        HFError::AuthRequired { .. } => HubError::Auth,
-        HFError::Forbidden { .. } => HubError::Forbidden {
-            namespace: namespace.to_string(),
-        },
-        HFError::RateLimited { .. } => HubError::RateLimited,
-        other => HubError::Other(other.to_string()),
+impl HfHub {
+    /// Maps a crate error. `namespace` names the owner for [`HubError::Forbidden`].
+    /// The crate's `Display` carries the server's `error` field, which a server
+    /// could fill with the token: such a message is withheld. `Debug` carries
+    /// response bodies, so it is never used.
+    fn map(&self, error: &HFError, namespace: &str) -> HubError {
+        match error {
+            HFError::AuthRequired { .. } => HubError::Auth,
+            HFError::Forbidden { .. } => HubError::Forbidden {
+                namespace: namespace.to_string(),
+            },
+            HFError::RateLimited { .. } => HubError::RateLimited,
+            other => {
+                let text = other.to_string();
+                let token = self.token.expose_secret();
+                if !token.is_empty() && text.contains(token) {
+                    HubError::Other(
+                        "the Hub's error message held the token, so it is not shown".to_string(),
+                    )
+                } else {
+                    HubError::Other(text)
+                }
+            },
+        }
     }
 }
 
@@ -83,7 +102,7 @@ impl Hub for HfHub {
         match self.client.whoami().send().await {
             Ok(user) => Ok(user.username),
             Err(HFError::Forbidden { .. }) => Err(HubError::Auth),
-            Err(error) => Err(map(&error, "")),
+            Err(error) => Err(self.map(&error, "")),
         }
     }
 
@@ -102,7 +121,7 @@ impl Hub for HfHub {
                 });
             },
             Err(HFError::RepoNotFound { .. }) => {},
-            Err(error) => return Err(map(&error, namespace)),
+            Err(error) => return Err(self.map(&error, namespace)),
         }
         let id = repo.to_string();
         self.client
@@ -113,7 +132,7 @@ impl Hub for HfHub {
             .exist_ok(true)
             .send()
             .await
-            .map_err(|error| map(&error, namespace))?;
+            .map_err(|error| self.map(&error, namespace))?;
         Ok(RepoState::Created { private })
     }
 
@@ -128,7 +147,7 @@ impl Hub for HfHub {
         {
             Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
             Err(HFError::EntryNotFound { .. }) => Ok(None),
-            Err(error) => Err(map(&error, &repo.namespace)),
+            Err(error) => Err(self.map(&error, &repo.namespace)),
         }
     }
 
@@ -157,7 +176,7 @@ impl Hub for HfHub {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)),
             Err(HFError::RepoNotFound { .. }) => Ok(None),
-            Err(error) => Err(map(&error, owner)),
+            Err(error) => Err(self.map(&error, owner)),
         }
     }
 
@@ -165,7 +184,7 @@ impl Hub for HfHub {
         &self,
         repo: &RepoId,
         files: Vec<UploadFile>,
-        card: String,
+        card: Option<String>,
         message: String,
         progress: ProgressSink,
     ) -> Result<Commit, HubError> {
@@ -173,7 +192,9 @@ impl Hub for HfHub {
             .into_iter()
             .map(|file| CommitOperation::add_file(file.path_in_repo, file.local))
             .collect();
-        operations.push(CommitOperation::add_bytes("README.md", card));
+        if let Some(card) = card {
+            operations.push(CommitOperation::add_bytes("README.md", card));
+        }
         let info = self
             .client
             .model(&repo.namespace, &repo.name)
@@ -183,7 +204,7 @@ impl Hub for HfHub {
             .progress(Handler(progress))
             .send()
             .await
-            .map_err(|error| map(&error, &repo.namespace))?;
+            .map_err(|error| self.map(&error, &repo.namespace))?;
         match (info.commit_url, info.commit_oid) {
             (Some(url), Some(oid)) => Ok(Commit { url, oid }),
             _ => Err(HubError::Other(
@@ -346,6 +367,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_repo_creates_a_missing_repo_public() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/me/x"))
+            .respond_with(not_found())
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/repos/create"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"url": "https://hf.co/me/x"})),
+            )
+            .mount(&server)
+            .await;
+        let state = hub(&server)?.ensure_repo(&repo("me/x")?, false).await?;
+        assert_eq!(state, RepoState::Created { private: false });
+        let requests = server.received_requests().await.ok_or("no request log")?;
+        let create = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/repos/create")
+            .ok_or("no create request")?;
+        let body: serde_json::Value = serde_json::from_slice(&create.body)?;
+        assert_eq!(body["private"], json!(false));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_other_and_never_echoes_the_token() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/me/x"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(json!({"error": format!("bad token {TOKEN}")})),
+            )
+            .mount(&server)
+            .await;
+        let error = hub(&server)?
+            .ensure_repo(&repo("me/x")?, true)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert!(matches!(error, HubError::Other(_)), "500 must map to Other");
+        assert!(!error.to_string().contains(TOKEN), "token must not appear");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn ensure_repo_reports_an_existing_repo_and_its_visibility() -> TestResult {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -429,6 +498,52 @@ mod tests {
         Ok(())
     }
 
+    /// A commit of `files` and `card` to `me/x` on a stub; the commit request's body.
+    async fn committed(card: Option<String>) -> Result<String, Box<dyn Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/models/me/x/preupload/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"files": [
+                {"path": "adapter_config.json", "uploadMode": "regular"},
+                {"path": "README.md", "uploadMode": "regular"}
+            ]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/models/me/x/commit/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"commitUrl": "https://hf.co/me/x/commit/abc", "commitOid": "abc"}),
+            ))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir()?;
+        let local = dir.path().join("adapter_config.json");
+        std::fs::write(&local, "{}")?;
+        let files = vec![UploadFile {
+            local,
+            path_in_repo: "adapter_config.json".into(),
+            size: 2,
+        }];
+        let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        hub(&server)?
+            .upload(&repo("me/x")?, files, card, "push run".into(), sink)
+            .await?;
+        let requests = server.received_requests().await.ok_or("no request log")?;
+        let commit_request = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/models/me/x/commit/main")
+            .ok_or("no commit request")?;
+        Ok(String::from_utf8(commit_request.body.clone())?)
+    }
+
+    #[tokio::test]
+    async fn a_kept_card_is_not_in_the_commit() -> TestResult {
+        let body = committed(None).await?;
+        assert!(!body.contains("README.md"), "the card stays as it is");
+        assert!(body.contains("adapter_config.json"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn upload_commits_small_files_inline_with_the_card() -> TestResult {
         let server = MockServer::start().await;
@@ -460,7 +575,7 @@ mod tests {
             .upload(
                 &repo("me/x")?,
                 files,
-                "# card".into(),
+                Some("# card".into()),
                 "push run".into(),
                 sink,
             )

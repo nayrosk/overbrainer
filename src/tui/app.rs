@@ -4432,6 +4432,11 @@ mod tests {
             status(&app),
             Some("run 20260920-101500-9f00 is being pushed: one push at a time")
         );
+        assert_eq!(
+            app.status.as_ref().map(|status| status.severity),
+            Some(Severity::Warn),
+            "a refusal warns, as the lock's do"
+        );
         let rows = text(&draw(&mut app, 120, 40)?);
         assert!(
             rows.iter()
@@ -4486,7 +4491,7 @@ mod tests {
             app.waiting_for(),
             [format!("waiting for the push of run {SECOND} to stop...")]
         );
-        let cancelled = "push cancelled: nothing was committed, run it again to resume";
+        let cancelled = crate::cli::push::PUSH_CANCELLED;
         ended(&mut app, task, Ok(Done::Pushed(Err(cancelled.into()))));
         assert_eq!(app.exit, Some(Exit::Quit));
         Ok(())

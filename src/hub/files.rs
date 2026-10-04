@@ -6,8 +6,12 @@ use anyhow::{Context, Result, bail};
 
 use super::UploadFile;
 
+/// The repo path of the card, which no file of the run may take.
+const CARD: &str = "README.md";
+
 /// The files of a run's `output/` to push, with their place in the repo.
-/// Skips `debug.log`, the root `README.md`, `checkpoint-*` directories and hidden entries.
+/// Skips `debug.log`, `checkpoint-*` directories, hidden entries and any file
+/// that would land on the repo's `README.md`, which is the card.
 /// `merged/**` keeps its prefix; `gguf/**` goes to the repo root.
 ///
 /// # Errors
@@ -37,10 +41,13 @@ fn walk(root: &Path, dir: &Path, chosen: &mut BTreeMap<String, UploadFile>) -> R
             }
             walk(root, &path, chosen)?;
         } else if meta.is_file() {
-            if at_root && (name == "debug.log" || name == "README.md") {
+            if at_root && name == "debug.log" {
                 continue;
             }
             let path_in_repo = repo_path(root, &path)?;
+            if path_in_repo == CARD {
+                continue;
+            }
             let file = UploadFile {
                 local: path.clone(),
                 path_in_repo: path_in_repo.clone(),
@@ -75,16 +82,6 @@ fn repo_path(root: &Path, path: &Path) -> Result<String> {
         parts.remove(0);
     }
     Ok(parts.join("/"))
-}
-
-/// Whether any selected file is a GGUF.
-#[must_use]
-pub fn has_gguf(files: &[UploadFile]) -> bool {
-    files.iter().any(|f| {
-        Path::new(&f.path_in_repo)
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
-    })
 }
 
 #[cfg(test)]
@@ -153,8 +150,24 @@ mod tests {
         let dir = tree(&["Modelfile", "gguf/Modelfile"])?;
         let err = select(dir.path()).err().ok_or("expected a clash")?;
         let text = format!("{err:#}");
-        assert!(text.contains("Modelfile"), "names the clashing path");
-        assert!(text.contains("gguf"), "names both local paths");
+        assert!(text.contains("map to Modelfile"), "names the clashing path");
+        let ours = dir.path().join("Modelfile");
+        let theirs = dir.path().join("gguf/Modelfile");
+        assert!(
+            text.contains(&ours.display().to_string()),
+            "names the root Modelfile: {text}"
+        );
+        assert!(
+            text.contains(&theirs.display().to_string()),
+            "names the gguf Modelfile: {text}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_may_land_on_the_card() -> Result<(), Box<dyn Error>> {
+        let dir = tree(&["adapter_config.json", "gguf/README.md", "gguf/m.gguf"])?;
+        assert_eq!(paths(dir.path())?, vec!["adapter_config.json", "m.gguf"]);
         Ok(())
     }
 
@@ -178,15 +191,6 @@ mod tests {
                 "sub/debug.log"
             ]
         );
-        Ok(())
-    }
-
-    #[test]
-    fn has_gguf_looks_at_extensions() -> Result<(), Box<dyn Error>> {
-        let dir = tree(&["gguf/m.gguf"])?;
-        assert!(has_gguf(&select(dir.path())?));
-        let dir = tree(&["adapter_config.json"])?;
-        assert!(!has_gguf(&select(dir.path())?));
         Ok(())
     }
 

@@ -5,7 +5,6 @@
 //! finished, and a rerun resumes.
 
 use std::future::{Future, ready};
-use std::iter;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -29,6 +28,10 @@ use crate::train::OUTPUT_DIR;
 
 /// The card in the repo, and the copy a dry run writes in `runs/<id>/hub/`.
 const CARD_FILE: &str = "README.md";
+
+/// What a push stopped by Ctrl-C (or the TUI) says.
+pub(crate) const PUSH_CANCELLED: &str =
+    "push cancelled before its commit finished; run it again to resume";
 
 /// At most one progress event per interval.
 const PROGRESS_EVERY: Duration = Duration::from_secs(1);
@@ -87,11 +90,13 @@ pub(super) async fn run(
             push_with_token(&runs, &settings, &args.run_id, &opts, front).await
         }
     };
+    // A push whose commit is done wins over a Ctrl-C that came with it.
     tokio::select! {
+        biased;
         pushed = push => pushed.map(|_| ()),
         signal = tokio::signal::ctrl_c() => {
             signal.context("cannot catch Ctrl-C")?;
-            bail!("push cancelled: nothing was committed, run it again to resume")
+            bail!("{PUSH_CANCELLED}")
         },
     }
 }
@@ -189,7 +194,10 @@ pub(crate) async fn push_with_token(
 /// # Errors
 ///
 /// Returns an error when the run cannot be pushed, or the Hub refuses it.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Hub, the run and how to push it; shared by three callers"
+)]
 pub(crate) async fn push_run<H: Hub>(
     hub: &H,
     runs: &Runs,
@@ -241,17 +249,20 @@ pub(crate) async fn push_run<H: Hub>(
         },
     };
     let remote = hub.remote_card(repo).await.map_err(hub_error)?;
-    let (card, card_kept) = match remote {
+    // A kept README.md is left out of the commit: re-uploading the copy read
+    // above could overwrite an edit made during the upload.
+    let card = match remote {
         Some(remote) if !opts.overwrite_card && !card::replaceable(Some(&remote)) => {
             front.line("kept the repo's own README.md (use --overwrite-card to replace it)");
-            (remote, true)
+            None
         },
-        _ => (card, false),
+        _ => Some(card),
     };
+    let card_kept = card.is_none();
     let paths: Vec<String> = files
         .iter()
         .map(|file| file.path_in_repo.clone())
-        .chain(iter::once(CARD_FILE.to_string()))
+        .chain(card.is_some().then(|| CARD_FILE.to_string()))
         .collect();
     let message = format!(
         "Upload run {run_id} with overbrainer {}",
@@ -310,7 +321,10 @@ async fn repo_of<H: Hub>(
 }
 
 /// Says what `pushed` would send and writes its `card` to `runs/<id>/hub/`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "what a dry run says, each part already at hand in push_run"
+)]
 fn dry_run(
     run_dir: &Path,
     run_id: &str,
@@ -339,14 +353,18 @@ fn dry_run(
     Ok(())
 }
 
-/// The commit of `files` and `card` to `repo`, its progress published on
-/// `bus` as [`Event::Push`] at most once per [`PROGRESS_EVERY`].
-#[allow(clippy::too_many_arguments)]
+/// The commit of `files` and `card` (none: README.md stays) to `repo`, its
+/// progress published on `bus` as [`Event::Push`] at most once per
+/// [`PROGRESS_EVERY`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the commit's parts for Hub::upload, plus where its progress goes"
+)]
 async fn upload<H: Hub>(
     hub: &H,
     repo: &RepoId,
     files: Vec<UploadFile>,
-    card: String,
+    card: Option<String>,
     message: String,
     run_id: &str,
     bus: &EventBus,
@@ -434,7 +452,7 @@ impl Hub for Offline {
         &self,
         _repo: &RepoId,
         _files: Vec<UploadFile>,
-        _card: String,
+        _card: Option<String>,
         _message: String,
         _progress: ProgressSink,
     ) -> impl Future<Output = Result<Commit, HubError>> + Send {
@@ -461,6 +479,9 @@ pub(crate) mod fixtures {
 
     pub(crate) const RUN: &str = "r1";
 
+    /// `(repo, paths, card)` of an upload; no card when README.md is kept.
+    pub(crate) type Upload = (String, Vec<String>, Option<String>);
+
     #[derive(Default)]
     pub(crate) struct FakeHub {
         /// The visibility of the repo when it exists already.
@@ -472,7 +493,7 @@ pub(crate) mod fixtures {
         /// `(repo, private)` of each `ensure_repo`.
         pub ensured: Mutex<Vec<(String, bool)>>,
         /// `(repo, paths, card)` of each upload.
-        pub uploads: Mutex<Vec<(String, Vec<String>, String)>>,
+        pub uploads: Mutex<Vec<Upload>>,
     }
 
     impl Hub for FakeHub {
@@ -516,7 +537,7 @@ pub(crate) mod fixtures {
             &self,
             repo: &RepoId,
             files: Vec<UploadFile>,
-            card: String,
+            card: Option<String>,
             _message: String,
             progress: ProgressSink,
         ) -> impl Future<Output = Result<Commit, HubError>> + Send {
@@ -543,7 +564,7 @@ pub(crate) mod fixtures {
     }
 
     impl FakeHub {
-        pub(crate) fn uploads(&self) -> Vec<(String, Vec<String>, String)> {
+        pub(crate) fn uploads(&self) -> Vec<Upload> {
             self.uploads.lock().map(|u| u.clone()).unwrap_or_default()
         }
 
@@ -617,11 +638,16 @@ parent = { provider = "mock", model = "parent" }
 
     /// A TUI front end whose lines land in the returned vector.
     pub(crate) fn front() -> (Frontend, Arc<Mutex<Vec<String>>>) {
+        front_with(CancellationToken::new())
+    }
+
+    /// [`front`], interrupted when `detach` is cancelled.
+    pub(crate) fn front_with(detach: CancellationToken) -> (Frontend, Arc<Mutex<Vec<String>>>) {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&lines);
         let front = Frontend::Tui {
             bus: EventBus::new(),
-            detach: CancellationToken::new(),
+            detach,
             abandon: Arc::new(AtomicBool::new(false)),
             report: Arc::new(move |report| {
                 if let (Report::Line(line), Ok(mut lines)) = (report, seen.lock()) {
@@ -723,8 +749,8 @@ mod tests {
         assert_eq!(pushed.url.as_deref(), Some("https://hf.co/me/x/commit/1"));
         assert_eq!((pushed.files, pushed.bytes), (2, 9));
         let uploads = hub.uploads();
-        let [(repo, paths, card)] = uploads.as_slice() else {
-            return Err("one upload expected".into());
+        let [(repo, paths, Some(card))] = uploads.as_slice() else {
+            return Err("one upload with a card expected".into());
         };
         assert_eq!(repo, "me/my-proj");
         assert_eq!(paths, &["adapter_config.json", "adapter_model.safetensors"]);
@@ -820,10 +846,18 @@ mod tests {
         let (pushed, lines) = push(&hub, &runs, &settings("")?, &PushOptions::default()).await;
         assert!(pushed?.card_kept);
         let uploads = hub.uploads();
-        let [(_, _, card)] = uploads.as_slice() else {
+        let [(_, paths, card)] = uploads.as_slice() else {
             return Err("one upload expected".into());
         };
-        assert_eq!(card, "# my own card\n");
+        assert_eq!(card, &None, "the kept card is not uploaded again");
+        assert_eq!(paths, &["adapter_config.json", "adapter_model.safetensors"]);
+        let text = std::fs::read_to_string(runs.run_dir(RUN)?.join("hub/push.json"))?;
+        let saved: crate::hub::record::PushRecord = serde_json::from_str(&text)?;
+        assert_eq!(
+            saved.files,
+            ["adapter_config.json", "adapter_model.safetensors"],
+            "the record lists what the commit wrote"
+        );
         assert!(
             lines.contains(&"repo me/my-proj exists and stays public".to_string()),
             "{lines:?}"
@@ -849,8 +883,8 @@ mod tests {
         let (pushed, lines) = push(&hub, &runs, &settings("")?, &PushOptions::default()).await;
         assert!(!pushed?.card_kept);
         let uploads = hub.uploads();
-        let [(_, _, card)] = uploads.as_slice() else {
-            return Err("one upload expected".into());
+        let [(_, _, Some(card))] = uploads.as_slice() else {
+            return Err("one upload with a card expected".into());
         };
         assert_ne!(card, &old);
         assert!(
@@ -879,8 +913,8 @@ mod tests {
         let (pushed, _) = push(&hub, &runs, &settings("")?, &opts).await;
         assert!(!pushed?.card_kept);
         let uploads = hub.uploads();
-        let [(_, _, card)] = uploads.as_slice() else {
-            return Err("one upload expected".into());
+        let [(_, _, Some(card))] = uploads.as_slice() else {
+            return Err("one upload with a card expected".into());
         };
         assert!(card.contains(MARKER), "{card}");
         Ok(())
@@ -926,7 +960,7 @@ mod tests {
             path_in_repo: "a".into(),
             size: 100,
         }];
-        upload(&hub, &repo, files, String::new(), String::new(), RUN, &bus).await?;
+        upload(&hub, &repo, files, None, String::new(), RUN, &bus).await?;
         let mut pushes = Vec::new();
         while let Ok(event) = events.try_recv() {
             pushes.push(event);

@@ -82,16 +82,15 @@ fn write_card(out: &mut String, input: &CardInput) -> fmt::Result {
         Adapter::Full => "fully fine-tuned".to_string(),
         adapter => format!("fine-tuned ({})", adapter_name(adapter)),
     };
-    let questions = match input.train_examples {
-        Some(count) => format!("{count} questions"),
-        None => "questions".to_string(),
-    };
-    writeln!(
-        out,
-        "{} {tuned} on {questions} answered by {}.\n",
-        text(&input.base_model),
-        text(&input.parent)
-    )?;
+    let base = text(&base_label(&input.base_model));
+    let parent = text(&input.parent);
+    match input.train_examples {
+        Some(count) => writeln!(
+            out,
+            "{base} {tuned} on {count} questions answered by {parent}.\n"
+        )?,
+        None => writeln!(out, "{base} {tuned} on answers from {parent}.\n")?,
+    }
     use_it(out, input)?;
     how_it_was_made(out, input)?;
     reproduce(out, input)?;
@@ -146,7 +145,7 @@ fn use_it(out: &mut String, input: &CardInput) -> fmt::Result {
         writeln!(
             out,
             "model = PeftModel.from_pretrained(AutoModelForCausalLM.from_pretrained({}), {})",
-            py_string(&input.base_model),
+            py_string(&shown_base(&input.base_model)),
             py_string(&repo)
         )?;
     }
@@ -198,7 +197,7 @@ fn rows(input: &CardInput) -> Vec<(&'static str, String)> {
     let mut rows = vec![
         ("Parent model", input.parent.clone()),
         ("Generator model", input.generator.clone()),
-        ("Base model", input.base_model.clone()),
+        ("Base model", base_label(&input.base_model)),
         ("Adapter", adapter_name(input.adapter).to_string()),
     ];
     let examples: Vec<String> = [
@@ -248,6 +247,39 @@ fn reproduce(out: &mut String, input: &CardInput) -> fmt::Result {
     }
     writeln!(out, "{fence}\n")?;
     writeln!(out, "See the [overbrainer docs]({REPO_URL}#readme).\n")
+}
+
+/// The final path component of a base model that is not a Hub repo ID, so no
+/// local path reaches the card; `None` for a repo ID.
+fn local_name(model: &str) -> Option<String> {
+    if is_repo_id(model) {
+        return None;
+    }
+    Some(
+        Path::new(model)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    )
+}
+
+/// The base model as code and the reproduce excerpt write it: a repo ID as
+/// is, a local model by its final path component.
+fn shown_base(model: &str) -> String {
+    match local_name(model) {
+        None => model.to_string(),
+        Some(name) if name.is_empty() => "local-model".to_string(),
+        Some(name) => name,
+    }
+}
+
+/// The base model as prose names it: a repo ID as is, else "a local model".
+fn base_label(model: &str) -> String {
+    match local_name(model) {
+        None => model.to_string(),
+        Some(name) if name.is_empty() => "a local model".to_string(),
+        Some(name) => format!("a local model (`{name}`)"),
+    }
 }
 
 /// How the card names an adapter.
@@ -348,7 +380,10 @@ pub fn replaceable(remote: Option<&str>) -> bool {
 /// Fails when the run's `axolotl.yaml` cannot be read or names no base model.
 /// Data, metrics or a pod record that cannot be read only leave their values
 /// out, with a warning.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each input is a separate source of the card; a struct would only wrap them"
+)]
 pub fn gather(
     runs: &Runs,
     record: &RunRecord,
@@ -371,7 +406,7 @@ pub fn gather(
         let path = dir.join("data").join(file);
         crate::dataset::read::<IgnoredAny>(&path)
             .map(|items| items.len())
-            .map_err(|error| tracing::warn!("leaving the example count out of the card: {error}"))
+            .map_err(|error| tracing::warn!("leaving the example count out of the card: {error:#}"))
             .ok()
     };
     let metrics = Metrics::read(&dir.join(METRICS_FILE)).unwrap_or_else(|error| {
@@ -379,7 +414,7 @@ pub fn gather(
         Metrics::default()
     });
     let pod = PodRecord::load(runs, &record.id).unwrap_or_else(|error| {
-        tracing::warn!("leaving the Runpod line out of the card: {error}");
+        tracing::warn!("leaving the Runpod line out of the card: {error:#}");
         None
     });
     let runpod = pod.and_then(|pod| {
@@ -521,7 +556,7 @@ fn role_table(role: &RoleModel) -> Table {
 
 fn training_table(training: &Training) -> Table {
     let mut table = Table::new();
-    table["base_model"] = value(training.base_model.as_str());
+    table["base_model"] = value(shown_base(&training.base_model));
     table["adapter"] = value(match training.adapter {
         Adapter::Lora => "lora",
         Adapter::Qlora => "qlora",
@@ -787,6 +822,65 @@ max_hours = 6
         ));
         assert!(!card.contains("ollama run"));
         assert!(!card.contains("- gguf\n"));
+    }
+
+    #[test]
+    fn a_local_base_model_shows_only_its_name() -> Result<(), Box<dyn Error>> {
+        let input = CardInput {
+            base_model: "/home/me/models/qwen3-0.6b/".into(),
+            gguf: Vec::new(),
+            ..qlora_on_runpod()
+        };
+        let card = render(&input);
+        assert!(!card.contains("/home/"), "{card}");
+        assert!(
+            card.contains(
+                "a local model (`qwen3-0.6b`) fine-tuned (QLoRA) on 412 questions answered by"
+            ),
+            "{card}"
+        );
+        assert!(
+            card.contains("| Base model | a local model (`qwen3-0.6b`) |"),
+            "{card}"
+        );
+        assert!(
+            card.contains(
+                "model = PeftModel.from_pretrained(AutoModelForCausalLM.from_pretrained(\"qwen3-0.6b\"), \"nayrosk/rust-mentor\")"
+            ),
+            "{card}"
+        );
+        assert!(!card.contains("base_model:"), "{card}");
+        let settings = load_str(
+            &CARD_CONFIG.replace("\"Qwen/Qwen3-0.6B\"", "\"/home/me/models/qwen3-0.6b\""),
+            EnvSource::Vars(Vec::new()),
+        )?;
+        let toml = reproduce_toml(&settings);
+        assert!(!toml.contains("/home/"), "{toml}");
+        assert!(toml.contains("base_model = \"qwen3-0.6b\""), "{toml}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_summary_without_a_count_names_the_answers() {
+        for (adapter, line) in [
+            (
+                Adapter::Qlora,
+                "Qwen/Qwen3-0.6B fine-tuned (QLoRA) on answers from p.\n",
+            ),
+            (
+                Adapter::Full,
+                "Qwen/Qwen3-0.6B fully fine-tuned on answers from p.\n",
+            ),
+        ] {
+            let input = CardInput {
+                adapter,
+                parent: "p".into(),
+                train_examples: None,
+                ..qlora_on_runpod()
+            };
+            let card = render(&input);
+            assert!(card.contains(line), "{card}");
+        }
     }
 
     #[test]
@@ -1101,7 +1195,7 @@ runtime = "docker"
         let card = render(&input);
         assert!(card.contains("| Examples | 0 eval |"), "{card}");
         assert!(
-            card.contains("fine-tuned (LoRA) on questions answered by m2."),
+            card.contains("fine-tuned (LoRA) on answers from m2."),
             "{card}"
         );
         assert!(

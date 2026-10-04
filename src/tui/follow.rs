@@ -212,7 +212,7 @@ impl App {
             return Vec::new();
         }
         if self.training.push_prepare.is_some() {
-            self.say(Severity::Info, "already preparing a push");
+            self.say(Severity::Warn, "already preparing a push");
             return Vec::new();
         }
         let id = self.task_id();
@@ -228,7 +228,7 @@ impl App {
         }
         if let Some(pushing) = &self.training.pushing {
             let said = format!("run {} is being pushed: one push at a time", pushing.run);
-            self.say(Severity::Info, said);
+            self.say(Severity::Warn, said);
             return true;
         }
         false
