@@ -165,7 +165,7 @@ pub(super) async fn train(
     let ollama = settings.export.ollama_name.as_deref();
     let report =
         |runs: &Runs, id: &str, result, front: &Frontend| finish(runs, id, result, front, ollama);
-    let created = std::sync::Mutex::new(None::<String>);
+    // The run's ID, once it was created, beside the job's result.
     let result = async {
         warn_orphans(&session.ctx()).await;
         let record = create(&session.runs, &settings.project.name, spec.workdir(), name)?;
@@ -173,9 +173,7 @@ pub(super) async fn train(
         let trainer = exporting(trainer, &record.id, &settings.export);
         started(&record);
         front.run_created(&record.id);
-        if let Ok(mut created) = created.lock() {
-            *created = Some(record.id.clone());
-        }
+        let id = record.id.clone();
         let job = Job {
             session: &session,
             spec,
@@ -185,13 +183,13 @@ pub(super) async fn train(
             report: &report,
             cancel_on_interrupt: false,
         };
-        job.run(&mut interrupt, record, keep, secrets).await
+        anyhow::Ok((id, job.run(&mut interrupt, record, keep, secrets).await))
     }
     .await;
     session.close().await;
+    let (id, result) = result?;
     // After the pod ended and the report: the GGUF of an export is in place.
-    let created = created.lock().ok().and_then(|id| id.clone());
-    if let (Ok(()), Some(id)) = (&result, created) {
+    if result.is_ok() {
         push_after_training(&Runs::new(project_dir), settings, &id, front).await;
     }
     result

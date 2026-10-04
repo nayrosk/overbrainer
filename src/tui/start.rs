@@ -264,6 +264,7 @@ fn plan(settings: &Settings, files: &DataFiles) -> Result<StartPlan, String> {
     };
     let mut warnings: Vec<String> = reasoning_template_warning(training).into_iter().collect();
     warnings.extend(crate::config::validate::deprecations(settings));
+    warnings.extend(crate::config::validate::hub_token_warning(settings));
     if training.hub_model_id.is_some() && settings.hf_token.is_none() {
         warnings.push(
             "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail"
@@ -1187,7 +1188,8 @@ mod tests {
         );
         let config = format!(
             "{}\n[training]\ntarget = \"homelab\"\nbase_model = \"Qwen/Qwen3-4B\"\nadapter = \"qlora\"\n\
-             hub_model_id = \"me/model\"\n\n[targets.homelab]\nkind = \"ssh\"\nruntime = \"docker\"\n",
+             hub_model_id = \"me/model\"\n\n[targets.homelab]\nkind = \"ssh\"\nruntime = \"docker\"\n\n\
+             [hub]\nafter_training = true\n",
             crate::tui::snapshots::CONFIG
         );
         std::fs::write(dir.path().join("overbrainer.toml"), config)?;
@@ -1211,6 +1213,13 @@ mod tests {
             plan.warnings
                 .iter()
                 .any(|w| w.starts_with("training.hub_model_id is deprecated"))
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.starts_with("[hub] after_training is on but OVERBRAINER_HF_TOKEN")),
+            "{:?}",
+            plan.warnings
         );
         assert!(
             !format!("{plan:?}").contains("gpu.example"),

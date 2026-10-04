@@ -8,14 +8,13 @@ use anyhow::{Context, anyhow, bail};
 
 use super::front::{Frontend, Interrupt};
 use super::progress::status_name;
-use super::push::{PushOptions, push_run};
+use super::push::{PushOptions, Pushed, push_with_token};
 use super::reload::Reloader;
 use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
 use crate::config::{DEFAULT_WORKDIR, Settings, Source, Target, Training};
 use crate::dataset::DataFiles;
 use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
-use crate::hub::{HfHub, Hub};
 use crate::runpod::{PodRecord, RunpodTarget, connect_followed};
 use crate::runs::{
     Launch, Outcome, REQUEST_POLL, RUNS_DIR, RunCtx, RunError, RunRecord, RunState, Runs,
@@ -88,8 +87,11 @@ async fn train(
 ) -> anyhow::Result<()> {
     let keep_pod = args.keep_pod;
     let training = training(settings)?;
-    for deprecation in crate::config::validate::deprecations(settings) {
-        warn(&deprecation);
+    let warnings = crate::config::validate::deprecations(settings)
+        .into_iter()
+        .chain(crate::config::validate::hub_token_warning(settings));
+    for warning in warnings {
+        warn(&warning);
     }
     let name = args.target.as_deref().unwrap_or(&training.target);
     let target = settings
@@ -768,45 +770,42 @@ pub(super) fn warn(message: &str) {
 }
 
 /// Pushes run `run_id` to the Hugging Face Hub when it succeeded and `[hub]
-/// after_training` is on. A failure only warns: the run stays succeeded and
-/// the command's outcome does not change.
+/// after_training` is on. A failure or an interruption only warns: the run
+/// stays succeeded and the command's outcome does not change.
 pub(super) async fn push_after_training(
     runs: &Runs,
     settings: &Settings,
     run_id: &str,
     front: &Frontend,
 ) {
-    if !push_due(runs, settings, run_id) {
-        return;
-    }
-    let hub = async {
-        let token = settings.hf_token.as_ref().context(
-            "OVERBRAINER_HF_TOKEN is not set: a Hugging Face token with write access is needed \
-                 to push",
-        )?;
-        let token = hf_token(token).await?;
-        HfHub::new(settings.hub.base_url.as_deref(), &token)
-    };
-    match hub.await {
-        Ok(hub) => push_after_training_with(&hub, runs, settings, run_id, front).await,
-        Err(error) => warn(&push_failed(run_id, &error)),
+    let opts = PushOptions::default();
+    let push = push_with_token(runs, settings, run_id, &opts, front);
+    if let Some(warning) = push_after(runs, settings, run_id, push, front).await {
+        warn(&warning);
     }
 }
 
-/// [`push_after_training`] on `hub`.
-async fn push_after_training_with<H: Hub>(
-    hub: &H,
+/// Runs `push`, the push of run `run_id`, when it is due, until a new
+/// interruption: the flow's own handler keeps catching Ctrl-C for the life of
+/// the process, so without this race nothing would stop the push. What to
+/// warn, if anything.
+async fn push_after(
     runs: &Runs,
     settings: &Settings,
     run_id: &str,
+    push: impl Future<Output = anyhow::Result<Pushed>>,
     front: &Frontend,
-) {
+) -> Option<String> {
     if !push_due(runs, settings, run_id) {
-        return;
+        return None;
     }
-    if let Err(error) = push_run(hub, runs, settings, run_id, &PushOptions::default(), front).await
-    {
-        warn(&push_failed(run_id, &error));
+    match front.interrupt().race(push).await {
+        None => Some(format!(
+            "push cancelled before its commit finished; run it again with: overbrainer push \
+             {run_id}"
+        )),
+        Some(Ok(_)) => None,
+        Some(Err(error)) => Some(push_failed(run_id, &error)),
     }
 }
 
@@ -833,15 +832,23 @@ mod tests {
     use super::*;
     use crate::events::EventBus;
 
-    use crate::cli::push::fixtures::{FakeHub, RUN, front, project, said, settings};
+    use crate::cli::push::fixtures::{FakeHub, RUN, front, front_with, project, said, settings};
+    use crate::cli::push::push_run;
     use crate::runs::RunState;
 
     const HUB_ON: &str = "\n[hub]\nafter_training = true\n";
 
-    async fn pushed_after_training(hub: &FakeHub, runs: &Runs, settings: &Settings) -> Vec<String> {
+    /// [`push_after`] of [`RUN`] to `hub`: what it warns, and the lines said.
+    async fn pushed_after_training(
+        hub: &FakeHub,
+        runs: &Runs,
+        settings: &Settings,
+    ) -> (Option<String>, Vec<String>) {
         let (front, lines) = front();
-        push_after_training_with(hub, runs, settings, RUN, &front).await;
-        said(&lines)
+        let opts = PushOptions::default();
+        let push = push_run(hub, runs, settings, RUN, &opts, &front);
+        let warning = push_after(runs, settings, RUN, push, &front).await;
+        (warning, said(&lines))
     }
 
     #[tokio::test]
@@ -849,8 +856,13 @@ mod tests {
         let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
         let hub = FakeHub::default();
         let settings = settings(HUB_ON).map_err(|e| anyhow!("{e}"))?;
-        pushed_after_training(&hub, &runs, &settings).await;
+        let (warning, said) = pushed_after_training(&hub, &runs, &settings).await;
+        assert_eq!(warning, None);
         assert_eq!(hub.uploads().len(), 1, "the run is pushed once");
+        assert!(
+            said.iter().any(|line| line.starts_with("push: https://")),
+            "{said:?}"
+        );
         Ok(())
     }
 
@@ -859,8 +871,9 @@ mod tests {
         let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
         let hub = FakeHub::default();
         let settings = settings("").map_err(|e| anyhow!("{e}"))?;
-        pushed_after_training(&hub, &runs, &settings).await;
-        assert!(hub.uploads().is_empty(), "nothing is pushed");
+        let (warning, said) = pushed_after_training(&hub, &runs, &settings).await;
+        assert_eq!(warning, None, "nothing failed either");
+        assert!(said.is_empty(), "nothing is said: {said:?}");
         assert!(hub.ensured().is_empty(), "the Hub is not reached");
         Ok(())
     }
@@ -870,9 +883,11 @@ mod tests {
         let (_project, runs) = project(RunState::Failed, false).map_err(|e| anyhow!("{e}"))?;
         let hub = FakeHub::default();
         let settings = settings(HUB_ON).map_err(|e| anyhow!("{e}"))?;
-        let said = pushed_after_training(&hub, &runs, &settings).await;
-        assert!(hub.uploads().is_empty(), "nothing is pushed");
-        assert!(said.is_empty(), "nothing is said");
+        let (warning, said) = pushed_after_training(&hub, &runs, &settings).await;
+        // Pushing a failed run would have been refused with a warning.
+        assert_eq!(warning, None, "the push was not tried");
+        assert!(said.is_empty(), "nothing is said: {said:?}");
+        assert!(hub.ensured().is_empty(), "the Hub is not reached");
         Ok(())
     }
 
@@ -884,13 +899,62 @@ mod tests {
             ..FakeHub::default()
         };
         let settings = settings(HUB_ON).map_err(|e| anyhow!("{e}"))?;
-        pushed_after_training(&hub, &runs, &settings).await;
+        let (warning, _) = pushed_after_training(&hub, &runs, &settings).await;
+        let warning = warning.context("a refused token warns")?;
+        assert!(
+            warning.starts_with("push failed: Hugging Face refused the token"),
+            "names the failure"
+        );
+        assert!(
+            warning.ends_with("; run it again with: overbrainer push r1"),
+            "says how to push again"
+        );
+        assert!(!warning.contains("hf_test"), "the token must not appear");
         assert!(hub.uploads().is_empty(), "nothing is uploaded");
         assert_eq!(runs.load(RUN)?.state, RunState::Succeeded);
-        let message = push_failed(RUN, &anyhow!("boom"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_token_warns_through_push_with_token() -> anyhow::Result<()> {
+        let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
+        let settings = crate::config::load_str(
+            &format!("{}{HUB_ON}", crate::cli::push::fixtures::CONFIG),
+            crate::config::EnvSource::Vars(Vec::new()),
+        )?;
+        let (front, _) = front();
+        let opts = PushOptions::default();
+        let push = push_with_token(&runs, &settings, RUN, &opts, &front);
+        let warning = push_after(&runs, &settings, RUN, push, &front).await;
         assert_eq!(
-            message,
-            "push failed: boom; run it again with: overbrainer push r1"
+            warning.as_deref(),
+            Some(
+                "push failed: OVERBRAINER_HF_TOKEN is not set: a Hugging Face token with write \
+                 access is needed to push; run it again with: overbrainer push r1"
+            )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_interruption_stops_the_push_after_training() -> anyhow::Result<()> {
+        let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
+        let settings = settings(HUB_ON).map_err(|e| anyhow!("{e}"))?;
+        let detach = CancellationToken::new();
+        let (front, _) = front_with(detach.clone());
+        detach.cancel();
+        let push = std::future::pending::<anyhow::Result<Pushed>>();
+        let warning = tokio::time::timeout(
+            Duration::from_secs(10),
+            push_after(&runs, &settings, RUN, push, &front),
+        )
+        .await?;
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "push cancelled before its commit finished; run it again with: overbrainer \
+                 push r1"
+            )
         );
         Ok(())
     }

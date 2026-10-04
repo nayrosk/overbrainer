@@ -50,6 +50,16 @@ pub fn deprecations(settings: &Settings) -> Vec<String> {
     found
 }
 
+/// The warning of a push after training bound to fail: `[hub] after_training`
+/// is on and no Hugging Face token is set.
+pub fn hub_token_warning(settings: &Settings) -> Option<String> {
+    (settings.hub.after_training && settings.hf_token.is_none()).then(|| {
+        "[hub] after_training is on but OVERBRAINER_HF_TOKEN is not set: the push after \
+         training will fail"
+            .to_string()
+    })
+}
+
 /// Provider and target names must be usable in env variable names.
 fn check_names(settings: &Settings, problems: &mut Vec<String>) {
     let names = settings
@@ -880,6 +890,30 @@ mod tests {
                 "training.hub_model_id is deprecated, use [hub] repo (overbrainer migrate moves it)"
                     .to_string()
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_push_after_training_without_a_token_is_warned() -> Result<(), config::ConfigError> {
+        let on = format!("{VALID}\n[hub]\nafter_training = true\n");
+        assert_eq!(
+            hub_token_warning(&settings(&on)?).as_deref(),
+            Some(
+                "[hub] after_training is on but OVERBRAINER_HF_TOKEN is not set: the push after \
+                 training will fail"
+            )
+        );
+        assert_eq!(
+            hub_token_warning(&settings(VALID)?),
+            None,
+            "the push is off"
+        );
+        let with_token = format!("hf_token = \"hf_x\"\n{on}");
+        assert_eq!(
+            hub_token_warning(&settings(&with_token)?),
+            None,
+            "a token is set"
         );
         Ok(())
     }
