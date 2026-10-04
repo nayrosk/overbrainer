@@ -2,7 +2,7 @@
 name = "overbrainer"
 version = "0.6.1"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.91"
 description = "Distill a large LLM into a smaller open-weights model: generate questions, collect answers, fine-tune, visualize."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nayrosk/overbrainer"
@@ -35,6 +35,7 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 dotenvy = "0.15.7"
 fastrand = "2.5.0"
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
+hf-hub = { version = "1.0.0", default-features = false, features = ["rustls-tls"] }
 hyper = { version = "1.11.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "debug", "serde"] }

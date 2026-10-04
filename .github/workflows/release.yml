@@ -67,7 +67,7 @@ jobs:
       - name: Install the MSRV toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch; toolchain set below
         with:
-          toolchain: "1.89"
+          toolchain: "1.91"
       - name: Check the MSRV
         run: cargo check --all-targets --locked
 

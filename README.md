@@ -66,7 +66,7 @@ The latest code from `main` installs with `cargo install --locked --git https://
 
 ### Requirements
 
-- Rust 1.89 or newer to build it. CI builds and tests on Linux, and checks that it builds on macOS.
+- Rust 1.91 or newer to build it. CI builds and tests on Linux, and checks that it builds on macOS.
 - `ssh` for SSH targets, and `ssh` with `ssh-keygen` for Runpod targets.
 - For training on this machine: Axolotl 0.19 in a virtual environment or on `PATH`, or Docker or Podman with NVIDIA GPU access to run the Axolotl image.
 
