@@ -58,24 +58,30 @@ Trained on [Runpod](https://runpod.io?ref=ym24z23f) (NVIDIA GeForce RTX 4090) fo
 cargo install --locked overbrainer
 ```
 
-With this `overbrainer.toml` (providers and keys left out), then `overbrainer run`:
+With these sections of overbrainer.toml (project, providers, targets and keys left out), then `overbrainer run`:
 
 ```toml
 [[topics]]
 name = "ownership"
-description = "Rust ownership"
-subtopics = 3
-questions_per_subtopic = 5
+description = "Rust ownership, borrowing and lifetimes"
+subtopics = 8
+questions_per_subtopic = 30
+
+[[topics]]
+name = "async"
+description = "Async Rust with tokio: futures, tasks and cancellation"
+subtopics = 8
+questions_per_subtopic = 30
 
 [roles.generator]
-provider = "nanogpt"
-model = "m1"
+provider = "openrouter"
+model = "deepseek/deepseek-v4-flash"
 reasoning = false
 max_tokens = 16384
 
 [roles.parent]
-provider = "nanogpt"
-model = "m2"
+provider = "openrouter"
+model = "deepseek/deepseek-v4-flash:thinking"
 reasoning = true
 max_tokens = 16384
 
@@ -102,7 +108,7 @@ concurrency = 8
 max_retries = 5
 dedup_threshold = 0.8
 eval_ratio = 0.1
-seed = 7
+seed = 42
 include_system_prompt = false
 embedding_threshold = 0.9
 question_batch_size = 10

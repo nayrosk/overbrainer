@@ -18,7 +18,7 @@ Distilled with [overbrainer](https://github.com/nayrosk/overbrainer) [![overbrai
 
 # nayrosk/rust-mentor
 
-Qwen/Qwen3-0.6B fine-tuned (full) on 412 questions answered by deepseek/deepseek-v4-flash:thinking.
+Qwen/Qwen3-0.6B fully fine-tuned on 412 questions answered by deepseek/deepseek-v4-flash:thinking.
 
 ## Use it
 
@@ -37,7 +37,7 @@ overbrainer wrote questions on the topics below with the generator model, kept t
 | Parent model | deepseek/deepseek-v4-flash:thinking |
 | Generator model | deepseek/deepseek-v4-flash |
 | Base model | Qwen/Qwen3-0.6B |
-| Adapter | full |
+| Adapter | none (full fine-tune) |
 | Examples | 412 train, 46 eval |
 | Epochs | 3 |
 | Learning rate | 0.0002 |
@@ -56,7 +56,7 @@ Topics:
 cargo install --locked overbrainer
 ```
 
-With this `overbrainer.toml` (providers and keys left out), then `overbrainer run`:
+With these sections of overbrainer.toml (project, providers, targets and keys left out), then `overbrainer run`:
 
 ```toml
 [[topics]]

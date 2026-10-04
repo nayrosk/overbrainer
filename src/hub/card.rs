@@ -38,8 +38,8 @@ pub struct CardInput {
     pub generator: String,
     /// Name and description, empty when the topic has none.
     pub topics: Vec<(String, String)>,
-    pub train_examples: usize,
-    pub eval_examples: usize,
+    pub train_examples: Option<usize>,
+    pub eval_examples: Option<usize>,
     pub epochs: Option<f64>,
     /// As written in the run's `axolotl.yaml`.
     pub learning_rate: Option<String>,
@@ -77,13 +77,19 @@ fn write_card(out: &mut String, input: &CardInput) -> fmt::Result {
         out,
         "Distilled with [overbrainer]({REPO_URL}) [![overbrainer](https://img.shields.io/badge/distilled%20with-overbrainer-E93D82)]({REPO_URL})\n"
     )?;
-    writeln!(out, "# {}\n", input.repo)?;
+    writeln!(out, "# {}\n", text(&input.repo.to_string()))?;
+    let tuned = match input.adapter {
+        Adapter::Full => "fully fine-tuned".to_string(),
+        adapter => format!("fine-tuned ({})", adapter_name(adapter)),
+    };
+    let questions = match input.train_examples {
+        Some(count) => format!("{count} questions"),
+        None => "questions".to_string(),
+    };
     writeln!(
         out,
-        "{} fine-tuned ({}) on {} questions answered by {}.\n",
+        "{} {tuned} on {questions} answered by {}.\n",
         text(&input.base_model),
-        adapter_name(input.adapter),
-        input.train_examples,
         text(&input.parent)
     )?;
     use_it(out, input)?;
@@ -194,14 +200,17 @@ fn rows(input: &CardInput) -> Vec<(&'static str, String)> {
         ("Generator model", input.generator.clone()),
         ("Base model", input.base_model.clone()),
         ("Adapter", adapter_name(input.adapter).to_string()),
-        (
-            "Examples",
-            format!(
-                "{} train, {} eval",
-                input.train_examples, input.eval_examples
-            ),
-        ),
     ];
+    let examples: Vec<String> = [
+        (input.train_examples, "train"),
+        (input.eval_examples, "eval"),
+    ]
+    .into_iter()
+    .filter_map(|(count, what)| count.map(|count| format!("{count} {what}")))
+    .collect();
+    if !examples.is_empty() {
+        rows.push(("Examples", examples.join(", ")));
+    }
     if let Some(epochs) = input.epochs {
         rows.push(("Epochs", epochs.to_string()));
     }
@@ -229,7 +238,7 @@ fn reproduce(out: &mut String, input: &CardInput) -> fmt::Result {
     writeln!(out, "```sh\ncargo install --locked overbrainer\n```\n")?;
     writeln!(
         out,
-        "With this `overbrainer.toml` (providers and keys left out), then `overbrainer run`:\n"
+        "With these sections of overbrainer.toml (project, providers, targets and keys left out), then `overbrainer run`:\n"
     )?;
     let fence = fence_for(&input.reproduce_toml);
     writeln!(out, "{fence}toml")?;
@@ -246,7 +255,7 @@ fn adapter_name(adapter: Adapter) -> &'static str {
     match adapter {
         Adapter::Lora => "LoRA",
         Adapter::Qlora => "QLoRA",
-        Adapter::Full => "full",
+        Adapter::Full => "none (full fine-tune)",
     }
 }
 
@@ -259,13 +268,16 @@ fn ollama_tag(gguf: &[String]) -> Option<&str> {
         .map(String::as_str)
 }
 
-/// `value` on one line: line breaks become spaces.
+/// `value` as prose: on one line, line breaks becoming spaces, with `<` and
+/// `>` escaped so it cannot open an HTML tag or comment on the Hub.
 fn text(value: &str) -> String {
     value
         .split(['\r', '\n'])
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// `value` as a table cell: on one line, with `|` escaped.
@@ -273,12 +285,20 @@ fn cell(value: &str) -> String {
     text(value).replace('|', "\\|")
 }
 
-/// A YAML scalar: plain when it is made of safe characters, else double-quoted.
+/// Plain scalars YAML 1.1 reads as booleans or null.
+const YAML_KEYWORDS: [&str; 12] = [
+    "true", "false", "yes", "no", "on", "off", "y", "n", "null", "nan", "inf", "infinity",
+];
+
+/// A YAML scalar: plain when it starts with a letter, holds only safe
+/// characters and is no YAML keyword, else double-quoted, so it always reads
+/// back as a string.
 fn yaml_scalar(value: &str) -> String {
-    let plain = !value.is_empty()
+    let plain = value.starts_with(|c: char| c.is_ascii_alphabetic())
         && value
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        && !YAML_KEYWORDS.contains(&value.to_ascii_lowercase().as_str());
     if plain {
         value.to_string()
     } else {
@@ -325,8 +345,9 @@ pub fn replaceable(remote: Option<&str>) -> bool {
 ///
 /// # Errors
 ///
-/// Fails when the run's `axolotl.yaml` cannot be read or names no base model,
-/// or when its data, metrics or pod record cannot be read.
+/// Fails when the run's `axolotl.yaml` cannot be read or names no base model.
+/// Data, metrics or a pod record that cannot be read only leave their values
+/// out, with a warning.
 #[allow(clippy::too_many_arguments)]
 pub fn gather(
     runs: &Runs,
@@ -346,11 +367,22 @@ pub fn gather(
     let base_model = scalar("base_model")
         .with_context(|| format!("{} names no base_model", config_path.display()))?;
 
-    let count = |file: &str| -> Result<usize> {
-        Ok(crate::dataset::read::<IgnoredAny>(&dir.join("data").join(file))?.len())
+    let count = |file: &str| {
+        let path = dir.join("data").join(file);
+        crate::dataset::read::<IgnoredAny>(&path)
+            .map(|items| items.len())
+            .map_err(|error| tracing::warn!("leaving the example count out of the card: {error}"))
+            .ok()
     };
-    let metrics = Metrics::read(&dir.join(METRICS_FILE))?;
-    let runpod = PodRecord::load(runs, &record.id)?.and_then(|pod| {
+    let metrics = Metrics::read(&dir.join(METRICS_FILE)).unwrap_or_else(|error| {
+        tracing::warn!("leaving the losses and training time out of the card: {error:#}");
+        Metrics::default()
+    });
+    let pod = PodRecord::load(runs, &record.id).unwrap_or_else(|error| {
+        tracing::warn!("leaving the Runpod line out of the card: {error}");
+        None
+    });
+    let runpod = pod.and_then(|pod| {
         Some(RunpodLine {
             gpu: pod.gpu_type?,
             spend_usd: pod.estimated_spend?,
@@ -369,8 +401,8 @@ pub fn gather(
             .iter()
             .map(|t| (t.name.clone(), t.description.clone().unwrap_or_default()))
             .collect(),
-        train_examples: count("train.jsonl")?,
-        eval_examples: count("eval.jsonl")?,
+        train_examples: count("train.jsonl"),
+        eval_examples: count("eval.jsonl"),
         epochs: scalar("num_epochs").and_then(|v| v.parse::<f64>().ok()),
         learning_rate: scalar("learning_rate").filter(|v| v.parse::<f64>().is_ok()),
         sequence_len: scalar("sequence_len").and_then(|v| v.parse().ok()),
@@ -384,6 +416,7 @@ pub fn gather(
 }
 
 /// What a run's `metrics.jsonl` says.
+#[derive(Default)]
 struct Metrics {
     summary: MetricsSummary,
     /// From the first training log to the last.
@@ -561,6 +594,49 @@ mod tests {
 
     const REPRODUCE: &str = "[[topics]]\nname = \"ownership\"\n";
 
+    /// The configuration the sample card's run was made with.
+    const CARD_CONFIG: &str = r#"
+[project]
+name = "rust-mentor"
+
+[[topics]]
+name = "ownership"
+description = "Rust ownership, borrowing and lifetimes"
+subtopics = 8
+questions_per_subtopic = 30
+
+[[topics]]
+name = "async"
+description = "Async Rust with tokio: futures, tasks and cancellation"
+subtopics = 8
+questions_per_subtopic = 30
+
+[providers.openrouter]
+protocol = "openai"
+
+[roles.generator]
+provider = "openrouter"
+model = "deepseek/deepseek-v4-flash"
+
+[roles.parent]
+provider = "openrouter"
+model = "deepseek/deepseek-v4-flash:thinking"
+reasoning = true
+
+[training]
+target = "cloud"
+base_model = "Qwen/Qwen3-0.6B"
+adapter = "qlora"
+epochs = 3
+learning_rate = 2e-4
+sequence_len = 4096
+
+[targets.cloud]
+kind = "runpod"
+gpu_types = ["NVIDIA GeForce RTX 4090"]
+max_hours = 6
+"#;
+
     fn qlora_on_runpod() -> CardInput {
         CardInput {
             repo: repo(),
@@ -579,8 +655,8 @@ mod tests {
                     "Async Rust with tokio: futures, tasks and cancellation".into(),
                 ),
             ],
-            train_examples: 412,
-            eval_examples: 46,
+            train_examples: Some(412),
+            eval_examples: Some(46),
             epochs: Some(3.0),
             learning_rate: Some("0.0002".into()),
             sequence_len: Some(4096),
@@ -597,13 +673,75 @@ mod tests {
     }
 
     #[test]
-    fn lora_with_gguf_on_runpod() -> Result<(), Box<dyn Error>> {
+    fn qlora_with_gguf_on_runpod() -> Result<(), Box<dyn Error>> {
+        let settings = load_str(CARD_CONFIG, EnvSource::Vars(Vec::new()))?;
         let input = CardInput {
-            reproduce_toml: reproduce_toml(&secret_settings()?),
+            reproduce_toml: reproduce_toml(&settings),
             ..qlora_on_runpod()
         };
-        snapshot("lora_with_gguf_on_runpod", &render(&input));
+        snapshot("qlora_with_gguf_on_runpod", &render(&input));
         Ok(())
+    }
+
+    #[test]
+    fn the_reproduce_intro_names_what_is_left_out() {
+        assert!(render(&qlora_on_runpod()).contains(
+            "With these sections of overbrainer.toml (project, providers, targets and keys left out), then `overbrainer run`:\n"
+        ));
+    }
+
+    #[test]
+    fn a_full_fine_tune_is_named_as_such() {
+        let input = CardInput {
+            adapter: Adapter::Full,
+            ..qlora_on_runpod()
+        };
+        let card = render(&input);
+        assert!(card.contains(
+            "Qwen/Qwen3-0.6B fully fine-tuned on 412 questions answered by deepseek/deepseek-v4-flash:thinking.\n"
+        ));
+        assert!(card.contains("| Adapter | none (full fine-tune) |"));
+    }
+
+    #[test]
+    fn prose_cannot_open_html() {
+        let input = CardInput {
+            parent: "p<script>alert(1)</script>".into(),
+            topics: vec![("t<b>".into(), "close <!-- the card".into())],
+            ..qlora_on_runpod()
+        };
+        let card = render(&input);
+        assert!(
+            card.contains("- **t&lt;b&gt;**: close &lt;!-- the card\n"),
+            "{card}"
+        );
+        assert!(
+            card.contains("| Parent model | p&lt;script&gt;alert(1)&lt;/script&gt; |"),
+            "{card}"
+        );
+        assert!(card.contains("answered by p&lt;script&gt;"), "{card}");
+        assert!(
+            !card.contains("<script>") && !card.contains("<!-- the"),
+            "{card}"
+        );
+    }
+
+    #[test]
+    fn licenses_yaml_would_not_read_as_strings_are_quoted() {
+        for (license, line) in [
+            ("no", "license: \"no\"\n"),
+            ("null", "license: \"null\"\n"),
+            ("1.0", "license: \"1.0\"\n"),
+            ("Off", "license: \"Off\"\n"),
+            ("-x", "license: \"-x\"\n"),
+            ("apache-2.0", "license: apache-2.0\n"),
+        ] {
+            let input = CardInput {
+                license: Some(license.into()),
+                ..qlora_on_runpod()
+            };
+            assert!(render(&input).contains(line), "{license}");
+        }
     }
 
     #[test]
@@ -875,7 +1013,10 @@ runtime = "docker"
             input.topics,
             vec![("ownership".to_string(), "Rust ownership".to_string())]
         );
-        assert_eq!((input.train_examples, input.eval_examples), (3, 1));
+        assert_eq!(
+            (input.train_examples, input.eval_examples),
+            (Some(3), Some(1))
+        );
         assert_eq!(input.epochs, Some(2.0));
         assert_eq!(input.learning_rate.as_deref(), Some("1.0e-5"));
         assert_eq!(input.sequence_len, Some(2048));
@@ -912,7 +1053,10 @@ runtime = "docker"
             &[],
         )?;
         assert_eq!(input.adapter, Adapter::Full);
-        assert_eq!((input.train_examples, input.eval_examples), (0, 0));
+        assert_eq!(
+            (input.train_examples, input.eval_examples),
+            (Some(0), Some(0))
+        );
         assert_eq!(
             (input.epochs, input.learning_rate, input.sequence_len),
             (None, None, None)
@@ -923,6 +1067,73 @@ runtime = "docker"
         );
         assert_eq!(input.gguf, Vec::<String>::new());
         assert_eq!(input.runpod, None);
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_run_files_drop_their_rows() -> Result<(), Box<dyn Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let id = "demo_20261004-130000";
+        let dir = runs.run_dir(id)?;
+        write(
+            dir.join("axolotl.yaml"),
+            "base_model: \"m\"\nadapter: \"lora\"\n",
+        )?;
+        write(dir.join("pod.json"), "{not json")?;
+        write(dir.join("data/train.jsonl"), "garbage\n{}\n")?;
+        // A directory where the metrics file should be cannot be read.
+        fs::create_dir_all(dir.join("metrics.jsonl"))?;
+        let input = gather(
+            &runs,
+            &run_record(id),
+            &secret_settings()?,
+            &repo(),
+            None,
+            &[],
+        )?;
+        assert_eq!(input.runpod, None);
+        assert_eq!((input.train_examples, input.eval_examples), (None, Some(0)));
+        assert_eq!(
+            (input.train_loss, input.eval_loss, input.duration),
+            (None, None, None)
+        );
+        let card = render(&input);
+        assert!(card.contains("| Examples | 0 eval |"), "{card}");
+        assert!(
+            card.contains("fine-tuned (LoRA) on questions answered by m2."),
+            "{card}"
+        );
+        assert!(
+            !card.contains("Final loss") && !card.contains("Trained on"),
+            "{card}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_metrics_file_of_bad_lines_gives_no_rows() -> Result<(), Box<dyn Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let id = "demo_20261004-140000";
+        let dir = runs.run_dir(id)?;
+        write(dir.join("axolotl.yaml"), "base_model: \"m\"\n")?;
+        write(
+            dir.join("metrics.jsonl"),
+            "not a record\n{\"event\": \"log\"}\n\u{0}\n",
+        )?;
+        let input = gather(
+            &runs,
+            &run_record(id),
+            &secret_settings()?,
+            &repo(),
+            None,
+            &[],
+        )?;
+        assert_eq!(
+            (input.train_loss, input.eval_loss, input.duration),
+            (None, None, None)
+        );
         Ok(())
     }
 
