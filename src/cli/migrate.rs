@@ -662,6 +662,19 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_or_unparsable_config_has_nothing_to_move() -> TestResult {
+        let dir = project_with_toml("")?;
+        std::fs::remove_file(dir.path().join(crate::config::CONFIG_FILE))?;
+        assert_eq!(migrate(dir.path(), false)?, ["nothing to migrate"]);
+        assert!(!dir.path().join(crate::config::CONFIG_FILE).exists());
+        let broken = "[training\nhub_model_id = \"me/x\"\n";
+        let dir = project_with_toml(broken)?;
+        assert_eq!(migrate(dir.path(), false)?, ["nothing to migrate"]);
+        assert_eq!(read_toml(dir.path())?, broken);
+        Ok(())
+    }
+
+    #[test]
     fn a_config_without_the_key_is_left_alone() -> TestResult {
         let toml = with_training_key("epochs = 2");
         let dir = project_with_toml(&toml)?;
