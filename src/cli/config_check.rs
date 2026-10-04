@@ -23,6 +23,9 @@ pub async fn run(project_dir: &Path, resolve: bool) -> anyhow::Result<()> {
     for line in describe(&settings) {
         println!("{line}");
     }
+    for deprecation in crate::config::validate::deprecations(&settings) {
+        println!("warning: {deprecation}");
+    }
     if resolve {
         let resolver = super::resolver();
         for (key, secret) in secrets(&settings) {

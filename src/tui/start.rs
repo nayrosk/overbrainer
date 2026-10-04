@@ -263,6 +263,7 @@ fn plan(settings: &Settings, files: &DataFiles) -> Result<StartPlan, String> {
         Adapter::Full => "full",
     };
     let mut warnings: Vec<String> = reasoning_template_warning(training).into_iter().collect();
+    warnings.extend(crate::config::validate::deprecations(settings));
     if training.hub_model_id.is_some() && settings.hf_token.is_none() {
         warnings.push(
             "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail"
@@ -1205,6 +1206,11 @@ mod tests {
             plan.warnings
                 .iter()
                 .any(|w| w.contains("OVERBRAINER_HF_TOKEN"))
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.starts_with("training.hub_model_id is deprecated"))
         );
         assert!(
             !format!("{plan:?}").contains("gpu.example"),

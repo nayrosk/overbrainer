@@ -5,7 +5,7 @@ pub mod fields;
 mod load;
 mod reload;
 mod types;
-mod validate;
+pub(crate) mod validate;
 
 pub use load::{CONFIG_FILE, ConfigError, ENV_PREFIX, EnvSource, Source, env_keys, load, load_str};
 pub use reload::{

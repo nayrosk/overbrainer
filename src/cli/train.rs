@@ -86,6 +86,9 @@ async fn train(
 ) -> anyhow::Result<()> {
     let keep_pod = args.keep_pod;
     let training = training(settings)?;
+    for deprecation in crate::config::validate::deprecations(settings) {
+        warn(&deprecation);
+    }
     let name = args.target.as_deref().unwrap_or(&training.target);
     let target = settings
         .targets

@@ -125,6 +125,34 @@ fn config_check_shows_a_runpod_target_with_its_defaults() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn config_check_warns_about_the_deprecated_hub_model_id() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    overbrainer()?
+        .arg("init")
+        .arg(dir.path())
+        .assert()
+        .success();
+    let toml = std::fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+    let toml = toml.replacen(
+        "[training]\n",
+        "[training]\nhub_model_id = \"me/child\"\n",
+        1,
+    );
+    std::fs::write(dir.path().join("overbrainer.toml"), toml)?;
+    overbrainer()?
+        .arg("-C")
+        .arg(dir.path())
+        .args(["config", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "warning: training.hub_model_id is deprecated, use [hub] repo (overbrainer migrate moves it)",
+        ));
+    Ok(())
+}
+
+#[test]
 fn config_check_shows_auto_runpod_choices() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     overbrainer()?

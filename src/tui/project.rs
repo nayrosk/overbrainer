@@ -313,6 +313,13 @@ pub(super) fn rows(config: &ProjectConfig, locks: &Locks) -> Vec<Row> {
         value: &|field| export_value(&settings.export, field),
         lock: None,
     });
+    rows.heading("hub");
+    rows.fields(&Table {
+        section: Section::Hub,
+        path: &|field| FieldPath::Hub(field),
+        value: &|field| hub_value(&settings.hub, field),
+        lock: None,
+    });
     rows.heading("metrics");
     rows.fields(&Table {
         section: Section::Metrics,
@@ -659,6 +666,15 @@ fn export_value(export: &crate::config::Export, field: &str) -> Option<String> {
         "after_training" => Some(export.after_training.to_string()),
         "quantize" => Some(export.quantize.clone()),
         "ollama_name" => export.ollama_name.clone(),
+        _ => None,
+    }
+}
+
+fn hub_value(hub: &crate::config::Hub, field: &str) -> Option<String> {
+    match field {
+        "repo" => hub.repo.clone(),
+        "private" => Some(hub.private.to_string()),
+        "after_training" => Some(hub.after_training.to_string()),
         _ => None,
     }
 }
@@ -1141,6 +1157,7 @@ mod tests {
                 "training",
                 "targets.gpu_cloud (runpod)",
                 "export",
+                "hub",
                 "metrics",
                 "runpod",
                 "other",

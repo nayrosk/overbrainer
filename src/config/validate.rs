@@ -30,7 +30,24 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
     check_export(settings, &mut problems);
     check_targets(settings, &mut problems);
     check_runpod(settings, &mut problems);
+    check_hub(settings, &mut problems);
     problems
+}
+
+/// Deprecated keys still accepted, one message each.
+pub fn deprecations(settings: &Settings) -> Vec<String> {
+    let mut found = Vec::new();
+    if settings
+        .training
+        .as_ref()
+        .is_some_and(|training| training.hub_model_id.is_some())
+    {
+        found.push(
+            "training.hub_model_id is deprecated, use [hub] repo (overbrainer migrate moves it)"
+                .to_string(),
+        );
+    }
+    found
 }
 
 /// Provider and target names must be usable in env variable names.
@@ -605,7 +622,26 @@ fn check_data_center_ids(name: &str, data_center_ids: &[String], problems: &mut 
 
 /// `runpod.base_url`, when set, is an `https` URL, or `http` on a loopback host.
 fn check_runpod(settings: &Settings, problems: &mut Vec<String>) {
-    let Some(base_url) = &settings.runpod.base_url else {
+    check_base_url(
+        "runpod.base_url",
+        settings.runpod.base_url.as_deref(),
+        problems,
+    );
+}
+
+/// `hub.repo`, when set, is `NAMESPACE/NAME`; `hub.base_url` follows the runpod rule.
+fn check_hub(settings: &Settings, problems: &mut Vec<String>) {
+    if let Some(repo) = &settings.hub.repo
+        && !(repo.matches('/').count() == 1 && crate::train::sizing::is_repo_id(repo))
+    {
+        problems.push(format!("hub.repo must be NAMESPACE/NAME, got \"{repo}\""));
+    }
+    check_base_url("hub.base_url", settings.hub.base_url.as_deref(), problems);
+}
+
+/// `base_url`, when set, is an `https` URL, or `http` on a loopback host.
+fn check_base_url(key: &str, base_url: Option<&str>, problems: &mut Vec<String>) {
+    let Some(base_url) = base_url else {
         return;
     };
     let allowed = url::Url::parse(base_url).is_ok_and(|url| match url.scheme() {
@@ -619,9 +655,9 @@ fn check_runpod(settings: &Settings, problems: &mut Vec<String>) {
         _ => false,
     });
     if !allowed {
-        problems.push(
-            "runpod.base_url: must be an https URL (http only on a loopback host)".to_string(),
-        );
+        problems.push(format!(
+            "{key}: must be an https URL (http only on a loopback host)"
+        ));
     }
 }
 
@@ -754,6 +790,7 @@ pub(crate) fn env_only_in_file(file: &config::Config) -> Vec<String> {
     }
     keys.push("runpod.api_key".to_string());
     keys.push("runpod.base_url".to_string());
+    keys.push("hub.base_url".to_string());
     keys.push("hf_token".to_string());
     keys.push("log".to_string());
 
@@ -794,6 +831,64 @@ mod tests {
         kind = "local"
         runtime = "native"
     "#;
+
+    #[test]
+    fn hub_defaults_are_private_and_manual() -> Result<(), config::ConfigError> {
+        let loaded = settings(VALID)?;
+        assert_eq!(loaded.hub, super::super::types::Hub::default());
+        assert!(loaded.hub.private);
+        assert!(!loaded.hub.after_training);
+        Ok(())
+    }
+
+    #[test]
+    fn hub_repo_must_be_namespace_slash_name() -> Result<(), config::ConfigError> {
+        for repo in ["no-slash", "a/b/c", "a/", "/b", "a b/c"] {
+            let toml = format!("{VALID}\n[hub]\nrepo = \"{repo}\"\n");
+            assert_eq!(
+                check(&settings(&toml)?),
+                vec![format!("hub.repo must be NAMESPACE/NAME, got \"{repo}\"")]
+            );
+        }
+        let toml = format!("{VALID}\n[hub]\nrepo = \"me/model.v1\"\n");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn hub_base_url_follows_the_runpod_rule() -> Result<(), config::ConfigError> {
+        let toml = format!("{VALID}\n[hub]\nbase_url = \"http://example.com\"\n");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["hub.base_url: must be an https URL (http only on a loopback host)".to_string()]
+        );
+        let toml = format!("{VALID}\n[hub]\nbase_url = \"http://127.0.0.1:8080\"\n");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn hub_model_id_is_reported_as_deprecated() -> Result<(), config::ConfigError> {
+        assert_eq!(deprecations(&settings(VALID)?), Vec::<String>::new());
+        let toml = VALID.replace(
+            "adapter = \"qlora\"",
+            "adapter = \"qlora\"\nhub_model_id = \"me/x\"",
+        );
+        assert_eq!(
+            deprecations(&settings(&toml)?),
+            vec![
+                "training.hub_model_id is deprecated, use [hub] repo (overbrainer migrate moves it)"
+                    .to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_hub_keys_are_rejected() {
+        let toml = format!("{VALID}\n[hub]\nrepository = \"a/b\"\n");
+        assert!(settings(&toml).is_err());
+    }
 
     #[test]
     fn names_follow_the_allowed_charset() {
