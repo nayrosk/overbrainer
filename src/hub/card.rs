@@ -21,7 +21,7 @@ use crate::train::{CONFIG_FILE, METRICS_FILE, MetricLine, Outputs, parse_line, t
 pub const MARKER: &str = "<!-- overbrainer:card -->";
 /// The banner at the top of the card.
 pub const BANNER_URL: &str =
-    "https://raw.githubusercontent.com/nayrosk/overbrainer/main/docs/assets/hf-banner.gif";
+    "https://raw.githubusercontent.com/nayrosk/overbrainer/main/docs/assets/hf-banner.webp";
 /// The project.
 pub const REPO_URL: &str = "https://github.com/nayrosk/overbrainer";
 /// Runpod, with the project's referral code.
