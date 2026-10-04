@@ -566,37 +566,52 @@ async fn settle(mut check: JoinHandle<Option<Newer>>) -> Option<Newer> {
     answer.ok()?.ok()?
 }
 
+/// How a command gets the project.
+enum Access {
+    /// The command runs, holding the project lock when it takes one.
+    Run(Option<ProjectLock>),
+    /// `train stop` asked the process holding the lock for the snapshot:
+    /// nothing is left to run.
+    StopRequested,
+}
+
+/// The project lock `cli`'s command runs under. Only a project takes the
+/// lock: without `overbrainer.toml` the command fails with its usual error and
+/// leaves nothing behind.
+async fn access(cli: &Cli) -> anyhow::Result<Access> {
+    let dir = &cli.project_dir;
+    if !cli.command.writes_project() || !dir.join(crate::config::CONFIG_FILE).is_file() {
+        return Ok(Access::Run(None));
+    }
+    match ProjectLock::acquire(dir) {
+        Ok(lock) => Ok(Access::Run(Some(lock))),
+        // `train stop` only asks for the snapshot then: the process holding
+        // the project, most likely following the run, collects it.
+        Err(LockError::Held { pid }) => match cli.command.stopped_run() {
+            Some(run_id) => {
+                let source = Source::from(EnvSource::Process);
+                let front = Frontend::Cli(None);
+                train::request_stop(dir, run_id, pid, &front, &source).await?;
+                Ok(Access::StopRequested)
+            },
+            None => Err(LockError::Held { pid }.into()),
+        },
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Runs `cli`'s command; `tui` takes `check` to show its answer.
-// One arm per command: splitting the table would only hide it.
-#[allow(clippy::cognitive_complexity)]
 async fn dispatch(
     cli: Cli,
     logs: LogMode,
     check: &mut Option<JoinHandle<Option<Newer>>>,
     dotenv: DotenvKeys,
 ) -> anyhow::Result<()> {
+    let Access::Run(lock) = access(&cli).await? else {
+        return Ok(());
+    };
     let dir = &cli.project_dir;
     let auto = cli.auto;
-    // Only a project takes the lock: without `overbrainer.toml` the command fails
-    // with its usual error and leaves nothing behind.
-    let lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
-        match ProjectLock::acquire(dir) {
-            Ok(lock) => Some(lock),
-            // `train stop` only asks for the snapshot then: the process holding
-            // the project, most likely following the run, collects it.
-            Err(LockError::Held { pid }) => match cli.command.stopped_run() {
-                Some(run_id) => {
-                    let source = Source::from(EnvSource::Process);
-                    let front = Frontend::Cli(None);
-                    return train::request_stop(dir, run_id, pid, &front, &source).await;
-                },
-                None => return Err(LockError::Held { pid }.into()),
-            },
-            Err(error) => return Err(error.into()),
-        }
-    } else {
-        None
-    };
     // Served while the lock is held: dropped before it.
     let served = served_metrics(&cli.command, dir, lock.is_some()).await;
     // The buses of the command count into the served metrics, if any.
