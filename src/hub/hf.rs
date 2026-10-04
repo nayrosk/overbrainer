@@ -9,7 +9,7 @@ use hf_hub::{
 };
 use secrecy::{ExposeSecret, SecretString};
 
-use super::{Commit, Hub, HubError, Progress, ProgressSink, RepoId, RepoState, UploadFile};
+use super::{Commit, CommitRequest, Hub, HubError, Progress, ProgressSink, RepoId, RepoState};
 
 const DEFAULT_BASE_URL: &str = "https://huggingface.co";
 const USER_AGENT: &str = concat!("overbrainer/", env!("CARGO_PKG_VERSION"));
@@ -31,18 +31,21 @@ impl HfHub {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP client cannot be built.
-    pub fn new(base_url: Option<&str>, token: &SecretString) -> anyhow::Result<Self> {
+    /// Returns [`HubError::Client`] when the HTTP client cannot be built, for
+    /// example for a base URL that is not a URL.
+    pub fn new(base_url: Option<&str>, token: &SecretString) -> Result<Self, HubError> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .connect_timeout(CONNECT_TIMEOUT)
-            .build()?;
+            .build()
+            .map_err(|error| HubError::Client(withheld(error.to_string(), token)))?;
         let client = HFClient::builder()
             .endpoint(base_url.unwrap_or(DEFAULT_BASE_URL))
             .token(token.expose_secret())
             .cache_enabled(false)
             .client(http)
-            .build()?;
+            .build()
+            .map_err(|error| HubError::Client(withheld(error.to_string(), token)))?;
         Ok(Self {
             client,
             token: token.clone(),
@@ -62,18 +65,18 @@ impl HfHub {
                 namespace: namespace.to_string(),
             },
             HFError::RateLimited { .. } => HubError::RateLimited,
-            other => {
-                let text = other.to_string();
-                let token = self.token.expose_secret();
-                if !token.is_empty() && text.contains(token) {
-                    HubError::Other(
-                        "the Hub's error message held the token, so it is not shown".to_string(),
-                    )
-                } else {
-                    HubError::Other(text)
-                }
-            },
+            other => HubError::Other(withheld(other.to_string(), &self.token)),
         }
+    }
+}
+
+/// `text`, unless it holds `token`: then a fixed message.
+fn withheld(text: String, token: &SecretString) -> String {
+    let token = token.expose_secret();
+    if !token.is_empty() && text.contains(token) {
+        "the Hub's error message held the token, so it is not shown".to_string()
+    } else {
+        text
     }
 }
 
@@ -183,9 +186,11 @@ impl Hub for HfHub {
     async fn upload(
         &self,
         repo: &RepoId,
-        files: Vec<UploadFile>,
-        card: Option<String>,
-        message: String,
+        CommitRequest {
+            files,
+            card,
+            message,
+        }: CommitRequest,
         progress: ProgressSink,
     ) -> Result<Commit, HubError> {
         let mut operations: Vec<CommitOperation> = files
@@ -225,12 +230,13 @@ mod tests {
     };
 
     use super::*;
+    use crate::hub::UploadFile;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
     const TOKEN: &str = "hf_test";
 
-    fn hub(server: &MockServer) -> anyhow::Result<HfHub> {
+    fn hub(server: &MockServer) -> Result<HfHub, HubError> {
         HfHub::new(Some(&server.uri()), &SecretString::from(TOKEN))
     }
 
@@ -254,6 +260,19 @@ mod tests {
             .mount(&server)
             .await;
         assert_eq!(hub(&server)?.whoami().await?, "nayrosk");
+        Ok(())
+    }
+
+    #[test]
+    fn a_bad_base_url_is_a_client_error_without_the_token() -> TestResult {
+        let error = HfHub::new(Some("not a url"), &SecretString::from(TOKEN))
+            .err()
+            .ok_or("expected an error")?;
+        assert!(
+            matches!(error, HubError::Client(_)),
+            "a bad URL must map to Client"
+        );
+        assert!(!error.to_string().contains(TOKEN), "token must not appear");
         Ok(())
     }
 
@@ -526,7 +545,15 @@ mod tests {
         }];
         let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
         hub(&server)?
-            .upload(&repo("me/x")?, files, card, "push run".into(), sink)
+            .upload(
+                &repo("me/x")?,
+                CommitRequest {
+                    files,
+                    card,
+                    message: "push run".into(),
+                },
+                sink,
+            )
             .await?;
         let requests = server.received_requests().await.ok_or("no request log")?;
         let commit_request = requests
@@ -574,9 +601,11 @@ mod tests {
         let commit = hub(&server)?
             .upload(
                 &repo("me/x")?,
-                files,
-                Some("# card".into()),
-                "push run".into(),
+                CommitRequest {
+                    files,
+                    card: Some("# card".into()),
+                    message: "push run".into(),
+                },
                 sink,
             )
             .await?;

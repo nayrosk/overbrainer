@@ -1,10 +1,47 @@
 //! Choosing which files of a run's `output/` go to the Hub.
 
-use std::{collections::BTreeMap, fs, path::Path};
-
-use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
+use std::{collections::BTreeMap, fs, io};
 
 use super::UploadFile;
+
+/// Errors choosing the files of a run.
+#[derive(Debug, thiserror::Error)]
+pub enum SelectError {
+    /// A directory or a file's metadata could not be read.
+    #[error("cannot read {}", path.display())]
+    Read {
+        /// The directory or the file.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+    /// A path is not valid UTF-8, so it cannot name a file in the repo.
+    #[error("{} is not valid UTF-8", path.display())]
+    NotUtf8 {
+        /// The file.
+        path: PathBuf,
+    },
+    /// A file found outside the directory walked.
+    #[error("{} is outside {}", path.display(), root.display())]
+    Outside {
+        /// The file.
+        path: PathBuf,
+        /// The directory walked.
+        root: PathBuf,
+    },
+    /// Two files land on the same path in the repo.
+    #[error("{} and {} both map to {path_in_repo} in the repo", first.display(), second.display())]
+    Clash {
+        /// The file found first.
+        first: PathBuf,
+        /// The file found second.
+        second: PathBuf,
+        /// The path in the repo they both take.
+        path_in_repo: String,
+    },
+}
 
 /// The repo path of the card, which no file of the run may take.
 const CARD: &str = "README.md";
@@ -16,25 +53,33 @@ const CARD: &str = "README.md";
 ///
 /// # Errors
 ///
-/// Fails when a directory cannot be read, or when two files land on the same repo path.
-pub fn select(output: &Path) -> Result<Vec<UploadFile>> {
+/// Returns a [`SelectError`] when a directory cannot be read, a path is not
+/// valid UTF-8, or two files land on the same repo path.
+pub fn select(output: &Path) -> Result<Vec<UploadFile>, SelectError> {
     let mut chosen: BTreeMap<String, UploadFile> = BTreeMap::new();
     walk(output, output, &mut chosen)?;
     Ok(chosen.into_values().collect())
 }
 
-fn walk(root: &Path, dir: &Path, chosen: &mut BTreeMap<String, UploadFile>) -> Result<()> {
-    let entries = fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
+fn walk(
+    root: &Path,
+    dir: &Path,
+    chosen: &mut BTreeMap<String, UploadFile>,
+) -> Result<(), SelectError> {
+    let read = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| SelectError::Read { path, source }
+    };
+    let entries = fs::read_dir(dir).map_err(read(dir))?;
     for entry in entries {
-        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let entry = entry.map_err(read(dir))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         let at_root = dir == root;
         if name.starts_with('.') {
             continue;
         }
-        let meta = fs::symlink_metadata(&path)
-            .with_context(|| format!("reading metadata of {}", path.display()))?;
+        let meta = fs::symlink_metadata(&path).map_err(read(&path))?;
         if meta.is_dir() {
             if at_root && name.starts_with("checkpoint-") {
                 continue;
@@ -54,11 +99,11 @@ fn walk(root: &Path, dir: &Path, chosen: &mut BTreeMap<String, UploadFile>) -> R
                 size: meta.len(),
             };
             if let Some(other) = chosen.insert(path_in_repo.clone(), file) {
-                bail!(
-                    "{} and {} both map to {path_in_repo} in the repo",
-                    other.local.display(),
-                    path.display()
-                );
+                return Err(SelectError::Clash {
+                    first: other.local,
+                    second: path,
+                    path_in_repo,
+                });
             }
         }
     }
@@ -66,16 +111,19 @@ fn walk(root: &Path, dir: &Path, chosen: &mut BTreeMap<String, UploadFile>) -> R
 }
 
 /// The path in the repo, `/`-separated, with the `gguf/` prefix dropped.
-fn repo_path(root: &Path, path: &Path) -> Result<String> {
-    let relative = path
-        .strip_prefix(root)
-        .with_context(|| format!("{} is outside {}", path.display(), root.display()))?;
+fn repo_path(root: &Path, path: &Path) -> Result<String, SelectError> {
+    let relative = path.strip_prefix(root).map_err(|_| SelectError::Outside {
+        path: path.to_path_buf(),
+        root: root.to_path_buf(),
+    })?;
     let mut parts = Vec::new();
     for component in relative.components() {
         let part = component
             .as_os_str()
             .to_str()
-            .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+            .ok_or_else(|| SelectError::NotUtf8 {
+                path: path.to_path_buf(),
+            })?;
         parts.push(part);
     }
     if parts.len() > 1 && parts.first() == Some(&"gguf") {

@@ -833,7 +833,7 @@ mod tests {
     use crate::events::EventBus;
 
     use crate::cli::push::fixtures::{FakeHub, RUN, front, front_with, project, said, settings};
-    use crate::cli::push::push_run;
+    use crate::cli::push::{PushTarget, push_run};
     use crate::runs::RunState;
 
     const HUB_ON: &str = "\n[hub]\nafter_training = true\n";
@@ -846,7 +846,12 @@ mod tests {
     ) -> (Option<String>, Vec<String>) {
         let (front, lines) = front();
         let opts = PushOptions::default();
-        let push = push_run(hub, runs, settings, RUN, &opts, &front);
+        let target = PushTarget {
+            runs,
+            settings,
+            run_id: RUN,
+        };
+        let push = push_run(hub, target, &opts, &front);
         let warning = push_after(runs, settings, RUN, push, &front).await;
         (warning, said(&lines))
     }

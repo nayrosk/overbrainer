@@ -1,18 +1,17 @@
 //! The model card (`README.md`) of a pushed run.
 
 use std::fmt::{self, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{fs, io};
 
-use anyhow::{Context, Result};
 use serde::de::IgnoredAny;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use super::{RepoId, UploadFile};
 use crate::config::{Adapter, Pipeline, RoleModel, Settings, Training};
 use crate::runpod::PodRecord;
-use crate::runs::{MetricsSummary, RunRecord, Runs};
+use crate::runs::{MetricsSummary, RunRecord, Runs, RunsError};
 use crate::train::sizing::is_repo_id;
 use crate::train::{CONFIG_FILE, METRICS_FILE, MetricLine, Outputs, parse_line, top_level_scalar};
 
@@ -26,6 +25,35 @@ pub const BANNER_URL: &str =
 pub const REPO_URL: &str = "https://github.com/nayrosk/overbrainer";
 /// Runpod, with the project's referral code.
 pub const RUNPOD_URL: &str = "https://runpod.io?ref=ym24z23f";
+
+/// Errors reading what the card says of a run.
+#[derive(Debug, thiserror::Error)]
+pub enum CardError {
+    /// The run's directory cannot be named.
+    #[error(transparent)]
+    Run(#[from] RunsError),
+    /// The run's `axolotl.yaml` cannot be read or names an unknown adapter.
+    #[error("cannot read the run config {}", path.display())]
+    Config {
+        /// The run's `axolotl.yaml`.
+        path: PathBuf,
+    },
+    /// A file of the run cannot be read.
+    #[error("cannot read {}", path.display())]
+    Read {
+        /// The file.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+    /// The run's `axolotl.yaml` names no base model.
+    #[error("{} names no base_model", path.display())]
+    NoBaseModel {
+        /// The run's `axolotl.yaml`.
+        path: PathBuf,
+    },
+}
 
 /// What the card says of a run.
 #[derive(Debug, Clone, PartialEq)]
@@ -373,34 +401,34 @@ pub fn replaceable(remote: Option<&str>) -> bool {
 /// run's `axolotl.yaml` for what it trained, its data files for the example
 /// counts, its `metrics.jsonl` for the losses and the training time, its pod
 /// record for the GPU and the spend, and `files` for the GGUF types. A value
-/// that cannot be read is left out.
+/// that cannot be read is left out. The license is left `None`: the caller
+/// looks it up on the Hub.
 ///
 /// # Errors
 ///
-/// Fails when the run's `axolotl.yaml` cannot be read or names no base model.
-/// Data, metrics or a pod record that cannot be read only leave their values
-/// out, with a warning.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "each input is a separate source of the card; a struct would only wrap them"
-)]
+/// Returns a [`CardError`] when the run's `axolotl.yaml` cannot be read or
+/// names no base model. Data, metrics or a pod record that cannot be read
+/// only leave their values out, with a warning.
 pub fn gather(
     runs: &Runs,
     record: &RunRecord,
     settings: &Settings,
     repo: &RepoId,
-    license: Option<String>,
     files: &[UploadFile],
-) -> Result<CardInput> {
+) -> Result<CardInput, CardError> {
     let dir = runs.run_dir(&record.id)?;
     let config_path = dir.join(CONFIG_FILE);
-    let outputs = Outputs::recorded(&dir)
-        .with_context(|| format!("cannot read the run config {}", config_path.display()))?;
-    let config = fs::read_to_string(&config_path)
-        .with_context(|| format!("reading {}", config_path.display()))?;
+    let outputs = Outputs::recorded(&dir).ok_or_else(|| CardError::Config {
+        path: config_path.clone(),
+    })?;
+    let config = fs::read_to_string(&config_path).map_err(|source| CardError::Read {
+        path: config_path.clone(),
+        source,
+    })?;
     let scalar = |key: &str| top_level_scalar(&config, key);
-    let base_model = scalar("base_model")
-        .with_context(|| format!("{} names no base_model", config_path.display()))?;
+    let base_model = scalar("base_model").ok_or_else(|| CardError::NoBaseModel {
+        path: config_path.clone(),
+    })?;
 
     let count = |file: &str| {
         let path = dir.join("data").join(file);
@@ -428,7 +456,7 @@ pub fn gather(
         repo: repo.clone(),
         base_model,
         adapter: outputs.adapter,
-        license,
+        license: None,
         parent: settings.roles.parent.model.clone(),
         generator: settings.roles.generator.model.clone(),
         topics: settings
@@ -460,11 +488,16 @@ struct Metrics {
 
 impl Metrics {
     /// Reads `path`; a missing file gives no values.
-    fn read(path: &Path) -> Result<Self> {
+    fn read(path: &Path) -> Result<Self, CardError> {
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            Err(source) => {
+                return Err(CardError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            },
         };
         let mut summary = MetricsSummary::default();
         let mut times = Vec::new();
@@ -1087,18 +1120,11 @@ runtime = "docker"
             upload("Modelfile"),
         ];
 
-        let input = gather(
-            &runs,
-            &record,
-            &settings,
-            &repo(),
-            Some("apache-2.0".into()),
-            &files,
-        )?;
+        let input = gather(&runs, &record, &settings, &repo(), &files)?;
 
         assert_eq!(input.base_model, "Qwen/Qwen3-1.7B");
         assert_eq!(input.adapter, Adapter::Lora);
-        assert_eq!(input.license.as_deref(), Some("apache-2.0"));
+        assert_eq!(input.license, None, "the caller looks the license up");
         assert_eq!(
             (input.parent.as_str(), input.generator.as_str()),
             ("m2", "m1")
@@ -1138,14 +1164,7 @@ runtime = "docker"
         let id = "demo_20261004-110000";
         let dir = runs.run_dir(id)?;
         write(dir.join("axolotl.yaml"), "base_model: \"m\"\n")?;
-        let input = gather(
-            &runs,
-            &run_record(id),
-            &secret_settings()?,
-            &repo(),
-            None,
-            &[],
-        )?;
+        let input = gather(&runs, &run_record(id), &secret_settings()?, &repo(), &[])?;
         assert_eq!(input.adapter, Adapter::Full);
         assert_eq!(
             (input.train_examples, input.eval_examples),
@@ -1178,14 +1197,7 @@ runtime = "docker"
         write(dir.join("data/train.jsonl"), "garbage\n{}\n")?;
         // A directory where the metrics file should be cannot be read.
         fs::create_dir_all(dir.join("metrics.jsonl"))?;
-        let input = gather(
-            &runs,
-            &run_record(id),
-            &secret_settings()?,
-            &repo(),
-            None,
-            &[],
-        )?;
+        let input = gather(&runs, &run_record(id), &secret_settings()?, &repo(), &[])?;
         assert_eq!(input.runpod, None);
         assert_eq!((input.train_examples, input.eval_examples), (None, Some(0)));
         assert_eq!(
@@ -1216,14 +1228,7 @@ runtime = "docker"
             dir.join("metrics.jsonl"),
             "not a record\n{\"event\": \"log\"}\n\u{0}\n",
         )?;
-        let input = gather(
-            &runs,
-            &run_record(id),
-            &secret_settings()?,
-            &repo(),
-            None,
-            &[],
-        )?;
+        let input = gather(&runs, &run_record(id), &secret_settings()?, &repo(), &[])?;
         assert_eq!(
             (input.train_loss, input.eval_loss, input.duration),
             (None, None, None)
@@ -1251,14 +1256,7 @@ runtime = "docker"
         let runs = Runs::new(project.path());
         let id = "demo_20261004-120000";
         fs::create_dir_all(runs.run_dir(id)?)?;
-        let result = gather(
-            &runs,
-            &run_record(id),
-            &secret_settings()?,
-            &repo(),
-            None,
-            &[],
-        );
+        let result = gather(&runs, &run_record(id), &secret_settings()?, &repo(), &[]);
         assert!(result.is_err());
         Ok(())
     }

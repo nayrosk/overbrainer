@@ -81,6 +81,20 @@ pub enum HubError {
     RateLimited,
     #[error("Hugging Face request failed: {0}")]
     Other(String),
+    /// The HTTP client could not be built. The message never holds the token.
+    #[error("cannot build the Hugging Face client: {0}")]
+    Client(String),
+}
+
+/// What one commit writes: the files, the card and the commit message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRequest {
+    /// The run's files to upload.
+    pub files: Vec<UploadFile>,
+    /// The new README.md; `None` leaves the repo's README.md as it is.
+    pub card: Option<String>,
+    /// The commit message.
+    pub message: String,
 }
 
 /// A Hugging Face Hub the pipeline can push a run to.
@@ -126,23 +140,17 @@ pub trait Hub: Send + Sync {
         model: &str,
     ) -> impl Future<Output = Result<Option<String>, HubError>> + Send;
 
-    /// One commit with every file plus README.md = `card`, the repo's README.md
-    /// left as it is when `card` is `None`; nothing is committed unless every
-    /// upload finished.
+    /// One commit of `commit`: every file plus README.md = its card, the
+    /// repo's README.md left as it is when the card is `None`; nothing is
+    /// committed unless every upload finished.
     ///
     /// # Errors
     ///
     /// Returns a [`HubError`] when an upload or the commit fails.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one commit's parts; the trait mirrors the Hub's commit call"
-    )]
     fn upload(
         &self,
         repo: &RepoId,
-        files: Vec<UploadFile>,
-        card: Option<String>,
-        message: String,
+        commit: CommitRequest,
         progress: ProgressSink,
     ) -> impl Future<Output = Result<Commit, HubError>> + Send;
 }

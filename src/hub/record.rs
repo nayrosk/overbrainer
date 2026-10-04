@@ -1,17 +1,36 @@
 //! `runs/<id>/hub/push.json`: what the last push of a run sent where.
 
-use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::{fs, io};
 
-use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use crate::runs::write_atomic;
+use crate::runs::{RunsError, write_atomic};
 
 /// The directory of a run that holds what concerns the Hub.
 pub const HUB_DIR: &str = "hub";
 /// The record of the last push, in [`HUB_DIR`].
 pub const PUSH_FILE: &str = "push.json";
+
+/// Errors writing a [`PushRecord`].
+#[derive(Debug, thiserror::Error)]
+pub enum RecordError {
+    /// The `hub/` directory of the run could not be created.
+    #[error("cannot create {}", path.display())]
+    Dir {
+        /// The directory.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+    /// The record could not be serialized.
+    #[error("cannot serialize the push record")]
+    Serialize(#[from] serde_json::Error),
+    /// The record file could not be written.
+    #[error(transparent)]
+    Write(#[from] RunsError),
+}
 
 /// The last push of a run.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -35,10 +54,14 @@ impl PushRecord {
     ///
     /// # Errors
     ///
-    /// Returns an error when the directory or the file cannot be written.
-    pub fn save(&self, run_dir: &Path) -> anyhow::Result<()> {
+    /// Returns a [`RecordError`] when the directory or the file cannot be
+    /// written.
+    pub fn save(&self, run_dir: &Path) -> Result<(), RecordError> {
         let dir = run_dir.join(HUB_DIR);
-        fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        fs::create_dir_all(&dir).map_err(|source| RecordError::Dir {
+            path: dir.clone(),
+            source,
+        })?;
         let mut content = serde_json::to_vec_pretty(self)?;
         content.push(b'\n');
         write_atomic(&dir, PUSH_FILE, &content)?;

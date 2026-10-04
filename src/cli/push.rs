@@ -20,8 +20,8 @@ use crate::config::{EnvSource, Settings, Source};
 use crate::events::{Event, EventBus};
 use crate::hub::record::{HUB_DIR, PushRecord};
 use crate::hub::{
-    Commit, HfHub, Hub, HubError, Progress, ProgressSink, RepoId, RepoState, UploadFile, card,
-    files,
+    Commit, CommitRequest, HfHub, Hub, HubError, Progress, ProgressSink, RepoId, RepoState,
+    UploadFile, card, files,
 };
 use crate::runs::{RUNS_DIR, RunRecord, Runs, rfc3339, write_atomic};
 use crate::train::OUTPUT_DIR;
@@ -47,6 +47,17 @@ pub(crate) struct PushOptions {
     pub overwrite_card: bool,
     /// Show what would be pushed, push nothing.
     pub dry_run: bool,
+}
+
+/// The run a push sends: the runs of the project, its settings and the run's id.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PushTarget<'a> {
+    /// The project's runs.
+    pub runs: &'a Runs,
+    /// The project's settings.
+    pub settings: &'a Settings,
+    /// The run to push.
+    pub run_id: &'a str,
 }
 
 /// What a push did, or would do on a dry run.
@@ -85,7 +96,12 @@ pub(super) async fn run(
     };
     let push = async {
         if settings.hf_token.is_none() && opts.dry_run {
-            push_run(&Offline, &runs, &settings, &args.run_id, &opts, front).await
+            let target = PushTarget {
+                runs: &runs,
+                settings: &settings,
+                run_id: &args.run_id,
+            };
+            push_run(&Offline, target, &opts, front).await
         } else {
             push_with_token(&runs, &settings, &args.run_id, &opts, front).await
         }
@@ -184,32 +200,36 @@ pub(crate) async fn push_with_token(
     };
     let token = hf_token(token).await?;
     let hub = HfHub::new(settings.hub.base_url.as_deref(), &token)?;
-    push_run(&hub, runs, settings, run_id, opts, front).await
+    let target = PushTarget {
+        runs,
+        settings,
+        run_id,
+    };
+    push_run(&hub, target, opts, front).await
 }
 
-/// Pushes run `run_id` of `runs` to `hub`; shared by the command, the TUI task
-/// and the push after training. Dropping the future cancels the push before
-/// its commit.
+/// Pushes run `target` to `hub`; shared by the command, the TUI task and the
+/// push after training. Dropping the future cancels the push before its
+/// commit.
 ///
 /// # Errors
 ///
 /// Returns an error when the run cannot be pushed, or the Hub refuses it.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the Hub, the run and how to push it; shared by three callers"
-)]
 pub(crate) async fn push_run<H: Hub>(
     hub: &H,
-    runs: &Runs,
-    settings: &Settings,
-    run_id: &str,
+    target: PushTarget<'_>,
     opts: &PushOptions,
     front: &Frontend,
 ) -> anyhow::Result<Pushed> {
+    let PushTarget {
+        runs,
+        settings,
+        run_id,
+    } = target;
     let (record, run_dir, files) = pushable(runs, run_id)?;
     let repo = repo_of(hub, settings, opts).await?;
     let private = !opts.public && settings.hub.private;
-    let mut input = card::gather(runs, &record, settings, &repo, None, &files)?;
+    let mut input = card::gather(runs, &record, settings, &repo, &files)?;
     // A local base model has no license to look up.
     if !Path::new(&input.base_model).exists() {
         input.license = hub
@@ -231,23 +251,19 @@ pub(crate) async fn push_run<H: Hub>(
         card_kept: false,
     };
     if opts.dry_run {
-        dry_run(&run_dir, run_id, &files, &card, private, &pushed, front)?;
+        let staged = DryRun {
+            run_dir: &run_dir,
+            run_id,
+            files: &files,
+            card: &card,
+            private,
+        };
+        dry_run(&staged, &pushed, front)?;
         return Ok(pushed);
     }
 
     let repo = &pushed.repo;
-    let private = match hub.ensure_repo(repo, private).await.map_err(hub_error)? {
-        RepoState::Created { private } => private,
-        RepoState::Existing { private: kept } => {
-            if kept != private {
-                front.line(&format!(
-                    "repo {repo} exists and stays {}",
-                    visibility(kept)
-                ));
-            }
-            kept
-        },
-    };
+    let private = ensure_repo(hub, repo, private, front).await?;
     let remote = hub.remote_card(repo).await.map_err(hub_error)?;
     // A kept README.md is left out of the commit: re-uploading the copy read
     // above could overwrite an edit made during the upload.
@@ -269,7 +285,12 @@ pub(crate) async fn push_run<H: Hub>(
         env!("CARGO_PKG_VERSION")
     );
     let guard = front.open_bus();
-    let commit = upload(hub, repo, files, card, message, run_id, &guard.bus).await;
+    let request = CommitRequest {
+        files,
+        card,
+        message,
+    };
+    let commit = upload(hub, repo, request, run_id, &guard.bus).await;
     guard.close().await;
     let commit = commit.map_err(hub_error)?;
     PushRecord {
@@ -292,6 +313,30 @@ pub(crate) async fn push_run<H: Hub>(
         card_kept,
         ..pushed
     })
+}
+
+/// Makes sure `repo` exists, created with `private` when it does not; its
+/// visibility then. An existing repo keeps its own, said when it differs.
+async fn ensure_repo<H: Hub>(
+    hub: &H,
+    repo: &RepoId,
+    private: bool,
+    front: &Frontend,
+) -> anyhow::Result<bool> {
+    Ok(
+        match hub.ensure_repo(repo, private).await.map_err(hub_error)? {
+            RepoState::Created { private } => private,
+            RepoState::Existing { private: kept } => {
+                if kept != private {
+                    front.line(&format!(
+                        "repo {repo} exists and stays {}",
+                        visibility(kept)
+                    ));
+                }
+                kept
+            },
+        },
+    )
 }
 
 /// The repo of a push: `--repo`, else `[hub] repo`, else `<whoami>/<project>`
@@ -320,20 +365,30 @@ async fn repo_of<H: Hub>(
         .with_context(|| format!("`{text}` is not a Hugging Face repo: use NAMESPACE/NAME"))
 }
 
-/// Says what `pushed` would send and writes its `card` to `runs/<id>/hub/`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "what a dry run says, each part already at hand in push_run"
-)]
-fn dry_run(
-    run_dir: &Path,
-    run_id: &str,
-    files: &[UploadFile],
-    card: &str,
+/// What a dry run of a push says and writes, at hand in [`push_run`].
+struct DryRun<'a> {
+    /// The run's directory.
+    run_dir: &'a Path,
+    /// The run.
+    run_id: &'a str,
+    /// The run's files that would be pushed.
+    files: &'a [UploadFile],
+    /// The card that would be pushed.
+    card: &'a str,
+    /// Whether the repo would be created private.
     private: bool,
-    pushed: &Pushed,
-    front: &Frontend,
-) -> anyhow::Result<()> {
+}
+
+/// Says what `pushed` would send and writes the card of `staged` to
+/// `runs/<id>/hub/`.
+fn dry_run(staged: &DryRun<'_>, pushed: &Pushed, front: &Frontend) -> anyhow::Result<()> {
+    let DryRun {
+        run_dir,
+        run_id,
+        files,
+        card,
+        private,
+    } = *staged;
     front.line(&format!(
         "push: {}, {} when created; nothing is sent (--dry-run)",
         pushed.repo,
@@ -353,24 +408,18 @@ fn dry_run(
     Ok(())
 }
 
-/// The commit of `files` and `card` (none: README.md stays) to `repo`, its
-/// progress published on `bus` as [`Event::Push`] at most once per
+/// The commit of `request` (no card: README.md stays) to `repo`, its progress
+/// published on `bus` as [`Event::Push`] of run `run_id` at most once per
 /// [`PROGRESS_EVERY`].
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the commit's parts for Hub::upload, plus where its progress goes"
-)]
 async fn upload<H: Hub>(
     hub: &H,
     repo: &RepoId,
-    files: Vec<UploadFile>,
-    card: Option<String>,
-    message: String,
+    request: CommitRequest,
     run_id: &str,
     bus: &EventBus,
 ) -> Result<Commit, HubError> {
     let (sink, mut progress): (ProgressSink, _) = mpsc::unbounded_channel();
-    let mut upload = std::pin::pin!(hub.upload(repo, files, card, message, sink));
+    let mut upload = std::pin::pin!(hub.upload(repo, request, sink));
     let mut last: Option<Instant> = None;
     loop {
         tokio::select! {
@@ -451,9 +500,7 @@ impl Hub for Offline {
     fn upload(
         &self,
         _repo: &RepoId,
-        _files: Vec<UploadFile>,
-        _card: Option<String>,
-        _message: String,
+        _commit: CommitRequest,
         _progress: ProgressSink,
     ) -> impl Future<Output = Result<Commit, HubError>> + Send {
         ready(Err(HubError::Auth))
@@ -473,7 +520,7 @@ pub(crate) mod fixtures {
     use crate::config::{EnvSource, Settings, load_str};
     use crate::events::EventBus;
     use crate::hub::{
-        Commit, Hub, HubError, Progress, ProgressSink, RepoId, RepoState, UploadFile,
+        Commit, CommitRequest, Hub, HubError, Progress, ProgressSink, RepoId, RepoState,
     };
     use crate::runs::{RunRecord, RunState, Runs, Snapshot, SnapshotReason};
 
@@ -536,9 +583,7 @@ pub(crate) mod fixtures {
         fn upload(
             &self,
             repo: &RepoId,
-            files: Vec<UploadFile>,
-            card: Option<String>,
-            _message: String,
+            CommitRequest { files, card, .. }: CommitRequest,
             progress: ProgressSink,
         ) -> impl Future<Output = Result<Commit, HubError>> + Send {
             let total: u64 = files.iter().map(|f| f.size).sum();
@@ -681,7 +726,12 @@ mod tests {
         opts: &PushOptions,
     ) -> (anyhow::Result<Pushed>, Vec<String>) {
         let (front, lines) = front();
-        let pushed = push_run(hub, runs, settings, RUN, opts, &front).await;
+        let target = PushTarget {
+            runs,
+            settings,
+            run_id: RUN,
+        };
+        let pushed = push_run(hub, target, opts, &front).await;
         (pushed, said(&lines))
     }
 
@@ -960,7 +1010,12 @@ mod tests {
             path_in_repo: "a".into(),
             size: 100,
         }];
-        upload(&hub, &repo, files, None, String::new(), RUN, &bus).await?;
+        let request = CommitRequest {
+            files,
+            card: None,
+            message: String::new(),
+        };
+        upload(&hub, &repo, request, RUN, &bus).await?;
         let mut pushes = Vec::new();
         while let Ok(event) = events.try_recv() {
             pushes.push(event);
