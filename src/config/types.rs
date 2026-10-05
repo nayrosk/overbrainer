@@ -391,6 +391,10 @@ pub const SSH_CLIENT_ENV: &str = "OVERBRAINER_SSH_CLIENT";
 /// feature.
 pub const BUILTIN_SSH_REFUSED: &str = "ssh_client = \"builtin\" needs a build with the builtin-ssh feature (the release binaries have it)";
 
+/// What a `builtin` choice made by `OVERBRAINER_SSH_CLIENT` is refused with in a
+/// build without the `builtin-ssh` feature.
+const BUILTIN_SSH_ENV_REFUSED: &str = "OVERBRAINER_SSH_CLIENT=builtin needs a build with the builtin-ssh feature (the release binaries have it)";
+
 /// Whether this build holds the built-in SSH client.
 pub const HAS_BUILTIN_SSH: bool = cfg!(feature = "builtin-ssh");
 
@@ -403,9 +407,10 @@ pub const HAS_BUILTIN_SSH: bool = cfg!(feature = "builtin-ssh");
 ///
 /// Returns a message when `env` is neither `openssh` nor `builtin`, naming the
 /// variable, and when the result is `builtin` in a build without the `builtin-ssh`
-/// feature.
+/// feature, naming the variable when it chose `builtin`.
 pub fn effective_client(configured: SshClient, env: Option<&str>) -> Result<SshClient, String> {
-    let client = match env.map(str::trim).filter(|value| !value.is_empty()) {
+    let env = env.map(str::trim).filter(|value| !value.is_empty());
+    let client = match env {
         None => configured,
         Some("openssh") => SshClient::Openssh,
         Some("builtin") => SshClient::Builtin,
@@ -414,7 +419,12 @@ pub fn effective_client(configured: SshClient, env: Option<&str>) -> Result<SshC
         },
     };
     if client == SshClient::Builtin && !HAS_BUILTIN_SSH {
-        return Err(BUILTIN_SSH_REFUSED.to_string());
+        let refusal = if env.is_some() {
+            BUILTIN_SSH_ENV_REFUSED
+        } else {
+            BUILTIN_SSH_REFUSED
+        };
+        return Err(refusal.to_string());
     }
     Ok(client)
 }
@@ -915,12 +925,14 @@ mod tests {
         );
     }
 
+    /// Without the feature, `builtin` is refused, and the refusal names the
+    /// variable when the variable asked for it.
     #[cfg(not(feature = "builtin-ssh"))]
     #[test]
     fn effective_client_refuses_builtin_without_the_feature() {
         assert_eq!(
             effective_client(SshClient::Openssh, Some("builtin")),
-            Err(BUILTIN_REFUSED.to_string())
+            Err("OVERBRAINER_SSH_CLIENT=builtin needs a build with the builtin-ssh feature (the release binaries have it)".to_string())
         );
         assert_eq!(
             effective_client(SshClient::Builtin, None),

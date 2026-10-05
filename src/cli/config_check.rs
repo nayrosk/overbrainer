@@ -344,9 +344,12 @@ max_hours = 6
         let lines = describe(&project("")?, None)?;
         let found = line(&lines, "targets.box.ssh_client").ok_or("no line")?;
         assert!(found.contains("builtin-ssh feature"), "{found}");
-        assert_eq!(
-            describe(&project("")?, Some("builtin")).err(),
-            Some(crate::config::BUILTIN_SSH_REFUSED.to_string())
+        let error = describe(&project("")?, Some("builtin")).err();
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("OVERBRAINER_SSH_CLIENT=builtin needs")),
+            "{error:?}"
         );
         Ok(())
     }
