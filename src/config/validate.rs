@@ -60,6 +60,20 @@ pub fn hub_token_warning(settings: &Settings) -> Option<String> {
     })
 }
 
+/// The warning of a push with the legacy `training.hub_model_id` bound to fail:
+/// it is set and no Hugging Face token is. `None` when [`hub_token_warning`]
+/// already applies, so the same missing token is not warned about twice.
+pub fn legacy_hub_token_warning(settings: &Settings) -> Option<String> {
+    let legacy = settings
+        .training
+        .as_ref()
+        .is_some_and(|training| training.hub_model_id.is_some());
+    (legacy && settings.hf_token.is_none() && hub_token_warning(settings).is_none()).then(|| {
+        "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail"
+            .to_string()
+    })
+}
+
 /// Provider and target names must be usable in env variable names.
 fn check_names(settings: &Settings, problems: &mut Vec<String>) {
     let names = settings
@@ -895,6 +909,25 @@ mod tests {
                     .to_string()
             ]
         );
+        Ok(())
+    }
+
+    /// The legacy token warning stands down when the after-training one applies.
+    #[test]
+    fn the_legacy_token_warning_stands_down_for_the_hub_one() -> Result<(), config::ConfigError> {
+        let legacy = VALID.replace(
+            "adapter = \"qlora\"",
+            "adapter = \"qlora\"\nhub_model_id = \"me/x\"",
+        );
+        assert_eq!(
+            legacy_hub_token_warning(&settings(&legacy)?).as_deref(),
+            Some(
+                "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail"
+            )
+        );
+        let both = format!("{legacy}\n[hub]\nafter_training = true\n");
+        assert_eq!(legacy_hub_token_warning(&settings(&both)?), None);
+        assert_eq!(legacy_hub_token_warning(&settings(VALID)?), None);
         Ok(())
     }
 

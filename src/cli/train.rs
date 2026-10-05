@@ -574,14 +574,8 @@ pub(super) async fn secrets(
     settings: &Settings,
 ) -> anyhow::Result<Vec<(String, secrecy::SecretString)>> {
     let Some(token) = &settings.hf_token else {
-        if settings
-            .training
-            .as_ref()
-            .is_some_and(|training| training.hub_model_id.is_some())
-        {
-            warn(
-                "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail",
-            );
+        if let Some(warning) = crate::config::validate::legacy_hub_token_warning(settings) {
+            warn(&warning);
         }
         return Ok(Vec::new());
     };

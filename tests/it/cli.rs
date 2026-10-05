@@ -147,7 +147,7 @@ fn config_check_warns_about_the_deprecated_hub_model_id() -> Result<(), Box<dyn 
         .args(["config", "check"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
+        .stderr(predicate::str::contains(
             "warning: training.hub_model_id is deprecated, use [hub] repo (overbrainer migrate moves it)",
         ));
     Ok(())

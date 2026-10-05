@@ -473,7 +473,7 @@ pub fn gather(
         })
     });
 
-    Ok(CardInput {
+    let mut input = CardInput {
         repo: repo.clone(),
         base_model,
         adapter: outputs.adapter,
@@ -495,8 +495,37 @@ pub fn gather(
         duration: metrics.duration,
         gguf: gguf_types(&record.id, files),
         runpod,
-        reproduce_toml: reproduce_toml(settings),
-    })
+        reproduce_toml: String::new(),
+    };
+    input.reproduce_toml = recorded_reproduce_toml(settings, &input);
+    Ok(input)
+}
+
+/// The reproduce config of `settings` with the `[training]` values the run
+/// recorded (`input`: base model, adapter, epochs, learning rate and sequence
+/// length) in place of the current config's, so the card never contradicts
+/// itself when the config changed after the run.
+fn recorded_reproduce_toml(settings: &Settings, input: &CardInput) -> String {
+    let mut doc = reproduce_doc(settings);
+    if let Some(table) = doc.get_mut("training").and_then(Item::as_table_mut) {
+        table["base_model"] = value(shown_base(&input.base_model));
+        table["adapter"] = value(config_adapter(input.adapter));
+        if let Some(epochs) = input.epochs {
+            let whole = format!("{epochs}").parse::<i64>().ok();
+            table["epochs"] = whole.map_or_else(|| value(epochs), value);
+        }
+        if let Some(rate) = input
+            .learning_rate
+            .as_deref()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            table["learning_rate"] = value(rate);
+        }
+        if let Some(len) = input.sequence_len {
+            table["sequence_len"] = value(i64::from(len));
+        }
+    }
+    doc.to_string()
 }
 
 /// What a run's `metrics.jsonl` says.
@@ -559,6 +588,11 @@ fn gguf_types(run_id: &str, files: &[UploadFile]) -> Vec<String> {
 /// an allowlist, so nothing else of the configuration can reach it.
 #[must_use]
 pub fn reproduce_toml(settings: &Settings) -> String {
+    reproduce_doc(settings).to_string()
+}
+
+/// The reproduce config of `settings` as a TOML document.
+fn reproduce_doc(settings: &Settings) -> DocumentMut {
     let mut doc = DocumentMut::new();
 
     let mut topics = ArrayOfTables::new();
@@ -587,7 +621,7 @@ pub fn reproduce_toml(settings: &Settings) -> String {
         doc["training"] = Item::Table(training_table(training));
     }
     doc["pipeline"] = Item::Table(pipeline_table(&settings.pipeline));
-    doc.to_string()
+    doc
 }
 
 /// The `[providers]` entry of a role's model, as a TOML table.
@@ -609,15 +643,20 @@ fn role_table(role: &RoleModel) -> Table {
     table
 }
 
+/// The name of `adapter` in the config.
+fn config_adapter(adapter: Adapter) -> &'static str {
+    match adapter {
+        Adapter::Lora => "lora",
+        Adapter::Qlora => "qlora",
+        Adapter::Full => "full",
+    }
+}
+
 /// The `[training]` settings that go in the reproduce config, as a TOML table.
 fn training_table(training: &Training) -> Table {
     let mut table = Table::new();
     table["base_model"] = value(shown_base(&training.base_model));
-    table["adapter"] = value(match training.adapter {
-        Adapter::Lora => "lora",
-        Adapter::Qlora => "qlora",
-        Adapter::Full => "full",
-    });
+    table["adapter"] = value(config_adapter(training.adapter));
     table["epochs"] = value(i64::from(training.epochs));
     table["learning_rate"] = value(training.learning_rate);
     table["lora_r"] = value(i64::from(training.lora_r));
@@ -1134,6 +1173,23 @@ runtime = "docker"
         }
     }
 
+    /// The excerpt names what the run trained, not what the current config says.
+    fn assert_recorded_excerpt(excerpt: &str) {
+        for line in [
+            "base_model = \"Qwen/Qwen3-1.7B\"",
+            "epochs = 2\n",
+            "learning_rate = 0.00001",
+            "sequence_len = 2048\n",
+            "lora_r = ",
+        ] {
+            assert!(excerpt.contains(line), "the excerpt keeps the run's value");
+        }
+        assert!(
+            !excerpt.contains("Qwen3-0.6B"),
+            "the config's model is gone"
+        );
+    }
+
     /// `gather` reads the run as it ran: its config, data, metrics and cost.
     #[test]
     fn gather_reads_the_run_as_it_ran() -> Result<(), Box<dyn Error>> {
@@ -1203,7 +1259,7 @@ runtime = "docker"
                 spend_usd: 0.42
             })
         );
-        assert_eq!(input.reproduce_toml, reproduce_toml(&settings));
+        assert_recorded_excerpt(&input.reproduce_toml);
         Ok(())
     }
 

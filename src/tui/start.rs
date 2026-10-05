@@ -265,12 +265,7 @@ fn plan(settings: &Settings, files: &DataFiles) -> Result<StartPlan, String> {
     let mut warnings: Vec<String> = reasoning_template_warning(training).into_iter().collect();
     warnings.extend(crate::config::validate::deprecations(settings));
     warnings.extend(crate::config::validate::hub_token_warning(settings));
-    if training.hub_model_id.is_some() && settings.hf_token.is_none() {
-        warnings.push(
-            "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail"
-                .to_string(),
-        );
-    }
+    warnings.extend(crate::config::validate::legacy_hub_token_warning(settings));
     Ok(StartPlan {
         target: training.target.clone(),
         kind: kind(target),
@@ -1205,10 +1200,13 @@ mod tests {
         assert_eq!(plan.kind, "ssh, docker");
         assert_eq!(plan.model, "Qwen/Qwen3-4B, qlora, 3 epochs, lr 2e-4");
         assert_eq!(plan.runpod, None);
-        assert!(
+        assert_eq!(
             plan.warnings
                 .iter()
-                .any(|w| w.contains("OVERBRAINER_HF_TOKEN"))
+                .filter(|w| w.contains("OVERBRAINER_HF_TOKEN"))
+                .count(),
+            1,
+            "one missing-token warning, not two"
         );
         assert!(
             plan.warnings
