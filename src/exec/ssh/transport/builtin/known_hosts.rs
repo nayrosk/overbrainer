@@ -136,7 +136,6 @@ mod tests {
     use std::path::PathBuf;
 
     use hmac::{Hmac, KeyInit, Mac};
-    use rand::Rng;
     use russh::keys::ssh_key::known_hosts::HostPatterns;
     use russh::keys::{Algorithm, PrivateKey, PublicKey};
     use sha1::Sha1;
@@ -263,8 +262,7 @@ mod tests {
     #[test]
     fn hashed_entry_accepts() -> TestResult {
         let key = new_key()?;
-        let mut salt = [0u8; 20];
-        rand::rng().fill_bytes(&mut salt);
+        let salt: [u8; 20] = rand::random();
         let mut mac = Hmac::<Sha1>::new_from_slice(&salt)?;
         mac.update(b"pod.example.test");
         let hash: [u8; 20] = mac.finalize().into_bytes().into();
