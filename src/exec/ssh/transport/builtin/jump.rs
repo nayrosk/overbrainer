@@ -53,7 +53,7 @@ struct Route<'a> {
 impl Route<'_> {
     /// Pushes onto `hops` the hosts this one is reached through, then itself.
     fn push_onto(&self, hops: &mut Vec<Hop>, sources: &ConfigSources) -> Result<(), SshError> {
-        let host = config::resolve(self.destination, sources)?;
+        let host = resolve_as(self.name, self.destination, sources)?;
         if let Some((first, rest)) = jumps(&host.proxy_jump).and_then(<[String]>::split_first) {
             if self.depth >= MAX_DEPTH {
                 return Err(SshError::Connect {
@@ -71,7 +71,7 @@ impl Route<'_> {
             for hop in rest {
                 hops.push(Hop {
                     name: hop.clone(),
-                    host: config::resolve(&hop_destination(hop), sources)?,
+                    host: resolve_as(hop, &hop_destination(hop), sources)?,
                 });
             }
         }
@@ -81,6 +81,22 @@ impl Route<'_> {
         });
         Ok(())
     }
+}
+
+/// [`config::resolve`] of `destination`, a connection error naming the host
+/// `name`, as written, when the two differ (a hop read as an `ssh://` URL).
+fn resolve_as(
+    name: &str,
+    destination: &str,
+    sources: &ConfigSources,
+) -> Result<HostConfig, SshError> {
+    config::resolve(destination, sources).map_err(|error| match error {
+        SshError::Connect { reason, .. } if name != destination => SshError::Connect {
+            host: name.escape_debug().to_string(),
+            reason,
+        },
+        other => other,
+    })
 }
 
 /// A `ProxyJump` hop (`[user@]host[:port]` or an `ssh://` URL) as a
@@ -94,7 +110,8 @@ fn hop_destination(hop: &str) -> String {
 }
 
 /// The jump hosts of `proxy_jump`, or `None` for a direct connection (empty
-/// or `none`).
+/// or `none`). As in OpenSSH, `none` counts only as the whole value, never as
+/// one hop of a chain.
 pub(super) fn jumps(proxy_jump: &[String]) -> Option<&[String]> {
     match proxy_jump {
         [] => None,
@@ -218,6 +235,32 @@ mod tests {
             .map(|hop| hop.name)
             .collect();
         assert_eq!(names, ["ssh://edge:2022", "inner", "gpu"]);
+        Ok(())
+    }
+
+    /// A hop that cannot be resolved is named as `ProxyJump` writes it, first
+    /// hop and later hops alike.
+    #[test]
+    fn a_bad_hop_is_named_as_written() -> TestResult {
+        let dir = TempDir::new()?;
+        let sources = sources(
+            &dir,
+            "Host gpu\n ProxyJump ops@b:2200\nHost web\n ProxyJump a,b\nHost b\n HostName -x\n",
+        )?;
+        for destination in ["gpu", "web"] {
+            let Err(SshError::Connect { host, reason }) = chain(destination, &sources) else {
+                return Err("a bad hop was accepted".into());
+            };
+            let written = if destination == "gpu" {
+                "ops@b:2200"
+            } else {
+                "b"
+            };
+            assert_eq!(
+                (host.as_str(), reason.as_str()),
+                (written, "the host name starts with -")
+            );
+        }
         Ok(())
     }
 

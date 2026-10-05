@@ -195,6 +195,8 @@ impl BuiltinTransport {
             link = Link::Through(Box::new(session.forward(next).await?));
             jumps.push(session.handle);
         }
+        // Unreachable: a chain always ends with `destination` itself, so the
+        // loop returns on its last hop.
         Err(SshError::Other(format!(
             "no host to connect to for {destination}"
         )))

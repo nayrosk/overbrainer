@@ -121,7 +121,15 @@ jobs:
             docker exec -i "$container" sh -c 'cat >> /config/.ssh/authorized_keys' < ~/.ssh/overbrainer_test.pub
           done
           # The image turns TCP forwarding off; the bastion needs it. SIGHUP
-          # makes sshd read its config again.
+          # makes sshd read its config again, once sshd has written its pid.
+          for _ in $(seq 1 60); do
+            docker exec "$BASTION" test -s /config/sshd.pid && break
+            sleep 1
+          done
+          if ! docker exec "$BASTION" test -s /config/sshd.pid; then
+            echo "the bastion's sshd wrote no pid file within 60s" >&2
+            exit 1
+          fi
           docker exec "$BASTION" sh -c 'sed -i "s/^AllowTcpForwarding no/AllowTcpForwarding yes/" /config/sshd/sshd_config && kill -HUP "$(cat /config/sshd.pid)"'
           # Appends the host keys the command "$@" prints, once it prints some.
           scan() {
