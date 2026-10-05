@@ -709,7 +709,7 @@ fn set_first<T>(slot: &mut Option<T>, value: T) {
 
 /// Matches `text` against a pattern where `*` is any run of characters and `?`
 /// one character.
-fn wildcard_match(pattern: &str, text: &str) -> bool {
+pub(super) fn wildcard_match(pattern: &str, text: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();
     let (mut p, mut t) = (0, 0);
