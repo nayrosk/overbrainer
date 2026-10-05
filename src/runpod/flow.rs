@@ -11,6 +11,7 @@ use secrecy::SecretString;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::config::{EnvSource, effective_client, ssh_client_env};
 use crate::events::Event;
 use crate::exec::{ExecError, Executor, SshExecutor};
 use crate::runs::{Outcome, RunCtx, RunError, RunRecord, RunState, Runs, SnapshotReason, watch};
@@ -127,7 +128,12 @@ async fn provision_run(
     vram_floor_gb: Option<u32>,
 ) -> Result<(PodRecord, Provisioned), PodError> {
     let ssh_dir = ctx.runs.run_dir(&run.id)?.join(SSH_DIR);
-    let keys = PodKeys::generate(&ssh_dir, &alias(&run.id))?;
+    let client = effective_client(
+        target.ssh_client,
+        ssh_client_env(&EnvSource::Process).as_deref(),
+    )
+    .map_err(PodError::Keygen)?;
+    let keys = PodKeys::generate(&ssh_dir, &alias(&run.id), client)?;
     let mut record = PodRecord::new(&run.id, keep, target.gpu_count, &keys.host_public);
     record.max_cost_usd = target.max_cost_usd.filter(|_| !keep);
     record

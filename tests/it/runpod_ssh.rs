@@ -155,7 +155,11 @@ async fn another_host_key_is_refused_through_the_per_run_config() -> TestResult 
         return Ok(());
     };
     let dir = tempfile::tempdir()?;
-    let other = PodKeys::generate(&dir.path().join("other"), "other")?;
+    let other = PodKeys::generate(
+        &dir.path().join("other"),
+        "other",
+        overbrainer::config::SshClient::Openssh,
+    )?;
     let result = connect(dir.path(), &sshd, &keys(&sshd, &other.host_public)).await;
     let Err(error) = result else {
         return Err("connected although the pinned key differs".into());
@@ -908,6 +912,7 @@ fn a40_target() -> RunpodTarget {
         data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
         max_volume_gb: None,
+        ssh_client: overbrainer::config::SshClient::Openssh,
     }
 }
 

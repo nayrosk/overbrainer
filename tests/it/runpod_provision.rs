@@ -140,6 +140,7 @@ fn target(gpu_types: &[&str]) -> RunpodTarget {
         data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
         max_volume_gb: None,
+        ssh_client: overbrainer::config::SshClient::Openssh,
     }
 }
 

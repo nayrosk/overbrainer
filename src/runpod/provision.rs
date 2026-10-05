@@ -1464,6 +1464,7 @@ mod tests {
                     data_center_ids: crate::config::ListOrAuto::default(),
                     network_volume_id: None,
                     max_volume_gb: None,
+                    ssh_client: crate::config::SshClient::Openssh,
                 },
                 keys: PodKeys::new(
                     std::path::PathBuf::from("/nonexistent/id_ed25519"),
