@@ -1,5 +1,5 @@
 # AGENTS.md
 
-Instructions for coding agents (Codex, Cursor, Gemini and others) live in [CLAUDE.md](CLAUDE.md). Read it before changing anything.
+Coding agent instructions (Codex, Cursor, Gemini, others) in [CLAUDE.md](CLAUDE.md). Read before changing anything.
 
-It covers the code layout, build and test limits, code rules, secrets handling, the issue to PR workflow and the release flow. Code review rules are in the `path_instructions` of [.coderabbit.yaml](.coderabbit.yaml).
+Covers code layout, build/test limits, code rules, secrets handling, issue→PR workflow, release flow. Code review rules in `path_instructions` of [.coderabbit.yaml](.coderabbit.yaml).
