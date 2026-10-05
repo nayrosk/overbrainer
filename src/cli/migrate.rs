@@ -7,6 +7,9 @@ use std::path::Path;
 use anyhow::{Context as _, bail};
 
 use super::init::{GITIGNORE, add_gitignore_entries};
+use crate::config::CONFIG_FILE;
+use crate::config::edit::{ConfigDoc, FieldPath};
+use crate::config::fields::FieldValue;
 use crate::dataset::{DataFiles, Example};
 use crate::events::Stage;
 use crate::history::{self, Entry, Status};
@@ -27,6 +30,9 @@ const STATE_ENTRIES: [&str; 4] = [
     STATE_ENTRY,
 ];
 
+/// The `[hub]` flags a move of `training.hub_model_id` turns on when unset.
+const HUB_FLAGS: [&str; 2] = ["private", "after_training"];
+
 /// One change a migration makes.
 #[derive(Debug, Clone, PartialEq)]
 enum Change {
@@ -36,6 +42,16 @@ enum Change {
     Backfill(Entry),
     /// Write `.overbrainer/version`.
     Version,
+    /// Move the deprecated `training.hub_model_id` to `[hub]`. A `[hub] repo`
+    /// already set stays, and the old key is only dropped.
+    HubModelId {
+        /// The value of `training.hub_model_id`.
+        value: String,
+        /// `[hub] repo`, when already set.
+        hub_repo: Option<String>,
+        /// The [`HUB_FLAGS`] the move sets, those not set yet.
+        flags: Vec<&'static str>,
+    },
 }
 
 impl Change {
@@ -43,6 +59,26 @@ impl Change {
     /// what would be.
     fn line(&self, dry_run: bool) -> String {
         let (done, planned, what) = match self {
+            Self::HubModelId {
+                value,
+                hub_repo,
+                flags,
+            } => {
+                let set = if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", flags.join(", "))
+                };
+                if hub_repo.is_none() {
+                    (
+                        "moved",
+                        "move",
+                        format!("training.hub_model_id to [hub] repo = \"{value}\"{set}"),
+                    )
+                } else {
+                    ("removed", "remove", format!("training.hub_model_id{set}"))
+                }
+            },
             Self::Gitignore => ("added", "add", format!("{STATE_ENTRY} to {GITIGNORE}")),
             Self::Backfill(entry) => (
                 "backfilled",
@@ -127,6 +163,19 @@ fn plan(project_dir: &Path) -> anyhow::Result<Plan> {
         );
     }
     let mut plan = Plan::default();
+    if let Some(change) = hub_model_id(project_dir)? {
+        if let Change::HubModelId {
+            value,
+            hub_repo: Some(hub_repo),
+            ..
+        } = &change
+        {
+            plan.notes.push(format!(
+                "kept [hub] repo = \"{hub_repo}\"; dropped training.hub_model_id = \"{value}\""
+            ));
+        }
+        plan.changes.push(change);
+    }
     if !ignores_state(&project_dir.join(GITIGNORE))? {
         plan.changes.push(Change::Gitignore);
     }
@@ -165,17 +214,81 @@ fn apply(project_dir: &Path, changes: &[Change]) -> anyhow::Result<()> {
         .iter()
         .filter_map(|change| match change {
             Change::Backfill(entry) => Some(entry.clone()),
-            Change::Gitignore | Change::Version => None,
+            Change::Gitignore | Change::Version | Change::HubModelId { .. } => None,
         })
         .collect();
     if !backfill.is_empty() {
         history::append_all(project_dir, &backfill)
             .with_context(|| format!("cannot write {}", history::path(project_dir).display()))?;
     }
+    if changes
+        .iter()
+        .any(|change| matches!(change, Change::HubModelId { .. }))
+    {
+        move_hub_model_id(project_dir)?;
+    }
     if changes.contains(&Change::Version) {
         project_format::write_current(project_dir).context("cannot write the project format")?;
     }
     Ok(())
+}
+
+/// The deprecated `training.hub_model_id` of `overbrainer.toml`, when set. A
+/// missing or unparsable file has none: `config check` reports those.
+fn hub_model_id(project_dir: &Path) -> anyhow::Result<Option<Change>> {
+    let Some(doc) = read_config(project_dir)? else {
+        return Ok(None);
+    };
+    let hub_repo = doc.get(&FieldPath::Hub("repo"));
+    let flags = HUB_FLAGS
+        .into_iter()
+        .filter(|key| doc.get(&FieldPath::Hub(key)).is_none())
+        .collect();
+    Ok(doc
+        .get(&FieldPath::Training("hub_model_id"))
+        .map(|value| Change::HubModelId {
+            value,
+            hub_repo,
+            flags,
+        }))
+}
+
+/// Parses the project's `overbrainer.toml`; `None` when the file is missing or does not parse.
+fn read_config(project_dir: &Path) -> anyhow::Result<Option<ConfigDoc>> {
+    let path = project_dir.join(CONFIG_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(ConfigDoc::parse(&text).ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// Moves `training.hub_model_id` to `[hub]`, keeping the comments, and writes
+/// `overbrainer.toml` atomically. `[hub]` keys that are already set stay, and
+/// the [`HUB_FLAGS`] are turned on when unset, even with a repo already set.
+fn move_hub_model_id(project_dir: &Path) -> anyhow::Result<()> {
+    let Some(mut doc) = read_config(project_dir)? else {
+        return Ok(());
+    };
+    let Some(value) = doc.get(&FieldPath::Training("hub_model_id")) else {
+        return Ok(());
+    };
+    let edit = |error: crate::config::edit::EditError| anyhow::anyhow!("{error}");
+    doc.unset(&FieldPath::Training("hub_model_id"))
+        .map_err(edit)?;
+    // A `[hub] repo` already there stays, but publishing stays automatic.
+    if doc.get(&FieldPath::Hub("repo")).is_none() {
+        doc.set(&FieldPath::Hub("repo"), FieldValue::Text(value))
+            .map_err(edit)?;
+    }
+    for key in HUB_FLAGS {
+        let path = FieldPath::Hub(key);
+        if doc.get(&path).is_none() {
+            doc.set(&path, FieldValue::Bool(true)).map_err(edit)?;
+        }
+    }
+    crate::runs::write_atomic(project_dir, CONFIG_FILE, doc.text().as_bytes())
+        .with_context(|| format!("cannot write {CONFIG_FILE}"))
 }
 
 /// Whether `.gitignore` at `path` has a line in [`STATE_ENTRIES`]; not when
@@ -379,6 +492,7 @@ mod tests {
         Ok(())
     }
 
+    /// A stopped backfill is finished for the models it lacks and no others.
     #[test]
     fn a_stopped_backfill_is_finished_with_the_missing_models_only() -> TestResult {
         let dir = old_project()?;
@@ -449,6 +563,7 @@ mod tests {
         Ok(())
     }
 
+    /// A config in a newer format than this version reads is refused.
     #[test]
     fn a_newer_format_is_refused() -> TestResult {
         let dir = old_project()?;
@@ -468,6 +583,204 @@ mod tests {
             Ok(lines) => return Err(format!("expected a refusal, got {lines:?}").into()),
         }
         assert_eq!(history::read(dir.path())?, [] as [crate::history::Entry; 0]);
+        Ok(())
+    }
+
+    /// A project already at the current format, with this `[training]` key and
+    /// the commented rest of a config.
+    fn project_with_toml(toml: &str) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join(crate::config::CONFIG_FILE), toml)?;
+        std::fs::write(dir.path().join(GITIGNORE), format!("{STATE_ENTRY}\n"))?;
+        project_format::write_current(dir.path())?;
+        Ok(dir)
+    }
+
+    /// A valid commented config whose `[training]` table also holds `extra`.
+    fn with_training_key(extra: &str) -> String {
+        format!(
+            "# my project\n[project]\nname = \"demo\"\n\n[[topics]]\nname = \"ownership\"\n\
+             subtopics = 3\nquestions_per_subtopic = 5\n\n[providers.nanogpt]\nprotocol = \"openai\"\n\n\
+             [roles]\ngenerator = {{ provider = \"nanogpt\", model = \"m1\" }}\n\
+             parent = {{ provider = \"nanogpt\", model = \"m2\" }}\n\n\
+             [training]\n# the base\ntarget = \"local\"\nbase_model = \"Qwen/Qwen3-4B\"\n\
+             adapter = \"qlora\"\n{extra}\n\n[targets.local]\nkind = \"local\"\nruntime = \"native\"\n"
+        )
+    }
+
+    /// Reads the project's `overbrainer.toml` back as text.
+    fn read_toml(dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(std::fs::read_to_string(
+            dir.join(crate::config::CONFIG_FILE),
+        )?)
+    }
+
+    /// Loads config text into settings with an empty environment.
+    fn load_text(text: &str) -> Result<crate::config::Settings, Box<dyn std::error::Error>> {
+        Ok(crate::config::load_str(
+            text,
+            crate::config::EnvSource::Vars(Vec::new()),
+        )?)
+    }
+
+    /// `training.hub_model_id` moves to `[hub].repo`.
+    #[test]
+    fn hub_model_id_moves_to_the_hub_section() -> TestResult {
+        let dir = project_with_toml(&with_training_key("hub_model_id = \"me/mentor\""))?;
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            ["moved training.hub_model_id to [hub] repo = \"me/mentor\" (private, after_training)"]
+        );
+        let text = read_toml(dir.path())?;
+        assert!(!text.contains("hub_model_id"), "{text}");
+        assert!(text.contains("# my project") && text.contains("# the base"));
+        let settings = load_text(&text)?;
+        assert_eq!(settings.hub.repo.as_deref(), Some("me/mentor"));
+        assert!(settings.hub.private && settings.hub.after_training);
+        assert_eq!(migrate(dir.path(), false)?, ["nothing to migrate"]);
+        Ok(())
+    }
+
+    /// A dry run lists the move to `[hub]` and leaves the file as it was.
+    #[test]
+    fn dry_run_lists_the_hub_move_without_writing() -> TestResult {
+        let dir = project_with_toml(&with_training_key("hub_model_id = \"me/mentor\""))?;
+        let before = read_toml(dir.path())?;
+        assert_eq!(
+            migrate(dir.path(), true)?,
+            [
+                "would move training.hub_model_id to [hub] repo = \"me/mentor\" (private, after_training)"
+            ]
+        );
+        assert_eq!(read_toml(dir.path())?, before);
+        Ok(())
+    }
+
+    /// A `[hub].repo` that is already set is not overwritten by the old key.
+    #[test]
+    fn an_existing_hub_repo_is_not_overwritten() -> TestResult {
+        let toml = format!(
+            "{}\n[hub]\nrepo = \"me/kept\"\nprivate = false\n",
+            with_training_key("hub_model_id = \"me/old\"")
+        );
+        let dir = project_with_toml(&toml)?;
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            [
+                "kept [hub] repo = \"me/kept\"; dropped training.hub_model_id = \"me/old\"",
+                "removed training.hub_model_id (after_training)"
+            ]
+        );
+        let text = read_toml(dir.path())?;
+        assert!(!text.contains("hub_model_id"), "{text}");
+        let settings = load_text(&text)?;
+        assert_eq!(settings.hub.repo.as_deref(), Some("me/kept"));
+        assert!(!settings.hub.private && settings.hub.after_training);
+        Ok(())
+    }
+
+    /// With a `[hub] repo` set and no flags, the move still turns publishing on.
+    #[test]
+    fn an_existing_hub_repo_still_gets_the_flags() -> TestResult {
+        let toml = format!(
+            "{}\n[hub]\nrepo = \"me/kept\"\n",
+            with_training_key("hub_model_id = \"me/old\"")
+        );
+        let dir = project_with_toml(&toml)?;
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            [
+                "kept [hub] repo = \"me/kept\"; dropped training.hub_model_id = \"me/old\"",
+                "removed training.hub_model_id (private, after_training)"
+            ]
+        );
+        let settings = load_text(&read_toml(dir.path())?)?;
+        assert_eq!(settings.hub.repo.as_deref(), Some("me/kept"));
+        assert!(settings.hub.private && settings.hub.after_training);
+        Ok(())
+    }
+
+    /// With a `[hub] repo` set and `after_training = false`, that value stays.
+    #[test]
+    fn an_existing_hub_repo_keeps_a_flag_set_false() -> TestResult {
+        let toml = format!(
+            "{}\n[hub]\nrepo = \"me/kept\"\nafter_training = false\n",
+            with_training_key("hub_model_id = \"me/old\"")
+        );
+        let dir = project_with_toml(&toml)?;
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            [
+                "kept [hub] repo = \"me/kept\"; dropped training.hub_model_id = \"me/old\"",
+                "removed training.hub_model_id (private)"
+            ]
+        );
+        let settings = load_text(&read_toml(dir.path())?)?;
+        assert!(settings.hub.private && !settings.hub.after_training);
+        Ok(())
+    }
+
+    /// A `[hub]` table that sets the flags keeps their values.
+    #[test]
+    fn a_hub_table_that_sets_the_flags_keeps_them() -> TestResult {
+        let toml = format!(
+            "{}\n[hub]\nprivate = false\nafter_training = false\n",
+            with_training_key("hub_model_id = \"me/mentor\"")
+        );
+        let dir = project_with_toml(&toml)?;
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            ["moved training.hub_model_id to [hub] repo = \"me/mentor\""],
+            "no flag is set, so none is named"
+        );
+        let settings = load_text(&read_toml(dir.path())?)?;
+        assert_eq!(settings.hub.repo.as_deref(), Some("me/mentor"));
+        assert!(!settings.hub.private && !settings.hub.after_training);
+        Ok(())
+    }
+
+    /// The move reports only the flags it actually sets.
+    #[test]
+    fn the_move_names_only_the_flags_it_sets() -> TestResult {
+        let toml = format!(
+            "{}\n[hub]\nprivate = false\n",
+            with_training_key("hub_model_id = \"me/mentor\"")
+        );
+        let dir = project_with_toml(&toml)?;
+        assert_eq!(
+            migrate(dir.path(), true)?,
+            ["would move training.hub_model_id to [hub] repo = \"me/mentor\" (after_training)"]
+        );
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            ["moved training.hub_model_id to [hub] repo = \"me/mentor\" (after_training)"]
+        );
+        let settings = load_text(&read_toml(dir.path())?)?;
+        assert!(!settings.hub.private && settings.hub.after_training);
+        Ok(())
+    }
+
+    /// A config that is missing or does not parse has nothing to move.
+    #[test]
+    fn a_missing_or_unparsable_config_has_nothing_to_move() -> TestResult {
+        let dir = project_with_toml("")?;
+        std::fs::remove_file(dir.path().join(crate::config::CONFIG_FILE))?;
+        assert_eq!(migrate(dir.path(), false)?, ["nothing to migrate"]);
+        assert!(!dir.path().join(crate::config::CONFIG_FILE).exists());
+        let broken = "[training\nhub_model_id = \"me/x\"\n";
+        let dir = project_with_toml(broken)?;
+        assert_eq!(migrate(dir.path(), false)?, ["nothing to migrate"]);
+        assert_eq!(read_toml(dir.path())?, broken);
+        Ok(())
+    }
+
+    /// A config without `hub_model_id` is left alone.
+    #[test]
+    fn a_config_without_the_key_is_left_alone() -> TestResult {
+        let toml = with_training_key("epochs = 2");
+        let dir = project_with_toml(&toml)?;
+        assert_eq!(migrate(dir.path(), false)?, ["nothing to migrate"]);
+        assert_eq!(read_toml(dir.path())?, toml);
         Ok(())
     }
 

@@ -1,0 +1,72 @@
+---
+source: src/hub/card.rs
+---
+---
+base_model: Qwen/Qwen3-0.6B
+base_model_relation: finetune
+library_name: transformers
+license: mit
+pipeline_tag: text-generation
+tags:
+- overbrainer
+- distillation
+---
+
+[![overbrainer](https://raw.githubusercontent.com/nayrosk/overbrainer/main/docs/assets/hf-banner.webp)](https://github.com/nayrosk/overbrainer)
+
+Distilled with [overbrainer](https://github.com/nayrosk/overbrainer) [![overbrainer](https://img.shields.io/badge/distilled%20with-overbrainer-E93D82)](https://github.com/nayrosk/overbrainer)
+
+# nayrosk/rust-mentor
+
+Qwen/Qwen3-0.6B fully fine-tuned on 412 questions answered by deepseek/deepseek-v4-flash:thinking.
+
+## Use it
+
+```python
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("nayrosk/rust-mentor")
+```
+
+## How it was made
+
+overbrainer wrote questions on the topics below with the generator model, kept the parent model's answers and reasoning, then fine-tuned the base model on them with Axolotl.
+
+| | |
+|---|---|
+| Parent model | deepseek/deepseek-v4-flash:thinking |
+| Generator model | deepseek/deepseek-v4-flash |
+| Base model | Qwen/Qwen3-0.6B |
+| Adapter | none (full fine-tune) |
+| Examples | 412 train, 46 eval |
+| Epochs | 3 |
+| Learning rate | 0.0002 |
+| Sequence length | 4096 |
+| Final loss | 0.84 train, 0.91 eval |
+| Training time | 1 h 20 min |
+
+Topics:
+
+- **ownership**: Rust ownership, borrowing and lifetimes
+- **async**: Async Rust with tokio: futures, tasks and cancellation
+
+## Reproduce
+
+```sh
+cargo install --locked overbrainer
+```
+
+With these sections of overbrainer.toml (project, providers, targets and keys left out), then `overbrainer run`:
+
+```toml
+[[topics]]
+name = "ownership"
+```
+
+See the [overbrainer docs](https://github.com/nayrosk/overbrainer#readme).
+
+---
+
+[overbrainer](https://github.com/nayrosk/overbrainer) distills a big LLM into a small one from your terminal. If this model is useful, a star on [GitHub](https://github.com/nayrosk/overbrainer) helps.
+
+<!-- overbrainer:card -->

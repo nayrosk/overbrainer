@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
-" j/k select · a attach · c cancel · t start · x clear failed · p pod                                     v#.#.#  ? help "
+" j/k select · a attach · c cancel · t start · h push · x clear · p pod                                   v#.#.#  ? help "

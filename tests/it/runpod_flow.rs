@@ -138,6 +138,7 @@ impl Harness {
     }
 }
 
+/// A Runpod target with an A40 and no limits.
 fn target() -> RunpodTarget {
     RunpodTarget {
         gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
@@ -149,7 +150,7 @@ fn target() -> RunpodTarget {
         container_disk_gb: 50,
         max_hours: 1.0,
         max_cost_usd: None,
-        boot_grace: Duration::from_secs(1800),
+        boot_grace: Duration::from_mins(30),
         retrieve_grace: Duration::from_secs(3600),
         data_center_ids: ListOrAuto::default(),
         network_volume_id: None,

@@ -58,7 +58,7 @@ pub(super) async fn run(
     let settings = Source::from(EnvSource::Process).load(project_dir)?;
     let runs = Runs::new(project_dir);
     let record = runs.load(&args.run_id)?;
-    let model = model_of(&runs, &record)?;
+    let model = model_of(&runs, &record, Action::Export)?;
     let quantize = args
         .quantize
         .clone()
@@ -105,7 +105,34 @@ pub(super) async fn run(
     Box::pin(on_target(project_dir, &settings, target, &plan, front)).await
 }
 
-/// The model of `record` to export, relative to its run directory: its
+/// What is done with the model of a finished run, as its refusals say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Action {
+    /// `overbrainer export`.
+    Export,
+    /// `overbrainer push`.
+    Push,
+}
+
+impl Action {
+    /// `export`, `push`.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Push => "push",
+        }
+    }
+
+    /// `exported`, `pushed`.
+    fn done(self) -> &'static str {
+        match self {
+            Self::Export => "exported",
+            Self::Push => "pushed",
+        }
+    }
+}
+
+/// The model of `record` to `action`, relative to its run directory: its
 /// `output/` once it succeeded; for a stopped run, `output/` when Axolotl
 /// saved the partial model there, else its snapshot's checkpoint.
 ///
@@ -113,23 +140,24 @@ pub(super) async fn run(
 ///
 /// Returns an error for a run neither succeeded nor stopped, one whose files
 /// were not retrieved, or one without a model or `axolotl.yaml` locally.
-pub(super) fn model_of(runs: &Runs, record: &RunRecord) -> anyhow::Result<String> {
+pub(super) fn model_of(runs: &Runs, record: &RunRecord, action: Action) -> anyhow::Result<String> {
     let id = &record.id;
+    let (verb, done) = (action.verb(), action.done());
     let dir = runs.run_dir(id)?;
     if !matches!(record.state, RunState::Succeeded | RunState::Stopped) {
         bail!(
-            "run {id} is {}: only a succeeded or stopped run can be exported",
+            "run {id} is {}: only a succeeded or stopped run can be {done}",
             record.state.name()
         );
     }
     if artifacts_missing(record) {
         bail!(
             "the results of run {id} were not retrieved: retrieve them with `overbrainer train \
-             attach {id}`, then export"
+             attach {id}`, then {verb}"
         );
     }
     if !dir.join(CONFIG_FILE).is_file() {
-        bail!("{RUNS_DIR}/{id}/{CONFIG_FILE} is missing: the export needs it");
+        bail!("{RUNS_DIR}/{id}/{CONFIG_FILE} is missing: the {verb} needs it");
     }
     let holds_model = |model: &str| {
         ["adapter_config.json", "config.json"]
@@ -145,7 +173,7 @@ pub(super) fn model_of(runs: &Runs, record: &RunRecord) -> anyhow::Result<String
         {
             Ok(snapshot.checkpoint.clone())
         },
-        _ => bail!("{RUNS_DIR}/{id}/{OUTPUT_DIR} holds no model: nothing to export"),
+        _ => bail!("{RUNS_DIR}/{id}/{OUTPUT_DIR} holds no model: nothing to {verb}"),
     }
 }
 
@@ -422,7 +450,7 @@ pub(super) fn report_delivered(
 }
 
 /// `bytes` in MB or GB, one decimal.
-fn size_words(bytes: u64) -> String {
+pub(crate) fn size_words(bytes: u64) -> String {
     let mb = bytes / 100_000;
     if mb >= 10_000 {
         format!("{}.{} GB", mb / 10_000, mb % 10_000 / 1_000)
@@ -492,6 +520,7 @@ mod tests {
         }
     }
 
+    /// A run that is not finished, or has no model, is refused by `export`.
     #[test]
     fn only_a_finished_run_with_a_model_is_exported() -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
@@ -499,7 +528,9 @@ mod tests {
         let dir = runs.run_dir("r1")?;
         std::fs::create_dir_all(dir.join("output/checkpoint-40"))?;
         let refused = |state, why: &str| -> Result<(), Box<dyn std::error::Error>> {
-            let error = model_of(&runs, &record(state)).err().ok_or("accepted")?;
+            let error = model_of(&runs, &record(state), Action::Export)
+                .err()
+                .ok_or("accepted")?;
             assert!(error.to_string().contains(why), "{error}");
             Ok(())
         };
@@ -513,7 +544,9 @@ mod tests {
         refused(RunState::Succeeded, "runs/r1/output holds no model")?;
         let mut missing = record(RunState::Succeeded);
         missing.message = Some("artifacts not retrieved: download failed".into());
-        let error = model_of(&runs, &missing).err().ok_or("accepted")?;
+        let error = model_of(&runs, &missing, Action::Export)
+            .err()
+            .ok_or("accepted")?;
         assert!(error.to_string().contains("train attach r1"), "{error}");
 
         let mut stopped = record(RunState::Stopped);
@@ -523,10 +556,16 @@ mod tests {
             reason: SnapshotReason::Requested,
         });
         std::fs::write(dir.join("output/checkpoint-40/adapter_config.json"), "{}")?;
-        assert_eq!(model_of(&runs, &stopped)?, "output/checkpoint-40");
+        assert_eq!(
+            model_of(&runs, &stopped, Action::Export)?,
+            "output/checkpoint-40"
+        );
         std::fs::write(dir.join("output/adapter_config.json"), "{}")?;
-        assert_eq!(model_of(&runs, &stopped)?, "output");
-        assert_eq!(model_of(&runs, &record(RunState::Succeeded))?, "output");
+        assert_eq!(model_of(&runs, &stopped, Action::Export)?, "output");
+        assert_eq!(
+            model_of(&runs, &record(RunState::Succeeded), Action::Export)?,
+            "output"
+        );
         Ok(())
     }
 

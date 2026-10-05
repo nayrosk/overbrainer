@@ -308,6 +308,7 @@ impl Metrics {
         }
     }
 
+    /// Counts the items and tokens of one event, keeping what it must remember in `followed`.
     fn follow(&self, followed: &mut Followed, event: &Event) {
         if let Some((stage, result)) = event.item_result() {
             self.item(stage.name(), result.name(), 1);
@@ -389,7 +390,10 @@ impl Metrics {
                     followed.system = Some(set);
                 }
             },
-            Event::ItemDone { .. } | Event::ItemFailed { .. } | Event::PodStatus(_) => {},
+            Event::ItemDone { .. }
+            | Event::ItemFailed { .. }
+            | Event::PodStatus(_)
+            | Event::Push { .. } => {},
         }
     }
 

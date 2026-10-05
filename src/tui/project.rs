@@ -265,10 +265,10 @@ fn roles_of(command: Command) -> Vec<Role> {
     }
 }
 
-/// The rows of `config`: project, topics,
-/// providers, roles, pipeline, training, targets, then the env-only `runpod`
-/// and the rest. Topics, providers and targets are those of the document,
-/// with the tables only the environment sets.
+/// The rows of `config`: project, topics, providers, roles, pipeline,
+/// training, targets, export, `hub` with its env-only `base_url`, metrics,
+/// then the env-only `runpod` and the rest. Topics, providers and targets are
+/// those of the document, with the tables only the environment sets.
 pub(super) fn rows(config: &ProjectConfig, locks: &Locks) -> Vec<Row> {
     let settings = &config.settings;
     let mut rows = Builder {
@@ -313,6 +313,22 @@ pub(super) fn rows(config: &ProjectConfig, locks: &Locks) -> Vec<Row> {
         value: &|field| export_value(&settings.export, field),
         lock: None,
     });
+    rows.heading("hub");
+    rows.fields(&Table {
+        section: Section::Hub,
+        path: &|field| FieldPath::Hub(field),
+        value: &|field| hub_value(&settings.hub, field),
+        lock: None,
+    });
+    rows.env_only(
+        ("hub", "base_url", "Base URL of the Hugging Face Hub"),
+        settings
+            .hub
+            .base_url
+            .clone()
+            .map_or(Shown::Unset, Shown::Value),
+        None,
+    );
     rows.heading("metrics");
     rows.fields(&Table {
         section: Section::Metrics,
@@ -659,6 +675,16 @@ fn export_value(export: &crate::config::Export, field: &str) -> Option<String> {
         "after_training" => Some(export.after_training.to_string()),
         "quantize" => Some(export.quantize.clone()),
         "ollama_name" => export.ollama_name.clone(),
+        _ => None,
+    }
+}
+
+/// The text of a `[hub]` field for the project view; `None` for a field it does not show.
+fn hub_value(hub: &crate::config::Hub, field: &str) -> Option<String> {
+    match field {
+        "repo" => hub.repo.clone(),
+        "private" => Some(hub.private.to_string()),
+        "after_training" => Some(hub.after_training.to_string()),
         _ => None,
     }
 }
@@ -1117,6 +1143,7 @@ mod tests {
         );
     }
 
+    /// The rows follow the file order, with the tables that only the environment sets last.
     #[test]
     fn the_rows_follow_the_file_order_with_the_env_only_tables_last() -> TestResult {
         let rows = rows(&config()?, &Locks::default());
@@ -1141,6 +1168,7 @@ mod tests {
                 "training",
                 "targets.gpu_cloud (runpod)",
                 "export",
+                "hub",
                 "metrics",
                 "runpod",
                 "other",
@@ -1220,6 +1248,7 @@ mod tests {
         Ok(())
     }
 
+    /// The detail of a row says where its value comes from.
     #[test]
     fn the_detail_says_where_a_value_comes_from() -> TestResult {
         let rows = rows(&config()?, &Locks::default());
@@ -1235,6 +1264,22 @@ mod tests {
         assert_eq!(
             field(&rows, "pipeline.seed")?.detail(None),
             "pipeline.seed: Seed of the train/eval split (default 42)"
+        );
+        Ok(())
+    }
+
+    /// The Hub base URL is an environment-only row like the Runpod one.
+    #[test]
+    fn the_hub_base_url_is_an_env_only_row_like_the_runpod_one() -> TestResult {
+        let rows = rows(&config()?, &Locks::default());
+        for key in ["hub.base_url", "runpod.base_url"] {
+            let row = field(&rows, key)?;
+            assert_eq!(row.shown, Shown::Unset, "{key}");
+            assert!(row.path.is_none(), "{key} is env only");
+        }
+        assert_eq!(
+            field(&rows, "hub.base_url")?.detail(None),
+            "hub.base_url: env only, set OVERBRAINER_HUB__BASE_URL in .env"
         );
         Ok(())
     }

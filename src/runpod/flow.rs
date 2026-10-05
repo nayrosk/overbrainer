@@ -28,7 +28,7 @@ use crate::secrets::Redactor;
 
 /// How long after the watchdog's deadline the client deletes the pod itself, when
 /// it is still there: the watchdog should have done it first.
-pub const DEADLINE_MARGIN: Duration = Duration::from_secs(5 * 60);
+pub const DEADLINE_MARGIN: Duration = Duration::from_mins(5);
 
 /// Where the watchdog looks for the client's "retrieved" marker, in a run
 /// directory on the pod.
@@ -56,14 +56,14 @@ pub const LEASE_FILE: &str = ".pod/lease";
 
 /// How long a renewed lease holds the deadline off; the watchdog's
 /// `OVERBRAINER_LEASE_TTL` default.
-pub const LEASE_TTL: Duration = Duration::from_secs(15 * 60);
+pub const LEASE_TTL: Duration = Duration::from_mins(15);
 
 /// How often the following client renews the lease.
-const LEASE_RENEW: Duration = Duration::from_secs(5 * 60);
+const LEASE_RENEW: Duration = Duration::from_mins(5);
 
 /// A job with no new metric for this long counts as stalled: its lease is no
 /// longer renewed, so `max_hours` applies again.
-const STALL: Duration = Duration::from_secs(30 * 60);
+const STALL: Duration = Duration::from_mins(30);
 
 /// How often the lease holder looks at the time.
 const LEASE_TICK: Duration = Duration::from_secs(60);

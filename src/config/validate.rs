@@ -30,7 +30,48 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
     check_export(settings, &mut problems);
     check_targets(settings, &mut problems);
     check_runpod(settings, &mut problems);
+    check_hub(settings, &mut problems);
     problems
+}
+
+/// Deprecated keys still accepted, one message each.
+pub fn deprecations(settings: &Settings) -> Vec<String> {
+    let mut found = Vec::new();
+    if settings
+        .training
+        .as_ref()
+        .is_some_and(|training| training.hub_model_id.is_some())
+    {
+        found.push(
+            "training.hub_model_id is deprecated, use [hub] repo (overbrainer migrate moves it)"
+                .to_string(),
+        );
+    }
+    found
+}
+
+/// The warning of a push after training bound to fail: `[hub] after_training`
+/// is on and no Hugging Face token is set.
+pub fn hub_token_warning(settings: &Settings) -> Option<String> {
+    (settings.hub.after_training && settings.hf_token.is_none()).then(|| {
+        "[hub] after_training is on but OVERBRAINER_HF_TOKEN is not set: the push after \
+         training will fail"
+            .to_string()
+    })
+}
+
+/// The warning of a push with the legacy `training.hub_model_id` bound to fail:
+/// it is set and no Hugging Face token is. `None` when [`hub_token_warning`]
+/// already applies, so the same missing token is not warned about twice.
+pub fn legacy_hub_token_warning(settings: &Settings) -> Option<String> {
+    let legacy = settings
+        .training
+        .as_ref()
+        .is_some_and(|training| training.hub_model_id.is_some());
+    (legacy && settings.hf_token.is_none() && hub_token_warning(settings).is_none()).then(|| {
+        "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail"
+            .to_string()
+    })
 }
 
 /// Provider and target names must be usable in env variable names.
@@ -605,7 +646,26 @@ fn check_data_center_ids(name: &str, data_center_ids: &[String], problems: &mut 
 
 /// `runpod.base_url`, when set, is an `https` URL, or `http` on a loopback host.
 fn check_runpod(settings: &Settings, problems: &mut Vec<String>) {
-    let Some(base_url) = &settings.runpod.base_url else {
+    check_base_url(
+        "runpod.base_url",
+        settings.runpod.base_url.as_deref(),
+        problems,
+    );
+}
+
+/// `hub.repo`, when set, is `NAMESPACE/NAME`; `hub.base_url` follows the runpod rule.
+fn check_hub(settings: &Settings, problems: &mut Vec<String>) {
+    if let Some(repo) = &settings.hub.repo
+        && !(repo.matches('/').count() == 1 && crate::train::sizing::is_repo_id(repo))
+    {
+        problems.push(format!("hub.repo must be NAMESPACE/NAME, got \"{repo}\""));
+    }
+    check_base_url("hub.base_url", settings.hub.base_url.as_deref(), problems);
+}
+
+/// `base_url`, when set, is an `https` URL, or `http` on a loopback host.
+fn check_base_url(key: &str, base_url: Option<&str>, problems: &mut Vec<String>) {
+    let Some(base_url) = base_url else {
         return;
     };
     let allowed = url::Url::parse(base_url).is_ok_and(|url| match url.scheme() {
@@ -619,9 +679,9 @@ fn check_runpod(settings: &Settings, problems: &mut Vec<String>) {
         _ => false,
     });
     if !allowed {
-        problems.push(
-            "runpod.base_url: must be an https URL (http only on a loopback host)".to_string(),
-        );
+        problems.push(format!(
+            "{key}: must be an https URL (http only on a loopback host)"
+        ));
     }
 }
 
@@ -754,6 +814,7 @@ pub(crate) fn env_only_in_file(file: &config::Config) -> Vec<String> {
     }
     keys.push("runpod.api_key".to_string());
     keys.push("runpod.base_url".to_string());
+    keys.push("hub.base_url".to_string());
     keys.push("hf_token".to_string());
     keys.push("log".to_string());
 
@@ -794,6 +855,113 @@ mod tests {
         kind = "local"
         runtime = "native"
     "#;
+
+    /// An empty `[hub]` is private and manual.
+    #[test]
+    fn hub_defaults_are_private_and_manual() -> Result<(), config::ConfigError> {
+        let loaded = settings(VALID)?;
+        assert_eq!(loaded.hub, super::super::types::Hub::default());
+        assert!(loaded.hub.private);
+        assert!(!loaded.hub.after_training);
+        Ok(())
+    }
+
+    /// `[hub].repo` must be `namespace/name`.
+    #[test]
+    fn hub_repo_must_be_namespace_slash_name() -> Result<(), config::ConfigError> {
+        for repo in ["no-slash", "a/b/c", "a/", "/b", "a b/c"] {
+            let toml = format!("{VALID}\n[hub]\nrepo = \"{repo}\"\n");
+            assert_eq!(
+                check(&settings(&toml)?),
+                vec![format!("hub.repo must be NAMESPACE/NAME, got \"{repo}\"")]
+            );
+        }
+        let toml = format!("{VALID}\n[hub]\nrepo = \"me/model.v1\"\n");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        Ok(())
+    }
+
+    /// The Hub base URL follows the same rule as the Runpod one.
+    #[test]
+    fn hub_base_url_follows_the_runpod_rule() -> Result<(), config::ConfigError> {
+        let toml = format!("{VALID}\n[hub]\nbase_url = \"http://example.com\"\n");
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec!["hub.base_url: must be an https URL (http only on a loopback host)".to_string()]
+        );
+        let toml = format!("{VALID}\n[hub]\nbase_url = \"http://127.0.0.1:8080\"\n");
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        Ok(())
+    }
+
+    /// `training.hub_model_id` is reported as deprecated.
+    #[test]
+    fn hub_model_id_is_reported_as_deprecated() -> Result<(), config::ConfigError> {
+        assert_eq!(deprecations(&settings(VALID)?), Vec::<String>::new());
+        let toml = VALID.replace(
+            "adapter = \"qlora\"",
+            "adapter = \"qlora\"\nhub_model_id = \"me/x\"",
+        );
+        assert_eq!(
+            deprecations(&settings(&toml)?),
+            vec![
+                "training.hub_model_id is deprecated, use [hub] repo (overbrainer migrate moves it)"
+                    .to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    /// The legacy token warning stands down when the after-training one applies.
+    #[test]
+    fn the_legacy_token_warning_stands_down_for_the_hub_one() -> Result<(), config::ConfigError> {
+        let legacy = VALID.replace(
+            "adapter = \"qlora\"",
+            "adapter = \"qlora\"\nhub_model_id = \"me/x\"",
+        );
+        assert_eq!(
+            legacy_hub_token_warning(&settings(&legacy)?).as_deref(),
+            Some(
+                "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail"
+            )
+        );
+        let both = format!("{legacy}\n[hub]\nafter_training = true\n");
+        assert_eq!(legacy_hub_token_warning(&settings(&both)?), None);
+        assert_eq!(legacy_hub_token_warning(&settings(VALID)?), None);
+        Ok(())
+    }
+
+    /// A push after training without a token is warned about.
+    #[test]
+    fn a_push_after_training_without_a_token_is_warned() -> Result<(), config::ConfigError> {
+        let on = format!("{VALID}\n[hub]\nafter_training = true\n");
+        assert_eq!(
+            hub_token_warning(&settings(&on)?).as_deref(),
+            Some(
+                "[hub] after_training is on but OVERBRAINER_HF_TOKEN is not set: the push after \
+                 training will fail"
+            )
+        );
+        assert_eq!(
+            hub_token_warning(&settings(VALID)?),
+            None,
+            "the push is off"
+        );
+        let with_token = format!("hf_token = \"hf_x\"\n{on}");
+        assert_eq!(
+            hub_token_warning(&settings(&with_token)?),
+            None,
+            "a token is set"
+        );
+        Ok(())
+    }
+
+    /// An unknown `[hub]` key is rejected.
+    #[test]
+    fn unknown_hub_keys_are_rejected() {
+        let toml = format!("{VALID}\n[hub]\nrepository = \"a/b\"\n");
+        assert!(settings(&toml).is_err());
+    }
 
     #[test]
     fn names_follow_the_allowed_charset() {

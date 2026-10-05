@@ -142,12 +142,13 @@ mod tests {
         }
     }
 
+    /// A target with no settings gets the default image, venv and boot grace.
     #[test]
     fn defaults_are_applied() -> Result<(), &'static str> {
         let target = RunpodTarget::from_target(&config_target(None)).ok_or("not runpod")?;
         assert_eq!(target.image, DEFAULT_RUNPOD_IMAGE);
         assert_eq!(target.venv, "/workspace/axolotl-venv");
-        assert_eq!(target.boot_grace, Duration::from_secs(1800));
+        assert_eq!(target.boot_grace, Duration::from_mins(30));
         assert_eq!(target.retrieve_grace, Duration::from_secs(3600));
         assert_eq!(target.workdir(), "/workspace/overbrainer");
         assert_eq!(

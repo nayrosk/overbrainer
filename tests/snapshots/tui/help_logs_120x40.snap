@@ -28,7 +28,7 @@ source: src/tui/snapshots.rs
 "                     │ s                          toggle overbrainer / selected run's pod         │                     "
 "                     │ x                          export the shown lines to .overbrainer/         │                     "
 "                     │                                                                            │                     "
-"                     │ e, d, r, A and t are refused while a stage, an edit or a training start    │                     "
+"                     │ e, d, r, A, t and h are refused while a stage, an edit or a training start │                     "
 "                     │ runs in this TUI; the TUI also holds the project lock, so no other         │                     "
 "                     │ overbrainer command writes to the project meanwhile.                       │                     "
 "                     ╰────────────────────────────────────────────────────────────────────────────╯                     "

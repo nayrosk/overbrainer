@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "                                                                                "
 "                                                                                "
 "                                                                                "
-" j/k select · a attach · c cancel · t start               $0.32  v#.#.#  ? help "
+" j/k select · a attach · c cancel · t start · h push      $0.32  v#.#.#  ? help "

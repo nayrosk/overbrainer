@@ -85,6 +85,7 @@ struct Progress {
 }
 
 impl Progress {
+    /// Prints one line for a pipeline event.
     fn log(&mut self, event: &Event) {
         match event {
             Event::StageStarted { stage, total } => self.started(*stage, *total),
@@ -106,6 +107,11 @@ impl Progress {
             },
             Event::Mark(_) | Event::RunWatched { .. } => self.tell_phase(event),
             Event::PodStatus(status) => tracing::info!("pod: {}", pod_line(status)),
+            Event::Push {
+                run_id,
+                done,
+                total,
+            } => pushed(run_id, *done, *total),
             // Only the metrics and the TUI use them.
             Event::StageModel { .. } | Event::System(_) => {},
         }
@@ -333,6 +339,20 @@ pub fn pod_line(status: &PodStatus) -> String {
     }
 }
 
+/// Logs the upload progress line of a push.
+fn pushed(run_id: &str, done: u64, total: u64) {
+    tracing::info!("{}", push_line(run_id, done, total));
+}
+
+/// The upload progress of run `run_id`: `push: <run-id> 1.2 MB/3.4 GB`.
+fn push_line(run_id: &str, done: u64, total: u64) -> String {
+    format!(
+        "push: {run_id} {}/{}",
+        super::export::size_words(done),
+        super::export::size_words(total)
+    )
+}
+
 /// `duration` to the second below a minute, to the second below an hour, to the
 /// minute above: `45s`, `3m41s`, `1h12m`.
 #[must_use]
@@ -385,6 +405,7 @@ mod tests {
         progress
     }
 
+    /// An event for a failed answer, retryable or not.
     fn failure(retryable: bool) -> Event {
         Event::ItemFailed {
             stage: Stage::Answers,
@@ -392,6 +413,15 @@ mod tests {
             error: "boom".to_string(),
             retryable,
         }
+    }
+
+    /// A push line shows the bytes uploaded out of the total.
+    #[test]
+    fn a_push_line_shows_the_bytes_uploaded() {
+        assert_eq!(
+            push_line("r1", 412_345_678, 1_234_567_890),
+            "push: r1 412.3 MB/1.2 GB"
+        );
     }
 
     #[test]
@@ -551,6 +581,7 @@ mod tests {
         assert_eq!(empty.advance(), None);
     }
 
+    /// Pod events read as short sentences.
     #[test]
     fn pod_events_read_as_sentences() -> Result<(), crate::runpod::InvalidPodId> {
         let pod_id = crate::runpod::PodId::new("k3x9abc")?;
@@ -574,7 +605,7 @@ mod tests {
         assert_eq!(
             pod_line(&PodStatus::Deleted {
                 pod_id: pod_id.clone(),
-                uptime: Some(Duration::from_secs(4_320)),
+                uptime: Some(Duration::from_mins(72)),
                 estimated_spend: Some(0.636),
             }),
             "k3x9abc deleted after 1h12m, about $0.64"
@@ -596,11 +627,12 @@ mod tests {
         Ok(())
     }
 
+    /// A duration is shown in the largest fitting unit.
     #[test]
     fn durations_read_in_the_right_unit() {
         assert_eq!(duration_words(Duration::from_secs(45)), "45s");
         assert_eq!(duration_words(Duration::from_secs(60)), "1m00s");
         assert_eq!(duration_words(Duration::from_secs(3_599)), "59m59s");
-        assert_eq!(duration_words(Duration::from_secs(10_920)), "3h02m");
+        assert_eq!(duration_words(Duration::from_mins(182)), "3h02m");
     }
 }

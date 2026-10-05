@@ -15,8 +15,8 @@ use secrecy::SecretString;
 use super::export::{Delivery, EXPORT_PREFIX, Plan, finish_export, started_line};
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
 use super::train::{
-    HF_TOKEN, POLL, exporting, finish, prepare, resumed, secrets, started, stop_requested,
-    stoppable, training, warn,
+    HF_TOKEN, POLL, exporting, finish, prepare, push_after_training, resumed, secrets, started,
+    stop_requested, stoppable, training, warn,
 };
 use crate::config::{Settings, Training};
 use crate::dataset::DataFiles;
@@ -165,6 +165,7 @@ pub(super) async fn train(
     let ollama = settings.export.ollama_name.as_deref();
     let report =
         |runs: &Runs, id: &str, result, front: &Frontend| finish(runs, id, result, front, ollama);
+    // The run's ID, once it was created, beside the job's result.
     let result = async {
         warn_orphans(&session.ctx()).await;
         let record = create(&session.runs, &settings.project.name, spec.workdir(), name)?;
@@ -172,6 +173,7 @@ pub(super) async fn train(
         let trainer = exporting(trainer, &record.id, &settings.export);
         started(&record);
         front.run_created(&record.id);
+        let id = record.id.clone();
         let job = Job {
             session: &session,
             spec,
@@ -181,10 +183,15 @@ pub(super) async fn train(
             report: &report,
             cancel_on_interrupt: false,
         };
-        job.run(&mut interrupt, record, keep, secrets).await
+        anyhow::Ok((id, job.run(&mut interrupt, record, keep, secrets).await))
     }
     .await;
     session.close().await;
+    let (id, result) = result?;
+    // After the pod ended and the report: the GGUF of an export is in place.
+    if result.is_ok() {
+        push_after_training(&Runs::new(project_dir), settings, &id, front).await;
+    }
     result
 }
 
@@ -924,8 +931,12 @@ pub(super) async fn attach(
         report: &report,
         cancel_on_interrupt: false,
     };
+    let id = record.id.clone();
     let result = job.attach(&mut interrupt, record, &mut pod).await;
     session.close().await;
+    if result.is_ok() {
+        push_after_training(&Runs::new(project_dir), settings, &id, front).await;
+    }
     result
 }
 
@@ -1028,8 +1039,12 @@ pub(super) async fn stop(
         report: &report,
         cancel_on_interrupt: false,
     };
+    let id = record.id.clone();
     let result = job.stop(&mut interrupt, record, &mut pod).await;
     session.close().await;
+    if result.is_ok() {
+        push_after_training(&Runs::new(project_dir), settings, &id, front).await;
+    }
     result
 }
 
@@ -1116,6 +1131,7 @@ mod tests {
         Ok(())
     }
 
+    /// A Runpod target with an A40 and no limits.
     fn target() -> RunpodTarget {
         RunpodTarget {
             gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
@@ -1127,7 +1143,7 @@ mod tests {
             container_disk_gb: 50,
             max_hours: 6.0,
             max_cost_usd: None,
-            boot_grace: Duration::from_secs(1800),
+            boot_grace: Duration::from_mins(30),
             retrieve_grace: Duration::from_secs(3600),
             data_center_ids: ListOrAuto::default(),
             network_volume_id: None,

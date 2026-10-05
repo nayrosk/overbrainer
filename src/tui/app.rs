@@ -324,6 +324,8 @@ pub(super) enum Action {
     /// Leaving the failed runs `0` out of the Training view's list until the
     /// TUI restarts, asked for with `x`.
     ClearFailed(Vec<String>),
+    /// Pushing run `0` to the Hugging Face Hub, asked for with `h`.
+    Push(String),
     /// Deleting a topic, a provider or a target from `overbrainer.toml`.
     Remove(Removal),
 }
@@ -695,6 +697,12 @@ impl App {
         if self.auto.prepare.is_some() {
             work.push("preparing auto mode".to_string());
         }
+        if self.training.push_prepare.is_some() {
+            work.push("preparing a push".to_string());
+        }
+        if self.training.pushing.is_some() {
+            work.push("pushing".to_string());
+        }
         if let Some(Overlay::Picker(picking)) = &self.overlay
             && picking.picker.loading()
         {
@@ -772,6 +780,8 @@ impl App {
             },
             Ok(Done::Catalog(listed)) => self.listed_catalog(id, listed),
             Ok(Done::ConfigChecked(checked)) => self.config_checked(id, *checked),
+            Ok(Done::PushPrepared(plan)) => self.push_prepared(id, plan),
+            Ok(Done::Pushed(result)) => self.pushed(id, result),
             Ok(
                 Done::Prepared(_)
                 | Done::PreparedAuto(_)
@@ -845,6 +855,12 @@ impl App {
         }
         if self.training.tasks.contains_key(&id) {
             return self.trained(id, Err(error));
+        }
+        if self.is_push(id) {
+            return self.pushed(id, Err(error));
+        }
+        if self.training.push_prepare == Some(id) {
+            return self.push_prepared(id, Err(error));
         }
         if self.prepare == Some(id) {
             return self.prepared(Err(error));
@@ -961,6 +977,9 @@ impl App {
                 return Vec::new();
             },
         };
+        if self.is_push(id) {
+            return self.on_push_message(message);
+        }
         if self.training.is_training(id) {
             return self.on_training_message(id, message);
         }
@@ -1171,7 +1190,8 @@ impl App {
         let idle = self.edit.is_none()
             && self.project_view.save.is_none()
             && self.pipeline_task.is_none()
-            && self.training.tasks.is_empty();
+            && self.training.tasks.is_empty()
+            && self.training.pushing.is_none();
         if self.leaving.is_some() && idle {
             self.exit = self.leaving;
         }
@@ -1484,6 +1504,7 @@ impl App {
             Action::Abandon(tasks) => self.abandon(&tasks),
             Action::AbandonStart(task) => self.abandon_start(task),
             Action::ClearFailed(runs) => self.clear_failed(&runs),
+            Action::Push(run) => self.confirm_push(run),
             Action::Remove(removal) => self.remove(&removal),
             Action::Delete { deletion, counts } => {
                 if self.locked() {
@@ -1806,6 +1827,13 @@ impl App {
             text.push("overbrainer.toml is being saved: quitting waits for it.".to_string());
         }
         text.extend(self.training_quit_text());
+        if let Some(pushing) = &self.training.pushing {
+            text.push(format!(
+                "Run {} is being pushed: the push stops now and nothing is committed; push it \
+                 again to resume.",
+                pushing.run
+            ));
+        }
         if text.is_empty() {
             self.exit = Some(Exit::Quit);
             return Vec::new();
@@ -1829,6 +1857,12 @@ impl App {
             self.leaving = Some(why);
         }
         let mut effects: Vec<Effect> = self.pipeline_task.map(Effect::Cancel).into_iter().collect();
+        effects.extend(
+            self.training
+                .pushing
+                .as_ref()
+                .map(|pushing| Effect::Cancel(pushing.task)),
+        );
         effects.extend(match self.leaving {
             Some(Exit::Signal) => self.abandon_all(),
             _ => self.detach_all(),
@@ -1854,6 +1888,12 @@ impl App {
         if self.pipeline_task.is_some() {
             let name = self.pipeline.command.map_or("stage", command_name);
             lines.push(format!("waiting for {name} to stop..."));
+        }
+        if let Some(pushing) = &self.training.pushing {
+            lines.push(format!(
+                "waiting for the push of run {} to stop...",
+                pushing.run
+            ));
         }
         lines.extend(self.training.tasks.values().map(|follow| {
             let run = &follow.run_id;
@@ -1888,6 +1928,9 @@ impl App {
         if self.pipeline_task.is_some() {
             let name = self.pipeline.command.map_or("stage", command_name);
             still.push(format!("{name} still stops"));
+        }
+        if self.training.pushing.is_some() {
+            still.push("the push still stops".to_string());
         }
         let (detached, abandoned) = self.keep_following();
         if detached > 0 {
@@ -1937,6 +1980,9 @@ impl App {
             }
             if !self.training.tasks.is_empty() {
                 waited.push("the training tasks end".to_string());
+            }
+            if self.training.pushing.is_some() {
+                waited.push("the push stops".to_string());
             }
             self.say(
                 Severity::Warn,
@@ -4278,6 +4324,180 @@ mod tests {
             )),
             "{effects:?}"
         );
+        Ok(())
+    }
+
+    /// What a push of [`SECOND`] would send.
+    fn push_plan() -> crate::cli::push::PushPlan {
+        crate::cli::push::PushPlan {
+            run_id: SECOND.into(),
+            repo: "<you>/rust-expert".into(),
+            private: true,
+            files: 2,
+            bytes: 1_500_000,
+        }
+    }
+
+    /// `h` on the selected run, its preparation ended with `plan`, then `y`:
+    /// the push task spawned.
+    fn push(
+        app: &mut App,
+        plan: crate::cli::push::PushPlan,
+    ) -> Result<TaskId, Box<dyn std::error::Error>> {
+        let effects = keys(app, &[KeyCode::Char('h')]);
+        let [Effect::Spawn(prepare, Task::PreparePush(run))] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        assert_eq!(run, &plan.run_id);
+        let prepare = *prepare;
+        ended(app, prepare, Ok(Done::PushPrepared(Ok(plan))));
+        let effects = keys(app, &[KeyCode::Char('y')]);
+        match effects.as_slice() {
+            [Effect::Spawn(push, Task::Push(_))] => Ok(*push),
+            _ => Err(format!("{effects:?}").into()),
+        }
+    }
+
+    /// `h` on a run that cannot be pushed shows the reason and nothing else.
+    #[test]
+    fn h_refuses_a_run_that_cannot_be_pushed() -> TestResult {
+        let (_dir, mut app) = runs_app()?;
+        let effects = keys(&mut app, &[KeyCode::Char('h')]);
+        let [Effect::Spawn(prepare, Task::PreparePush(run))] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        assert_eq!(run, FIRST);
+        let refusal =
+            "run 20260921-133200-a1b2 is running: only a succeeded or stopped run can be pushed";
+        let prepare = *prepare;
+        ended(
+            &mut app,
+            prepare,
+            Ok(Done::PushPrepared(Err(refusal.into()))),
+        );
+        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        assert_eq!(status(&app), Some(refusal));
+        app.edit = Some(TaskId(99));
+        assert_eq!(keys(&mut app, &[KeyCode::Char('h')]), []);
+        assert_eq!(
+            status(&app),
+            Some("refused: an edit is being saved; one task at a time")
+        );
+        Ok(())
+    }
+
+    /// The push dialog says where, how and how much the push sends.
+    #[test]
+    fn the_push_dialog_says_where_how_and_how_much() -> TestResult {
+        let (_dir, mut app) = runs_app()?;
+        keys(&mut app, &[KeyCode::Char('j')]);
+        let effects = keys(&mut app, &[KeyCode::Char('h')]);
+        let [Effect::Spawn(prepare, Task::PreparePush(_))] = effects.as_slice() else {
+            return Err(format!("{effects:?}").into());
+        };
+        let prepare = *prepare;
+        assert!(app.overlay.is_none(), "nothing shows before the plan");
+        assert_eq!(
+            keys(&mut app, &[KeyCode::Char('h')]),
+            [],
+            "one preparation at a time"
+        );
+        ended(&mut app, prepare, Ok(Done::PushPrepared(Ok(push_plan()))));
+        let Some(Overlay::Confirm(confirm)) = &app.overlay else {
+            return Err(format!("no dialog: {:?}", app.overlay).into());
+        };
+        assert_eq!(confirm.title, format!(" Push run {SECOND}? "));
+        assert_eq!(
+            confirm.text,
+            [
+                "repo <you>/rust-expert",
+                "visibility private if created; an existing public repo is refused",
+                "2 files, 1.5 MB"
+            ]
+        );
+        assert_eq!((confirm.yes, confirm.no), ("push", "cancel"));
+        let effects = keys(&mut app, &[KeyCode::Char('y')]);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Spawn(_, Task::Push(run))] if run == SECOND),
+            "{effects:?}"
+        );
+        Ok(())
+    }
+
+    /// A push shows its progress, then its end.
+    #[test]
+    fn a_push_shows_its_progress_then_its_end() -> TestResult {
+        let (_dir, mut app) = runs_app()?;
+        keys(&mut app, &[KeyCode::Char('j')]);
+        let task = push(&mut app, push_plan())?;
+        assert_eq!(keys(&mut app, &[KeyCode::Char('h')]), []);
+        assert_eq!(
+            status(&app),
+            Some("run 20260920-101500-9f00 is being pushed: one push at a time")
+        );
+        assert_eq!(
+            app.status.as_ref().map(|status| status.severity),
+            Some(Severity::Warn),
+            "a refusal warns, as the lock's do"
+        );
+        let rows = text(&draw(&mut app, 120, 40)?);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(SECOND) && row.contains("pushing")),
+            "the head line says it: {rows:?}"
+        );
+        let progress = crate::events::Event::Push {
+            run_id: SECOND.into(),
+            done: 500_000,
+            total: 1_500_000,
+        };
+        app.on_message(Msg::Event(task, progress));
+        let rows = text(&draw(&mut app, 120, 40)?).join("\n");
+        assert!(rows.contains("pushing 0.5 MB/1.5 MB"), "{rows}");
+        let url = "https://huggingface.co/me/rust-expert/commit/1";
+        ended(&mut app, task, Ok(Done::Pushed(Ok(url.into()))));
+        assert_eq!(status(&app), Some(format!("pushed to {url}").as_str()));
+        let rows = text(&draw(&mut app, 120, 40)?).join("\n");
+        assert!(!rows.contains("pushing"), "{rows}");
+
+        let task = push(&mut app, push_plan())?;
+        let missing = "OVERBRAINER_HF_TOKEN is not set: a Hugging Face token with write access \
+                       is needed to push";
+        ended(&mut app, task, Ok(Done::Pushed(Err(missing.into()))));
+        assert_eq!(
+            status(&app),
+            Some(format!("push failed: {missing}").as_str())
+        );
+        Ok(())
+    }
+
+    /// Quitting asks first, then stops the push and waits for it.
+    #[test]
+    fn quitting_stops_a_push_and_waits_for_it() -> TestResult {
+        let (_dir, mut app) = runs_app()?;
+        keys(&mut app, &[KeyCode::Char('j')]);
+        let task = push(&mut app, push_plan())?;
+        keys(&mut app, &[KeyCode::Char('q')]);
+        let Some(Overlay::Confirm(confirm)) = &app.overlay else {
+            return Err(format!("no dialog: {:?}", app.overlay).into());
+        };
+        assert_eq!(
+            confirm.text,
+            [format!(
+                "Run {SECOND} is being pushed: the push stops now and nothing is committed; \
+                 push it again to resume."
+            )]
+        );
+        let effects = keys(&mut app, &[KeyCode::Char('y')]);
+        assert_eq!(effects, [Effect::Cancel(task)]);
+        assert_eq!(app.exit, None, "the push is waited for");
+        assert_eq!(
+            app.waiting_for(),
+            [format!("waiting for the push of run {SECOND} to stop...")]
+        );
+        let cancelled = crate::cli::push::PUSH_CANCELLED;
+        ended(&mut app, task, Ok(Done::Pushed(Err(cancelled.into()))));
+        assert_eq!(app.exit, Some(Exit::Quit));
         Ok(())
     }
 

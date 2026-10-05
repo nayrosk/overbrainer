@@ -26,6 +26,8 @@ pub enum Section {
     Target(TargetKind),
     /// `[export]`.
     Export,
+    /// `[hub]`.
+    Hub,
     /// `[metrics]`.
     Metrics,
 }
@@ -445,6 +447,7 @@ const PIPELINE: &[FieldSpec] = &[
     ),
 ];
 
+/// The fields of the `[training]` section.
 const TRAINING: &[FieldSpec] = &[
     spec("target", TEXT, false, "Name of the target the job runs on"),
     spec(
@@ -537,7 +540,7 @@ const TRAINING: &[FieldSpec] = &[
         "hub_model_id",
         TEXT,
         true,
-        "Hugging Face repo to push the model to",
+        "Deprecated: use [hub] repo (overbrainer migrate moves it)",
     ),
 ];
 
@@ -694,6 +697,28 @@ const EXPORT: &[FieldSpec] = &[
     ),
 ];
 
+/// `[hub]`: the push of a run to the Hugging Face Hub.
+const HUB: &[FieldSpec] = &[
+    spec(
+        "repo",
+        TEXT,
+        true,
+        "Hugging Face repo to push runs to, NAMESPACE/NAME (default <you>/<project>)",
+    ),
+    spec(
+        "private",
+        BOOL,
+        true,
+        "Create the repo private (default true)",
+    ),
+    spec(
+        "after_training",
+        BOOL,
+        true,
+        "Push each run once it succeeded (default false)",
+    ),
+];
+
 const METRICS: &[FieldSpec] = &[spec(
     "listen",
     TEXT,
@@ -715,6 +740,7 @@ pub fn for_section(section: Section) -> &'static [FieldSpec] {
         Section::Target(TargetKind::Ssh) => SSH,
         Section::Target(TargetKind::Runpod) => RUNPOD,
         Section::Export => EXPORT,
+        Section::Hub => HUB,
         Section::Metrics => METRICS,
     }
 }
@@ -776,12 +802,14 @@ max_hours = 6
 #ZZ runpod
 [export]
 #ZZ export
+[hub]
+#ZZ hub
 [metrics]
 #ZZ metrics
 "#;
 
     /// Keys a form never writes: env-only secrets and hosts, and free-form tables.
-    const NOT_IN_FORM: [(&str, &str); 7] = [
+    const NOT_IN_FORM: [(&str, &str); 8] = [
         ("settings", "runpod"),
         ("settings", "hf_token"),
         ("settings", "log"),
@@ -789,9 +817,11 @@ max_hours = 6
         ("provider", "api_key"),
         ("ssh", "host"),
         ("training", "axolotl_extra"),
+        ("hub", "base_url"),
     ];
 
-    const SECTIONS: [(&str, Section); 11] = [
+    /// Every section name with its `Section`.
+    const SECTIONS: [(&str, Section); 12] = [
         ("project", Section::Project),
         ("topic", Section::Topic),
         ("provider", Section::Provider),
@@ -802,6 +832,7 @@ max_hours = 6
         ("ssh", Section::Target(TargetKind::Ssh)),
         ("runpod", Section::Target(TargetKind::Runpod)),
         ("export", Section::Export),
+        ("hub", Section::Hub),
         ("metrics", Section::Metrics),
     ];
 
@@ -864,6 +895,7 @@ max_hours = 6
                 "training",
                 "targets",
                 "export",
+                "hub",
                 "metrics",
             ],
         ),

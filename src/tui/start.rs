@@ -263,12 +263,9 @@ fn plan(settings: &Settings, files: &DataFiles) -> Result<StartPlan, String> {
         Adapter::Full => "full",
     };
     let mut warnings: Vec<String> = reasoning_template_warning(training).into_iter().collect();
-    if training.hub_model_id.is_some() && settings.hf_token.is_none() {
-        warnings.push(
-            "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail"
-                .to_string(),
-        );
-    }
+    warnings.extend(crate::config::validate::deprecations(settings));
+    warnings.extend(crate::config::validate::hub_token_warning(settings));
+    warnings.extend(crate::config::validate::legacy_hub_token_warning(settings));
     Ok(StartPlan {
         target: training.target.clone(),
         kind: kind(target),
@@ -767,7 +764,7 @@ pub(super) fn runpod_spec(gpus: ListOrAuto, count: u32) -> RunpodTarget {
         container_disk_gb: 50,
         max_hours: 6.0,
         max_cost_usd: None,
-        boot_grace: Duration::from_secs(1800),
+        boot_grace: Duration::from_mins(30),
         retrieve_grace: Duration::from_secs(3600),
         data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
@@ -1175,6 +1172,7 @@ mod tests {
         Ok(())
     }
 
+    /// A plan reads the `[training]` section and the split files, and refuses a project without one.
     #[test]
     fn a_plan_reads_the_training_section_and_the_split_files()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1186,7 +1184,8 @@ mod tests {
         );
         let config = format!(
             "{}\n[training]\ntarget = \"homelab\"\nbase_model = \"Qwen/Qwen3-4B\"\nadapter = \"qlora\"\n\
-             hub_model_id = \"me/model\"\n\n[targets.homelab]\nkind = \"ssh\"\nruntime = \"docker\"\n",
+             hub_model_id = \"me/model\"\n\n[targets.homelab]\nkind = \"ssh\"\nruntime = \"docker\"\n\n\
+             [hub]\nafter_training = true\n",
             crate::tui::snapshots::CONFIG
         );
         std::fs::write(dir.path().join("overbrainer.toml"), config)?;
@@ -1201,10 +1200,25 @@ mod tests {
         assert_eq!(plan.kind, "ssh, docker");
         assert_eq!(plan.model, "Qwen/Qwen3-4B, qlora, 3 epochs, lr 2e-4");
         assert_eq!(plan.runpod, None);
+        assert_eq!(
+            plan.warnings
+                .iter()
+                .filter(|w| w.contains("OVERBRAINER_HF_TOKEN"))
+                .count(),
+            1,
+            "one missing-token warning, not two"
+        );
         assert!(
             plan.warnings
                 .iter()
-                .any(|w| w.contains("OVERBRAINER_HF_TOKEN"))
+                .any(|w| w.starts_with("training.hub_model_id is deprecated"))
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.starts_with("[hub] after_training is on but OVERBRAINER_HF_TOKEN")),
+            "{:?}",
+            plan.warnings
         );
         assert!(
             !format!("{plan:?}").contains("gpu.example"),

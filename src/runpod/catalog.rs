@@ -693,6 +693,7 @@ mod tests {
         }
     }
 
+    /// A Runpod target with the given GPU types and data centers and no other limit.
     fn target(gpu_types: ListOrAuto, data_center_ids: ListOrAuto) -> RunpodTarget {
         RunpodTarget {
             gpu_types,
@@ -704,7 +705,7 @@ mod tests {
             container_disk_gb: 50,
             max_hours: 1.0,
             max_cost_usd: None,
-            boot_grace: std::time::Duration::from_secs(1800),
+            boot_grace: std::time::Duration::from_mins(30),
             retrieve_grace: std::time::Duration::from_secs(3600),
             data_center_ids,
             network_volume_id: None,

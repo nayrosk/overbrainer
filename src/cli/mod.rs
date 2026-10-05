@@ -11,6 +11,7 @@ mod logs;
 pub(crate) mod migrate;
 pub(crate) mod pod;
 mod progress;
+pub(crate) mod push;
 mod record;
 mod reload;
 mod runpod_train;
@@ -111,6 +112,15 @@ pub enum Command {
     /// llama.cpp and quantized, and the GGUF and its Modelfile land in
     /// `runs/<run-id>/output/gguf/`. Ctrl-C cancels it.
     Export(ExportArgs),
+    /// Push the model of a finished run to a Hugging Face model repo, with a
+    /// generated model card.
+    ///
+    /// Everything the run left in `runs/<run-id>/output/` goes in one commit,
+    /// checkpoints, `debug.log` and Axolotl's README.md aside. The repo is
+    /// created private unless `--public` or `[hub] private = false`. Needs
+    /// `OVERBRAINER_HF_TOKEN`, a token with write access. Ctrl-C cancels it:
+    /// nothing is committed, and a rerun resumes.
+    Push(PushArgs),
     /// Inspect training runs.
     Runs {
         /// The runs subcommand to run.
@@ -185,7 +195,8 @@ impl Command {
             | Self::Run
             | Self::Migrate(_)
             | Self::Train(_)
-            | Self::Export(_) => true,
+            | Self::Export(_)
+            | Self::Push(_) => true,
             Self::Pod { command } => matches!(command, PodCommand::Rm { .. }),
             Self::Init { .. }
             | Self::Config { .. }
@@ -305,6 +316,26 @@ pub struct ExportArgs {
     /// limit. Nothing deletes it then but `overbrainer pod rm <export-id>`.
     #[arg(long)]
     pub keep_pod: bool,
+}
+
+/// Options of `overbrainer push`.
+#[derive(Debug, Args)]
+pub struct PushArgs {
+    /// Run to push.
+    #[arg(add = ArgValueCandidates::new(complete::run_ids))]
+    pub run_id: String,
+    /// Repo, NAMESPACE/NAME (default `[hub] repo`, else `<you>/<project>`).
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Create the repo public.
+    #[arg(long)]
+    pub public: bool,
+    /// Replace a README.md the repo already has, even one overbrainer did not write.
+    #[arg(long)]
+    pub overwrite_card: bool,
+    /// Show what would be pushed and write the card to `runs/<id>/hub/README.md`, push nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Parses an Ollama model name, as `--ollama` takes it.
@@ -535,6 +566,40 @@ async fn settle(mut check: JoinHandle<Option<Newer>>) -> Option<Newer> {
     answer.ok()?.ok()?
 }
 
+/// How a command gets the project.
+enum Access {
+    /// The command runs, holding the project lock when it takes one.
+    Run(Option<ProjectLock>),
+    /// `train stop` asked the process holding the lock for the snapshot:
+    /// nothing is left to run.
+    StopRequested,
+}
+
+/// The project lock `cli`'s command runs under. Only a project takes the
+/// lock: without `overbrainer.toml` the command fails with its usual error and
+/// leaves nothing behind.
+async fn access(cli: &Cli) -> anyhow::Result<Access> {
+    let dir = &cli.project_dir;
+    if !cli.command.writes_project() || !dir.join(crate::config::CONFIG_FILE).is_file() {
+        return Ok(Access::Run(None));
+    }
+    match ProjectLock::acquire(dir) {
+        Ok(lock) => Ok(Access::Run(Some(lock))),
+        // `train stop` only asks for the snapshot then: the process holding
+        // the project, most likely following the run, collects it.
+        Err(LockError::Held { pid }) => match cli.command.stopped_run() {
+            Some(run_id) => {
+                let source = Source::from(EnvSource::Process);
+                let front = Frontend::Cli(None);
+                train::request_stop(dir, run_id, pid, &front, &source).await?;
+                Ok(Access::StopRequested)
+            },
+            None => Err(LockError::Held { pid }.into()),
+        },
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Runs `cli`'s command; `tui` takes `check` to show its answer.
 async fn dispatch(
     cli: Cli,
@@ -542,28 +607,11 @@ async fn dispatch(
     check: &mut Option<JoinHandle<Option<Newer>>>,
     dotenv: DotenvKeys,
 ) -> anyhow::Result<()> {
+    let Access::Run(lock) = access(&cli).await? else {
+        return Ok(());
+    };
     let dir = &cli.project_dir;
     let auto = cli.auto;
-    // Only a project takes the lock: without `overbrainer.toml` the command fails
-    // with its usual error and leaves nothing behind.
-    let lock = if cli.command.writes_project() && dir.join(crate::config::CONFIG_FILE).is_file() {
-        match ProjectLock::acquire(dir) {
-            Ok(lock) => Some(lock),
-            // `train stop` only asks for the snapshot then: the process holding
-            // the project, most likely following the run, collects it.
-            Err(LockError::Held { pid }) => match cli.command.stopped_run() {
-                Some(run_id) => {
-                    let source = Source::from(EnvSource::Process);
-                    let front = Frontend::Cli(None);
-                    return train::request_stop(dir, run_id, pid, &front, &source).await;
-                },
-                None => return Err(LockError::Held { pid }.into()),
-            },
-            Err(error) => return Err(error.into()),
-        }
-    } else {
-        None
-    };
     // Served while the lock is held: dropped before it.
     let served = served_metrics(&cli.command, dir, lock.is_some()).await;
     // The buses of the command count into the served metrics, if any.
@@ -592,6 +640,7 @@ async fn dispatch(
             Box::pin(train::run(dir, &args, &front, &source)).await
         },
         Command::Export(args) => Box::pin(export::run(dir, &args, &front)).await,
+        Command::Push(args) => Box::pin(push::run(dir, &args, &front)).await,
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
@@ -831,6 +880,33 @@ mod tests {
         Ok(())
     }
 
+    /// `push` parses a run, a repo and its flags.
+    #[test]
+    fn push_takes_a_repo_and_its_flags() -> Result<(), clap::Error> {
+        let Command::Push(args) = command(&[
+            "push",
+            "r1",
+            "--repo",
+            "me/model",
+            "--public",
+            "--overwrite-card",
+            "--dry-run",
+        ])?
+        else {
+            return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+        };
+        assert_eq!(args.run_id, "r1");
+        assert_eq!(args.repo.as_deref(), Some("me/model"));
+        assert!(args.public && args.overwrite_card && args.dry_run);
+        let Command::Push(defaults) = command(&["push", "r1"])? else {
+            return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+        };
+        assert_eq!(defaults.repo, None);
+        assert!(!defaults.public && !defaults.overwrite_card && !defaults.dry_run);
+        assert!(command(&["push"]).is_err());
+        Ok(())
+    }
+
     #[test]
     fn only_train_stop_names_a_stopped_run() -> Result<(), clap::Error> {
         let stopped = |args: &[&str]| -> Result<Option<String>, clap::Error> {
@@ -849,6 +925,7 @@ mod tests {
         Ok(())
     }
 
+    /// Only the commands that write take the project lock.
     #[test]
     fn only_commands_that_write_take_the_lock() -> Result<(), clap::Error> {
         let writes = |args: &[&str]| -> Result<bool, clap::Error> {
@@ -868,6 +945,8 @@ mod tests {
             &["train", "cancel", "x"],
             &["train", "stop", "x"],
             &["export", "x"],
+            &["push", "x"],
+            &["push", "x", "--dry-run"],
             &["pod", "rm", "x"],
             &["migrate"],
             &["migrate", "--dry-run"],

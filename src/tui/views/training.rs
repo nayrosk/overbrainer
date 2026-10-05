@@ -14,6 +14,7 @@ use ratatui::widgets::{
     TableState, Wrap,
 };
 
+use crate::cli::push::size_words;
 use crate::runpod::{PodRecord, PodState, PodStatus};
 use crate::runs::{RunRecord, RunState};
 use crate::train::{Phase, TrainMetric};
@@ -22,7 +23,7 @@ use crate::tui::format::{cut, duration};
 use crate::tui::motion::Bar;
 use crate::tui::theme::Theme;
 use crate::tui::training::{
-    Ended, Follow, RunActivity, RunRow, TrainingView, float, pod_rate, pod_spend, progress,
+    Ended, Follow, Pushing, RunActivity, RunRow, TrainingView, float, pod_rate, pod_spend, progress,
 };
 use crate::tui::views::dataset::failed;
 use crate::tui::views::system;
@@ -72,12 +73,16 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Op
     let shown = app
         .motion
         .bar(Bar::Step, view.selected_ratio().unwrap_or(0.0), STEP_BAR);
+    let push = view
+        .pushing
+        .as_ref()
+        .filter(|pushing| pushing.run == row.record.id);
     let head = fit(
         head_line(
             &row.record,
             series,
             (activity, shown),
-            (view.phase(row), app.motion.spinner()),
+            (view.phase(row), push, app.motion.spinner()),
             theme,
         ),
         inner.width,
@@ -280,12 +285,13 @@ fn pod_summary(record: &PodRecord) -> String {
 /// its step with a bar filled to `shown` and a percentage, and while its job
 /// runs, its ETA, or once it does more than training steps (an evaluation, the
 /// work after the last step, the retrieval of its results), that `phase` after
-/// the `spinner`.
+/// the `spinner`; while it is pushed to the Hugging Face Hub (`push`), the
+/// bytes uploaded so far.
 fn head_line(
     record: &RunRecord,
     series: &[TrainMetric],
     (activity, shown): (RunActivity, f64),
-    (phase, spinner): (Phase, &str),
+    (phase, push, spinner): (Phase, Option<&Pushing>, &str),
     theme: &Theme,
 ) -> Line<'static> {
     // No stand-in for the marker: the ID of a run nothing follows starts in
@@ -308,6 +314,13 @@ fn head_line(
             },
             _ => head.push(Span::raw(format!("  step {}", now.step))),
         }
+    }
+    if let Some(push) = push {
+        let pushing = match push.progress {
+            Some((done, total)) => format!("pushing {}/{}", size_words(done), size_words(total)),
+            None => "pushing".to_string(),
+        };
+        head.push(Span::styled(format!("  {spinner} {pushing}"), theme.accent));
     }
     if !matches!(record.state, RunState::Preparing | RunState::Running) {
         return Line::from(head);

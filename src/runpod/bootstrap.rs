@@ -170,13 +170,14 @@ mod tests {
         }
     }
 
+    /// The pod env holds the watchdog settings and no secret.
     #[test]
     fn the_env_holds_the_watchdog_settings_and_no_secret() {
         let settings = PodSettings {
             run_id: "r1",
             workdir: "/workspace/overbrainer",
             deadline_unix: Some(1_790_021_600),
-            boot_grace: Duration::from_secs(1800),
+            boot_grace: Duration::from_mins(30),
             retrieve_grace: Duration::from_secs(3600),
             keep: false,
             volume_dir: None,
@@ -216,13 +217,14 @@ mod tests {
         assert!(!kept.contains_key("OVERBRAINER_VOLUME_DIR"));
     }
 
+    /// A network volume hands its mount and size to the watchdog.
     #[test]
     fn a_network_volume_hands_its_mount_and_size_to_the_watchdog() {
         let settings = PodSettings {
             run_id: "r1",
             workdir: "/workspace/overbrainer",
             deadline_unix: Some(1_790_021_600),
-            boot_grace: Duration::from_secs(1800),
+            boot_grace: Duration::from_mins(30),
             retrieve_grace: Duration::from_secs(3600),
             keep: false,
             volume_dir: Some("/workspace/data"),

@@ -314,6 +314,21 @@ pub(super) struct TrainingView {
     /// The last [`SYSTEM_SAMPLES`] samples of each run's machine, oldest first,
     /// by run ID. They stay once the task ends, until the TUI restarts.
     pub(super) system: BTreeMap<String, VecDeque<SystemSample>>,
+    /// The preparation of a push running (`h`), if any.
+    pub(super) push_prepare: Option<TaskId>,
+    /// The push to the Hugging Face Hub running, if any: one at a time.
+    pub(super) pushing: Option<Pushing>,
+}
+
+/// A push of a run to the Hugging Face Hub, started with `h`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Pushing {
+    /// Its task.
+    pub(super) task: TaskId,
+    /// The run pushed.
+    pub(super) run: String,
+    /// Bytes uploaded and bytes to upload, from its latest event.
+    pub(super) progress: Option<(u64, u64)>,
 }
 
 /// The progress a series of metrics shows.

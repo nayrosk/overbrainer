@@ -79,6 +79,7 @@ Training:
 | `s` | Stop the selected run's job with a snapshot (asks first). |
 | `T` | Start a training run resuming the selected stopped run (asks first). |
 | `x` | Hide the failed runs from the list until the TUI restarts (asks first). Nothing is deleted. |
+| `h` | Push the selected run to Hugging Face, as `overbrainer push` does (asks first, showing the repo, its visibility and the size). Refused while a stage, an edit or a training start runs. |
 | `p` | Dismiss the selected run's pod from the view, or show it again. Refused while the run is followed. |
 | `g` `c`, in the start confirmation for a Runpod target | Choose the GPU types or the data centers from the catalog instead of what `overbrainer.toml` has; the choice is saved to `overbrainer.toml` when the run starts. |
 
@@ -96,7 +97,7 @@ Logs:
 
 ### Project (`1`)
 
-The left pane lists the effective configuration section by section: `project`, each topic, each provider, the roles, `pipeline`, `training`, each target, `metrics`, then the env-only `runpod` and `other` tables. A value comes from `overbrainer.toml`, else from the environment, else from its default, shown dim; a field with no value shows `unset`. A value the environment sets is marked `(env)` and is read-only here: change it in `.env` instead (a field only the environment can ever set, such as a provider's `base_url`, is read-only the same way). A secret never shows its value, only `set`, `unset` or `vault ref` for a `vault:` reference.
+The left pane lists the effective configuration section by section: `project`, each topic, each provider, the roles, `pipeline`, `training`, each target, `export`, `hub` with its env-only `base_url`, `metrics`, then the env-only `runpod` and `other` tables. A value comes from `overbrainer.toml`, else from the environment, else from its default, shown dim; a field with no value shows `unset`. A value the environment sets is marked `(env)` and is read-only here: change it in `.env` instead (a field only the environment can ever set, such as a provider's `base_url`, is read-only the same way). A secret never shows its value, only `set`, `unset` or `vault ref` for a `vault:` reference.
 
 `k`/`j`, PgUp/PgDn, Home/End move the selection. Enter opens the field for editing: a bool toggles at once, a choice cycles through its values (and to unset, when the field may be left out), and anything else opens a one-line form under the list, shown with what it accepts and any error from the last Enter. A number is checked when the form is submitted with Enter, not as it is typed. `a` asks what to add, a topic, a provider or a target, then its name (must match `^[a-z0-9_]+$` and be new) and, for a provider or a target, its protocol or kind. `d` deletes the selected topic, provider or target after a confirmation; it is refused while something uses it. Each change is saved to `overbrainer.toml` at once: the value as typed with Enter in the form, a toggled bool or a cycled choice, a pick, a table added or a confirmed deletion. A new Runpod target is written with `gpu_types = "auto"`, so it is valid as added.
 

@@ -36,6 +36,9 @@ pub struct Settings {
     /// Export of a trained model to GGUF, and its Ollama Modelfile.
     #[serde(default)]
     pub export: Export,
+    /// Push of a run to the Hugging Face Hub.
+    #[serde(default)]
+    pub hub: Hub,
     /// The Prometheus endpoint, off unless `metrics.listen` is set.
     #[serde(default)]
     pub metrics: Metrics,
@@ -700,6 +703,42 @@ impl Default for Export {
             ollama_name: None,
         }
     }
+}
+
+/// Push of a run to the Hugging Face Hub: `overbrainer push`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Hub {
+    /// Repo to push to, `NAMESPACE/NAME`; default `<whoami>/<project name>`.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Create the repo private (default true).
+    #[serde(default = "default_true")]
+    pub private: bool,
+    /// Push each run once it succeeded and came back (and was exported).
+    #[serde(default)]
+    pub after_training: bool,
+    /// Env only. Base URL of the Hub, `https://huggingface.co` when unset.
+    /// Must be `https`, or `http` on a loopback host (a test stub).
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+impl Default for Hub {
+    /// The default `[hub]`: private, manual and with no repo.
+    fn default() -> Self {
+        Self {
+            repo: None,
+            private: true,
+            after_training: false,
+            base_url: None,
+        }
+    }
+}
+
+/// The serde default of a flag that is on unless the file says otherwise.
+fn default_true() -> bool {
+    true
 }
 
 fn default_quantize() -> String {

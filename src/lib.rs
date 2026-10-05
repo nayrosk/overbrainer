@@ -8,6 +8,7 @@ pub mod events;
 pub mod exec;
 pub mod export;
 pub mod history;
+pub mod hub;
 pub mod llm;
 pub mod logging;
 pub mod metrics;
