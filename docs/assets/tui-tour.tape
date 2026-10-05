@@ -1,7 +1,7 @@
 # The README hero: a tour of `overbrainer tui` on a finished demo project.
 # Render with docs/assets/record.sh, which mounts the demo project at /demo.
-# It starts no paid work: no r, t, A, a, s or E. The only dialog is answered
-# with its default, n.
+# It starts no paid work: no r, t, A, a, s or E. Every dialog is answered with
+# its default, n, so the push dialog opened with h pushes nothing.
 
 Output tui-tour.gif
 
@@ -61,4 +61,8 @@ Escape Sleep 1s
 
 # Training: the latest run, listed first and selected, with its 48-step loss
 # chart. The footer's version and live cost have been visible throughout.
-Type "4" Sleep 9s
+Type "4" Sleep 6s
+
+# Push: h shows what the run would push to Hugging Face; n cancels.
+Type "h" Sleep 3.5s
+Type "n" Sleep 2s
