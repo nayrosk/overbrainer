@@ -4411,7 +4411,7 @@ mod tests {
             confirm.text,
             [
                 "repo <you>/rust-expert",
-                "visibility private",
+                "visibility private if created; an existing public repo is refused",
                 "2 files, 1.5 MB"
             ]
         );

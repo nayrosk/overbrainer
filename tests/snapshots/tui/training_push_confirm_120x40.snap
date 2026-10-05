@@ -20,7 +20,7 @@ source: src/tui/snapshots.rs
 "                        ╭ Push run 20260920-101500-9f00? ──────────────────────────────────────╮                        "
 "                        │                                                                      │                        "
 "                        │  repo <you>/rust-expert                                              │                        "
-"                        │  visibility private                                                  │                        "
+"                        │  visibility private if created; an existing public repo is refused   │                        "
 "                        │  2 files, 1.2 GB                                                     │                        "
 "                        │                                                                      │                        "
 "                        │                                                 y push    n cancel   │                        "

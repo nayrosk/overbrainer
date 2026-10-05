@@ -140,7 +140,7 @@ Everything in `runs/<run-id>/output/` goes, except `checkpoint-*` directories, `
 - The files of `output/gguf/` go to the root of the repo, not into a `gguf/` directory. That is where `ollama run hf.co/<repo>:<quant>` and `llama-cli -hf <repo>:<quant>` look for them. The `Modelfile` goes with them.
 - `README.md` is the generated card.
 
-The repo is `--repo NAMESPACE/NAME`, else `[hub] repo`, else `<you>/<project.name>` with `_` replaced by `-`, where `<you>` is the account of the token. It is created private unless `--public` or `[hub] private = false`. Visibility only applies when the repo is created: an existing repo keeps its own, and the command says so (`repo me/my-demo exists and stays private`). Pushing again adds a commit to the same repo.
+The repo is `--repo NAMESPACE/NAME`, else `[hub] repo`, else `<you>/<project.name>` with `_` replaced by `-`, where `<you>` is the account of the token. It is created private unless `--public` or `[hub] private = false`. Visibility only applies when the repo is created: an existing repo keeps its own, and the command says so (`repo me/my-demo exists and stays private`). The one exception is a private push into an existing public repo, which is refused before anything is read or uploaded: pass `--public` or set `[hub] private = false` to push to it. Pushing again adds a commit to the same repo.
 
 The card is replaced only when the repo has no `README.md`, or when its `README.md` carries the marker `<!-- overbrainer:card -->` that the generated card ends with. A card you wrote yourself is kept: the other files are pushed and the command says `kept the repo's own README.md (use --overwrite-card to replace it)`. `--overwrite-card` replaces it anyway.
 

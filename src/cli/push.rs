@@ -316,7 +316,9 @@ pub(crate) async fn push_run<H: Hub>(
 }
 
 /// Makes sure `repo` exists, created with `private` when it does not; its
-/// visibility then. An existing repo keeps its own, said when it differs.
+/// visibility then. An existing repo keeps its own, said when it differs. A
+/// private push into an existing public repo is refused, so the user never
+/// publishes under a private assurance.
 async fn ensure_repo<H: Hub>(
     hub: &H,
     repo: &RepoId,
@@ -339,6 +341,12 @@ async fn ensure_repo<H: Hub>(
     Ok(match state {
         RepoState::Created { private } => private,
         RepoState::Existing { private: kept } => {
+            if private && !kept {
+                return Err(anyhow!(
+                    "repo {repo} is public and [hub] private is true: pass --public (or set \
+                     [hub] private = false) to push to it"
+                ));
+            }
             if kept != private {
                 front.line(&format!(
                     "repo {repo} exists and stays {}",
@@ -588,6 +596,8 @@ pub(crate) mod fixtures {
         pub ensured: Mutex<Vec<(String, bool)>>,
         /// `(repo, paths, card)` of each upload.
         pub uploads: Mutex<Vec<Upload>>,
+        /// Whether `remote_card` was called.
+        pub card_reads: Mutex<bool>,
     }
 
     impl Hub for FakeHub {
@@ -620,11 +630,14 @@ pub(crate) mod fixtures {
             }))
         }
 
-        /// Answers with the remote card set on the fake.
+        /// Notes the read, and answers with the remote card set on the fake.
         fn remote_card(
             &self,
             _repo: &RepoId,
         ) -> impl Future<Output = Result<Option<String>, HubError>> + Send {
+            if let Ok(mut read) = self.card_reads.lock() {
+                *read = true;
+            }
             ready(Ok(self.remote_card.clone()))
         }
 
@@ -669,6 +682,11 @@ pub(crate) mod fixtures {
         /// The uploads made so far.
         pub(crate) fn uploads(&self) -> Vec<Upload> {
             self.uploads.lock().map(|u| u.clone()).unwrap_or_default()
+        }
+
+        /// Whether the remote card was read.
+        pub(crate) fn card_read(&self) -> bool {
+            self.card_reads.lock().is_ok_and(|r| *r)
         }
 
         /// The repos ensured so far, with their visibility.
@@ -955,16 +973,83 @@ mod tests {
         Ok(())
     }
 
+    /// Pushes to an existing repo of the given visibility; the result, the lines
+    /// said and the hub, for the tests on the refusal.
+    async fn push_to_existing(
+        existing: bool,
+        config: &str,
+        public: bool,
+    ) -> Result<(anyhow::Result<Pushed>, Vec<String>, FakeHub), Box<dyn std::error::Error>> {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let hub = FakeHub {
+            existing: Some(existing),
+            ..FakeHub::default()
+        };
+        let opts = PushOptions {
+            public,
+            ..PushOptions::default()
+        };
+        let (pushed, lines) = push(&hub, &runs, &settings(config)?, &opts).await;
+        Ok((pushed, lines, hub))
+    }
+
+    /// A private push into an existing public repo is refused before any card read or upload.
+    #[tokio::test]
+    async fn private_push_into_a_public_repo_is_refused() -> TestResult {
+        let (pushed, _, hub) = push_to_existing(false, "", false).await?;
+        let error = pushed.err().ok_or("pushed into a public repo")?;
+        assert_eq!(
+            error.to_string(),
+            "repo me/my-proj is public and [hub] private is true: pass --public (or set [hub] \
+             private = false) to push to it"
+        );
+        assert!(hub.uploads().is_empty(), "nothing is uploaded");
+        assert!(!hub.card_read(), "the remote card is not read");
+        Ok(())
+    }
+
+    /// `--public` lets the push into an existing public repo through.
+    #[tokio::test]
+    async fn public_flag_allows_a_public_repo() -> TestResult {
+        let (pushed, _, hub) = push_to_existing(false, "", true).await?;
+        pushed?;
+        assert_eq!(hub.uploads().len(), 1, "one upload");
+        Ok(())
+    }
+
+    /// `[hub] private = false` lets the push into an existing public repo through.
+    #[tokio::test]
+    async fn config_public_allows_a_public_repo() -> TestResult {
+        let (pushed, _, hub) = push_to_existing(false, "\n[hub]\nprivate = false\n", false).await?;
+        pushed?;
+        assert_eq!(hub.uploads().len(), 1, "one upload");
+        Ok(())
+    }
+
+    /// `--public` into an existing private repo still pushes and says it stays private.
+    #[tokio::test]
+    async fn public_flag_into_a_private_repo_stays_private() -> TestResult {
+        let (pushed, lines, hub) = push_to_existing(true, "", true).await?;
+        pushed?;
+        assert_eq!(hub.uploads().len(), 1, "one upload");
+        assert!(
+            lines.contains(&"repo me/my-proj exists and stays private".to_string()),
+            "{lines:?}"
+        );
+        Ok(())
+    }
+
     /// A card that overbrainer did not write is kept unless the flag is given.
     #[tokio::test]
     async fn foreign_card_is_kept_without_the_flag() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;
         let hub = FakeHub {
-            existing: Some(false),
+            existing: Some(true),
             remote_card: Some("# my own card\n".into()),
             ..FakeHub::default()
         };
-        let (pushed, lines) = push(&hub, &runs, &settings("")?, &PushOptions::default()).await;
+        let open = settings("\n[hub]\nprivate = false\n")?;
+        let (pushed, lines) = push(&hub, &runs, &open, &PushOptions::default()).await;
         assert!(pushed?.card_kept);
         let uploads = hub.uploads();
         let [(_, paths, card)] = uploads.as_slice() else {
@@ -980,7 +1065,7 @@ mod tests {
             "the record lists what the commit wrote"
         );
         assert!(
-            lines.contains(&"repo me/my-proj exists and stays public".to_string()),
+            lines.contains(&"repo me/my-proj exists and stays private".to_string()),
             "{lines:?}"
         );
         assert!(

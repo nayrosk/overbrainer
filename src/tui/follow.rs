@@ -259,7 +259,11 @@ impl App {
             self.say(Severity::Info, "a push is prepared: press h again to push");
             return Vec::new();
         }
-        let visibility = if plan.private { "private" } else { "public" };
+        let visibility = if plan.private {
+            "private if created; an existing public repo is refused"
+        } else {
+            "public if created"
+        };
         self.overlay = Some(Overlay::Confirm(Confirm {
             title: format!(" Push run {}? ", plan.run_id),
             text: vec![
