@@ -323,20 +323,55 @@ async fn ensure_repo<H: Hub>(
     private: bool,
     front: &Frontend,
 ) -> anyhow::Result<bool> {
-    Ok(
-        match hub.ensure_repo(repo, private).await.map_err(hub_error)? {
-            RepoState::Created { private } => private,
-            RepoState::Existing { private: kept } => {
-                if kept != private {
-                    front.line(&format!(
-                        "repo {repo} exists and stays {}",
-                        visibility(kept)
-                    ));
-                }
-                kept
-            },
+    let state = match hub.ensure_repo(repo, private).await {
+        Ok(state) => state,
+        Err(HubError::Forbidden { namespace }) => {
+            // A failed whoami keeps the plain message.
+            let owner = hub.whoami().await.ok();
+            return Err(anyhow!(forbidden_message(
+                &namespace,
+                &repo.name,
+                owner.as_deref()
+            )));
         },
-    )
+        Err(other) => return Err(hub_error(other)),
+    };
+    Ok(match state {
+        RepoState::Created { private } => private,
+        RepoState::Existing { private: kept } => {
+            if kept != private {
+                front.line(&format!(
+                    "repo {repo} exists and stays {}",
+                    visibility(kept)
+                ));
+            }
+            kept
+        },
+    })
+}
+
+/// Why a token cannot write to `namespace`, given the user it belongs to when
+/// known. Hub namespaces are case-sensitive, so a name that differs only in
+/// case gets its own advice.
+fn forbidden_message(namespace: &str, name: &str, owner: Option<&str>) -> String {
+    match owner {
+        Some(owner) if owner == namespace => None,
+        Some(owner) if owner.eq_ignore_ascii_case(namespace) => Some(format!(
+            "the Hugging Face namespace is case-sensitive: the token belongs to {owner}, use \
+             --repo {owner}/{name} (or [hub] repo)"
+        )),
+        Some(owner) => Some(format!(
+            "the Hugging Face token belongs to {owner}, which cannot write to {namespace}: use \
+             a namespace it can write to, or a token with write access to {namespace}"
+        )),
+        None => None,
+    }
+    .unwrap_or_else(|| {
+        format!(
+            "the Hugging Face token needs write access to {namespace}: set OVERBRAINER_HF_TOKEN \
+             to a token that has it"
+        )
+    })
 }
 
 /// The repo of a push: `--repo`, else `[hub] repo`, else `<whoami>/<project>`
@@ -535,6 +570,10 @@ pub(crate) mod fixtures {
         pub existing: Option<bool>,
         pub remote_card: Option<String>,
         pub fail_auth: bool,
+        /// The namespace `ensure_repo` refuses with `Forbidden`, when set.
+        pub forbidden: Option<String>,
+        /// The user `whoami` names; `me` when unset.
+        pub owner: Option<String>,
         /// Progress reports per upload, at least one.
         pub progress_steps: u64,
         /// `(repo, private)` of each `ensure_repo`.
@@ -548,7 +587,7 @@ pub(crate) mod fixtures {
             ready(if self.fail_auth {
                 Err(HubError::Auth)
             } else {
-                Ok("me".into())
+                Ok(self.owner.clone().unwrap_or_else(|| "me".into()))
             })
         }
 
@@ -559,6 +598,11 @@ pub(crate) mod fixtures {
         ) -> impl Future<Output = Result<RepoState, HubError>> + Send {
             if let Ok(mut ensured) = self.ensured.lock() {
                 ensured.push((repo.to_string(), private));
+            }
+            if let Some(namespace) = &self.forbidden {
+                return ready(Err(HubError::Forbidden {
+                    namespace: namespace.clone(),
+                }));
             }
             ready(Ok(match self.existing {
                 Some(private) => RepoState::Existing { private },
@@ -993,6 +1037,59 @@ mod tests {
             "no line may hold the token"
         );
         assert_eq!(hub.uploads().len(), 0, "nothing uploaded");
+        Ok(())
+    }
+
+    /// The message of a push to `nayrosk/x` refused for `nayrosk`, with the
+    /// token owned by `owner` (`None`: whoami fails).
+    async fn forbidden_push(owner: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+        let (_project, runs) = project(RunState::Succeeded, false)?;
+        let hub = FakeHub {
+            forbidden: Some("nayrosk".into()),
+            owner: owner.map(Into::into),
+            fail_auth: owner.is_none(),
+            ..FakeHub::default()
+        };
+        let opts = PushOptions {
+            repo: Some("nayrosk/x".into()),
+            ..PushOptions::default()
+        };
+        let (pushed, _) = push(&hub, &runs, &settings("")?, &opts).await;
+        let error = pushed.err().ok_or("pushed to a forbidden namespace")?;
+        assert_eq!(hub.uploads().len(), 0, "nothing uploaded");
+        Ok(format!("{error:#}"))
+    }
+
+    #[tokio::test]
+    async fn forbidden_namespace_differing_in_case_says_so() -> TestResult {
+        let text = forbidden_push(Some("Nayrosk")).await?;
+        assert_eq!(
+            text,
+            "the Hugging Face namespace is case-sensitive: the token belongs to Nayrosk, use \
+             --repo Nayrosk/x (or [hub] repo)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forbidden_namespace_of_another_user_names_the_owner() -> TestResult {
+        let text = forbidden_push(Some("someone")).await?;
+        assert_eq!(
+            text,
+            "the Hugging Face token belongs to someone, which cannot write to nayrosk: use a \
+             namespace it can write to, or a token with write access to nayrosk"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forbidden_namespace_keeps_the_plain_message_when_whoami_fails() -> TestResult {
+        let text = forbidden_push(None).await?;
+        assert_eq!(
+            text,
+            "the Hugging Face token needs write access to nayrosk: set OVERBRAINER_HF_TOKEN to a \
+             token that has it"
+        );
         Ok(())
     }
 
