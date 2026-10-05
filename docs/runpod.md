@@ -14,10 +14,10 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 | Key | Default | Meaning |
 |---|---|---|
 | `gpu_types` | required | Runpod GPU type IDs, tried in order until one can be placed, or `"auto"` to try every GPU type in stock, cheapest first, after up to 3 cheaper ones reported out of stock (see [`"auto"`](#auto) below). From the environment, one comma-separated value, or `auto`: `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES="NVIDIA GeForce RTX 4090,NVIDIA A40"` or `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. |
-| `ssh_client` | `openssh` | `openssh` or `builtin`; `OVERBRAINER_SSH_CLIENT` overrides it. See [Built-in SSH client](training.md#built-in-ssh-client). |
 | `min_vram_gb` | none | Least VRAM per GPU, in GB. Only with `gpu_types = "auto"`. At least 1. Unset, `auto` uses the [VRAM estimate](#vram-estimate) instead, when it can be made. |
 | `max_price_per_hour` | none | Highest Secure Cloud list price of one GPU, in USD per hour. Only with `gpu_types = "auto"`. Greater than 0. |
 | `max_hours` | required | The pod's watchdog deletes the pod this long after it was created, unless overbrainer is following a job that still makes progress ([the watchdog](#the-watchdog)). At most 720. |
+| `ssh_client` | `openssh` | `openssh` or `builtin`; `OVERBRAINER_SSH_CLIENT` overrides it. See [Built-in SSH client](training.md#built-in-ssh-client). |
 | `max_cost_usd` | none | Most a run may spend on its pod, in USD, at the pod's hourly rate: at 95% the job is stopped with a snapshot, at 100% the watchdog deletes the pod ([automatic snapshots](#automatic-snapshots)). Greater than 0, and worth at least 30 minutes of the pod (a warning says so otherwise). Not applied with `--keep-pod`. |
 | `gpu_count` | `1` | GPUs per pod. |
 | `image` | `axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1`, pinned by digest | Pod image (CUDA 13, driver 580 or newer). |
@@ -225,7 +225,7 @@ A custom `image` must keep an entrypoint that ends with `exec "$@"`, and provide
 
 ### `the local ssh cannot keep its connection`
 
-overbrainer opens one `ssh` master connection per pod and runs every command through it: `ssh -M -f` authenticates, then leaves a background process holding the connection. When the pod's sshd answers (its `SSH-2.0-` banner is readable) but that background process ends right after it started, twice in a row, the cause is on this machine: overbrainer deletes the pod at once and stops, without trying other GPU types, since every pod would fail the same way. The error ends with the last lines of ssh's own log (`ssh log: ...`), or `empty` when it wrote none.
+overbrainer opens one `ssh` master connection per pod and runs every command through it: `ssh -M -f` authenticates, then leaves a background process holding the connection. When the pod's sshd answers (its `SSH-2.0-` banner is readable) but that background process ends right after it started, twice in a row, the cause is on this machine: overbrainer deletes the pod at once and stops, without trying other GPU types, since every pod would fail the same way. The error holds the last lines of ssh's own log (`ssh log: ...`, or `empty` when it wrote none) and ends with the fix: `ssh_client = "builtin"`, or a build with the `builtin-ssh` feature when this one has none.
 
 The usual cause is a wrapper around `ssh` on `PATH` that kills background processes when the command in the foreground exits, for example a firejail symlink (`/usr/local/bin/ssh -> firejail`). Check with `command -v ssh`, then set `ssh_client = "builtin"` on the target (or `OVERBRAINER_SSH_CLIENT=builtin`), which does not use the local `ssh` at all and needs a build with the `builtin-ssh` feature, as the release binaries have. Or put the real `ssh` first on `PATH` for overbrainer, for example `PATH=/usr/bin:$PATH overbrainer train`.
 

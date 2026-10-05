@@ -26,7 +26,6 @@ These keys are accepted from the environment only, and `overbrainer.toml` is rej
 | `OVERBRAINER_PROVIDERS__<NAME>__BASE_URL` | Base URL of a provider. |
 | `OVERBRAINER_PROVIDERS__<NAME>__API_KEY` | API key of a provider. Without one, the provider is called without authentication, which suits a local server. |
 | `OVERBRAINER_TARGETS__<NAME>__HOST` | Host of an `ssh` target: `user@host` or a `~/.ssh/config` alias. |
-| `OVERBRAINER_SSH_CLIENT` | `openssh` or `builtin`: the SSH client of every `ssh` and `runpod` target, over their `ssh_client` field. See [Built-in SSH client](training.md#built-in-ssh-client). |
 | `OVERBRAINER_RUNPOD__API_KEY` | Runpod API key, for `runpod` targets. |
 | `OVERBRAINER_RUNPOD__BASE_URL` | Runpod REST API, `https://api.runpod.io/v2` by default. Must be `https`, or `http` on a loopback host. |
 | `OVERBRAINER_HF_TOKEN` | Hugging Face token, see [Training](training.md#the-hugging-face-token). |
@@ -34,7 +33,7 @@ These keys are accepted from the environment only, and `overbrainer.toml` is rej
 
 Provider and target names may only use lowercase letters, digits and `_`, so they map cleanly to variable names.
 
-Any other `OVERBRAINER_*` variable must name a key, or the command stops with `unknown field`. The exceptions are the variables read outside the configuration, which are never taken as keys: `OVERBRAINER_NO_UPDATE_CHECK` (see [Update check](#update-check)), `OVERBRAINER_TUI_COLOR` and `OVERBRAINER_TUI_MOTION` (see [Color and motion](tui.md#color-and-motion)), and the `OVERBRAINER_TEST_*` variables of the test suite.
+Any other `OVERBRAINER_*` variable must name a key, or the command stops with `unknown field`. The exceptions are the variables read outside the configuration, which are never taken as keys: `OVERBRAINER_NO_UPDATE_CHECK` (see [Update check](#update-check)), `OVERBRAINER_TUI_COLOR` and `OVERBRAINER_TUI_MOTION` (see [Color and motion](tui.md#color-and-motion)), `OVERBRAINER_SSH_CLIENT` (`openssh` or `builtin`, over the `ssh_client` field of every `ssh` and `runpod` target; any other value stops the command with `OVERBRAINER_SSH_CLIENT must be openssh or builtin`, and an empty one counts as unset; see [Built-in SSH client](training.md#built-in-ssh-client)), and the `OVERBRAINER_TEST_*` variables of the test suite.
 
 ## Reloading while overbrainer runs
 
