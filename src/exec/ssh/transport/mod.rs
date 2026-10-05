@@ -1,6 +1,8 @@
 //! The client carrying an [`SshExecutor`](super::SshExecutor)'s commands: the
 //! user's OpenSSH through a master connection.
 
+#[cfg(feature = "builtin-ssh")]
+pub mod builtin;
 mod openssh;
 
 use tokio::io::{AsyncRead, AsyncWrite};

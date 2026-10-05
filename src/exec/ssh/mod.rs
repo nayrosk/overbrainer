@@ -12,6 +12,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Child;
 
 pub use self::error::SshError;
+#[cfg(feature = "builtin-ssh")]
+pub use self::transport::builtin::config::{
+    AgentChoice, ConfigSources, HostConfig, resolve as resolve_ssh_config,
+};
 use self::transport::{OpenSshTransport, Pipes, RemoteProcess, Transport};
 use super::tar;
 use super::{

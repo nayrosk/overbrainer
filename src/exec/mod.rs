@@ -30,6 +30,8 @@ pub use runtime::{JobRuntime, JobSpec, Stages, TOOLS_ENV, shell_path, stage_comm
 pub use script::{
     GROUP_SIGNAL, cancel_script, claim_script, job_script, parse_status, quote, status_script,
 };
+#[cfg(feature = "builtin-ssh")]
+pub use ssh::{AgentChoice, ConfigSources, HostConfig, resolve_ssh_config};
 pub use ssh::{SshError, SshExecutor};
 
 use crate::config::Engine;
