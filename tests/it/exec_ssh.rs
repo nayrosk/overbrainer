@@ -607,6 +607,35 @@ async fn an_unknown_host_key_is_refused() -> TestResult {
     .await
 }
 
+/// Through `OVERBRAINER_TEST_SSH_JUMP_HOST`, whose `ProxyJump` goes through a
+/// bastion, each client reaches the same machine as the direct alias.
+#[tokio::test]
+async fn proxy_jump_reaches_the_target_through_the_bastion() -> TestResult {
+    each_ssh_client(|client| async move {
+        let (Some((host, config)), Ok(behind)) =
+            (target(), std::env::var("OVERBRAINER_TEST_SSH_JUMP_HOST"))
+        else {
+            eprintln!("skipped: OVERBRAINER_TEST_SSH_JUMP_HOST is not set");
+            return Ok(());
+        };
+        let workdir = format!("overbrainer-tests/jump-{}", fastrand::u32(..));
+        let direct = open(&host, &workdir, &config, client).await?;
+        let jumped = open(&behind, &workdir, &config, client).await?;
+        let name = direct.probe("uname -n").await?;
+        assert!(!name.is_empty(), "the target has no host name");
+        assert_eq!(jumped.probe("uname -n").await?, name);
+        assert_eq!(jumped.workdir(), direct.workdir());
+        let dir = format!("{}/demo_20261005-120000", jumped.workdir());
+        assert!(jumped.claim(&dir, "jump").await?);
+        assert_eq!(
+            direct.read_from(&format!("{dir}/.claim"), 0, 16).await?,
+            b"jump\n"
+        );
+        Ok(())
+    })
+    .await
+}
+
 /// The manifest lists the files a download brings back, with their digests.
 #[tokio::test]
 async fn the_manifest_of_the_target_matches_the_downloaded_files() -> TestResult {

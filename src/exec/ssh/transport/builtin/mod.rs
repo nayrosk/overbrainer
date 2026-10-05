@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod config;
+mod jump;
 pub mod known_hosts;
 
 use std::fmt;
@@ -16,7 +17,7 @@ use std::time::Duration;
 
 use russh::client::{self, DisconnectReason, Handle, Msg};
 use russh::keys::{PublicKey, PublicKeyOrCertificate};
-use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
+use russh::{ChannelMsg, ChannelReadHalf, ChannelStream, ChannelWriteHalf};
 use tokio::io::{AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -55,7 +56,11 @@ pub struct DirectTarget {
     pub host_key: PublicKey,
 }
 
-/// A russh session to one host.
+/// A russh session to one host, and the sessions to the jump hosts it goes
+/// through.
+///
+/// Fields drop in order: the session first, then the jump hosts from the one
+/// nearest the destination to the first one.
 pub struct BuiltinTransport {
     /// The session.
     handle: Handle<Client>,
@@ -63,6 +68,9 @@ pub struct BuiltinTransport {
     host: String,
     /// Set once the session ended.
     closed: Arc<AtomicBool>,
+    /// The sessions to the jump hosts, the one nearest the destination first,
+    /// kept open while the session uses them.
+    jumps: Vec<Handle<Client>>,
 }
 
 impl fmt::Debug for BuiltinTransport {
@@ -90,6 +98,14 @@ enum HostCheck {
         /// The `HostKeyAlias`, looked up in place of the host.
         alias: Option<String>,
     },
+}
+
+/// What a session runs over.
+enum Link {
+    /// A TCP connection of its own.
+    Tcp,
+    /// A `direct-tcpip` channel of the previous jump host (D13).
+    Through(Box<ChannelStream<Msg>>),
 }
 
 /// Everything a connection needs, whichever way it was described.
@@ -124,49 +140,97 @@ impl BuiltinTransport {
     /// one, [`SshError::Auth`] when the key is refused, and
     /// [`SshError::Connect`] when the host cannot be reached in time.
     pub async fn connect_direct(target: &DirectTarget) -> Result<Self, SshError> {
-        Self::connect(Plan {
-            name: target.name.clone(),
-            host: target.host.clone(),
-            port: target.port,
-            user: target.user.clone(),
-            check: HostCheck::Pinned(target.host_key.clone()),
-            auth: AuthPlan {
-                agent: None,
-                files: vec![target.key.clone()],
+        Self::connect(
+            Plan {
+                name: target.name.clone(),
+                host: target.host.clone(),
+                port: target.port,
+                user: target.user.clone(),
+                check: HostCheck::Pinned(target.host_key.clone()),
+                auth: AuthPlan {
+                    agent: None,
+                    files: vec![target.key.clone()],
+                },
+                connect_timeout: CONNECT_TIMEOUT,
+                alive_interval: ALIVE_INTERVAL,
+                alive_count: ALIVE_COUNT,
             },
-            connect_timeout: CONNECT_TIMEOUT,
-            alive_interval: ALIVE_INTERVAL,
-            alive_count: ALIVE_COUNT,
-        })
+            Link::Tcp,
+        )
         .await
     }
 
     /// Connects to `destination` (`[user@]host` or an alias) as the files of
     /// `sources` describe it, the agent at `SSH_AUTH_SOCK` included unless the
-    /// files say otherwise.
+    /// files say otherwise, through its `ProxyJump` hosts (D13).
+    ///
+    /// Each jump host is reached, checked against its own `known_hosts` and
+    /// authenticated with its own settings, then forwards a `direct-tcpip`
+    /// channel to the next host.
     ///
     /// # Errors
     ///
-    /// Returns the [`SshError`] of [`config::resolve`], [`SshError::HostKey`]
-    /// when `known_hosts` does not hold the server's key, [`SshError::Auth`]
-    /// when no key is accepted, and [`SshError::Connect`] when the host cannot
-    /// be reached in time.
+    /// Returns the [`SshError`] of [`config::resolve`] for any host on the
+    /// way, [`SshError::HostKey`] when `known_hosts` does not hold a server's
+    /// key, [`SshError::Auth`] when no key is accepted, and
+    /// [`SshError::Connect`] when a host cannot be reached in time, a jump
+    /// host does not forward to the next one, or `ProxyJump` nests too deep.
     pub async fn connect_config(
         destination: &str,
         sources: &ConfigSources,
     ) -> Result<Self, SshError> {
-        let host = config::resolve(destination, sources)?;
-        if !direct(&host.proxy_jump) {
-            return Err(SshError::Other("ProxyJump is not supported yet".into()));
-        }
         let auth_sock = std::env::var_os("SSH_AUTH_SOCK")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
-        Self::connect(config_plan(destination, &host, auth_sock.as_deref())).await
+        let mut hops = jump::chain(destination, sources)?.into_iter().peekable();
+        let mut jumps = Vec::new();
+        let mut link = Link::Tcp;
+        while let Some(hop) = hops.next() {
+            let plan = config_plan(&hop.name, &hop.host, auth_sock.as_deref());
+            let session = Self::connect(plan, link).await?;
+            let Some(next) = hops.peek() else {
+                jumps.reverse();
+                return Ok(Self { jumps, ..session });
+            };
+            link = Link::Through(Box::new(session.forward(next).await?));
+            jumps.push(session.handle);
+        }
+        Err(SshError::Other(format!(
+            "no host to connect to for {destination}"
+        )))
     }
 
-    /// Opens the session of `plan`, checks the host key and authenticates.
-    async fn connect(plan: Plan) -> Result<Self, SshError> {
+    /// A `direct-tcpip` channel from this jump host to the host of `next`,
+    /// within the connect timeout of `next`.
+    async fn forward(&self, next: &jump::Hop) -> Result<ChannelStream<Msg>, SshError> {
+        let refused = |reason: String| SshError::Connect {
+            host: next.name.clone(),
+            reason,
+        };
+        let opening = self.handle.channel_open_direct_tcpip(
+            next.host.host_name.clone(),
+            u32::from(next.host.port),
+            "127.0.0.1",
+            0,
+        );
+        let opened = match connect_limit(next.host.connect_timeout) {
+            Some(limit) => tokio::time::timeout(limit, opening).await.map_err(|_| {
+                refused(format!(
+                    "{} did not forward to it within {}s",
+                    self.host,
+                    limit.as_secs()
+                ))
+            })?,
+            None => opening.await,
+        };
+        let channel = opened
+            .map_err(|error| refused(format!("{} did not forward to it: {error}", self.host)))?;
+        Ok(channel.into_stream())
+    }
+
+    /// Opens the session of `plan` over `link`, checks the host key and
+    /// authenticates.
+    async fn connect(plan: Plan, link: Link) -> Result<Self, SshError> {
         let verdict = Arc::new(Mutex::new(None));
         let closed = Arc::new(AtomicBool::new(false));
         let handler = Client {
@@ -175,9 +239,15 @@ impl BuiltinTransport {
             verdict: Arc::clone(&verdict),
             closed: Arc::clone(&closed),
         };
-        let config = session_config(&plan);
-        let connecting =
-            client::connect(Arc::new(config), (plan.host.as_str(), plan.port), handler);
+        let config = Arc::new(session_config(&plan));
+        let connecting = async {
+            match link {
+                Link::Tcp => {
+                    client::connect(config, (plan.host.as_str(), plan.port), handler).await
+                },
+                Link::Through(stream) => client::connect_stream(config, *stream, handler).await,
+            }
+        };
         let connected = match connect_limit(plan.connect_timeout) {
             Some(limit) => tokio::time::timeout(limit, connecting).await,
             None => Ok(connecting.await),
@@ -210,6 +280,7 @@ impl BuiltinTransport {
             handle,
             host: plan.name,
             closed,
+            jumps: Vec::new(),
         })
     }
 
@@ -281,18 +352,25 @@ impl BuiltinTransport {
     }
 
     /// `error` from the session as an [`SshError`]: [`SshError::Disconnected`]
-    /// once the session ended.
+    /// once the session or a jump host it goes through ended.
     fn lost(&self, error: &russh::Error) -> SshError {
-        if self.handle.is_closed() || self.closed.load(Ordering::SeqCst) {
+        if self.gone() {
             SshError::Disconnected
         } else {
             SshError::Other(format!("{}: {error}", self.host))
         }
     }
 
+    /// Whether the session ended, or a jump host it goes through did.
+    fn gone(&self) -> bool {
+        self.handle.is_closed()
+            || self.closed.load(Ordering::SeqCst)
+            || self.jumps.iter().any(Handle::is_closed)
+    }
+
     /// Why a channel ended before it was set up.
     fn ended(&self) -> SshError {
-        if self.handle.is_closed() || self.closed.load(Ordering::SeqCst) {
+        if self.gone() {
             SshError::Disconnected
         } else {
             SshError::Other(format!("{} closed the channel of the command", self.host))
@@ -315,15 +393,6 @@ fn session_config(plan: &Plan) -> client::Config {
 /// as in OpenSSH).
 fn connect_limit(timeout: Duration) -> Option<Duration> {
     (!timeout.is_zero()).then_some(timeout)
-}
-
-/// Whether `proxy_jump` asks for a direct connection: empty or `none`.
-fn direct(proxy_jump: &[String]) -> bool {
-    match proxy_jump {
-        [] => true,
-        [only] => only.eq_ignore_ascii_case("none"),
-        _ => false,
-    }
 }
 
 /// The connection plan of `destination` resolved to `host`, the agent at
@@ -685,15 +754,6 @@ mod tests {
             "{unknown:?}"
         );
         Ok(())
-    }
-
-    /// Only an empty `ProxyJump` or `none` connects directly.
-    #[test]
-    fn proxy_jump_none_is_direct() {
-        assert!(direct(&[]));
-        assert!(direct(&["none".to_string()]));
-        assert!(!direct(&["bastion".to_string()]));
-        assert!(!direct(&["a".to_string(), "b".to_string()]));
     }
 
     /// A command's end: its status; terminated when the server closed the
