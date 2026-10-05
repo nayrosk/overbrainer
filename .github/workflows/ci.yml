@@ -128,6 +128,10 @@ jobs:
         env:
           OVERBRAINER_TEST_SSH_HOST: overbrainer-test
         run: 'cargo test --locked --test it -- exec_ssh:: runpod_ssh::'
+      - name: Test them again with the built-in client too
+        env:
+          OVERBRAINER_TEST_SSH_HOST: overbrainer-test
+        run: 'cargo test --locked --features builtin-ssh --test it -- exec_ssh:: runpod_ssh::'
 
   doc:
     runs-on: ubuntu-latest
