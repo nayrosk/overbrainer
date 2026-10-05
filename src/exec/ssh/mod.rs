@@ -13,11 +13,7 @@ use tokio::process::Child;
 
 pub use self::error::SshError;
 #[cfg(feature = "builtin-ssh")]
-pub use self::transport::builtin::config::{
-    AgentChoice, ConfigSources, HostConfig, resolve as resolve_ssh_config,
-};
-#[cfg(feature = "builtin-ssh")]
-pub use self::transport::builtin::known_hosts::check as check_known_hosts;
+use self::transport::builtin::config::ConfigSources;
 use self::transport::{OpenSshTransport, Pipes, RemoteProcess, Transport};
 use super::tar;
 use super::{

@@ -1,10 +1,10 @@
 //! The pure-Rust SSH client behind the `builtin-ssh` feature: one russh session
 //! per transport, carrying a channel per command.
 
-pub mod auth;
-pub mod config;
+mod auth;
+pub(crate) mod config;
 mod jump;
-pub mod known_hosts;
+mod known_hosts;
 
 use std::fmt;
 use std::io;
