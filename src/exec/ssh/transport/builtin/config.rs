@@ -25,6 +25,20 @@ const DEFAULT_USER_KNOWN_HOSTS: [&str; 2] = ["~/.ssh/known_hosts", "~/.ssh/known
 const DEFAULT_GLOBAL_KNOWN_HOSTS: &str = "/etc/ssh/ssh_known_hosts";
 /// How deep `Include`s may nest, as in OpenSSH.
 const MAX_INCLUDE_DEPTH: usize = 16;
+/// Algorithm-list directives ignored in system files only (S8): russh negotiates
+/// its own modern algorithms, and crypto policies (Fedora, RHEL) set them there.
+/// In user files they stay refused (lowercase).
+const SYSTEM_ALGORITHMS: [&str; 9] = [
+    "ciphers",
+    "kexalgorithms",
+    "macs",
+    "hostkeyalgorithms",
+    "pubkeyacceptedalgorithms",
+    "casignaturealgorithms",
+    "gssapikexalgorithms",
+    "hostbasedacceptedalgorithms",
+    "requiredrsasize",
+];
 /// Directives read but without effect on the destination or the authentication
 /// (lowercase). Every `GSSAPI*` directive is ignored too.
 const IGNORED: [&str; 18] = [
@@ -112,8 +126,9 @@ pub struct ConfigSources {
 /// # Errors
 ///
 /// Returns [`SshError::Unsupported`] for a directive the built-in client does not
-/// support in a block that applies to the destination, and [`SshError::Other`] for an
-/// unreadable file, a malformed line or a malformed destination.
+/// support in a block that applies to the destination, [`SshError::Connect`] for a
+/// malformed destination, `HostName`, user or `ProxyJump` hop, and
+/// [`SshError::Other`] for an unreadable, unsafe or cyclic file or a malformed line.
 pub fn resolve(destination: &str, sources: &ConfigSources) -> Result<HostConfig, SshError> {
     let destination = Destination::parse(destination)?;
     let mut reader = Reader {
@@ -127,17 +142,67 @@ pub fn resolve(destination: &str, sources: &ConfigSources) -> Result<HostConfig,
             home: &sources.home,
         },
         found: Found::default(),
+        open_files: Vec::new(),
     };
     for (index, file) in sources.files.iter().enumerate() {
-        let base = if index == 0 {
-            sources.home.join(".ssh")
+        let origin = if index == 0 {
+            Origin {
+                base: sources.home.join(".ssh"),
+                system: false,
+            }
         } else {
-            file.parent().map(Path::to_path_buf).unwrap_or_default()
+            Origin {
+                base: file.parent().map(Path::to_path_buf).unwrap_or_default(),
+                system: true,
+            }
         };
-        reader.read(file, &base, 0)?;
+        reader.read(file, &origin, 0)?;
     }
     let found = reader.found;
-    Ok(found.finish(&destination, sources))
+    found.finish(&destination, sources)
+}
+
+/// Where a root file and the files it includes come from.
+struct Origin {
+    /// The directory relative `Include` paths start from.
+    base: PathBuf,
+    /// A system file (or one a system file includes), not the user's.
+    system: bool,
+}
+
+/// Escapes control characters, quotes and backslashes so a name can be shown.
+fn escaped(text: &str) -> String {
+    text.escape_debug().to_string()
+}
+
+/// Why `value` cannot be a host or user name (`what` names which), if it cannot:
+/// empty, starting with `-`, or holding whitespace, a control character or `/`.
+fn name_problem(what: &str, value: &str) -> Option<String> {
+    if value.is_empty() {
+        Some(format!("the {what} is empty"))
+    } else if value.starts_with('-') {
+        Some(format!("the {what} starts with -"))
+    } else if value.chars().any(char::is_control) {
+        Some(format!("the {what} holds a control character"))
+    } else if value.chars().any(char::is_whitespace) {
+        Some(format!("the {what} holds whitespace"))
+    } else if value.contains('/') {
+        Some(format!("the {what} holds /"))
+    } else {
+        None
+    }
+}
+
+/// Refuses a host or user name [`name_problem`] objects to, as a connection error
+/// for `destination` (shown escaped).
+fn check_name(destination: &str, what: &str, value: &str) -> Result<(), SshError> {
+    match name_problem(what, value) {
+        Some(reason) => Err(SshError::Connect {
+            host: escaped(destination),
+            reason,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// A destination split into its parts.
@@ -153,18 +218,25 @@ struct Destination {
 impl Destination {
     /// Parses `[user@]host` or `ssh://[user@]host[:port]`.
     fn parse(text: &str) -> Result<Self, SshError> {
-        let invalid =
-            |why: &str| SshError::Other(format!("invalid SSH destination {text:?}: {why}"));
-        let (user_host, url) = match text.strip_prefix("ssh://") {
-            Some(rest) => (rest.strip_suffix('/').unwrap_or(rest), true),
-            None => (text, false),
+        match text.strip_prefix("ssh://") {
+            Some(rest) => Self::split(text, rest.strip_suffix('/').unwrap_or(rest), true),
+            None => Self::split(text, text, false),
+        }
+    }
+
+    /// Splits `user_host` (`[user@]host`, with `[:port]` when `with_port`) and
+    /// checks its names; errors show `text`.
+    fn split(text: &str, user_host: &str, with_port: bool) -> Result<Self, SshError> {
+        let invalid = |why: &str| SshError::Connect {
+            host: escaped(text),
+            reason: format!("invalid SSH destination: {why}"),
         };
         let (user, host_port) = match user_host.rsplit_once('@') {
             Some((user, rest)) if !user.is_empty() => (Some(user.to_owned()), rest),
             Some(_) => return Err(invalid("empty user")),
             None => (None, user_host),
         };
-        let (host, port) = if !url {
+        let (host, port) = if !with_port {
             (host_port, None)
         } else if let Some(bracketed) = host_port.strip_prefix('[') {
             let (host, tail) = bracketed
@@ -181,9 +253,10 @@ impl Destination {
                 None => (host_port, None),
             }
         };
-        if host.is_empty() {
-            return Err(invalid("empty host"));
+        if let Some(user) = &user {
+            check_name(text, "user", user)?;
         }
+        check_name(text, "host", host)?;
         let port = port
             .map(|port| parse_port(port).ok_or_else(|| invalid("bad port")))
             .transpose()?;
@@ -234,7 +307,15 @@ struct Found {
 impl Found {
     /// Applies the destination's user and port, the defaults and the token
     /// expansions.
-    fn finish(self, destination: &Destination, sources: &ConfigSources) -> HostConfig {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::Connect`] when the host name or user is not a valid name.
+    fn finish(
+        self,
+        destination: &Destination,
+        sources: &ConfigSources,
+    ) -> Result<HostConfig, SshError> {
         let alias_tokens = Tokens {
             host: &destination.host,
             port: DEFAULT_PORT,
@@ -246,11 +327,13 @@ impl Found {
             || destination.host.clone(),
             |name| alias_tokens.expand(&name),
         );
+        check_name(&destination.host, "host name", &host_name)?;
         let user = destination
             .user
             .clone()
             .or(self.user)
             .unwrap_or_else(|| sources.local_user.clone());
+        check_name(&destination.host, "user", &user)?;
         let port = destination.port.or(self.port).unwrap_or(DEFAULT_PORT);
         let tokens = Tokens {
             host: &host_name,
@@ -287,7 +370,7 @@ impl Found {
             Some(agent) if agent.eq_ignore_ascii_case("none") => AgentChoice::None,
             Some(agent) => AgentChoice::Path(PathBuf::from(tokens.expand(agent))),
         };
-        HostConfig {
+        Ok(HostConfig {
             alias: destination.host.clone(),
             host_name: host_name.clone(),
             user: user.clone(),
@@ -305,7 +388,7 @@ impl Found {
                 .alive_interval
                 .map_or(DEFAULT_ALIVE_INTERVAL, Duration::from_secs),
             alive_count: self.alive_count.unwrap_or(DEFAULT_ALIVE_COUNT),
-        }
+        })
     }
 }
 
@@ -324,17 +407,16 @@ struct Tokens<'a> {
 }
 
 impl Tokens<'_> {
-    /// Expands a leading `~` (alone or followed by `/`) and the `%h`, `%p`, `%r`,
-    /// `%u`, `%d` and `%%` tokens. [`check_tokens`] has refused any other token.
+    /// Expands the `%h`, `%p`, `%r`, `%u`, `%d` and `%%` tokens of the raw value,
+    /// then a leading `~` (alone or followed by `/`): a `%` in the home path is not
+    /// read as a token. [`check_tokens`] has refused any other token.
     fn expand(&self, raw: &str) -> String {
         let home = self.home.to_string_lossy();
-        let text = match raw.strip_prefix('~') {
-            Some("") => home.to_string(),
-            Some(rest) if rest.starts_with('/') => format!("{home}{rest}"),
-            _ => raw.to_owned(),
+        let (mut out, rest) = match raw.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => (home.to_string(), rest),
+            _ => (String::new(), raw),
         };
-        let mut out = String::with_capacity(text.len());
-        let mut chars = text.chars();
+        let mut chars = rest.chars();
         while let Some(c) = chars.next() {
             if c != '%' {
                 out.push(c);
@@ -374,8 +456,8 @@ fn check_tokens(raw: &str) -> Result<(), String> {
 struct Here<'a> {
     /// The file holding the line.
     file: &'a Path,
-    /// The directory relative `Include` paths start from.
-    base: &'a Path,
+    /// Where the root file of this line comes from.
+    origin: &'a Origin,
     /// How many `Include`s led to this file.
     depth: usize,
     /// The line number, from 1.
@@ -403,11 +485,16 @@ struct Reader<'a> {
     include_tokens: Tokens<'a>,
     /// The values obtained so far.
     found: Found,
+    /// The files being read, outermost first, to refuse an `Include` cycle.
+    open_files: Vec<PathBuf>,
 }
 
 impl Reader<'_> {
     /// Reads `file` (skipped when missing); its lines before any `Host` apply.
-    fn read(&mut self, file: &Path, base: &Path, depth: usize) -> Result<(), SshError> {
+    ///
+    /// A user file (or one it includes) writable by its group or by others is
+    /// refused, as OpenSSH does; a file already being read is refused too.
+    fn read(&mut self, file: &Path, origin: &Origin, depth: usize) -> Result<(), SshError> {
         let text = match fs::read_to_string(file) {
             Ok(text) => text,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -418,11 +505,22 @@ impl Reader<'_> {
                 )));
             },
         };
+        if !origin.system {
+            check_permissions(file)?;
+        }
+        let identity = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        if self.open_files.contains(&identity) {
+            return Err(SshError::Other(format!(
+                "{} is included while it is being read",
+                file.display()
+            )));
+        }
+        self.open_files.push(identity);
         let mut active = true;
         for (index, raw) in text.lines().enumerate() {
             let here = Here {
                 file,
-                base,
+                origin,
                 depth,
                 number: index + 1,
             };
@@ -430,12 +528,17 @@ impl Reader<'_> {
                 continue;
             };
             match line.keyword.to_ascii_lowercase().as_str() {
+                "host" if line.args.is_empty() => {
+                    return Err(here.error("Host needs at least one pattern"));
+                },
                 "host" => active = self.host_matches(&line.args),
+                "match" if matches_everything(&line.args) => active = true,
                 "match" => return Err(self.unsupported(&line.keyword, file)),
                 _ if active => self.apply(&line, &here)?,
                 _ => {},
             }
         }
+        self.open_files.pop();
         Ok(())
     }
 
@@ -497,7 +600,7 @@ impl Reader<'_> {
                 line.one(here)?;
             },
             "proxyjump" => {
-                let hops = line.one(here)?.split(',').map(str::to_owned).collect();
+                let hops = proxy_jump_hops(line.one(here)?, self.alias)?;
                 set_first(&mut found.proxy_jump, hops);
             },
             "connecttimeout" => set_first(&mut found.connect_timeout, line.seconds(here)?),
@@ -510,6 +613,13 @@ impl Reader<'_> {
                 set_first(&mut found.alive_count, count);
             },
             "include" => self.include(line, here)?,
+            other if here.origin.system && SYSTEM_ALGORITHMS.contains(&other) => {
+                tracing::debug!(
+                    directive = %line.keyword,
+                    file = %here.file.display(),
+                    "algorithm list in a system ssh_config ignored by the built-in SSH client"
+                );
+            },
             other if IGNORED.contains(&other) || other.starts_with("gssapi") => {},
             _ => return Err(self.unsupported(&line.keyword, here.file)),
         }
@@ -530,14 +640,64 @@ impl Reader<'_> {
             let pattern = if expanded.is_absolute() {
                 expanded
             } else {
-                here.base.join(expanded)
+                here.origin.base.join(expanded)
             };
             for file in expand_glob(&pattern) {
-                self.read(&file, here.base, here.depth + 1)?;
+                self.read(&file, here.origin, here.depth + 1)?;
             }
         }
         Ok(())
     }
+}
+
+/// Whether `Match` arguments are `all` or `final all` (S8), which apply to every
+/// host.
+fn matches_everything(args: &[String]) -> bool {
+    let words: Vec<String> = args.iter().map(|arg| arg.to_ascii_lowercase()).collect();
+    words == ["all"] || words == ["final", "all"]
+}
+
+/// The hops of a `ProxyJump` value: `none` (any case) alone means a direct
+/// connection; otherwise each comma-separated hop (`[user@]host[:port]` or an
+/// `ssh://` URL) is checked like a destination.
+fn proxy_jump_hops(value: &str, alias: &str) -> Result<Vec<String>, SshError> {
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(vec!["none".to_owned()]);
+    }
+    value
+        .split(',')
+        .map(|hop| {
+            if hop.is_empty() {
+                return Err(SshError::Connect {
+                    host: escaped(alias),
+                    reason: "ProxyJump holds an empty hop".to_owned(),
+                });
+            }
+            let body = hop.strip_prefix("ssh://").unwrap_or(hop);
+            Destination::split(hop, body, true)?;
+            Ok(hop.to_owned())
+        })
+        .collect()
+}
+
+/// Refuses `file` when its group or others may write it (Unix only), as OpenSSH
+/// does for the user's configuration.
+fn check_permissions(file: &Path) -> Result<(), SshError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(file)
+            && metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(SshError::Other(format!(
+                "Bad owner or permissions on {}",
+                file.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
 }
 
 /// Keeps the first value obtained.
@@ -769,6 +929,7 @@ fn split_args(text: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -806,6 +967,7 @@ mod tests {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&path, text)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
             Ok(path)
         }
 
@@ -1195,11 +1357,11 @@ mod tests {
     fn line_syntax() -> TestResult {
         let fx = Fixture::new()?;
         let sources = fx.user_config(
-            "# comment\n\nhost \"gpu\"\n  HOSTNAME=10.0.0.9\n  user = \"al ice\" # trailing\n  IdentityFile \"~/.ssh/my key\"\n",
+            "# comment\n\nhost \"gpu\"\n  HOSTNAME=10.0.0.9\n  user = \"alice\" # trailing\n  IdentityFile \"~/.ssh/my key\"\n",
         )?;
         let host = resolve("gpu", &sources)?;
         assert_eq!(host.host_name, "10.0.0.9");
-        assert_eq!(host.user, "al ice");
+        assert_eq!(host.user, "alice");
         assert_eq!(host.identity_files, vec![fx.home().join(".ssh/my key")]);
         Ok(())
     }
@@ -1274,15 +1436,21 @@ mod tests {
         Ok(())
     }
 
-    /// A file including itself stops at the nesting limit with an error.
+    /// A chain of includes deeper than the limit is an error.
     #[test]
-    fn include_loop_is_an_error() -> TestResult {
+    fn include_depth_is_capped() -> TestResult {
         let fx = Fixture::new()?;
-        let sources = fx.user_config("Include config\n")?;
+        for level in 0..20 {
+            fx.write(
+                &format!(".ssh/inc{level}"),
+                &format!("Include inc{}\n", level + 1),
+            )?;
+        }
+        let sources = fx.user_config("Include inc0\n")?;
         let Err(SshError::Other(message)) = resolve("gpu", &sources) else {
-            return Err("include loop accepted".into());
+            return Err("deep include chain accepted".into());
         };
-        assert!(message.contains("nested too deep"), "loop not reported");
+        assert!(message.contains("nested too deep"), "depth not reported");
         Ok(())
     }
 
@@ -1339,5 +1507,183 @@ mod tests {
             ])
         );
         assert_eq!(split_args(r#""""#).ok(), Some(vec![String::new()]));
+    }
+
+    /// A Fedora-like system configuration (`Match final all` and a crypto-policy
+    /// include with algorithm lists) resolves.
+    #[test]
+    fn fedora_like_system_config_resolves() -> TestResult {
+        let fx = Fixture::new()?;
+        let user = fx.write(".ssh/config", "")?;
+        let policy = fx.write(
+            "etc/crypto-policies/back-ends/openssh.config",
+            "Ciphers aes256-gcm@openssh.com\nMACs hmac-sha2-256\nGSSAPIKexAlgorithms gss-curve25519-sha256-\nKexAlgorithms curve25519-sha256\nPubkeyAcceptedAlgorithms ssh-ed25519\nHostKeyAlgorithms ssh-ed25519\nCASignatureAlgorithms ssh-ed25519\nHostbasedAcceptedAlgorithms ssh-ed25519\nRequiredRSASize 2048\n",
+        )?;
+        let system = fx.write(
+            "etc/ssh/ssh_config",
+            "Include ssh_config.d/*.conf\nHost *\n",
+        )?;
+        fx.write(
+            "etc/ssh/ssh_config.d/50-redhat.conf",
+            &format!(
+                "Match final all\n Include {}\n GSSAPIAuthentication yes\n ForwardX11Trusted yes\n Match ALL\n User fedora\n",
+                policy.display()
+            ),
+        )?;
+        let host = resolve("gpu", &fx.sources(&[&user, &system]))?;
+        assert_eq!(host.user, "fedora");
+        Ok(())
+    }
+
+    /// Algorithm lists stay refused in the user file.
+    #[test]
+    fn algorithm_list_in_the_user_file_is_refused() -> TestResult {
+        let fx = Fixture::new()?;
+        let sources = fx.user_config("Match all\n Ciphers aes256-gcm@openssh.com\n")?;
+        let path = fx.home().join(".ssh/config");
+        let error = resolve("gpu", &sources).map_err(|e| e.to_string());
+        assert_eq!(error.err(), Some(refusal(&path, "Ciphers")));
+        Ok(())
+    }
+
+    /// Any other `Match` criterion stays refused, in system files too.
+    #[test]
+    fn match_with_a_criterion_is_refused_in_a_system_file() -> TestResult {
+        let fx = Fixture::new()?;
+        let user = fx.write(".ssh/config", "")?;
+        let system = fx.write("etc/ssh/ssh_config", "Match host x\n")?;
+        let error = resolve("gpu", &fx.sources(&[&user, &system])).map_err(|e| e.to_string());
+        assert_eq!(error.err(), Some(refusal(&system, "Match")));
+        Ok(())
+    }
+
+    /// Destinations that could be read as options or hold odd characters are
+    /// refused as connection errors, with control characters escaped.
+    #[test]
+    fn bad_destinations_are_refused() -> TestResult {
+        let fx = Fixture::new()?;
+        let sources = fx.user_config("")?;
+        for (destination, reason) in [
+            ("-oProxyCommand=x", "the host starts with -"),
+            ("a b", "the host holds whitespace"),
+            ("a\nb", "the host holds a control character"),
+            ("../x", "the host holds /"),
+            ("", "the host is empty"),
+            ("-l@gpu", "the user starts with -"),
+        ] {
+            match resolve(destination, &sources) {
+                Err(SshError::Connect { host, reason: got }) => {
+                    assert_eq!(got, reason, "wrong reason");
+                    assert!(!host.contains('\n'), "control character shown raw");
+                },
+                _ => return Err("bad destination accepted".into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// A `HostName` that expands to a bad name is refused.
+    #[test]
+    fn bad_host_name_is_refused() -> TestResult {
+        let fx = Fixture::new()?;
+        let sources = fx.user_config("Host gpu\n HostName -oProxyCommand=x\n")?;
+        let Err(SshError::Connect { reason, .. }) = resolve("gpu", &sources) else {
+            return Err("bad HostName accepted".into());
+        };
+        assert_eq!(reason, "the host name starts with -");
+        Ok(())
+    }
+
+    /// Bad and empty `ProxyJump` hops are refused; `none` ignores case.
+    #[test]
+    fn proxy_jump_hops_are_checked() -> TestResult {
+        let fx = Fixture::new()?;
+        let sources = fx.user_config(
+            "Host empty\n ProxyJump a,,b\nHost dash\n ProxyJump a,-oProxyCommand=x\nHost upper\n ProxyJump NONE\nHost url\n ProxyJump ssh://u@[::1]:2200,b:22\n",
+        )?;
+        let Err(SshError::Connect { reason, .. }) = resolve("empty", &sources) else {
+            return Err("empty hop accepted".into());
+        };
+        assert_eq!(reason, "ProxyJump holds an empty hop");
+        let Err(SshError::Connect { reason, .. }) = resolve("dash", &sources) else {
+            return Err("bad hop accepted".into());
+        };
+        assert_eq!(reason, "the host starts with -");
+        assert_eq!(
+            resolve("upper", &sources)?.proxy_jump,
+            vec!["none".to_owned()]
+        );
+        assert_eq!(
+            resolve("url", &sources)?.proxy_jump,
+            vec!["ssh://u@[::1]:2200".to_owned(), "b:22".to_owned()]
+        );
+        Ok(())
+    }
+
+    /// A `%` in the home path is not read as a token.
+    #[test]
+    fn percent_in_the_home_is_not_a_token() -> TestResult {
+        let fx = Fixture::new()?;
+        let home = fx.home().join("we%hird");
+        let config = fx.write("we%hird/.ssh/config", "IdentityFile ~/key_%h\n")?;
+        let sources = ConfigSources {
+            files: vec![config],
+            home: home.clone(),
+            local_user: "me".to_owned(),
+        };
+        assert_eq!(
+            resolve("gpu", &sources)?.identity_files,
+            vec![home.join("key_gpu")]
+        );
+        Ok(())
+    }
+
+    /// A file including itself is refused, naming it.
+    #[test]
+    fn self_include_is_refused() -> TestResult {
+        let fx = Fixture::new()?;
+        let inc = fx.write(".ssh/inc", "Include inc\n")?;
+        let sources = fx.user_config("Include inc\n")?;
+        let Err(SshError::Other(message)) = resolve("gpu", &sources) else {
+            return Err("self include accepted".into());
+        };
+        assert_eq!(
+            message,
+            format!("{} is included while it is being read", inc.display())
+        );
+        Ok(())
+    }
+
+    /// A `Host` line without patterns is an error naming the file and line.
+    #[test]
+    fn host_without_patterns_is_an_error() -> TestResult {
+        let fx = Fixture::new()?;
+        let sources = fx.user_config("User a\nHost\n")?;
+        let Err(SshError::Other(message)) = resolve("gpu", &sources) else {
+            return Err("empty Host accepted".into());
+        };
+        assert!(message.contains(".ssh/config line 2"), "line not named");
+        Ok(())
+    }
+
+    /// A user file writable by others is refused; a system file is not checked.
+    #[test]
+    fn writable_user_file_is_refused() -> TestResult {
+        let fx = Fixture::new()?;
+        let sources = fx.user_config("Host gpu\n User a\n")?;
+        let path = fx.home().join(".ssh/config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+        let Err(SshError::Other(message)) = resolve("gpu", &sources) else {
+            return Err("writable user file accepted".into());
+        };
+        assert_eq!(
+            message,
+            format!("Bad owner or permissions on {}", path.display())
+        );
+        let system = fx.write("etc/ssh_config", "Host gpu\n User s\n")?;
+        fs::set_permissions(&system, fs::Permissions::from_mode(0o666))?;
+        let missing = fx.home().join(".ssh/none");
+        assert_eq!(resolve("gpu", &fx.sources(&[&missing, &system]))?.user, "s");
+        Ok(())
     }
 }
