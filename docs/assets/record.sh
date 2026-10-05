@@ -5,8 +5,9 @@
 #
 # DEMO_PROJECT is an overbrainer project with data/ and runs/ to show, for
 # example one that went through `overbrainer run` and a training run. It is
-# copied without .env, .env.*, runs/*/ssh/, runs/*/output/ and the Hugging
-# Face cache, so no key reaches the recording. Pod IDs and hosts in
+# copied without .env, .env.*, runs/*/ssh/, the Hugging Face cache, and the
+# debug log and checkpoints of runs/*/output/, so no key reaches the recording.
+# The adapter files stay, so the TUI tour can open a run's push dialog. Pod IDs and hosts in
 # runs/*/pod.json do show in the Training view and in `runs ls`: use a project
 # whose pods are deleted, or edit them in the copy.
 #
@@ -80,7 +81,8 @@ mkdir -p "$demo"
   cd "$demo_src"
   tar -cf - \
     --exclude='./.env' --exclude='./.env.*' \
-    --exclude='./runs/*/ssh' --exclude='./runs/*/output' --exclude='./runs/.hf-cache' \
+    --exclude='./runs/*/ssh' --exclude='./runs/.hf-cache' \
+    --exclude='./runs/*/output/debug.log' --exclude='./runs/*/output/checkpoint-*' \
     .
 ) | tar -xf - -C "$demo"
 
