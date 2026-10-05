@@ -179,10 +179,11 @@ jobs:
           OVERBRAINER_TEST_SSH_HOST: overbrainer-test
           OVERBRAINER_TEST_SSH_JUMP_HOST: overbrainer-behind
         run: 'cargo test --locked --test it -- exec_ssh:: runpod_ssh::'
-      - name: Test them again with the built-in client too
+      - name: Test them again with the built-in client
         env:
           OVERBRAINER_TEST_SSH_HOST: overbrainer-test
           OVERBRAINER_TEST_SSH_JUMP_HOST: overbrainer-behind
+          OVERBRAINER_TEST_SSH_CLIENT: builtin
         run: 'cargo test --locked --features builtin-ssh --test it -- exec_ssh:: runpod_ssh::'
 
   doc:

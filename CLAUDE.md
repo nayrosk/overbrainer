@@ -45,7 +45,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked --features builtin-ssh
 - One test: `cargo test --test it -- runpod_flow::` or `cargo test --lib tui::`.
 - Never `cargo clean` shared target dir while other worktree builds.
 - CI uses latest stable toolchain: run `rustup update stable` before local clippy.
-- SSH integration tests (`exec_ssh::`, `runpod_ssh::`) run only when `OVERBRAINER_TEST_SSH_HOST` (host alias) and `OVERBRAINER_TEST_SSH_CONFIG` (ssh config file defining it) set; else skip. `OVERBRAINER_TEST_SSH_JUMP_HOST` (ProxyJump bastion) enables the jump test. `ssh` job in `.github/workflows/ci.yml` shows setup.
+- SSH integration tests (`exec_ssh::`, `runpod_ssh::`) run only when `OVERBRAINER_TEST_SSH_HOST` (host alias) and `OVERBRAINER_TEST_SSH_CONFIG` (ssh config file defining it) set; else skip. `OVERBRAINER_TEST_SSH_JUMP_HOST` (ProxyJump bastion) enables the jump test. With `--features builtin-ssh` suites run under both clients; `OVERBRAINER_TEST_SSH_CLIENT` (`openssh` or `builtin`) limits them to one. `ssh` job in `.github/workflows/ci.yml` shows setup.
 - If `ssh` on `PATH` is sandbox wrapper (e.g. firejail), put real ssh first for those tests: `PATH=/usr/bin:$PATH cargo test ...`, or build with `--features builtin-ssh`, whose suite run uses the built-in client. Wrapper kills background OpenSSH master connection.
 
 ## Code rules
