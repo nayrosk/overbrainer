@@ -243,7 +243,7 @@ pub fn env_keys(env: &EnvSource) -> BTreeSet<String> {
 pub fn ssh_client_env(env: &EnvSource) -> Option<String> {
     env_pairs(env.clone())
         .into_iter()
-        .find(|(key, _)| key == super::SSH_CLIENT_ENV)
+        .find(|(key, _)| key.eq_ignore_ascii_case(super::SSH_CLIENT_ENV))
         .map(|(_, value)| value)
 }
 
@@ -468,6 +468,13 @@ mod tests {
         assert_eq!(env_keys(&env), BTreeSet::new());
         assert_eq!(ssh_client_env(&env), Some("builtin".to_string()));
         assert_eq!(ssh_client_env(&vars(&[])), None);
+    }
+
+    /// A lower-case `overbrainer_ssh_client` is read like the upper-case name.
+    #[test]
+    fn the_ssh_client_variable_is_read_in_any_case() {
+        let env = vars(&[("overbrainer_ssh_client", "builtin")]);
+        assert_eq!(ssh_client_env(&env), Some("builtin".to_string()));
     }
 
     #[test]

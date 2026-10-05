@@ -44,7 +44,7 @@ const SYSTEM_ALGORITHMS: [&str; 9] = [
 ];
 /// Directives read but without effect on the destination or the authentication
 /// (lowercase). Every `GSSAPI*` directive is ignored too.
-const IGNORED: [&str; 18] = [
+const IGNORED: [&str; 24] = [
     "sendenv",
     "setenv",
     "forwardagent",
@@ -63,6 +63,12 @@ const IGNORED: [&str; 18] = [
     "dynamicforward",
     "visualhostkey",
     "updatehostkeys",
+    "batchmode",
+    "passwordauthentication",
+    "kbdinteractiveauthentication",
+    "challengeresponseauthentication",
+    "tcpkeepalive",
+    "checkhostip",
 ];
 
 /// Which agent the built-in client asks for keys.
@@ -582,6 +588,12 @@ impl Reader<'_> {
                 let value = line.one(here)?;
                 check_tokens(value).map_err(|why| here.error(&why))?;
                 found.identity_files.push(value.to_owned());
+            },
+            // Only `no` contradicts the built-in client, which always tries keys.
+            "pubkeyauthentication" => {
+                if !line.yes_no(here)? {
+                    return Err(self.unsupported(&line.keyword, here.file));
+                }
             },
             "identitiesonly" => set_first(&mut found.identities_only, line.yes_no(here)?),
             "identityagent" => {
@@ -1220,6 +1232,31 @@ mod tests {
             resolve("gpu", &fx.sources(&[&user, &system])).is_ok(),
             "ignored directive refused"
         );
+        Ok(())
+    }
+
+    /// The auth-policy directives that do not change the built-in client pass in `Host *`.
+    #[test]
+    fn auth_policy_directives_pass() -> TestResult {
+        let fx = Fixture::new()?;
+        let sources = fx.user_config(
+            "Host *\n BatchMode yes\n PasswordAuthentication no\n KbdInteractiveAuthentication no\n ChallengeResponseAuthentication no\n TCPKeepAlive yes\n CheckHostIP no\n PubkeyAuthentication yes\n",
+        )?;
+        assert!(
+            resolve("gpu", &sources).is_ok(),
+            "auth-policy directive refused"
+        );
+        Ok(())
+    }
+
+    /// `PubkeyAuthentication no` contradicts the built-in client and is refused.
+    #[test]
+    fn pubkey_authentication_no_is_refused() -> TestResult {
+        let fx = Fixture::new()?;
+        let sources = fx.user_config("Host gpu\n PubkeyAuthentication no\n")?;
+        let path = fx.home().join(".ssh/config");
+        let error = resolve("gpu", &sources).map_err(|e| e.to_string());
+        assert_eq!(error.err(), Some(refusal(&path, "PubkeyAuthentication")));
         Ok(())
     }
 
