@@ -11,11 +11,9 @@ use russh::keys::PublicKey;
 use russh::keys::ssh_key::known_hosts::{Entry, HostPatterns, Marker};
 use sha1::Sha1;
 
-use super::config::wildcard_match;
+use super::config::{DEFAULT_PORT, pattern_list_matches};
 use crate::exec::ssh::SshError;
 
-/// The port that `known_hosts` names with the bare host.
-const DEFAULT_PORT: u16 = 22;
 /// The reason for a host no file names.
 const UNKNOWN: &str = "unknown host (add it with ssh-keyscan or a first connection with ssh)";
 /// The reason for a host named with another key.
@@ -125,18 +123,10 @@ fn names_host(patterns: &HostPatterns, name: &str) -> bool {
     match patterns {
         HostPatterns::HashedName { salt, hash } => Hmac::<Sha1>::new_from_slice(salt)
             .is_ok_and(|mac| mac.chain_update(name).verify_slice(hash).is_ok()),
-        HostPatterns::Patterns(list) => {
-            let mut matched = false;
-            for pattern in list {
-                let pattern = pattern.to_ascii_lowercase();
-                match pattern.strip_prefix('!') {
-                    Some(negated) if wildcard_match(negated, name) => return false,
-                    Some(_) => {},
-                    None => matched |= wildcard_match(&pattern, name),
-                }
-            }
-            matched
-        },
+        HostPatterns::Patterns(list) => pattern_list_matches(
+            list.iter().map(|pattern| pattern.to_ascii_lowercase()),
+            name,
+        ),
     }
 }
 

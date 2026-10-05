@@ -1,5 +1,9 @@
 /// Why an SSH transport failed, whichever client carries the connection. Messages
 /// never hold key material.
+///
+/// Only the built-in client yields [`Self::Connect`], [`Self::Auth`] and
+/// [`Self::Unsupported`]: OpenSSH reports a failed connection or authentication
+/// in its own words, which arrive as [`Self::Other`].
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
     /// The connection could not be established.

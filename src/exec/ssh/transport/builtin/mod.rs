@@ -28,12 +28,6 @@ use super::{Pipes, RemoteProcess, Waiter};
 use crate::exec::quote;
 use crate::exec::ssh::SshError;
 
-/// How long the connection to a pod may take (D14).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// The keepalive interval of a pod connection (D14).
-const ALIVE_INTERVAL: Duration = Duration::from_secs(15);
-/// How many unanswered keepalives close a pod connection (D14).
-const ALIVE_COUNT: u32 = 3;
 /// Bytes a command's output may hold before its reader takes them.
 const PIPE_BUFFER: usize = 64 * 1024;
 /// The extended data type of standard error (RFC 4254, section 5.2).
@@ -152,9 +146,9 @@ impl BuiltinTransport {
                     files: vec![target.key.clone()],
                     identities_only: true,
                 },
-                connect_timeout: CONNECT_TIMEOUT,
-                alive_interval: ALIVE_INTERVAL,
-                alive_count: ALIVE_COUNT,
+                connect_timeout: config::DEFAULT_CONNECT_TIMEOUT,
+                alive_interval: config::DEFAULT_ALIVE_INTERVAL,
+                alive_count: config::DEFAULT_ALIVE_COUNT,
             },
             Link::Tcp,
         )

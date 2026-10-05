@@ -9,14 +9,17 @@ use std::time::Duration;
 
 use crate::exec::ssh::SshError;
 
-/// The port when neither the destination nor the files set one.
-const DEFAULT_PORT: u16 = 22;
-/// The connect timeout when `ConnectTimeout` is not set.
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// The keepalive interval when `ServerAliveInterval` is not set.
-const DEFAULT_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
-/// The keepalive count when `ServerAliveCountMax` is not set.
-const DEFAULT_ALIVE_COUNT: u32 = 3;
+/// The port when neither the destination nor the files set one, and the one
+/// `known_hosts` names with the bare host.
+pub(super) const DEFAULT_PORT: u16 = 22;
+/// The connect timeout when `ConnectTimeout` is not set, and of a pod (D14).
+pub(super) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The keepalive interval when `ServerAliveInterval` is not set, and of a pod
+/// (D14).
+pub(super) const DEFAULT_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// The keepalive count when `ServerAliveCountMax` is not set, and of a pod
+/// (D14).
+pub(super) const DEFAULT_ALIVE_COUNT: u32 = 3;
 /// The key files tried when no `IdentityFile` applies (RSA keys are not supported).
 const DEFAULT_IDENTITY_FILES: [&str; 2] = ["~/.ssh/id_ed25519", "~/.ssh/id_ecdsa"];
 /// The user `known_hosts` files when no `UserKnownHostsFile` applies.
@@ -545,16 +548,10 @@ impl Reader<'_> {
     /// Whether a `Host` line's patterns select the destination: one pattern
     /// matches and no negated pattern does.
     fn host_matches(&self, patterns: &[String]) -> bool {
-        let mut matched = false;
-        for pattern in patterns {
-            let pattern = pattern.to_lowercase();
-            match pattern.strip_prefix('!') {
-                Some(negated) if wildcard_match(negated, &self.pattern_host) => return false,
-                Some(_) => {},
-                None => matched |= wildcard_match(&pattern, &self.pattern_host),
-            }
-        }
-        matched
+        pattern_list_matches(
+            patterns.iter().map(|pattern| pattern.to_lowercase()),
+            &self.pattern_host,
+        )
     }
 
     /// The refusal of `directive` (as written) in `file`.
@@ -680,23 +677,18 @@ fn proxy_jump_hops(value: &str, alias: &str) -> Result<Vec<String>, SshError> {
         .collect()
 }
 
-/// Refuses `file` when its group or others may write it (Unix only), as OpenSSH
-/// does for the user's configuration.
+/// Refuses `file` when its group or others may write it, as OpenSSH does for
+/// the user's configuration.
 fn check_permissions(file: &Path) -> Result<(), SshError> {
-    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = fs::metadata(file)
+        && metadata.permissions().mode() & 0o022 != 0
     {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(file)
-            && metadata.permissions().mode() & 0o022 != 0
-        {
-            return Err(SshError::Other(format!(
-                "Bad owner or permissions on {}",
-                file.display()
-            )));
-        }
+        return Err(SshError::Other(format!(
+            "Bad owner or permissions on {}",
+            file.display()
+        )));
     }
-    #[cfg(not(unix))]
-    let _ = file;
     Ok(())
 }
 
@@ -707,9 +699,23 @@ fn set_first<T>(slot: &mut Option<T>, value: T) {
     }
 }
 
+/// Whether the pattern list `patterns` (already lowercase) selects `name`: one
+/// pattern matches and no negated (`!`) pattern does, as in OpenSSH.
+pub(super) fn pattern_list_matches(patterns: impl IntoIterator<Item = String>, name: &str) -> bool {
+    let mut matched = false;
+    for pattern in patterns {
+        match pattern.strip_prefix('!') {
+            Some(negated) if wildcard_match(negated, name) => return false,
+            Some(_) => {},
+            None => matched |= wildcard_match(&pattern, name),
+        }
+    }
+    matched
+}
+
 /// Matches `text` against a pattern where `*` is any run of characters and `?`
 /// one character.
-pub(super) fn wildcard_match(pattern: &str, text: &str) -> bool {
+fn wildcard_match(pattern: &str, text: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();
     let (mut p, mut t) = (0, 0);
