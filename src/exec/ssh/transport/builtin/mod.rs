@@ -150,6 +150,7 @@ impl BuiltinTransport {
                 auth: AuthPlan {
                     agent: None,
                     files: vec![target.key.clone()],
+                    identities_only: true,
                 },
                 connect_timeout: CONNECT_TIMEOUT,
                 alive_interval: ALIVE_INTERVAL,
@@ -804,6 +805,7 @@ mod tests {
             auth: AuthPlan {
                 agent: None,
                 files: Vec::new(),
+                identities_only: false,
             },
             connect_timeout: connect,
             alive_interval: alive,
@@ -859,7 +861,8 @@ mod tests {
             &plan.check,
             HostCheck::KnownHosts { alias: Some(alias), port: 2200, .. } if alias == "gpu-alias"
         ));
-        assert_eq!(plan.auth.agent, None);
+        assert_eq!(plan.auth.agent.as_deref(), Some(Path::new("/sock")));
+        assert!(plan.auth.identities_only);
         assert_eq!(plan.connect_timeout, Duration::from_secs(7));
         assert_eq!(plan.alive_interval, Duration::from_secs(9));
         assert_eq!(plan.alive_count, 2);

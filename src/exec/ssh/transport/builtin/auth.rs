@@ -1,16 +1,19 @@
 //! Public key authentication for the built-in client: the agent's keys, then
-//! the key files, skipping what the client cannot use (an encrypted file, an
-//! RSA key) with a note that ends up in the error when nothing authenticates.
+//! the key files, skipping what the client cannot use (an encrypted file the
+//! agent does not hold, an RSA key, a file others may read) with a note that
+//! ends up in the error when nothing authenticates.
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use russh::client::{AuthResult, Handle, Handler};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
-use russh::keys::{PrivateKey, PrivateKeyWithHashAlg};
+use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKey};
+use secrecy::zeroize::Zeroizing;
 
 use super::config::{AgentChoice, HostConfig};
 
@@ -21,24 +24,23 @@ pub struct AuthPlan {
     pub agent: Option<PathBuf>,
     /// The key files tried after the agent's keys.
     pub files: Vec<PathBuf>,
+    /// `IdentitiesOnly`: the agent offers only the keys of [`Self::files`].
+    pub identities_only: bool,
 }
 
-/// The plan for `host`: with `IdentitiesOnly` only its key files, otherwise the
-/// agent (`IdentityAgent`, or `auth_sock` from `SSH_AUTH_SOCK`, unless `none`)
-/// then the key files.
+/// The plan for `host`: the agent (`IdentityAgent`, or `auth_sock` from
+/// `SSH_AUTH_SOCK`, unless `none`) then the key files. With `IdentitiesOnly`
+/// the agent offers only the keys of those files, as OpenSSH does.
 pub fn plan(host: &HostConfig, auth_sock: Option<&Path>) -> AuthPlan {
-    let agent = if host.identities_only {
-        None
-    } else {
-        match &host.identity_agent {
-            AgentChoice::Env => auth_sock.map(Path::to_path_buf),
-            AgentChoice::None => None,
-            AgentChoice::Path(path) => Some(path.clone()),
-        }
+    let agent = match &host.identity_agent {
+        AgentChoice::Env => auth_sock.map(Path::to_path_buf),
+        AgentChoice::None => None,
+        AgentChoice::Path(path) => Some(path.clone()),
     };
     AuthPlan {
         agent,
         files: host.identity_files.clone(),
+        identities_only: host.identities_only,
     }
 }
 
@@ -49,15 +51,29 @@ pub enum KeyFile {
     Missing,
     /// A key the client can sign with.
     Usable(Box<PrivateKey>),
+    /// A key behind a passphrase: usable only through the agent.
+    Encrypted,
     /// A key the client cannot use, and why, in words for the user.
     Skipped(String),
 }
 
-/// What `path` holds: never prompts for a passphrase. The note of a skipped
-/// file names the path only, never the key.
+/// What `path` holds: never prompts for a passphrase. A file its group or
+/// others may read is skipped, as OpenSSH does. The note of a skipped file
+/// names the path only, never the key.
 pub fn load_key(path: &Path) -> KeyFile {
+    match fs::metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return KeyFile::Missing,
+        Ok(metadata) if metadata.permissions().mode() & 0o077 != 0 => {
+            return KeyFile::Skipped(format!(
+                "Permissions {:04o} for '{}' are too open",
+                metadata.permissions().mode() & 0o7777,
+                path.display()
+            ));
+        },
+        _ => {},
+    }
     let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+        Ok(text) => Zeroizing::new(text),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return KeyFile::Missing,
         Err(error) => {
             return KeyFile::Skipped(format!(
@@ -71,25 +87,69 @@ pub fn load_key(path: &Path) -> KeyFile {
         return KeyFile::Skipped(rsa_note(path));
     }
     if text.contains("-----BEGIN OPENSSH PRIVATE KEY-----") {
-        return match PrivateKey::from_openssh(&text) {
+        return match PrivateKey::from_openssh(text.as_str()) {
             Ok(key) if key.algorithm().is_rsa() => KeyFile::Skipped(rsa_note(path)),
-            Ok(key) if key.is_encrypted() => KeyFile::Skipped(encrypted_note(path)),
+            Ok(key) if key.is_encrypted() => KeyFile::Encrypted,
             Ok(key) => KeyFile::Usable(Box::new(key)),
             Err(_) => KeyFile::Skipped(unreadable_note(path)),
         };
     }
     if text.contains("ENCRYPTED") {
-        return KeyFile::Skipped(encrypted_note(path));
+        return KeyFile::Encrypted;
     }
     match russh::keys::decode_secret_key(&text, None) {
         Ok(key) if key.algorithm().is_rsa() => KeyFile::Skipped(rsa_note(path)),
         Ok(key) => KeyFile::Usable(Box::new(key)),
-        Err(russh::keys::Error::KeyIsEncrypted) => KeyFile::Skipped(encrypted_note(path)),
+        Err(russh::keys::Error::KeyIsEncrypted) => KeyFile::Encrypted,
         Err(_) => KeyFile::Skipped(unreadable_note(path)),
     }
 }
 
-/// The note for an encrypted key file (D11).
+/// The public key of the key file at `path`: from `<path>.pub` when it holds
+/// one, else from the private file. An OpenSSH private key carries its public
+/// key in clear, so an encrypted one gives it too; an encrypted PEM file does
+/// not.
+fn file_public_key(path: &Path) -> Option<PublicKey> {
+    let mut public = path.as_os_str().to_owned();
+    public.push(".pub");
+    if let Some(key) = fs::read_to_string(&public)
+        .ok()
+        .and_then(|text| PublicKey::from_openssh(text.trim()).ok())
+    {
+        return Some(key);
+    }
+    let text = Zeroizing::new(fs::read_to_string(path).ok()?);
+    if text.contains("-----BEGIN OPENSSH PRIVATE KEY-----") {
+        return PrivateKey::from_openssh(text.as_str())
+            .ok()
+            .map(|key| key.public_key().clone());
+    }
+    russh::keys::decode_secret_key(&text, None)
+        .ok()
+        .map(|key| key.public_key().clone())
+}
+
+/// Whether `key` is in `keys`, comments aside.
+fn holds(keys: &[PublicKey], key: &PublicKey) -> bool {
+    keys.iter().any(|held| held.key_data() == key.key_data())
+}
+
+/// Whether the agent key `key` is offered: not RSA (S3), and with
+/// `IdentitiesOnly` (`only` holding the keys of the key files) one of those.
+fn offers_agent_key(key: &PublicKey, only: Option<&[PublicKey]>) -> bool {
+    !key.algorithm().is_rsa() && only.is_none_or(|files| holds(files, key))
+}
+
+/// The note for the encrypted key file at `path`, or `None` when, with
+/// `identities_only`, the agent holds its key among `held`: the agent has
+/// offered it already.
+fn encrypted_skip_note(path: &Path, identities_only: bool, held: &[PublicKey]) -> Option<String> {
+    let through_agent =
+        identities_only && file_public_key(path).is_some_and(|key| holds(held, &key));
+    (!through_agent).then(|| encrypted_note(path))
+}
+
+/// The note for an encrypted key file the agent does not hold (D11).
 fn encrypted_note(path: &Path) -> String {
     format!("key {} is encrypted: add it to ssh-agent", path.display())
 }
@@ -110,6 +170,18 @@ fn unreadable_note(path: &Path) -> String {
     )
 }
 
+/// What the offers so far gave: the keys offered, the notes of what was
+/// skipped, and the keys the agent holds.
+#[derive(Debug, Default)]
+struct Tally {
+    /// How many keys were offered.
+    offered: usize,
+    /// Why keys were skipped, and agent failures.
+    notes: Vec<String>,
+    /// The keys the agent listed.
+    held: Vec<PublicKey>,
+}
+
 /// Offers the keys of `plan` for `user` until the server accepts one.
 ///
 /// # Errors
@@ -121,25 +193,36 @@ pub async fn authenticate<H: Handler>(
     user: &str,
     plan: &AuthPlan,
 ) -> Result<(), String> {
-    let mut notes = Vec::new();
-    let mut offered = 0_usize;
+    let mut tally = Tally::default();
     if let Some(socket) = &plan.agent {
-        match agent_keys(handle, user, socket, (&mut offered, &mut notes)).await {
+        let file_keys: Option<Vec<PublicKey>> = plan.identities_only.then(|| {
+            plan.files
+                .iter()
+                .filter_map(|path| file_public_key(path))
+                .collect()
+        });
+        match agent_keys(handle, user, socket, file_keys.as_deref(), &mut tally).await {
             Ok(true) => return Ok(()),
             Ok(false) => {},
-            Err(note) => notes.push(note),
+            Err(note) => tally.notes.push(note),
         }
     }
     for path in &plan.files {
         let key = match load_key(path) {
             KeyFile::Missing => continue,
+            KeyFile::Encrypted => {
+                tally
+                    .notes
+                    .extend(encrypted_skip_note(path, plan.identities_only, &tally.held));
+                continue;
+            },
             KeyFile::Skipped(note) => {
-                notes.push(note);
+                tally.notes.push(note);
                 continue;
             },
             KeyFile::Usable(key) => key,
         };
-        offered += 1;
+        tally.offered += 1;
         let key = PrivateKeyWithHashAlg::new(Arc::new(*key), None);
         match handle.authenticate_publickey(user, key).await {
             Ok(AuthResult::Success) => return Ok(()),
@@ -151,12 +234,12 @@ pub async fn authenticate<H: Handler>(
             },
         }
     }
-    Err(failure(offered, &notes))
+    Err(failure(tally.offered, &tally.notes))
 }
 
-/// Offers the agent's keys at `socket`, counting them in `offered` and noting
-/// in `notes` a key the agent failed to sign with: `true` once one is
-/// accepted.
+/// Offers the agent's keys at `socket` (with `IdentitiesOnly`, only those in
+/// `only`), recording in `tally` the keys it holds, the keys offered and a key
+/// the agent failed to sign with: `true` once one is accepted.
 ///
 /// # Errors
 ///
@@ -165,7 +248,8 @@ async fn agent_keys<H: Handler>(
     handle: &mut Handle<H>,
     user: &str,
     socket: &Path,
-    (offered, notes): (&mut usize, &mut Vec<String>),
+    only: Option<&[PublicKey]>,
+    tally: &mut Tally,
 ) -> Result<bool, String> {
     let unreachable = |_| format!("the agent at {} cannot be reached", socket.display());
     let mut agent = AgentClient::connect_uds(socket)
@@ -177,10 +261,11 @@ async fn agent_keys<H: Handler>(
         let AgentIdentity::PublicKey { key, .. } = identity else {
             continue;
         };
-        if key.algorithm().is_rsa() {
+        tally.held.push(key.clone());
+        if !offers_agent_key(&key, only) {
             continue;
         }
-        *offered += 1;
+        tally.offered += 1;
         let result = handle
             .authenticate_publickey_with(user, key, None, &mut agent)
             .await;
@@ -188,8 +273,8 @@ async fn agent_keys<H: Handler>(
             Attempt::Accepted => return Ok(true),
             Attempt::Refused => {},
             Attempt::Failed(note) => {
-                if !notes.contains(&note) {
-                    notes.push(note);
+                if !tally.notes.contains(&note) {
+                    tally.notes.push(note);
                 }
             },
         }
@@ -247,7 +332,16 @@ mod tests {
 
     use super::*;
 
+    /// The result of a test that may fail on I/O or key handling.
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Writes `text` to `path` readable by its owner only, as a private key
+    /// file must be.
+    fn write_key(path: &Path, text: &str) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, text.as_bytes())?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    }
 
     /// A resolved host with `identities_only` and `agent`, two key files.
     fn host(identities_only: bool, agent: AgentChoice) -> HostConfig {
@@ -268,9 +362,9 @@ mod tests {
         }
     }
 
-    /// The agent comes before the files, unless `IdentitiesOnly` or
-    /// `IdentityAgent none` keeps it out; `IdentityAgent <path>` wins over
-    /// `SSH_AUTH_SOCK`.
+    /// The agent comes before the files, unless `IdentityAgent none` keeps it
+    /// out; `IdentityAgent <path>` wins over `SSH_AUTH_SOCK`. `IdentitiesOnly`
+    /// keeps the agent and is carried in the plan.
     #[test]
     fn the_plan_follows_identities_only_and_identity_agent() {
         let sock = Path::new("/run/agent.sock");
@@ -279,8 +373,10 @@ mod tests {
         assert_eq!(with_env.agent.as_deref(), Some(sock));
         assert_eq!(with_env.files, files);
         assert_eq!(plan(&host(false, AgentChoice::Env), None).agent, None);
+        assert!(!with_env.identities_only);
         let only = plan(&host(true, AgentChoice::Env), Some(sock));
-        assert_eq!(only.agent, None);
+        assert_eq!(only.agent.as_deref(), Some(sock));
+        assert!(only.identities_only);
         assert_eq!(only.files, files);
         assert_eq!(
             plan(&host(false, AgentChoice::None), Some(sock)).agent,
@@ -292,7 +388,7 @@ mod tests {
         );
         assert_eq!(own.agent.as_deref(), Some(Path::new("/own.sock")));
         let only_own = plan(&host(true, AgentChoice::Path("/own.sock".into())), None);
-        assert_eq!(only_own.agent, None);
+        assert_eq!(only_own.agent.as_deref(), Some(Path::new("/own.sock")));
     }
 
     /// A fresh ed25519 key in OpenSSH format.
@@ -305,7 +401,7 @@ mod tests {
     fn a_plain_key_is_usable_and_a_missing_one_is_skipped() -> TestResult {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("id_ed25519");
-        fs::write(&path, ed25519()?.to_openssh(LineEnding::LF)?.as_bytes())?;
+        write_key(&path, &ed25519()?.to_openssh(LineEnding::LF)?)?;
         assert!(matches!(load_key(&path), KeyFile::Usable(_)));
         assert!(matches!(
             load_key(&dir.path().join("absent")),
@@ -320,14 +416,115 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("id_ed25519");
         let key = ed25519()?.encrypt(&mut rand::rng(), "passphrase")?;
-        fs::write(&path, key.to_openssh(LineEnding::LF)?.as_bytes())?;
-        let KeyFile::Skipped(note) = load_key(&path) else {
-            return Err("the encrypted key was not skipped".into());
-        };
+        write_key(&path, &key.to_openssh(LineEnding::LF)?)?;
+        assert!(matches!(load_key(&path), KeyFile::Encrypted));
         assert_eq!(
-            note,
+            encrypted_note(&path),
             format!("key {} is encrypted: add it to ssh-agent", path.display())
         );
+        Ok(())
+    }
+
+    /// A private key file that its group or others may read is skipped with
+    /// OpenSSH's words, as OpenSSH ignores it.
+    #[test]
+    fn a_key_others_may_read_is_skipped() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("id_ed25519");
+        write_key(&path, &ed25519()?.to_openssh(LineEnding::LF)?)?;
+        for mode in [0o644, 0o640, 0o604] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+            let KeyFile::Skipped(note) = load_key(&path) else {
+                return Err("the open key was not skipped".into());
+            };
+            assert_eq!(
+                note,
+                format!(
+                    "Permissions {mode:04o} for '{}' are too open",
+                    path.display()
+                )
+            );
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
+        assert!(matches!(load_key(&path), KeyFile::Usable(_)));
+        Ok(())
+    }
+
+    /// The public key of a key file comes from `<file>.pub` when present, else
+    /// from the private file, encrypted or not; nothing for a missing file or
+    /// one that holds no key.
+    #[test]
+    fn a_key_file_gives_its_public_key() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let plain = ed25519()?;
+        let plain_path = dir.path().join("plain");
+        write_key(&plain_path, &plain.to_openssh(LineEnding::LF)?)?;
+        assert_eq!(
+            file_public_key(&plain_path),
+            Some(plain.public_key().clone())
+        );
+
+        let locked = ed25519()?;
+        let locked_path = dir.path().join("locked");
+        let encrypted = locked.encrypt(&mut rand::rng(), "passphrase")?;
+        write_key(&locked_path, &encrypted.to_openssh(LineEnding::LF)?)?;
+        assert_eq!(
+            file_public_key(&locked_path),
+            Some(locked.public_key().clone())
+        );
+
+        let other = ed25519()?;
+        fs::write(
+            dir.path().join("plain.pub"),
+            other.public_key().to_openssh()?,
+        )?;
+        assert_eq!(
+            file_public_key(&plain_path),
+            Some(other.public_key().clone())
+        );
+
+        fs::write(dir.path().join("notes"), "hello\n")?;
+        assert_eq!(file_public_key(&dir.path().join("notes")), None);
+        assert_eq!(file_public_key(&dir.path().join("absent")), None);
+        Ok(())
+    }
+
+    /// Without `IdentitiesOnly` every agent key is offered; with it, only the
+    /// keys of the key files, whatever their comments.
+    #[test]
+    fn identities_only_offers_the_agent_keys_of_the_key_files() -> TestResult {
+        let file = ed25519()?.public_key().clone();
+        let mut same = file.clone();
+        same.set_comment("agent comment");
+        let stranger = ed25519()?.public_key().clone();
+        assert!(offers_agent_key(&stranger, None));
+        assert!(offers_agent_key(&same, Some(std::slice::from_ref(&file))));
+        assert!(!offers_agent_key(
+            &stranger,
+            Some(std::slice::from_ref(&file))
+        ));
+        assert!(!offers_agent_key(&file, Some(&[])));
+        Ok(())
+    }
+
+    /// With `IdentitiesOnly`, an encrypted key file the agent holds goes
+    /// through the agent without a note; one it does not hold keeps the "add
+    /// it to ssh-agent" note. Without `IdentitiesOnly` the note stays.
+    #[test]
+    fn an_encrypted_key_the_agent_holds_has_no_note() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("id_ed25519");
+        let key = ed25519()?;
+        let encrypted = key.encrypt(&mut rand::rng(), "passphrase")?;
+        write_key(&path, &encrypted.to_openssh(LineEnding::LF)?)?;
+        let held = [key.public_key().clone()];
+        let stranger = [ed25519()?.public_key().clone()];
+        let note = Some(encrypted_note(&path));
+        assert_eq!(encrypted_skip_note(&path, true, &held), None);
+        assert_eq!(encrypted_skip_note(&path, true, &stranger), note);
+        assert_eq!(encrypted_skip_note(&path, true, &[]), note);
+        assert_eq!(encrypted_skip_note(&path, false, &held), note);
         Ok(())
     }
 
@@ -368,7 +565,7 @@ mod tests {
     fn a_file_that_is_no_key_is_skipped() -> TestResult {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("notes.txt");
-        fs::write(&path, "hello\n")?;
+        write_key(&path, "hello\n")?;
         let KeyFile::Skipped(note) = load_key(&path) else {
             return Err("the file was not skipped".into());
         };
