@@ -73,8 +73,8 @@ pub(crate) enum Waiter {
 }
 
 impl RemoteProcess {
-    /// Waits for the exit status, after closing the standard input when it is
-    /// still held.
+    /// Waits for the exit status, after closing the standard input and
+    /// dropping the output pipes still held.
     ///
     /// # Errors
     ///
@@ -82,6 +82,10 @@ impl RemoteProcess {
     /// status, and the [`SshError`] that broke the connection otherwise.
     pub async fn wait(mut self) -> Result<i32, SshError> {
         drop(self.stdin.take());
+        // Pipes nobody took are never read: dropped, their output is
+        // discarded rather than left to fill up and stall the connection.
+        drop(self.stdout.take());
+        drop(self.stderr.take());
         match self.waiter {
             Waiter::OpenSsh(waiter) => Box::pin((*waiter).wait()).await,
             #[cfg(feature = "builtin-ssh")]

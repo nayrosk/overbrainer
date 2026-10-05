@@ -129,7 +129,13 @@ impl Respond for SecretStore {
 /// The SSH clients of this build: OpenSSH, then the built-in client when the
 /// `builtin-ssh` feature is on. `OVERBRAINER_TEST_SSH_CLIENT` (`openssh` or
 /// `builtin`) keeps only that one, for a run whose `PATH` suits one client.
-pub fn ssh_clients() -> Vec<overbrainer::config::SshClient> {
+///
+/// # Errors
+///
+/// Returns an error when `OVERBRAINER_TEST_SSH_CLIENT` names no client of this
+/// build, so a misspelt value fails the tests rather than passing them with
+/// nothing run.
+pub fn ssh_clients() -> Result<Vec<overbrainer::config::SshClient>, Box<dyn std::error::Error>> {
     use overbrainer::config::{HAS_BUILTIN_SSH, SshClient};
     let all = if HAS_BUILTIN_SSH {
         vec![SshClient::Openssh, SshClient::Builtin]
@@ -137,11 +143,20 @@ pub fn ssh_clients() -> Vec<overbrainer::config::SshClient> {
         vec![SshClient::Openssh]
     };
     match std::env::var("OVERBRAINER_TEST_SSH_CLIENT") {
-        Ok(only) if !only.is_empty() => all
-            .into_iter()
-            .filter(|client| client.name() == only)
-            .collect(),
-        _ => all,
+        Ok(only) if !only.is_empty() => {
+            let kept: Vec<SshClient> = all
+                .into_iter()
+                .filter(|client| client.name() == only)
+                .collect();
+            if kept.is_empty() {
+                return Err(format!(
+                    "OVERBRAINER_TEST_SSH_CLIENT={only} names no SSH client of this build"
+                )
+                .into());
+            }
+            Ok(kept)
+        },
+        _ => Ok(all),
     }
 }
 
@@ -153,7 +168,7 @@ where
     F: Fn(overbrainer::config::SshClient) -> Fut,
     Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
 {
-    for client in ssh_clients() {
+    for client in ssh_clients()? {
         eprintln!("ssh_client = {}", client.name());
         case(client)
             .await

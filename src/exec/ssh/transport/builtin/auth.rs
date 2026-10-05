@@ -124,7 +124,7 @@ pub async fn authenticate<H: Handler>(
     let mut notes = Vec::new();
     let mut offered = 0_usize;
     if let Some(socket) = &plan.agent {
-        match agent_keys(handle, user, socket, &mut offered).await {
+        match agent_keys(handle, user, socket, (&mut offered, &mut notes)).await {
             Ok(true) => return Ok(()),
             Ok(false) => {},
             Err(note) => notes.push(note),
@@ -154,8 +154,9 @@ pub async fn authenticate<H: Handler>(
     Err(failure(offered, &notes))
 }
 
-/// Offers the agent's keys at `socket`, counting them in `offered`: `true` once
-/// one is accepted.
+/// Offers the agent's keys at `socket`, counting them in `offered` and noting
+/// in `notes` a key the agent failed to sign with: `true` once one is
+/// accepted.
 ///
 /// # Errors
 ///
@@ -164,7 +165,7 @@ async fn agent_keys<H: Handler>(
     handle: &mut Handle<H>,
     user: &str,
     socket: &Path,
-    offered: &mut usize,
+    (offered, notes): (&mut usize, &mut Vec<String>),
 ) -> Result<bool, String> {
     let unreachable = |_| format!("the agent at {} cannot be reached", socket.display());
     let mut agent = AgentClient::connect_uds(socket)
@@ -180,16 +181,45 @@ async fn agent_keys<H: Handler>(
             continue;
         }
         *offered += 1;
-        match handle
+        let result = handle
             .authenticate_publickey_with(user, key, None, &mut agent)
-            .await
-        {
-            Ok(AuthResult::Success) => return Ok(true),
-            Ok(AuthResult::Failure { .. }) => {},
-            Err(_) => return Err(format!("the agent at {} failed to sign", socket.display())),
+            .await;
+        match agent_attempt(&result, socket) {
+            Attempt::Accepted => return Ok(true),
+            Attempt::Refused => {},
+            Attempt::Failed(note) => {
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
+            },
         }
     }
     Ok(false)
+}
+
+/// What one offer of an agent key gave.
+#[derive(Debug, PartialEq, Eq)]
+enum Attempt {
+    /// The server accepted the key.
+    Accepted,
+    /// The server refused it: the next key is tried.
+    Refused,
+    /// The agent could not sign, with the note saying so: the next key is
+    /// tried too.
+    Failed(String),
+}
+
+/// The [`Attempt`] of an agent key offer that gave `result`, the agent
+/// listening at `socket`.
+fn agent_attempt<E>(result: &Result<AuthResult, E>, socket: &Path) -> Attempt {
+    match result {
+        Ok(AuthResult::Success) => Attempt::Accepted,
+        Ok(AuthResult::Failure { .. }) => Attempt::Refused,
+        Err(_) => Attempt::Failed(format!(
+            "the agent at {} failed to sign with one of its keys",
+            socket.display()
+        )),
+    }
 }
 
 /// The reason of an authentication failure after `offered` refused keys and
@@ -344,6 +374,28 @@ mod tests {
         };
         assert!(note.starts_with(&format!("key {} is not", path.display())));
         Ok(())
+    }
+
+    /// An agent signing failure is a note and the next key is tried; a
+    /// refusal moves on without one.
+    #[test]
+    fn an_agent_signing_failure_is_noted_and_skipped() {
+        let socket = Path::new("/run/agent.sock");
+        assert_eq!(
+            agent_attempt::<()>(&Err(()), socket),
+            Attempt::Failed(
+                "the agent at /run/agent.sock failed to sign with one of its keys".into()
+            )
+        );
+        assert_eq!(
+            agent_attempt::<()>(&Ok(AuthResult::Success), socket),
+            Attempt::Accepted
+        );
+        let refused = AuthResult::Failure {
+            remaining_methods: russh::MethodSet::empty(),
+            partial_success: false,
+        };
+        assert_eq!(agent_attempt::<()>(&Ok(refused), socket), Attempt::Refused);
     }
 
     /// The failure reason counts the refused keys and lists every note.

@@ -175,14 +175,13 @@ impl BuiltinTransport {
             verdict: Arc::clone(&verdict),
             closed: Arc::clone(&closed),
         };
-        let config = client::Config {
-            keepalive_interval: Some(plan.alive_interval),
-            keepalive_max: usize::try_from(plan.alive_count).unwrap_or(usize::MAX),
-            ..client::Config::default()
-        };
+        let config = session_config(&plan);
         let connecting =
             client::connect(Arc::new(config), (plan.host.as_str(), plan.port), handler);
-        let connected = tokio::time::timeout(plan.connect_timeout, connecting).await;
+        let connected = match connect_limit(plan.connect_timeout) {
+            Some(limit) => tokio::time::timeout(limit, connecting).await,
+            None => Ok(connecting.await),
+        };
         let refused = verdict.lock().ok().and_then(|mut slot| slot.take());
         let mut handle = match (connected, refused) {
             (_, Some(refused)) => return Err(refused),
@@ -299,6 +298,23 @@ impl BuiltinTransport {
             SshError::Other(format!("{} closed the channel of the command", self.host))
         }
     }
+}
+
+/// The russh settings of `plan`: keepalives every `alive_interval`, closing
+/// after `alive_count` unanswered, or none when the interval is zero
+/// (`ServerAliveInterval 0`, as in OpenSSH).
+fn session_config(plan: &Plan) -> client::Config {
+    client::Config {
+        keepalive_interval: (!plan.alive_interval.is_zero()).then_some(plan.alive_interval),
+        keepalive_max: usize::try_from(plan.alive_count).unwrap_or(usize::MAX),
+        ..client::Config::default()
+    }
+}
+
+/// The time a connection may take, `None` for no limit (`ConnectTimeout 0`,
+/// as in OpenSSH).
+fn connect_limit(timeout: Duration) -> Option<Duration> {
+    (!timeout.is_zero()).then_some(timeout)
 }
 
 /// Whether `proxy_jump` asks for a direct connection: empty or `none`.
@@ -536,7 +552,10 @@ impl Pump {
                 self.out = None;
                 self.err = None;
             },
-            ChannelMsg::Close => return true,
+            ChannelMsg::Close => {
+                outcome.channel_closed = true;
+                return true;
+            },
             _ => {},
         }
         false
@@ -559,15 +578,24 @@ struct Outcome {
     status: Option<i32>,
     /// Whether it was killed by a signal.
     signalled: bool,
+    /// Whether the server closed the channel. Without a close, the channel's
+    /// messages stopped because the session is gone.
+    channel_closed: bool,
 }
 
 impl Outcome {
-    /// The exit code, [`SshError::Terminated`] without one, or
-    /// [`SshError::Disconnected`] when the session ended first.
+    /// The exit code; [`SshError::Disconnected`] without one when the session
+    /// ended first or the channel stopped without a close;
+    /// [`SshError::Terminated`] when the server closed it without one.
+    ///
+    /// The pump that fills it needs a russh channel, which only a live session
+    /// creates, so this mapping is kept here, apart, where tests reach it.
     fn result(&self, closed: &AtomicBool) -> Result<i32, SshError> {
         match self.status {
             Some(code) if !self.signalled => Ok(code),
-            _ if closed.load(Ordering::SeqCst) => Err(SshError::Disconnected),
+            _ if closed.load(Ordering::SeqCst) || !self.channel_closed => {
+                Err(SshError::Disconnected)
+            },
             _ => Err(SshError::Terminated),
         }
     }
@@ -668,8 +696,9 @@ mod tests {
         assert!(!direct(&["a".to_string(), "b".to_string()]));
     }
 
-    /// A command's end: its status, or terminated, or disconnected when the
-    /// session ended without one.
+    /// A command's end: its status; terminated when the server closed the
+    /// channel without one; disconnected when the session ended first or the
+    /// channel's messages stopped without a close.
     #[test]
     fn the_outcome_maps_to_status_terminated_or_disconnected() {
         let open = AtomicBool::new(false);
@@ -677,17 +706,68 @@ mod tests {
         let exited = Outcome {
             status: Some(3),
             signalled: false,
+            channel_closed: true,
         };
         assert!(matches!(exited.result(&open), Ok(3)));
         assert!(matches!(exited.result(&gone), Ok(3)));
-        let silent = Outcome::default();
+        let silent = Outcome {
+            channel_closed: true,
+            ..Outcome::default()
+        };
         assert!(matches!(silent.result(&open), Err(SshError::Terminated)));
         assert!(matches!(silent.result(&gone), Err(SshError::Disconnected)));
         let killed = Outcome {
             status: None,
             signalled: true,
+            channel_closed: true,
         };
         assert!(matches!(killed.result(&open), Err(SshError::Terminated)));
+        let cut = Outcome::default();
+        assert!(matches!(cut.result(&open), Err(SshError::Disconnected)));
+    }
+
+    /// A plan with the given keepalive and connect timeout.
+    fn timed(alive: Duration, connect: Duration) -> Plan {
+        Plan {
+            name: "h".into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            check: HostCheck::KnownHosts {
+                files: Vec::new(),
+                host: "h".into(),
+                port: 22,
+                alias: None,
+            },
+            auth: AuthPlan {
+                agent: None,
+                files: Vec::new(),
+            },
+            connect_timeout: connect,
+            alive_interval: alive,
+            alive_count: 2,
+        }
+    }
+
+    /// `ServerAliveInterval 0` turns keepalives off; another value sets them,
+    /// with `ServerAliveCountMax`.
+    #[test]
+    fn a_zero_alive_interval_disables_keepalives() {
+        let off = session_config(&timed(Duration::ZERO, Duration::from_secs(5)));
+        assert_eq!(off.keepalive_interval, None);
+        let on = session_config(&timed(Duration::from_secs(9), Duration::from_secs(5)));
+        assert_eq!(on.keepalive_interval, Some(Duration::from_secs(9)));
+        assert_eq!(on.keepalive_max, 2);
+    }
+
+    /// `ConnectTimeout 0` means no time limit, as in OpenSSH.
+    #[test]
+    fn a_zero_connect_timeout_means_no_limit() {
+        assert_eq!(connect_limit(Duration::ZERO), None);
+        assert_eq!(
+            connect_limit(Duration::from_secs(7)),
+            Some(Duration::from_secs(7))
+        );
     }
 
     /// A resolved host becomes a plan checking `known_hosts` under its alias,
