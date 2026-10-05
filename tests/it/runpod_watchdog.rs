@@ -1224,6 +1224,7 @@ struct FailingBootstrap {
 }
 
 impl FailingBootstrap {
+    /// A fresh tree whose bootstrap reaches the API at `server`.
     fn new(server: &MockServer) -> Result<Self, Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let run_dir = root.path().join("run");
@@ -1238,7 +1239,11 @@ impl FailingBootstrap {
         fs::create_dir_all(&readonly_root)?;
         fs::set_permissions(&readonly_root, fs::Permissions::from_mode(0o500))?;
         let authorized_keys_dir = readonly_root.join("ssh");
-        let keys = PodKeys::generate(&root.path().join("ssh-keys"), "overbrainer-r1")?;
+        let keys = PodKeys::generate(
+            &root.path().join("ssh-keys"),
+            "overbrainer-r1",
+            overbrainer::config::SshClient::Openssh,
+        )?;
         let refused_dir = root.path().join("refused");
         let env = vec![
             ("OVERBRAINER_RUN_ID", "r1".to_string()),
@@ -1541,6 +1546,8 @@ fn keygen_available() -> bool {
         .is_ok()
 }
 
+/// In every shell, the bootstrap replaces the baked host keys with the run's
+/// host key and authorizes the run's client key, with sshd's permissions.
 #[test]
 fn the_bootstrap_installs_the_run_keys() -> TestResult {
     if !keygen_available() {
@@ -1548,7 +1555,11 @@ fn the_bootstrap_installs_the_run_keys() -> TestResult {
         return Ok(());
     }
     let keys_dir = tempfile::tempdir()?;
-    let keys = PodKeys::generate(&keys_dir.path().join("ssh"), "overbrainer-r1")?;
+    let keys = PodKeys::generate(
+        &keys_dir.path().join("ssh"),
+        "overbrainer-r1",
+        overbrainer::config::SshClient::Openssh,
+    )?;
     for &shell in shells() {
         let root = tempfile::tempdir()?;
         let etc = root.path().join("etc/ssh");

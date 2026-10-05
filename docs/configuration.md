@@ -33,7 +33,7 @@ These keys are accepted from the environment only, and `overbrainer.toml` is rej
 
 Provider and target names may only use lowercase letters, digits and `_`, so they map cleanly to variable names.
 
-Any other `OVERBRAINER_*` variable must name a key, or the command stops with `unknown field`. The exceptions are the variables read outside the configuration, which are never taken as keys: `OVERBRAINER_NO_UPDATE_CHECK` (see [Update check](#update-check)), `OVERBRAINER_TUI_COLOR` and `OVERBRAINER_TUI_MOTION` (see [Color and motion](tui.md#color-and-motion)), and the `OVERBRAINER_TEST_*` variables of the test suite.
+Any other `OVERBRAINER_*` variable must name a key, or the command stops with `unknown field`. The exceptions are the variables read outside the configuration, which are never taken as keys: `OVERBRAINER_NO_UPDATE_CHECK` (see [Update check](#update-check)), `OVERBRAINER_TUI_COLOR` and `OVERBRAINER_TUI_MOTION` (see [Color and motion](tui.md#color-and-motion)), `OVERBRAINER_SSH_CLIENT` (`openssh` or `builtin`, over the `ssh_client` field of every `ssh` and `runpod` target; any other value stops the command with `OVERBRAINER_SSH_CLIENT must be openssh or builtin`, and an empty one counts as unset; see [Built-in SSH client](training.md#built-in-ssh-client)), and the `OVERBRAINER_TEST_*` variables of the test suite.
 
 ## Reloading while overbrainer runs
 
@@ -131,7 +131,7 @@ Topic names must be unique. `subtopics` and `questions_per_subtopic` must be at 
 
 Retries wait with exponential backoff and jitter, or as long as the provider's `Retry-After` asks.
 
-The `[training]` section and the `[targets.*]` tables are described in [Training](training.md) and [Runpod](runpod.md). A Runpod target's `gpu_types` and `data_center_ids` take a TOML array, or `"auto"`; from the environment, a comma-separated value or `auto`, for example `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. `min_vram_gb` and `max_price_per_hour` narrow an `auto` choice of GPU types and are rejected otherwise, and `max_volume_gb` needs `network_volume_id`; see [Runpod](runpod.md) for every field.
+`ssh_client` (`openssh` by default, or `builtin`) on an `ssh` or `runpod` target picks the SSH client, and `OVERBRAINER_SSH_CLIENT` overrides it for every target; see [Built-in SSH client](training.md#built-in-ssh-client). The `[training]` section and the `[targets.*]` tables are described in [Training](training.md) and [Runpod](runpod.md). A Runpod target's `gpu_types` and `data_center_ids` take a TOML array, or `"auto"`; from the environment, a comma-separated value or `auto`, for example `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. `min_vram_gb` and `max_price_per_hour` narrow an `auto` choice of GPU types and are rejected otherwise, and `max_volume_gb` needs `network_volume_id`; see [Runpod](runpod.md) for every field.
 
 The optional `[export]` section (`after_training`, `quantize`, `ollama_name`) sets the export of a run's model to GGUF and its Ollama Modelfile, described in [Training](training.md#export-to-gguf-and-ollama), for example `OVERBRAINER_EXPORT__QUANTIZE=Q8_0` from the environment.
 

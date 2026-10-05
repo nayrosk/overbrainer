@@ -36,18 +36,22 @@ dotenvy = "0.15.7"
 fastrand = "2.5.0"
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
 hf-hub = { version = "1.0.0", default-features = false, features = ["rustls-tls"] }
+hmac = { version = "0.13", optional = true }
 hyper = { version = "1.11.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "debug", "serde"] }
 openssh = { version = "0.11.6", default-features = false, features = ["native-mux"] }
 prometheus-client = "0.25.1"
+rand = { version = "0.10", default-features = false, features = ["thread_rng"], optional = true }
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "http2", "charset"] }
+russh = { version = "0.64", default-features = false, features = ["ring"], optional = true }
 rustify = { version = "0.7.0", default-features = false }
 rustix = { version = "1.1.5", features = ["fs"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha1 = { version = "0.11", optional = true }
 sha2 = { version = "0.11.0", default-features = false }
 tachyonfx = { version = "0.25.2", default-features = false, features = ["std-duration"] }
 thiserror = "2.0.20"
@@ -68,6 +72,9 @@ predicates = "3.1.4"
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["test-util"] }
 wiremock = "0.6.5"
+
+[features]
+builtin-ssh = ["dep:russh", "dep:rand", "dep:hmac", "dep:sha1"]
 
 # Backtraces keep file and line; full debug info made each test binary link
 # take about 1 GB of RAM and a worktree's target/ grow past 15 GB.

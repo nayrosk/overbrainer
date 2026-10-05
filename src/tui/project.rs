@@ -713,6 +713,8 @@ fn training_value(training: &Training, field: &str) -> Option<String> {
     })
 }
 
+/// The value of `field` in `target` as the Project view shows it, or `None`
+/// when unset or not a field of that kind of target.
 fn target_value(target: &Target, field: &str) -> Option<String> {
     let engine = |engine: &Option<Engine>| engine.map(|engine| engine.command().to_string());
     match target {
@@ -734,6 +736,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             engine: used,
             image,
             venv,
+            ssh_client,
             ..
         } => match field {
             "runtime" => Some(runtime(*run).to_string()),
@@ -741,6 +744,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             "engine" => engine(used),
             "image" => image.clone(),
             "venv" => venv.clone(),
+            "ssh_client" => Some(ssh_client.name().to_string()),
             _ => None,
         },
         Target::Runpod {
@@ -758,6 +762,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             data_center_ids,
             network_volume_id,
             max_volume_gb,
+            ssh_client,
         } => match field {
             "gpu_types" => Some(gpu_types.to_string()),
             "min_vram_gb" => min_vram_gb.map(|gb| gb.to_string()),
@@ -773,6 +778,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             "data_center_ids" => (!data_center_ids.is_any()).then(|| data_center_ids.to_string()),
             "network_volume_id" => network_volume_id.clone(),
             "max_volume_gb" => max_volume_gb.map(|gb| gb.to_string()),
+            "ssh_client" => Some(ssh_client.name().to_string()),
             _ => None,
         },
     }
@@ -1265,6 +1271,25 @@ mod tests {
             field(&rows, "pipeline.seed")?.detail(None),
             "pipeline.seed: Seed of the train/eval split (default 42)"
         );
+        Ok(())
+    }
+
+    /// `ssh_client` is a row of an SSH or Runpod target, `openssh` by default.
+    #[test]
+    fn a_target_shows_its_ssh_client_with_openssh_as_the_default() -> TestResult {
+        let rows = rows(&config()?, &Locks::default());
+        let row = field(&rows, "targets.gpu_cloud.ssh_client")?;
+        assert_eq!(row.shown, Shown::Default("openssh".into()));
+        assert!(row.path.is_some(), "an editable row");
+        let text = format!(
+            "{}\n[targets.box]\nkind = \"ssh\"\nruntime = \"docker\"\n",
+            crate::tui::snapshots::PROJECT_CONFIG
+        );
+        let with_ssh = ProjectConfig::new(&text, &env())?;
+        let ssh_rows = super::rows(&with_ssh, &Locks::default());
+        let row = field(&ssh_rows, "targets.box.ssh_client")?;
+        assert_eq!(row.shown, Shown::Default("openssh".into()));
+        assert!(row.path.is_some(), "an editable row");
         Ok(())
     }
 

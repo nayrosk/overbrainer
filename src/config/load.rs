@@ -13,11 +13,13 @@ pub const ENV_PREFIX: &str = "OVERBRAINER";
 /// The `OVERBRAINER_*` variables read outside the configuration, which [`load`]
 /// skips: the terminal UI's own (`OVERBRAINER_TUI_COLOR`, `OVERBRAINER_TUI_MOTION`),
 /// the test suite's (`OVERBRAINER_TEST_SSH_HOST`, `OVERBRAINER_TEST_SSH_CONFIG`) and
-/// the update check's switch. A name ending in `_` is a prefix, any other is exact.
-const NOT_CONFIG_VARIABLES: [&str; 3] = [
+/// the update check's switch and the SSH client's ([`super::SSH_CLIENT_ENV`], read by
+/// [`ssh_client_env`]). A name ending in `_` is a prefix, any other is exact.
+const NOT_CONFIG_VARIABLES: [&str; 4] = [
     "OVERBRAINER_TUI_",
     "OVERBRAINER_TEST_",
     crate::update::NO_UPDATE_CHECK_ENV,
+    super::SSH_CLIENT_ENV,
 ];
 
 /// Where [`load`] reads `OVERBRAINER_*` environment variable overrides from.
@@ -236,6 +238,27 @@ pub fn env_keys(env: &EnvSource) -> BTreeSet<String> {
         .collect()
 }
 
+/// The value of `OVERBRAINER_SSH_CLIENT` in `env`, for [`super::effective_client`].
+#[must_use]
+pub fn ssh_client_env(env: &EnvSource) -> Option<String> {
+    env_pairs(env.clone())
+        .into_iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(super::SSH_CLIENT_ENV))
+        .map(|(_, value)| value)
+}
+
+/// The client a target set to `configured` uses in this process:
+/// [`super::effective_client`] with `OVERBRAINER_SSH_CLIENT` from the process
+/// environment.
+///
+/// # Errors
+///
+/// Returns the message of [`super::effective_client`], which names the
+/// variable when its value is invalid.
+pub fn process_client(configured: super::SshClient) -> Result<super::SshClient, String> {
+    super::effective_client(configured, ssh_client_env(&EnvSource::Process).as_deref())
+}
+
 /// Whether `key` is one of [`NOT_CONFIG_VARIABLES`] once lower-cased, as
 /// `config::Environment` lower-cases keys before matching.
 fn is_not_config(key: &str) -> bool {
@@ -436,6 +459,22 @@ mod tests {
     fn env_keys_maps_log_to_a_bare_key() {
         let env = vars(&[("OVERBRAINER_LOG", "debug")]);
         assert_eq!(env_keys(&env), BTreeSet::from(["log".to_string()]));
+    }
+
+    /// `OVERBRAINER_SSH_CLIENT` is read by [`ssh_client_env`], not loaded as a key.
+    #[test]
+    fn the_ssh_client_variable_is_read_apart_from_the_configuration() {
+        let env = vars(&[("OVERBRAINER_SSH_CLIENT", "builtin")]);
+        assert_eq!(env_keys(&env), BTreeSet::new());
+        assert_eq!(ssh_client_env(&env), Some("builtin".to_string()));
+        assert_eq!(ssh_client_env(&vars(&[])), None);
+    }
+
+    /// A lower-case `overbrainer_ssh_client` is read like the upper-case name.
+    #[test]
+    fn the_ssh_client_variable_is_read_in_any_case() {
+        let env = vars(&[("overbrainer_ssh_client", "builtin")]);
+        assert_eq!(ssh_client_env(&env), Some("builtin".to_string()));
     }
 
     #[test]

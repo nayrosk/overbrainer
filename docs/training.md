@@ -189,6 +189,7 @@ runtime = "docker"
 engine = "podman"              # docker (default) | podman
 # image = "..."                # default: axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1, pinned by digest
 # workdir = "overbrainer"      # on the remote machine, relative to its home directory
+# ssh_client = "openssh"       # openssh (default) | builtin, see "Built-in SSH client" below
 ```
 
 `venv` applies only with `runtime = "native"`, and `engine` and `image` only with `runtime = "docker"`. The third kind, `runpod`, has [its own page](runpod.md).
@@ -210,6 +211,30 @@ The job's environment differs by target. On a local target it is overbrainer's o
 ### SSH
 
 SSH uses your `ssh` binary with `~/.ssh/config`, the agent and `known_hosts`. A host that is not already in `known_hosts` is refused. Files travel as `tar` streams over the connection, so the remote machine needs `tar`, `setsid` and `nohup` (any Linux distribution has them). overbrainer keeps one master connection open (OpenSSH `ControlMaster`); an `ssh` wrapper that kills background processes, such as a firejail profile, breaks it.
+
+#### Built-in SSH client
+
+Some machines cannot run overbrainer's `ssh` the way it needs: a sandbox wrapper such as firejail kills the background master connection, or there is no `ssh` binary at all. The built-in client is a pure-Rust SSH client inside overbrainer that needs neither. Choose it with `ssh_client = "builtin"` on an `ssh` or `runpod` target, or for every target with `OVERBRAINER_SSH_CLIENT=builtin`, which wins over the field. `openssh` is the default.
+
+Release binaries include it; a build from source needs `cargo install --locked overbrainer --features builtin-ssh`. Without the feature, `builtin` is refused with `ssh_client = "builtin" needs a build with the builtin-ssh feature (the release binaries have it)`, or with `OVERBRAINER_SSH_CLIENT=builtin needs ...` when the variable chose it. `overbrainer config check` shows the client of each target.
+
+It reads `~/.ssh/config`, then `/etc/ssh/ssh_config`, with OpenSSH rules: the first value obtained wins (the values of `IdentityFile` add up), `Host` patterns (`*`, `?`, `!`) match, and `Include` globs are relative to `~/.ssh` in the user file and to `/etc/ssh` in the system file. A user file that its group or others can write is refused (`Bad owner or permissions on <file>`), as OpenSSH does. Directives fall in three classes:
+
+- Applied: `HostName`, `User`, `Port`, `IdentityFile`, `IdentitiesOnly`, `IdentityAgent`, `UserKnownHostsFile`, `GlobalKnownHostsFile`, `HostKeyAlias`, `StrictHostKeyChecking`, `ProxyJump`, `ConnectTimeout`, `ServerAliveInterval`, `ServerAliveCountMax` and `Include`.
+- Ignored, since they change neither the destination nor the authentication: `SendEnv`, `SetEnv`, `ForwardAgent`, `ForwardX11`, `ForwardX11Trusted`, every `GSSAPI*`, `Compression`, `LogLevel`, `HashKnownHosts`, `AddKeysToAgent`, `UseKeychain`, `ControlMaster`, `ControlPath`, `ControlPersist`, `LocalForward`, `RemoteForward`, `DynamicForward`, `VisualHostKey`, `UpdateHostKeys`, `BatchMode`, `PasswordAuthentication`, `KbdInteractiveAuthentication`, `ChallengeResponseAuthentication`, `TCPKeepAlive`, `CheckHostIP` and `PubkeyAuthentication yes` (the client never prompts, never uses a password and always refuses an unknown host).
+- Refused: any other directive that applies to the host, such as `ProxyCommand`, `CertificateFile`, `PKCS11Provider`, `SecurityKeyProvider`, `Ciphers`, `KexAlgorithms`, `HostKeyAlgorithms`, `MACs` and `PubkeyAcceptedAlgorithms`, and `PubkeyAuthentication no`. So is any `Match` line, wherever it appears, except `Match all` and `Match final all`, which apply to every host.
+
+The client negotiates only modern algorithms. The algorithm lists a system file sets (`Ciphers`, `KexAlgorithms`, `MACs`, `HostKeyAlgorithms`, `PubkeyAcceptedAlgorithms`, `CASignatureAlgorithms`, `GSSAPIKexAlgorithms`, `HostbasedAcceptedAlgorithms`, `RequiredRSASize`) are ignored in `/etc/ssh/ssh_config`, so a crypto policy such as Fedora's or RHEL's does not stop it. The same directives in a user file are refused, except `GSSAPIKexAlgorithms`, which is ignored like every `GSSAPI*`. A refusal names the file, the directive and the host:
+
+```text
+/home/me/.ssh/config: ProxyCommand for host gpu is not supported by the built-in SSH client: use ssh_client = "openssh", or a host entry without it
+```
+
+Authentication tries, in order, the agent's keys (`SSH_AUTH_SOCK`, or the socket `IdentityAgent` names; `IdentityAgent none` turns the agent off), then the `IdentityFile` keys, which default to `~/.ssh/id_ed25519` and `~/.ssh/id_ecdsa`. With `IdentitiesOnly yes`, as with OpenSSH, the agent offers only the keys of the `IdentityFile`s (it finds the public key in `<file>.pub`, or in the key file itself, even an encrypted one), so a passphrase key loaded in the agent still works. It never asks for a passphrase: an encrypted key file the agent does not hold is skipped, and so is an RSA key, which the client does not support. Like OpenSSH, it skips a key file that its group or others may read (`Permissions 0644 for '<path>' are too open`). The agent's RSA keys and certificates are passed over without a note. When no key is accepted, the error lists what was skipped, for example `key /home/me/.ssh/id_ed25519 is encrypted: add it to ssh-agent` or `key /home/me/.ssh/id_rsa is RSA, which the built-in SSH client does not support: use an ed25519 key, or ssh_client = "openssh"`.
+
+The host key is checked against `UserKnownHostsFile` and `GlobalKnownHostsFile` (by default `~/.ssh/known_hosts`, `~/.ssh/known_hosts2` and `/etc/ssh/ssh_known_hosts`), with hashed entries, `[host]:port` entries and `HostKeyAlias`. A host that is not there is always refused, whatever `StrictHostKeyChecking` says: the message asks you to add it with `ssh-keyscan` or a first connection with `ssh`. A `@revoked` key is refused. A `@cert-authority` line is not supported, and refuses the connection when it is the only match.
+
+`ProxyJump` works with a comma-separated chain: each hop is resolved through the same files and its host key is checked the same way. `ProxyJump none` is respected. The client keeps one session per target. For an `ssh` target, a keepalive goes every 15 seconds with 3 missed answers allowed, and the connect timeout is 30 seconds; `ServerAliveInterval`, `ServerAliveCountMax` and `ConnectTimeout` change them. A Runpod pod always uses these values.
 
 ## The Hugging Face token
 

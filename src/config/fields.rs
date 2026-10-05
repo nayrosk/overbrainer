@@ -324,6 +324,8 @@ const fn floats(min: Bound, max: Bound) -> FieldKind {
 const THRESHOLD: FieldKind = floats(Bound::Excl(0.0), Bound::Incl(1.0));
 const RUNTIMES: FieldKind = FieldKind::Choice(&["docker", "native"]);
 const ENGINES: FieldKind = FieldKind::Choice(&["docker", "podman"]);
+/// The SSH clients a target may name.
+const SSH_CLIENTS: FieldKind = FieldKind::Choice(&["openssh", "builtin"]);
 
 const PROJECT: &[FieldSpec] = &[spec("name", TEXT, false, "Name of the project")];
 
@@ -566,6 +568,7 @@ const LOCAL: &[FieldSpec] = &[
     ),
 ];
 
+/// The fields of an `ssh` target.
 const SSH: &[FieldSpec] = &[
     spec("runtime", RUNTIMES, false, "Run in a container or natively"),
     spec(
@@ -592,8 +595,15 @@ const SSH: &[FieldSpec] = &[
         true,
         "Virtual environment with bin/axolotl, native runtime only",
     ),
+    spec(
+        "ssh_client",
+        SSH_CLIENTS,
+        true,
+        "SSH client: openssh (default) or builtin, which needs the builtin-ssh feature",
+    ),
 ];
 
+/// The fields of a `runpod` target.
 const RUNPOD: &[FieldSpec] = &[
     spec(
         "gpu_types",
@@ -673,6 +683,12 @@ const RUNPOD: &[FieldSpec] = &[
         COUNT,
         true,
         "Largest size in GB the network volume may grow to when it fills; a grow is permanent and billed monthly",
+    ),
+    spec(
+        "ssh_client",
+        SSH_CLIENTS,
+        true,
+        "SSH client: openssh (default) or builtin, which needs the builtin-ssh feature",
     ),
 ];
 
@@ -1024,6 +1040,22 @@ max_hours = 6
             TEXT.parse(" a = \"b\" "),
             Ok(FieldValue::Text(" a = \"b\" ".to_string()))
         );
+    }
+
+    /// `ssh_client` is an optional choice of SSH and Runpod targets, absent
+    /// from local ones.
+    #[test]
+    fn ssh_client_is_a_choice_of_ssh_and_runpod_targets_only() {
+        for kind in [TargetKind::Ssh, TargetKind::Runpod] {
+            let spec = find(Section::Target(kind), "ssh_client");
+            assert_eq!(spec.map(|spec| spec.kind), Some(SSH_CLIENTS));
+            assert_eq!(
+                spec.map(|spec| spec.kind.describe()),
+                Some("one of openssh, builtin".to_string())
+            );
+            assert!(spec.is_some_and(|spec| spec.optional && !spec.help.is_empty()));
+        }
+        assert!(find(Section::Target(TargetKind::Local), "ssh_client").is_none());
     }
 
     #[test]

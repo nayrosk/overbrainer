@@ -46,8 +46,8 @@ pub use flow::{
     past_deadline, reconnect, settle_watch, ssh_command, start_pod, watch_leased, watch_on_pod,
 };
 pub use keys::{
-    CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,
-    write_known_hosts,
+    CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, pod_endpoint, ssh_config,
+    write_config, write_known_hosts,
 };
 pub use logs::{
     BOOTSTRAP_LOG, Capture, DRAIN_WAIT, LogError, LogQuery, LogSource, POD_LOG, POD_LOG_CAP,
@@ -79,6 +79,18 @@ pub use types::{
     RemoteStatus, Secret, SecretList, SshDirect, Stock, Template, TemplatePage,
 };
 
+/// How to get past a local `ssh` that cannot keep its connection, closing the
+/// [`PodError::LocalSsh`] message.
+#[cfg(feature = "builtin-ssh")]
+const LOCAL_SSH_FIX: &str =
+    "; set ssh_client = \"builtin\" on the target (or OVERBRAINER_SSH_CLIENT=builtin)";
+
+/// How to get past a local `ssh` that cannot keep its connection, closing the
+/// [`PodError::LocalSsh`] message.
+#[cfg(not(feature = "builtin-ssh"))]
+const LOCAL_SSH_FIX: &str =
+    "; a build with the builtin-ssh feature (the release binaries have it) avoids the local ssh";
+
 /// Errors of a Runpod run's pod: provisioning, keys, readiness, deletion.
 #[derive(Debug, thiserror::Error)]
 pub enum PodError {
@@ -97,6 +109,11 @@ pub enum PodError {
     /// The run's SSH keys could not be generated.
     #[error("cannot generate the run's SSH keys: {0}")]
     Keygen(String),
+    /// The SSH client cannot be chosen: `OVERBRAINER_SSH_CLIENT` holds an
+    /// invalid value, or `builtin` is asked of a build without it. The
+    /// message names the setting.
+    #[error("{0}")]
+    SshClient(String),
     /// A local path cannot be written into an ssh config.
     #[error("{0}")]
     InvalidPath(String),
@@ -166,7 +183,8 @@ pub enum PodError {
     /// right after it started: the cause is on this machine, so no other GPU type
     /// is tried. The pod was deleted.
     #[error(
-        "pod {pod_id} answers SSH, but the local ssh cannot keep its connection ({reason}); a wrapper around `ssh` on PATH, such as firejail, may kill its background process: put the real ssh first on PATH. The pod was deleted and no other GPU type tried"
+        "pod {pod_id} answers SSH, but the local ssh cannot keep its connection ({reason}); a wrapper around `ssh` on PATH, such as firejail, may kill its background process: put the real ssh first on PATH. The pod was deleted and no other GPU type tried{}",
+        LOCAL_SSH_FIX
     )]
     LocalSsh {
         /// The pod.

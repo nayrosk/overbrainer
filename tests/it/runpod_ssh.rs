@@ -13,14 +13,14 @@ use std::time::Duration;
 
 use std::sync::Mutex;
 
-use overbrainer::config::ListOrAuto;
+use overbrainer::config::{ListOrAuto, SshClient};
 use overbrainer::events::EventBus;
-use overbrainer::exec::{Executor, JobCommand, JobRuntime, JobStatus, SshExecutor};
+use overbrainer::exec::{Executor, JobCommand, JobRuntime, JobStatus, SshDestination, SshExecutor};
 use overbrainer::retry::RetryPolicy;
 use overbrainer::runpod::{
     AttemptResult, Ending, PodCtx, PodError, PodId, PodKeys, PodPlan, PodRecord, PodState,
-    RunpodClient, RunpodTarget, SshEndpoint, Timing, alias, end_pod, job_started, provision,
-    reconnect, write_config,
+    RunpodClient, RunpodTarget, SshEndpoint, Timing, alias, end_pod, job_started, pod_endpoint,
+    provision, reconnect, write_config,
 };
 use overbrainer::runs::{Launch, RunCtx, RunRecord, RunState, Runs, start};
 use overbrainer::train::{Artifacts, TrainError, Trainer};
@@ -30,7 +30,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-use crate::common::SecretStore;
+use crate::common::{SecretStore, each_ssh_client};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -108,16 +108,18 @@ fn new_run_id() -> String {
     format!("20260922-000000-{:04x}", fastrand::u16(..))
 }
 
+/// Connects with `client` to the test sshd as to a new run's pod pinned to
+/// the host key of `keys`.
 async fn connect(
     dir: &Path,
     sshd: &Sshd,
     keys: &PodKeys,
+    ssh: SshClient,
 ) -> Result<SshExecutor, Box<dyn std::error::Error>> {
     let run_id = new_run_id();
-    let alias = alias(&run_id);
-    let config = write_config(dir, &alias, &sshd.endpoint, keys)?;
+    let pod = pod_endpoint(dir, &alias(&run_id), &sshd.endpoint, keys)?;
     let workdir = format!("overbrainer-tests/runpod-{run_id}");
-    Ok(SshExecutor::connect(&alias, &workdir, Some(&config)).await?)
+    Ok(SshExecutor::connect(&SshDestination::Pod(&pod), &workdir, ssh).await?)
 }
 
 /// Whether `error`'s chain names a host key check failure, rather than some
@@ -136,35 +138,43 @@ fn is_host_key_failure(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// A pod is reached with its endpoint, its client key and its pinned host key.
 #[tokio::test]
 async fn the_per_run_config_reaches_the_pinned_host() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let dir = tempfile::tempdir()?;
-    let executor = connect(dir.path(), &sshd, &keys(&sshd, &sshd.host_public)).await?;
-    assert!(executor.workdir().contains("/overbrainer-tests/runpod-"));
-    Ok(())
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let executor = connect(dir.path(), &sshd, &keys(&sshd, &sshd.host_public), ssh).await?;
+        assert!(executor.workdir().contains("/overbrainer-tests/runpod-"));
+        Ok(())
+    })
+    .await
 }
 
+/// A pod whose host key differs from the pinned one is refused as a host key failure.
 #[tokio::test]
 async fn another_host_key_is_refused_through_the_per_run_config() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let dir = tempfile::tempdir()?;
-    let other = PodKeys::generate(&dir.path().join("other"), "other")?;
-    let result = connect(dir.path(), &sshd, &keys(&sshd, &other.host_public)).await;
-    let Err(error) = result else {
-        return Err("connected although the pinned key differs".into());
-    };
-    assert!(
-        is_host_key_failure(error.as_ref()),
-        "expected a host key verification failure, got: {error}"
-    );
-    Ok(())
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let other = PodKeys::generate(&dir.path().join("other"), "other", ssh)?;
+        let result = connect(dir.path(), &sshd, &keys(&sshd, &other.host_public), ssh).await;
+        let Err(error) = result else {
+            return Err("connected although the pinned key differs".into());
+        };
+        assert!(
+            is_host_key_failure(error.as_ref()),
+            "expected a host key verification failure, got: {error}"
+        );
+        Ok(())
+    })
+    .await
 }
 
 /// `GET /pods/p1`: the pod with the test sshd as its endpoint, until deleted.
@@ -252,18 +262,18 @@ async fn stub(sshd: &Sshd, run_id: &str, dies_after: Option<usize>) -> (MockServ
     (server, secrets)
 }
 
-/// Writes the watchdog's verdict for `run_id` under `workdir` on the test sshd.
+/// Writes the watchdog's verdict for `run_id` under `workdir` on the test sshd,
+/// connecting with `client`.
 async fn write_verdict(
     sshd: &Sshd,
-    workdir: &str,
-    run_id: &str,
+    (workdir, run_id): (&str, &str),
     verdict: &str,
+    ssh: SshClient,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let keys = keys(sshd, &sshd.host_public);
-    let alias = alias(run_id);
-    let config = write_config(dir.path(), &alias, &sshd.endpoint, &keys)?;
-    let executor = SshExecutor::connect(&alias, workdir, Some(&config)).await?;
+    let pod = pod_endpoint(dir.path(), &alias(run_id), &sshd.endpoint, &keys)?;
+    let executor = SshExecutor::connect(&SshDestination::Pod(&pod), workdir, ssh).await?;
     let job = executor
         .spawn(&JobCommand {
             dir: format!("{}/{run_id}", executor.workdir()),
@@ -283,22 +293,23 @@ async fn write_verdict(
     Err("the verdict was not written".into())
 }
 
-/// Provisions against the test sshd with `verdict` written (none when `None`),
-/// the pod dying after `dies_after` looks at it.
+/// Provisions against the test sshd with `client` and `verdict` written (none
+/// when `None`), the pod dying after `dies_after` looks at it.
 async fn provision_against(
     sshd: &Sshd,
     verdict: Option<&str>,
     dies_after: Option<usize>,
+    ssh: SshClient,
 ) -> Result<(Result<(), PodError>, PodRecord, usize), Box<dyn std::error::Error>> {
     let run_id = new_run_id();
     let workdir = format!("overbrainer-tests/runpod-{run_id}");
     if let Some(verdict) = verdict {
-        write_verdict(sshd, &workdir, &run_id, verdict).await?;
+        write_verdict(sshd, (&workdir, &run_id), verdict, ssh).await?;
     }
     let (server, _) = stub(sshd, &run_id, dies_after).await;
     let project = tempfile::tempdir()?;
     let runs = Runs::new(project.path());
-    let client = client(&server)?;
+    let client = api_client(&server)?;
     let timing = Timing {
         ready_timeout: Duration::from_secs(30),
         preflight_timeout: Duration::from_secs(30),
@@ -313,7 +324,7 @@ async fn provision_against(
         timing: &timing,
         interrupted: &interrupted,
     };
-    let target = a40_target();
+    let target = a40_target(ssh);
     let keys = keys(sshd, &sshd.host_public);
     let ssh_dir = runs.run_dir(&run_id)?.join("ssh");
     let plan = PodPlan {
@@ -342,92 +353,110 @@ async fn provision_against(
     Ok((result.map(drop), record, deletes))
 }
 
+/// A pod is ready once SSH works and its watchdog wrote `ready`.
 #[tokio::test]
 async fn a_pod_is_ready_once_ssh_and_its_watchdog_answer() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let (result, record, deletes) = provision_against(&sshd, Some("ready"), None).await?;
-    result?;
-    assert_eq!(record.state, PodState::Ready);
-    assert_eq!(
-        record.ssh.as_ref().map(|ssh| ssh.port),
-        Some(sshd.endpoint.port)
-    );
-    assert!(record.ready_at.is_some());
-    assert_eq!(deletes, 0);
-    Ok(())
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        let (result, record, deletes) = provision_against(&sshd, Some("ready"), None, ssh).await?;
+        result?;
+        assert_eq!(record.state, PodState::Ready);
+        assert_eq!(
+            record.ssh.as_ref().map(|ssh| ssh.port),
+            Some(sshd.endpoint.port)
+        );
+        assert!(record.ready_at.is_some());
+        assert_eq!(deletes, 0);
+        Ok(())
+    })
+    .await
 }
 
+/// A watchdog that cannot delete its own pod refuses the run, and the pod is deleted.
 #[tokio::test]
 async fn a_watchdog_that_cannot_delete_its_pod_refuses_the_run() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let (result, record, deletes) = provision_against(&sshd, Some("failed http_403"), None).await?;
-    let error = result.err().ok_or("the run was not refused")?;
-    assert!(
-        error
-            .to_string()
-            .starts_with("the pod's watchdog cannot remove its own pod (http_403)"),
-        "{error}"
-    );
-    assert_eq!(record.state, PodState::Deleted);
-    assert_eq!(deletes, 1);
-    Ok(())
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        let (result, record, deletes) =
+            provision_against(&sshd, Some("failed http_403"), None, ssh).await?;
+        let error = result.err().ok_or("the run was not refused")?;
+        assert!(
+            error
+                .to_string()
+                .starts_with("the pod's watchdog cannot remove its own pod (http_403)"),
+            "{error}"
+        );
+        assert_eq!(record.state, PodState::Deleted);
+        assert_eq!(deletes, 1);
+        Ok(())
+    })
+    .await
 }
 
+/// A failed bootstrap deletes the pod and refuses the run with its reason.
 #[tokio::test]
 async fn a_failed_bootstrap_deletes_the_pod_and_refuses_the_run() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let (result, record, deletes) = provision_against(
-        &sshd,
-        Some("failed bootstrap: cannot write the job environment"),
-        None,
-    )
-    .await?;
-    let Err(PodError::BootstrapFailed { pod_id, reason }) = result else {
-        return Err(format!("the run was not refused: {result:?}").into());
-    };
-    assert_eq!(pod_id.as_str(), "p1");
-    assert_eq!(reason, "cannot write the job environment");
-    assert_eq!(record.state, PodState::Deleted);
-    assert_eq!(deletes, 1);
-    Ok(())
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        let (result, record, deletes) = provision_against(
+            &sshd,
+            Some("failed bootstrap: cannot write the job environment"),
+            None,
+            ssh,
+        )
+        .await?;
+        let Err(PodError::BootstrapFailed { pod_id, reason }) = result else {
+            return Err(format!("the run was not refused: {result:?}").into());
+        };
+        assert_eq!(pod_id.as_str(), "p1");
+        assert_eq!(reason, "cannot write the job environment");
+        assert_eq!(record.state, PodState::Deleted);
+        assert_eq!(deletes, 1);
+        Ok(())
+    })
+    .await
 }
 
+/// A pod that dies while its verdict is awaited is deleted at once.
 #[tokio::test]
 async fn a_pod_that_dies_while_its_verdict_is_awaited_is_deleted_at_once() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let started = std::time::Instant::now();
-    // No verdict: SSH works on the first look, the pod is EXITED on the next.
-    let (result, record, deletes) = provision_against(&sshd, None, Some(1)).await?;
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "waited {:?} for a dead pod",
-        started.elapsed()
-    );
-    assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
-    assert_eq!(record.attempts.len(), 1);
-    assert_eq!(
-        record.attempts[0].detail.as_deref(),
-        Some("the pod is EXITED")
-    );
-    assert_eq!(record.pod_id, None);
-    assert_eq!(deletes, 1);
-    Ok(())
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        // No verdict: SSH works on the first look, the pod is EXITED on the next.
+        let (result, record, deletes) = provision_against(&sshd, None, Some(1), ssh).await?;
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "waited {:?} for a dead pod",
+            started.elapsed()
+        );
+        assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
+        assert_eq!(record.attempts.len(), 1);
+        assert_eq!(
+            record.attempts[0].detail.as_deref(),
+            Some("the pod is EXITED")
+        );
+        assert_eq!(record.pod_id, None);
+        assert_eq!(deletes, 1);
+        Ok(())
+    })
+    .await
 }
 
 /// A client of the stub `server`, with millisecond retries.
-fn client(server: &MockServer) -> Result<RunpodClient, Box<dyn std::error::Error>> {
+fn api_client(server: &MockServer) -> Result<RunpodClient, Box<dyn std::error::Error>> {
     Ok(
         RunpodClient::new(&format!("{}/v2", server.uri()), &SecretString::from("k"))?.with_policy(
             RetryPolicy {
@@ -451,24 +480,24 @@ fn fast() -> Timing {
 }
 
 /// A run whose directory exists on the test sshd, its pod record for pod `p1`,
-/// and a connection to it.
+/// and a connection to it with `client`.
 async fn started_run(
     sshd: &Sshd,
     runs: &Runs,
     keep: bool,
+    ssh: SshClient,
 ) -> Result<(RunRecord, PodRecord, SshExecutor), Box<dyn std::error::Error>> {
     let run_id = new_run_id();
     let workdir = format!("overbrainer-tests/runpod-{run_id}");
-    write_verdict(sshd, &workdir, &run_id, "ready").await?;
+    write_verdict(sshd, (&workdir, &run_id), "ready", ssh).await?;
     let dir = tempfile::tempdir()?;
-    let alias = alias(&run_id);
-    let config = write_config(
+    let pod = pod_endpoint(
         dir.path(),
-        &alias,
+        &alias(&run_id),
         &sshd.endpoint,
         &keys(sshd, &sshd.host_public),
     )?;
-    let executor = SshExecutor::connect(&alias, &workdir, Some(&config)).await?;
+    let executor = SshExecutor::connect(&SshDestination::Pod(&pod), &workdir, ssh).await?;
     let run = RunRecord {
         id: run_id.clone(),
         target: "gpu_cloud".into(),
@@ -505,60 +534,65 @@ async fn marker_exists(
     Ok(manifest.iter().any(|file| file.path == ".pod/retrieved"))
 }
 
+/// A retrieved run marks its pod, then deletes it with its key and secret, unless kept.
 #[tokio::test]
 async fn a_retrieved_run_marks_its_pod_then_deletes_it_unless_kept() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    for keep in [false, true] {
-        let project = tempfile::tempdir()?;
-        let runs = Runs::new(project.path());
-        let (run, mut pod, executor) = started_run(&sshd, &runs, keep).await?;
-        let key = runs.run_dir(&run.id)?.join("ssh/id_ed25519");
-        fs::create_dir_all(key.parent().ok_or("no ssh dir")?)?;
-        fs::write(&key, "private")?;
-        let (server, secrets) = stub(&sshd, &run.id, None).await;
-        let secret = format!("overbrainer_host_key_{}", run.id);
-        secrets.hold("k1", &secret);
-        let client = client(&server)?;
-        let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
-        let ctx = PodCtx {
-            client: &client,
-            runs: &runs,
-            bus: &bus,
-            timing: &timing,
-            interrupted: &interrupted,
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
         };
-        let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
-        assert!(marker_exists(&executor, &run).await?, "keep = {keep}");
-        let log = runs.run_dir(&run.id)?.join(".pod/watchdog.log");
-        assert_eq!(fs::read_to_string(log)?, "probe ready\n");
-        let deletes = server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter(|request| {
-                request.method.as_str() == "DELETE" && request.url.path().starts_with("/v2/pods/")
-            })
-            .count();
-        if keep {
-            assert_eq!(ending, Ending::Kept);
-            assert_eq!(pod.state, PodState::Kept);
-            assert_eq!(deletes, 0);
-            assert!(key.is_file(), "the key of a kept pod is removed");
-            assert_eq!(secrets.names(), [secret]);
-        } else {
-            assert_eq!(ending, Ending::Deleted);
-            assert_eq!(pod.state, PodState::Deleted);
-            assert_eq!(deletes, 1);
-            assert!(!key.exists(), "the key of a deleted pod is kept");
-            assert_eq!(secrets.deleted(), [secret]);
+        for keep in [false, true] {
+            let project = tempfile::tempdir()?;
+            let runs = Runs::new(project.path());
+            let (run, mut pod, executor) = started_run(&sshd, &runs, keep, ssh).await?;
+            let key = runs.run_dir(&run.id)?.join("ssh/id_ed25519");
+            fs::create_dir_all(key.parent().ok_or("no ssh dir")?)?;
+            fs::write(&key, "private")?;
+            let (server, secrets) = stub(&sshd, &run.id, None).await;
+            let secret = format!("overbrainer_host_key_{}", run.id);
+            secrets.hold("k1", &secret);
+            let client = api_client(&server)?;
+            let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
+            let ctx = PodCtx {
+                client: &client,
+                runs: &runs,
+                bus: &bus,
+                timing: &timing,
+                interrupted: &interrupted,
+            };
+            let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
+            assert!(marker_exists(&executor, &run).await?, "keep = {keep}");
+            let log = runs.run_dir(&run.id)?.join(".pod/watchdog.log");
+            assert_eq!(fs::read_to_string(log)?, "probe ready\n");
+            let deletes = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "DELETE"
+                        && request.url.path().starts_with("/v2/pods/")
+                })
+                .count();
+            if keep {
+                assert_eq!(ending, Ending::Kept);
+                assert_eq!(pod.state, PodState::Kept);
+                assert_eq!(deletes, 0);
+                assert!(key.is_file(), "the key of a kept pod is removed");
+                assert_eq!(secrets.names(), [secret]);
+            } else {
+                assert_eq!(ending, Ending::Deleted);
+                assert_eq!(pod.state, PodState::Deleted);
+                assert_eq!(deletes, 1);
+                assert!(!key.exists(), "the key of a deleted pod is kept");
+                assert_eq!(secrets.deleted(), [secret]);
+            }
+            assert_eq!(PodRecord::load(&runs, &run.id)?, Some(pod));
         }
-        assert_eq!(PodRecord::load(&runs, &run.id)?, Some(pod));
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 /// `DELETE /pods/p1` that first looks, over its own ssh connection, whether the
@@ -586,195 +620,56 @@ impl Respond for DeleteAfterMarker {
     }
 }
 
+/// The retrieved marker is on the pod before the pod is deleted.
 #[tokio::test]
 async fn the_retrieved_marker_is_on_the_pod_before_its_delete() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let project = tempfile::tempdir()?;
-    let runs = Runs::new(project.path());
-    let (run, mut pod, executor) = started_run(&sshd, &runs, false).await?;
-    let dir = tempfile::tempdir()?;
-    let probe = format!("{}-probe", alias(&run.id));
-    let config = write_config(
-        dir.path(),
-        &probe,
-        &sshd.endpoint,
-        &keys(&sshd, &sshd.host_public),
-    )?;
-    let server = MockServer::start().await;
-    let deleted = Arc::new(AtomicBool::new(false));
-    let marked = Arc::new(AtomicBool::new(false));
-    Mock::given(method("GET"))
-        .and(path("/v2/pods/p1"))
-        .respond_with(Get {
-            deleted: Arc::clone(&deleted),
-            body: json!({"id": "p1", "status": "RUNNING", "cost": 0.25}),
-            looks: AtomicUsize::new(0),
-            dies_after: None,
-        })
-        .mount(&server)
-        .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v2/pods/p1"))
-        .respond_with(DeleteAfterMarker {
-            deleted,
-            marked: Arc::clone(&marked),
-            config,
-            alias: probe,
-            marker: format!("{}/.pod/retrieved", run.remote_dir),
-        })
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v2/pods"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": []})))
-        .mount(&server)
-        .await;
-    let client = client(&server)?;
-    let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
-    let ctx = PodCtx {
-        client: &client,
-        runs: &runs,
-        bus: &bus,
-        timing: &timing,
-        interrupted: &interrupted,
-    };
-    let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
-    assert_eq!(ending, Ending::Deleted);
-    assert!(
-        marked.load(Ordering::SeqCst),
-        "the pod was deleted before its retrieved marker was written"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_duplicate_pod_whose_delete_fails_is_recorded_as_stray() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let project = tempfile::tempdir()?;
-    let runs = Runs::new(project.path());
-    let (run, mut pod, executor) = started_run(&sshd, &runs, false).await?;
-    let server = MockServer::start().await;
-    let deleted = Arc::new(AtomicBool::new(false));
-    Mock::given(method("GET"))
-        .and(path("/v2/pods/p1"))
-        .respond_with(Get {
-            deleted: Arc::clone(&deleted),
-            body: json!({"id": "p1", "status": "RUNNING", "cost": 0.25}),
-            looks: AtomicUsize::new(0),
-            dies_after: None,
-        })
-        .mount(&server)
-        .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v2/pods/p1"))
-        .respond_with(Delete(deleted))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v2/pods"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": [{
-            "id": "dup1",
-            "status": "RUNNING",
-            "env": {"OVERBRAINER_RUN_ID": run.id}
-        }]})))
-        .mount(&server)
-        .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v2/pods/dup1"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-    let client = client(&server)?;
-    let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
-    let ctx = PodCtx {
-        client: &client,
-        runs: &runs,
-        bus: &bus,
-        timing: &timing,
-        interrupted: &interrupted,
-    };
-    let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
-    assert_eq!(ending, Ending::Deleted);
-    let saved = PodRecord::load(&runs, &run.id)?.ok_or("no pod.json")?;
-    assert_eq!(saved.state, PodState::Deleted);
-    let stray: Vec<&str> = saved.stray_pods.iter().map(PodId::as_str).collect();
-    assert_eq!(stray, ["dup1"]);
-    Ok(())
-}
-
-/// A pod list that fails after the retrieval may hide a stray: the run keeps
-/// its host key secret, which the startup sweep deletes once no pod is listed.
-#[tokio::test]
-async fn a_failed_pod_list_at_the_end_keeps_the_host_key_secret() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let project = tempfile::tempdir()?;
-    let runs = Runs::new(project.path());
-    let (run, mut pod, executor) = started_run(&sshd, &runs, false).await?;
-    let server = MockServer::start().await;
-    let secrets = SecretStore::mount(&server).await;
-    secrets.hold("k1", &format!("overbrainer_host_key_{}", run.id));
-    let deleted = Arc::new(AtomicBool::new(false));
-    Mock::given(method("GET"))
-        .and(path("/v2/pods/p1"))
-        .respond_with(Get {
-            deleted: Arc::clone(&deleted),
-            body: json!({"id": "p1", "status": "RUNNING", "cost": 0.25}),
-            looks: AtomicUsize::new(0),
-            dies_after: None,
-        })
-        .mount(&server)
-        .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v2/pods/p1"))
-        .respond_with(Delete(deleted))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v2/pods"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-    let client = client(&server)?;
-    let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
-    let ctx = PodCtx {
-        client: &client,
-        runs: &runs,
-        bus: &bus,
-        timing: &timing,
-        interrupted: &interrupted,
-    };
-    let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
-    assert_eq!(ending, Ending::Deleted);
-    assert_eq!(secrets.deleted(), Vec::<String>::new());
-    assert_eq!(
-        secrets.names(),
-        [format!("overbrainer_host_key_{}", run.id)]
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn an_unretrieved_run_leaves_its_pod_to_the_watchdog_or_kept() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    for keep in [false, true] {
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
         let project = tempfile::tempdir()?;
         let runs = Runs::new(project.path());
-        let (run, mut pod, executor) = started_run(&sshd, &runs, keep).await?;
-        let (server, _) = stub(&sshd, &run.id, None).await;
-        let client = client(&server)?;
+        let (run, mut pod, executor) = started_run(&sshd, &runs, false, ssh).await?;
+        let dir = tempfile::tempdir()?;
+        let probe = format!("{}-probe", alias(&run.id));
+        let config = write_config(
+            dir.path(),
+            &probe,
+            &sshd.endpoint,
+            &keys(&sshd, &sshd.host_public),
+        )?;
+        let server = MockServer::start().await;
+        let deleted = Arc::new(AtomicBool::new(false));
+        let marked = Arc::new(AtomicBool::new(false));
+        Mock::given(method("GET"))
+            .and(path("/v2/pods/p1"))
+            .respond_with(Get {
+                deleted: Arc::clone(&deleted),
+                body: json!({"id": "p1", "status": "RUNNING", "cost": 0.25}),
+                looks: AtomicUsize::new(0),
+                dies_after: None,
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v2/pods/p1"))
+            .respond_with(DeleteAfterMarker {
+                deleted,
+                marked: Arc::clone(&marked),
+                config,
+                alias: probe,
+                marker: format!("{}/.pod/retrieved", run.remote_dir),
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/pods"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": []})))
+            .mount(&server)
+            .await;
+        let client = api_client(&server)?;
         let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
         let ctx = PodCtx {
             client: &client,
@@ -783,72 +678,232 @@ async fn an_unretrieved_run_leaves_its_pod_to_the_watchdog_or_kept() -> TestResu
             timing: &timing,
             interrupted: &interrupted,
         };
-        let ending = end_pod(&ctx, &mut pod, &executor, &run, false).await?;
-        if keep {
-            assert_eq!(ending, Ending::Kept);
-            assert_eq!(pod.state, PodState::Kept);
-        } else {
-            assert_eq!(ending, Ending::AwaitingRetrieval);
-            assert_eq!(pod.state, PodState::AwaitingRetrieval);
-        }
-        assert!(!marker_exists(&executor, &run).await?, "keep = {keep}");
+        let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
+        assert_eq!(ending, Ending::Deleted);
         assert!(
-            server
-                .received_requests()
-                .await
-                .unwrap_or_default()
-                .is_empty()
+            marked.load(Ordering::SeqCst),
+            "the pod was deleted before its retrieved marker was written"
         );
-        assert_eq!(PodRecord::load(&runs, &run.id)?, Some(pod));
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
+/// A duplicate pod whose delete fails is recorded as a stray.
+#[tokio::test]
+async fn a_duplicate_pod_whose_delete_fails_is_recorded_as_stray() -> TestResult {
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let (run, mut pod, executor) = started_run(&sshd, &runs, false, ssh).await?;
+        let server = MockServer::start().await;
+        let deleted = Arc::new(AtomicBool::new(false));
+        Mock::given(method("GET"))
+            .and(path("/v2/pods/p1"))
+            .respond_with(Get {
+                deleted: Arc::clone(&deleted),
+                body: json!({"id": "p1", "status": "RUNNING", "cost": 0.25}),
+                looks: AtomicUsize::new(0),
+                dies_after: None,
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v2/pods/p1"))
+            .respond_with(Delete(deleted))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/pods"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": [{
+                "id": "dup1",
+                "status": "RUNNING",
+                "env": {"OVERBRAINER_RUN_ID": run.id}
+            }]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v2/pods/dup1"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = api_client(&server)?;
+        let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
+        let ctx = PodCtx {
+            client: &client,
+            runs: &runs,
+            bus: &bus,
+            timing: &timing,
+            interrupted: &interrupted,
+        };
+        let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
+        assert_eq!(ending, Ending::Deleted);
+        let saved = PodRecord::load(&runs, &run.id)?.ok_or("no pod.json")?;
+        assert_eq!(saved.state, PodState::Deleted);
+        let stray: Vec<&str> = saved.stray_pods.iter().map(PodId::as_str).collect();
+        assert_eq!(stray, ["dup1"]);
+        Ok(())
+    })
+    .await
+}
+
+/// A pod list that fails after the retrieval may hide a stray: the run keeps
+/// its host key secret, which the startup sweep deletes once no pod is listed.
+#[tokio::test]
+async fn a_failed_pod_list_at_the_end_keeps_the_host_key_secret() -> TestResult {
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let (run, mut pod, executor) = started_run(&sshd, &runs, false, ssh).await?;
+        let server = MockServer::start().await;
+        let secrets = SecretStore::mount(&server).await;
+        secrets.hold("k1", &format!("overbrainer_host_key_{}", run.id));
+        let deleted = Arc::new(AtomicBool::new(false));
+        Mock::given(method("GET"))
+            .and(path("/v2/pods/p1"))
+            .respond_with(Get {
+                deleted: Arc::clone(&deleted),
+                body: json!({"id": "p1", "status": "RUNNING", "cost": 0.25}),
+                looks: AtomicUsize::new(0),
+                dies_after: None,
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v2/pods/p1"))
+            .respond_with(Delete(deleted))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/pods"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = api_client(&server)?;
+        let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
+        let ctx = PodCtx {
+            client: &client,
+            runs: &runs,
+            bus: &bus,
+            timing: &timing,
+            interrupted: &interrupted,
+        };
+        let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
+        assert_eq!(ending, Ending::Deleted);
+        assert_eq!(secrets.deleted(), Vec::<String>::new());
+        assert_eq!(
+            secrets.names(),
+            [format!("overbrainer_host_key_{}", run.id)]
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// An unretrieved run leaves its pod to the watchdog, or kept, without any API call.
+#[tokio::test]
+async fn an_unretrieved_run_leaves_its_pod_to_the_watchdog_or_kept() -> TestResult {
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        for keep in [false, true] {
+            let project = tempfile::tempdir()?;
+            let runs = Runs::new(project.path());
+            let (run, mut pod, executor) = started_run(&sshd, &runs, keep, ssh).await?;
+            let (server, _) = stub(&sshd, &run.id, None).await;
+            let client = api_client(&server)?;
+            let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
+            let ctx = PodCtx {
+                client: &client,
+                runs: &runs,
+                bus: &bus,
+                timing: &timing,
+                interrupted: &interrupted,
+            };
+            let ending = end_pod(&ctx, &mut pod, &executor, &run, false).await?;
+            if keep {
+                assert_eq!(ending, Ending::Kept);
+                assert_eq!(pod.state, PodState::Kept);
+            } else {
+                assert_eq!(ending, Ending::AwaitingRetrieval);
+                assert_eq!(pod.state, PodState::AwaitingRetrieval);
+            }
+            assert!(!marker_exists(&executor, &run).await?, "keep = {keep}");
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+            assert_eq!(PodRecord::load(&runs, &run.id)?, Some(pod));
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// An attach looks the pod up again and connects through its fresh endpoint.
 #[tokio::test]
 async fn attach_reconnects_through_a_fresh_endpoint() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let project = tempfile::tempdir()?;
-    let runs = Runs::new(project.path());
-    let (run, mut pod, _) = started_run(&sshd, &runs, false).await?;
-    let ssh_dir = runs.run_dir(&run.id)?.join("ssh");
-    fs::create_dir_all(&ssh_dir)?;
-    fs::copy(&sshd.identity, ssh_dir.join("id_ed25519"))?;
-    // The endpoint seen last is stale: the pod was reset and its port changed.
-    let stale = SshEndpoint {
-        port: sshd.endpoint.port.wrapping_add(1),
-        ..sshd.endpoint.clone()
-    };
-    write_config(
-        &ssh_dir,
-        &alias(&run.id),
-        &stale,
-        &keys(&sshd, &sshd.host_public),
-    )?;
-    pod.ssh = Some(stale);
-    pod.save(&runs)?;
-    let (server, _) = stub(&sshd, &run.id, None).await;
-    let client = client(&server)?;
-    let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
-    let ctx = PodCtx {
-        client: &client,
-        runs: &runs,
-        bus: &bus,
-        timing: &timing,
-        interrupted: &interrupted,
-    };
-    let executor = reconnect(&ctx, &mut pod, &run).await?.ok_or("no pod")?;
-    assert_eq!(format!("{}/{}", executor.workdir(), run.id), run.remote_dir);
-    assert_eq!(pod.ssh.as_ref(), Some(&sshd.endpoint));
-    assert_eq!(PodRecord::load(&runs, &run.id)?, Some(pod));
-    let config = fs::read_to_string(ssh_dir.join("config"))?;
-    assert!(
-        config.contains(&format!("Port {}", sshd.endpoint.port)),
-        "{config}"
-    );
-    Ok(())
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let (run, mut pod, _) = started_run(&sshd, &runs, false, ssh).await?;
+        let ssh_dir = runs.run_dir(&run.id)?.join("ssh");
+        fs::create_dir_all(&ssh_dir)?;
+        fs::copy(&sshd.identity, ssh_dir.join("id_ed25519"))?;
+        // The endpoint seen last is stale: the pod was reset and its port changed.
+        let stale = SshEndpoint {
+            port: sshd.endpoint.port.wrapping_add(1),
+            ..sshd.endpoint.clone()
+        };
+        write_config(
+            &ssh_dir,
+            &alias(&run.id),
+            &stale,
+            &keys(&sshd, &sshd.host_public),
+        )?;
+        pod.ssh = Some(stale);
+        pod.save(&runs)?;
+        let (server, _) = stub(&sshd, &run.id, None).await;
+        let client = api_client(&server)?;
+        let (bus, timing, interrupted) = (EventBus::new(), fast(), AtomicBool::new(false));
+        let ctx = PodCtx {
+            client: &client,
+            runs: &runs,
+            bus: &bus,
+            timing: &timing,
+            interrupted: &interrupted,
+        };
+        let executor = reconnect(&ctx, &mut pod, &run, ssh)
+            .await?
+            .ok_or("no pod")?;
+        assert_eq!(format!("{}/{}", executor.workdir(), run.id), run.remote_dir);
+        assert_eq!(pod.ssh.as_ref(), Some(&sshd.endpoint));
+        assert_eq!(PodRecord::load(&runs, &run.id)?, Some(pod));
+        let config = fs::read_to_string(ssh_dir.join("config"))?;
+        assert!(
+            config.contains(&format!("Port {}", sshd.endpoint.port)),
+            "{config}"
+        );
+        Ok(())
+    })
+    .await
 }
 
 /// A trainer with nothing to run, which notes what `run.json` and `pod.json`
@@ -891,8 +946,8 @@ impl Trainer for Observer {
     }
 }
 
-/// A Runpod target of one A40 for an hour, nothing else set.
-fn a40_target() -> RunpodTarget {
+/// A Runpod target of one A40 for an hour using `client`, nothing else set.
+fn a40_target(ssh_client: SshClient) -> RunpodTarget {
     RunpodTarget {
         gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),
         min_vram_gb: None,
@@ -908,6 +963,7 @@ fn a40_target() -> RunpodTarget {
         data_center_ids: ListOrAuto::default(),
         network_volume_id: None,
         max_volume_gb: None,
+        ssh_client,
     }
 }
 
@@ -918,93 +974,96 @@ fn a40_target() -> RunpodTarget {
 /// a host key only a real pod's bootstrap installs.
 #[tokio::test]
 async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestResult {
-    let Some(sshd) = sshd().await? else {
-        skip();
-        return Ok(());
-    };
-    let run_id = new_run_id();
-    let workdir = format!("overbrainer-tests/runpod-{run_id}");
-    write_verdict(&sshd, &workdir, &run_id, "ready").await?;
-    let (server, _) = stub(&sshd, &run_id, None).await;
-    let project = tempfile::tempdir()?;
-    let runs = Runs::new(project.path());
-    let client = client(&server)?;
-    let timing = Timing {
-        ready_timeout: Duration::from_secs(30),
-        preflight_timeout: Duration::from_secs(30),
-        ..fast()
-    };
-    let (bus, interrupted) = (EventBus::new(), AtomicBool::new(false));
-    let ctx = PodCtx {
-        client: &client,
-        runs: &runs,
-        bus: &bus,
-        timing: &timing,
-        interrupted: &interrupted,
-    };
-    let target = a40_target();
-    let keys = keys(&sshd, &sshd.host_public);
-    let ssh_dir = runs.run_dir(&run_id)?.join("ssh");
-    let plan = PodPlan {
-        run_id: &run_id,
-        target: &target,
-        keys: &keys,
-        ssh_dir: &ssh_dir,
-        workdir: &workdir,
-        api_url: client.base_url(),
-        vram_floor_gb: None,
-        volume_gb: None,
-    };
-    let mut pod = PodRecord::new(&run_id, false, 1, &keys.host_public);
-    let provisioned = provision(&ctx, &plan, &mut pod).await?;
-    let record = RunRecord {
-        id: run_id.clone(),
-        target: "gpu_cloud".into(),
-        created: "2026-09-22T00:00:00Z".into(),
-        remote_dir: format!("{}/{run_id}", provisioned.executor.workdir()),
-        job: None,
-        state: RunState::Preparing,
-        message: None,
-        snapshot: None,
-        resumed_from: None,
-        snapshots: true,
-    };
-    runs.save(&record)?;
-    let observer = Observer {
-        runs: Runs::new(project.path()),
-        run_id: run_id.clone(),
-        seen: Mutex::new(None),
-    };
-    let runtime = JobRuntime::Native {
-        venv: None,
-        env_file: None,
-    };
-    let run_ctx = RunCtx {
-        runs: &runs,
-        executor: &provisioned.executor,
-        bus: &bus,
-        poll: Duration::from_millis(50),
-    };
-    let launch = Launch {
-        runtime: &runtime,
-        secrets: Vec::new(),
-    };
-    let started = start(&run_ctx, &observer, launch, record).await?;
-    assert_eq!(started.state, RunState::Running);
-    let seen = observer
-        .seen
-        .lock()
-        .map_err(|_| "poisoned")?
-        .take()
-        .ok_or("start never prepared the run")?;
-    let (run_state, saved) = seen;
-    assert_eq!(run_state, RunState::Preparing);
-    let saved = saved.ok_or("no pod.json when the job was started")?;
-    assert_eq!(saved.pod_id.as_ref().map(PodId::as_str), Some("p1"));
-    assert_eq!(saved.state, PodState::Ready);
-    job_started(&runs, &mut pod)?;
-    let saved = PodRecord::load(&runs, &run_id)?.ok_or("no pod.json")?;
-    assert_eq!(saved.state, PodState::Running);
-    assert_eq!(saved.pod_id.as_ref().map(PodId::as_str), Some("p1"));
-    Ok(())
+    each_ssh_client(|ssh| async move {
+        let Some(sshd) = sshd().await? else {
+            skip();
+            return Ok(());
+        };
+        let run_id = new_run_id();
+        let workdir = format!("overbrainer-tests/runpod-{run_id}");
+        write_verdict(&sshd, (&workdir, &run_id), "ready", ssh).await?;
+        let (server, _) = stub(&sshd, &run_id, None).await;
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let client = api_client(&server)?;
+        let timing = Timing {
+            ready_timeout: Duration::from_secs(30),
+            preflight_timeout: Duration::from_secs(30),
+            ..fast()
+        };
+        let (bus, interrupted) = (EventBus::new(), AtomicBool::new(false));
+        let ctx = PodCtx {
+            client: &client,
+            runs: &runs,
+            bus: &bus,
+            timing: &timing,
+            interrupted: &interrupted,
+        };
+        let target = a40_target(ssh);
+        let keys = keys(&sshd, &sshd.host_public);
+        let ssh_dir = runs.run_dir(&run_id)?.join("ssh");
+        let plan = PodPlan {
+            run_id: &run_id,
+            target: &target,
+            keys: &keys,
+            ssh_dir: &ssh_dir,
+            workdir: &workdir,
+            api_url: client.base_url(),
+            vram_floor_gb: None,
+            volume_gb: None,
+        };
+        let mut pod = PodRecord::new(&run_id, false, 1, &keys.host_public);
+        let provisioned = provision(&ctx, &plan, &mut pod).await?;
+        let record = RunRecord {
+            id: run_id.clone(),
+            target: "gpu_cloud".into(),
+            created: "2026-09-22T00:00:00Z".into(),
+            remote_dir: format!("{}/{run_id}", provisioned.executor.workdir()),
+            job: None,
+            state: RunState::Preparing,
+            message: None,
+            snapshot: None,
+            resumed_from: None,
+            snapshots: true,
+        };
+        runs.save(&record)?;
+        let observer = Observer {
+            runs: Runs::new(project.path()),
+            run_id: run_id.clone(),
+            seen: Mutex::new(None),
+        };
+        let runtime = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        };
+        let run_ctx = RunCtx {
+            runs: &runs,
+            executor: &provisioned.executor,
+            bus: &bus,
+            poll: Duration::from_millis(50),
+        };
+        let launch = Launch {
+            runtime: &runtime,
+            secrets: Vec::new(),
+        };
+        let started = start(&run_ctx, &observer, launch, record).await?;
+        assert_eq!(started.state, RunState::Running);
+        let seen = observer
+            .seen
+            .lock()
+            .map_err(|_| "poisoned")?
+            .take()
+            .ok_or("start never prepared the run")?;
+        let (run_state, saved) = seen;
+        assert_eq!(run_state, RunState::Preparing);
+        let saved = saved.ok_or("no pod.json when the job was started")?;
+        assert_eq!(saved.pod_id.as_ref().map(PodId::as_str), Some("p1"));
+        assert_eq!(saved.state, PodState::Ready);
+        job_started(&runs, &mut pod)?;
+        let saved = PodRecord::load(&runs, &run_id)?.ok_or("no pod.json")?;
+        assert_eq!(saved.state, PodState::Running);
+        assert_eq!(saved.pod_id.as_ref().map(PodId::as_str), Some("p1"));
+        Ok(())
+    })
+    .await
 }

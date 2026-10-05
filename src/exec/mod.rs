@@ -30,7 +30,7 @@ pub use runtime::{JobRuntime, JobSpec, Stages, TOOLS_ENV, shell_path, stage_comm
 pub use script::{
     GROUP_SIGNAL, cancel_script, claim_script, job_script, parse_status, quote, status_script,
 };
-pub use ssh::SshExecutor;
+pub use ssh::{PodEndpoint, SshDestination, SshError, SshExecutor};
 
 use crate::config::Engine;
 
@@ -95,7 +95,7 @@ pub enum ExecError {
     },
     /// The SSH connection failed or broke.
     #[error("ssh failed")]
-    Ssh(#[source] openssh::Error),
+    Ssh(#[source] SshError),
     /// `ssh` connected, then its background master connection ended before the
     /// first command (killed locally, or the server dropped it). `log` is the tail of
     /// the master's own log on one bounded line, control characters dropped, empty

@@ -4,20 +4,20 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::config::ListOrAuto;
+use crate::config::{ListOrAuto, process_client};
 use crate::events::{Event, EventBus};
-use crate::exec::{ExecError, Executor, SshExecutor};
+use crate::exec::{ExecError, Executor, PodEndpoint, SshDestination, SshExecutor};
 use crate::runs::Runs;
 
 use super::{
     ApiError, Attempt, AttemptResult, CreatePod, DeleteReason, DeletedBy, GpuRequest,
     MAX_OUT_OF_STOCK, MIN_CUDA_VERSION, Mounts, NetworkMount, Pod, PodError, PodId, PodKeys,
     PodRecord, PodSettings, PodStatus, RunpodClient, RunpodTarget, SshEndpoint, VOLUME_MOUNT,
-    WalkOrder, alias, pod_command, pod_env, store_host_key, write_config,
+    WalkOrder, alias, pod_command, pod_endpoint, pod_env, store_host_key,
 };
 
 /// Ambiguous creates tried per GPU type before moving to the next one.
@@ -866,9 +866,11 @@ async fn ready(
 }
 
 /// Polls the pod until it has an SSH endpoint and a strict handshake with it
-/// succeeds, within [`Timing::ready_timeout`]. When the pod's sshd sends its
-/// banner but the local master connection dies, [`LOCAL_STRIKES`] times in a
-/// row, the wait stops with [`PodError::LocalSsh`]: no pod would do better.
+/// succeeds, within [`Timing::ready_timeout`], with the target's SSH client.
+/// When the pod's sshd sends its banner but the local master connection dies,
+/// [`LOCAL_STRIKES`] times in a row, the wait stops with
+/// [`PodError::LocalSsh`]: no pod would do better. Only the OpenSSH client has
+/// a master connection, so only it can fail that way.
 async fn reach(
     ctx: &PodCtx<'_>,
     plan: &PodPlan<'_>,
@@ -876,13 +878,15 @@ async fn reach(
     id: &PodId,
 ) -> Result<(SshExecutor, SshEndpoint), Wait> {
     let workdir = plan.workdir;
-    let connect = move |alias: String, config: PathBuf| async move {
-        SshExecutor::connect(&alias, workdir, Some(&config)).await
+    let client = process_client(plan.target.ssh_client)
+        .map_err(|message| Wait::Failed(PodError::SshClient(message)))?;
+    let connect = move |pod: PodEndpoint| async move {
+        SshExecutor::connect(&SshDestination::Pod(&pod), workdir, client).await
     };
     reach_with(ctx, plan, record, id, connect).await
 }
 
-/// [`reach`], connecting with `connect(alias, config)`: tests stand in for ssh.
+/// [`reach`], connecting with `connect(pod)`: tests stand in for ssh.
 async fn reach_with<C, F>(
     ctx: &PodCtx<'_>,
     plan: &PodPlan<'_>,
@@ -891,7 +895,7 @@ async fn reach_with<C, F>(
     connect: C,
 ) -> Result<(SshExecutor, SshEndpoint), Wait>
 where
-    C: Fn(String, PathBuf) -> F,
+    C: Fn(PodEndpoint) -> F,
     F: Future<Output = Result<SshExecutor, ExecError>>,
 {
     let started = Instant::now();
@@ -914,9 +918,9 @@ where
                 port: direct.port,
                 user: direct.username.clone(),
             };
-            let config =
-                write_config(plan.ssh_dir, &alias, &endpoint, plan.keys).map_err(Wait::Failed)?;
-            match connect(alias.clone(), config).await {
+            let pod =
+                pod_endpoint(plan.ssh_dir, &alias, &endpoint, plan.keys).map_err(Wait::Failed)?;
+            match connect(pod).await {
                 Ok(executor) => return Ok((executor, endpoint)),
                 Err(error) => {
                     let died =
@@ -1302,6 +1306,42 @@ mod tests {
         Ok(())
     }
 
+    /// With the feature the error names the built-in client as the way out.
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn a_local_ssh_failure_points_to_the_builtin_client() -> Result<(), crate::runpod::InvalidPodId>
+    {
+        let error = PodError::LocalSsh {
+            pod_id: PodId::new("p1")?,
+            reason: "x".into(),
+        };
+        assert!(
+            error.to_string().ends_with(
+                "; set ssh_client = \"builtin\" on the target (or OVERBRAINER_SSH_CLIENT=builtin)"
+            ),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// Without the feature the error points to a build that has it.
+    #[cfg(not(feature = "builtin-ssh"))]
+    #[test]
+    fn a_local_ssh_failure_points_to_a_build_with_the_feature()
+    -> Result<(), crate::runpod::InvalidPodId> {
+        let error = PodError::LocalSsh {
+            pod_id: PodId::new("p1")?,
+            reason: "x".into(),
+        };
+        assert!(
+            error.to_string().ends_with(
+                "; a build with the builtin-ssh feature (the release binaries have it) avoids the local ssh"
+            ),
+            "{error}"
+        );
+        Ok(())
+    }
+
     /// A local server answering each connection with `answer`, then closing it.
     fn server(answer: &'static [u8]) -> std::io::Result<u16> {
         use std::io::Write;
@@ -1428,6 +1468,7 @@ mod tests {
                     data_center_ids: crate::config::ListOrAuto::default(),
                     network_volume_id: None,
                     max_volume_gb: None,
+                    ssh_client: crate::config::SshClient::Openssh,
                 },
                 keys: PodKeys::new(
                     std::path::PathBuf::from("/nonexistent/id_ed25519"),
@@ -1472,7 +1513,7 @@ mod tests {
         /// that logged `log`. Returns the outcome and the connection count.
         async fn reach(&self, log: &str) -> (Result<(), Wait>, usize) {
             let calls = std::sync::atomic::AtomicUsize::new(0);
-            let connect = |_: String, _: PathBuf| {
+            let connect = |_: PodEndpoint| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Err(ExecError::MasterDied { log: log.into() }))
             };

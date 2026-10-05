@@ -62,16 +62,18 @@ On macOS, set `target=aarch64-apple-darwin` and check the archive with `shasum -
 cargo install --locked overbrainer
 ```
 
+The release binaries include the built-in SSH client. A build from source needs `--features builtin-ssh` to have it: `cargo install --locked overbrainer --features builtin-ssh`.
+
 The latest code from `main` installs with `cargo install --locked --git https://github.com/nayrosk/overbrainer`.
 
 ### Requirements
 
 - Rust 1.91 or newer to build it. CI builds and tests on Linux, and checks that it builds on macOS.
-- `ssh` for SSH targets, and `ssh` with `ssh-keygen` for Runpod targets.
+- `ssh` for SSH targets, and `ssh` with `ssh-keygen` for Runpod targets, unless you use the built-in SSH client.
 - For training on this machine: Axolotl 0.19 in a virtual environment or on `PATH`, or Docker or Podman with NVIDIA GPU access to run the Axolotl image.
 
-> [!WARNING]
-> SSH sandboxes such as firejail are not supported for now. overbrainer keeps one `ssh` connection open in the background for each SSH or Runpod target, and a sandbox that kills background processes when the foreground command exits breaks it. If `command -v ssh` points to a wrapper (for example `/usr/local/bin/ssh -> firejail`), put the real `ssh` first on `PATH` for overbrainer: `PATH=/usr/bin:$PATH overbrainer train`. See [Runpod troubleshooting](docs/runpod.md#troubleshooting).
+> [!TIP]
+> If `ssh` is a sandbox wrapper such as firejail, or missing, set `ssh_client = "builtin"` on the target (or `OVERBRAINER_SSH_CLIENT=builtin`) to use the built-in SSH client, which needs no `ssh` binary. See [Built-in SSH client](docs/training.md#built-in-ssh-client).
 
 ### Shell completions
 

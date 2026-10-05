@@ -103,7 +103,7 @@ jobs:
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked --target "$TARGET"
+        run: cargo build --release --locked --features builtin-ssh --target "$TARGET"
       - name: Check that the binary is statically linked
         if: contains(matrix.target, 'musl')
         env:

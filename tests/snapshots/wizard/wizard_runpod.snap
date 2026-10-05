@@ -86,6 +86,7 @@ max_hours = 6                # the pod watchdog deletes the pod after this, what
 # kind = "ssh"                 # host comes from OVERBRAINER_TARGETS__HOMELAB__HOST
 # runtime = "docker"
 # workdir = "overbrainer"      # on the remote machine, relative to its home directory
+# ssh_client = "openssh"       # openssh | builtin (builtin needs a build with the builtin-ssh feature; OVERBRAINER_SSH_CLIENT overrides it)
 
 # [export]                     # GGUF for llama.cpp and Ollama: `overbrainer export <run-id>`, or at the end of training
 # after_training = false       # export in the training job, after the merge

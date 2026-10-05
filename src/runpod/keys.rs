@@ -15,6 +15,8 @@ use std::process::{Command, Stdio};
 use secrecy::SecretString;
 use secrecy::zeroize::Zeroizing;
 
+use crate::config::SshClient;
+use crate::exec::PodEndpoint;
 use crate::runs::is_safe_name;
 
 use super::{PodError, SshEndpoint};
@@ -68,23 +70,28 @@ impl PodKeys {
         }
     }
 
-    /// Generates both keys with `ssh-keygen` (ed25519, no passphrase), the client
-    /// key into `dir` (created with mode 700). The host key file is read and
-    /// removed at once, whether the read succeeds or fails.
+    /// Generates both keys (ed25519, no passphrase), the client key into `dir`
+    /// (created with mode 700): with `ssh-keygen` for [`SshClient::Openssh`], in
+    /// Rust for [`SshClient::Builtin`], which writes the same files in the same
+    /// formats. In a build without the `builtin-ssh` feature `Builtin` is
+    /// refused by the configuration and never gets here; it is generated with
+    /// `ssh-keygen` like `Openssh`. The host key file is read and removed at
+    /// once, whether the read succeeds or fails.
     ///
     /// # Errors
     ///
-    /// Returns [`PodError::Keygen`] when `ssh-keygen` is missing or fails, and
-    /// [`PodError::Io`] when a file cannot be written, read or removed.
-    pub fn generate(dir: &Path, comment: &str) -> Result<Self, PodError> {
+    /// Returns [`PodError::Keygen`] when `ssh-keygen` is missing or fails (or the
+    /// Rust generation fails), and [`PodError::Io`] when a file cannot be
+    /// written, read or removed.
+    pub fn generate(dir: &Path, comment: &str, client: SshClient) -> Result<Self, PodError> {
         fs::create_dir_all(dir).map_err(io_error(dir))?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_error(dir))?;
         let dir = std::path::absolute(dir).map_err(io_error(dir))?;
         let client_key = dir.join(CLIENT_KEY);
-        keygen(&client_key, comment)?;
+        make_pair(&client_key, comment, client)?;
         let client_public = read_public(&client_key)?;
         let host_key = dir.join(HOST_KEY);
-        keygen(&host_key, comment)?;
+        make_pair(&host_key, comment, client)?;
         let (host_public, host_private) = take_host_key(&host_key)?;
         Ok(Self {
             client_key,
@@ -99,6 +106,54 @@ impl PodKeys {
     pub fn host_private(&self) -> &SecretString {
         &self.host_private
     }
+}
+
+/// Writes a fresh ed25519 key pair at `path` with the generator of `client`.
+fn make_pair(path: &Path, comment: &str, client: SshClient) -> Result<(), PodError> {
+    match client {
+        #[cfg(feature = "builtin-ssh")]
+        SshClient::Builtin => rust_keygen(path, comment),
+        // Without the feature, `Builtin` is refused when the configuration is
+        // validated; `ssh-keygen` is the only generator there is.
+        #[cfg(not(feature = "builtin-ssh"))]
+        SshClient::Builtin => keygen(path, comment),
+        SshClient::Openssh => keygen(path, comment),
+    }
+}
+
+/// Writes a fresh ed25519 key pair at `path` in Rust, in the files `ssh-keygen`
+/// writes: the OpenSSH private key (mode 0600, never overwritten) and the
+/// `.pub` line `ssh-ed25519 <key> <comment>`.
+#[cfg(feature = "builtin-ssh")]
+fn rust_keygen(path: &Path, comment: &str) -> Result<(), PodError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use russh::keys::ssh_key::LineEnding;
+    use russh::keys::{Algorithm, PrivateKey};
+
+    let failed = |what: &str| PodError::Keygen(format!("cannot generate an ed25519 key: {what}"));
+    remove_pair(path)?;
+    let mut key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+        .map_err(|_| failed("the key pair was refused"))?;
+    key.set_comment(comment);
+    let private = key
+        .to_openssh(LineEnding::LF)
+        .map_err(|_| failed("the private key cannot be encoded"))?;
+    let public = key
+        .public_key()
+        .to_openssh()
+        .map_err(|_| failed("the public key cannot be encoded"))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(io_error(path))?;
+    file.write_all(private.as_bytes()).map_err(io_error(path))?;
+    let public_file = public_path(path);
+    fs::write(&public_file, format!("{public}\n")).map_err(io_error(&public_file))?;
+    Ok(())
 }
 
 /// Runs `ssh-keygen` to write a fresh ed25519 key pair at `path`.
@@ -232,6 +287,31 @@ pub fn write_config(
     let path = dir.join(SSH_CONFIG);
     fs::write(&path, text).map_err(io_error(&path))?;
     Ok(path)
+}
+
+/// Writes the run's ssh config (see [`write_config`]) and returns what reaches
+/// the pod at `endpoint`, with either client: the config for OpenSSH, the
+/// endpoint, client key and pinned host key for the built-in client.
+///
+/// # Errors
+///
+/// See [`write_config`].
+pub fn pod_endpoint(
+    dir: &Path,
+    alias: &str,
+    endpoint: &SshEndpoint,
+    keys: &PodKeys,
+) -> Result<PodEndpoint, PodError> {
+    let config = write_config(dir, alias, endpoint, keys)?;
+    Ok(PodEndpoint {
+        alias: alias.to_string(),
+        config,
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        user: endpoint.user.clone(),
+        key: keys.client_key.clone(),
+        host_key: keys.host_public.clone(),
+    })
 }
 
 /// The text of a run's ssh config.
@@ -460,6 +540,7 @@ mod tests {
         Ok(())
     }
 
+    /// Whether the OpenSSH `ssh-keygen` is installed on `PATH`.
     fn keygen_available() -> bool {
         Command::new("ssh-keygen")
             .arg("-?")
@@ -469,15 +550,14 @@ mod tests {
             .is_ok()
     }
 
-    #[test]
-    fn generated_keys_hold_together() -> TestResult {
-        if !keygen_available() {
-            eprintln!("skipped: ssh-keygen is not installed");
-            return Ok(());
-        }
+    /// Generates keys with `client` and checks the files, the modes and the
+    /// shapes of the public lines; the pair is then usable by either client.
+    fn check_generated(
+        client: SshClient,
+    ) -> Result<(tempfile::TempDir, PodKeys), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let dir = root.path().join("ssh");
-        let keys = PodKeys::generate(&dir, "overbrainer-r1")?;
+        let keys = PodKeys::generate(&dir, "overbrainer-r1", client)?;
         assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
         assert_eq!(
             fs::metadata(&keys.client_key)?.permissions().mode() & 0o777,
@@ -488,23 +568,109 @@ mod tests {
         assert!(keys.host_public.starts_with("ssh-ed25519 "));
         assert_eq!(keys.host_public.split_whitespace().count(), 2);
         assert!(!dir.join(HOST_KEY).exists());
+        assert!(!dir.join(format!("{HOST_KEY}.pub")).exists());
         assert!(!format!("{keys:?}").contains(keys.host_private().expose_secret()));
-        // Decoded the way the pod's bootstrap does, the private host key gives back
-        // the pinned public key.
-        let decoded = root.path().join("decoded");
+        Ok((root, keys))
+    }
+
+    /// Decodes the private host key the way the pod's bootstrap does and asks
+    /// `ssh-keygen -y` for its public key.
+    fn host_public_through_keygen(
+        root: &Path,
+        keys: &PodKeys,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let decoded = root.join("decoded");
         let output = Command::new("sh")
             .arg("-c")
             .arg("printf '%s' \"$KEY\" | base64 -d > \"$OUT\" && chmod 600 \"$OUT\" && ssh-keygen -y -f \"$OUT\"")
             .env("KEY", keys.host_private().expose_secret())
             .env("OUT", &decoded)
             .output()?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+        assert!(output.status.success(), "ssh-keygen -y failed");
+        Ok(key_fields(&String::from_utf8(output.stdout)?))
+    }
+
+    /// Keys from `ssh-keygen` hold together: the pod's bootstrap decodes the
+    /// private host key back to the pinned public key.
+    #[test]
+    fn generated_keys_hold_together() -> TestResult {
+        if !keygen_available() {
+            eprintln!("skipped: ssh-keygen is not installed");
+            return Ok(());
+        }
+        let (root, keys) = check_generated(SshClient::Openssh)?;
+        // Decoded the way the pod's bootstrap does, the private host key gives back
+        // the pinned public key.
+        assert_eq!(
+            host_public_through_keygen(root.path(), &keys)?,
+            keys.host_public
+        );
+        Ok(())
+    }
+
+    /// Keys from the built-in generator hold together: the client's public
+    /// line matches its private key and its `.pub` file.
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn rust_generated_keys_hold_together() -> TestResult {
+        let (_root, keys) = check_generated(SshClient::Builtin)?;
+        // The public line of the client key matches its private key.
+        let private = russh::keys::load_secret_key(&keys.client_key, None)?;
+        assert_eq!(
+            key_fields(&private.public_key().to_openssh()?),
+            key_fields(&keys.client_public)
         );
         assert_eq!(
+            fs::read_to_string(public_path(&keys.client_key))?,
+            format!("{}\n", keys.client_public)
+        );
+        Ok(())
+    }
+
+    /// Two runs never share a key.
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn rust_generated_keys_are_fresh() -> TestResult {
+        let (_a, first) = check_generated(SshClient::Builtin)?;
+        let (_b, second) = check_generated(SshClient::Builtin)?;
+        assert_ne!(first.client_public, second.client_public);
+        assert_ne!(first.host_public, second.host_public);
+        assert_ne!(first.client_public, first.host_public);
+        Ok(())
+    }
+
+    /// Cross-checks the Rust-written files with the real `ssh-keygen -y`. It runs
+    /// only when `/usr/bin/ssh-keygen` exists and is skipped otherwise.
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn rust_generated_keys_are_read_by_ssh_keygen() -> TestResult {
+        let keygen = Path::new("/usr/bin/ssh-keygen");
+        if !keygen.exists() {
+            eprintln!("skipped: /usr/bin/ssh-keygen is not installed");
+            return Ok(());
+        }
+        let (root, keys) = check_generated(SshClient::Builtin)?;
+        let output = Command::new(keygen)
+            .arg("-y")
+            .arg("-f")
+            .arg(&keys.client_key)
+            .stdin(Stdio::null())
+            .output()?;
+        assert!(output.status.success(), "ssh-keygen -y failed");
+        assert_eq!(
             key_fields(&String::from_utf8(output.stdout)?),
+            key_fields(&keys.client_public)
+        );
+        let decoded = root.path().join("decoded");
+        let host = Command::new("sh")
+            .arg("-c")
+            .arg("printf '%s' \"$KEY\" | base64 -d > \"$OUT\" && chmod 600 \"$OUT\" && /usr/bin/ssh-keygen -y -f \"$OUT\"")
+            .env("KEY", keys.host_private().expose_secret())
+            .env("OUT", &decoded)
+            .output()?;
+        assert!(host.status.success(), "ssh-keygen -y failed");
+        assert_eq!(
+            key_fields(&String::from_utf8(host.stdout)?),
             keys.host_public
         );
         Ok(())
