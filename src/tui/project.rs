@@ -1279,6 +1279,15 @@ mod tests {
         let row = field(&rows, "targets.gpu_cloud.ssh_client")?;
         assert_eq!(row.shown, Shown::Default("openssh".into()));
         assert!(row.path.is_some(), "an editable row");
+        let text = format!(
+            "{}\n[targets.box]\nkind = \"ssh\"\nruntime = \"docker\"\n",
+            crate::tui::snapshots::PROJECT_CONFIG
+        );
+        let with_ssh = ProjectConfig::new(&text, &env())?;
+        let ssh_rows = super::rows(&with_ssh, &Locks::default());
+        let row = field(&ssh_rows, "targets.box.ssh_client")?;
+        assert_eq!(row.shown, Shown::Default("openssh".into()));
+        assert!(row.path.is_some(), "an editable row");
         Ok(())
     }
 

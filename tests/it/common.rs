@@ -163,6 +163,11 @@ pub fn ssh_clients() -> Result<Vec<overbrainer::config::SshClient>, Box<dyn std:
 /// Runs `case` once for each of [`ssh_clients`], stopping at the first failure,
 /// whose error names the client. The client is also printed before each case,
 /// so a failed assertion's captured output names it.
+///
+/// # Errors
+///
+/// Returns the error of [`ssh_clients`], or the first failing case's error
+/// with the client's name in front.
 pub async fn each_ssh_client<F, Fut>(case: F) -> Result<(), Box<dyn std::error::Error>>
 where
     F: Fn(overbrainer::config::SshClient) -> Fut,

@@ -783,7 +783,6 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command as StdCommand;
-
     use std::time::Duration;
 
     use tempfile::tempdir;
