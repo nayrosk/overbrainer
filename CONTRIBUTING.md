@@ -2,6 +2,8 @@
 
 Thanks for helping. This guide covers how work flows from an idea to `main`.
 
+Using a coding agent? Point it at [CLAUDE.md](CLAUDE.md), which holds the project rules and workflow for agents.
+
 By taking part you agree to the [code of conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately as described in the [security policy](SECURITY.md).
 
 ## Workflow

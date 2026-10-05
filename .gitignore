@@ -4,6 +4,7 @@
 /runs/
 /docs/design/
 .claude/settings.local.json
+.claude/worktrees/
 .claude/**/*.jsonl
 .claude/projects/
 .claude/todos/
