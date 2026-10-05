@@ -43,6 +43,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy with the built-in SSH client
+        run: cargo clippy --all-targets --locked --features builtin-ssh -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -71,6 +73,10 @@ jobs:
       - run: cargo test --all-targets --locked
         env:
           # A missing or changed TUI snapshot fails the test; nothing is written.
+          INSTA_UPDATE: "no"
+      - name: Test with the built-in SSH client
+        run: cargo test --all-targets --locked --features builtin-ssh
+        env:
           INSTA_UPDATE: "no"
 
   ssh:
@@ -137,6 +143,8 @@ jobs:
           toolchain: "stable"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo doc --no-deps --locked
+      - name: Doc with the built-in SSH client
+        run: cargo doc --no-deps --locked --features builtin-ssh
 
   msrv:
     runs-on: ubuntu-latest
@@ -150,6 +158,8 @@ jobs:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo check --all-targets --locked
+      - name: Check with the built-in SSH client
+        run: cargo check --all-targets --locked --features builtin-ssh
 
   macos:
     runs-on: macos-latest
@@ -172,6 +182,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          arguments: --all-features
 
   crates-metadata:
     runs-on: ubuntu-latest
