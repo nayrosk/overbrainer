@@ -1325,6 +1325,7 @@ mod tests {
         );
     }
 
+    /// `venv` needs a native runtime, `engine` and `image` a docker one.
     #[test]
     fn runtime_options_match_the_runtime() -> Result<(), config::ConfigError> {
         let toml = VALID.replace(r#"runtime = "native""#, r#"runtime = "docker""#);
@@ -1359,6 +1360,7 @@ mod tests {
         format!("{VALID}\n[targets.box]\nkind = \"ssh\"\nruntime = \"native\"\n{extra}\n")
     }
 
+    /// SSH and Runpod targets use OpenSSH when `ssh_client` is unset.
     #[test]
     fn ssh_client_defaults_to_openssh_on_ssh_and_runpod_targets()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1381,6 +1383,7 @@ mod tests {
         Ok(())
     }
 
+    /// An `ssh_client` that names no client is rejected, quoting it.
     #[test]
     fn an_unknown_ssh_client_is_rejected() {
         let error = settings(&with_ssh("ssh_client = \"putty\""))
@@ -1394,6 +1397,7 @@ mod tests {
         );
     }
 
+    /// With the feature, `ssh_client = "builtin"` raises no problem.
     #[cfg(feature = "builtin-ssh")]
     #[test]
     fn builtin_is_accepted_with_the_feature() -> Result<(), config::ConfigError> {
@@ -1408,6 +1412,8 @@ mod tests {
         Ok(())
     }
 
+    /// Without the feature, `ssh_client = "builtin"` is a problem of each
+    /// target naming it.
     #[cfg(not(feature = "builtin-ssh"))]
     #[test]
     fn builtin_is_refused_without_the_feature() -> Result<(), config::ConfigError> {

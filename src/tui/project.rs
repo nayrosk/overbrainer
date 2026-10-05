@@ -713,6 +713,8 @@ fn training_value(training: &Training, field: &str) -> Option<String> {
     })
 }
 
+/// The value of `field` in `target` as the Project view shows it, or `None`
+/// when unset or not a field of that kind of target.
 fn target_value(target: &Target, field: &str) -> Option<String> {
     let engine = |engine: &Option<Engine>| engine.map(|engine| engine.command().to_string());
     match target {

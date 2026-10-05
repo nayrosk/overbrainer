@@ -460,6 +460,7 @@ struct Client {
 }
 
 impl client::Handler for Client {
+    /// The error of a callback: russh's own.
     type Error = russh::Error;
 
     /// Accepts the key [`server_key_verdict`] accepts; otherwise keeps the
@@ -693,6 +694,7 @@ mod tests {
 
     use super::*;
 
+    /// The result of a test that may fail on I/O or SSH handling.
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// A fresh ed25519 public key.

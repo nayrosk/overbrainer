@@ -189,10 +189,12 @@ impl SshExecutor {
 }
 
 impl Executor for SshExecutor {
+    /// The remote directory holding the run directories.
     fn workdir(&self) -> &str {
         &self.workdir
     }
 
+    /// Claims `dir` for `owner` with [`claim_script`], over the connection.
     async fn claim(&self, dir: &str, owner: &str) -> Result<bool, ExecError> {
         let script = claim_script(dir, owner);
         let output = run(&self.transport, &script, "claim the run directory").await?;
@@ -205,14 +207,17 @@ impl Executor for SshExecutor {
         }
     }
 
+    /// Sends `local` into `remote` as a `tar` stream.
     async fn upload(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {
         self.send(local, remote, skip).await
     }
 
+    /// Starts `job` in the background on the remote machine.
     async fn spawn(&self, job: &JobCommand) -> Result<JobId, ExecError> {
         self.start(job).await
     }
 
+    /// Reads up to `limit` bytes of the remote `path` from `offset`.
     async fn read_from(&self, path: &str, offset: u64, limit: u64) -> Result<Vec<u8>, ExecError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -220,6 +225,7 @@ impl Executor for SshExecutor {
         run(&self.transport, &read_script(path, offset, limit), "read").await
     }
 
+    /// Asks the remote machine what `job` is doing, with [`status_script`].
     async fn status(&self, job: &JobId) -> Result<JobStatus, ExecError> {
         let script = status_script(&job.dir, job.pid.get());
         let output = run(&self.transport, &script, "status").await?;
@@ -228,11 +234,13 @@ impl Executor for SshExecutor {
             .ok_or_else(|| ExecError::Protocol(format!("unknown job status {:?}", text.trim())))
     }
 
+    /// Stops `job` with [`cancel_script`].
     async fn cancel(&self, job: &JobId) -> Result<(), ExecError> {
         let script = cancel_script(&job.dir, job.pid.get(), job.container.as_ref());
         run(&self.transport, &script, "cancel").await.map(drop)
     }
 
+    /// Fetches `entries` of `remote` into `local` as a `tar` stream.
     async fn download(
         &self,
         remote: &str,
@@ -243,6 +251,7 @@ impl Executor for SshExecutor {
         self.fetch(remote, local, entries, exclude).await
     }
 
+    /// The digests of `entries` of `remote`, from [`manifest_script`].
     async fn manifest(
         &self,
         remote: &str,
@@ -254,10 +263,12 @@ impl Executor for SshExecutor {
         parse_manifest(&String::from_utf8_lossy(&output))
     }
 
+    /// Runs `script` with the remote `sh -c` and returns its output.
     async fn probe(&self, script: &str) -> Result<Vec<u8>, ExecError> {
         run(&self.transport, script, "probe").await
     }
 
+    /// Replaces the remote `path` with `content` through a temporary file.
     async fn put_file(&self, path: &str, content: &str) -> Result<(), ExecError> {
         run(&self.transport, &put_script(path, content), "write a file")
             .await

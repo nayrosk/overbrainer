@@ -590,6 +590,8 @@ mod tests {
         Ok(key_fields(&String::from_utf8(output.stdout)?))
     }
 
+    /// Keys from `ssh-keygen` hold together: the pod's bootstrap decodes the
+    /// private host key back to the pinned public key.
     #[test]
     fn generated_keys_hold_together() -> TestResult {
         if !keygen_available() {
@@ -606,6 +608,8 @@ mod tests {
         Ok(())
     }
 
+    /// Keys from the built-in generator hold together: the client's public
+    /// line matches its private key and its `.pub` file.
     #[cfg(feature = "builtin-ssh")]
     #[test]
     fn rust_generated_keys_hold_together() -> TestResult {

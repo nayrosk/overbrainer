@@ -153,6 +153,7 @@ fn client_summary(configured: SshClient, ssh_env: Option<&str>) -> Result<String
     Ok(summary)
 }
 
+/// `target` on one line: its kind, where it runs and how, defaults applied.
 fn target_summary(target: &Target) -> String {
     match target {
         Target::Local {
@@ -291,6 +292,8 @@ max_hours = 6
         lines.iter().find(|line| line.starts_with(prefix))
     }
 
+    /// `config check` prints the client of SSH and Runpod targets, none for a
+    /// local target.
     #[test]
     fn config_check_prints_the_effective_client_of_ssh_and_runpod_targets()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -303,6 +306,8 @@ max_hours = 6
         Ok(())
     }
 
+    /// With the feature, the OpenSSH line suggests the built-in client, and a
+    /// `builtin` field shows as such.
     #[cfg(feature = "builtin-ssh")]
     #[test]
     fn config_check_suggests_builtin_in_a_build_with_the_feature()
@@ -322,6 +327,7 @@ max_hours = 6
         Ok(())
     }
 
+    /// `OVERBRAINER_SSH_CLIENT` wins over the field, and the line says so.
     #[cfg(feature = "builtin-ssh")]
     #[test]
     fn the_environment_wins_in_config_check() -> Result<(), Box<dyn std::error::Error>> {
@@ -337,6 +343,8 @@ max_hours = 6
         Ok(())
     }
 
+    /// Without the feature, the line points to the feature build, and the
+    /// variable asking for `builtin` is refused under its own name.
     #[cfg(not(feature = "builtin-ssh"))]
     #[test]
     fn config_check_points_to_the_feature_build_without_the_feature()
@@ -354,6 +362,7 @@ max_hours = 6
         Ok(())
     }
 
+    /// An invalid `OVERBRAINER_SSH_CLIENT` is refused, naming the variable.
     #[test]
     fn config_check_refuses_an_invalid_client_variable() -> Result<(), Box<dyn std::error::Error>> {
         let error = describe(&project("")?, Some("putty")).err();

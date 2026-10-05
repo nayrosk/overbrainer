@@ -128,6 +128,8 @@ impl RunpodTarget {
 mod tests {
     use super::*;
 
+    /// A Runpod target of the configuration, with the network volume
+    /// `volume`.
     fn config_target(volume: Option<&str>) -> Target {
         Target::Runpod {
             gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),

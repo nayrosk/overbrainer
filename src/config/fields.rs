@@ -324,6 +324,7 @@ const fn floats(min: Bound, max: Bound) -> FieldKind {
 const THRESHOLD: FieldKind = floats(Bound::Excl(0.0), Bound::Incl(1.0));
 const RUNTIMES: FieldKind = FieldKind::Choice(&["docker", "native"]);
 const ENGINES: FieldKind = FieldKind::Choice(&["docker", "podman"]);
+/// The SSH clients a target may name.
 const SSH_CLIENTS: FieldKind = FieldKind::Choice(&["openssh", "builtin"]);
 
 const PROJECT: &[FieldSpec] = &[spec("name", TEXT, false, "Name of the project")];
@@ -567,6 +568,7 @@ const LOCAL: &[FieldSpec] = &[
     ),
 ];
 
+/// The fields of an `ssh` target.
 const SSH: &[FieldSpec] = &[
     spec("runtime", RUNTIMES, false, "Run in a container or natively"),
     spec(
@@ -601,6 +603,7 @@ const SSH: &[FieldSpec] = &[
     ),
 ];
 
+/// The fields of a `runpod` target.
 const RUNPOD: &[FieldSpec] = &[
     spec(
         "gpu_types",
@@ -1039,6 +1042,8 @@ max_hours = 6
         );
     }
 
+    /// `ssh_client` is an optional choice of SSH and Runpod targets, absent
+    /// from local ones.
     #[test]
     fn ssh_client_is_a_choice_of_ssh_and_runpod_targets_only() {
         for kind in [TargetKind::Ssh, TargetKind::Runpod] {

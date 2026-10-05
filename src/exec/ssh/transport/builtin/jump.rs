@@ -130,6 +130,7 @@ mod tests {
 
     use super::*;
 
+    /// The result of a test that may fail on I/O or SSH handling.
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// Sources reading only a user file holding `text`, in a fresh home that

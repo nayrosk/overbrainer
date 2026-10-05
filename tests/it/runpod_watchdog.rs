@@ -1224,6 +1224,7 @@ struct FailingBootstrap {
 }
 
 impl FailingBootstrap {
+    /// A fresh tree whose bootstrap reaches the API at `server`.
     fn new(server: &MockServer) -> Result<Self, Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let run_dir = root.path().join("run");
@@ -1545,6 +1546,8 @@ fn keygen_available() -> bool {
         .is_ok()
 }
 
+/// In every shell, the bootstrap replaces the baked host keys with the run's
+/// host key and authorizes the run's client key, with sshd's permissions.
 #[test]
 fn the_bootstrap_installs_the_run_keys() -> TestResult {
     if !keygen_available() {

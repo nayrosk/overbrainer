@@ -896,6 +896,7 @@ mod tests {
     #[cfg(not(feature = "builtin-ssh"))]
     const BUILTIN_REFUSED: &str = "ssh_client = \"builtin\" needs a build with the builtin-ssh feature (the release binaries have it)";
 
+    /// The variable wins over the field; an empty value counts as unset.
     #[test]
     fn effective_client_lets_the_environment_win() {
         assert_eq!(
@@ -912,6 +913,7 @@ mod tests {
         );
     }
 
+    /// With the feature, `builtin` is accepted from the variable or the field.
     #[cfg(feature = "builtin-ssh")]
     #[test]
     fn effective_client_accepts_builtin_with_the_feature() {
@@ -940,6 +942,8 @@ mod tests {
         );
     }
 
+    /// An invalid value is refused with a message naming the variable and the
+    /// valid values.
     #[test]
     fn effective_client_names_the_variable_on_an_invalid_value() {
         let error = effective_client(SshClient::Openssh, Some("putty"));
