@@ -26,6 +26,7 @@ These keys are accepted from the environment only, and `overbrainer.toml` is rej
 | `OVERBRAINER_PROVIDERS__<NAME>__BASE_URL` | Base URL of a provider. |
 | `OVERBRAINER_PROVIDERS__<NAME>__API_KEY` | API key of a provider. Without one, the provider is called without authentication, which suits a local server. |
 | `OVERBRAINER_TARGETS__<NAME>__HOST` | Host of an `ssh` target: `user@host` or a `~/.ssh/config` alias. |
+| `OVERBRAINER_SSH_CLIENT` | `openssh` or `builtin`: the SSH client of every `ssh` and `runpod` target, over their `ssh_client` field. See [Built-in SSH client](training.md#built-in-ssh-client). |
 | `OVERBRAINER_RUNPOD__API_KEY` | Runpod API key, for `runpod` targets. |
 | `OVERBRAINER_RUNPOD__BASE_URL` | Runpod REST API, `https://api.runpod.io/v2` by default. Must be `https`, or `http` on a loopback host. |
 | `OVERBRAINER_HF_TOKEN` | Hugging Face token, see [Training](training.md#the-hugging-face-token). |
@@ -131,7 +132,7 @@ Topic names must be unique. `subtopics` and `questions_per_subtopic` must be at 
 
 Retries wait with exponential backoff and jitter, or as long as the provider's `Retry-After` asks.
 
-The `[training]` section and the `[targets.*]` tables are described in [Training](training.md) and [Runpod](runpod.md). A Runpod target's `gpu_types` and `data_center_ids` take a TOML array, or `"auto"`; from the environment, a comma-separated value or `auto`, for example `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. `min_vram_gb` and `max_price_per_hour` narrow an `auto` choice of GPU types and are rejected otherwise, and `max_volume_gb` needs `network_volume_id`; see [Runpod](runpod.md) for every field.
+`ssh_client` (`openssh` by default, or `builtin`) on an `ssh` or `runpod` target picks the SSH client, and `OVERBRAINER_SSH_CLIENT` overrides it for every target; see [Built-in SSH client](training.md#built-in-ssh-client). The `[training]` section and the `[targets.*]` tables are described in [Training](training.md) and [Runpod](runpod.md). A Runpod target's `gpu_types` and `data_center_ids` take a TOML array, or `"auto"`; from the environment, a comma-separated value or `auto`, for example `OVERBRAINER_TARGETS__GPU_CLOUD__GPU_TYPES=auto`. `min_vram_gb` and `max_price_per_hour` narrow an `auto` choice of GPU types and are rejected otherwise, and `max_volume_gb` needs `network_volume_id`; see [Runpod](runpod.md) for every field.
 
 The optional `[export]` section (`after_training`, `quantize`, `ollama_name`) sets the export of a run's model to GGUF and its Ollama Modelfile, described in [Training](training.md#export-to-gguf-and-ollama), for example `OVERBRAINER_EXPORT__QUANTIZE=Q8_0` from the environment.
 
