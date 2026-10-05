@@ -89,6 +89,14 @@ jobs:
           - 2222:2222
         env:
           USER_NAME: overbrainer
+      # A jump host for ProxyJump: reaches the target as sshd:2222 on the
+      # services' network.
+      bastion:
+        image: linuxserver/openssh-server:10.3_p1-r1-ls237@sha256:946fa26105e0ec212fdf821b9ddc59aab65f2c2d07c02b25ff0f5001fc332ff0
+        ports:
+          - 2223:2222
+        env:
+          USER_NAME: overbrainer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -97,23 +105,42 @@ jobs:
         with:
           toolchain: "stable"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Authorize a throwaway key on the test sshd
+      - name: Authorize a throwaway key on the test sshd and the bastion
         env:
           SSHD: ${{ job.services.sshd.id }}
+          BASTION: ${{ job.services.bastion.id }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/overbrainer_test
-          for _ in $(seq 1 60); do
-            docker exec "$SSHD" test -f /config/.ssh/authorized_keys && break
-            sleep 1
+          for container in "$SSHD" "$BASTION"; do
+            for _ in $(seq 1 60); do
+              docker exec "$container" test -f /config/.ssh/authorized_keys && break
+              sleep 1
+            done
+            docker exec -i "$container" sh -c 'cat >> /config/.ssh/authorized_keys' < ~/.ssh/overbrainer_test.pub
           done
-          docker exec -i "$SSHD" sh -c 'cat >> /config/.ssh/authorized_keys' < ~/.ssh/overbrainer_test.pub
-          for _ in $(seq 1 60); do
-            ssh-keyscan -p 2222 127.0.0.1 > ~/.ssh/overbrainer_known_hosts 2>/dev/null
-            [ -s ~/.ssh/overbrainer_known_hosts ] && break
-            sleep 1
-          done
+          # The image turns TCP forwarding off; the bastion needs it. SIGHUP
+          # makes sshd read its config again.
+          docker exec "$BASTION" sh -c 'sed -i "s/^AllowTcpForwarding no/AllowTcpForwarding yes/" /config/sshd/sshd_config && kill -HUP "$(cat /config/sshd.pid)"'
+          # Appends the host keys the command "$@" prints, once it prints some.
+          scan() {
+            for _ in $(seq 1 60); do
+              keys=$("$@" 2>/dev/null || true)
+              if [ -n "$keys" ]; then
+                echo "$keys" >> ~/.ssh/overbrainer_known_hosts
+                return 0
+              fi
+              sleep 1
+            done
+            echo "no host keys from: $*" >&2
+            return 1
+          }
+          : > ~/.ssh/overbrainer_known_hosts
+          scan ssh-keyscan -p 2222 127.0.0.1
+          scan ssh-keyscan -p 2223 127.0.0.1
+          # The target as the bastion reaches it.
+          scan docker exec "$BASTION" ssh-keyscan -p 2222 sshd
           cat > ~/.ssh/overbrainer_config <<EOF
           Host overbrainer-test
             HostName 127.0.0.1
@@ -122,15 +149,32 @@ jobs:
             IdentityFile $HOME/.ssh/overbrainer_test
             IdentitiesOnly yes
             UserKnownHostsFile $HOME/.ssh/overbrainer_known_hosts
+          Host overbrainer-bastion
+            HostName 127.0.0.1
+            Port 2223
+            User overbrainer
+            IdentityFile $HOME/.ssh/overbrainer_test
+            IdentitiesOnly yes
+            UserKnownHostsFile $HOME/.ssh/overbrainer_known_hosts
+          Host overbrainer-behind
+            HostName sshd
+            Port 2222
+            User overbrainer
+            ProxyJump overbrainer-bastion
+            IdentityFile $HOME/.ssh/overbrainer_test
+            IdentitiesOnly yes
+            UserKnownHostsFile $HOME/.ssh/overbrainer_known_hosts
           EOF
           echo "OVERBRAINER_TEST_SSH_CONFIG=$HOME/.ssh/overbrainer_config" >> "$GITHUB_ENV"
       - name: Test the SSH executor and Runpod pod access against the sshd
         env:
           OVERBRAINER_TEST_SSH_HOST: overbrainer-test
+          OVERBRAINER_TEST_SSH_JUMP_HOST: overbrainer-behind
         run: 'cargo test --locked --test it -- exec_ssh:: runpod_ssh::'
       - name: Test them again with the built-in client too
         env:
           OVERBRAINER_TEST_SSH_HOST: overbrainer-test
+          OVERBRAINER_TEST_SSH_JUMP_HOST: overbrainer-behind
         run: 'cargo test --locked --features builtin-ssh --test it -- exec_ssh:: runpod_ssh::'
 
   doc:
