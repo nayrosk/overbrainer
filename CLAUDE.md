@@ -64,16 +64,35 @@ The source of truth is the `path_instructions` in `.coderabbit.yaml`; CodeRabbit
 
 ## Workflow
 
-1. Open an issue first. Every change goes issue, branch, PR. Nobody pushes to `main`.
-2. Branch from the issue: `gh issue develop <n> --name <type>/<n>-slug --base main`, with `<type>` one of `feat`, `fix` or `chore` (CI also accepts `feature`, `bugfix`, `hotfix`). No `docs/`, `perf/` or `test/` prefixes. Pick the prefix right away: renaming a PR's head branch closes the PR.
-3. Work in a git worktree for that branch.
-4. Commits: Conventional Commits, GPG-signed (`git commit -S`). No AI attribution, no `Co-Authored-By` trailers, no session links or transcripts in commits or PRs.
-5. PR to `main`: Conventional title (it becomes the squash commit subject) and `Closes #<n>` in the body. `pr-policy.yml` enforces both.
-6. Keep the diff in scope. No unrelated edits, not even a stray `.gitignore` line.
-7. Review: CodeRabbit reviews the PR (it skips `docs:` titles and the `release` label). Its pre-merge checks need docstring coverage of at least 80% over touched functions (aim for 100%) and no out-of-scope changes.
-8. Fix every finding of a review round locally, run the checks, push once, then reply in each thread. Each push costs a rate-limited review.
-9. CI: count the checks, do not only look for failures. The `main` ruleset requires 15: `fmt`, `clippy`, `test`, `ssh`, `doc`, `msrv`, `macos`, `deny`, `crates-metadata`, `commits`, `branch`, `title`, `issue`, `analyze (rust)`, `analyze (actions)`.
-10. Merge: squash only. The branch is deleted on merge.
+Follow these steps for every change. The `feature-flow` skill walks through them.
+
+1. **Issue.** Search for duplicates (`gh issue list --search`). Open the issue with the right labels, a milestone (create one if none fits) and assign it to yourself. Anything beyond a small fix needs a design approved by a maintainer before code: write the spec and plan in `docs/design/` and wait for an explicit yes.
+2. **Branch.** From an up-to-date `main`: `gh issue develop <n> --name <type>/<n>-slug --base main`, `<type>` one of `feat`, `fix` or `chore` (CI also accepts `feature`, `bugfix`, `hotfix`; no `docs/`, `perf/` or `test/`). Work in a git worktree for that branch. Pick the prefix right away: renaming a PR's head branch closes the PR.
+3. **Develop**, in English, strictly what the issue asks:
+   1. modular code following the code rules above;
+   2. unit and integration tests (TDD where it fits);
+   3. a doc comment on every item added or touched, tests included;
+   4. the user docs (`README.md`, `docs/`, the `overbrainer` skill) when behaviour changes. Do not edit `CHANGELOG.md`: git-cliff writes it.
+4. **Test**, with the build limits:
+   1. unit tests;
+   2. integration and end-to-end tests (`tests/it`; SSH suites when the change touches SSH);
+   3. `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, `cargo deny check`, `actionlint` when a workflow changes;
+   4. no warning, no unused code, no `unwrap`, no `#[allow]`; snapshots accepted with `cargo insta review` after reading every changed line;
+   5. multi-target: the default build and every cargo feature the change touches, plus the MSRV (`cargo +<rust-version> check --all-targets`). CI covers musl and macOS.
+   Paid live tests (Runpod, Hugging Face) only with a maintainer's approval, and only delete resources you created.
+5. **Commit.** Conventional Commits, signed with GPG (`git commit -S`) only. No AI attribution, no `Co-Authored-By` trailers, no session links: check `git log --format=%B origin/main..HEAD` before each push.
+6. **Pull request.**
+   - Sync from `main` by rebase (history is linear), never by merge.
+   - Batch: push once per review round, since each push costs a rate-limited CodeRabbit review.
+   - Title in Conventional Commits form (it becomes the squash commit subject), `Closes #<n>` in the body, the issue's labels and milestone.
+   - Written in English, no transcript, and say which tests and checks ran.
+   - Keep the diff in scope: no unrelated edits, not even a stray `.gitignore` line.
+7. **Review and CI.** Wait for CodeRabbit and CI, then fix:
+   - Count the checks (17 on a normal PR; the `main` ruleset requires 15: `fmt`, `clippy`, `test`, `ssh`, `doc`, `msrv`, `macos`, `deny`, `crates-metadata`, `commits`, `branch`, `title`, `issue`, `analyze (rust)`, `analyze (actions)`). A missing check is not a pass.
+   - Gather every finding of a round, verify each one, fix them all, rerun the checks, push once, reply in each thread and resolve it.
+   - CodeRabbit's pre-merge checks must pass: docstring coverage over touched functions (80% minimum, aim for 100%), no out-of-scope changes, linked issue covered. It skips `docs:` titles and the `release` label.
+   - During its rate limit, do not repeat `@coderabbitai review`: wait for the window it names.
+8. **Hand over.** Once everything is green and CodeRabbit approved, tag the maintainer (`@nayrosk`) on the PR. Agents do not merge, tag releases or publish unless a maintainer asks. After the merge: remove the worktree and its `target/`, then pull `main`.
 
 ## Release
 
