@@ -123,6 +123,7 @@ async fn create_for(server: &MockServer, gpu: &str, response: ResponseTemplate) 
         .await;
 }
 
+/// A Runpod target with an A40 and no limits.
 fn target(gpu_types: &[&str]) -> RunpodTarget {
     RunpodTarget {
         gpu_types: ListOrAuto::List(gpu_types.iter().map(|gpu| (*gpu).to_string()).collect()),

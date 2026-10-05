@@ -100,6 +100,7 @@ mod tests {
         assert_eq!(hang("abcdefgh ij", 4, 0), ["abcdefgh", "  ij"]);
     }
 
+    /// A duration shows hours and minutes, or seconds when it is short.
     #[test]
     fn durations_show_hours_and_minutes_or_seconds() {
         assert_eq!(duration(Duration::from_secs(35)), "35s");

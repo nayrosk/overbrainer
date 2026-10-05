@@ -11,8 +11,11 @@ use secrecy::{ExposeSecret, SecretString};
 
 use super::{Commit, CommitRequest, Hub, HubError, Progress, ProgressSink, RepoId, RepoState};
 
+/// The Hub that `HfHub` talks to unless a base URL is set.
 const DEFAULT_BASE_URL: &str = "https://huggingface.co";
+/// The `User-Agent` of every request.
 const USER_AGENT: &str = concat!("overbrainer/", env!("CARGO_PKG_VERSION"));
+/// How long to wait for a connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The Hugging Face Hub, reached through `hf-hub`.
@@ -84,6 +87,7 @@ fn withheld(text: String, token: &SecretString) -> String {
 struct Handler(ProgressSink);
 
 impl ProgressHandler for Handler {
+    /// Forwards the upload progress of `hf-hub` as `Progress` reports.
     fn on_progress(&self, event: &ProgressEvent) {
         if let ProgressEvent::Upload(UploadEvent::Progress {
             bytes_completed,
@@ -101,6 +105,7 @@ impl ProgressHandler for Handler {
 }
 
 impl Hub for HfHub {
+    /// The Hub calls, made through `hf-hub` and the Hub's HTTP API.
     async fn whoami(&self) -> Result<String, HubError> {
         match self.client.whoami().send().await {
             Ok(user) => Ok(user.username),
@@ -109,6 +114,7 @@ impl Hub for HfHub {
         }
     }
 
+    /// Creates the repo when it is missing and says whether it existed and its visibility.
     async fn ensure_repo(&self, repo: &RepoId, private: bool) -> Result<RepoState, HubError> {
         let namespace = repo.namespace.as_str();
         match self
@@ -139,6 +145,7 @@ impl Hub for HfHub {
         Ok(RepoState::Created { private })
     }
 
+    /// Reads the repo's `README.md`; `None` when there is none.
     async fn remote_card(&self, repo: &RepoId) -> Result<Option<String>, HubError> {
         match self
             .client
@@ -154,6 +161,7 @@ impl Hub for HfHub {
         }
     }
 
+    /// Reads the license of a model from its card data.
     async fn license_of(&self, model: &str) -> Result<Option<String>, HubError> {
         // A local path or a bare name is not a Hub repo: no request.
         let Some(RepoId {
@@ -183,6 +191,7 @@ impl Hub for HfHub {
         }
     }
 
+    /// Commits the files and the card to the repo, reporting progress.
     async fn upload(
         &self,
         repo: &RepoId,
@@ -232,22 +241,28 @@ mod tests {
     use super::*;
     use crate::hub::UploadFile;
 
+    /// The result of a test that can fail with any error.
     type TestResult = Result<(), Box<dyn Error>>;
 
+    /// A fake token for the tests.
     const TOKEN: &str = "hf_test";
 
+    /// A client for the mock server.
     fn hub(server: &MockServer) -> Result<HfHub, HubError> {
         HfHub::new(Some(&server.uri()), &SecretString::from(TOKEN))
     }
 
+    /// A repo id from `text`.
     fn repo(text: &str) -> Result<RepoId, Box<dyn Error>> {
         RepoId::parse(text).ok_or_else(|| "bad repo id".into())
     }
 
+    /// The Hub's answer for a repo that does not exist.
     fn not_found() -> ResponseTemplate {
         ResponseTemplate::new(404).set_body_json(json!({"error": "Repository not found"}))
     }
 
+    /// `whoami` reads the user name.
     #[tokio::test]
     async fn whoami_reads_the_user_name() -> TestResult {
         let server = MockServer::start().await;
@@ -263,6 +278,7 @@ mod tests {
         Ok(())
     }
 
+    /// A bad base URL is a client error that does not carry the token.
     #[test]
     fn a_bad_base_url_is_a_client_error_without_the_token() -> TestResult {
         let error = HfHub::new(Some("not a url"), &SecretString::from(TOKEN))
@@ -276,6 +292,7 @@ mod tests {
         Ok(())
     }
 
+    /// A rejected token is an authentication error and is never echoed.
     #[tokio::test]
     async fn a_rejected_token_is_auth_and_never_echoed() -> TestResult {
         let server = MockServer::start().await;
@@ -294,6 +311,7 @@ mod tests {
         Ok(())
     }
 
+    /// `whoami` maps a 403 to an authentication error.
     #[tokio::test]
     async fn whoami_maps_a_403_to_auth() -> TestResult {
         let server = MockServer::start().await;
@@ -311,6 +329,7 @@ mod tests {
         Ok(())
     }
 
+    /// A forbidden create names the namespace.
     #[tokio::test]
     async fn forbidden_names_the_namespace() -> TestResult {
         let server = MockServer::start().await;
@@ -336,6 +355,7 @@ mod tests {
         Ok(())
     }
 
+    /// A 429 is a rate limit.
     #[tokio::test]
     async fn a_429_is_rate_limited() -> TestResult {
         let server = MockServer::start().await;
@@ -356,6 +376,7 @@ mod tests {
         Ok(())
     }
 
+    /// A missing repo is created private.
     #[tokio::test]
     async fn ensure_repo_creates_a_missing_repo_private() -> TestResult {
         let server = MockServer::start().await;
@@ -385,6 +406,7 @@ mod tests {
         Ok(())
     }
 
+    /// A missing repo is created public when asked.
     #[tokio::test]
     async fn ensure_repo_creates_a_missing_repo_public() -> TestResult {
         let server = MockServer::start().await;
@@ -412,6 +434,7 @@ mod tests {
         Ok(())
     }
 
+    /// A server error is `Other` and never echoes the token.
     #[tokio::test]
     async fn a_server_error_is_other_and_never_echoes_the_token() -> TestResult {
         let server = MockServer::start().await;
@@ -433,6 +456,7 @@ mod tests {
         Ok(())
     }
 
+    /// An existing repo is reported with its visibility.
     #[tokio::test]
     async fn ensure_repo_reports_an_existing_repo_and_its_visibility() -> TestResult {
         let server = MockServer::start().await;
@@ -448,6 +472,7 @@ mod tests {
         Ok(())
     }
 
+    /// A repo without a `README.md` has no remote card.
     #[tokio::test]
     async fn remote_card_is_none_without_readme() -> TestResult {
         let server = MockServer::start().await;
@@ -481,6 +506,7 @@ mod tests {
         Ok(())
     }
 
+    /// The license is read from the card data of the model.
     #[tokio::test]
     async fn license_of_reads_card_data() -> TestResult {
         let server = MockServer::start().await;
@@ -563,6 +589,7 @@ mod tests {
         Ok(String::from_utf8(commit_request.body.clone())?)
     }
 
+    /// A kept card is left out of the commit.
     #[tokio::test]
     async fn a_kept_card_is_not_in_the_commit() -> TestResult {
         let body = committed(None).await?;
@@ -571,6 +598,7 @@ mod tests {
         Ok(())
     }
 
+    /// Small files are committed inline with the card.
     #[tokio::test]
     async fn upload_commits_small_files_inline_with_the_card() -> TestResult {
         let server = MockServer::start().await;

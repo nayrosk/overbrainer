@@ -85,6 +85,7 @@ struct Progress {
 }
 
 impl Progress {
+    /// Prints one line for a pipeline event.
     fn log(&mut self, event: &Event) {
         match event {
             Event::StageStarted { stage, total } => self.started(*stage, *total),
@@ -338,6 +339,7 @@ pub fn pod_line(status: &PodStatus) -> String {
     }
 }
 
+/// Logs the upload progress line of a push.
 fn pushed(run_id: &str, done: u64, total: u64) {
     tracing::info!("{}", push_line(run_id, done, total));
 }
@@ -403,6 +405,7 @@ mod tests {
         progress
     }
 
+    /// An event for a failed answer, retryable or not.
     fn failure(retryable: bool) -> Event {
         Event::ItemFailed {
             stage: Stage::Answers,
@@ -412,6 +415,7 @@ mod tests {
         }
     }
 
+    /// A push line shows the bytes uploaded out of the total.
     #[test]
     fn a_push_line_shows_the_bytes_uploaded() {
         assert_eq!(
@@ -577,6 +581,7 @@ mod tests {
         assert_eq!(empty.advance(), None);
     }
 
+    /// Pod events read as short sentences.
     #[test]
     fn pod_events_read_as_sentences() -> Result<(), crate::runpod::InvalidPodId> {
         let pod_id = crate::runpod::PodId::new("k3x9abc")?;
@@ -622,6 +627,7 @@ mod tests {
         Ok(())
     }
 
+    /// A duration is shown in the largest fitting unit.
     #[test]
     fn durations_read_in_the_right_unit() {
         assert_eq!(duration_words(Duration::from_secs(45)), "45s");

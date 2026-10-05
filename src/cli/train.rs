@@ -80,6 +80,7 @@ fn no_training() {
     tracing::info!("no [training] section in overbrainer.toml: run stops after split");
 }
 
+/// Runs the training: starts the job, follows it and pushes the model when asked.
 async fn train(
     project_dir: &Path,
     settings: &Settings,
@@ -195,6 +196,7 @@ pub(super) fn exporting<'a>(
     }
 }
 
+/// Attaches to a run that is already going and follows it to its end.
 async fn attach(
     project_dir: &Path,
     run_id: &str,
@@ -766,6 +768,7 @@ pub(super) fn started(record: &RunRecord) {
     );
 }
 
+/// Logs a warning line.
 pub(super) fn warn(message: &str) {
     tracing::warn!("{message}");
 }
@@ -832,6 +835,7 @@ fn already_pushed(runs: &Runs, run_id: &str) -> bool {
         .is_ok_and(|dir| dir.join(HUB_DIR).join(PUSH_FILE).is_file())
 }
 
+/// The warning for a push after training that failed, with the command that retries it.
 fn push_failed(run_id: &str, error: &anyhow::Error) -> String {
     format!("push failed: {error:#}; run it again with: overbrainer push {run_id}")
 }
@@ -851,6 +855,7 @@ mod tests {
     use crate::cli::push::{PushTarget, push_run};
     use crate::runs::RunState;
 
+    /// `[hub]` section that turns the push after training on.
     const HUB_ON: &str = "\n[hub]\nafter_training = true\n";
 
     /// [`push_after`] of [`RUN`] to `hub`: what it warns, and the lines said.
@@ -871,6 +876,7 @@ mod tests {
         (warning, said(&lines))
     }
 
+    /// A succeeded run is pushed when `after_training` is on.
     #[tokio::test]
     async fn pushes_a_succeeded_run_when_enabled() -> anyhow::Result<()> {
         let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
@@ -886,6 +892,7 @@ mod tests {
         Ok(())
     }
 
+    /// A run that has been pushed already is not pushed again.
     #[tokio::test]
     async fn a_run_already_pushed_is_not_pushed_again() -> anyhow::Result<()> {
         let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
@@ -902,6 +909,7 @@ mod tests {
         Ok(())
     }
 
+    /// Nothing is pushed when `after_training` is off.
     #[tokio::test]
     async fn does_nothing_when_disabled() -> anyhow::Result<()> {
         let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
@@ -914,6 +922,7 @@ mod tests {
         Ok(())
     }
 
+    /// Nothing is pushed for a run that failed.
     #[tokio::test]
     async fn does_nothing_for_a_failed_run() -> anyhow::Result<()> {
         let (_project, runs) = project(RunState::Failed, false).map_err(|e| anyhow!("{e}"))?;
@@ -927,6 +936,7 @@ mod tests {
         Ok(())
     }
 
+    /// A failed push warns and leaves the run succeeded.
     #[tokio::test]
     async fn a_failed_push_warns_and_keeps_the_run_succeeded() -> anyhow::Result<()> {
         let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
@@ -951,6 +961,7 @@ mod tests {
         Ok(())
     }
 
+    /// A missing token warns through `push_with_token`.
     #[tokio::test]
     async fn a_missing_token_warns_through_push_with_token() -> anyhow::Result<()> {
         let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;
@@ -972,6 +983,7 @@ mod tests {
         Ok(())
     }
 
+    /// An interruption stops the push that follows training.
     #[tokio::test]
     async fn an_interruption_stops_the_push_after_training() -> anyhow::Result<()> {
         let (_project, runs) = project(RunState::Succeeded, false).map_err(|e| anyhow!("{e}"))?;

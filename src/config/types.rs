@@ -725,6 +725,7 @@ pub struct Hub {
 }
 
 impl Default for Hub {
+    /// The default `[hub]`: private, manual and with no repo.
     fn default() -> Self {
         Self {
             repo: None,
@@ -735,6 +736,7 @@ impl Default for Hub {
     }
 }
 
+/// The serde default of a flag that is on unless the file says otherwise.
 fn default_true() -> bool {
     true
 }

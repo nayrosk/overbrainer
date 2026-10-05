@@ -447,6 +447,7 @@ const PIPELINE: &[FieldSpec] = &[
     ),
 ];
 
+/// The fields of the `[training]` section.
 const TRAINING: &[FieldSpec] = &[
     spec("target", TEXT, false, "Name of the target the job runs on"),
     spec(
@@ -819,6 +820,7 @@ max_hours = 6
         ("hub", "base_url"),
     ];
 
+    /// Every section name with its `Section`.
     const SECTIONS: [(&str, Section); 12] = [
         ("project", Section::Project),
         ("topic", Section::Topic),

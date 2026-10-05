@@ -4358,6 +4358,7 @@ mod tests {
         }
     }
 
+    /// `h` on a run that cannot be pushed shows the reason and nothing else.
     #[test]
     fn h_refuses_a_run_that_cannot_be_pushed() -> TestResult {
         let (_dir, mut app) = runs_app()?;
@@ -4385,6 +4386,7 @@ mod tests {
         Ok(())
     }
 
+    /// The push dialog says where, how and how much the push sends.
     #[test]
     fn the_push_dialog_says_where_how_and_how_much() -> TestResult {
         let (_dir, mut app) = runs_app()?;
@@ -4422,6 +4424,7 @@ mod tests {
         Ok(())
     }
 
+    /// A push shows its progress, then its end.
     #[test]
     fn a_push_shows_its_progress_then_its_end() -> TestResult {
         let (_dir, mut app) = runs_app()?;
@@ -4468,6 +4471,7 @@ mod tests {
         Ok(())
     }
 
+    /// Quitting asks first, then stops the push and waits for it.
     #[test]
     fn quitting_stops_a_push_and_waits_for_it() -> TestResult {
         let (_dir, mut app) = runs_app()?;

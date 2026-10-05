@@ -124,6 +124,7 @@ fn config_check_shows_a_runpod_target_with_its_defaults() -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// `config check` warns about the deprecated `training.hub_model_id`.
 #[test]
 fn config_check_warns_about_the_deprecated_hub_model_id() -> Result<(), Box<dyn std::error::Error>>
 {

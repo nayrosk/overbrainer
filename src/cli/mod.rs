@@ -880,6 +880,7 @@ mod tests {
         Ok(())
     }
 
+    /// `push` parses a run, a repo and its flags.
     #[test]
     fn push_takes_a_repo_and_its_flags() -> Result<(), clap::Error> {
         let Command::Push(args) = command(&[
@@ -924,6 +925,7 @@ mod tests {
         Ok(())
     }
 
+    /// Only the commands that write take the project lock.
     #[test]
     fn only_commands_that_write_take_the_lock() -> Result<(), clap::Error> {
         let writes = |args: &[&str]| -> Result<bool, clap::Error> {

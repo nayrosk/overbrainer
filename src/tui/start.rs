@@ -1177,6 +1177,7 @@ mod tests {
         Ok(())
     }
 
+    /// A plan reads the `[training]` section and the split files, and refuses a project without one.
     #[test]
     fn a_plan_reads_the_training_section_and_the_split_files()
     -> Result<(), Box<dyn std::error::Error>> {

@@ -61,6 +61,7 @@ pub fn select(output: &Path) -> Result<Vec<UploadFile>, SelectError> {
     Ok(chosen.into_values().collect())
 }
 
+/// Walks `dir` and collects the files to upload into `chosen`, keyed by their path in the repo.
 fn walk(
     root: &Path,
     dir: &Path,
@@ -138,6 +139,7 @@ mod tests {
 
     use super::*;
 
+    /// A temporary tree holding the given files.
     fn tree(files: &[&str]) -> Result<tempfile::TempDir, Box<dyn Error>> {
         let dir = tempfile::tempdir()?;
         for f in files {
@@ -150,10 +152,12 @@ mod tests {
         Ok(dir)
     }
 
+    /// The repo paths `select` picks for `dir`.
     fn paths(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
         Ok(select(dir)?.into_iter().map(|f| f.path_in_repo).collect())
     }
 
+    /// The layout flattens the GGUF files and keeps the merged model.
     #[test]
     fn layout_flattens_gguf_and_keeps_merged() -> Result<(), Box<dyn Error>> {
         let dir = tree(&[
@@ -182,6 +186,7 @@ mod tests {
         Ok(())
     }
 
+    /// The sizes come from the files on disk.
     #[test]
     fn sizes_come_from_the_files() -> Result<(), Box<dyn Error>> {
         let dir = tempfile::tempdir()?;
@@ -193,6 +198,7 @@ mod tests {
         Ok(())
     }
 
+    /// Two files that get the same name after flattening are an error.
     #[test]
     fn a_name_clash_after_flattening_is_an_error() -> Result<(), Box<dyn Error>> {
         let dir = tree(&["Modelfile", "gguf/Modelfile"])?;
@@ -212,6 +218,7 @@ mod tests {
         Ok(())
     }
 
+    /// No file may land on the card's `README.md`.
     #[test]
     fn nothing_may_land_on_the_card() -> Result<(), Box<dyn Error>> {
         let dir = tree(&["adapter_config.json", "gguf/README.md", "gguf/m.gguf"])?;
@@ -219,6 +226,7 @@ mod tests {
         Ok(())
     }
 
+    /// A nested GGUF keeps its relative path, and a hidden file is skipped at any depth.
     #[test]
     fn nested_gguf_keeps_its_relative_path_and_hidden_is_skipped_at_depth()
     -> Result<(), Box<dyn Error>> {
@@ -242,6 +250,7 @@ mod tests {
         Ok(())
     }
 
+    /// Symbolic links are skipped.
     #[cfg(unix)]
     #[test]
     fn symlinks_are_skipped() -> Result<(), Box<dyn Error>> {

@@ -489,6 +489,7 @@ fn hub_error(error: HubError) -> anyhow::Error {
     }
 }
 
+/// `private` or `public`, as the push says it.
 fn visibility(private: bool) -> &'static str {
     if private { "private" } else { "public" }
 }
@@ -506,10 +507,12 @@ pub(crate) fn files_word(count: usize) -> String {
 struct Offline;
 
 impl Hub for Offline {
+    /// Reports no user and refuses every call that would reach the network.
     fn whoami(&self) -> impl Future<Output = Result<String, HubError>> + Send {
         ready(Err(HubError::Auth))
     }
 
+    /// Refuses with an authentication error: a dry run has no token.
     fn ensure_repo(
         &self,
         _repo: &RepoId,
@@ -518,6 +521,7 @@ impl Hub for Offline {
         ready(Err(HubError::Auth))
     }
 
+    /// Refuses with an authentication error: a dry run has no token.
     fn remote_card(
         &self,
         _repo: &RepoId,
@@ -525,6 +529,7 @@ impl Hub for Offline {
         ready(Err(HubError::Auth))
     }
 
+    /// Refuses with an authentication error: a dry run has no token.
     fn license_of(
         &self,
         _model: &str,
@@ -532,6 +537,7 @@ impl Hub for Offline {
         ready(Ok(None))
     }
 
+    /// Refuses with an authentication error: a dry run has no token.
     fn upload(
         &self,
         _repo: &RepoId,
@@ -559,11 +565,13 @@ pub(crate) mod fixtures {
     };
     use crate::runs::{RunRecord, RunState, Runs, Snapshot, SnapshotReason};
 
+    /// The id of the run the fake Hub tests push.
     pub(crate) const RUN: &str = "r1";
 
     /// `(repo, paths, card)` of an upload; no card when README.md is kept.
     pub(crate) type Upload = (String, Vec<String>, Option<String>);
 
+    /// A Hub that records what it is asked and answers as it was set up to.
     #[derive(Default)]
     pub(crate) struct FakeHub {
         /// The visibility of the repo when it exists already.
@@ -583,6 +591,7 @@ pub(crate) mod fixtures {
     }
 
     impl Hub for FakeHub {
+        /// Answers from the fields, and records the repo and the files of each upload.
         fn whoami(&self) -> impl Future<Output = Result<String, HubError>> + Send {
             ready(if self.fail_auth {
                 Err(HubError::Auth)
@@ -591,6 +600,7 @@ pub(crate) mod fixtures {
             })
         }
 
+        /// Records the repo and its visibility, and answers from the fields.
         fn ensure_repo(
             &self,
             repo: &RepoId,
@@ -610,6 +620,7 @@ pub(crate) mod fixtures {
             }))
         }
 
+        /// Answers with the remote card set on the fake.
         fn remote_card(
             &self,
             _repo: &RepoId,
@@ -617,6 +628,7 @@ pub(crate) mod fixtures {
             ready(Ok(self.remote_card.clone()))
         }
 
+        /// Answers with a fixed license.
         fn license_of(
             &self,
             _model: &str,
@@ -624,6 +636,7 @@ pub(crate) mod fixtures {
             ready(Ok(Some("apache-2.0".into())))
         }
 
+        /// Records the upload and reports progress in the steps set on the fake.
         fn upload(
             &self,
             repo: &RepoId,
@@ -653,15 +666,18 @@ pub(crate) mod fixtures {
     }
 
     impl FakeHub {
+        /// The uploads made so far.
         pub(crate) fn uploads(&self) -> Vec<Upload> {
             self.uploads.lock().map(|u| u.clone()).unwrap_or_default()
         }
 
+        /// The repos ensured so far, with their visibility.
         pub(crate) fn ensured(&self) -> Vec<(String, bool)> {
             self.ensured.lock().map(|e| e.clone()).unwrap_or_default()
         }
     }
 
+    /// A minimal project config, with a mock provider and a local target.
     pub(crate) const CONFIG: &str = r#"[project]
 name = "my_proj"
 
@@ -673,11 +689,13 @@ generator = { provider = "mock", model = "gen" }
 parent = { provider = "mock", model = "parent" }
 "#;
 
+    /// Settings from `CONFIG` plus `extra`, with a Hugging Face token in the environment.
     pub(crate) fn settings(extra: &str) -> Result<Settings, Box<dyn std::error::Error>> {
         let env = vec![("OVERBRAINER_HF_TOKEN".to_string(), "hf_test".to_string())];
         Ok(load_str(&format!("{CONFIG}{extra}"), EnvSource::Vars(env))?)
     }
 
+    /// A run record in `state`, with no model recorded yet.
     pub(crate) fn record(state: RunState) -> RunRecord {
         RunRecord {
             id: RUN.into(),
@@ -747,6 +765,7 @@ parent = { provider = "mock", model = "parent" }
         (front, lines)
     }
 
+    /// The lines the front end said so far.
     pub(crate) fn said(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
         lines.lock().map(|l| l.clone()).unwrap_or_default()
     }
@@ -761,8 +780,10 @@ mod tests {
     use crate::hub::card::MARKER;
     use crate::runs::{RunRecord, RunState};
 
+    /// The result of a test that can fail with any error.
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+    /// Runs `push_run` against `hub` and returns its result with the lines said.
     async fn push(
         hub: &FakeHub,
         runs: &Runs,
@@ -779,6 +800,7 @@ mod tests {
         (pushed, said(&lines))
     }
 
+    /// A running run is refused and nothing is uploaded.
     #[tokio::test]
     async fn refuses_a_running_run() -> TestResult {
         let (_project, runs) = project(RunState::Running, false)?;
@@ -818,6 +840,7 @@ mod tests {
         Ok(())
     }
 
+    /// A stopped run that has only a checkpoint is refused.
     #[tokio::test]
     async fn refuses_a_checkpoint_only_stopped_run() -> TestResult {
         let (_project, runs) = project(RunState::Stopped, true)?;
@@ -833,6 +856,7 @@ mod tests {
         Ok(())
     }
 
+    /// Without `--repo` or `[hub].repo`, the repo is the user name and the project name.
     #[tokio::test]
     async fn default_repo_is_whoami_slash_project() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;
@@ -873,6 +897,7 @@ mod tests {
         Ok(())
     }
 
+    /// `--public` wins over `[hub].private`.
     #[tokio::test]
     async fn public_flag_wins_over_config() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;
@@ -901,6 +926,7 @@ mod tests {
         Ok(())
     }
 
+    /// A dry run writes the card and uploads nothing.
     #[tokio::test]
     async fn dry_run_writes_the_card_and_uploads_nothing() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;
@@ -929,6 +955,7 @@ mod tests {
         Ok(())
     }
 
+    /// A card that overbrainer did not write is kept unless the flag is given.
     #[tokio::test]
     async fn foreign_card_is_kept_without_the_flag() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;
@@ -965,6 +992,7 @@ mod tests {
         Ok(())
     }
 
+    /// A card that carries the overbrainer marker is replaced.
     #[tokio::test]
     async fn marked_card_is_replaced() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;
@@ -992,6 +1020,7 @@ mod tests {
         Ok(())
     }
 
+    /// `--overwrite-card` replaces a card that overbrainer did not write.
     #[tokio::test]
     async fn overwrite_card_replaces_a_foreign_card() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;
@@ -1014,6 +1043,7 @@ mod tests {
         Ok(())
     }
 
+    /// An authentication error names the token variable and never its value.
     #[tokio::test]
     async fn auth_error_names_the_token_variable_not_its_value() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;
@@ -1060,6 +1090,7 @@ mod tests {
         Ok(format!("{error:#}"))
     }
 
+    /// A refused namespace that differs from the user's only in case says so.
     #[tokio::test]
     async fn forbidden_namespace_differing_in_case_says_so() -> TestResult {
         let text = forbidden_push(Some("Nayrosk")).await?;
@@ -1071,6 +1102,7 @@ mod tests {
         Ok(())
     }
 
+    /// A refused namespace of another user names the owner.
     #[tokio::test]
     async fn forbidden_namespace_of_another_user_names_the_owner() -> TestResult {
         let text = forbidden_push(Some("someone")).await?;
@@ -1082,6 +1114,7 @@ mod tests {
         Ok(())
     }
 
+    /// A refused namespace keeps the plain message when `whoami` fails.
     #[tokio::test]
     async fn forbidden_namespace_keeps_the_plain_message_when_whoami_fails() -> TestResult {
         let text = forbidden_push(None).await?;
@@ -1093,6 +1126,7 @@ mod tests {
         Ok(())
     }
 
+    /// Progress is published at most once a second.
     #[tokio::test]
     async fn progress_is_published_at_most_once_a_second() -> TestResult {
         let hub = FakeHub {
@@ -1129,6 +1163,7 @@ mod tests {
         Ok(())
     }
 
+    /// The plan says what a push sends without any network call.
     #[test]
     fn plan_says_what_a_push_sends_without_the_network() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;
@@ -1169,6 +1204,7 @@ mod tests {
         Ok(())
     }
 
+    /// `push_with_token` refuses when no token is set.
     #[tokio::test]
     async fn push_with_token_refuses_without_a_token() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;
@@ -1186,6 +1222,7 @@ mod tests {
         Ok(())
     }
 
+    /// A finished push is saved in the run's push record.
     #[tokio::test]
     async fn push_record_is_saved() -> TestResult {
         let (_project, runs) = project(RunState::Succeeded, false)?;

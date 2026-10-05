@@ -693,6 +693,7 @@ mod tests {
         }
     }
 
+    /// A Runpod target with the given GPU types and data centers and no other limit.
     fn target(gpu_types: ListOrAuto, data_center_ids: ListOrAuto) -> RunpodTarget {
         RunpodTarget {
             gpu_types,

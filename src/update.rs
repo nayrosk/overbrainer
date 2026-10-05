@@ -321,6 +321,7 @@ mod tests {
         "newest_version":"0.5.0-rc.1","downloads":1234},
         "versions":[{"num":"0.5.0-rc.1"},{"num":"0.4.2"}]}"#;
 
+    /// A fixed clock for the update tests.
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_hours(500_000)
     }

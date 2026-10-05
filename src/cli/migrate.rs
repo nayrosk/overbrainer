@@ -254,6 +254,7 @@ fn hub_model_id(project_dir: &Path) -> anyhow::Result<Option<Change>> {
         }))
 }
 
+/// Parses the project's `overbrainer.toml`; `None` when the file is missing or does not parse.
 fn read_config(project_dir: &Path) -> anyhow::Result<Option<ConfigDoc>> {
     let path = project_dir.join(CONFIG_FILE);
     match std::fs::read_to_string(&path) {
@@ -491,6 +492,7 @@ mod tests {
         Ok(())
     }
 
+    /// A stopped backfill is finished for the models it lacks and no others.
     #[test]
     fn a_stopped_backfill_is_finished_with_the_missing_models_only() -> TestResult {
         let dir = old_project()?;
@@ -561,6 +563,7 @@ mod tests {
         Ok(())
     }
 
+    /// A config in a newer format than this version reads is refused.
     #[test]
     fn a_newer_format_is_refused() -> TestResult {
         let dir = old_project()?;
@@ -605,12 +608,14 @@ mod tests {
         )
     }
 
+    /// Reads the project's `overbrainer.toml` back as text.
     fn read_toml(dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
         Ok(std::fs::read_to_string(
             dir.join(crate::config::CONFIG_FILE),
         )?)
     }
 
+    /// Loads config text into settings with an empty environment.
     fn load_text(text: &str) -> Result<crate::config::Settings, Box<dyn std::error::Error>> {
         Ok(crate::config::load_str(
             text,
@@ -618,6 +623,7 @@ mod tests {
         )?)
     }
 
+    /// `training.hub_model_id` moves to `[hub].repo`.
     #[test]
     fn hub_model_id_moves_to_the_hub_section() -> TestResult {
         let dir = project_with_toml(&with_training_key("hub_model_id = \"me/mentor\""))?;
@@ -635,6 +641,7 @@ mod tests {
         Ok(())
     }
 
+    /// A dry run lists the move to `[hub]` and leaves the file as it was.
     #[test]
     fn dry_run_lists_the_hub_move_without_writing() -> TestResult {
         let dir = project_with_toml(&with_training_key("hub_model_id = \"me/mentor\""))?;
@@ -649,6 +656,7 @@ mod tests {
         Ok(())
     }
 
+    /// A `[hub].repo` that is already set is not overwritten by the old key.
     #[test]
     fn an_existing_hub_repo_is_not_overwritten() -> TestResult {
         let toml = format!(
@@ -671,6 +679,7 @@ mod tests {
         Ok(())
     }
 
+    /// A `[hub]` table that sets the flags keeps their values.
     #[test]
     fn a_hub_table_that_sets_the_flags_keeps_them() -> TestResult {
         let toml = format!(
@@ -689,6 +698,7 @@ mod tests {
         Ok(())
     }
 
+    /// The move reports only the flags it actually sets.
     #[test]
     fn the_move_names_only_the_flags_it_sets() -> TestResult {
         let toml = format!(
@@ -709,6 +719,7 @@ mod tests {
         Ok(())
     }
 
+    /// A config that is missing or does not parse has nothing to move.
     #[test]
     fn a_missing_or_unparsable_config_has_nothing_to_move() -> TestResult {
         let dir = project_with_toml("")?;
@@ -722,6 +733,7 @@ mod tests {
         Ok(())
     }
 
+    /// A config without `hub_model_id` is left alone.
     #[test]
     fn a_config_without_the_key_is_left_alone() -> TestResult {
         let toml = with_training_key("epochs = 2");

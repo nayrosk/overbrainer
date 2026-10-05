@@ -520,6 +520,7 @@ mod tests {
         }
     }
 
+    /// A run that is not finished, or has no model, is refused by `export`.
     #[test]
     fn only_a_finished_run_with_a_model_is_exported() -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;

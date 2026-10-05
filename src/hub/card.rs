@@ -114,6 +114,7 @@ pub fn render(input: &CardInput) -> String {
     out
 }
 
+/// Writes the whole card: front matter, banner and its sections.
 fn write_card(out: &mut String, input: &CardInput) -> fmt::Result {
     front_matter(out, input)?;
     writeln!(out, "[![overbrainer]({BANNER_URL})]({REPO_URL})\n")?;
@@ -146,6 +147,7 @@ fn write_card(out: &mut String, input: &CardInput) -> fmt::Result {
     writeln!(out, "{MARKER}")
 }
 
+/// Writes the YAML front matter of the card.
 fn front_matter(out: &mut String, input: &CardInput) -> fmt::Result {
     let full = input.adapter == Adapter::Full;
     writeln!(out, "---")?;
@@ -167,6 +169,7 @@ fn front_matter(out: &mut String, input: &CardInput) -> fmt::Result {
     writeln!(out, "---\n")
 }
 
+/// Writes the "Use it" section: how to load and run the model.
 fn use_it(out: &mut String, input: &CardInput) -> fmt::Result {
     let repo = input.repo.to_string();
     writeln!(out, "## Use it\n")?;
@@ -196,6 +199,7 @@ fn use_it(out: &mut String, input: &CardInput) -> fmt::Result {
     writeln!(out, "```\n")
 }
 
+/// Writes the "How it was made" section: the data and the training behind the model.
 fn how_it_was_made(out: &mut String, input: &CardInput) -> fmt::Result {
     writeln!(out, "## How it was made\n")?;
     writeln!(
@@ -276,6 +280,7 @@ fn rows(input: &CardInput) -> Vec<(&'static str, String)> {
     rows
 }
 
+/// Writes the "Reproduce" section with the commands and the config to run it again.
 fn reproduce(out: &mut String, input: &CardInput) -> fmt::Result {
     writeln!(out, "## Reproduce\n")?;
     writeln!(out, "```sh\ncargo install --locked overbrainer\n```\n")?;
@@ -585,6 +590,7 @@ pub fn reproduce_toml(settings: &Settings) -> String {
     doc.to_string()
 }
 
+/// The `[providers]` entry of a role's model, as a TOML table.
 fn role_table(role: &RoleModel) -> Table {
     let mut table = Table::new();
     table["provider"] = value(role.provider.as_str());
@@ -603,6 +609,7 @@ fn role_table(role: &RoleModel) -> Table {
     table
 }
 
+/// The `[training]` settings that go in the reproduce config, as a TOML table.
 fn training_table(training: &Training) -> Table {
     let mut table = Table::new();
     table["base_model"] = value(shown_base(&training.base_model));
@@ -628,6 +635,7 @@ fn training_table(training: &Training) -> Table {
     table
 }
 
+/// The `[pipeline]` settings that go in the reproduce config, as a TOML table.
 fn pipeline_table(pipeline: &Pipeline) -> Table {
     let mut table = Table::new();
     if let Ok(concurrency) = i64::try_from(pipeline.concurrency) {
@@ -659,8 +667,10 @@ mod tests {
     use crate::runpod::PodRecord;
     use crate::runs::RunState;
 
+    /// Where the card snapshots are stored.
     const SNAPSHOTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/hub");
 
+    /// Compares `card` with the stored snapshot `name`.
     fn snapshot(name: &str, card: &str) {
         let mut settings = insta::Settings::clone_current();
         settings.set_snapshot_path(SNAPSHOTS);
@@ -669,6 +679,7 @@ mod tests {
         settings.bind(|| insta::assert_snapshot!(name.to_string(), card));
     }
 
+    /// The repo the test cards are for.
     fn repo() -> RepoId {
         RepoId {
             namespace: "nayrosk".into(),
@@ -676,6 +687,7 @@ mod tests {
         }
     }
 
+    /// A reproduce config with one topic.
     const REPRODUCE: &str = "[[topics]]\nname = \"ownership\"\n";
 
     /// The configuration the sample card's run was made with.
@@ -721,6 +733,7 @@ gpu_types = ["NVIDIA GeForce RTX 4090"]
 max_hours = 6
 "#;
 
+    /// A card input for an adapter run on Runpod, with a GGUF export.
     fn qlora_on_runpod() -> CardInput {
         CardInput {
             repo: repo(),
@@ -756,6 +769,7 @@ max_hours = 6
         }
     }
 
+    /// An adapter run with a GGUF export on Runpod gives the expected card.
     #[test]
     fn qlora_with_gguf_on_runpod() -> Result<(), Box<dyn Error>> {
         let settings = load_str(CARD_CONFIG, EnvSource::Vars(Vec::new()))?;
@@ -767,6 +781,7 @@ max_hours = 6
         Ok(())
     }
 
+    /// The reproduce intro names what the config leaves out.
     #[test]
     fn the_reproduce_intro_names_what_is_left_out() {
         assert!(render(&qlora_on_runpod()).contains(
@@ -774,6 +789,7 @@ max_hours = 6
         ));
     }
 
+    /// A full fine-tune is named as such and not as an adapter.
     #[test]
     fn a_full_fine_tune_is_named_as_such() {
         let input = CardInput {
@@ -787,6 +803,7 @@ max_hours = 6
         assert!(card.contains("| Adapter | none (full fine-tune) |"));
     }
 
+    /// Prose that comes from the config cannot open an HTML tag in the card.
     #[test]
     fn prose_cannot_open_html() {
         let input = CardInput {
@@ -810,6 +827,7 @@ max_hours = 6
         );
     }
 
+    /// A license that YAML would not read as a string is quoted.
     #[test]
     fn licenses_yaml_would_not_read_as_strings_are_quoted() {
         for (license, line) in [
@@ -828,6 +846,7 @@ max_hours = 6
         }
     }
 
+    /// A full fine-tune on a local target without GGUF gives the expected card.
     #[test]
     fn full_without_gguf_local() {
         let input = CardInput {
@@ -841,6 +860,7 @@ max_hours = 6
         snapshot("full_without_gguf_local", &render(&input));
     }
 
+    /// An unknown license and a run without metrics leave those parts out.
     #[test]
     fn unknown_license_and_no_metrics() {
         let input = CardInput {
@@ -859,6 +879,7 @@ max_hours = 6
         snapshot("unknown_license_and_no_metrics", &render(&input));
     }
 
+    /// Without GGUF, the card loads the adapter with PEFT.
     #[test]
     fn without_gguf_an_adapter_is_loaded_with_peft() {
         let input = CardInput {
@@ -873,6 +894,7 @@ max_hours = 6
         assert!(!card.contains("- gguf\n"));
     }
 
+    /// A local base model shows only its name.
     #[test]
     fn a_local_base_model_shows_only_its_name() -> Result<(), Box<dyn Error>> {
         let input = CardInput {
@@ -909,6 +931,7 @@ max_hours = 6
         Ok(())
     }
 
+    /// A summary without a count names the answers instead.
     #[test]
     fn a_summary_without_a_count_names_the_answers() {
         for (adapter, line) in [
@@ -932,6 +955,7 @@ max_hours = 6
         }
     }
 
+    /// A card is replaceable only when it carries the marker.
     #[test]
     fn replaceable_needs_the_marker() {
         assert!(replaceable(None));
@@ -940,6 +964,7 @@ max_hours = 6
         assert!(!replaceable(Some("")));
     }
 
+    /// Pipes in a table cell are escaped.
     #[test]
     fn table_cells_escape_pipes() {
         let input = CardInput {
@@ -953,6 +978,7 @@ max_hours = 6
         assert!(card.contains("answered by a|b c."), "{card}");
     }
 
+    /// A spend under one cent reads as less than a cent.
     #[test]
     fn tiny_spend_reads_less_than_a_cent() {
         let mut input = qlora_on_runpod();
@@ -970,6 +996,7 @@ max_hours = 6
         assert!(render(&input).contains("(NVIDIA A40) for about $1.23."));
     }
 
+    /// A duration uses the largest fitting unit.
     #[test]
     fn durations_use_the_largest_unit() {
         let cases = [
@@ -983,6 +1010,7 @@ max_hours = 6
         }
     }
 
+    /// A config that holds secret values, to check they stay out of the card.
     const SECRET_CONFIG: &str = r#"
 [project]
 name = "demo"
@@ -1019,6 +1047,7 @@ kind = "ssh"
 runtime = "docker"
 "#;
 
+    /// Settings loaded from `SECRET_CONFIG`.
     fn secret_settings() -> Result<Settings, Box<dyn Error>> {
         let env = EnvSource::Vars(vec![
             (
@@ -1037,6 +1066,7 @@ runtime = "docker"
         Ok(load_str(SECRET_CONFIG, env)?)
     }
 
+    /// The reproduce config holds no secret value.
     #[test]
     fn reproduce_toml_has_no_secrets() -> Result<(), Box<dyn Error>> {
         let settings = secret_settings()?;
@@ -1070,6 +1100,7 @@ runtime = "docker"
         Ok(())
     }
 
+    /// Writes `text` to `path`, creating the parent directories.
     fn write(path: PathBuf, text: &str) -> Result<(), Box<dyn Error>> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -1078,6 +1109,7 @@ runtime = "docker"
         Ok(())
     }
 
+    /// A succeeded run record named `id`.
     fn run_record(id: &str) -> RunRecord {
         RunRecord {
             id: id.to_string(),
@@ -1093,6 +1125,7 @@ runtime = "docker"
         }
     }
 
+    /// An upload file of one byte at `path_in_repo`.
     fn upload(path_in_repo: &str) -> UploadFile {
         UploadFile {
             local: PathBuf::from(path_in_repo),
@@ -1101,6 +1134,7 @@ runtime = "docker"
         }
     }
 
+    /// `gather` reads the run as it ran: its config, data, metrics and cost.
     #[test]
     fn gather_reads_the_run_as_it_ran() -> Result<(), Box<dyn Error>> {
         let project = tempfile::tempdir()?;
@@ -1173,6 +1207,7 @@ runtime = "docker"
         Ok(())
     }
 
+    /// `gather` leaves out what a bare run does not have.
     #[test]
     fn gather_leaves_out_what_a_bare_run_lacks() -> Result<(), Box<dyn Error>> {
         let project = tempfile::tempdir()?;
@@ -1199,6 +1234,7 @@ runtime = "docker"
         Ok(())
     }
 
+    /// Run files that cannot be read drop their rows and not the card.
     #[test]
     fn unreadable_run_files_drop_their_rows() -> Result<(), Box<dyn Error>> {
         let project = tempfile::tempdir()?;
@@ -1233,6 +1269,7 @@ runtime = "docker"
         Ok(())
     }
 
+    /// A metrics file of bad lines gives no rows.
     #[test]
     fn a_metrics_file_of_bad_lines_gives_no_rows() -> Result<(), Box<dyn Error>> {
         let project = tempfile::tempdir()?;
@@ -1252,6 +1289,7 @@ runtime = "docker"
         Ok(())
     }
 
+    /// One training log gives no duration.
     #[test]
     fn one_training_log_gives_no_duration() -> Result<(), Box<dyn Error>> {
         let dir = tempfile::tempdir()?;
@@ -1266,6 +1304,7 @@ runtime = "docker"
         Ok(())
     }
 
+    /// `gather` fails when the run has no config.
     #[test]
     fn gather_fails_without_the_run_config() -> Result<(), Box<dyn Error>> {
         let project = tempfile::tempdir()?;

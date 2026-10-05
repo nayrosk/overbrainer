@@ -37,6 +37,7 @@ impl RepoId {
 }
 
 impl fmt::Display for RepoId {
+    /// Writes the repo as `namespace/name`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.namespace, self.name)
     }
@@ -186,6 +187,7 @@ pub trait Hub: Send + Sync {
 mod tests {
     use super::*;
 
+    /// `parse` accepts one slash and displays the id back unchanged.
     #[test]
     fn parse_accepts_one_slash_and_displays_it_back() {
         let repo = RepoId::parse("me/model-1");
@@ -199,6 +201,7 @@ mod tests {
         assert_eq!(repo.map(|r| r.to_string()).as_deref(), Some("me/model-1"));
     }
 
+    /// `parse` rejects anything but `namespace/name`.
     #[test]
     fn parse_rejects_anything_but_namespace_slash_name() {
         for text in ["a", "a/b/c", "/b", "a/", "", "a/b c", ".a/b"] {

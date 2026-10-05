@@ -73,6 +73,7 @@ impl PushRecord {
 mod tests {
     use super::*;
 
+    /// A saved record reads back as it was written.
     #[test]
     fn a_saved_record_reads_back() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;

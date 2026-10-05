@@ -76,6 +76,7 @@ const DATASET: &[KeyHelp] = &[
     row("D", "delete the question's answer only (asks first)"),
 ];
 
+/// The help rows of the training view.
 const TRAINING: &[KeyHelp] = &[
     row("k j, Up Down", "select a run"),
     row("a, p", "attach the run again; p hides or shows its pod"),
@@ -199,6 +200,7 @@ const FOOTER_PIPELINE: &[Hint] = &[
     hint("q", "quit"),
     hint("1-5", "views"),
 ];
+/// The footer hints of the training view.
 const FOOTER_TRAINING: &[Hint] = &[
     hint("j/k", "select"),
     hint("a", "attach"),
@@ -208,6 +210,7 @@ const FOOTER_TRAINING: &[Hint] = &[
     hint("x", "clear"),
     hint("p", "pod"),
 ];
+/// The footer hints of the Training view on a Runpod run still starting, where `c` abandons it.
 const FOOTER_ABANDON: &[Hint] = &[
     hint("j/k", "select"),
     hint("a", "attach"),

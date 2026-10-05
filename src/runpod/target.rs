@@ -142,6 +142,7 @@ mod tests {
         }
     }
 
+    /// A target with no settings gets the default image, venv and boot grace.
     #[test]
     fn defaults_are_applied() -> Result<(), &'static str> {
         let target = RunpodTarget::from_target(&config_target(None)).ok_or("not runpod")?;

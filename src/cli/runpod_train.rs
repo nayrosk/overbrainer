@@ -1131,6 +1131,7 @@ mod tests {
         Ok(())
     }
 
+    /// A Runpod target with an A40 and no limits.
     fn target() -> RunpodTarget {
         RunpodTarget {
             gpu_types: ListOrAuto::List(vec!["NVIDIA A40".into()]),

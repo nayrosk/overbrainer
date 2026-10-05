@@ -9,12 +9,16 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// The result of a test that can fail with any error.
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+/// The id of the run the tests push.
 const RUN: &str = "20261004-120000-a1b2";
 
+/// A fake token for the tests.
 const TOKEN: &str = "hf_test";
 
+/// A project config with a mock provider and a local target.
 const CONFIG: &str = r#"[project]
 name = "my_demo"
 
@@ -56,6 +60,7 @@ fn project() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
     Ok(dir)
 }
 
+/// The `overbrainer` command in `dir`, with a clean environment.
 fn overbrainer(dir: &Path) -> Result<Command, Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("overbrainer")?;
     cmd.env_clear()
@@ -66,6 +71,7 @@ fn overbrainer(dir: &Path) -> Result<Command, Box<dyn std::error::Error>> {
     Ok(cmd)
 }
 
+/// The Hub's answer for a repo that does not exist.
 fn not_found() -> ResponseTemplate {
     ResponseTemplate::new(404).set_body_json(json!({"error": "Repository not found"}))
 }
@@ -128,6 +134,7 @@ fn leaks(bytes: &[u8]) -> bool {
     String::from_utf8_lossy(bytes).contains(TOKEN)
 }
 
+/// A run is pushed to a new repo and the push is recorded.
 #[tokio::test]
 async fn a_run_is_pushed_to_a_new_repo_and_recorded() -> TestResult {
     let dir = project()?;
@@ -169,6 +176,7 @@ async fn a_run_is_pushed_to_a_new_repo_and_recorded() -> TestResult {
     Ok(())
 }
 
+/// A dry run needs no token and sends nothing.
 #[tokio::test]
 async fn a_dry_run_needs_no_token_and_sends_nothing() -> TestResult {
     let dir = project()?;
@@ -198,6 +206,7 @@ async fn a_dry_run_needs_no_token_and_sends_nothing() -> TestResult {
     Ok(())
 }
 
+/// A push without a token is refused before any request.
 #[tokio::test]
 async fn a_push_without_a_token_is_refused_before_any_request() -> TestResult {
     let dir = project()?;
@@ -220,6 +229,7 @@ async fn a_push_without_a_token_is_refused_before_any_request() -> TestResult {
     Ok(())
 }
 
+/// A refused token is named and never shown.
 #[tokio::test]
 async fn a_refused_token_is_named_never_shown() -> TestResult {
     let dir = project()?;

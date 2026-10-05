@@ -679,6 +679,7 @@ fn export_value(export: &crate::config::Export, field: &str) -> Option<String> {
     }
 }
 
+/// The text of a `[hub]` field for the project view; `None` for a field it does not show.
 fn hub_value(hub: &crate::config::Hub, field: &str) -> Option<String> {
     match field {
         "repo" => hub.repo.clone(),
@@ -1142,6 +1143,7 @@ mod tests {
         );
     }
 
+    /// The rows follow the file order, with the tables that only the environment sets last.
     #[test]
     fn the_rows_follow_the_file_order_with_the_env_only_tables_last() -> TestResult {
         let rows = rows(&config()?, &Locks::default());
@@ -1246,6 +1248,7 @@ mod tests {
         Ok(())
     }
 
+    /// The detail of a row says where its value comes from.
     #[test]
     fn the_detail_says_where_a_value_comes_from() -> TestResult {
         let rows = rows(&config()?, &Locks::default());
@@ -1265,6 +1268,7 @@ mod tests {
         Ok(())
     }
 
+    /// The Hub base URL is an environment-only row like the Runpod one.
     #[test]
     fn the_hub_base_url_is_an_env_only_row_like_the_runpod_one() -> TestResult {
         let rows = rows(&config()?, &Locks::default());

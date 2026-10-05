@@ -842,6 +842,7 @@ mod tests {
         runtime = "native"
     "#;
 
+    /// An empty `[hub]` is private and manual.
     #[test]
     fn hub_defaults_are_private_and_manual() -> Result<(), config::ConfigError> {
         let loaded = settings(VALID)?;
@@ -851,6 +852,7 @@ mod tests {
         Ok(())
     }
 
+    /// `[hub].repo` must be `namespace/name`.
     #[test]
     fn hub_repo_must_be_namespace_slash_name() -> Result<(), config::ConfigError> {
         for repo in ["no-slash", "a/b/c", "a/", "/b", "a b/c"] {
@@ -865,6 +867,7 @@ mod tests {
         Ok(())
     }
 
+    /// The Hub base URL follows the same rule as the Runpod one.
     #[test]
     fn hub_base_url_follows_the_runpod_rule() -> Result<(), config::ConfigError> {
         let toml = format!("{VALID}\n[hub]\nbase_url = \"http://example.com\"\n");
@@ -877,6 +880,7 @@ mod tests {
         Ok(())
     }
 
+    /// `training.hub_model_id` is reported as deprecated.
     #[test]
     fn hub_model_id_is_reported_as_deprecated() -> Result<(), config::ConfigError> {
         assert_eq!(deprecations(&settings(VALID)?), Vec::<String>::new());
@@ -894,6 +898,7 @@ mod tests {
         Ok(())
     }
 
+    /// A push after training without a token is warned about.
     #[test]
     fn a_push_after_training_without_a_token_is_warned() -> Result<(), config::ConfigError> {
         let on = format!("{VALID}\n[hub]\nafter_training = true\n");
@@ -918,6 +923,7 @@ mod tests {
         Ok(())
     }
 
+    /// An unknown `[hub]` key is rejected.
     #[test]
     fn unknown_hub_keys_are_rejected() {
         let toml = format!("{VALID}\n[hub]\nrepository = \"a/b\"\n");

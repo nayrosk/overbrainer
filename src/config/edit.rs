@@ -581,6 +581,7 @@ impl ConfigDoc {
         Ok(())
     }
 
+    /// The field spec of `path`, or an error when the section has no such field.
     fn spec_of(&self, path: &FieldPath) -> Result<&'static FieldSpec, EditError> {
         let section = match path {
             FieldPath::Project(_) => Section::Project,
