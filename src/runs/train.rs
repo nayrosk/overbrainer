@@ -1016,9 +1016,10 @@ mod tests {
 
     use super::*;
 
+    /// The warning for a failed poll carries the SSH error's cause.
     #[test]
     fn an_unreachable_job_says_why_ssh_failed() {
-        let error = ExecError::Ssh(openssh::Error::Disconnected);
+        let error = ExecError::Ssh(crate::exec::SshError::Disconnected);
         assert_eq!(
             unreachable_line(&error, 2),
             format!(

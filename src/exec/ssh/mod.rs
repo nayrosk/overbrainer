@@ -1,14 +1,18 @@
+mod error;
+mod transport;
+
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::ExitStatus;
-use std::time::Duration;
 
-use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Child;
 
+pub use self::error::SshError;
+use self::transport::{OpenSshTransport, Pipes, RemoteProcess, Transport};
 use super::tar;
 use super::{
     CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, FileDigest, JOB_LOG, JobCommand,
@@ -42,7 +46,7 @@ use super::{
 /// cancel cannot stop it.
 #[derive(Debug)]
 pub struct SshExecutor {
-    session: Session,
+    transport: Transport,
     workdir: String,
 }
 
@@ -62,54 +66,48 @@ impl SshExecutor {
         workdir: &str,
         config_file: Option<&Path>,
     ) -> Result<Self, ExecError> {
-        let mut builder = SessionBuilder::default();
-        builder
-            .known_hosts_check(KnownHosts::Strict)
-            .connect_timeout(Duration::from_secs(30))
-            .server_alive_interval(Duration::from_secs(15));
-        if let Some(config_file) = config_file {
-            builder.config_file(config_file);
-        }
-        // What `connect_mux` does, keeping the master's `-E` log path: `log` in
-        // the control directory, the path `Session::detach` documents as the
-        // "ssh multiplex output log".
-        let (builder, destination) = builder.resolve(destination);
-        let control = builder
-            .launch_master(destination)
-            .await
-            .map_err(ExecError::Ssh)?;
-        let log: PathBuf = control.path().join("log");
-        let session = Session::new_native_mux(control);
+        let transport = Transport::OpenSsh(
+            OpenSshTransport::connect(destination, config_file)
+                .await
+                .map_err(ExecError::Ssh)?,
+        );
         let dir = shell_path(workdir);
         let resolved = run(
-            &session,
+            &transport,
             &format!("mkdir -p -- {dir} && cd -- {dir} && pwd -P"),
             "create the work directory",
         )
         .await
-        .map_err(|error| master_died(error, &log))?;
+        .map_err(|error| match &transport {
+            Transport::OpenSsh(openssh) => master_died(error, openssh.master_log()),
+        })?;
         let workdir = String::from_utf8_lossy(&resolved).trim().to_string();
         if !workdir.starts_with('/') {
             return Err(ExecError::Protocol(format!(
                 "the work directory resolved to `{workdir}`"
             )));
         }
-        Ok(Self { session, workdir })
+        Ok(Self { transport, workdir })
     }
 
+    /// Starts `job` detached on the target, its secrets fed on the launcher's
+    /// standard input, and returns its process ID.
     async fn start(&self, job: &JobCommand) -> Result<JobId, ExecError> {
         let launcher = launcher(job)?;
-        let mut command = self.session.shell(launcher);
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().await.map_err(ExecError::Ssh)?;
-        let stdin = child.stdin().take();
+        let all = Pipes {
+            stdin: true,
+            stdout: true,
+            stderr: true,
+        };
+        let mut process = self
+            .transport
+            .exec(&launcher, all)
+            .await
+            .map_err(ExecError::Ssh)?;
+        let stdin = process.stdin.take();
         // Fed while the output is read, so a launcher failing before it has read
         // every secret reports its own error rather than a broken pipe.
-        let (fed, output) =
-            tokio::join!(feed_secrets(stdin, &job.secrets), child.wait_with_output());
+        let (fed, output) = tokio::join!(feed_secrets(stdin, &job.secrets), output(process));
         let output = output.map_err(ExecError::Ssh)?;
         if !output.status.success() {
             return Err(ExecError::Command {
@@ -117,7 +115,7 @@ impl SshExecutor {
                 message: tar::failure(&output.stderr, output.status),
             });
         }
-        fed.map_err(remote_io)?;
+        fed.map_err(|error| remote_io(&error))?;
         let text = String::from_utf8_lossy(&output.stdout);
         let raw: u32 = text
             .trim()
@@ -130,6 +128,8 @@ impl SshExecutor {
         })
     }
 
+    /// Copies `local`, without the `skip` entries, into `remote` through a `tar`
+    /// stream.
     async fn send(&self, local: &Path, remote: &str, skip: &[String]) -> Result<(), ExecError> {
         // Listed up front: a local `tar` that cannot even open the directory would
         // send an empty stream, and the remote `tar` complaining about that would hide
@@ -137,24 +137,32 @@ impl SshExecutor {
         let entries = tar::upload_entries(local, skip)?;
         let dir = quote(remote);
         if entries.is_empty() {
-            run(&self.session, &format!("mkdir -p -- {dir}"), "upload").await?;
+            run(&self.transport, &format!("mkdir -p -- {dir}"), "upload").await?;
             return Ok(());
         }
-        let mut command = self
-            .session
-            .shell(format!("mkdir -p -- {dir} && tar -C {dir} -xf -"));
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().await.map_err(ExecError::Ssh)?;
+        let pipes = Pipes {
+            stdin: true,
+            stdout: false,
+            stderr: true,
+        };
+        let mut process = self
+            .transport
+            .exec(&format!("mkdir -p -- {dir} && tar -C {dir} -xf -"), pipes)
+            .await
+            .map_err(ExecError::Ssh)?;
         let create = tar::spawn_create(local, &entries, &[])?;
         let (copied, errors, created) =
-            transfer(create, child.stdin().take(), child.stderr().take()).await;
-        let received = child.wait().await.map_err(ExecError::Ssh);
+            transfer(create, process.stdin.take(), process.stderr.take()).await;
+        let received = process
+            .wait()
+            .await
+            .map(exit_status)
+            .map_err(ExecError::Ssh);
         upload_outcome(received, &errors, created, copied)
     }
 
+    /// Copies the `entries` of `remote`, without `exclude`, into `local` through a
+    /// `tar` stream.
     async fn fetch(
         &self,
         remote: &str,
@@ -162,15 +170,23 @@ impl SshExecutor {
         entries: &[String],
         exclude: &[String],
     ) -> Result<(), ExecError> {
-        let mut command = self.session.shell(archive_script(remote, entries, exclude));
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().await.map_err(ExecError::Ssh)?;
+        let pipes = Pipes {
+            stdin: false,
+            stdout: true,
+            stderr: true,
+        };
+        let mut process = self
+            .transport
+            .exec(&archive_script(remote, entries, exclude), pipes)
+            .await
+            .map_err(ExecError::Ssh)?;
         let (extracted, errors) =
-            receive(child.stdout().take(), child.stderr().take(), local).await;
-        let sent = child.wait().await.map_err(ExecError::Ssh);
+            receive(process.stdout.take(), process.stderr.take(), local).await;
+        let sent = process
+            .wait()
+            .await
+            .map(exit_status)
+            .map_err(ExecError::Ssh);
         download_outcome(extracted, sent, &errors)
     }
 }
@@ -182,7 +198,7 @@ impl Executor for SshExecutor {
 
     async fn claim(&self, dir: &str, owner: &str) -> Result<bool, ExecError> {
         let script = claim_script(dir, owner);
-        let output = run(&self.session, &script, "claim the run directory").await?;
+        let output = run(&self.transport, &script, "claim the run directory").await?;
         match String::from_utf8_lossy(&output).trim() {
             "claimed" => Ok(true),
             "taken" => Ok(false),
@@ -204,12 +220,12 @@ impl Executor for SshExecutor {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        run(&self.session, &read_script(path, offset, limit), "read").await
+        run(&self.transport, &read_script(path, offset, limit), "read").await
     }
 
     async fn status(&self, job: &JobId) -> Result<JobStatus, ExecError> {
         let script = status_script(&job.dir, job.pid.get());
-        let output = run(&self.session, &script, "status").await?;
+        let output = run(&self.transport, &script, "status").await?;
         let text = String::from_utf8_lossy(&output);
         parse_status(&text)
             .ok_or_else(|| ExecError::Protocol(format!("unknown job status {:?}", text.trim())))
@@ -217,7 +233,7 @@ impl Executor for SshExecutor {
 
     async fn cancel(&self, job: &JobId) -> Result<(), ExecError> {
         let script = cancel_script(&job.dir, job.pid.get(), job.container.as_ref());
-        run(&self.session, &script, "cancel").await.map(drop)
+        run(&self.transport, &script, "cancel").await.map(drop)
     }
 
     async fn download(
@@ -237,16 +253,16 @@ impl Executor for SshExecutor {
         exclude: &[String],
     ) -> Result<Vec<FileDigest>, ExecError> {
         let script = manifest_script(remote, entries, exclude);
-        let output = run(&self.session, &script, "manifest").await?;
+        let output = run(&self.transport, &script, "manifest").await?;
         parse_manifest(&String::from_utf8_lossy(&output))
     }
 
     async fn probe(&self, script: &str) -> Result<Vec<u8>, ExecError> {
-        run(&self.session, script, "probe").await
+        run(&self.transport, script, "probe").await
     }
 
     async fn put_file(&self, path: &str, content: &str) -> Result<(), ExecError> {
-        run(&self.session, &put_script(path, content), "write a file")
+        run(&self.transport, &put_script(path, content), "write a file")
             .await
             .map(drop)
     }
@@ -396,7 +412,7 @@ async fn drain<E: AsyncRead + Unpin>(errors: Option<E>) -> Vec<u8> {
 /// The result of an upload. The receiving `tar`'s own failure comes first: when it
 /// dies early, the local `tar` and the copy only fail on a broken pipe. A receiver
 /// killed by a signal has no exit status: its error output, when it printed any,
-/// says more than openssh's bare [`openssh::Error::RemoteProcessTerminated`].
+/// says more than a bare [`SshError::Terminated`].
 fn upload_outcome(
     received: Result<ExitStatus, ExecError>,
     errors: &[u8],
@@ -404,9 +420,9 @@ fn upload_outcome(
     copied: io::Result<()>,
 ) -> Result<(), ExecError> {
     let status = match received {
-        Err(ExecError::Ssh(openssh::Error::RemoteProcessTerminated)) => {
+        Err(ExecError::Ssh(SshError::Terminated)) => {
             return Err(tar::error_text(errors).map_or(
-                ExecError::Ssh(openssh::Error::RemoteProcessTerminated),
+                ExecError::Ssh(SshError::Terminated),
                 |message| ExecError::Command {
                     action: "upload",
                     message,
@@ -422,7 +438,7 @@ fn upload_outcome(
         });
     }
     created?;
-    copied.map_err(remote_io)
+    copied.map_err(|error| remote_io(&error))
 }
 
 /// The result of a download. The local extraction's failure comes first: when it
@@ -448,7 +464,7 @@ fn download_outcome(
 /// with the tail of the master's log at `log` when the master was gone.
 fn master_died(error: ExecError, log: &Path) -> ExecError {
     match error {
-        ExecError::Ssh(openssh::Error::Disconnected) => ExecError::MasterDied {
+        ExecError::Ssh(SshError::Disconnected) => ExecError::MasterDied {
             log: master_log(log),
         },
         other => other,
@@ -498,13 +514,21 @@ fn log_tail(text: &str) -> String {
 }
 
 /// Runs `script` with `sh` on the target and returns its stdout.
-async fn run(session: &Session, script: &str, action: &'static str) -> Result<Vec<u8>, ExecError> {
-    let output = session
-        .shell(script)
-        .stdin(Stdio::null())
-        .output()
+async fn run(
+    transport: &Transport,
+    script: &str,
+    action: &'static str,
+) -> Result<Vec<u8>, ExecError> {
+    let pipes = Pipes {
+        stdin: false,
+        stdout: true,
+        stderr: true,
+    };
+    let process = transport
+        .exec(script, pipes)
         .await
         .map_err(ExecError::Ssh)?;
+    let output = output(process).await.map_err(ExecError::Ssh)?;
     if output.status.success() {
         Ok(output.stdout)
     } else {
@@ -515,8 +539,55 @@ async fn run(session: &Session, script: &str, action: &'static str) -> Result<Ve
     }
 }
 
-fn remote_io(source: io::Error) -> ExecError {
-    ExecError::Ssh(openssh::Error::Remote(source))
+/// What a finished remote command printed, and how it ended.
+struct Output {
+    /// Its exit status.
+    status: ExitStatus,
+    /// Everything it wrote to its standard output.
+    stdout: Vec<u8>,
+    /// Everything it wrote to its standard error.
+    stderr: Vec<u8>,
+}
+
+/// Reads `process`'s standard output and error to their ends, both at once so
+/// neither pipe can fill up and stall it, then waits for its exit status.
+async fn output(mut process: RemoteProcess) -> Result<Output, SshError> {
+    let (stdout, stderr) = tokio::try_join!(
+        read_all(process.stdout.take()),
+        read_all(process.stderr.take())
+    )?;
+    let status = exit_status(process.wait().await?);
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Everything `pipe` holds until its end, nothing when there is no pipe.
+async fn read_all<R: AsyncRead + Unpin>(pipe: Option<R>) -> Result<Vec<u8>, SshError> {
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut bytes).await.map_err(|error| {
+            SshError::Other(format!(
+                "failure while accessing standard i/o of remote process: {error}"
+            ))
+        })?;
+    }
+    Ok(bytes)
+}
+
+/// A remote exit `code` as the local [`ExitStatus`] of a process that exited
+/// with it.
+fn exit_status(code: i32) -> ExitStatus {
+    ExitStatus::from_raw((code & 0xff) << 8)
+}
+
+/// A failure feeding or copying to a remote command's pipes.
+fn remote_io(source: &io::Error) -> ExecError {
+    ExecError::Ssh(SshError::Other(format!(
+        "the remote command could not be executed: {source}"
+    )))
 }
 
 #[cfg(test)]
@@ -524,6 +595,8 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command as StdCommand;
+
+    use std::time::Duration;
 
     use tempfile::tempdir;
     use tokio::process::Command;
@@ -592,12 +665,13 @@ mod tests {
         Ok(())
     }
 
+    /// A connection lost at the first command reads as a dead master, with its log.
     #[test]
     fn a_session_gone_at_its_first_command_is_a_dead_master() -> TestResult {
         let dir = tempdir()?;
         let log = dir.path().join("log");
         fs::write(&log, "debug1: forking\r\nkilled\u{1b}[0m\n")?;
-        let error = master_died(ExecError::Ssh(openssh::Error::Disconnected), &log);
+        let error = master_died(ExecError::Ssh(SshError::Disconnected), &log);
         assert!(
             matches!(&error, ExecError::MasterDied { log } if log == "debug1: forking | killed[0m"),
             "{error:?}"
@@ -961,9 +1035,11 @@ mod tests {
         Ok(())
     }
 
+    /// A receiver ended without an exit status reports its error output when it
+    /// printed any.
     #[test]
     fn a_receiver_killed_by_a_signal_is_reported_with_its_error_output() {
-        let killed = || Err(ExecError::Ssh(openssh::Error::RemoteProcessTerminated));
+        let killed = || Err(ExecError::Ssh(SshError::Terminated));
         let result = upload_outcome(killed(), b"tar: write error\n", Ok(()), Ok(()));
         assert!(
             matches!(
@@ -974,12 +1050,20 @@ mod tests {
         );
         let silent = upload_outcome(killed(), b" \n", Ok(()), Ok(()));
         assert!(
-            matches!(
-                silent,
-                Err(ExecError::Ssh(openssh::Error::RemoteProcessTerminated))
-            ),
+            matches!(silent, Err(ExecError::Ssh(SshError::Terminated))),
             "{silent:?}"
         );
+    }
+
+    /// A remote exit code reads as the status of a local process that exited
+    /// with it, so failure messages stay as they were.
+    #[test]
+    fn a_remote_exit_code_is_an_exit_status() {
+        assert_eq!(exit_status(0).code(), Some(0));
+        assert!(exit_status(0).success());
+        assert_eq!(exit_status(2).code(), Some(2));
+        assert_eq!(exit_status(2).to_string(), "exit status: 2");
+        assert_eq!(exit_status(255).code(), Some(255));
     }
 
     #[test]
