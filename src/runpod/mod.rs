@@ -46,8 +46,8 @@ pub use flow::{
     past_deadline, reconnect, settle_watch, ssh_command, start_pod, watch_leased, watch_on_pod,
 };
 pub use keys::{
-    CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, ssh_config, write_config,
-    write_known_hosts,
+    CLIENT_KEY, KNOWN_HOSTS, PodKeys, SSH_CONFIG, SSH_DIR, alias, base64, pod_endpoint, ssh_config,
+    write_config, write_known_hosts,
 };
 pub use logs::{
     BOOTSTRAP_LOG, Capture, DRAIN_WAIT, LogError, LogQuery, LogSource, POD_LOG, POD_LOG_CAP,
@@ -109,6 +109,11 @@ pub enum PodError {
     /// The run's SSH keys could not be generated.
     #[error("cannot generate the run's SSH keys: {0}")]
     Keygen(String),
+    /// The SSH client cannot be chosen: `OVERBRAINER_SSH_CLIENT` holds an
+    /// invalid value, or `builtin` is asked of a build without it. The
+    /// message names the setting.
+    #[error("{0}")]
+    SshClient(String),
     /// A local path cannot be written into an ssh config.
     #[error("{0}")]
     InvalidPath(String),

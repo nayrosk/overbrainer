@@ -1,4 +1,4 @@
-//! Helpers shared by the Runpod test files. Each file uses only some of them.
+//! Helpers shared by the Runpod and SSH test files. Each file uses only some of them.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -124,4 +124,40 @@ impl Respond for SecretStore {
             _ => ResponseTemplate::new(405),
         }
     }
+}
+
+/// The SSH clients of this build: OpenSSH, then the built-in client when the
+/// `builtin-ssh` feature is on. `OVERBRAINER_TEST_SSH_CLIENT` (`openssh` or
+/// `builtin`) keeps only that one, for a run whose `PATH` suits one client.
+pub fn ssh_clients() -> Vec<overbrainer::config::SshClient> {
+    use overbrainer::config::{HAS_BUILTIN_SSH, SshClient};
+    let all = if HAS_BUILTIN_SSH {
+        vec![SshClient::Openssh, SshClient::Builtin]
+    } else {
+        vec![SshClient::Openssh]
+    };
+    match std::env::var("OVERBRAINER_TEST_SSH_CLIENT") {
+        Ok(only) if !only.is_empty() => all
+            .into_iter()
+            .filter(|client| client.name() == only)
+            .collect(),
+        _ => all,
+    }
+}
+
+/// Runs `case` once for each of [`ssh_clients`], stopping at the first failure,
+/// whose error names the client. The client is also printed before each case,
+/// so a failed assertion's captured output names it.
+pub async fn each_ssh_client<F, Fut>(case: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Fn(overbrainer::config::SshClient) -> Fut,
+    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+{
+    for client in ssh_clients() {
+        eprintln!("ssh_client = {}", client.name());
+        case(client)
+            .await
+            .map_err(|error| format!("with ssh_client = {}: {error}", client.name()))?;
+    }
+    Ok(())
 }

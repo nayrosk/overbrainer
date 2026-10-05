@@ -16,6 +16,7 @@ use secrecy::SecretString;
 use secrecy::zeroize::Zeroizing;
 
 use crate::config::SshClient;
+use crate::exec::PodEndpoint;
 use crate::runs::is_safe_name;
 
 use super::{PodError, SshEndpoint};
@@ -286,6 +287,31 @@ pub fn write_config(
     let path = dir.join(SSH_CONFIG);
     fs::write(&path, text).map_err(io_error(&path))?;
     Ok(path)
+}
+
+/// Writes the run's ssh config (see [`write_config`]) and returns what reaches
+/// the pod at `endpoint`, with either client: the config for OpenSSH, the
+/// endpoint, client key and pinned host key for the built-in client.
+///
+/// # Errors
+///
+/// See [`write_config`].
+pub fn pod_endpoint(
+    dir: &Path,
+    alias: &str,
+    endpoint: &SshEndpoint,
+    keys: &PodKeys,
+) -> Result<PodEndpoint, PodError> {
+    let config = write_config(dir, alias, endpoint, keys)?;
+    Ok(PodEndpoint {
+        alias: alias.to_string(),
+        config,
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        user: endpoint.user.clone(),
+        key: keys.client_key.clone(),
+        host_key: keys.host_public.clone(),
+    })
 }
 
 /// The text of a run's ssh config.

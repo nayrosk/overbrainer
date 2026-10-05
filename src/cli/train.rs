@@ -12,9 +12,13 @@ use super::push::{PushOptions, Pushed, push_with_token};
 use super::reload::Reloader;
 use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
-use crate::config::{DEFAULT_WORKDIR, Settings, Source, Target, Training};
+use crate::config::{
+    DEFAULT_WORKDIR, Settings, Source, SshClient, Target, Training, process_client,
+};
 use crate::dataset::DataFiles;
-use crate::exec::{AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshExecutor};
+use crate::exec::{
+    AnyExecutor, Executor, JobRuntime, JobStatus, LocalExecutor, SshDestination, SshExecutor,
+};
 use crate::hub::record::{HUB_DIR, PUSH_FILE};
 use crate::runpod::{PodRecord, RunpodTarget, connect_followed};
 use crate::runs::{
@@ -395,7 +399,13 @@ pub(super) async fn request_stop(
     let record = runs.load(run_id)?;
     stoppable(&record)?;
     if let Some(pod) = PodRecord::load(&runs, run_id)? {
-        let Some(executor) = connect_followed(&runs, &pod, &record).await? else {
+        let configured = settings
+            .targets
+            .get(&record.target)
+            .and_then(RunpodTarget::from_target)
+            .map_or(SshClient::default(), |target| target.ssh_client);
+        let client = process_client(configured).map_err(|message| anyhow!(message))?;
+        let Some(executor) = connect_followed(&runs, &pod, &record, client).await? else {
             bail!("run {run_id} has no pod to reach: nothing to stop");
         };
         request_snapshot(&executor, &record, SnapshotReason::Requested).await?;
@@ -612,7 +622,12 @@ pub(super) async fn executor(
         Target::Local { .. } => Ok(AnyExecutor::Local(LocalExecutor::new(
             &project_dir.join(RUNS_DIR),
         )?)),
-        Target::Ssh { host, workdir, .. } => {
+        Target::Ssh {
+            host,
+            workdir,
+            ssh_client,
+            ..
+        } => {
             let host = host.as_deref().with_context(|| {
                 format!(
                     "targets.{name}.host is not set: set OVERBRAINER_TARGETS__{}__HOST",
@@ -620,7 +635,12 @@ pub(super) async fn executor(
                 )
             })?;
             let workdir = workdir.as_deref().unwrap_or(DEFAULT_WORKDIR);
-            let executor = SshExecutor::connect(host, workdir, None)
+            let client = process_client(*ssh_client).map_err(|message| anyhow!(message))?;
+            let destination = SshDestination::Config {
+                destination: host,
+                config_file: None,
+            };
+            let executor = SshExecutor::connect(&destination, workdir, client)
                 .await
                 .with_context(|| format!("cannot reach target `{name}`"))?;
             Ok(AnyExecutor::Ssh(executor))

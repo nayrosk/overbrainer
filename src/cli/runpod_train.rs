@@ -18,7 +18,7 @@ use super::train::{
     HF_TOKEN, POLL, exporting, finish, prepare, push_after_training, resumed, secrets, started,
     stop_requested, stoppable, training, warn,
 };
-use crate::config::{Settings, Training};
+use crate::config::{Settings, SshClient, Training, process_client};
 use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
 use crate::export::ExportJob;
@@ -395,6 +395,11 @@ struct Job<'a, T> {
 }
 
 impl<T: Trainer + Sync> Job<'_, T> {
+    /// The SSH client of the target, `OVERBRAINER_SSH_CLIENT` applied.
+    fn client(&self) -> anyhow::Result<SshClient> {
+        process_client(self.spec.ssh_client).map_err(|message| anyhow!(message))
+    }
+
     fn run_ctx<'e>(&'e self, executor: &'e SshExecutor) -> RunCtx<'e, SshExecutor> {
         RunCtx {
             runs: &self.session.runs,
@@ -617,7 +622,7 @@ impl<T: Trainer + Sync> Job<'_, T> {
         pod: &mut PodRecord,
     ) -> anyhow::Result<()> {
         let ctx = self.session.ctx();
-        let Some(executor) = reconnect(&ctx, pod, &record).await? else {
+        let Some(executor) = reconnect(&ctx, pod, &record, self.client()?).await? else {
             return from_local_files(self.session, self.trainer, record, pod, self.report).await;
         };
         if record.state == RunState::Running {
@@ -646,7 +651,7 @@ impl<T: Trainer + Sync> Job<'_, T> {
     ) -> anyhow::Result<()> {
         let ctx = self.session.ctx();
         let id = record.id.clone();
-        let Some(executor) = reconnect(&ctx, pod, &record).await? else {
+        let Some(executor) = reconnect(&ctx, pod, &record, self.client()?).await? else {
             bail!("run {id} has no pod left: nothing to stop");
         };
         request_snapshot(&executor, &record, SnapshotReason::Requested).await?;
@@ -664,7 +669,7 @@ impl<T: Trainer + Sync> Job<'_, T> {
     ) -> anyhow::Result<()> {
         let ctx = self.session.ctx();
         let id = record.id.clone();
-        let Some(executor) = reconnect(&ctx, pod, &record).await? else {
+        let Some(executor) = reconnect(&ctx, pod, &record, self.client()?).await? else {
             bail!("run {id} has no pod left: nothing to cancel");
         };
         // Cancelling is never interrupted, like on any other target.

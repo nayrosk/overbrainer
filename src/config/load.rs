@@ -247,6 +247,18 @@ pub fn ssh_client_env(env: &EnvSource) -> Option<String> {
         .map(|(_, value)| value)
 }
 
+/// The client a target set to `configured` uses in this process:
+/// [`super::effective_client`] with `OVERBRAINER_SSH_CLIENT` from the process
+/// environment.
+///
+/// # Errors
+///
+/// Returns the message of [`super::effective_client`], which names the
+/// variable when its value is invalid.
+pub fn process_client(configured: super::SshClient) -> Result<super::SshClient, String> {
+    super::effective_client(configured, ssh_client_env(&EnvSource::Process).as_deref())
+}
+
 /// Whether `key` is one of [`NOT_CONFIG_VARIABLES`] once lower-cased, as
 /// `config::Environment` lower-cases keys before matching.
 fn is_not_config(key: &str) -> bool {

@@ -1,5 +1,5 @@
 //! The client carrying an [`SshExecutor`](super::SshExecutor)'s commands: the
-//! user's OpenSSH through a master connection.
+//! user's OpenSSH through a master connection, or the built-in client.
 
 #[cfg(feature = "builtin-ssh")]
 pub mod builtin;
@@ -7,6 +7,8 @@ mod openssh;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
+#[cfg(feature = "builtin-ssh")]
+pub use self::builtin::BuiltinTransport;
 pub use self::openssh::OpenSshTransport;
 use super::SshError;
 
@@ -15,6 +17,9 @@ use super::SshError;
 pub enum Transport {
     /// The user's `ssh`, through one master connection.
     OpenSsh(OpenSshTransport),
+    /// The built-in client, one russh session.
+    #[cfg(feature = "builtin-ssh")]
+    Builtin(BuiltinTransport),
 }
 
 impl Transport {
@@ -29,6 +34,8 @@ impl Transport {
             // Boxed: the `ssh` multiplex future is large, and every executor
             // future holding it would grow with it.
             Self::OpenSsh(transport) => Box::pin(transport.exec(command, pipes)).await,
+            #[cfg(feature = "builtin-ssh")]
+            Self::Builtin(transport) => transport.exec(command, pipes).await,
         }
     }
 }
@@ -59,7 +66,10 @@ pub struct RemoteProcess {
 /// The client-specific handle [`RemoteProcess::wait`] waits on.
 pub(crate) enum Waiter {
     /// A command started through the OpenSSH master.
-    OpenSsh(self::openssh::OpenSshWaiter),
+    OpenSsh(Box<self::openssh::OpenSshWaiter>),
+    /// A command started on a channel of the built-in client.
+    #[cfg(feature = "builtin-ssh")]
+    Builtin(self::builtin::BuiltinWaiter),
 }
 
 impl RemoteProcess {
@@ -73,7 +83,9 @@ impl RemoteProcess {
     pub async fn wait(mut self) -> Result<i32, SshError> {
         drop(self.stdin.take());
         match self.waiter {
-            Waiter::OpenSsh(waiter) => Box::pin(waiter.wait()).await,
+            Waiter::OpenSsh(waiter) => Box::pin((*waiter).wait()).await,
+            #[cfg(feature = "builtin-ssh")]
+            Waiter::Builtin(waiter) => waiter.wait().await,
         }
     }
 }

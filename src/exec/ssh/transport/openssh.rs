@@ -93,10 +93,10 @@ impl OpenSshTransport {
             stdin,
             stdout,
             stderr,
-            waiter: Waiter::OpenSsh(OpenSshWaiter {
+            waiter: Waiter::OpenSsh(Box::new(OpenSshWaiter {
                 child,
                 host: self.host.clone(),
-            }),
+            })),
         })
     }
 }

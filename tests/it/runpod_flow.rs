@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use overbrainer::config::ListOrAuto;
+use overbrainer::config::{ListOrAuto, SshClient};
 use overbrainer::events::EventBus;
 use overbrainer::exec::{Executor, JobCommand, LocalExecutor};
 use overbrainer::retry::RetryPolicy;
@@ -807,7 +807,7 @@ async fn reconnect_to_a_stopped_pod_points_to_pod_rm() -> TestResult {
         .await;
     let run = broken_run(&harness.runs)?;
     let mut pod = pod_record(&run.id, true, Duration::ZERO)?;
-    let error = reconnect(&harness.ctx(), &mut pod, &run)
+    let error = reconnect(&harness.ctx(), &mut pod, &run, SshClient::Openssh)
         .await
         .err()
         .ok_or("reconnected to a stopped pod")?;
@@ -823,6 +823,8 @@ async fn reconnect_to_a_stopped_pod_points_to_pod_rm() -> TestResult {
     Ok(())
 }
 
+/// A pod confirmed gone by repeated looks is recorded deleted, by the watchdog
+/// once its deadline passed, and a single miss is not gone.
 #[tokio::test]
 async fn reconnect_records_a_pod_confirmed_gone_without_deleting_it() -> TestResult {
     let harness = Harness::new().await?;
@@ -833,7 +835,7 @@ async fn reconnect_records_a_pod_confirmed_gone_without_deleting_it() -> TestRes
     std::fs::create_dir_all(key.parent().ok_or("no ssh dir")?)?;
     std::fs::write(&key, "private")?;
     harness.secrets.hold("k1", &host_key_secret(&run.id));
-    let executor = reconnect(&harness.ctx(), &mut pod, &run).await?;
+    let executor = reconnect(&harness.ctx(), &mut pod, &run, SshClient::Openssh).await?;
     assert!(executor.is_none());
     assert_eq!(harness.secrets.deleted(), [host_key_secret(&run.id)]);
     assert_eq!(pod.state, PodState::Deleted);
@@ -848,7 +850,11 @@ async fn reconnect_records_a_pod_confirmed_gone_without_deleting_it() -> TestRes
     serve_sequence(&late.server, vec![false], false).await;
     let run = broken_run(&late.runs)?;
     let mut pod = pod_record(&run.id, false, Duration::from_secs(60))?;
-    assert!(reconnect(&late.ctx(), &mut pod, &run).await?.is_none());
+    assert!(
+        reconnect(&late.ctx(), &mut pod, &run, SshClient::Openssh)
+            .await?
+            .is_none()
+    );
     assert_eq!(pod.deleted_by, Some(DeletedBy::Watchdog));
     assert_eq!(deletes(&late.server).await, 0);
 
@@ -857,7 +863,7 @@ async fn reconnect_records_a_pod_confirmed_gone_without_deleting_it() -> TestRes
     serve_sequence(&flaky.server, vec![false, true], false).await;
     let run = broken_run(&flaky.runs)?;
     let mut pod = pod_record(&run.id, true, Duration::ZERO)?;
-    let result = reconnect(&flaky.ctx(), &mut pod, &run).await;
+    let result = reconnect(&flaky.ctx(), &mut pod, &run, SshClient::Openssh).await;
     assert!(
         matches!(result, Err(PodError::NoEndpoint(..))),
         "{result:?}"

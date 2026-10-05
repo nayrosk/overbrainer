@@ -32,7 +32,7 @@ pub use script::{
 };
 #[cfg(feature = "builtin-ssh")]
 pub use ssh::{AgentChoice, ConfigSources, HostConfig, check_known_hosts, resolve_ssh_config};
-pub use ssh::{SshError, SshExecutor};
+pub use ssh::{PodEndpoint, SshDestination, SshError, SshExecutor};
 
 use crate::config::Engine;
 

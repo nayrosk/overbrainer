@@ -11,9 +11,9 @@ use secrecy::SecretString;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::config::{EnvSource, effective_client, ssh_client_env};
+use crate::config::{SshClient, process_client};
 use crate::events::Event;
-use crate::exec::{ExecError, Executor, SshExecutor};
+use crate::exec::{ExecError, Executor, PodEndpoint, SshDestination, SshExecutor};
 use crate::runs::{Outcome, RunCtx, RunError, RunRecord, RunState, Runs, SnapshotReason, watch};
 use crate::train::{Pace, SNAPSHOT_REQUEST, Trainer};
 
@@ -22,8 +22,8 @@ use super::provision::note_strays;
 use super::{
     BOOTSTRAP_LOG, CLIENT_KEY, CostCap, DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId,
     PodKeys, PodPlan, PodRecord, PodState, PodStatus, Provisioned, RemoteStatus, RunpodTarget,
-    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, forget_keys, keep_file, provision,
-    remove, short_cap_warning, sweep, with_pod_logs, write_config,
+    SSH_DIR, SshEndpoint, VOLUME_MOUNT, VOLUME_WORKDIR, alias, forget_keys, keep_file,
+    pod_endpoint, provision, remove, short_cap_warning, sweep, with_pod_logs,
 };
 use crate::secrets::Redactor;
 
@@ -128,11 +128,7 @@ async fn provision_run(
     vram_floor_gb: Option<u32>,
 ) -> Result<(PodRecord, Provisioned), PodError> {
     let ssh_dir = ctx.runs.run_dir(&run.id)?.join(SSH_DIR);
-    let client = effective_client(
-        target.ssh_client,
-        ssh_client_env(&EnvSource::Process).as_deref(),
-    )
-    .map_err(PodError::Keygen)?;
+    let client = process_client(target.ssh_client).map_err(PodError::SshClient)?;
     let keys = PodKeys::generate(&ssh_dir, &alias(&run.id), client)?;
     let mut record = PodRecord::new(&run.id, keep, target.gpu_count, &keys.host_public);
     record.max_cost_usd = target.max_cost_usd.filter(|_| !keep);
@@ -1048,9 +1044,9 @@ pub fn forget_client_key(runs: &Runs, run_id: &str) {
     }
 }
 
-/// Connects again to the pod of the run `run`, for `train attach` and `train
-/// cancel`: looks it up (its public port may have changed), rewrites the run's ssh
-/// config and connects. `None` when the pod no longer exists (confirmed by
+/// Connects again to the pod of the run `run` with `client`, for `train attach`
+/// and `train cancel`: looks it up (its public port may have changed), rewrites
+/// the run's ssh config and connects. `None` when the pod no longer exists (confirmed by
 /// repeated looks, never by a delete), which `pod.json` then records.
 ///
 /// # Errors
@@ -1062,6 +1058,7 @@ pub async fn reconnect(
     ctx: &PodCtx<'_>,
     pod: &mut PodRecord,
     run: &RunRecord,
+    client: SshClient,
 ) -> Result<Option<SshExecutor>, PodError> {
     let Some(id) = pod.pod_id.clone() else {
         return Ok(None);
@@ -1094,19 +1091,20 @@ pub async fn reconnect(
         pod.host_key.clone(),
         SecretString::from(String::new()),
     );
-    let alias = alias(&run.id);
-    let config = write_config(&ssh_dir, &alias, &endpoint, &keys)?;
-    let executor = SshExecutor::connect(&alias, pod_workdir(run), Some(&config)).await?;
+    let target = pod_endpoint(&ssh_dir, &alias(&run.id), &endpoint, &keys)?;
+    let executor =
+        SshExecutor::connect(&SshDestination::Pod(&target), pod_workdir(run), client).await?;
     pod.ssh = Some(endpoint);
     pod.save(ctx.runs)?;
     Ok(Some(executor))
 }
 
-/// Connects to the pod of the run `run` through the ssh config the process
-/// following it wrote, for `train stop` while that process holds the project:
+/// Connects to the pod of the run `run` with `client` through the ssh config
+/// the process following it wrote (the endpoint `pod.json` holds, for the
+/// built-in client), for `train stop` while that process holds the project:
 /// no Runpod API call, and nothing written locally, so the run directory stays
 /// that process's alone. `None` when the run has no pod left or no ssh config
-/// yet.
+/// or endpoint yet.
 ///
 /// # Errors
 ///
@@ -1116,15 +1114,27 @@ pub async fn connect_followed(
     runs: &Runs,
     pod: &PodRecord,
     run: &RunRecord,
+    client: SshClient,
 ) -> Result<Option<SshExecutor>, PodError> {
     if pod.pod_id.is_none() || pod.state == PodState::Deleted {
         return Ok(None);
     }
-    let config = runs.run_dir(&run.id)?.join(SSH_DIR).join(super::SSH_CONFIG);
-    if !config.is_file() {
+    let ssh_dir = runs.run_dir(&run.id)?.join(SSH_DIR);
+    let config = ssh_dir.join(super::SSH_CONFIG);
+    let (true, Some(endpoint)) = (config.is_file(), pod.ssh.as_ref()) else {
         return Ok(None);
-    }
-    let executor = SshExecutor::connect(&alias(&run.id), pod_workdir(run), Some(&config)).await?;
+    };
+    let target = PodEndpoint {
+        alias: alias(&run.id),
+        config,
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        user: endpoint.user.clone(),
+        key: ssh_dir.join(CLIENT_KEY),
+        host_key: pod.host_key.clone(),
+    };
+    let executor =
+        SshExecutor::connect(&SshDestination::Pod(&target), pod_workdir(run), client).await?;
     Ok(Some(executor))
 }
 

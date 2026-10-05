@@ -4,7 +4,7 @@ mod transport;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -25,10 +25,12 @@ use super::{
     JobId, JobStatus, PID_FILE, Pid, cancel_script, check_job_env, claim_script, job_script,
     manifest_script, parse_manifest, parse_status, quote, shell_path, status_script,
 };
+use crate::config::SshClient;
 
-/// Runs jobs on a remote Linux machine through the user's `ssh`: `~/.ssh/config`, the
-/// agent and `known_hosts` apply, and unknown host keys are refused. One master
-/// connection carries every command.
+/// Runs jobs on a remote Linux machine through the user's `ssh` or the built-in
+/// client: `~/.ssh/config`, the agent and `known_hosts` apply, and unknown host
+/// keys are refused. One connection (an OpenSSH master, or one built-in
+/// session) carries every command.
 ///
 /// A job's secrets travel on the standard input of the command starting it and are
 /// read into the job's environment there: they never appear on a command line,
@@ -57,26 +59,21 @@ pub struct SshExecutor {
 }
 
 impl SshExecutor {
-    /// Connects to `destination` (`user@host` or a `~/.ssh/config` alias) and
-    /// creates `workdir` there, relative to the remote home unless absolute. Tests
-    /// pass `config_file` in place of `~/.ssh/config`.
+    /// Connects to `destination` with `client` and creates `workdir` there,
+    /// relative to the remote home unless absolute.
     ///
     /// # Errors
     ///
     /// Returns [`ExecError::Ssh`] when the connection fails, for example on an
     /// unknown host key, [`ExecError::MasterDied`], with the tail of the master's
-    /// log, when the master connection ends right after it started, and
+    /// log, when an OpenSSH master connection ends right after it started, and
     /// [`ExecError::Command`] when `workdir` cannot be created.
     pub async fn connect(
-        destination: &str,
+        destination: &SshDestination<'_>,
         workdir: &str,
-        config_file: Option<&Path>,
+        client: SshClient,
     ) -> Result<Self, ExecError> {
-        let transport = Transport::OpenSsh(
-            OpenSshTransport::connect(destination, config_file)
-                .await
-                .map_err(ExecError::Ssh)?,
-        );
+        let transport = open(destination, client).await.map_err(ExecError::Ssh)?;
         let dir = shell_path(workdir);
         let resolved = run(
             &transport,
@@ -84,9 +81,7 @@ impl SshExecutor {
             "create the work directory",
         )
         .await
-        .map_err(|error| match &transport {
-            Transport::OpenSsh(openssh) => master_died(error, openssh.master_log()),
-        })?;
+        .map_err(|error| first_failure(&transport, error))?;
         let workdir = String::from_utf8_lossy(&resolved).trim().to_string();
         if !workdir.starts_with('/') {
             return Err(ExecError::Protocol(format!(
@@ -272,6 +267,186 @@ impl Executor for SshExecutor {
             .await
             .map(drop)
     }
+}
+
+/// Where [`SshExecutor::connect`] goes.
+#[derive(Debug, Clone, Copy)]
+pub enum SshDestination<'a> {
+    /// `user@host` or an alias of the user's ssh configuration.
+    Config {
+        /// The destination, as given.
+        destination: &'a str,
+        /// A file read in place of `~/.ssh/config` and the system file, as
+        /// `ssh -F` does (tests pass one).
+        config_file: Option<&'a Path>,
+    },
+    /// A Runpod pod, reached without the user's configuration.
+    Pod(&'a PodEndpoint),
+}
+
+/// What reaches a pod (D6, D8): its endpoint, the run's client key, its pinned
+/// host key, and the per-run config the OpenSSH client reads.
+#[derive(Debug, Clone)]
+pub struct PodEndpoint {
+    /// The run's host alias, also its `HostKeyAlias`.
+    pub alias: String,
+    /// The per-run ssh config defining `alias`, read by OpenSSH.
+    pub config: PathBuf,
+    /// The pod's public address.
+    pub host: String,
+    /// The pod's public SSH port.
+    pub port: u16,
+    /// The remote user.
+    pub user: String,
+    /// The run's client private key file.
+    pub key: PathBuf,
+    /// The pod's pinned public host key, `ssh-ed25519 AAAA...`.
+    pub host_key: String,
+}
+
+/// Opens the transport of `client` to `destination`.
+///
+/// # Errors
+///
+/// Returns the [`SshError`] of the connection, and [`SshError::Other`] for
+/// `builtin` in a build without the `builtin-ssh` feature.
+async fn open(destination: &SshDestination<'_>, client: SshClient) -> Result<Transport, SshError> {
+    match (client, destination) {
+        (
+            SshClient::Openssh,
+            SshDestination::Config {
+                destination,
+                config_file,
+            },
+        ) => Ok(Transport::OpenSsh(
+            OpenSshTransport::connect(destination, *config_file).await?,
+        )),
+        (SshClient::Openssh, SshDestination::Pod(pod)) => Ok(Transport::OpenSsh(
+            OpenSshTransport::connect(&pod.alias, Some(&pod.config)).await?,
+        )),
+        #[cfg(feature = "builtin-ssh")]
+        (
+            SshClient::Builtin,
+            SshDestination::Config {
+                destination,
+                config_file,
+            },
+        ) => {
+            let sources = config_sources(*config_file, &LocalEnv::read())?;
+            // Boxed, as the russh handshake future is large.
+            Ok(Transport::Builtin(
+                Box::pin(transport::BuiltinTransport::connect_config(
+                    destination,
+                    &sources,
+                ))
+                .await?,
+            ))
+        },
+        #[cfg(feature = "builtin-ssh")]
+        (SshClient::Builtin, SshDestination::Pod(pod)) => Ok(Transport::Builtin(
+            Box::pin(transport::BuiltinTransport::connect_direct(&direct_target(
+                pod,
+            )?))
+            .await?,
+        )),
+        #[cfg(not(feature = "builtin-ssh"))]
+        (SshClient::Builtin, _) => Err(SshError::Other(
+            crate::config::BUILTIN_SSH_REFUSED.to_string(),
+        )),
+    }
+}
+
+/// The built-in client's view of `pod`.
+///
+/// # Errors
+///
+/// Returns [`SshError::HostKey`] when the pinned host key cannot be read.
+#[cfg(feature = "builtin-ssh")]
+fn direct_target(pod: &PodEndpoint) -> Result<transport::builtin::DirectTarget, SshError> {
+    let host_key = russh::keys::PublicKey::from_openssh(pod.host_key.trim()).map_err(|_| {
+        SshError::HostKey {
+            host: pod.alias.clone(),
+            reason: "the host key pinned for this run cannot be read".into(),
+        }
+    })?;
+    Ok(transport::builtin::DirectTarget {
+        name: pod.alias.clone(),
+        host: pod.host.clone(),
+        port: pod.port,
+        user: pod.user.clone(),
+        key: pod.key.clone(),
+        host_key,
+    })
+}
+
+/// What the built-in client reads of the local environment.
+#[cfg(feature = "builtin-ssh")]
+#[derive(Debug, Default)]
+struct LocalEnv {
+    /// `HOME`.
+    home: Option<std::ffi::OsString>,
+    /// `USER`.
+    user: Option<std::ffi::OsString>,
+    /// `LOGNAME`.
+    logname: Option<std::ffi::OsString>,
+}
+
+#[cfg(feature = "builtin-ssh")]
+impl LocalEnv {
+    /// The variables of this process.
+    fn read() -> Self {
+        Self {
+            home: std::env::var_os("HOME"),
+            user: std::env::var_os("USER"),
+            logname: std::env::var_os("LOGNAME"),
+        }
+    }
+}
+
+/// The ssh configuration files the built-in client reads: `config_file` alone
+/// when given (as `ssh -F`), otherwise `~/.ssh/config` then
+/// `/etc/ssh/ssh_config`; the home and the local user from `env`.
+///
+/// # Errors
+///
+/// Returns [`SshError::Other`] when `HOME`, or both `USER` and `LOGNAME`, are
+/// unset or empty: the client does not guess them.
+#[cfg(feature = "builtin-ssh")]
+fn config_sources(config_file: Option<&Path>, env: &LocalEnv) -> Result<ConfigSources, SshError> {
+    let home = env
+        .home
+        .as_ref()
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            SshError::Other(
+                "HOME is not set: the built-in SSH client needs it to find ~/.ssh".into(),
+            )
+        })?;
+    let local_user = [&env.user, &env.logname]
+        .into_iter()
+        .flatten()
+        .filter_map(|name| name.to_str())
+        .find(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            SshError::Other(
+                "neither USER nor LOGNAME is set: the built-in SSH client needs the local user name"
+                    .into(),
+            )
+        })?;
+    let files = match config_file {
+        Some(file) => vec![file.to_path_buf()],
+        None => vec![
+            home.join(".ssh").join("config"),
+            PathBuf::from("/etc/ssh/ssh_config"),
+        ],
+    };
+    Ok(ConfigSources {
+        files,
+        home,
+        local_user,
+    })
 }
 
 /// Replaces `path` with `content` through a sibling temporary file of the
@@ -463,6 +638,17 @@ fn download_outcome(
             action: "download",
             message: tar::failure(errors, status),
         })
+    }
+}
+
+/// `error` of the first command on the new connection `transport`: with the
+/// OpenSSH client, [`master_died`] reads the master's log; the built-in client
+/// has no master, and its error stays as is.
+fn first_failure(transport: &Transport, error: ExecError) -> ExecError {
+    match transport {
+        Transport::OpenSsh(openssh) => master_died(error, openssh.master_log()),
+        #[cfg(feature = "builtin-ssh")]
+        Transport::Builtin(_) => error,
     }
 }
 
@@ -1084,5 +1270,77 @@ mod tests {
             ),
             "{result:?}"
         );
+    }
+
+    /// The built-in client reads `~/.ssh/config` then the system file, or the
+    /// given file alone, with the home and user of the environment.
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn the_builtin_client_reads_the_user_and_system_files() -> TestResult {
+        let env = LocalEnv {
+            home: Some("/home/me".into()),
+            user: None,
+            logname: Some("me".into()),
+        };
+        let sources = config_sources(None, &env)?;
+        assert_eq!(
+            sources.files,
+            [
+                PathBuf::from("/home/me/.ssh/config"),
+                PathBuf::from("/etc/ssh/ssh_config")
+            ]
+        );
+        assert_eq!(sources.home, PathBuf::from("/home/me"));
+        assert_eq!(sources.local_user, "me");
+        let given = config_sources(Some(Path::new("/tmp/cfg")), &env)?;
+        assert_eq!(given.files, [PathBuf::from("/tmp/cfg")]);
+        Ok(())
+    }
+
+    /// Without `HOME`, or without both `USER` and `LOGNAME`, the built-in
+    /// client refuses rather than guesses.
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn the_builtin_client_does_not_guess_home_or_user() {
+        let no_home = LocalEnv {
+            home: None,
+            user: Some("me".into()),
+            logname: None,
+        };
+        let error = config_sources(None, &no_home).err().map(|e| e.to_string());
+        assert!(error.is_some_and(|e| e.starts_with("HOME is not set")));
+        let no_user = LocalEnv {
+            home: Some("/h".into()),
+            user: Some(String::new().into()),
+            logname: None,
+        };
+        let error = config_sources(None, &no_user).err().map(|e| e.to_string());
+        assert!(error.is_some_and(|e| e.starts_with("neither USER nor LOGNAME")));
+    }
+
+    /// A pod's pinned key line becomes the built-in client's target; a line
+    /// that is no key is a host key failure.
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn a_pod_endpoint_becomes_a_direct_target() -> TestResult {
+        use russh::keys::{Algorithm, PrivateKey};
+
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+        let mut pod = PodEndpoint {
+            alias: "overbrainer-r1".into(),
+            config: "/runs/r1/ssh/config".into(),
+            host: "1.2.3.4".into(),
+            port: 2201,
+            user: "root".into(),
+            key: "/runs/r1/ssh/id_ed25519".into(),
+            host_key: key.public_key().to_openssh()?,
+        };
+        let target = direct_target(&pod)?;
+        assert_eq!(target.name, "overbrainer-r1");
+        assert_eq!((target.host.as_str(), target.port), ("1.2.3.4", 2201));
+        assert_eq!(target.host_key.key_data(), key.public_key().key_data());
+        pod.host_key = "not a key".into();
+        assert!(matches!(direct_target(&pod), Err(SshError::HostKey { .. })));
+        Ok(())
     }
 }
