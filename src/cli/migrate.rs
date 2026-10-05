@@ -61,7 +61,7 @@ impl Change {
         let (done, planned, what) = match self {
             Self::HubModelId {
                 value,
-                hub_repo: None,
+                hub_repo,
                 flags,
             } => {
                 let set = if flags.is_empty() {
@@ -69,13 +69,16 @@ impl Change {
                 } else {
                     format!(" ({})", flags.join(", "))
                 };
-                (
-                    "moved",
-                    "move",
-                    format!("training.hub_model_id to [hub] repo = \"{value}\"{set}"),
-                )
+                if hub_repo.is_none() {
+                    (
+                        "moved",
+                        "move",
+                        format!("training.hub_model_id to [hub] repo = \"{value}\"{set}"),
+                    )
+                } else {
+                    ("removed", "remove", format!("training.hub_model_id{set}"))
+                }
             },
-            Self::HubModelId { .. } => ("removed", "remove", "training.hub_model_id".to_string()),
             Self::Gitignore => ("added", "add", format!("{STATE_ENTRY} to {GITIGNORE}")),
             Self::Backfill(entry) => (
                 "backfilled",
@@ -237,14 +240,10 @@ fn hub_model_id(project_dir: &Path) -> anyhow::Result<Option<Change>> {
         return Ok(None);
     };
     let hub_repo = doc.get(&FieldPath::Hub("repo"));
-    let flags = if hub_repo.is_none() {
-        HUB_FLAGS
-            .into_iter()
-            .filter(|key| doc.get(&FieldPath::Hub(key)).is_none())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let flags = HUB_FLAGS
+        .into_iter()
+        .filter(|key| doc.get(&FieldPath::Hub(key)).is_none())
+        .collect();
     Ok(doc
         .get(&FieldPath::Training("hub_model_id"))
         .map(|value| Change::HubModelId {
@@ -265,7 +264,8 @@ fn read_config(project_dir: &Path) -> anyhow::Result<Option<ConfigDoc>> {
 }
 
 /// Moves `training.hub_model_id` to `[hub]`, keeping the comments, and writes
-/// `overbrainer.toml` atomically. `[hub]` keys that are already set stay.
+/// `overbrainer.toml` atomically. `[hub]` keys that are already set stay, and
+/// the [`HUB_FLAGS`] are turned on when unset, even with a repo already set.
 fn move_hub_model_id(project_dir: &Path) -> anyhow::Result<()> {
     let Some(mut doc) = read_config(project_dir)? else {
         return Ok(());
@@ -276,15 +276,15 @@ fn move_hub_model_id(project_dir: &Path) -> anyhow::Result<()> {
     let edit = |error: crate::config::edit::EditError| anyhow::anyhow!("{error}");
     doc.unset(&FieldPath::Training("hub_model_id"))
         .map_err(edit)?;
-    // With a `[hub] repo` already there, that table is the user's: leave it be.
+    // A `[hub] repo` already there stays, but publishing stays automatic.
     if doc.get(&FieldPath::Hub("repo")).is_none() {
         doc.set(&FieldPath::Hub("repo"), FieldValue::Text(value))
             .map_err(edit)?;
-        for key in HUB_FLAGS {
-            let path = FieldPath::Hub(key);
-            if doc.get(&path).is_none() {
-                doc.set(&path, FieldValue::Bool(true)).map_err(edit)?;
-            }
+    }
+    for key in HUB_FLAGS {
+        let path = FieldPath::Hub(key);
+        if doc.get(&path).is_none() {
+            doc.set(&path, FieldValue::Bool(true)).map_err(edit)?;
         }
     }
     crate::runs::write_atomic(project_dir, CONFIG_FILE, doc.text().as_bytes())
@@ -668,14 +668,55 @@ mod tests {
             migrate(dir.path(), false)?,
             [
                 "kept [hub] repo = \"me/kept\"; dropped training.hub_model_id = \"me/old\"",
-                "removed training.hub_model_id"
+                "removed training.hub_model_id (after_training)"
             ]
         );
         let text = read_toml(dir.path())?;
         assert!(!text.contains("hub_model_id"), "{text}");
         let settings = load_text(&text)?;
         assert_eq!(settings.hub.repo.as_deref(), Some("me/kept"));
-        assert!(!settings.hub.private && !settings.hub.after_training);
+        assert!(!settings.hub.private && settings.hub.after_training);
+        Ok(())
+    }
+
+    /// With a `[hub] repo` set and no flags, the move still turns publishing on.
+    #[test]
+    fn an_existing_hub_repo_still_gets_the_flags() -> TestResult {
+        let toml = format!(
+            "{}\n[hub]\nrepo = \"me/kept\"\n",
+            with_training_key("hub_model_id = \"me/old\"")
+        );
+        let dir = project_with_toml(&toml)?;
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            [
+                "kept [hub] repo = \"me/kept\"; dropped training.hub_model_id = \"me/old\"",
+                "removed training.hub_model_id (private, after_training)"
+            ]
+        );
+        let settings = load_text(&read_toml(dir.path())?)?;
+        assert_eq!(settings.hub.repo.as_deref(), Some("me/kept"));
+        assert!(settings.hub.private && settings.hub.after_training);
+        Ok(())
+    }
+
+    /// With a `[hub] repo` set and `after_training = false`, that value stays.
+    #[test]
+    fn an_existing_hub_repo_keeps_a_flag_set_false() -> TestResult {
+        let toml = format!(
+            "{}\n[hub]\nrepo = \"me/kept\"\nafter_training = false\n",
+            with_training_key("hub_model_id = \"me/old\"")
+        );
+        let dir = project_with_toml(&toml)?;
+        assert_eq!(
+            migrate(dir.path(), false)?,
+            [
+                "kept [hub] repo = \"me/kept\"; dropped training.hub_model_id = \"me/old\"",
+                "removed training.hub_model_id (private)"
+            ]
+        );
+        let settings = load_text(&read_toml(dir.path())?)?;
+        assert!(settings.hub.private && !settings.hub.after_training);
         Ok(())
     }
 

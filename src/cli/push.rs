@@ -537,7 +537,7 @@ impl Hub for Offline {
         ready(Err(HubError::Auth))
     }
 
-    /// Refuses with an authentication error: a dry run has no token.
+    /// Leaves the license unknown (`Ok(None)`): a dry run has no token.
     fn license_of(
         &self,
         _model: &str,
