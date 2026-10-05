@@ -1302,6 +1302,42 @@ mod tests {
         Ok(())
     }
 
+    /// With the feature the error names the built-in client as the way out.
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn a_local_ssh_failure_points_to_the_builtin_client() -> Result<(), crate::runpod::InvalidPodId>
+    {
+        let error = PodError::LocalSsh {
+            pod_id: PodId::new("p1")?,
+            reason: "x".into(),
+        };
+        assert!(
+            error.to_string().ends_with(
+                "; set ssh_client = \"builtin\" on the target (or OVERBRAINER_SSH_CLIENT=builtin)"
+            ),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// Without the feature the error points to a build that has it.
+    #[cfg(not(feature = "builtin-ssh"))]
+    #[test]
+    fn a_local_ssh_failure_points_to_a_build_with_the_feature()
+    -> Result<(), crate::runpod::InvalidPodId> {
+        let error = PodError::LocalSsh {
+            pod_id: PodId::new("p1")?,
+            reason: "x".into(),
+        };
+        assert!(
+            error.to_string().ends_with(
+                "; a build with the builtin-ssh feature (the release binaries have it) avoids the local ssh"
+            ),
+            "{error}"
+        );
+        Ok(())
+    }
+
     /// A local server answering each connection with `answer`, then closing it.
     fn server(answer: &'static [u8]) -> std::io::Result<u16> {
         use std::io::Write;

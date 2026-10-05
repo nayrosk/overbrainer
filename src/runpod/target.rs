@@ -72,6 +72,8 @@ impl RunpodTarget {
             data_center_ids,
             network_volume_id,
             max_volume_gb,
+            // The SSH client is chosen where the connection is made.
+            ssh_client: _,
         } = target
         else {
             return None;
@@ -139,6 +141,7 @@ mod tests {
             data_center_ids: ListOrAuto::List(vec!["EU-RO-1".into()]),
             network_volume_id: volume.map(str::to_string),
             max_volume_gb: None,
+            ssh_client: crate::config::SshClient::Openssh,
         }
     }
 

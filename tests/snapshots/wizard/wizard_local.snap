@@ -77,6 +77,7 @@ runtime = "docker"             # native | docker
 # kind = "ssh"                 # host comes from OVERBRAINER_TARGETS__HOMELAB__HOST
 # runtime = "docker"
 # workdir = "overbrainer"      # on the remote machine, relative to its home directory
+# ssh_client = "openssh"       # openssh | builtin (builtin needs a build with the builtin-ssh feature; OVERBRAINER_SSH_CLIENT overrides it)
 
 # [targets.gpu_cloud]
 # kind = "runpod"              # needs OVERBRAINER_RUNPOD__API_KEY; Secure Cloud only
@@ -95,6 +96,7 @@ runtime = "docker"             # native | docker
 # data_center_ids = ["EU-RO-1"]  # any when unset; "auto": those with a chosen GPU in stock
 # network_volume_id = "..."    # mounted at /workspace/data; needs exactly one data_center_ids entry, not "auto"
 # max_volume_gb = 200          # grow the network volume up to this size in GB when the run fills it (permanent, billed monthly)
+# ssh_client = "openssh"       # openssh | builtin (builtin needs a build with the builtin-ssh feature; OVERBRAINER_SSH_CLIENT overrides it)
 
 # [export]                     # GGUF for llama.cpp and Ollama: `overbrainer export <run-id>`, or at the end of training
 # after_training = false       # export in the training job, after the merge

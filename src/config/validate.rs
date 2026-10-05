@@ -1,6 +1,6 @@
 use super::types::{
-    Adapter, ListOrAuto, Protocol, QUANTIZE_TYPES, Runtime, Settings, Target, Training,
-    is_ollama_name,
+    Adapter, BUILTIN_SSH_REFUSED, HAS_BUILTIN_SSH, ListOrAuto, Protocol, QUANTIZE_TYPES, Runtime,
+    Settings, SshClient, Target, Training, is_ollama_name,
 };
 
 /// Highest `pipeline.concurrency`: far above what providers allow, and well within
@@ -411,6 +411,7 @@ fn check_targets(settings: &Settings, problems: &mut Vec<String>) {
                 image,
                 venv,
                 workdir,
+                ssh_client,
                 ..
             } => {
                 check_runtime(
@@ -423,9 +424,17 @@ fn check_targets(settings: &Settings, problems: &mut Vec<String>) {
                 check_target_image(name, image.as_deref(), problems);
                 check_target_venv(name, venv.as_deref(), problems);
                 check_target_workdir(name, workdir.as_deref(), problems);
+                check_ssh_client(name, *ssh_client, problems);
             },
             Target::Runpod { .. } => check_runpod_target(name, target, problems),
         }
+    }
+}
+
+/// `builtin` needs a build with the `builtin-ssh` feature.
+fn check_ssh_client(name: &str, client: SshClient, problems: &mut Vec<String>) {
+    if client == SshClient::Builtin && !HAS_BUILTIN_SSH {
+        problems.push(format!("targets.{name}.ssh_client: {BUILTIN_SSH_REFUSED}"));
     }
 }
 
@@ -456,10 +465,12 @@ fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) 
         data_center_ids,
         network_volume_id,
         max_volume_gb,
+        ssh_client,
     } = target
     else {
         return;
     };
+    check_ssh_client(name, *ssh_client, problems);
     check_gpu_types(name, gpu_types, problems);
     check_auto_limits(name, gpu_types, *min_vram_gb, *max_price_per_hour, problems);
     let minimums = [
@@ -1335,6 +1346,78 @@ mod tests {
             vec![
                 "targets.local: engine and image only apply with runtime = \"docker\"".to_string()
             ]
+        );
+        Ok(())
+    }
+
+    /// The problem a `builtin` choice raises in a build without the feature.
+    #[cfg(not(feature = "builtin-ssh"))]
+    const BUILTIN_REFUSED: &str = "ssh_client = \"builtin\" needs a build with the builtin-ssh feature (the release binaries have it)";
+
+    /// `VALID` plus an ssh target `box` with `extra` lines.
+    fn with_ssh(extra: &str) -> String {
+        format!("{VALID}\n[targets.box]\nkind = \"ssh\"\nruntime = \"native\"\n{extra}\n")
+    }
+
+    #[test]
+    fn ssh_client_defaults_to_openssh_on_ssh_and_runpod_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let settings = settings(&with_ssh(""))?;
+        assert!(matches!(
+            settings.targets.get("box"),
+            Some(Target::Ssh {
+                ssh_client: SshClient::Openssh,
+                ..
+            })
+        ));
+        let settings = self::settings(&with_runpod(""))?;
+        assert!(matches!(
+            settings.targets.get("cloud"),
+            Some(Target::Runpod {
+                ssh_client: SshClient::Openssh,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_ssh_client_is_rejected() {
+        let error = settings(&with_ssh("ssh_client = \"putty\""))
+            .err()
+            .map(|error| error.to_string());
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("putty")),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn builtin_is_accepted_with_the_feature() -> Result<(), config::ConfigError> {
+        assert_eq!(
+            check(&settings(&with_ssh("ssh_client = \"builtin\""))?),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            check(&settings(&with_runpod("ssh_client = \"builtin\""))?),
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    #[cfg(not(feature = "builtin-ssh"))]
+    #[test]
+    fn builtin_is_refused_without_the_feature() -> Result<(), config::ConfigError> {
+        assert_eq!(
+            check(&settings(&with_ssh("ssh_client = \"builtin\""))?),
+            vec![format!("targets.box.ssh_client: {BUILTIN_REFUSED}")]
+        );
+        assert_eq!(
+            check(&settings(&with_runpod("ssh_client = \"builtin\""))?),
+            vec![format!("targets.cloud.ssh_client: {BUILTIN_REFUSED}")]
         );
         Ok(())
     }

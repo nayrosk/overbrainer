@@ -361,6 +361,64 @@ impl Engine {
     }
 }
 
+/// The SSH client a target uses to reach its machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SshClient {
+    /// The `ssh` found on `PATH`, with `~/.ssh/config`, the agent and `known_hosts`.
+    #[default]
+    Openssh,
+    /// The client built into overbrainer, only in a build with the `builtin-ssh`
+    /// feature.
+    Builtin,
+}
+
+impl SshClient {
+    /// The value as written in `overbrainer.toml`: `openssh` or `builtin`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Openssh => "openssh",
+            Self::Builtin => "builtin",
+        }
+    }
+}
+
+/// Environment variable that sets the SSH client of every target.
+pub const SSH_CLIENT_ENV: &str = "OVERBRAINER_SSH_CLIENT";
+
+/// What a `builtin` choice is refused with in a build without the `builtin-ssh`
+/// feature.
+pub const BUILTIN_SSH_REFUSED: &str = "ssh_client = \"builtin\" needs a build with the builtin-ssh feature (the release binaries have it)";
+
+/// Whether this build holds the built-in SSH client.
+pub const HAS_BUILTIN_SSH: bool = cfg!(feature = "builtin-ssh");
+
+/// The client for a target: `OVERBRAINER_SSH_CLIENT` when set, else the target's field.
+///
+/// `env` is the value of the variable, read by the caller through its environment
+/// source; an empty value counts as unset.
+///
+/// # Errors
+///
+/// Returns a message when `env` is neither `openssh` nor `builtin`, naming the
+/// variable, and when the result is `builtin` in a build without the `builtin-ssh`
+/// feature.
+pub fn effective_client(configured: SshClient, env: Option<&str>) -> Result<SshClient, String> {
+    let client = match env.map(str::trim).filter(|value| !value.is_empty()) {
+        None => configured,
+        Some("openssh") => SshClient::Openssh,
+        Some("builtin") => SshClient::Builtin,
+        Some(_) => {
+            return Err(format!("{SSH_CLIENT_ENV} must be openssh or builtin"));
+        },
+    };
+    if client == SshClient::Builtin && !HAS_BUILTIN_SSH {
+        return Err(BUILTIN_SSH_REFUSED.to_string());
+    }
+    Ok(client)
+}
+
 /// Image used by the `docker` runtime when a target sets none: Axolotl 0.19.0 for
 /// CUDA 13 (NVIDIA driver 580 or newer), pinned by digest.
 pub const DEFAULT_IMAGE: &str = "axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1@sha256:9de7c7a5b8830480a7d2eb3b6d49759586615f5f8eb1126d5df29f8bd9fa324b";
@@ -401,6 +459,10 @@ pub enum Target {
         /// Virtual environment holding `bin/axolotl`, only with `runtime = "native"`.
         /// Without it, `axolotl` must be on the remote `PATH`.
         venv: Option<String>,
+        /// The SSH client: `openssh` (default) or `builtin`, which needs a build with
+        /// the `builtin-ssh` feature. `OVERBRAINER_SSH_CLIENT` overrides it.
+        #[serde(default)]
+        ssh_client: SshClient,
     },
     /// Runs on a Runpod GPU pod, created for the run and deleted after it.
     Runpod {
@@ -463,6 +525,10 @@ pub enum Target {
         /// `network_volume_id`. None by default.
         #[serde(default, deserialize_with = "optional_number")]
         max_volume_gb: Option<u32>,
+        /// The SSH client: `openssh` (default) or `builtin`, which needs a build with
+        /// the `builtin-ssh` feature. `OVERBRAINER_SSH_CLIENT` overrides it.
+        #[serde(default)]
+        ssh_client: SshClient,
     },
 }
 
@@ -810,4 +876,69 @@ pub struct Metrics {
     /// Address `GET /metrics` listens on while a command holds the project, such
     /// as `127.0.0.1:9464`. No endpoint when unset.
     pub listen: Option<SocketAddr>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal of a `builtin` choice in a build without the feature.
+    #[cfg(not(feature = "builtin-ssh"))]
+    const BUILTIN_REFUSED: &str = "ssh_client = \"builtin\" needs a build with the builtin-ssh feature (the release binaries have it)";
+
+    #[test]
+    fn effective_client_lets_the_environment_win() {
+        assert_eq!(
+            effective_client(SshClient::Openssh, None),
+            Ok(SshClient::Openssh)
+        );
+        assert_eq!(
+            effective_client(SshClient::Builtin, Some("openssh")),
+            Ok(SshClient::Openssh)
+        );
+        assert_eq!(
+            effective_client(SshClient::Builtin, Some("")),
+            effective_client(SshClient::Builtin, None)
+        );
+    }
+
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn effective_client_accepts_builtin_with_the_feature() {
+        assert_eq!(
+            effective_client(SshClient::Openssh, Some("builtin")),
+            Ok(SshClient::Builtin)
+        );
+        assert_eq!(
+            effective_client(SshClient::Builtin, None),
+            Ok(SshClient::Builtin)
+        );
+    }
+
+    #[cfg(not(feature = "builtin-ssh"))]
+    #[test]
+    fn effective_client_refuses_builtin_without_the_feature() {
+        assert_eq!(
+            effective_client(SshClient::Openssh, Some("builtin")),
+            Err(BUILTIN_REFUSED.to_string())
+        );
+        assert_eq!(
+            effective_client(SshClient::Builtin, None),
+            Err(BUILTIN_REFUSED.to_string())
+        );
+    }
+
+    #[test]
+    fn effective_client_names_the_variable_on_an_invalid_value() {
+        let error = effective_client(SshClient::Openssh, Some("putty"));
+        assert!(
+            error
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.contains("OVERBRAINER_SSH_CLIENT")
+                    && error.contains("openssh")
+                    && error.contains("builtin")),
+            "{error:?}"
+        );
+    }
 }

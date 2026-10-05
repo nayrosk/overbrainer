@@ -7,7 +7,10 @@ mod reload;
 mod types;
 pub(crate) mod validate;
 
-pub use load::{CONFIG_FILE, ConfigError, ENV_PREFIX, EnvSource, Source, env_keys, load, load_str};
+pub use load::{
+    CONFIG_FILE, ConfigError, ENV_PREFIX, EnvSource, Source, env_keys, load, load_str,
+    ssh_client_env,
+};
 pub use reload::{
     DOTENV_FILE, DotenvError, DotenvKeys, ReloadError, Reloaded, Stamp, merged_env, reload, stamp,
 };

@@ -7,7 +7,8 @@ use secrecy::SecretString;
 
 use crate::config::{
     DEFAULT_IMAGE, DEFAULT_RUNPOD_BASE_URL, DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV,
-    DEFAULT_WORKDIR, Engine, EnvSource, Runtime, Settings, Target,
+    DEFAULT_WORKDIR, Engine, EnvSource, HAS_BUILTIN_SSH, Runtime, SSH_CLIENT_ENV, Settings,
+    SshClient, Target, effective_client, ssh_client_env,
 };
 
 /// Prints the resolved configuration with secrets masked. With `resolve`, also
@@ -20,7 +21,8 @@ use crate::config::{
 /// Vault configured, or a Vault request that fails).
 pub async fn run(project_dir: &Path, resolve: bool) -> anyhow::Result<()> {
     let settings = crate::config::load(project_dir, EnvSource::Process)?;
-    for line in describe(&settings) {
+    let ssh_env = ssh_client_env(&EnvSource::Process);
+    for line in describe(&settings, ssh_env.as_deref()).map_err(anyhow::Error::msg)? {
         println!("{line}");
     }
     for deprecation in crate::config::validate::deprecations(&settings) {
@@ -59,7 +61,13 @@ fn secrets(settings: &Settings) -> Vec<(String, &SecretString)> {
     found
 }
 
-fn describe(settings: &Settings) -> Vec<String> {
+/// The lines of `config check`. `ssh_env` is the value of `OVERBRAINER_SSH_CLIENT`.
+///
+/// # Errors
+///
+/// Returns a message when `ssh_env` is invalid, or names the built-in client in a
+/// build without it.
+fn describe(settings: &Settings, ssh_env: Option<&str>) -> Result<Vec<String>, String> {
     let mut lines = vec![format!("project.name = {}", settings.project.name)];
     for topic in &settings.topics {
         lines.push(format!(
@@ -96,6 +104,12 @@ fn describe(settings: &Settings) -> Vec<String> {
     }
     for (name, target) in &settings.targets {
         lines.push(format!("targets.{name} = {}", target_summary(target)));
+        if let Some(configured) = configured_client(target) {
+            lines.push(format!(
+                "targets.{name}.ssh_client = {}",
+                client_summary(configured, ssh_env)?
+            ));
+        }
     }
     lines.push(format!(
         "runpod.api_key = {}",
@@ -110,7 +124,33 @@ fn describe(settings: &Settings) -> Vec<String> {
             .unwrap_or(DEFAULT_RUNPOD_BASE_URL)
     ));
     lines.push(format!("hf_token = {}", masked(settings.hf_token.as_ref())));
-    lines
+    Ok(lines)
+}
+
+/// The `ssh_client` of an SSH or Runpod target.
+fn configured_client(target: &Target) -> Option<SshClient> {
+    match target {
+        Target::Ssh { ssh_client, .. } | Target::Runpod { ssh_client, .. } => Some(*ssh_client),
+        Target::Local { .. } => None,
+    }
+}
+
+/// The effective client, where it comes from, and how to use the other one.
+fn client_summary(configured: SshClient, ssh_env: Option<&str>) -> Result<String, String> {
+    let client = effective_client(configured, ssh_env)?;
+    let from_env = ssh_env.is_some_and(|value| !value.trim().is_empty());
+    let mut summary = client.name().to_string();
+    if from_env {
+        summary = format!("{summary} ({SSH_CLIENT_ENV})");
+    }
+    if client == SshClient::Openssh {
+        summary.push_str(if HAS_BUILTIN_SSH {
+            "; set ssh_client = \"builtin\" (or OVERBRAINER_SSH_CLIENT=builtin) to use the built-in client"
+        } else {
+            "; a build with the builtin-ssh feature (the release binaries have it) can use the built-in client"
+        });
+    }
+    Ok(summary)
 }
 
 fn target_summary(target: &Target) -> String {
@@ -131,6 +171,7 @@ fn target_summary(target: &Target) -> String {
             engine,
             image,
             venv,
+            ..
         } => format!(
             "ssh {} in {}, {}",
             host.as_deref().unwrap_or("(host unset)"),
@@ -158,6 +199,7 @@ fn runpod_summary(target: &Target) -> String {
         data_center_ids,
         network_volume_id,
         max_volume_gb,
+        ..
     } = target
     else {
         return String::new();
@@ -204,5 +246,120 @@ fn runtime_summary(
             image.unwrap_or(DEFAULT_IMAGE)
         ),
         Runtime::Native => format!("native, venv {}", venv.unwrap_or("(axolotl on PATH)")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::load_str;
+
+    /// A project with an ssh target `box` and a runpod target `cloud`, `extra`
+    /// appended to both.
+    fn project(extra: &str) -> Result<Settings, crate::config::ConfigError> {
+        let text = format!(
+            r#"
+[project]
+name = "demo"
+[providers.p]
+protocol = "openai"
+[roles.generator]
+provider = "p"
+model = "m"
+[roles.parent]
+provider = "p"
+model = "m"
+[targets.local]
+kind = "local"
+runtime = "native"
+[targets.box]
+kind = "ssh"
+runtime = "native"
+{extra}
+[targets.cloud]
+kind = "runpod"
+gpu_types = ["NVIDIA A40"]
+max_hours = 6
+{extra}
+"#
+        );
+        load_str(&text, EnvSource::Vars(Vec::new()))
+    }
+
+    /// The line of `lines` that starts with `prefix`.
+    fn line<'a>(lines: &'a [String], prefix: &str) -> Option<&'a String> {
+        lines.iter().find(|line| line.starts_with(prefix))
+    }
+
+    #[test]
+    fn config_check_prints_the_effective_client_of_ssh_and_runpod_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lines = describe(&project("")?, None)?;
+        for target in ["box", "cloud"] {
+            let found = line(&lines, &format!("targets.{target}.ssh_client = openssh"));
+            assert!(found.is_some(), "{lines:?}");
+        }
+        assert!(line(&lines, "targets.local.ssh_client").is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn config_check_suggests_builtin_in_a_build_with_the_feature()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lines = describe(&project("")?, None)?;
+        let found = line(&lines, "targets.box.ssh_client").ok_or("no line")?;
+        assert!(
+            found.contains("ssh_client = \"builtin\"")
+                && found.contains("OVERBRAINER_SSH_CLIENT=builtin"),
+            "{found}"
+        );
+        let lines = describe(&project("ssh_client = \"builtin\"")?, None)?;
+        assert!(
+            line(&lines, "targets.box.ssh_client = builtin").is_some(),
+            "{lines:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "builtin-ssh")]
+    #[test]
+    fn the_environment_wins_in_config_check() -> Result<(), Box<dyn std::error::Error>> {
+        let lines = describe(&project("")?, Some("builtin"))?;
+        assert!(
+            line(
+                &lines,
+                "targets.cloud.ssh_client = builtin (OVERBRAINER_SSH_CLIENT)"
+            )
+            .is_some(),
+            "{lines:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(feature = "builtin-ssh"))]
+    #[test]
+    fn config_check_points_to_the_feature_build_without_the_feature()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lines = describe(&project("")?, None)?;
+        let found = line(&lines, "targets.box.ssh_client").ok_or("no line")?;
+        assert!(found.contains("builtin-ssh feature"), "{found}");
+        assert_eq!(
+            describe(&project("")?, Some("builtin")).err(),
+            Some(crate::config::BUILTIN_SSH_REFUSED.to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_check_refuses_an_invalid_client_variable() -> Result<(), Box<dyn std::error::Error>> {
+        let error = describe(&project("")?, Some("putty")).err();
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("OVERBRAINER_SSH_CLIENT")),
+            "{error:?}"
+        );
+        Ok(())
     }
 }

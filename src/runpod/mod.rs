@@ -79,6 +79,18 @@ pub use types::{
     RemoteStatus, Secret, SecretList, SshDirect, Stock, Template, TemplatePage,
 };
 
+/// How to get past a local `ssh` that cannot keep its connection, closing the
+/// [`PodError::LocalSsh`] message.
+#[cfg(feature = "builtin-ssh")]
+const LOCAL_SSH_FIX: &str =
+    "; set ssh_client = \"builtin\" on the target (or OVERBRAINER_SSH_CLIENT=builtin)";
+
+/// How to get past a local `ssh` that cannot keep its connection, closing the
+/// [`PodError::LocalSsh`] message.
+#[cfg(not(feature = "builtin-ssh"))]
+const LOCAL_SSH_FIX: &str =
+    "; a build with the builtin-ssh feature (the release binaries have it) avoids the local ssh";
+
 /// Errors of a Runpod run's pod: provisioning, keys, readiness, deletion.
 #[derive(Debug, thiserror::Error)]
 pub enum PodError {
@@ -166,7 +178,8 @@ pub enum PodError {
     /// right after it started: the cause is on this machine, so no other GPU type
     /// is tried. The pod was deleted.
     #[error(
-        "pod {pod_id} answers SSH, but the local ssh cannot keep its connection ({reason}); a wrapper around `ssh` on PATH, such as firejail, may kill its background process: put the real ssh first on PATH. The pod was deleted and no other GPU type tried"
+        "pod {pod_id} answers SSH, but the local ssh cannot keep its connection ({reason}); a wrapper around `ssh` on PATH, such as firejail, may kill its background process: put the real ssh first on PATH. The pod was deleted and no other GPU type tried{}",
+        LOCAL_SSH_FIX
     )]
     LocalSsh {
         /// The pod.
