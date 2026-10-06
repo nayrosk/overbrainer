@@ -16,34 +16,28 @@ pub fn strip_reasoning(text: &str) -> String {
         _ => text,
     };
     let mut kept = String::with_capacity(rest.len());
+    let mut joined = false;
     while let Some(start) = rest.find(OPEN) {
-        kept.push_str(&rest[..start]);
+        push_segment(&mut kept, &rest[..start], joined);
+        joined = true;
         rest = match rest[start..].find(CLOSE) {
             Some(end) => &rest[start + end + CLOSE.len()..],
             None => "",
         };
     }
-    kept.push_str(rest);
-    collapse_spaces(kept.trim())
+    push_segment(&mut kept, rest, joined);
+    kept.trim().to_string()
 }
 
-/// `text` with runs of spaces left by a removed block made one space; line
-/// breaks are kept.
-fn collapse_spaces(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut space = false;
-    for c in text.chars() {
-        if c == ' ' {
-            if !space {
-                out.push(c);
-            }
-            space = true;
-        } else {
-            out.push(c);
-            space = false;
-        }
+/// Appends `segment` to `kept`. After a removed block (`joined`), leading
+/// spaces of the segment are dropped when `kept` already ends with a space, so
+/// the join leaves no doubled space; indentation elsewhere is untouched.
+fn push_segment(kept: &mut String, segment: &str, joined: bool) {
+    if joined && kept.ends_with(' ') {
+        kept.push_str(segment.trim_start_matches(' '));
+    } else {
+        kept.push_str(segment);
     }
-    out
 }
 
 #[cfg(test)]
@@ -69,5 +63,14 @@ mod tests {
             strip_reasoning("thinking first</think>\nAnswer."),
             "Answer."
         );
+    }
+
+    /// Code indentation survives, with or without a reasoning block before it.
+    #[test]
+    fn indentation_is_kept() {
+        let code = "def f():\n    return 1";
+        assert_eq!(strip_reasoning(code), code);
+        assert_eq!(strip_reasoning(&format!("<think>x</think>\n{code}")), code);
+        assert_eq!(strip_reasoning(&format!("{code}<think>x</think>")), code);
     }
 }
