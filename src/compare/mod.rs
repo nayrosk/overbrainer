@@ -15,10 +15,14 @@
 //! - `compare.json` and `compare.md`: the report.
 
 mod error;
+mod judge;
 mod text;
 mod types;
 
 pub use error::CompareError;
+pub use judge::{
+    Pick, child_first, judge_key, parse_reply, render_judge, verdict_of, verdicts_file,
+};
 pub use text::strip_reasoning;
 pub use types::{
     ChatMessage, ChildAnswer, CompareSetup, EvalQuestion, Hardware, Verdict, VerdictLine,
