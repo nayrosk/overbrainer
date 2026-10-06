@@ -1,0 +1,18 @@
+---
+source: src/compare/judge.rs
+---
+You compare two answers to the same question, for a quality check of a model.
+
+Question:
+Why borrow?
+
+Answer A:
+First answer.
+
+Answer B:
+Second answer.
+
+Pick the answer that serves the person who asked better: correct first, then complete, then clear and well formatted. Length is not a quality: a longer answer wins only when what it adds is correct and useful. When both are as good, or as bad, say tie. The order of the answers means nothing.
+
+Reply with one JSON object and nothing else:
+{"verdict": "A" or "B" or "tie", "reason": "one sentence"}

@@ -120,6 +120,9 @@ jobs:
             done
             docker exec -i "$container" sh -c 'cat >> /config/.ssh/authorized_keys' < ~/.ssh/overbrainer_test.pub
           done
+          # The compare job and its fake llama-server run on python3, which
+          # the image lacks.
+          docker exec "$SSHD" apk add --no-cache python3
           # The image turns TCP forwarding off; the bastion needs it. SIGHUP
           # makes sshd read its config again, once sshd has written its pid.
           for _ in $(seq 1 60); do

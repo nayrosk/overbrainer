@@ -824,8 +824,9 @@ max_hours = 6
 #ZZ metrics
 "#;
 
-    /// Keys a form never writes: env-only secrets and hosts, and free-form tables.
-    const NOT_IN_FORM: [(&str, &str); 8] = [
+    /// Keys a form never writes: env-only secrets and hosts, free-form tables, and
+    /// the compare settings and judge, edited in the file only.
+    const NOT_IN_FORM: [(&str, &str); 10] = [
         ("settings", "runpod"),
         ("settings", "hf_token"),
         ("settings", "log"),
@@ -834,6 +835,8 @@ max_hours = 6
         ("ssh", "host"),
         ("training", "axolotl_extra"),
         ("hub", "base_url"),
+        ("settings", "compare"),
+        ("roles", "judge"),
     ];
 
     /// Every section name with its `Section`.

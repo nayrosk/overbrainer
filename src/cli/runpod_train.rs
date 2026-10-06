@@ -12,12 +12,13 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, anyhow, bail};
 use secrecy::SecretString;
 
-use super::export::{Delivery, EXPORT_PREFIX, Plan, finish_export, started_line};
+use super::export::{Delivery, EXPORT_PREFIX, Plan, fail, finish_export, started_line};
 use super::front::{BusGuard, Flag, Frontend, Interrupt};
 use super::train::{
     HF_TOKEN, POLL, exporting, finish, prepare, push_after_training, resumed, secrets, started,
     stop_requested, stoppable, training, warn,
 };
+use crate::compare::{COMPARE_PREFIX, ModelSource, discard_model};
 use crate::config::{Settings, SshClient, Training, process_client};
 use crate::dataset::DataFiles;
 use crate::exec::{JobStatus, LocalExecutor, SshExecutor};
@@ -261,6 +262,86 @@ pub(super) async fn export(
     .await;
     session.close().await;
     result
+}
+
+/// `overbrainer compare` of `plan` on the Runpod target `spec`: a new pod
+/// with the target's GPU settings, the compare job uploaded with the run's
+/// GGUF and the questions, its answers retrieved, then the pod deleted (kept
+/// with `keep`), under the same lease, deadline and cost cap as a training
+/// job. The pod's price and the questions are said before it starts. The
+/// compare's record and pod live in `runs/<run-id>/compares/<compare-id>/`.
+/// Ctrl-C cancels the job and ends its pod. Returns the compares of the run
+/// and the compare's ID once its answers are back.
+///
+/// # Errors
+///
+/// Returns an error when the pod cannot be provisioned, the job fails, or it
+/// is interrupted.
+pub(super) async fn compare(
+    project_dir: &Path,
+    settings: &Settings,
+    (spec, keep): (&RunpodTarget, bool),
+    plan: &super::compare::Plan,
+    front: &Frontend,
+) -> anyhow::Result<(Runs, String)> {
+    let run = &plan.run;
+    let compares = Runs::new(project_dir).compares(&run.id)?;
+    let trainer = super::compare::job_of(plan, settings, ModelSource::Upload(plan.gguf.clone()))?;
+    let vram_floor_gb = super::compare::compare_vram_floor(spec, plan.export.size);
+    // Caught from before the preparation: Ctrl-C stops it without a compare.
+    let mut interrupt = front.interrupt();
+    let session = prepare(&mut interrupt, async {
+        let session = Session::open_in(compares.clone(), settings, front).await?;
+        let price = super::compare::pod_price(&session.client, spec, vram_floor_gb).await;
+        tracing::info!(
+            "compare: {} questions on a new Runpod pod {}",
+            plan.questions.len(),
+            price.words()
+        );
+        Ok(session)
+    })
+    .await?;
+    let report =
+        |compares: &Runs, id: &str, result: anyhow::Result<Option<Outcome>>, _front: &Frontend| {
+            let outcome = result?.with_context(|| format!("interrupted: compare {id} stopped"))?;
+            super::compare::generated(compares, &outcome)
+        };
+    let result = async {
+        let record = create(&session.runs, COMPARE_PREFIX, spec.workdir(), &run.target)?;
+        let id = record.id.clone();
+        let dir = session.runs.run_dir(&id)?;
+        if let Err(error) = super::compare::setup_of(plan, &id, settings.pipeline.seed).save(&dir) {
+            let error = anyhow::Error::from(error);
+            fail(&session.runs, &id, &error);
+            return Err(error);
+        }
+        tracing::info!("compare: {id}: {}", session.runs.relative_dir(&id));
+        let job = Job {
+            session: &session,
+            spec,
+            trainer: &trainer,
+            vram_floor_gb,
+            stopping: false,
+            report: &report,
+            cancel_on_interrupt: true,
+        };
+        let ran = job.run(&mut interrupt, record, keep, Vec::new()).await;
+        // The GGUF linked into the job directory for the upload is of no use now.
+        if let Err(error) = discard_model(&dir) {
+            warn(&format!("cannot clean the compare {id}: {error}"));
+        }
+        ran.map(|()| id)
+    }
+    .await;
+    session.close().await;
+    Ok((compares, result?))
+}
+
+/// The VRAM floor of `auto` GPU types for a compare of a GGUF of `bytes`:
+/// the file and its cache, a fifth more, plus 2 GB, in whole GB.
+pub(super) fn gguf_vram_floor(bytes: u64) -> u32 {
+    let gb = bytes.saturating_mul(6).div_ceil(5).div_ceil(1_000_000_000);
+    u32::try_from(gb).unwrap_or(u32::MAX).saturating_add(2)
 }
 
 /// What an export of `plan` needs of a pod of `spec`, from its base model's
@@ -836,16 +917,17 @@ fn pod_name(pod: &PodRecord) -> String {
         .map_or_else(|| "(none)".to_string(), ToString::to_string)
 }
 
+/// The warning of `--keep-pod` for the pod of `id`, a run or a job (an export
+/// or a compare) of `runs`: nothing deletes the pod once it ends.
 fn keep_warning(pod: &PodRecord, runs: &Runs, id: &str) -> String {
     let rate = pod.cost_per_hour.map_or_else(
         || "at an hourly rate Runpod did not give".to_string(),
         |rate| format!("at ${rate:.2}/h"),
     );
-    let ends = if runs.export_of().is_some() {
-        "the export"
-    } else {
-        "the run"
-    };
+    let ends = runs.job_of().map_or_else(
+        || "the run".to_string(),
+        |(_, kind)| format!("the {}", kind.noun()),
+    );
     format!(
         "--keep-pod: pod {} is kept with no time limit, {rate}, even once {ends} ends; \
          nothing deletes it but `overbrainer pod rm {id}`",
@@ -1195,6 +1277,36 @@ mod tests {
         Ok(())
     }
 
+    /// A compare's messages name the compare and how to run it again.
+    #[test]
+    fn a_compare_s_messages_name_the_compare_and_never_train_attach()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let compares = runs().compares("r1")?;
+        let kept = pod(true)?;
+        let warning = keep_warning(&kept, &compares, "c1");
+        assert!(warning.contains("even once the compare ends"), "{warning}");
+        let detached = detached(&kept, "c1", &target(), &compares);
+        assert!(
+            detached.starts_with("interrupted: compare c1 of run r1 keeps running on pod k3x9abc"),
+            "{detached}"
+        );
+        assert!(
+            detached.contains("`overbrainer compare --run r1`"),
+            "{detached}"
+        );
+        assert!(!detached.contains("train attach"), "{detached}");
+        Ok(())
+    }
+
+    /// The GGUF and its cache must fit: a fifth more than the file, plus 2 GB.
+    #[test]
+    fn the_vram_floor_of_a_compare_follows_the_gguf() {
+        assert_eq!(gguf_vram_floor(0), 2);
+        assert_eq!(gguf_vram_floor(2_500_000_000), 5);
+        assert_eq!(gguf_vram_floor(4_000_000_001), 7);
+    }
+
+    /// The record of pod k3x9abc, an A40 at $0.53/h, kept when `keep`.
     fn pod(keep: bool) -> Result<PodRecord, serde_json::Error> {
         let mut pod = PodRecord::new("r1", keep, 1, "ssh-ed25519 AAAAhost");
         let remote: Pod = serde_json::from_value(

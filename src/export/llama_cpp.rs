@@ -1,7 +1,9 @@
 //! The llama.cpp release an export uses: one pinned tag, its source tarball and
-//! the prebuilt `llama-quantize` for each platform, each with its SHA-256. The
-//! export script downloads them on the target, checks them against these
-//! digests before extracting anything, and caches them there.
+//! the prebuilt binaries for each platform (`llama-quantize` for an export,
+//! `llama-server` for a compare, with a CUDA build and its runtime for NVIDIA
+//! GPUs and a `ROCm` build for AMD GPUs), each with its SHA-256. The scripts
+//! download them on the target, check them against these digests before
+//! extracting anything, and cache them there.
 //!
 //! To move to a newer release, see "Bumping llama.cpp" in `docs/training.md`.
 
@@ -27,8 +29,38 @@ pub const UBUNTU_ARM64_SHA256: &str =
 pub const MACOS_ARM64_SHA256: &str =
     "f6f337fc7d2ff9260f53177cf4fe6bbf6b0f7faa75a49fb224aaf66885a5c956";
 
-/// The environment the export script reads the pin from: the tag, the
-/// repository, and each digest.
+/// The CUDA version of the CUDA builds a compare runs on an NVIDIA GPU.
+pub const CUDA: &str = "13.4";
+
+/// SHA-256 of `llama-<TAG>-bin-ubuntu-cuda-<CUDA>-x64.tar.gz` (Linux `x86_64`, NVIDIA GPU).
+pub const UBUNTU_CUDA_X64_SHA256: &str =
+    "4c6b7cf40228efb96930f6694e7faae43a7e01993baba8e7894e2a3fc43e8a31";
+
+/// SHA-256 of `llama-<TAG>-bin-ubuntu-cuda-<CUDA>-arm64.tar.gz` (Linux `aarch64`, NVIDIA GPU).
+pub const UBUNTU_CUDA_ARM64_SHA256: &str =
+    "df2ea0d5c3bd5492dda70cd86f2a384709f7aa7ceec123b159e20b2844ce2f46";
+
+/// SHA-256 of `cudart-llama-<TAG>-bin-ubuntu-cuda-<CUDA>-x64.tar.gz`: the CUDA
+/// runtime and cuBLAS the x64 CUDA build loads, when the machine lacks them.
+pub const CUDART_X64_SHA256: &str =
+    "249a86f9156641b98d586c6c6c649335f691d3a27f9fdaaca699af9cbfbb3ca2";
+
+/// SHA-256 of `cudart-llama-<TAG>-bin-ubuntu-cuda-<CUDA>-arm64.tar.gz`.
+pub const CUDART_ARM64_SHA256: &str =
+    "e0895065d9244b3f8a50c2d85e196605e8a48c1f06a53f2f52db089fbd29d8bb";
+
+/// The `ROCm` label of the `ROCm` build a compare runs on an AMD GPU.
+pub const ROCM: &str = "10.0";
+
+/// SHA-256 of `llama-<TAG>-bin-ubuntu-rocm-<ROCM>-x64.tar.gz` (Linux `x86_64`,
+/// AMD GPU). It does not bundle the `ROCm` 7 runtime (`libamdhip64.so.7`,
+/// `librocblas.so.5`, `libhipblas.so.3`): the system provides it. There is no
+/// `ROCm` build for `aarch64`.
+pub const UBUNTU_ROCM_X64_SHA256: &str =
+    "d3f610c849bc8d365c31a62dba9c1a309a783202fe5d86d85f6a64b34cecb195";
+
+/// The environment the scripts read the pin from: the tag, the CUDA and `ROCm`
+/// versions, the repository, and each digest.
 #[must_use]
 pub fn env() -> Vec<(String, String)> {
     [
@@ -44,6 +76,25 @@ pub fn env() -> Vec<(String, String)> {
             "OVERBRAINER_LLAMA_CPP_MACOS_ARM64_SHA256",
             MACOS_ARM64_SHA256,
         ),
+        ("OVERBRAINER_LLAMA_CPP_CUDA", CUDA),
+        (
+            "OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_X64_SHA256",
+            UBUNTU_CUDA_X64_SHA256,
+        ),
+        (
+            "OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_ARM64_SHA256",
+            UBUNTU_CUDA_ARM64_SHA256,
+        ),
+        ("OVERBRAINER_LLAMA_CPP_CUDART_X64_SHA256", CUDART_X64_SHA256),
+        ("OVERBRAINER_LLAMA_CPP_ROCM", ROCM),
+        (
+            "OVERBRAINER_LLAMA_CPP_UBUNTU_ROCM_X64_SHA256",
+            UBUNTU_ROCM_X64_SHA256,
+        ),
+        (
+            "OVERBRAINER_LLAMA_CPP_CUDART_ARM64_SHA256",
+            CUDART_ARM64_SHA256,
+        ),
     ]
     .into_iter()
     .map(|(name, value)| (name.to_string(), value.to_string()))
@@ -54,6 +105,7 @@ pub fn env() -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
+    /// Every pinned digest is 64 lowercase hex digits.
     #[test]
     fn every_digest_is_a_sha256_in_lowercase_hex() {
         for digest in [
@@ -61,6 +113,11 @@ mod tests {
             UBUNTU_X64_SHA256,
             UBUNTU_ARM64_SHA256,
             MACOS_ARM64_SHA256,
+            UBUNTU_CUDA_X64_SHA256,
+            UBUNTU_CUDA_ARM64_SHA256,
+            CUDART_X64_SHA256,
+            CUDART_ARM64_SHA256,
+            UBUNTU_ROCM_X64_SHA256,
         ] {
             assert_eq!(digest.len(), 64, "{digest}");
             assert!(
@@ -72,6 +129,8 @@ mod tests {
         }
     }
 
+    /// The script's environment holds the release tag, the CUDA version and
+    /// every build's digest.
     #[test]
     fn the_script_gets_the_tag_and_every_digest() {
         let env = env();
@@ -85,6 +144,28 @@ mod tests {
             get("OVERBRAINER_LLAMA_CPP_MACOS_ARM64_SHA256"),
             Some(MACOS_ARM64_SHA256)
         );
-        assert_eq!(env.len(), 6);
+        assert_eq!(get("OVERBRAINER_LLAMA_CPP_CUDA"), Some(CUDA));
+        assert_eq!(
+            get("OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_X64_SHA256"),
+            Some(UBUNTU_CUDA_X64_SHA256)
+        );
+        assert_eq!(
+            get("OVERBRAINER_LLAMA_CPP_CUDART_ARM64_SHA256"),
+            Some(CUDART_ARM64_SHA256)
+        );
+        assert_eq!(
+            get("OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_ARM64_SHA256"),
+            Some(UBUNTU_CUDA_ARM64_SHA256)
+        );
+        assert_eq!(
+            get("OVERBRAINER_LLAMA_CPP_CUDART_X64_SHA256"),
+            Some(CUDART_X64_SHA256)
+        );
+        assert_eq!(get("OVERBRAINER_LLAMA_CPP_ROCM"), Some(ROCM));
+        assert_eq!(
+            get("OVERBRAINER_LLAMA_CPP_UBUNTU_ROCM_X64_SHA256"),
+            Some(UBUNTU_ROCM_X64_SHA256)
+        );
+        assert_eq!(env.len(), 13);
     }
 }

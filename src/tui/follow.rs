@@ -140,7 +140,8 @@ impl App {
         before != self.training.reading.len()
     }
 
-    /// A key in the Training view.
+    /// A key in the Training view; `C` compares the selected run with its
+    /// parent (see [`super::compare`]).
     pub(super) fn on_training_key(&mut self, code: KeyCode) -> Vec<Effect> {
         let view = &mut self.training;
         match code {
@@ -168,6 +169,13 @@ impl App {
                 return Vec::new();
             },
             KeyCode::Char('h') => return self.prepare_push(),
+            KeyCode::Char('C') => {
+                let run = self
+                    .training
+                    .selected_run()
+                    .map(|row| row.record.id.clone());
+                return self.ask_compare(run);
+            },
             _ => return Vec::new(),
         }
         self.read_selected()

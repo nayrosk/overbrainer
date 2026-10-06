@@ -14,9 +14,11 @@ pub const SUBTOPICS: &str = "subtopics.txt";
 pub const QUESTIONS: &str = "questions.txt";
 /// System prompt sent to the parent with each question.
 pub const ANSWER_SYSTEM: &str = "answer_system.txt";
+/// Prompt asking the judge of `overbrainer compare` which of two answers is better.
+pub const JUDGE: &str = "judge.txt";
 
 /// Built-in templates, by file name. `init` writes them to `prompts/`.
-pub const DEFAULTS: [(&str, &str); 3] = [
+pub const DEFAULTS: [(&str, &str); 4] = [
     (
         SUBTOPICS,
         include_str!("../templates/prompts/subtopics.txt"),
@@ -29,6 +31,7 @@ pub const DEFAULTS: [(&str, &str); 3] = [
         ANSWER_SYSTEM,
         include_str!("../templates/prompts/answer_system.txt"),
     ),
+    (JUDGE, include_str!("../templates/prompts/judge.txt")),
 ];
 
 /// Errors from loading or rendering templates.
@@ -102,6 +105,16 @@ impl Prompts {
         }
     }
 
+    /// The source of template `name`, as loaded (the override or the
+    /// default); `None` when there is no such template.
+    #[must_use]
+    pub fn source(&self, name: &str) -> Option<String> {
+        self.env
+            .get_template(name)
+            .ok()
+            .map(|template| template.source().to_string())
+    }
+
     /// Renders template `name` with `context`.
     ///
     /// # Errors
@@ -137,6 +150,8 @@ mod tests {
 
     use super::*;
 
+    /// Each default prompt, the judge's included, renders with the variables
+    /// its docs name.
     #[test]
     fn defaults_render_with_their_documented_variables() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
@@ -164,6 +179,12 @@ mod tests {
             context! { topic => "ownership", description => None::<String> },
         )?;
         assert!(text.starts_with("You are an expert in ownership."));
+
+        let text = prompts.render(
+            JUDGE,
+            context! { question => "Why?", answer_a => "A.", answer_b => "B." },
+        )?;
+        assert!(text.contains("Answer A:\nA."));
         Ok(())
     }
 

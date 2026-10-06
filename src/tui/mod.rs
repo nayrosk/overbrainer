@@ -1,11 +1,12 @@
 //! The terminal UI, `overbrainer tui`: the configuration and stats of the
-//! project, the dataset, the pipeline stages, training runs and the logs in five
-//! views. It runs the flows the command line runs, and writes nothing to stdout
-//! or stderr while the terminal shows it.
+//! project, the dataset, the pipeline stages, training runs, the logs and the
+//! compares in six views. It runs the flows the command line runs, and writes
+//! nothing to stdout or stderr while the terminal shows it.
 
 mod app;
 mod auto;
 mod catalog;
+mod compare;
 mod config_watch;
 mod cost;
 mod dataset;

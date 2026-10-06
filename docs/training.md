@@ -125,9 +125,9 @@ The export uses one pinned llama.cpp release, `b11320`: the source tarball of th
 Bumping llama.cpp, in `src/export/llama_cpp.rs`:
 
 1. Set `TAG` to the new release tag.
-2. Take the `digest` of `llama-<tag>-bin-ubuntu-x64.tar.gz`, `-ubuntu-arm64` and `-macos-arm64` from `gh api repos/ggml-org/llama.cpp/releases/tags/<tag>`, and set the three `*_SHA256` constants.
+2. Take the `digest` of `llama-<tag>-bin-ubuntu-x64.tar.gz`, `-ubuntu-arm64`, `-macos-arm64`, `-ubuntu-cuda-<cuda>-x64`, `-ubuntu-cuda-<cuda>-arm64` and `-ubuntu-rocm-<rocm>-x64`, and of `cudart-llama-<tag>-bin-ubuntu-cuda-<cuda>-x64.tar.gz` and `-arm64`, from `gh api repos/ggml-org/llama.cpp/releases/tags/<tag>`, and set the `*_SHA256` constants. Set `CUDA` to the CUDA version of those builds, and `ROCM` to the ROCm label of the ROCm build. How the compare script picks a build is in [compare](compare.md#how-it-works). When a bump changes the ROCm major version, update the library names in `pick_amd` in `src/compare/compare.sh` and in its warning.
 3. Download `https://github.com/ggml-org/llama.cpp/archive/refs/tags/<tag>.tar.gz`, run `sha256sum` on it, and set `SOURCE_SHA256`.
-4. Check that the archives still hold `llama.cpp-<tag>/convert_hf_to_gguf.py` and `llama-<tag>/llama-quantize`, then export a small run on a GPU target and load it in Ollama.
+4. Check that the archives still hold `llama.cpp-<tag>/convert_hf_to_gguf.py`, `llama-<tag>/llama-quantize` and `llama-<tag>/llama-server`, the cudart archives `libcudart.so.<major>`, and that `libggml-hip.so` of the ROCm archive still needs the libraries `pick_amd` checks (`readelf -d`), then export a small run on a GPU target, load it in Ollama, and compare it.
 
 ## Push to Hugging Face
 
@@ -173,7 +173,7 @@ Ctrl-C cancels a push before its commit: nothing is committed (`push cancelled b
 
 `OVERBRAINER_HUB__BASE_URL` points the push at another Hub, over `https` (or `http` on a loopback address, for a test stub); it has no `overbrainer.toml` key.
 
-Before you publish a repo, read its card. It names the topics and their descriptions and the parent model, which is why repos are private by default. Some providers' terms forbid training models on their outputs: check the terms of the parent's provider before you make a repo public.
+Before you publish a repo, read its card. It names the topics with their descriptions and every role, including the judge when set. That is why repos are private by default. Some providers' terms forbid training models on their outputs: check the terms of the parent's provider before you make a repo public.
 
 ## Targets
 

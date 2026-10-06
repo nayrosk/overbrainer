@@ -1,7 +1,7 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  rust_ex… "
+" ⠿ 1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare  rust_expert "
 "  Logs · WARN and above                                                         "
 "                                                                                "
 "  14:12:23 WARN  cli::progress: answers: 77aa: 429 Too Many Requests; retrying  "

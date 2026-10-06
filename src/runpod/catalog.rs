@@ -473,6 +473,44 @@ pub fn resolve_with_floor(
     Ok(resolved)
 }
 
+/// A GPU type in stock and what a pod of it costs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuOffer {
+    /// The GPU type's ID.
+    pub gpu_type: String,
+    /// Secure Cloud price of the pod, all its GPUs, in USD per hour.
+    pub per_hour: f64,
+}
+
+/// The cheapest GPU type in stock a pod of `target` would get, from the
+/// catalog `gpus`, priced for `target.gpu_count` GPUs, as `overbrainer pod
+/// gpus` lists prices: its `auto` GPU types as [`resolve_with_floor`] picks
+/// them (with `floor_gb`), else its listed ones. `None` when none is in stock
+/// with a price.
+#[must_use]
+pub fn cheapest_in_stock(
+    target: &RunpodTarget,
+    gpus: &[GpuType],
+    floor_gb: Option<u32>,
+) -> Option<GpuOffer> {
+    let resolved = resolve_with_floor(target, gpus, floor_gb).ok()?;
+    let wanted = resolved.gpu_types.list();
+    let filter = GpuFilter {
+        in_stock: true,
+        gpu_count: Some(target.gpu_count),
+        ..GpuFilter::default()
+    };
+    select_gpus(gpus, &filter)
+        .into_iter()
+        .filter(|gpu| wanted.contains(&gpu.id))
+        .find_map(|gpu| {
+            gpu.secure_price().map(|price| GpuOffer {
+                per_hour: price * f64::from(target.gpu_count),
+                gpu_type: gpu.id,
+            })
+        })
+}
+
 /// Most GPU types reported out of stock that one walk over `auto` GPU types
 /// tries (see [`walk_order`]).
 pub(crate) const MAX_OUT_OF_STOCK: usize = 3;
@@ -917,6 +955,35 @@ mod tests {
             resolved.map(|target| target.gpu_types),
             Ok(list(&["big", "a", "dear"]))
         );
+    }
+
+    /// The cheapest GPU type in stock a target would get prices its pod, for
+    /// its GPU count: `auto` within its limits and the VRAM floor, a list
+    /// among its own types.
+    #[test]
+    fn the_cheapest_gpu_in_stock_prices_the_pod() {
+        let mut out = gpu("out", 80, Some(0.1));
+        out.availability = Availability::None;
+        let gpus = [
+            out,
+            gpu("small", 16, Some(0.2)),
+            gpu("mid", 48, Some(0.8)),
+            gpu("unpriced", 80, None),
+        ];
+        let offer = |gpu_type: &str, per_hour| {
+            Some(GpuOffer {
+                gpu_type: gpu_type.to_string(),
+                per_hour,
+            })
+        };
+        let auto = target(ListOrAuto::Auto, ListOrAuto::default());
+        assert_eq!(cheapest_in_stock(&auto, &gpus, None), offer("small", 0.2));
+        assert_eq!(cheapest_in_stock(&auto, &gpus, Some(20)), offer("mid", 0.8));
+        let mut listed = target(list(&["out", "unpriced", "mid"]), ListOrAuto::default());
+        listed.gpu_count = 2;
+        assert_eq!(cheapest_in_stock(&listed, &gpus, None), offer("mid", 1.6));
+        let sold_out = target(list(&["out", "unpriced"]), ListOrAuto::default());
+        assert_eq!(cheapest_in_stock(&sold_out, &gpus, None), None);
     }
 
     #[test]

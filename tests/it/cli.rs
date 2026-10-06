@@ -10,6 +10,8 @@ fn overbrainer() -> Result<Command, Box<dyn std::error::Error>> {
     Ok(cmd)
 }
 
+/// `init` writes every project file, the judge prompt included, and refuses
+/// a directory that holds a project already.
 #[test]
 fn init_creates_project_files_and_refuses_to_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
@@ -25,6 +27,7 @@ fn init_creates_project_files_and_refuses_to_overwrite() -> Result<(), Box<dyn s
         "prompts/subtopics.txt",
         "prompts/questions.txt",
         "prompts/answer_system.txt",
+        "prompts/judge.txt",
         ".overbrainer/version",
     ] {
         assert!(dir.path().join(file).is_file(), "{file} missing");

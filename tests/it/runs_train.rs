@@ -123,6 +123,8 @@ async fn wait_until_ended(
     Err("the job did not end".into())
 }
 
+/// A run trains, merges and records its outcome, and its watch names the run
+/// (a training job, not a nested job) before its metrics.
 #[tokio::test]
 async fn a_run_trains_merges_and_records_its_outcome() -> TestResult {
     let fixture = Fixture::new("ok")?;
@@ -176,7 +178,7 @@ async fn a_run_trains_merges_and_records_its_outcome() -> TestResult {
     let events = events(&mut receiver);
     assert_eq!(
         events.iter().position(
-            |event| matches!(event, Event::RunWatched { run_id, export: false } if *run_id == outcome.record.id)
+            |event| matches!(event, Event::RunWatched { run_id, job: None } if *run_id == outcome.record.id)
         ),
         Some(0),
         "the watch names its run before its metrics: {events:?}"

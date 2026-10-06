@@ -420,11 +420,15 @@ mod tests {
             .collect()
     }
 
+    /// The tasks `effects` spawn, but the reads of the data, the runs and the
+    /// compares.
     fn spawned(effects: &[Effect]) -> Vec<(TaskId, Task)> {
         effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Spawn(id, task) if !matches!(task, Task::Load | Task::Runs) => {
+                Effect::Spawn(id, task)
+                    if !matches!(task, Task::Load | Task::Runs | Task::Compares) =>
+                {
                     Some((*id, task.clone()))
                 },
                 _ => None,

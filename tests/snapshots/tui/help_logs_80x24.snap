@@ -1,11 +1,11 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  rust_ex… "
+" ⠿ 1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare  rust_expert "
 "                                                                                "
 " ╭ Keys ──────────────────────────────────────────────────────────────────────╮ "
 " │ Everywhere                                                                 │ "
-" │ 1 2 3 4 5, Tab, Shift-Tab  switch view                                     │ "
+" │ 1-6, Tab, Shift-Tab        switch view                                     │ "
 " │ ?                          this help (Esc, ? or q closes it)               │ "
 " │ q, Ctrl-C                  quit                                            │ "
 " │ R                          reload the data files and runs                  │ "
@@ -20,8 +20,8 @@ source: src/tui/snapshots.rs
 " │ s                          toggle overbrainer / selected run's pod         │ "
 " │ x                          export the shown lines to .overbrainer/         │ "
 " │                                                                            │ "
-" │ e, d, r, A, t and h are refused while a stage, an edit or a training start │ "
-" │ runs in this TUI; the TUI also holds the project lock, so no other         │ "
+" │ e, d, r, A, t, h, C and J are refused while a stage, an edit or a training │ "
+" │ start runs in this TUI; the TUI also holds the project lock, so no other   │ "
 " │ overbrainer command writes to the project meanwhile.                       │ "
 " ╰────────────────────────────────────────────────────────────────────────────╯ "
 " Esc close                                                               ? help "

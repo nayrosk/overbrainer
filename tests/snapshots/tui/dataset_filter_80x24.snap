@@ -1,7 +1,7 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  rust_ex… "
+" ⠿ 1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare  rust_expert "
 "╭ data: 4 matches ─────────────────╮╭ topic ───────────────────────────────────╮"
 "│ ▼ ownership  2 sub, 5 q, 4 a     ││ ownership                                │"
 "│   ▼ Borrowing  3 q, 2 a          ││ Moves, borrows and lifetimes in Rust     │"

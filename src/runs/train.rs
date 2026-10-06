@@ -453,7 +453,7 @@ pub async fn watch<E: Executor, T: Trainer>(
     }
     ctx.bus.publish(Event::RunWatched {
         run_id: record.id.clone(),
-        export: ctx.runs.export_of().is_some(),
+        job: ctx.runs.job_of().map(|(_, kind)| kind),
     });
     let metrics = format!("{}/{}", record.remote_dir, trainer.metrics_file());
     let mut stream = ctx.executor.tail(&metrics, 0);

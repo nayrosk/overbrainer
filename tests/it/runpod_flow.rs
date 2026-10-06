@@ -20,7 +20,7 @@ use overbrainer::runpod::{
     host_key_placeholder, host_key_secret, reconnect, settle_watch, start_pod, watch_leased,
     watch_on_pod,
 };
-use overbrainer::runs::{RunCtx, RunRecord, RunState, Runs, create};
+use overbrainer::runs::{JobKind, RunCtx, RunRecord, RunState, Runs, create};
 use overbrainer::train::{Artifacts, TrainError, Trainer};
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -956,6 +956,30 @@ async fn a_kept_pod_past_a_deadline_is_never_deleted() -> TestResult {
 /// the run's own pod may still need it.
 #[tokio::test]
 async fn an_export_pod_has_its_own_secret_which_a_failed_start_deletes() -> TestResult {
+    a_job_pod_has_its_own_secret(JobKind::Export).await
+}
+
+/// A compare's pod gets a host key secret of its own, named after the
+/// compare, as an export's does.
+#[tokio::test]
+async fn a_compare_pod_has_its_own_secret_which_a_failed_start_deletes() -> TestResult {
+    a_job_pod_has_its_own_secret(JobKind::Compare).await
+}
+
+/// The body of the first pod create `server` received.
+async fn create_body(server: &MockServer) -> Result<Value, Box<dyn std::error::Error>> {
+    let requests = server.received_requests().await.unwrap_or_default();
+    let create_call = requests
+        .iter()
+        .find(|request| request.url.path() == "/v2/pods")
+        .ok_or("no create call")?;
+    Ok(serde_json::from_slice(&create_call.body)?)
+}
+
+/// A job of `kind` of a run starts its own pod, recorded in the job's own
+/// directory with a host key secret named after the job; a start that fails
+/// for capacity fails the job and deletes that secret, never the run's.
+async fn a_job_pod_has_its_own_secret(kind: JobKind) -> TestResult {
     require_keygen()?;
     let harness = Harness::new().await?;
     Mock::given(method("POST"))
@@ -964,33 +988,39 @@ async fn an_export_pod_has_its_own_secret_which_a_failed_start_deletes() -> Test
         .await;
     let run = create(&harness.runs, "demo", "/workspace/overbrainer", "gpu_cloud")?;
     harness.secrets.hold("k-run", &host_key_secret(&run.id));
-    let exports = harness.runs.exports(&run.id)?;
-    let export = create(&exports, "export", "/workspace/overbrainer", "gpu_cloud")?;
+    let jobs = harness.runs.jobs(&run.id, kind)?;
+    let job = create(&jobs, kind.noun(), "/workspace/overbrainer", "gpu_cloud")?;
     let ctx = PodCtx {
-        runs: &exports,
+        runs: &jobs,
         ..harness.ctx()
     };
-    let result = start_pod(&ctx, &target(), export.clone(), false, None).await;
+    let result = start_pod(&ctx, &target(), job.clone(), false, None).await;
     assert!(matches!(result, Err(PodError::NoCapacity(_))), "{result:?}");
-    assert_eq!(exports.load(&export.id)?.state, RunState::Failed);
+    assert_eq!(jobs.load(&job.id)?.state, RunState::Failed);
     assert_eq!(harness.runs.load(&run.id)?.state, RunState::Preparing);
-    let pod = PodRecord::load(&exports, &export.id)?.ok_or("no export pod.json")?;
-    assert_eq!(pod.run_id, export.id);
+    let pod = PodRecord::load(&jobs, &job.id)?.ok_or("no job pod.json")?;
+    assert_eq!(pod.run_id, job.id);
     assert!(PodRecord::load(&harness.runs, &run.id)?.is_none());
-    let requests = harness.server.received_requests().await.unwrap_or_default();
-    let create_call = requests
-        .iter()
-        .find(|request| request.url.path() == "/v2/pods")
-        .ok_or("no create call")?;
-    let body: Value = serde_json::from_slice(&create_call.body)?;
+    let body = create_body(&harness.server).await?;
     assert_eq!(
         body["env"]["OVERBRAINER_HOST_KEY"],
-        host_key_placeholder(&export.id)
+        host_key_placeholder(&job.id)
     );
-    assert_eq!(body["env"]["OVERBRAINER_RUN_ID"], export.id.as_str());
-    assert_eq!(harness.secrets.deleted(), [host_key_secret(&export.id)]);
-    assert_eq!(harness.secrets.names(), [host_key_secret(&run.id)]);
-    let ssh = exports.run_dir(&export.id)?.join("ssh");
+    assert_eq!(body["env"]["OVERBRAINER_RUN_ID"], job.id.as_str());
+    only_the_job_secret_is_deleted(&harness, &run.id, &jobs, &job.id)
+}
+
+/// Of the host key secrets `harness` holds, the job `job_id`'s (of `jobs`)
+/// is deleted with its local key, the run `run_id`'s kept.
+fn only_the_job_secret_is_deleted(
+    harness: &Harness,
+    run_id: &str,
+    jobs: &Runs,
+    job_id: &str,
+) -> TestResult {
+    assert_eq!(harness.secrets.deleted(), [host_key_secret(job_id)]);
+    assert_eq!(harness.secrets.names(), [host_key_secret(run_id)]);
+    let ssh = jobs.run_dir(job_id)?.join("ssh");
     assert!(!ssh.join("id_ed25519").exists());
     Ok(())
 }
