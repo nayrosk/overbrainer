@@ -28,6 +28,7 @@ pub(crate) fn check(settings: &Settings) -> Vec<String> {
     check_pipeline(settings, &mut problems);
     check_training(settings, &mut problems);
     check_export(settings, &mut problems);
+    check_compare(settings, &mut problems);
     check_targets(settings, &mut problems);
     check_runpod(settings, &mut problems);
     check_hub(settings, &mut problems);
@@ -282,6 +283,31 @@ fn check_training(settings: &Settings, problems: &mut Vec<String>) {
     check_training_counts(training, problems);
     check_training_rates(training, problems);
     check_axolotl_extra(training, problems);
+}
+
+/// Prices are finite and not negative; the child's limits are in range.
+fn check_compare(settings: &Settings, problems: &mut Vec<String>) {
+    let compare = &settings.compare;
+    for (key, price) in [
+        ("parent_price_in", compare.parent_price_in),
+        ("parent_price_out", compare.parent_price_out),
+        ("child_price_per_hour", compare.child_price_per_hour),
+    ] {
+        if price.is_some_and(|price| !price.is_finite() || price < 0.0) {
+            problems.push(format!(
+                "compare.{key}: must be a number of dollars, 0 or more"
+            ));
+        }
+    }
+    if compare.max_tokens == 0 {
+        problems.push("compare.max_tokens: must be at least 1".to_string());
+    }
+    if !(0.0..=2.0).contains(&compare.temperature) {
+        problems.push("compare.temperature: must be in [0, 2]".to_string());
+    }
+    if !(1..=3600).contains(&compare.server_start_secs) {
+        problems.push("compare.server_start_secs: must be between 1 and 3600".to_string());
+    }
 }
 
 /// `quantize` is a llama-quantize type, and `ollama_name` an Ollama model name.
@@ -985,6 +1011,65 @@ mod tests {
     #[test]
     fn valid_settings_have_no_problems() -> Result<(), config::ConfigError> {
         assert_eq!(check(&settings(VALID)?), Vec::<String>::new());
+        Ok(())
+    }
+
+    /// Without `[compare]` and `roles.judge`, the judge is the parent and the
+    /// child's limits have their defaults.
+    #[test]
+    fn compare_defaults_and_the_judge_falls_back_to_the_parent() -> Result<(), config::ConfigError>
+    {
+        let settings = settings(VALID)?;
+        assert_eq!(settings.roles.judge_model().model, "m2");
+        assert_eq!(settings.compare, crate::config::Compare::default());
+        assert_eq!(settings.compare.max_tokens, 4096);
+        assert_eq!(settings.compare.server_start_secs, 300);
+        assert!(settings.compare.parent_price_in.is_none());
+        Ok(())
+    }
+
+    /// `roles.judge` is listed by `Roles::all` and checked like any role.
+    #[test]
+    fn the_judge_role_is_checked_like_the_others() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            "[training]",
+            "judge = { provider = \"missing\", model = \"j\" }\n        [training]",
+        );
+        let settings = settings(&toml)?;
+        assert_eq!(settings.roles.judge_model().model, "j");
+        assert!(
+            settings
+                .roles
+                .all()
+                .iter()
+                .any(|(name, _)| *name == "judge")
+        );
+        assert_eq!(
+            check(&settings),
+            vec!["roles.judge: unknown provider `missing`".to_string()]
+        );
+        Ok(())
+    }
+
+    /// Prices are dollars, 0 or more; the child's limits are in range.
+    #[test]
+    fn compare_bounds_are_checked() -> Result<(), config::ConfigError> {
+        let toml = format!(
+            "{VALID}\n        [compare]\n        parent_price_in = -1.0\n        \
+             child_price_per_hour = 0.4\n        max_tokens = 0\n        temperature = 2.5\n        \
+             server_start_secs = 0\n"
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "compare.parent_price_in: must be a number of dollars, 0 or more".to_string(),
+                "compare.max_tokens: must be at least 1".to_string(),
+                "compare.temperature: must be in [0, 2]".to_string(),
+                "compare.server_start_secs: must be between 1 and 3600".to_string(),
+            ]
+        );
+        let unknown = format!("{VALID}\n        [compare]\n        price = 1.0\n");
+        assert!(settings(&unknown).is_err(), "unknown keys are refused");
         Ok(())
     }
 

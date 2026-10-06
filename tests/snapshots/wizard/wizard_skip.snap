@@ -25,6 +25,7 @@ protocol = "openai"
 [roles]
 generator = { provider = "nanogpt", model = "qwen/qwen3-235b-a22b" }
 parent = { provider = "nanogpt", model = "deepseek/deepseek-r1", reasoning = true }
+# judge = { provider = "openrouter", model = "..." }   # overbrainer compare: defaults to the parent
 # Optional on every role: max_tokens (default 16384), temperature (0 to 2),
 # reasoning_effort ("low", "medium" or "high", only with reasoning = true).
 # thinking_budget = 8000  # anthropic only; Claude Opus 4.5, Sonnet 4.5 and Haiku 4.5 need this
@@ -74,6 +75,14 @@ include_system_prompt = false
 # after_training = false       # export in the training job, after the merge
 # quantize = "Q4_K_M"          # Q4_K_M | Q4_K_S | Q5_K_M | Q5_K_S | Q6_K | Q8_0 | Q3_K_M | Q2_K | F16 | BF16
 # ollama_name = "rust-mentor"  # `ollama create` this model once an export in a training job is retrieved
+
+# [compare]                      # overbrainer compare, see docs/compare.md
+# parent_price_in = 0.55         # dollars per million input tokens of the parent
+# parent_price_out = 2.19        # dollars per million output tokens of the parent
+# child_price_per_hour = 0.40    # dollars per hour of the child's hardware; on Runpod, the pod's price
+# max_tokens = 4096              # limit of each child answer
+# temperature = 0.0
+# server_start_secs = 300        # how long llama-server may take to be ready
 
 # [hub]                          # overbrainer push RUN_ID, see docs/training.md
 # repo = "you/your-model"        # default: <your HF user>/<project name>
