@@ -246,6 +246,15 @@ Releases are cut by hand from `main`:
 
 To test the release build from a branch without publishing, run the release workflow by hand: a manual run verifies and builds, and never publishes.
 
+## Commercial support
+
+The maintainer offers paid help to teams that want their own smaller model:
+
+- A feasibility audit: a short distillation run on your use case. You get a report on how the child compares with the parent in quality, latency and cost per request, and whether a full project is worth it.
+- A finished distilled model: dataset, fine-tune, GGUF and Ollama Modelfile. It runs on your own hardware, or on an EU cloud when your data must stay there. A handover lets your team run it again.
+
+Contact: [linktr.ee/nayrosk](https://linktr.ee/nayrosk).
+
 ## Contributing
 
 Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and the [code of conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
