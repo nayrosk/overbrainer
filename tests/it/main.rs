@@ -1,6 +1,7 @@
 //! Every integration test, built as one binary to keep link time, memory and disk low.
 
 mod cli;
+mod cli_compare;
 mod cli_complete;
 mod cli_metrics;
 mod cli_pipeline;

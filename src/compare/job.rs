@@ -10,7 +10,7 @@ use super::{
     ANSWERS_FILE, CompareError, EvalQuestion, HARDWARE_FILE, MODEL_FILE, SERVER_LOG,
     write_child_questions,
 };
-use crate::export::{PYTHON, TRAMPOLINE, link_file, llama_cpp_env};
+use crate::export::{PYTHON, TRAMPOLINE, link_file, llama_cpp_env, train_io};
 use crate::train::{Artifacts, JobStage, METRICS_ENV, METRICS_FILE, TrainError, Trainer};
 
 /// The job script, written into the job directory: the llama.cpp helpers
@@ -112,14 +112,6 @@ impl CompareJob {
             ModelSource::Upload(_) => MODEL_FILE,
             ModelSource::OnTarget(path) => path,
         }
-    }
-}
-
-/// Maps an I/O error on `path` to [`TrainError::Io`].
-fn train_io(path: &Path) -> impl FnOnce(io::Error) -> TrainError + '_ {
-    move |source| TrainError::Io {
-        path: path.to_path_buf(),
-        source,
     }
 }
 

@@ -283,28 +283,25 @@ pub(super) fn started_line(id: &str, plan: &Plan<'_>) -> String {
     )
 }
 
-/// Records the export `id` of `exports` failed with `error`, which stopped it
-/// before its job was followed, best effort: whatever step failed (the
-/// upload, the start, or saving its record once the job was spawned), its
-/// record never stays `preparing` or `running`. A record already failed keeps
-/// its own message.
-fn fail(exports: &Runs, id: &str, error: &anyhow::Error) {
-    let mut record = match exports.load(id) {
+/// Records the job `id` of `jobs` (an export or a compare) failed with
+/// `error`, which stopped it before its job was followed, best effort:
+/// whatever step failed (an upload, the start, or saving its record once the
+/// job was spawned), its record never stays `preparing` or `running`. A record
+/// already failed keeps its own message.
+pub(super) fn fail(jobs: &Runs, id: &str, error: &anyhow::Error) {
+    let subject = jobs.subject(id);
+    let mut record = match jobs.load(id) {
         Ok(record) if record.state == RunState::Failed => return,
         Ok(record) => record,
         Err(load_error) => {
-            warn(&format!(
-                "cannot record export {id} as failed: {load_error}"
-            ));
+            warn(&format!("cannot record {subject} as failed: {load_error}"));
             return;
         },
     };
     record.state = RunState::Failed;
     record.message = Some(format!("{error:#}"));
-    if let Err(save_error) = exports.save(&record) {
-        warn(&format!(
-            "cannot record export {id} as failed: {save_error}"
-        ));
+    if let Err(save_error) = jobs.save(&record) {
+        warn(&format!("cannot record {subject} as failed: {save_error}"));
     }
 }
 
@@ -322,15 +319,13 @@ async fn upload_missing<E: Executor>(
 ) -> anyhow::Result<()> {
     let remote = &run.remote_dir;
     let at = |path: &str| quote(&format!("{remote}/{path}"));
-    let probe = format!(
-        "if [ -f {config} ] && {{ [ -f {adapter} ] || [ -f {full} ]; }}; then echo present; \
-         else echo missing; fi\n",
+    let condition = format!(
+        "[ -f {config} ] && {{ [ -f {adapter} ] || [ -f {full} ]; }}",
         config = at(CONFIG_FILE),
         adapter = at(&format!("{model}/adapter_config.json")),
         full = at(&format!("{model}/config.json")),
     );
-    let answer = executor.probe(&probe).await?;
-    if String::from_utf8_lossy(&answer).trim() == "present" {
+    if holds_on_target(executor, &condition).await? {
         return Ok(());
     }
     tracing::info!(
@@ -340,6 +335,36 @@ async fn upload_missing<E: Executor>(
     ExportJob::staged(&run.id, "", local_run, model).prepare(stage, "")?;
     let script = stage.join(SCRIPT_FILE);
     std::fs::remove_file(&script).with_context(|| format!("cannot remove {}", script.display()))?;
+    upload_stage(executor, stage, remote).await
+}
+
+/// Whether the POSIX shell test `condition`, read-only, holds on the target
+/// of `executor`.
+///
+/// # Errors
+///
+/// Returns an error when the target cannot be reached or the test cannot run.
+pub(super) async fn holds_on_target<E: Executor>(
+    executor: &E,
+    condition: &str,
+) -> anyhow::Result<bool> {
+    let probe = format!("if {condition}; then echo present; else echo missing; fi\n");
+    let answer = executor.probe(&probe).await?;
+    Ok(String::from_utf8_lossy(&answer).trim() == "present")
+}
+
+/// Uploads what the local directory `stage` holds into `remote` on the target
+/// of `executor`, then removes `stage`; failing to remove it is only warned
+/// about.
+///
+/// # Errors
+///
+/// Returns an error when the upload fails.
+pub(super) async fn upload_stage<E: Executor>(
+    executor: &E,
+    stage: &Path,
+    remote: &str,
+) -> anyhow::Result<()> {
     let uploaded = executor.upload(stage, remote, &[]).await;
     if let Err(error) = std::fs::remove_dir_all(stage) {
         warn(&format!("cannot remove {}: {error}", stage.display()));

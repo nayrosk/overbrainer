@@ -796,3 +796,83 @@ async fn builtin_child_under_a_broken_ssh() -> TestResult {
     assert_eq!(output, b"reached\n");
     Ok(())
 }
+
+/// A compare job runs over SSH: the fake llama-server is put in the target's
+/// llama.cpp cache, the job answers, its answers come back.
+#[tokio::test]
+async fn a_compare_job_answers_over_ssh() -> TestResult {
+    use crate::common::{FAKE_LLAMA_SERVER, LLAMA_ASSETS};
+    use overbrainer::compare::{ChatMessage, ChildSettings, CompareJob, EvalQuestion, ModelSource};
+    use overbrainer::export::LLAMA_CPP_TAG;
+    use overbrainer::runs::{Launch, RunCtx, RunState, Runs, create, start, watch};
+
+    each_ssh_client(|client| async move {
+        let Some(executor) = connect("compare", client).await? else {
+            skip();
+            return Ok(());
+        };
+        let cache = format!("{}/.cache/llama.cpp/{LLAMA_CPP_TAG}", executor.workdir());
+        let install = format!(
+            "mkdir -p {cache}\ncat > {cache}/fake-server <<'EOF'\n{FAKE_LLAMA_SERVER}EOF\n\
+             for asset in {assets}; do mkdir -p {cache}/$asset && \
+             cp {cache}/fake-server {cache}/$asset/llama-server && \
+             chmod 755 {cache}/$asset/llama-server; done\n\
+             for arch in x64 arm64; do d={cache}/cudart-llama-{LLAMA_CPP_TAG}-bin-ubuntu-cuda-13.4-$arch; \
+             mkdir -p $d; : > $d/libcudart.so.13; done\n",
+            assets = LLAMA_ASSETS.join(" "),
+        );
+        probe(&executor, format!("{}/install", executor.workdir()), &install).await?;
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let gguf = project.path().join("model.gguf");
+        fs::write(&gguf, "gguf")?;
+        let compares = runs.compares("r1")?;
+        let record = create(&compares, "compare", executor.workdir(), "box")?;
+        let questions = vec![EvalQuestion {
+            id: "q0".into(),
+            topic: "t".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "Why?".into(),
+            }],
+            parent: "P.".into(),
+            parent_input_tokens: 1,
+            parent_output_tokens: 1,
+        }];
+        let settings = ChildSettings {
+            max_tokens: 16,
+            temperature: 0.0,
+            server_start_secs: 30,
+            context: 0,
+        };
+        let job = CompareJob::new(ModelSource::Upload(gguf), questions, settings)?;
+        let bus = overbrainer::events::EventBus::new();
+        let ctx = RunCtx {
+            runs: &compares,
+            executor: &executor,
+            bus: &bus,
+            poll: Duration::from_millis(200),
+        };
+        let runtime = overbrainer::exec::JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        };
+        let launch = Launch {
+            runtime: &runtime,
+            secrets: Vec::new(),
+        };
+        let started = start(&ctx, &job, launch, record).await?;
+        let outcome = watch(&ctx, &job, started).await?;
+        assert_eq!(
+            outcome.record.state,
+            RunState::Succeeded,
+            "{:?}",
+            outcome.record.message
+        );
+        let answers = overbrainer::compare::read_answers(&compares.run_dir(&outcome.record.id)?)?;
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].answer.as_deref(), Some("Child: Why?"));
+        Ok(())
+    })
+    .await
+}

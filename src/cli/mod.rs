@@ -1,5 +1,6 @@
 //! Command line interface.
 
+pub(crate) mod compare;
 mod complete;
 mod config_check;
 pub(crate) mod data;
@@ -112,6 +113,16 @@ pub enum Command {
     /// llama.cpp and quantized, and the GGUF and its Modelfile land in
     /// `runs/<run-id>/output/gguf/`. Ctrl-C cancels it.
     Export(ExportArgs),
+    /// Compare the child with the parent on data/eval.jsonl: quality, latency, cost.
+    ///
+    /// The run's GGUF (from `overbrainer export`) is served by llama-server on
+    /// the run's target (on Runpod, a new pod); every question is asked, then a
+    /// judge model (`roles.judge`, else the parent) compares each child answer
+    /// with the parent's. The report lands in
+    /// `runs/<run-id>/compares/<compare-id>/compare.md`, its path on stdout.
+    /// Ctrl-C cancels the job; while judging, it stops and keeps the verdicts:
+    /// `--rejudge <compare-id>` resumes.
+    Compare(CompareArgs),
     /// Push the model of a finished run to a Hugging Face model repo, with a
     /// generated model card.
     ///
@@ -196,6 +207,7 @@ impl Command {
             | Self::Migrate(_)
             | Self::Train(_)
             | Self::Export(_)
+            | Self::Compare(_)
             | Self::Push(_) => true,
             Self::Pod { command } => matches!(command, PodCommand::Rm { .. }),
             Self::Init { .. }
@@ -316,6 +328,25 @@ pub struct ExportArgs {
     /// limit. Nothing deletes it then but `overbrainer pod rm <export-id>`.
     #[arg(long)]
     pub keep_pod: bool,
+}
+
+/// Options of `overbrainer compare`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct CompareArgs {
+    /// Run to compare; default: the newest run with a GGUF.
+    #[arg(long, add = ArgValueCandidates::new(complete::run_ids))]
+    pub run: Option<String>,
+    /// Ask only the first N questions of data/eval.jsonl.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub limit: Option<u32>,
+    /// Runpod target only: keep the compare's pod once it ends, with no time
+    /// limit. Nothing deletes it then but `overbrainer pod rm <compare-id>`.
+    #[arg(long, conflicts_with = "rejudge")]
+    pub keep_pod: bool,
+    /// Judge compare `COMPARE_ID` again, without asking the child again: with
+    /// another judge or prompt, or to resume an interrupted judge.
+    #[arg(long, value_name = "COMPARE_ID", conflicts_with = "limit")]
+    pub rejudge: Option<String>,
 }
 
 /// Options of `overbrainer push`.
@@ -635,12 +666,10 @@ async fn dispatch(
             stage(dir, &front, data::Command::Split, &args).await
         },
         Command::Run => run_all(dir, &front, dotenv).await,
-        Command::Train(args) => {
-            let source = Source::from(EnvSource::Process);
-            Box::pin(train::run(dir, &args, &front, &source)).await
-        },
-        Command::Export(args) => Box::pin(export::run(dir, &args, &front)).await,
-        Command::Push(args) => Box::pin(push::run(dir, &args, &front)).await,
+        command @ (Command::Train(_)
+        | Command::Export(_)
+        | Command::Compare(_)
+        | Command::Push(_)) => Box::pin(model_job(dir, command, &front)).await,
         Command::Runs {
             command: RunsCommand::Ls,
         } => train::list(dir),
@@ -658,6 +687,23 @@ async fn dispatch(
             },
             LogMode::Stderr => anyhow::bail!("overbrainer tui needs the TUI log mode"),
         },
+    }
+}
+
+/// Runs a command on the model of a run: `train`, `export`, `compare` or
+/// `push`, with the settings of the project and the process environment.
+///
+/// # Errors
+///
+/// Returns the command's error, or an error for any other command.
+async fn model_job(dir: &Path, command: Command, front: &Frontend) -> anyhow::Result<()> {
+    let source = Source::from(EnvSource::Process);
+    match command {
+        Command::Train(args) => Box::pin(train::run(dir, &args, front, &source)).await,
+        Command::Export(args) => Box::pin(export::run(dir, &args, front)).await,
+        Command::Compare(args) => Box::pin(compare::run(dir, &args, front, &source)).await,
+        Command::Push(args) => Box::pin(push::run(dir, &args, front)).await,
+        other => anyhow::bail!("{other:?} is not a command on the model of a run"),
     }
 }
 
@@ -877,6 +923,28 @@ mod tests {
         assert!(command(&["export", "r1", "--ollama", "bad name"]).is_err());
         assert!(command(&["export", "r1", "--ollama", "a//b"]).is_err());
         assert!(command(&["export"]).is_err());
+        Ok(())
+    }
+
+    /// `compare` takes a run, a limit and --keep-pod, or --rejudge alone.
+    #[test]
+    fn compare_options_parse() -> Result<(), clap::Error> {
+        let Command::Compare(args) =
+            command(&["compare", "--run", "r1", "--limit", "20", "--keep-pod"])?
+        else {
+            return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+        };
+        assert_eq!(args.run.as_deref(), Some("r1"));
+        assert_eq!(args.limit, Some(20));
+        assert!(args.keep_pod);
+        let Command::Compare(args) = command(&["compare", "--rejudge", "compare_20261006-120000"])?
+        else {
+            return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+        };
+        assert_eq!(args.rejudge.as_deref(), Some("compare_20261006-120000"));
+        assert!(command(&["compare", "--limit", "0"]).is_err());
+        assert!(command(&["compare", "--rejudge", "c1", "--limit", "3"]).is_err());
+        assert!(command(&["compare", "--rejudge", "c1", "--keep-pod"]).is_err());
         Ok(())
     }
 

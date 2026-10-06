@@ -181,3 +181,46 @@ where
     }
     Ok(())
 }
+
+/// A fake `llama-server` (Python), put in the llama.cpp cache of a target by
+/// the compare tests: answers `/health` and streams `Child: <question>`, or
+/// `I do not know.` to a question with `hard` in it.
+pub const FAKE_LLAMA_SERVER: &str = r#"#!/usr/bin/env python3
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+args = sys.argv[1:]
+port = int(args[args.index("--port") + 1])
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"{}")
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        question = body["messages"][-1]["content"]
+        answer = "I do not know." if "hard" in question else "Child: " + question
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for chunk in [
+            {"choices": [{"delta": {"content": answer}, "finish_reason": "stop"}]},
+            {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 4}},
+        ]:
+            self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+
+HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+"#;
+
+/// The llama.cpp build directories of a target's tools cache that may serve
+/// the child, whichever the machine picks: the CPU and CUDA builds.
+pub const LLAMA_ASSETS: [&str; 5] = [
+    "ubuntu-x64",
+    "ubuntu-arm64",
+    "macos-arm64",
+    "ubuntu-cuda-13.4-x64",
+    "ubuntu-cuda-13.4-arm64",
+];

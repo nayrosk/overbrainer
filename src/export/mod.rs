@@ -213,7 +213,9 @@ pub fn gguf_name(name: &str, quantize: &str) -> String {
     format!("{name}-{quantize}.gguf")
 }
 
-fn train_io(path: &Path) -> impl FnOnce(io::Error) -> TrainError + '_ {
+/// Maps an I/O error on `path` to [`TrainError::Io`]: the export job's, and
+/// the compare job's.
+pub(crate) fn train_io(path: &Path) -> impl FnOnce(io::Error) -> TrainError + '_ {
     move |source| TrainError::Io {
         path: path.to_path_buf(),
         source,
