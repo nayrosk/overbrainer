@@ -75,6 +75,9 @@ pub enum ModelSource {
 pub struct CompareJob {
     /// Where the GGUF comes from.
     model: ModelSource,
+    /// The script as the job's program gets it: [`SCRIPT_FILE`] unless
+    /// [`CompareJob::with_script`] sets it.
+    script: String,
     /// The questions, written as `questions.jsonl`.
     questions: Vec<EvalQuestion>,
     /// How the child generates.
@@ -100,9 +103,19 @@ impl CompareJob {
         }
         Ok(Self {
             model,
+            script: SCRIPT_FILE.to_string(),
             questions,
             settings,
         })
+    }
+
+    /// The same compare, its script named `script`: the script's path as the
+    /// job sees it, for a job that does not start in its own directory (a
+    /// container mounting the run directory starts there).
+    #[must_use]
+    pub fn with_script(mut self, script: String) -> Self {
+        self.script = script;
+        self
     }
 
     /// The GGUF as the script gets it: `model.gguf` in the job directory, or
@@ -145,13 +158,13 @@ impl Trainer for CompareJob {
         }
     }
 
-    /// Runs `compare.sh` through the trampoline, with the job's Python.
+    /// Runs the script through the trampoline, with the job's Python.
     fn commands(&self) -> Vec<Vec<String>> {
         vec![vec![
             PYTHON.to_string(),
             "-c".to_string(),
             TRAMPOLINE.to_string(),
-            SCRIPT_FILE.to_string(),
+            self.script.clone(),
         ]]
     }
 

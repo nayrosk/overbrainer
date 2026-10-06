@@ -1037,6 +1037,31 @@ fn the_job_runs_compare_sh_with_its_settings() -> TestResult {
     Ok(())
 }
 
+/// A compare in a container mounting the run directory names its script by
+/// its path there, as an export in place does.
+#[test]
+fn a_mounted_compare_names_its_script_by_its_path() -> TestResult {
+    let job = CompareJob::new(
+        ModelSource::OnTarget("/workspace/run/output/gguf/r1-Q4_K_M.gguf".into()),
+        Vec::new(),
+        ChildSettings {
+            max_tokens: 512,
+            temperature: 0.2,
+            server_start_secs: 120,
+            context: 0,
+        },
+    )?
+    .with_script("/workspace/run/compares/c1/compare.sh".into());
+    assert_eq!(
+        job.commands()
+            .first()
+            .and_then(|command| command.last())
+            .map(String::as_str),
+        Some("/workspace/run/compares/c1/compare.sh")
+    );
+    Ok(())
+}
+
 /// A GGUF on the target is named by its absolute path: a relative one is
 /// refused, as the job could not tell where it is.
 #[test]

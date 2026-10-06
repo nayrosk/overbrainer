@@ -19,9 +19,9 @@ use super::front::Frontend;
 use super::train::{POLL, executor, prepare};
 use crate::compare::{
     COMPARE_PREFIX, COMPARES_DIR, ChildSettings, CompareJob, CompareSetup, EvalQuestion, JudgeInfo,
-    JudgeRun, ModelSource, Parts, build_report, find_compare, judge_all, judge_key, latest_export,
-    newest_exported_run, prices, read_answers, read_eval, read_hardware, verdicts_file,
-    write_report,
+    JudgeRun, ModelSource, Parts, SCRIPT_FILE, build_report, find_compare, judge_all, judge_key,
+    latest_export, newest_exported_run, prices, read_answers, read_eval, read_hardware,
+    verdicts_file, write_report,
 };
 use crate::config::{Settings, Source, Target};
 use crate::dataset::DataFiles;
@@ -372,6 +372,11 @@ async fn on_target(
     let jobs = format!("{}/{COMPARES_DIR}", run.remote_dir);
     let record = create(&compares, COMPARE_PREFIX, &jobs, &run.target)?;
     let id = record.id.clone();
+    // The script as the job sees it: a container starts in the run directory.
+    let job = job.with_script(format!(
+        "{}/{COMPARES_DIR}/{id}/{SCRIPT_FILE}",
+        runtime.root(&run.remote_dir)
+    ));
     let job_dir = compares.run_dir(&id)?;
     tracing::info!("compare: {id}: {}", compares.relative_dir(&id));
     let guard = front.open_bus();
