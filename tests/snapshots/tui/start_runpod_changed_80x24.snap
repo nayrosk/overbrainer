@@ -1,7 +1,7 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ o╭ Start a training run? ───────────────────────────────────────────────╮pare"
+" ⠿ 1╭ Start a training run? ───────────────────────────────────────────────╮ert "
 "╭ r │                                                                      │ ──╮"
 "│ N │  target      gpu_cloud (runpod, Secure Cloud)                        │   │"
 "╰── │  model       Qwen/Qwen3-4B, qlora, 3 epochs, lr 2e-4                 │ ──╯"

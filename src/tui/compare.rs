@@ -302,6 +302,7 @@ impl App {
         }
         if self.compare.listing == Some(id) {
             self.compare.listing = None;
+            self.compare.list_again = false;
             self.compare.error = Some(format!("cannot list the compares: {error}"));
             return Some(Vec::new());
         }
@@ -740,6 +741,25 @@ mod tests {
         assert_eq!(label.as_deref(), Some("judging 12/100"));
         app.on_done(task, Ok(Done::Compared(Ok(()))));
         assert!(app.compare.running.is_none());
+    }
+
+    /// A read of the compares that panicked no longer counts, nor does a
+    /// read asked for while it ran.
+    #[test]
+    fn a_listing_that_panicked_is_forgotten() -> TestResult {
+        let mut app = app();
+        app.view = View::Compare;
+        let effects = app.refresh_compares();
+        let Some(Effect::Spawn(id, Task::Compares)) = effects.first().cloned() else {
+            return Err(format!("no listing: {effects:?}").into());
+        };
+        app.refresh_compares();
+        assert!(app.compare.list_again);
+        app.on_done(id, Err("a background task failed".into()));
+        assert_eq!(app.compare.listing, None);
+        assert!(!app.compare.list_again);
+        assert!(app.compare.error.is_some());
+        Ok(())
     }
 
     /// Quitting while a compare runs asks first, then abandons it and waits.

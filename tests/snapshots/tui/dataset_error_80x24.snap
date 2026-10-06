@@ -1,7 +1,7 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare"
+" ⠿ 1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare  rust_expert "
 "╭ data ────────────────────────────────────────────────────────────────────────╮"
 "│ ✗ data/answers.jsonl:3: invalid record: expected value at line 1 column 2    │"
 "│ R reloads                                                                    │"

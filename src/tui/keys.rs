@@ -84,7 +84,7 @@ const TRAINING: &[KeyHelp] = &[
     row("t", "start a training run (asks first)"),
     row("s, T", "stop with a snapshot; T resumes it (asks first)"),
     row("x", "hide the failed runs until restart (asks first)"),
-    row("h, C", "push to Hugging Face; C compares (asks first)"),
+    row("h, C", "push to Hugging Face; compare it (both ask)"),
     row(
         "g c, starting on Runpod",
         "choose GPU types, data centers (saved on y)",
@@ -369,7 +369,7 @@ mod tests {
         assert!(
             TRAINING
                 .iter()
-                .any(|row| row.keys == "h, C" && row.action.contains("C compares")),
+                .any(|row| row.keys == "h, C" && row.action.ends_with("compare it (both ask)")),
             "C in the Training help"
         );
         assert!(

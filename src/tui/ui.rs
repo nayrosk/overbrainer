@@ -16,6 +16,12 @@ use super::widgets::{dialog, help, menu, picker, status, too_small};
 
 /// Columns of the header's brand, before the tabs.
 const BRAND_WIDTH: u16 = 17;
+/// Columns of the brand's mark alone, drawn when the whole brand would leave
+/// the name too few columns.
+const MARK_WIDTH: u16 = 3;
+/// Columns the name keeps beside the brand: two before it, as between two
+/// tabs, eleven for the name, and one after it.
+const NAME_ROOM: u16 = 14;
 /// What parts two tabs.
 const DIVIDER: &str = "  ";
 
@@ -116,8 +122,9 @@ fn clear_margin(buffer: &mut Buffer, popup: Rect, body: Rect) {
 }
 
 /// The brand, the tabs and the project name, each in its own columns. The
-/// tabs come first: the name is cut to what is left, and the brand is dropped
-/// when the tabs would not fit beside it.
+/// tabs come first: the name is cut to what is left. The brand is drawn
+/// whole when the name keeps [`NAME_ROOM`] columns beside it, else as its
+/// mark alone when that leaves the name its room, else it is dropped.
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let titles: Vec<String> = View::ALL
@@ -130,10 +137,14 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         .sum::<usize>()
         + DIVIDER.chars().count() * titles.len().saturating_sub(1);
     let tabs_width = u16::try_from(tabs_width).unwrap_or(u16::MAX);
-    let brand_width = if area.width >= BRAND_WIDTH.saturating_add(tabs_width) {
-        BRAND_WIDTH
+    let fits =
+        |brand: u16| area.width >= brand.saturating_add(tabs_width).saturating_add(NAME_ROOM);
+    let (brand_width, brand_text) = if fits(BRAND_WIDTH) {
+        (BRAND_WIDTH, " ⠿ overbrainer")
+    } else if fits(MARK_WIDTH) {
+        (MARK_WIDTH, " ⠿")
     } else {
-        0
+        (0, "")
     };
     let [brand, tabs_area, name_area] = Layout::horizontal([
         Constraint::Length(brand_width),
@@ -142,7 +153,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .areas(area);
     frame.render_widget(
-        Paragraph::new(Span::styled(" ⠿ overbrainer", theme.accent)),
+        Paragraph::new(Span::styled(brand_text, theme.accent)),
         brand,
     );
     let tabs = Tabs::new(titles)
@@ -187,19 +198,21 @@ mod tests {
         Ok(text(&terminal).concat())
     }
 
-    /// The brand and the six tabs fill 80 columns, so the name shows only
-    /// from wider, cut to what is left.
+    /// At 80 columns the brand shrinks to its mark so the name keeps its
+    /// columns, cut when longer; from where the whole brand fits beside the
+    /// tabs and the name, it is drawn whole. The name never covers the tabs.
     #[test]
     fn a_long_project_name_is_cut_and_never_covers_the_tabs() -> TestResult {
         let mut app = app();
+        assert_eq!(header(&app, 80)?, format!(" ⠿ {TABS}  rust_expert "));
         app.project.name = "a_project_name_forty_characters_long_xyz".into();
         assert_eq!(app.project.name.chars().count(), 40);
         let rows = text(&draw(&mut app, 80, 24)?);
         let row = rows.first().ok_or("no header")?;
         assert_eq!(
             row,
-            &format!(" ⠿ overbrainer   {TABS}"),
-            "the brand and the six tabs fit 80 columns"
+            &format!(" ⠿ {TABS}  a_project_… "),
+            "the mark, the six tabs and the name fit 80 columns"
         );
         assert_eq!(
             header(&app, 100)?,

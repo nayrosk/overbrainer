@@ -1,7 +1,7 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare"
+" ⠿ 1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare  rust_expert "
 "╭ configuration ───────────────────────────╮╭ stats ───────────────────────────╮"
 "│   protocol               anthrop… (used) ││ cost and tokens (in/out)         │"
 "│   base_url               unset (used)    ││   subtopics   3.0k/750 $0.0012   │"
