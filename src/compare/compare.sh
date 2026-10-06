@@ -90,14 +90,20 @@ pick_amd() {
     fi
     known=$(linker_libraries)
     missing=
-    for library in libamdhip64.so.7 librocblas.so.5 libhipblas.so.3; do
+    packages=
+    # Each library of the ROCm 7 runtime, with the Ubuntu package holding it.
+    for pair in libamdhip64.so.7:libamdhip64-7 librocblas.so.5:librocblas5 libhipblas.so.3:libhipblas3; do
+        library=${pair%%:*}
         case $known in
         *"$library "*) ;;
-        *) missing="${missing:+$missing, }$library" ;;
+        *)
+            missing="${missing:+$missing, }$library"
+            packages="${packages:+$packages }${pair#*:}"
+            ;;
         esac
     done
     if [ -n "$missing" ]; then
-        warn "AMD GPU found but the ROCm 7 runtime is missing (libamdhip64.so.7, librocblas.so.5, libhipblas.so.3); using the CPU build. On Ubuntu: apt install libamdhip64-7 librocblas5 libhipblas3"
+        warn "AMD GPU found but the ROCm 7 runtime is missing ($missing); using the CPU build. On Ubuntu: apt install $packages"
         return 0
     fi
     if [ ! -r "$kfd" ] || [ ! -w "$kfd" ]; then

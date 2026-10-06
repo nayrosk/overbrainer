@@ -231,7 +231,10 @@ pub fn read_answers(dir: &Path) -> Result<Vec<ChildAnswer>, CompareError> {
 pub struct Hardware {
     /// The llama.cpp build: `ubuntu-cuda-13.4-x64`, `ubuntu-x64`, `macos-arm64`...
     pub build: String,
-    /// The GPUs, as `nvidia-smi` names them; empty on CPU.
+    /// The GPUs the build served on: the NVIDIA ones for a CUDA build, the
+    /// AMD ones for a `ROCm` build (an integrated "AMD Radeon Graphics" left
+    /// out beside a discrete GPU), the Apple chip for the Metal build; empty
+    /// for a CPU build.
     #[serde(default)]
     pub gpus: Vec<String>,
     /// The CPU model, when known.
@@ -240,22 +243,46 @@ pub struct Hardware {
 }
 
 impl Hardware {
-    /// One line: `1 x NVIDIA A40 (ubuntu-cuda-13.4-x64)` or `AMD EPYC 7413, CPU (ubuntu-x64)`.
+    /// One line: `2 x NVIDIA A40 (ubuntu-cuda-13.4-x64)`, each different GPU
+    /// counted apart (`1 x A + 1 x B (...)`), or `AMD EPYC 7413, CPU (ubuntu-x64)`.
     #[must_use]
     pub fn describe(&self) -> String {
-        match self.gpus.first() {
-            Some(gpu) => format!("{} x {gpu} ({})", self.gpus.len(), self.build),
-            None => format!(
+        if self.gpus.is_empty() {
+            return format!(
                 "{}, CPU ({})",
                 self.cpu.as_deref().unwrap_or("unknown CPU"),
                 self.build
-            ),
+            );
         }
+        let mut counted: Vec<(&str, usize)> = Vec::new();
+        for gpu in &self.gpus {
+            match counted.iter_mut().find(|(name, _)| name == gpu) {
+                Some((_, count)) => *count += 1,
+                None => counted.push((gpu, 1)),
+            }
+        }
+        let gpus: Vec<String> = counted
+            .into_iter()
+            .map(|(name, count)| format!("{count} x {name}"))
+            .collect();
+        format!("{} ({})", gpus.join(" + "), self.build)
     }
 
-    /// Whether the child ran on a GPU.
+    /// Whether the child ran on a GPU: always for the CUDA, `ROCm` and macOS
+    /// (Metal) builds, never for the Linux CPU builds; for another build,
+    /// whether a GPU is listed.
     #[must_use]
     pub fn has_gpu(&self) -> bool {
+        let build = self.build.as_str();
+        if ["ubuntu-cuda-", "ubuntu-rocm-", "macos-"]
+            .iter()
+            .any(|prefix| build.starts_with(prefix))
+        {
+            return true;
+        }
+        if matches!(build, "ubuntu-x64" | "ubuntu-arm64") {
+            return false;
+        }
         !self.gpus.is_empty()
     }
 }
@@ -475,5 +502,54 @@ mod tests {
         let failed: ChildAnswer = serde_json::from_str(r#"{"id":"q2","error":"timed out"}"#)?;
         assert!(failed.is_error());
         Ok(())
+    }
+    /// Hardware served by `build` with `gpus`, on an EPYC CPU.
+    fn hardware(build: &str, gpus: &[&str]) -> Hardware {
+        Hardware {
+            build: build.into(),
+            gpus: gpus.iter().map(|gpu| (*gpu).to_string()).collect(),
+            cpu: Some("AMD EPYC 7413".into()),
+        }
+    }
+
+    /// Identical GPUs are counted, different ones each named: a discrete
+    /// Radeon beside an integrated one is never "2 x" the Radeon.
+    #[test]
+    fn the_hardware_line_groups_identical_gpus() {
+        let rocm = "ubuntu-rocm-7.2-x64";
+        assert_eq!(
+            hardware(rocm, &["AMD Radeon RX 7800 XT", "AMD Radeon Graphics"]).describe(),
+            "1 x AMD Radeon RX 7800 XT + 1 x AMD Radeon Graphics (ubuntu-rocm-7.2-x64)"
+        );
+        assert_eq!(
+            hardware("ubuntu-cuda-13.4-x64", &["NVIDIA A40", "NVIDIA A40"]).describe(),
+            "2 x NVIDIA A40 (ubuntu-cuda-13.4-x64)"
+        );
+        assert_eq!(
+            hardware(
+                "ubuntu-cuda-13.4-x64",
+                &["NVIDIA A40", "NVIDIA T4", "NVIDIA A40"]
+            )
+            .describe(),
+            "2 x NVIDIA A40 + 1 x NVIDIA T4 (ubuntu-cuda-13.4-x64)"
+        );
+        assert_eq!(
+            hardware("ubuntu-x64", &[]).describe(),
+            "AMD EPYC 7413, CPU (ubuntu-x64)"
+        );
+    }
+
+    /// Whether the child ran on a GPU follows the build: the CPU builds
+    /// never did, the CUDA, `ROCm` and Metal builds always did.
+    #[test]
+    fn the_build_says_whether_a_gpu_served() {
+        assert!(hardware("ubuntu-cuda-13.4-x64", &["NVIDIA A40"]).has_gpu());
+        assert!(hardware("ubuntu-cuda-13.4-x64", &[]).has_gpu());
+        assert!(hardware("ubuntu-rocm-7.2-x64", &["AMD GPU"]).has_gpu());
+        assert!(hardware("macos-arm64", &["Apple M2 Pro (Metal)"]).has_gpu());
+        assert!(hardware("macos-arm64", &[]).has_gpu());
+        assert!(!hardware("ubuntu-x64", &[]).has_gpu());
+        assert!(!hardware("ubuntu-x64", &["NVIDIA RTX 3090"]).has_gpu());
+        assert!(!hardware("ubuntu-arm64", &[]).has_gpu());
     }
 }

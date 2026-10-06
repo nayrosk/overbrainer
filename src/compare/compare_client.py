@@ -108,8 +108,15 @@ def after(lines, marker):
     return names
 
 
+# The name ROCm tools give an AMD integrated GPU (a Ryzen iGPU): left out
+# beside a discrete GPU, as it is not what serves the model.
+INTEGRATED_AMD = "AMD Radeon Graphics"
+
+
 def amd_gpus():
-    """The AMD GPUs by name: rocm-smi, else amd-smi, else lspci, else one generic."""
+    """The AMD GPUs by name: rocm-smi, else amd-smi, else lspci, else one
+    generic. An integrated GPU named "AMD Radeon Graphics" is left out when
+    a discrete one is listed too."""
     names = after(listed(["rocm-smi", "--showproductname"]), "Card Series:")
     names = names or after(listed(["amd-smi", "static"]), "MARKET_NAME:")
     if not names:
@@ -117,18 +124,34 @@ def amd_gpus():
             if re.search(r"VGA|Display|3D", line) and re.search(r"AMD|ATI", line):
                 name = line.split("[AMD/ATI]", 1)[-1] if "[AMD/ATI]" in line else line.split(": ", 1)[-1]
                 names.append(name.strip())
-    return names or ["AMD GPU"]
+    discrete = [name for name in names if name != INTEGRATED_AMD]
+    return discrete or names or ["AMD GPU"]
+
+
+def apple_gpu():
+    """The Apple chip whose GPU Metal uses, as `<chip> (Metal)`."""
+    chip = listed(["sysctl", "-n", "machdep.cpu.brand_string"])
+    return [f"{chip[0] if chip else 'Apple GPU'} (Metal)"]
+
+
+def gpus_of(build):
+    """The GPUs the llama.cpp `build` served on: the NVIDIA ones for a CUDA
+    build, the AMD ones for a ROCm build, the Apple chip for the macOS (Metal)
+    build, none for a CPU build, whatever GPU the machine has."""
+    if build.startswith("ubuntu-cuda-"):
+        names = listed(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
+        return names or ["NVIDIA GPU"]
+    if build.startswith("ubuntu-rocm-"):
+        return amd_gpus()
+    if build.startswith("macos-"):
+        return apple_gpu()
+    return []
 
 
 def write_hardware(build):
-    """Writes hardware.json: the build, the GPUs (nvidia-smi, or the AMD tools
-    for the ROCm build), the CPU."""
-    if "rocm" in build:
-        gpus = amd_gpus()
-    else:
-        gpus = listed(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
+    """Writes hardware.json: the build, the GPUs it served on, the CPU."""
     with open(HARDWARE, "w", encoding="utf-8") as file:
-        json.dump({"build": build, "gpus": gpus, "cpu": cpu_name()}, file)
+        json.dump({"build": build, "gpus": gpus_of(build), "cpu": cpu_name()}, file)
 
 
 def wait_ready(base, pid, seconds):

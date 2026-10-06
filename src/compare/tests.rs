@@ -83,6 +83,11 @@ const LDCONFIG_ROCM: &str = "#!/bin/sh\n\
     echo '\tlibrocblas.so.5 (libc6,x86-64) => /usr/lib/librocblas.so.5'\n\
     echo '\tlibhipblas.so.3 (libc6,x86-64) => /usr/lib/libhipblas.so.3'\n";
 
+/// A stub `ldconfig -p` listing the `ROCm` 7 runtime but `librocblas.so.5`.
+const LDCONFIG_NO_ROCBLAS: &str = "#!/bin/sh\n\
+    echo '\tlibamdhip64.so.7 (libc6,x86-64) => /usr/lib/libamdhip64.so.7'\n\
+    echo '\tlibhipblas.so.3 (libc6,x86-64) => /usr/lib/libhipblas.so.3'\n";
+
 /// A stub `ldconfig -p` of a machine without the `ROCm` runtime.
 const LDCONFIG_PLAIN: &str = "#!/bin/sh\necho '\tlibc.so.6 (libc6,x86-64) => /usr/lib/libc.so.6'\n";
 
@@ -212,7 +217,7 @@ impl Fixture {
     /// Makes the host an AMD one with the `ROCm` 7 runtime: `/dev/kfd` exists
     /// and `ldconfig` lists the libraries. `amd_tools` are the stub AMD
     /// tools to add, each as a name and its body.
-    fn make_amd(&self, amd_tools: AmdTools<'_>) -> TestResult {
+    fn make_amd(&self, amd_tools: StubTools<'_>) -> TestResult {
         std::fs::write(self.kfd(), "")?;
         stub(&self.stubs(), "ldconfig", LDCONFIG_ROCM)?;
         for (name, body) in amd_tools {
@@ -416,8 +421,133 @@ fn a_gpu_host_runs_the_cuda_build_with_its_runtime_first() -> TestResult {
     Ok(())
 }
 
-/// The stub AMD tools of a host, each a name and its body.
-type AmdTools<'a> = &'a [(&'a str, &'a str)];
+/// On an NVIDIA host whose driver supports CUDA 12 only, the CPU build
+/// serves the child: hardware.json lists no GPU and the report says the
+/// child ran on a CPU.
+#[test]
+fn an_old_nvidia_driver_falls_back_to_the_cpu_and_says_so() -> TestResult {
+    if !tools_available() {
+        eprintln!("skipped: needs sh, python3 and tar");
+        return Ok(());
+    }
+    let fixture = Fixture::new(&["Why?"], false)?;
+    stub(&fixture.stubs(), "nvidia-smi", &gpu("12.8"))?;
+    let output = fixture.run("ok")?;
+    assert!(output.status.success(), "{}", text(&output));
+    let hardware = read_hardware(&fixture.job_dir()).ok_or("no hardware.json")?;
+    assert_eq!(hardware.build, "ubuntu-x64");
+    assert!(hardware.gpus.is_empty(), "{:?}", hardware.gpus);
+    assert!(!hardware.has_gpu());
+    let (setup, answers, verdicts) = (
+        super::fixtures::setup(),
+        super::fixtures::answers(),
+        super::fixtures::verdicts(),
+    );
+    let role = super::fixtures::judge()?;
+    let report = build_report(&Parts {
+        setup: &setup,
+        answers: &answers,
+        verdicts: &verdicts,
+        hardware: Some(hardware),
+        judge: JudgeInfo {
+            role: &role,
+            is_parent: false,
+            verdicts_file: "verdicts-0123456789abcdef.jsonl",
+        },
+        prices: Prices::default(),
+        child_price_from_pod: false,
+    });
+    let markdown = render_markdown(&report);
+    assert!(markdown.contains("- The child ran on a CPU."), "{markdown}");
+    assert!(markdown.contains(", CPU (ubuntu-x64)"), "{markdown}");
+    Ok(())
+}
+
+/// Runs the client's `write_hardware` for `build` in a fresh directory,
+/// with `nvidia-smi`, `rocm-smi`, `amd-smi`, `lspci` and `sysctl` stubbed
+/// (failing unless `tools` gives a body, each a name and its body), and
+/// returns hardware.json.
+fn hardware_of(build: &str, tools: StubTools<'_>) -> Result<Hardware, Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let stubs = dir.path().join("stubs");
+    for name in ["nvidia-smi", "rocm-smi", "amd-smi", "lspci", "sysctl"] {
+        stub(&stubs, name, FAILS)?;
+    }
+    for (name, body) in tools {
+        stub(&stubs, name, body)?;
+    }
+    std::fs::write(dir.path().join(CLIENT_FILE), super::job::CLIENT)?;
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            "import sys, compare_client; compare_client.write_hardware(sys.argv[1])",
+            build,
+        ])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stubs.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()?;
+    if !output.status.success() {
+        return Err(text(&output).into());
+    }
+    read_hardware(dir.path()).ok_or_else(|| "no hardware.json".into())
+}
+
+/// The GPUs of hardware.json follow the build that served the child: the
+/// NVIDIA ones for CUDA, the AMD ones for `ROCm` (an integrated "AMD Radeon
+/// Graphics" left out beside a discrete GPU), the Apple chip for Metal, and
+/// none for a CPU build, even with an NVIDIA GPU in the machine.
+#[test]
+fn hardware_lists_the_gpus_of_the_build_that_served() -> TestResult {
+    if !tools_available() {
+        eprintln!("skipped: needs sh, python3 and tar");
+        return Ok(());
+    }
+    let nvidia = gpu("13.0");
+    let rocm_smi = "#!/bin/sh\n\
+        echo 'GPU[0]\t\t: Card Series: \t\tAMD Radeon RX 7800 XT'\n\
+        echo 'GPU[1]\t\t: Card Series: \t\tAMD Radeon Graphics'\n";
+    let igpu_only = "#!/bin/sh\necho 'GPU[0]\t\t: Card Series: \t\tAMD Radeon Graphics'\n";
+    let sysctl = "#!/bin/sh\necho 'Apple M2 Pro'\n";
+    let cuda = format!("ubuntu-cuda-{LLAMA_CPP_CUDA}-x64");
+    let rocm = format!("ubuntu-rocm-{LLAMA_CPP_ROCM}-x64");
+    let cases: [(&str, StubTools<'_>, Vec<&str>); 6] = [
+        (&cuda, &[("nvidia-smi", &nvidia)], vec!["Fake GPU"]),
+        (
+            &rocm,
+            &[("rocm-smi", rocm_smi)],
+            vec!["AMD Radeon RX 7800 XT"],
+        ),
+        (
+            &rocm,
+            &[("rocm-smi", igpu_only)],
+            vec!["AMD Radeon Graphics"],
+        ),
+        (
+            "macos-arm64",
+            &[("sysctl", sysctl)],
+            vec!["Apple M2 Pro (Metal)"],
+        ),
+        ("ubuntu-x64", &[("nvidia-smi", &nvidia)], vec![]),
+        ("ubuntu-arm64", &[("rocm-smi", rocm_smi)], vec![]),
+    ];
+    for (build, tools, expected) in cases {
+        let hardware = hardware_of(build, tools)?;
+        assert_eq!(hardware.build, build);
+        assert_eq!(hardware.gpus, expected, "{build}");
+        assert_eq!(hardware.has_gpu(), !expected.is_empty(), "{build}");
+    }
+    Ok(())
+}
+
+/// Stub tools of a host, each a name and its body.
+type StubTools<'a> = &'a [(&'a str, &'a str)];
 
 /// On an AMD host with the `ROCm` 7 runtime, the `ROCm` build serves the model,
 /// and hardware.json names the GPU the AMD tool lists, whichever tool answers:
@@ -434,7 +564,7 @@ fn an_amd_host_runs_the_rocm_build_and_names_its_gpu() -> TestResult {
     let lspci = "#!/bin/sh\n\
         echo '03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Fake Navi'\n\
         echo '00:02.0 VGA compatible controller: Intel Corporation Fake Graphics'\n";
-    let cases: [(AmdTools<'_>, Vec<&str>); 4] = [
+    let cases: [(StubTools<'_>, Vec<&str>); 4] = [
         (
             &[("rocm-smi", rocm_smi), ("amd-smi", FAILS), ("lspci", FAILS)],
             vec!["Fake Radeon", "Fake Radeon"],
@@ -592,6 +722,8 @@ enum Amd {
     WithRuntime,
     /// `/dev/kfd`, usable, and no `ROCm` runtime.
     WithoutRuntime,
+    /// `/dev/kfd`, usable, and the `ROCm` runtime but `librocblas.so.5`.
+    WithoutRocblas,
     /// `/dev/kfd`, the runtime, and no write access to the device.
     Unwritable,
 }
@@ -610,10 +742,10 @@ fn pick_build(
     if let Some(body) = smi {
         stub(&stubs, "nvidia-smi", body)?;
     }
-    let libs = if amd == Amd::WithoutRuntime {
-        LDCONFIG_PLAIN
-    } else {
-        LDCONFIG_ROCM
+    let libs = match amd {
+        Amd::WithoutRuntime => LDCONFIG_PLAIN,
+        Amd::WithoutRocblas => LDCONFIG_NO_ROCBLAS,
+        Amd::Absent | Amd::WithRuntime | Amd::Unwritable => LDCONFIG_ROCM,
     };
     stub(&stubs, "ldconfig", libs)?;
     let kfd = dir.path().join("kfd");
@@ -803,6 +935,15 @@ fn an_amd_host_gets_the_rocm_build_or_the_reason_it_does_not() -> TestResult {
         case(
             "Linux x86_64",
             None,
+            Amd::WithoutRocblas,
+            cpu_x64(),
+            Some(
+                "missing (librocblas.so.5); using the CPU build. On Ubuntu: apt install librocblas5",
+            ),
+        ),
+        case(
+            "Linux x86_64",
+            None,
             Amd::Unwritable,
             cpu_x64(),
             Some("render"),
@@ -826,8 +967,16 @@ fn an_amd_host_gets_the_rocm_build_or_the_reason_it_does_not() -> TestResult {
         case.check()?;
     }
     let (_, stderr) = pick_build("Linux x86_64", None, Amd::WithoutRuntime)?;
-    for library in ["libamdhip64.so.7", "librocblas.so.5", "libhipblas.so.3"] {
-        assert!(stderr.contains(library), "{stderr}");
+    assert!(
+        stderr.contains("missing (libamdhip64.so.7, librocblas.so.5, libhipblas.so.3)"),
+        "{stderr}"
+    );
+    let (_, stderr) = pick_build("Linux x86_64", None, Amd::WithoutRocblas)?;
+    for present in ["libamdhip64", "libhipblas"] {
+        assert!(
+            !stderr.contains(present),
+            "only the missing library: {stderr}"
+        );
     }
     Ok(())
 }
