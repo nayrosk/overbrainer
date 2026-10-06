@@ -33,7 +33,7 @@ stdout is the path of the report, `runs/RUN_ID/compares/COMPARE_ID/compare.md`. 
 2. Before a Runpod pod starts, stderr shows its GPU price per hour (the cheapest in-stock price of the catalog, else the cap `max_price_per_hour`) and the number of questions.
 3. A job downloads the pinned `llama-server` of llama.cpp, checks its SHA-256, caches it (the cache is shared with `export`) and serves the GGUF on `127.0.0.1`. Nothing listens on another address. Which build it gets depends on the machine:
    - NVIDIA (`nvidia-smi` works): the CUDA 13.4 build. Its CUDA runtime is a separate archive, downloaded and verified like the build, and put first on `LD_LIBRARY_PATH`. When the driver supports CUDA below 13, the CPU build runs instead, with a warning.
-   - AMD (Linux x86-64 with `/dev/kfd`): the ROCm build. It needs the system ROCm 7 runtime (`libamdhip64.so.7`, `librocblas.so.5`, `libhipblas.so.3`; on Ubuntu, `apt install libamdhip64-7 librocblas5 libhipblas3`) and read and write access to `/dev/kfd` (your user in the `render` group). Otherwise the CPU build runs, with a warning that says why: a missing library, no access to `/dev/kfd` (the `render` group), or an arm64 host, which has no ROCm build.
+   - AMD (Linux with `/dev/kfd`): the ROCm build, which llama.cpp makes for x86-64 only. It needs the system ROCm 7 runtime (`libamdhip64.so.7`, `librocblas.so.5`, `libhipblas.so.3`; on Ubuntu, `apt install libamdhip64-7 librocblas5 libhipblas3`) and read and write access to `/dev/kfd` (your user in the `render` group). Otherwise the CPU build runs, with a warning that says why: the missing libraries and the Ubuntu packages that hold them, no access to `/dev/kfd` (the `render` group), or an arm64 host.
    - macOS on Apple silicon: the Metal build.
    - A Linux host without a usable GPU: the CPU build. Any other platform fails, naming it.
 4. The job asks the child every question, one at a time, and records each answer with its time to first token, its total time and its tokens per second. The child gets the system message of the eval record, if it has one, and its user message.
@@ -54,10 +54,10 @@ Questions go one at a time: the numbers describe one user. Throughput under load
 
 `compare.md` has:
 
-- what was compared: base model, GGUF type and SHA-256, llama.cpp release, hardware, judge, number of questions, date;
-- the summary: win or tie rate (unparsed verdicts left out), wins, ties and losses (child errors count as losses), unparsed verdicts, latency p50 and p95, time to first token p50, output tokens per second, cost per 1,000 requests for the parent and the child, and their ratio;
+- what was compared: base model, GGUF type and SHA-256, llama.cpp release, hardware, judge, number of questions, date. The hardware is the GPUs of the build that served the child, each model counted (`1 x AMD Radeon RX 7800 XT + 1 x NVIDIA T4`): the NVIDIA GPUs for the CUDA build, the AMD GPUs for the ROCm build, the Apple chip for the Metal build (`Apple M2 Pro (Metal)`). A CPU build shows the CPU, even on a machine with a GPU it could not use. With the ROCm build, an integrated GPU named `AMD Radeon Graphics` is left out when a discrete GPU is listed;
+- the summary: win or tie rate (unparsed verdicts left out), wins, ties and losses (child errors count as losses), unparsed verdicts, latency p50 and p95, time to first token p50, output tokens per second, child answers cut at the token limit (`[compare] max_tokens` or the context; the judge sees them as cut), cost per 1,000 requests for the parent and the child, and their ratio;
 - the first five losses, then the first five wins, in eval order, with child errors first among the losses. Each shows the child's answer, then the parent's, and the judge's reason. The heading says how many there are (`Losses (first 5 of 18)`);
-- the limits that apply: a judge that is the parent, fewer than 100 questions, requests sent one at a time (so the child's cost is an upper bound), a child cost that uses the Runpod pod's price, a child that ran on a CPU.
+- the limits that apply: a judge that is the parent, fewer than 100 questions, requests sent one at a time (so the child's cost is an upper bound), a child cost that uses the Runpod pod's price, child answers cut at the token limit, a child that ran on a CPU.
 
 `compare.json` holds the same, and every question with both answers, timings and verdict. Neither file holds a secret.
 

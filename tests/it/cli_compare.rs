@@ -55,6 +55,8 @@ struct Judge {
 }
 
 impl Respond for Judge {
+    /// Answers a judge request: a 400 for the first judging of `fail_on`,
+    /// else the child's answer wins unless the child does not know.
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let prompt = prompt_of(request);
         if let Some(question) = self.fail_on

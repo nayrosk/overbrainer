@@ -1357,6 +1357,9 @@ impl App {
         }
     }
 
+    /// Handles a key press: Ctrl+C quits; else the open picker, the
+    /// Project form or the Dataset filter, the open overlay, the global keys
+    /// and the current view's keys get it, the first that applies.
     fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         self.dirty = true;
         let ctrl_c =
@@ -1568,6 +1571,8 @@ impl App {
         }
     }
 
+    /// Hands `code` to the key handler of the current view, the Compare
+    /// view's among them.
     fn on_view_key(&mut self, code: KeyCode) -> Vec<Effect> {
         match self.view {
             View::Project => return self.on_project_key(code),

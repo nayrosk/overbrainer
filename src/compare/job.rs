@@ -127,7 +127,10 @@ fn questions_error(path: &Path, error: CompareError) -> TrainError {
     }
 }
 
+/// A compare is a job of the run's target, as a training or an export is.
 impl Trainer for CompareJob {
+    /// Writes the script, the client and the questions to `run_dir`, and
+    /// links the GGUF there when it is uploaded with the job.
     fn prepare(&self, run_dir: &Path, _root: &str) -> Result<(), TrainError> {
         fs::create_dir_all(run_dir).map_err(train_io(run_dir))?;
         for (name, content) in [(SCRIPT_FILE, SCRIPT), (CLIENT_FILE, CLIENT)] {
@@ -142,6 +145,7 @@ impl Trainer for CompareJob {
         }
     }
 
+    /// Runs `compare.sh` through the trampoline, with the job's Python.
     fn commands(&self) -> Vec<Vec<String>> {
         vec![vec![
             PYTHON.to_string(),
@@ -151,6 +155,8 @@ impl Trainer for CompareJob {
         ]]
     }
 
+    /// The model, the child's settings, the metrics file under `root`, the
+    /// discard flag of an uploaded GGUF, and the pinned llama.cpp release.
     fn env(&self, root: &str) -> Vec<(String, String)> {
         let mut env = vec![
             (METRICS_ENV.to_string(), format!("{root}/{METRICS_FILE}")),
@@ -185,10 +191,12 @@ impl Trainer for CompareJob {
         env
     }
 
+    /// The job's metrics file, where the progress lines go.
     fn metrics_file(&self) -> &'static str {
         METRICS_FILE
     }
 
+    /// The answers (required), the server log, the hardware and the metrics.
     fn artifacts(&self) -> Artifacts {
         Artifacts {
             entries: vec![
@@ -202,14 +210,17 @@ impl Trainer for CompareJob {
         }
     }
 
+    /// One stage: the compare.
     fn stages(&self) -> Vec<JobStage> {
         vec![JobStage::Compare]
     }
 
+    /// A compare that asked no question yet has no metrics: none required.
     fn metrics_required(&self) -> bool {
         false
     }
 
+    /// llama.cpp is cached on the target, shared by the runs.
     fn caches_tools(&self) -> bool {
         true
     }
