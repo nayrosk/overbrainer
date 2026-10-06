@@ -433,7 +433,7 @@ fn render_limits(text: &mut String, report: &Report) {
     }
     limits.push(
         "Requests were sent one at a time: the latency is that of one user, and the child cost \
-         an upper bound (a server under load answers several requests at once)."
+         is an upper bound (a server under load answers several requests at once)."
             .to_string(),
     );
     if report.child_price_from_pod {
@@ -457,6 +457,7 @@ mod tests {
     use super::*;
     use crate::compare::fixtures::{answers, judge, sample_report, setup, verdicts};
 
+    /// What a test returns.
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// Where the report snapshots are stored.
@@ -515,10 +516,17 @@ mod tests {
         assert!(markdown.ends_with(crate::compare::REPORT_MD));
         let back = Report::load(dir.path())?;
         assert_eq!(back.questions.len(), 8);
-        assert_eq!(serde_json::to_value(&back)?, serde_json::to_value(&report)?);
+        assert_eq!(
+            serde_json::to_string_pretty(&back)?,
+            serde_json::to_string_pretty(&report)?
+        );
         let first = back.questions.first().ok_or("no question")?;
-        assert_eq!(first.first_token_seconds, Some(0.05));
-        assert_eq!(first.tokens_per_second, Some(60.0));
+        assert_eq!(first.id, "q1");
+        assert_eq!(first.verdict, Verdict::Win);
+        let first_token = first.first_token_seconds.ok_or("no first token time")?;
+        assert!((first_token - 0.05).abs() < 1e-9);
+        let rate = first.tokens_per_second.ok_or("no rate")?;
+        assert!((rate - 60.0).abs() < 1e-9);
         let failed = back.questions.get(6).ok_or("no q7")?;
         assert_eq!(failed.tokens_per_second, None);
         let json = std::fs::read_to_string(dir.path().join(crate::compare::REPORT_JSON))?;

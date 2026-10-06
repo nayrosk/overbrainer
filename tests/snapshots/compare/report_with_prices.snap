@@ -106,5 +106,5 @@ Judge: Reason 4.
 
 - The judge is the parent model: it may favor its own answers. Set `roles.judge` to another model and run `overbrainer compare --rejudge <compare-id>`.
 - 8 questions: a small sample, the rates move by several points from one set to another.
-- Requests were sent one at a time: the latency is that of one user, and the child cost an upper bound (a server under load answers several requests at once).
+- Requests were sent one at a time: the latency is that of one user, and the child cost is an upper bound (a server under load answers several requests at once).
 - The child's hourly price is the Runpod pod's.
