@@ -134,6 +134,14 @@ mod tests {
             get("OVERBRAINER_LLAMA_CPP_CUDART_ARM64_SHA256"),
             Some(CUDART_ARM64_SHA256)
         );
+        assert_eq!(
+            get("OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_ARM64_SHA256"),
+            Some(UBUNTU_CUDA_ARM64_SHA256)
+        );
+        assert_eq!(
+            get("OVERBRAINER_LLAMA_CPP_CUDART_X64_SHA256"),
+            Some(CUDART_X64_SHA256)
+        );
         assert_eq!(env.len(), 11);
     }
 }
