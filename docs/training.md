@@ -173,7 +173,7 @@ Ctrl-C cancels a push before its commit: nothing is committed (`push cancelled b
 
 `OVERBRAINER_HUB__BASE_URL` points the push at another Hub, over `https` (or `http` on a loopback address, for a test stub); it has no `overbrainer.toml` key.
 
-Before you publish a repo, read its card. It names the topics and their descriptions and the parent model, which is why repos are private by default. Some providers' terms forbid training models on their outputs: check the terms of the parent's provider before you make a repo public.
+Before you publish a repo, read its card. It names the topics and their descriptions, the parent model and the roles, the judge of `overbrainer compare` included when set, which is why repos are private by default. Some providers' terms forbid training models on their outputs: check the terms of the parent's provider before you make a repo public.
 
 ## Targets
 

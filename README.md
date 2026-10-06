@@ -27,9 +27,10 @@ flowchart LR
     F -->|SSH| L
     F -->|Runpod| L
     L --> G[GGUF and Ollama Modelfile]
+    G --> C[compare: child vs parent]
 ```
 
-A generator model writes the subtopics and questions, and drops near-duplicates. The parent model answers each question; answers that were truncated, refused or empty, or that lack the raw reasoning asked for, are kept for inspection and left out of training. `split` writes `data/train.jsonl` and `data/eval.jsonl` in Axolotl's chat format, and `train` fine-tunes the base model on them. `export` turns the result into a quantized GGUF with an Ollama Modelfile, on the same target.
+A generator model writes the subtopics and questions, and drops near-duplicates. The parent model answers each question; answers that were truncated, refused or empty, or that lack the raw reasoning asked for, are kept for inspection and left out of training. `split` writes `data/train.jsonl` and `data/eval.jsonl` in Axolotl's chat format, and `train` fine-tunes the base model on them. `export` turns the result into a quantized GGUF with an Ollama Modelfile, on the same target. Once a run is exported, `overbrainer compare` measures the child against the parent on the eval set: win or tie rate, latency, cost per 1,000 requests (see [compare](docs/compare.md)).
 
 ## Install
 
@@ -104,7 +105,7 @@ overbrainer tui             # browse the dataset and follow the runs
 
 Or let the TUI ask: `overbrainer tui` in an empty directory opens a wizard that asks for the provider, its key, the models, the topics and where to train, writes `overbrainer.toml`, `.env` (mode 600), `.env.example`, `prompts/` and `.gitignore`, then offers to start auto mode, which runs every stage then training after one confirmation. See [the TUI page](docs/tui.md#the-init-wizard).
 
-`init` writes `overbrainer.toml`, `.env.example`, the prompt templates in `prompts/` and a `.gitignore`. Edit the topics in `overbrainer.toml` before `run`. `run` trains only when `overbrainer.toml` has a `[training]` section; otherwise it stops after `split`. After training, it prints where the adapter is, and the merged model with `merge = true`. Each stage also runs on its own (`subtopics`, `questions`, `answers`, `split`, `train`) and resumes where it stopped: see [the dataset pipeline](docs/pipeline.md). Only one overbrainer process writes to a project at a time; a second one fails at once, naming the first one's PID. Changes to `overbrainer.toml` and `.env` apply without a restart: the TUI reloads them within 2 seconds, and `run` between stages (see [reloading](docs/configuration.md#reloading-while-overbrainer-runs)).
+`init` writes `overbrainer.toml`, `.env.example`, the prompt templates in `prompts/` (`subtopics.txt`, `questions.txt`, `answer_system.txt`, `judge.txt`) and a `.gitignore`. Edit the topics in `overbrainer.toml` before `run`. `run` trains only when `overbrainer.toml` has a `[training]` section; otherwise it stops after `split`. After training, it prints where the adapter is, and the merged model with `merge = true`. Each stage also runs on its own (`subtopics`, `questions`, `answers`, `split`, `train`) and resumes where it stopped: see [the dataset pipeline](docs/pipeline.md). Only one overbrainer process writes to a project at a time; a second one fails at once, naming the first one's PID. Changes to `overbrainer.toml` and `.env` apply without a restart: the TUI reloads them within 2 seconds, and `run` between stages (see [reloading](docs/configuration.md#reloading-while-overbrainer-runs)).
 
 A project made before overbrainer 0.4.0 makes every command say `this project predates overbrainer 0.4.0: run overbrainer migrate`. `overbrainer migrate` (or `overbrainer migrate --dry-run` to see the changes first) brings it up to date once; see [migrating a project](docs/pipeline.md#migrating-a-project).
 
@@ -149,17 +150,18 @@ In a directory without `overbrainer.toml`, `overbrainer tui` opens an init wizar
 
 ![overbrainer tui's init wizard: naming a project, picking the NanoGPT preset, the masked API key, the roles, a topic, skipping training, the summary and its write, then opening the Project view](docs/assets/wizard.gif)
 
-`overbrainer tui` has five views, and opens on Project:
+`overbrainer tui` has six views, and opens on Project:
 
 - Project (`1`): the effective configuration by section, with env-set and secret values marked, next to the project's stats. Edit a field, add or delete a topic, provider or target: each change is validated and saved to `overbrainer.toml` at once, its comments kept, and `u` undoes the last one.
 - Dataset (`2`): the topics, subtopics and questions as a tree, with a question's answer, reasoning, stats and a filter in a detail pane. Edit or delete a question, its answer or a subtopic in place.
 - Pipeline (`3`): run a stage, or auto mode (every stage then training, `A`), and watch its progress, tokens and cost, live as it runs.
 - Training (`4`): the runs, with progress, pod, spend, a loss chart and learning rate and gradient norm sparklines. Start, follow or cancel a run.
 - Logs (`5`): the captured log lines, filtered by level, exportable to a file.
+- Compare (`6`): the compares of each run, their summary, and each question with the child's and the parent's answers and the judge's reason. Start a compare (`C`) or judge one again (`J`).
 
 | Keys | Action |
 |---|---|
-| `1` to `5`, Tab, Shift-Tab | Switch view. |
+| `1` to `6`, Tab, Shift-Tab | Switch view. |
 | `?` | The keys of the current view. |
 | `j` `k`, `l` `h`, Enter | Move, expand and collapse (Enter toggles); in Project, move and edit a field. |
 | `/`, `s` | Filter the tree, show the stats. |
@@ -232,6 +234,7 @@ An installed skill that was edited is only replaced with `--force`. In Claude Co
 - [The dataset pipeline](docs/pipeline.md): stages, resuming, deduplication, the split, the answer format, reasoning, prompt templates, and the project state (`history.jsonl` and the lock).
 - [Configuration](docs/configuration.md): `overbrainer.toml`, environment variables, providers, roles, pipeline settings, Prometheus metrics, Vault and logs.
 - [Training](docs/training.md): runs, local and SSH targets, the Hugging Face token, chat templates and training settings.
+- [Compare](docs/compare.md): the child against the parent on the eval set, the judge, the report and its cost rows.
 - [Runpod](docs/runpod.md): pods, the watchdog, `--keep-pod`, stray pods and custom images.
 - [Terminal UI](docs/tui.md): views, keys, editing, quitting, color and motion.
 
