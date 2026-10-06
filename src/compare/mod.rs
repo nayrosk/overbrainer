@@ -23,6 +23,7 @@ mod job;
 mod judge;
 mod report;
 mod stats;
+mod store;
 mod text;
 mod types;
 
@@ -40,6 +41,7 @@ pub use report::{
     write as write_report,
 };
 pub use stats::{Summary, count_f64, percentile, summarize};
+pub use store::{CompareEntry, find_compare, latest_export, list_compares, newest_exported_run};
 pub use text::strip_reasoning;
 pub use types::{
     ChatMessage, ChildAnswer, CompareSetup, EvalQuestion, Hardware, Verdict, VerdictLine,
