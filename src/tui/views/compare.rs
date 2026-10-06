@@ -32,8 +32,13 @@ const JUDGE: u16 = 12;
 const RATE: u16 = 7;
 /// Columns of the questions count column.
 const COUNT: u16 = 3;
-/// Columns the summary pane's border and title take beside the progress.
-const SUMMARY_TITLE: usize = 16;
+/// The summary pane's title.
+const SUMMARY_TITLE: &str = " summary ";
+/// Columns of the summary pane's top border beside its title and the
+/// progress: two corners and at least one column of line between them.
+const SUMMARY_BORDER: usize = 3;
+/// The progress's mark, before its text.
+const PROGRESS_MARK: &str = " ● ";
 /// Characters of a question ID shown whole; longer ones keep both ends.
 const ID_SHOWN: usize = 8;
 
@@ -52,9 +57,9 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let wide = frame.area().width >= SIDE_BY_SIDE;
     let theme = app.theme;
     let view = &mut app.compare;
-    let summary = summary_lines(view, &theme);
     let halves = || Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]);
     let [_, summary_width] = halves().areas(area);
+    let summary = summary_lines(view, summary_width.width.saturating_sub(FRAME), &theme);
     let summary_paragraph = Paragraph::new(summary).wrap(Wrap { trim: false });
     let summary_rows = summary_paragraph.line_count(summary_width.width.saturating_sub(FRAME));
     let list_rows = view.rows.len().saturating_add(1);
@@ -66,7 +71,7 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         Layout::vertical([Constraint::Length(top_rows), Constraint::Fill(1)]).areas(area);
     let [list_area, summary_area] = halves().areas(top);
     render_list(frame, list_area, (view, wide), &theme);
-    let mut block = framed(" summary ".to_string(), false, &theme);
+    let mut block = framed(SUMMARY_TITLE.to_string(), false, &theme);
     if let Some(progress) = progress(view, summary_area.width, &theme) {
         block = block.title_top(progress);
     }
@@ -168,31 +173,56 @@ fn judge_word(report: &Report) -> String {
     cut(model, usize::from(JUDGE))
 }
 
+/// What names the compare running: its run, else its ID once known.
+fn running_name(view: &CompareView) -> Option<&str> {
+    let running = view.running.as_ref()?;
+    running.run.as_deref().or(running.compare.as_deref())
+}
+
 /// The progress of the compare running, for the summary pane's top right:
-/// `● compare_...: judging 12/100`, or `● judging 12/100` when the whole
-/// would not fit in `width` columns beside the pane's title.
+/// `● demo_...: judging 12/100`, or `● judging 12/100` when the run does
+/// not fit in `width` columns beside the pane's title.
 fn progress(view: &CompareView, width: u16, theme: &Theme) -> Option<Line<'static>> {
     let running = view.running.as_ref()?;
     let label = running.label();
-    let whole = running
-        .compare
-        .as_ref()
-        .or(running.run.as_ref())
-        .map(|what| format!("{what}: {label}"))
-        .filter(|whole| whole.chars().count() + SUMMARY_TITLE <= usize::from(width));
+    // The mark, the text and a space before the corner.
+    let room = usize::from(width)
+        .saturating_sub(SUMMARY_TITLE.chars().count() + SUMMARY_BORDER)
+        .saturating_sub(PROGRESS_MARK.chars().count() + 1);
+    let text = running_name(view)
+        .map(|name| format!("{name}: {label}"))
+        .filter(|text| text.chars().count() <= room)
+        .unwrap_or(label);
     Some(
         Line::from(vec![
-            Span::styled(" ● ", theme.accent),
-            Span::raw(format!("{} ", whole.unwrap_or(label))),
+            Span::styled(PROGRESS_MARK, theme.accent),
+            Span::raw(format!("{text} ")),
         ])
         .right_aligned(),
     )
 }
 
-/// The summary pane's lines: the selected compare's counts, latency, cost
-/// per 1,000 requests and hardware.
-fn summary_lines(view: &CompareView, theme: &Theme) -> Vec<Line<'static>> {
+/// Whether the compare running is the selected one.
+fn running_is_selected(view: &CompareView) -> bool {
+    let Some(running) = &view.running else {
+        return false;
+    };
+    let selected = view.selected_row().map(|row| row.record.id.as_str());
+    running.compare.is_some() && running.compare.as_deref() == selected
+}
+
+/// The summary pane's lines, `width` columns wide: which run is being
+/// compared when it is not the selected compare, then the selected compare's
+/// counts, latency, cost per 1,000 requests and hardware.
+fn summary_lines(view: &CompareView, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    if view.running.is_some() && !running_is_selected(view) {
+        let name = running_name(view).unwrap_or("the newest run");
+        lines.push(Line::styled(
+            cut(&format!("comparing {name}"), usize::from(width)),
+            theme.accent,
+        ));
+    }
     let Some(row) = view.selected_row() else {
         return lines;
     };
@@ -221,7 +251,7 @@ fn summary_lines(view: &CompareView, theme: &Theme) -> Vec<Line<'static>> {
     let dollars =
         |value: Option<f64>| value.map_or_else(|| "-".to_string(), |d| format!("${d:.2}"));
     lines.push(Line::raw(format!(
-        "per 1k requests: parent {}, child {}",
+        "cost/1k parent {} child {}",
         dollars(report.costs.parent_per_1k),
         dollars(report.costs.child_per_1k)
     )));
@@ -335,8 +365,14 @@ fn part(title: &str, text: &str, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
-/// The question's lines: its text, then its topic and timings, dim.
-fn question_lines(question: &QuestionResult, theme: &Theme) -> Vec<Line<'static>> {
+/// The question's lines: its text, then its topic and timings, dim; the
+/// topic alone when the timings would not fit in `room` columns (`None`:
+/// they always show, as side by side).
+fn question_lines(
+    question: &QuestionResult,
+    room: Option<u16>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = question
         .question
         .lines()
@@ -352,7 +388,11 @@ fn question_lines(question: &QuestionResult, theme: &Theme) -> Vec<Line<'static>
     if let Some(speed) = question.tokens_per_second {
         facts.push(format!("{speed:.0} tok/s"));
     }
-    lines.push(Line::styled(facts.join("  "), theme.dim));
+    let mut facts = facts.join("  ");
+    if room.is_some_and(|room| facts.chars().count() > usize::from(room)) {
+        facts = format!("topic {}", question.topic);
+    }
+    lines.push(Line::styled(facts, theme.dim));
     lines.push(Line::raw(""));
     lines
 }
@@ -378,7 +418,8 @@ fn render_detail(
         question.reason.as_deref().unwrap_or("(no reason)"),
         theme,
     );
-    let mut bands = vec![Band::one(question_lines(question, theme))];
+    let room = (!wide).then(|| area.width.saturating_sub(FRAME));
+    let mut bands = vec![Band::one(question_lines(question, room, theme))];
     if wide {
         bands.push(Band {
             columns: vec![child, parent],

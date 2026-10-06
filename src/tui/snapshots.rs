@@ -2207,3 +2207,43 @@ fn the_stacked_detail_jumps_between_its_parts() -> TestResult {
 fn the_side_by_side_detail_jumps_between_its_parts() -> TestResult {
     jumps_between(120, 40, 3)
 }
+
+/// The compare running is named by its run: on the summary's border when it
+/// fits there, and on a line of the summary when another compare is selected.
+#[test]
+fn the_running_compare_names_its_run() -> TestResult {
+    let mut app = app();
+    app.view = View::Compare;
+    let task = app.task_id();
+    let mut running =
+        super::compare::Comparing::new(task, Some("demo_20261006-100000".into()), false);
+    running.compare = Some("compare_20261006-130000".into());
+    running.judged = Some((12, 100));
+    app.compare.running = Some(running);
+    app.compare.rows = vec![compare_entry()?];
+    let wide = text(&draw(&mut app, 120, 40)?).join("\n");
+    assert!(
+        wide.contains("● demo_20261006-100000: judging 12/100"),
+        "{wide}"
+    );
+    let narrow = text(&draw(&mut app, 80, 24)?).join("\n");
+    assert!(narrow.contains("● judging 12/100"), "{narrow}");
+    assert!(
+        narrow.contains("comparing demo_20261006-100000"),
+        "{narrow}"
+    );
+    Ok(())
+}
+
+/// At 80x24 the first question's detail shows the judge's reason without a
+/// scroll.
+#[test]
+fn the_stacked_detail_shows_the_reason_at_80x24() -> TestResult {
+    let mut app = app();
+    app.view = View::Compare;
+    app.compare.rows = vec![compare_entry()?];
+    let rows = text(&draw(&mut app, 80, 24)?).join("\n");
+    assert!(rows.contains("Reason 1."), "{rows}");
+    assert!(rows.contains("cost/1k parent $0.90 child $0.12"), "{rows}");
+    Ok(())
+}
