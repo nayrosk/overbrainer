@@ -9,6 +9,7 @@ import http.client
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -85,17 +86,47 @@ def cpu_name():
         return platform.processor() or None
 
 
-def write_hardware(build):
-    """Writes hardware.json: the build, the GPUs nvidia-smi lists, the CPU."""
-    gpus = []
+def listed(command):
+    """The non-empty lines `command` prints, or none when it is missing or fails."""
     try:
-        listed = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=30, check=True,
+        done = subprocess.run(
+            command, capture_output=True, text=True, timeout=30, check=True,
         )
-        gpus = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
     except (OSError, subprocess.SubprocessError):
-        pass
+        return []
+    return [line.strip() for line in done.stdout.splitlines() if line.strip()]
+
+
+def after(lines, marker):
+    """What follows `marker` on each of `lines` that holds it, when not empty."""
+    names = []
+    for line in lines:
+        if marker in line:
+            name = line.split(marker, 1)[1].strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def amd_gpus():
+    """The AMD GPUs by name: rocm-smi, else amd-smi, else lspci, else one generic."""
+    names = after(listed(["rocm-smi", "--showproductname"]), "Card Series:")
+    names = names or after(listed(["amd-smi", "static"]), "MARKET_NAME:")
+    if not names:
+        for line in listed(["lspci"]):
+            if re.search(r"VGA|Display|3D", line) and re.search(r"AMD|ATI", line):
+                name = line.split("[AMD/ATI]", 1)[-1] if "[AMD/ATI]" in line else line.split(": ", 1)[-1]
+                names.append(name.strip())
+    return names or ["AMD GPU"]
+
+
+def write_hardware(build):
+    """Writes hardware.json: the build, the GPUs (nvidia-smi, or the AMD tools
+    for the ROCm build), the CPU."""
+    if "rocm" in build:
+        gpus = amd_gpus()
+    else:
+        gpus = listed(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
     with open(HARDWARE, "w", encoding="utf-8") as file:
         json.dump({"build": build, "gpus": gpus, "cpu": cpu_name()}, file)
 

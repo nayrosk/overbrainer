@@ -216,11 +216,12 @@ HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 "#;
 
 /// The llama.cpp build directories of a target's tools cache that may serve
-/// the child, whichever the machine picks: the CPU and CUDA builds.
-pub const LLAMA_ASSETS: [&str; 5] = [
+/// the child, whichever the machine picks: the CPU, CUDA and `ROCm` builds.
+pub const LLAMA_ASSETS: [&str; 6] = [
     "ubuntu-x64",
     "ubuntu-arm64",
     "macos-arm64",
     "ubuntu-cuda-13.4-x64",
     "ubuntu-cuda-13.4-arm64",
+    "ubuntu-rocm-10.0-x64",
 ];

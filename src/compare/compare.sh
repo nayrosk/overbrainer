@@ -14,6 +14,7 @@
 #   OVERBRAINER_COMPARE_START_SECS   how long the server may take to be ready
 #   OVERBRAINER_METRICS              the job's metrics file, for progress lines
 #   OVERBRAINER_CACHE                cache holding llama.cpp, shared by the runs
+#   OVERBRAINER_COMPARE_KFD          the AMD compute device, /dev/kfd by default
 #   OVERBRAINER_LLAMA_CPP*           the pinned llama.cpp release and its digests
 #
 # overbrainer puts the helpers of llama_cpp.sh (fail, say, fetch, unpack)
@@ -65,14 +66,57 @@ driver_cuda() {
     printf '%s\n' "${version%%[!0-9.]*}"
 }
 
+# Prints the output of `ldconfig -p`, the libraries the dynamic linker knows;
+# prints nothing when there is no ldconfig. It lives in /sbin for most users.
+linker_libraries() {
+    if command -v ldconfig >/dev/null 2>&1; then
+        ldconfig -p 2>/dev/null || true
+    elif [ -x /sbin/ldconfig ]; then
+        /sbin/ldconfig -p 2>/dev/null || true
+    fi
+}
+
+# Picks the ROCm build for an AMD GPU, after pick_build chose the CPU build:
+# only a Linux x86_64 host with /dev/kfd, the ROCm 7 runtime in the linker's
+# cache and read and write access to the device gets it. When there is a
+# /dev/kfd and the build stays on the CPU, warns why. Does nothing, quietly,
+# on a host without /dev/kfd.
+pick_amd() {
+    kfd=${OVERBRAINER_COMPARE_KFD:-/dev/kfd}
+    [ -e "$kfd" ] || return 0
+    if [ "$arch" != x64 ]; then
+        warn "AMD GPU found but llama.cpp $tag has no ROCm build for $arch: using the CPU build $asset"
+        return 0
+    fi
+    known=$(linker_libraries)
+    missing=
+    for library in libamdhip64.so.7 librocblas.so.5 libhipblas.so.3; do
+        case $known in
+        *"$library "*) ;;
+        *) missing="${missing:+$missing, }$library" ;;
+        esac
+    done
+    if [ -n "$missing" ]; then
+        warn "AMD GPU found but the ROCm 7 runtime is missing (libamdhip64.so.7, librocblas.so.5, libhipblas.so.3); using the CPU build. On Ubuntu: apt install libamdhip64-7 librocblas5 libhipblas3"
+        return 0
+    fi
+    if [ ! -r "$kfd" ] || [ ! -w "$kfd" ]; then
+        warn "AMD GPU found but $kfd is not readable and writable by this user (add it to the render group); using the CPU build $asset"
+        return 0
+    fi
+    asset=ubuntu-rocm-$rocm-x64 digest=$OVERBRAINER_LLAMA_CPP_UBUNTU_ROCM_X64_SHA256
+}
+
 # Picks the llama.cpp build for this machine: sets asset and digest, and
 # cudart and cudart_digest (the CUDA runtime archive) for a CUDA build, empty
-# for a CPU one. A Linux host with a working nvidia-smi gets the CUDA build,
-# unless its driver supports a CUDA major version below the pinned one: then
-# the CPU build, with a warning.
+# for a CPU or ROCm one. A Linux host with a working nvidia-smi gets the CUDA
+# build, unless its driver supports a CUDA major version below the pinned one:
+# then the CPU build, with a warning. Without nvidia-smi, an AMD host gets the
+# ROCm build (see pick_amd).
 pick_build() {
     tag=$OVERBRAINER_LLAMA_CPP
     cuda=$OVERBRAINER_LLAMA_CPP_CUDA
+    rocm=$OVERBRAINER_LLAMA_CPP_ROCM
     cudart=
     cudart_digest=
     platform=$(uname -sm)
@@ -95,7 +139,10 @@ pick_build() {
         ;;
     *) fail "llama.cpp $tag has no prebuilt llama-server for $platform (Linux x86_64, Linux aarch64 and Darwin arm64 only)" ;;
     esac
-    driver=$(driver_cuda) || return 0
+    if ! driver=$(driver_cuda); then
+        pick_amd
+        return 0
+    fi
     driver_major=${driver%%.*}
     case $driver_major in
     '' | *[!0-9]*)
@@ -111,7 +158,8 @@ pick_build() {
     cudart=cudart-llama-$tag-bin-ubuntu-cuda-$cuda-$arch cudart_digest=$runtime_digest
 }
 
-# Fetches the build pick_build chose into the cache, with its CUDA runtime,
+# Fetches the build pick_build chose into the cache, with its CUDA runtime
+# (the ROCm runtime comes from the system),
 # starts llama-server on 127.0.0.1 and runs the client.
 main() {
     cd "$(dirname -- "$0")"
