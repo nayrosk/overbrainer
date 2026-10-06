@@ -2,7 +2,7 @@
 
 ![A tour of overbrainer tui: the dataset tree and an answer's reasoning, the topic stats, a filter, the help, a training run's loss chart, the logs and a dialog](assets/tui-tour.gif)
 
-`overbrainer tui` shows the project in five views, switched with `1` to `5` (or Tab, Shift-Tab): the project's configuration and stats, the dataset, the pipeline stages, the training runs, and the logs. It opens on the Project view; in a directory without `overbrainer.toml`, it opens the [init wizard](#the-init-wizard) first. It runs the same stages and training flows as the commands, and [auto mode](#auto-mode) runs them all in a row. It needs a terminal (it refuses to start when stdout is not one) and is laid out for at least 80x24 characters. While the TUI runs, logs go to its Logs view instead of stderr; `OVERBRAINER_LOG` still sets what is captured.
+`overbrainer tui` shows the project in six views, switched with `1` to `6` (or Tab, Shift-Tab): the project's configuration and stats, the dataset, the pipeline stages, the training runs, the logs, and the compares of each run's model with the parent. It opens on the Project view; in a directory without `overbrainer.toml`, it opens the [init wizard](#the-init-wizard) first. It runs the same stages and training flows as the commands, and [auto mode](#auto-mode) runs them all in a row. It needs a terminal (it refuses to start when stdout is not one) and is laid out for at least 80x24 characters. While the TUI runs, logs go to its Logs view instead of stderr; `OVERBRAINER_LOG` still sets what is captured.
 
 ## Keys
 
@@ -10,7 +10,7 @@ Everywhere:
 
 | Keys | Action |
 |---|---|
-| `1` `2` `3` `4` `5`, Tab, Shift-Tab | Switch view. |
+| `1` to `6`, Tab, Shift-Tab | Switch view. |
 | `?` | List the keys of the current view. Esc, `?` or `q` closes it. |
 | `q`, Ctrl-C | Quit. |
 | `R` | Reload the data files and the runs list from disk. |
@@ -81,6 +81,7 @@ Training:
 | `x` | Hide the failed runs from the list until the TUI restarts (asks first). Nothing is deleted. |
 | `h` | Push the selected run to Hugging Face, as `overbrainer push` does (asks first, showing the repo, its visibility and the size). Refused while a stage, an edit or a training start runs. |
 | `p` | Dismiss the selected run's pod from the view, or show it again. Refused while the run is followed. |
+| `C` | Compare the selected run's GGUF with the parent, as `overbrainer compare` does (asks first). Refused while a stage, an edit or a training start runs. |
 | `g` `c`, in the start confirmation for a Runpod target | Choose the GPU types or the data centers from the catalog instead of what `overbrainer.toml` has; the choice is saved to `overbrainer.toml` when the run starts. |
 
 Logs:
@@ -93,6 +94,19 @@ Logs:
 | `s` | Show the pod log of the run selected in the Training view, or overbrainer's own log again. |
 | `x` | Export the lines shown to `.overbrainer/logs-<timestamp>.log` (`logs-pod-<run-id>-<timestamp>.log` for a pod log). |
 
+Compare:
+
+| Keys | Action |
+|---|---|
+| `k` `j`, Up, Down | Move in the focused list. |
+| `h` `l`, Left, Right | Focus the compares or the questions. |
+| PgUp, PgDn | Scroll the detail pane. |
+| `[` `]` | Jump the detail pane from part to part (the question, the child's answer, the parent's, the judge's reason). |
+| `f` | Cycle the filter: all, losses, ties, wins, errors. |
+| `C` | Compare the newest run with a GGUF (asks first). |
+| `J` | Judge the selected compare again (asks first). |
+| `c` | Cancel the compare running (asks first). |
+
 ## The views
 
 ### Project (`1`)
@@ -103,7 +117,7 @@ The left pane lists the effective configuration section by section: `project`, e
 
 On a Runpod target, Enter on `gpu_types` or `data_center_ids` instead opens a picker reading the Runpod catalog live, its top row `auto` (cheapest GPU types in stock, or the data centers with a chosen GPU type in stock); Space toggles an entry, `J`/`K` move it in the chosen order, `o` sorts the entries another way, and Enter saves the choice, `auto` included. Enter on `network_volume_id` opens a picker of the account's network volumes, its top row `none` (unsets it); picking a volume, or typing one the volume listing read last has, also sets `data_center_ids` to the volume's own data center. Once a volume listing is read, a target whose volume it lists in another data center gets that data center, saved in a write of its own, and the status line says so; while such a volume is set, changing `data_center_ids` to anything else (in its picker or typed) is refused: the status line says to pick another `network_volume_id` instead. A volume the listing does not have, or no listing yet, leaves `data_center_ids` free; since a volume needs `data_center_ids` with exactly one entry, the volume's, set it first for such a volume. Enter on `image` opens a picker of the account's pod templates, its top row `default` (unsets `image`, so the pinned Axolotl image applies); a template with no image cannot be picked. In any of these pickers, `t` types the value instead, and Esc cancels without changing anything. Selecting `gpu_count` or `max_hours` reads the GPU catalog in the background and adds a hint: the most GPUs a pod can have with the chosen types (or on Runpod's Secure Cloud with `auto`), and the most a run can cost at `max_hours`. Picking or typing a list of GPU types for `gpu_types` (instead of `auto`) also unsets `min_vram_gb` and `max_price_per_hour`, since those narrow `gpu_types = "auto"` only, and the status line says so.
 
-Each change is validated against the whole configuration before anything is written: on error, nothing is written, the form stays open with the problem (or the status line says it, for a change made without the form), and the field keeps its value. A change that sets several fields (a volume with its data center, a list of GPU types with the `auto` limits it unsets, a renamed topic) is one write. The file is written atomically, keeping its permissions and its comments; the write is refused if the file changed on disk since it was read or if it is a symlink. No other change starts until a write ends. `u` undoes the last write from the TUI: it writes back the file as it was before it, unless the file changed on disk since, or a stage or a training run uses a field it would change (it can be undone once that ends). There is one level of undo: an undo cannot be undone, and a reload of the file or `E` leaves nothing to undo. `E` opens `overbrainer.toml` whole in `$EDITOR`, for what the form does not cover, such as `training.axolotl_extra`: it is refused while a stage, an edit or a write runs, or while a training run is starting or being followed (since it would change the training table).
+Each change is validated against the whole configuration before anything is written: on error, nothing is written, the form stays open with the problem (or the status line says it, for a change made without the form), and the field keeps its value. A change that sets several fields (a volume with its data center, a list of GPU types with the `auto` limits it unsets, a renamed topic) is one write. The file is written atomically, keeping its permissions and its comments; the write is refused if the file changed on disk since it was read or if it is a symlink. No other change starts until a write ends. `u` undoes the last write from the TUI: it writes back the file as it was before it, unless the file changed on disk since, or a stage or a training run uses a field it would change (it can be undone once that ends). There is one level of undo: an undo cannot be undone, and a reload of the file or `E` leaves nothing to undo. `E` opens `overbrainer.toml` whole in `$EDITOR`, for what the form does not cover, such as `training.axolotl_extra`, `[compare]` and `roles.judge`: it is refused while a stage, an edit or a write runs, or while a training run is starting or being followed (since it would change the training table).
 
 `overbrainer.toml` and `.env` are read again when they change on disk, every 2 seconds at most, except while a save runs or `E` has the file: a valid configuration replaces the one shown, as a save does, and the next stages and runs use it; an invalid one leaves the view as it was and marks the fields its problems name, and the stages, runs, edits and catalog pickers started meanwhile keep using the configuration the view shows. A write from the view is not read again.
 
@@ -134,6 +148,7 @@ The runs of `runs/` with the system panel of the selected run, and for the selec
 - `x` hides the failed runs that no task follows, after a confirmation. They stay hidden for as long as the TUI runs, even when `runs/` is read again; their files are kept and `overbrainer runs ls` still lists them. A run that fails later shows until `x` is pressed again.
 - `p` dismisses the selected run's pod: its pod line and its pod column show nothing, until `p` shows them again or the run is followed again. It is refused while a task follows the run, since that pod is live.
 - On a terminal 120 columns wide or more, when the rows under it still leave 14 for the selected run, a system panel sits right of the runs: the machine of the selected run, sampled every 10 seconds while a task follows it (see [Training](training.md)). One row per disk (`disk` for the file system of the run directory, `root` for `/` when it is another), then `cpu`, `mem` and one per GPU, each with a gauge, its percentage, a sparkline and the figures behind it: space used and size, CPU use, memory used and its limit, and for a GPU its memory, temperature and power (the temperature and power are left out when they do not fit). A GPU's gauge is its utilisation. On a host the CPU figures are the load average over the CPU count; inside a container, whose load average is the host's, they are the cores busy over the container's CPUs (`4.0/8.0 cores`). Gauges turn yellow at 85% and red at 95%; a GPU's figures do the same with its memory. A network file system, such as a Runpod network volume, is marked `shared` and stays dim: `df` reports the whole shared cluster there, not what the volume holds or allows, so its figures never warn (the volume's own usage is measured separately). With more than four GPUs, the first three show and a `rest` row averages the others. The last 60 samples of each run (ten minutes) are kept while the TUI runs; each sparkline cell shows the peak of its share of them, and a cell without the figure stays blank. A run no longer followed shows its last sample. Once the last sample is more than 20 seconds old, followed or not, the panel's title shows its age. Before the first sample of a followed run the panel says so.
+- `C` compares the selected run's GGUF with the parent (see [Compare](#compare-6)). Under its ID, a run with a finished compare shows how its latest finished compare went: `compare: 71% win or tie (compare_20261006-120000, 8 questions)`.
 - Leaving the view does not stop following a run: while the TUI is open, its results are still retrieved and its pod deleted on time.
 
 ### Logs (`5`)
@@ -142,9 +157,19 @@ The captured log lines, newest at the bottom. Scrolling back with `k`/`j`, the a
 
 `s` switches to the Runpod pod log of the run selected in the Training view, as overbrainer keeps it in `runs/<run-id>/.pod/pod.log` (see [pod logs](runpod.md#pod-logs)), read again every 2 seconds. Each line shows its time, its source (`sys` for Runpod's own lines, such as the image pull, `ctr` for the container's output) and the line, secrets masked. `f` does not apply there; `x` exports that log to `.overbrainer/logs-pod-<run-id>-<YYYYMMDDTHHMMSSZ>.log`. `s` again shows overbrainer's own log.
 
+### Compare (`6`)
+
+The compares of every run, newest first (see [Compare](compare.md)), with their quantize type, win or tie rate and number of questions, and from 120 columns their judge (`parent` when it is the parent model). On their right, the selected compare's summary: wins, ties, losses (child errors included), unparsed verdicts, latency, cost per 1,000 requests and the hardware that served the child.
+
+While a compare runs, the summary's top right shows its run and progress (`demo_20261006-100000: answering 34/100`, then `judging 12/100`; the progress alone when the run does not fit). When another compare is selected, the summary's first line names the run being compared. A compare without a report yet shows its state instead (`running`, `failed`).
+
+Below, the selected compare's questions, each with its verdict: `✓` win, `=` tie, `✗` loss, `!` the child gave no answer, `?` the judge's reply did not parse. On their right, the selected question with its topic and, when they fit, its timings, the child's and the parent's answers, and the judge's reason. From 120 columns the two answers sit side by side; below, they are stacked, and the timings are dropped when the pane is too narrow for them.
+
+One compare runs at a time. Quitting cancels it, as Ctrl-C does on the command line. `C` and `J` are refused while a stage, an edit or a training start runs.
+
 ## The footer and dialogs
 
-The footer lists the keys of what the keys act on (the view, the filter or a form being typed, a dialog or the help), dropping the last ones when the row is full. A new message replaces them for ten seconds, marked `✓` or `✗`: `✓ config reloaded` when `overbrainer.toml` or `.env` changed on disk and was applied, `✗ overbrainer.toml: <problem>` or `✗ cannot parse .env (syntax error at line N)` when the change is invalid and the previous settings stay (see [reloading](configuration.md#reloading-while-overbrainer-runs)). On the right, the footer shows the work running, each with a spinner, `locked` while the data lock holds (see below), the project's cost so far, the version, then `? help`. The cost is `$` with two decimals, a trailing `+` when part of it is unknown, and it is left out while nothing has been spent. It includes the estimated spend of the Runpod pods, so it can differ from `overbrainer history`, which counts the stages only. When a newer overbrainer release is available, `↑ X.Y.Z` follows the version, naming that release. The cost, the version and that marker are left out while a dialog, the help overlay or the `r` menu is open, so the hints have the room. While `e`, `d`, `r`, `A` and `t` are refused (see below), they are drawn crossed out and `locked` joins the work.
+The footer lists the keys of what the keys act on (the view, the filter or a form being typed, a dialog or the help), dropping the last ones when the row is full. A new message replaces them for ten seconds, marked `✓` or `✗`: `✓ config reloaded` when `overbrainer.toml` or `.env` changed on disk and was applied, `✗ overbrainer.toml: <problem>` or `✗ cannot parse .env (syntax error at line N)` when the change is invalid and the previous settings stay (see [reloading](configuration.md#reloading-while-overbrainer-runs)). On the right, the footer shows the work running, each with a spinner, `locked` while the data lock holds (see below), the project's cost so far, the version, then `? help`. The cost is `$` with two decimals, a trailing `+` when part of it is unknown, and it is left out while nothing has been spent. It includes the estimated spend of the Runpod pods, so it can differ from `overbrainer history`, which counts the stages only. When a newer overbrainer release is available, `↑ X.Y.Z` follows the version, naming that release. The cost, the version and that marker are left out while a dialog, the help overlay or the `r` menu is open, so the hints have the room. While `e`, `d`, `r`, `A`, `t`, `h`, `C` and `J` are refused (see below), they are drawn crossed out and `locked` joins the work.
 
 A dialog highlights its default answer, `n`. `y` confirms; `n`, Esc and Enter cancel. A `y` that deletes, cancels or abandons something, or quits while a stage runs (its requests in flight are lost), is drawn as an error. The view under a dialog, the help or a menu goes dim.
 
@@ -186,7 +211,7 @@ A deleted subtopic or question is recorded in `data/rejected.jsonl`, so the stag
 
 ## The data lock
 
-While a stage, an edit or a training start runs in the TUI, and once it is quitting, `e`, `d`, `r`, `A` and `t` are refused. `overbrainer tui` also holds the project's [lock](pipeline.md#project-state) for as long as it runs, so no other overbrainer command can write to the same project at the same time. An edit checks that what it changes is still on disk as shown, and refuses otherwise.
+While a stage, an edit or a training start runs in the TUI, and once it is quitting, `e`, `d`, `r`, `A`, `t`, `h`, `C` and `J` are refused. `overbrainer tui` also holds the project's [lock](pipeline.md#project-state) for as long as it runs, so no other overbrainer command can write to the same project at the same time. An edit checks that what it changes is still on disk as shown, and refuses otherwise.
 
 ## Quitting
 
@@ -196,7 +221,8 @@ While a stage, an edit or a training start runs in the TUI, and once it is quitt
 - a followed run keeps running and can be attached again;
 - a run still starting is left running once its job has started, never cut during its start; for a Runpod run still provisioning, a second question offers to delete its pod instead;
 - an edit or a cancel in progress is waited for, including a cancel confirmed while quitting;
-- a write of `overbrainer.toml` in progress is waited for.
+- a write of `overbrainer.toml` in progress is waited for;
+- a running compare is cancelled and its pod deleted; while it judges, the verdicts so far are kept for `J`.
 
 While the help overlay is open, `q` (like Esc or `?`) closes it instead of quitting, and a filter or a Project form being typed takes `q` as a character. Ctrl-C quits the same way `q` does, but from any of those contexts too, closing or leaving them first. After the TUI exits, it prints what it left running, with the commands to follow it again.
 

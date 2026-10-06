@@ -27,9 +27,9 @@ pub use bootstrap::{
     HOST_KEY_ENV, JOB_ENV, PodSettings, bootstrap_functions, pod_command, pod_env, watchdog_script,
 };
 pub use catalog::{
-    DataCenterStock, GpuFilter, ResolveError, by_price, data_center_stock, data_center_table,
-    gpu_table, printable, resolve, resolve_with_floor, select_gpus, stocked_data_centers,
-    template_table, volume_table,
+    DataCenterStock, GpuFilter, GpuOffer, ResolveError, by_price, cheapest_in_stock,
+    data_center_stock, data_center_table, gpu_table, printable, resolve, resolve_with_floor,
+    select_gpus, stocked_data_centers, template_table, volume_table,
 };
 pub(crate) use catalog::{MAX_OUT_OF_STOCK, WalkOrder, walk_order};
 pub use client::{ApiError, RunpodClient, SECRETS_FORBIDDEN_MESSAGE, USER_AGENT};

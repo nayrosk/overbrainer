@@ -27,14 +27,14 @@ const fn row(keys: &'static str, action: &'static str) -> KeyHelp {
 
 /// The note under the keys: what the data lock refuses, and the project lock the
 /// TUI holds.
-pub(super) const NOTE: &str = "e, d, r, A, t and h are refused while a stage, an edit or a \
-                               training start runs in this TUI; the TUI also holds the project lock, \
+pub(super) const NOTE: &str = "e, d, r, A, t, h, C and J are refused while a stage, an edit or \
+                               a training start runs in this TUI; the TUI also holds the project lock, \
                                so no other overbrainer command writes to the project \
                                meanwhile.";
 
 /// Keys that work in every view.
 pub(super) const GLOBAL: &[KeyHelp] = &[
-    row("1 2 3 4 5, Tab, Shift-Tab", "switch view"),
+    row("1-6, Tab, Shift-Tab", "switch view"),
     row("?", "this help (Esc, ? or q closes it)"),
     row("q, Ctrl-C", "quit"),
     row("R", "reload the data files and runs"),
@@ -84,7 +84,7 @@ const TRAINING: &[KeyHelp] = &[
     row("t", "start a training run (asks first)"),
     row("s, T", "stop with a snapshot; T resumes it (asks first)"),
     row("x", "hide the failed runs until restart (asks first)"),
-    row("h", "push to Hugging Face (asks first)"),
+    row("h, C", "push to Hugging Face; compare it (both ask)"),
     row(
         "g c, starting on Runpod",
         "choose GPU types, data centers (saved on y)",
@@ -95,6 +95,20 @@ const PIPELINE: &[KeyHelp] = &[row(
     "c, auto mode running",
     "cancel its stage and the rest (asks first)",
 )];
+
+/// The help rows of the Compare view.
+const COMPARE: &[KeyHelp] = &[
+    row("k j, Up Down", "move in the focused list"),
+    row("h l, Left Right", "focus the compares or the questions"),
+    row(
+        "PgUp PgDn, [ ]",
+        "scroll the detail; [ ] jumps part to part",
+    ),
+    row("f", "filter: all, losses, ties, wins, errors"),
+    row("C", "compare the newest run with a GGUF (asks first)"),
+    row("J", "judge the selected compare again (asks first)"),
+    row("c", "cancel the compare running (asks first)"),
+];
 
 const LOGS: &[KeyHelp] = &[
     row("k j, Up Down, PgUp PgDn", "scroll"),
@@ -198,7 +212,7 @@ const FOOTER_PIPELINE: &[Hint] = &[
     locking("r", "run a stage"),
     locking("A", "auto"),
     hint("q", "quit"),
-    hint("1-5", "views"),
+    hint("1-6", "views"),
 ];
 /// The footer hints of the training view.
 const FOOTER_TRAINING: &[Hint] = &[
@@ -226,6 +240,15 @@ const FOOTER_LOGS: &[Hint] = &[
     hint("f", "level"),
     hint("s", "source"),
     hint("x", "export"),
+];
+/// The footer hints of the Compare view.
+const FOOTER_COMPARE: &[Hint] = &[
+    hint("j/k", "move"),
+    hint("h/l", "focus"),
+    hint("f", "filter"),
+    locking("C", "compare"),
+    locking("J", "rejudge"),
+    hint("c", "cancel"),
 ];
 const FOOTER_FILTER: &[Hint] = &[hint("Enter", "keep"), hint("Esc", "clear")];
 const FOOTER_FORM: &[Hint] = &[hint("Enter", "save"), hint("Esc", "cancel")];
@@ -272,6 +295,7 @@ pub(super) fn footer(context: Context) -> Vec<Hint> {
         Context::View(View::Pipeline) => FOOTER_PIPELINE.to_vec(),
         Context::View(View::Training) => FOOTER_TRAINING.to_vec(),
         Context::View(View::Logs) => FOOTER_LOGS.to_vec(),
+        Context::View(View::Compare) => FOOTER_COMPARE.to_vec(),
         Context::Abandon => FOOTER_ABANDON.to_vec(),
         Context::Filter => FOOTER_FILTER.to_vec(),
         Context::Form => FOOTER_FORM.to_vec(),
@@ -309,6 +333,7 @@ pub(super) fn of(view: View) -> &'static [KeyHelp] {
         View::Training => TRAINING,
         View::Logs => LOGS,
         View::Pipeline => PIPELINE,
+        View::Compare => COMPARE,
     }
 }
 
@@ -322,7 +347,7 @@ mod tests {
         assert!(
             TRAINING
                 .iter()
-                .any(|row| row.keys == "h" && row.action.starts_with("push to Hugging Face")),
+                .any(|row| row.keys == "h, C" && row.action.starts_with("push to Hugging Face")),
             "h in the help"
         );
         for context in [Context::View(View::Training), Context::Abandon] {
@@ -332,9 +357,28 @@ mod tests {
             );
         }
         assert!(
-            NOTE.starts_with("e, d, r, A, t and h are refused"),
+            NOTE.starts_with("e, d, r, A, t, h, C and J are refused"),
             "{NOTE}"
         );
+    }
+
+    /// `C` compares in the Training and Compare views; `C` and `J` are
+    /// locking keys of the Compare view, as `h` is of the Training view.
+    #[test]
+    fn c_compares_and_j_judges_again() {
+        assert!(
+            TRAINING
+                .iter()
+                .any(|row| row.keys == "h, C" && row.action.ends_with("compare it (both ask)")),
+            "C in the Training help"
+        );
+        assert!(
+            COMPARE.iter().any(|row| row.keys == "J"),
+            "J in the Compare help"
+        );
+        let hints = footer(Context::View(View::Compare));
+        assert!(hints.contains(&locking("C", "compare")), "{hints:?}");
+        assert!(hints.contains(&locking("J", "rejudge")), "{hints:?}");
     }
 
     /// Every row fits the overlay, so no text is cut at the minimum terminal size

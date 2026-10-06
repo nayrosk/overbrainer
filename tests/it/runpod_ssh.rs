@@ -534,7 +534,9 @@ async fn marker_exists(
     Ok(manifest.iter().any(|file| file.path == ".pod/retrieved"))
 }
 
-/// A retrieved run marks its pod, then deletes it with its key and secret, unless kept.
+/// A retrieved run marks its pod, then deletes it with its key and secret,
+/// unless kept; a compare's pod, recorded in the compare's own directory,
+/// too.
 #[tokio::test]
 async fn a_retrieved_run_marks_its_pod_then_deletes_it_unless_kept() -> TestResult {
     each_ssh_client(|ssh| async move {
@@ -542,9 +544,14 @@ async fn a_retrieved_run_marks_its_pod_then_deletes_it_unless_kept() -> TestResu
             skip();
             return Ok(());
         };
-        for keep in [false, true] {
+        for (keep, compare) in [(false, false), (true, false), (false, true), (true, true)] {
             let project = tempfile::tempdir()?;
             let runs = Runs::new(project.path());
+            let runs = if compare {
+                runs.compares("demo_20261006-100000")?
+            } else {
+                runs
+            };
             let (run, mut pod, executor) = started_run(&sshd, &runs, keep, ssh).await?;
             let key = runs.run_dir(&run.id)?.join("ssh/id_ed25519");
             fs::create_dir_all(key.parent().ok_or("no ssh dir")?)?;
@@ -562,7 +569,10 @@ async fn a_retrieved_run_marks_its_pod_then_deletes_it_unless_kept() -> TestResu
                 interrupted: &interrupted,
             };
             let ending = end_pod(&ctx, &mut pod, &executor, &run, true).await?;
-            assert!(marker_exists(&executor, &run).await?, "keep = {keep}");
+            assert!(
+                marker_exists(&executor, &run).await?,
+                "keep = {keep}, compare = {compare}"
+            );
             let log = runs.run_dir(&run.id)?.join(".pod/watchdog.log");
             assert_eq!(fs::read_to_string(log)?, "probe ready\n");
             let deletes = server

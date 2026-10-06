@@ -20,7 +20,7 @@ const TOGGLE: u16 = 2;
 const FIRST_KEYS: [&str; 3] = ["r generates data", "t trains", "? all keys"];
 
 /// A rounded pane with a column of padding, its border drawn in `border`.
-fn pane<'a>(border: ratatui::style::Style) -> Block<'a> {
+pub(in crate::tui) fn pane<'a>(border: ratatui::style::Style) -> Block<'a> {
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(border)

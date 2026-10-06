@@ -15,7 +15,7 @@ use crate::runpod::{
     GpuFilter, PodCtx, PodError, RunpodClient, Timing, data_center_table, gpu_table, pod_rows,
     remove_run_pods, select_gpus, table, template_table, volume_table,
 };
-use crate::runs::Runs;
+use crate::runs::{JobKind, Runs};
 
 /// Runs an `overbrainer pod` subcommand.
 ///
@@ -133,6 +133,8 @@ async fn ls(ctx: &PodCtx<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pod rm`: deletes the pods of run or job `run_id` and prints each one; a
+/// running export or compare is refused with how to stop it instead.
 async fn rm(ctx: &PodCtx<'_>, run_id: &str, force: bool) -> anyhow::Result<()> {
     let removal = remove_run_pods(ctx, run_id, force).await;
     if removal.removed.is_empty() && removal.result.is_ok() {
@@ -148,24 +150,29 @@ async fn rm(ctx: &PodCtx<'_>, run_id: &str, force: bool) -> anyhow::Result<()> {
             .map_or_else(String::new, |spend| format!(", about ${spend:.2}"));
         println!("pod: {} deleted{after}{spend}", pod.pod_id);
     }
-    match (removal.result, ctx.runs.export_of()) {
-        (Err(error), Some(run)) => Err(export_refusal(error, run_id, &run)),
+    match (removal.result, ctx.runs.job_of()) {
+        (Err(error), Some((run, kind))) => Err(job_refusal(error, run_id, &run, kind)),
         (result, _) => Ok(result?),
     }
 }
 
-/// The error of `pod rm` of the export `id` of run `run`: an export is not
-/// stopped with `train cancel`, but by interrupting `overbrainer export`, which
-/// cancels it.
-fn export_refusal(error: PodError, id: &str, run: &str) -> anyhow::Error {
+/// The error of `pod rm` of the job `id` (an export or a compare) of run
+/// `run`: such a job is not stopped with `train cancel`, but by interrupting
+/// the command following it, which cancels it.
+fn job_refusal(error: PodError, id: &str, run: &str, kind: JobKind) -> anyhow::Error {
+    let noun = kind.noun();
+    let command = match kind {
+        JobKind::Export => format!("overbrainer export {run}"),
+        JobKind::Compare => format!("overbrainer compare --run {run}"),
+    };
     match error {
         PodError::RunStillRunning { kept, .. } => anyhow::anyhow!(
-            "export {id} of run {run} is still running{kept}; stop the `overbrainer export {run}` \
-             following it with Ctrl-C, which cancels it, or pass --force"
+            "{noun} {id} of run {run} is still running{kept}; stop the `{command}` following it \
+             with Ctrl-C, which cancels it, or pass --force"
         ),
         PodError::StillStarting(_) => anyhow::anyhow!(
-            "export {id} of run {run} is still starting its pod; wait for it, or stop the \
-             `overbrainer export {run}` starting it with Ctrl-C, or use `pod rm {id} --force`"
+            "{noun} {id} of run {run} is still starting its pod; wait for it, or stop the \
+             `{command}` starting it with Ctrl-C, or use `pod rm {id} --force`"
         ),
         other => other.into(),
     }
@@ -233,18 +240,31 @@ async fn templates(client: &RunpodClient) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// `pod rm` of a running export or compare says to stop the command
+    /// following it, not `train cancel`; the export text is unchanged.
     #[test]
     fn pod_rm_of_a_running_export_says_how_to_stop_it() {
-        let running = PodError::RunStillRunning {
-            run_id: "e1".into(),
+        let running = |id: &str| PodError::RunStillRunning {
+            run_id: id.into(),
             kept: ": kept pod p1".into(),
         };
         assert_eq!(
-            export_refusal(running, "e1", "r1").to_string(),
+            job_refusal(running("e1"), "e1", "r1", JobKind::Export).to_string(),
             "export e1 of run r1 is still running: kept pod p1; stop the `overbrainer export r1` \
              following it with Ctrl-C, which cancels it, or pass --force"
         );
-        let starting = export_refusal(PodError::StillStarting("e1".into()), "e1", "r1");
+        let starting = job_refusal(
+            PodError::StillStarting("e1".into()),
+            "e1",
+            "r1",
+            JobKind::Export,
+        );
         assert!(!starting.to_string().contains("train cancel"), "{starting}");
+        assert_eq!(
+            job_refusal(running("c1"), "c1", "r1", JobKind::Compare).to_string(),
+            "compare c1 of run r1 is still running: kept pod p1; stop the \
+             `overbrainer compare --run r1` following it with Ctrl-C, which cancels it, or pass \
+             --force"
+        );
     }
 }

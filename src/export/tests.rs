@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use super::*;
+use crate::test_support::{make_executable, sh_available, tar, text, tools_available};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -196,29 +197,6 @@ fn ollama_is_run_in_the_gguf_directory_or_its_command_given() -> TestResult {
     Ok(())
 }
 
-fn make_executable(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-}
-
-fn sh_available() -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(":")
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-fn tools_available() -> bool {
-    sh_available()
-        && ["python3", "tar"].iter().all(|program| {
-            Command::new(program)
-                .arg("--version")
-                .output()
-                .is_ok_and(|output| output.status.success())
-        })
-}
-
 /// The release asset name of this machine, as the script picks it.
 fn host_asset() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -351,29 +329,6 @@ impl Fixture {
         edit(&mut command);
         command.output()
     }
-}
-
-fn tar(dir: &Path, archive: &Path, top: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new("tar")
-        .arg("-czf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dir)
-        .arg(top)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("tar failed: {status}").into())
-    }
-}
-
-fn text(output: &std::process::Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
 }
 
 #[test]

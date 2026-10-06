@@ -108,6 +108,8 @@ pub enum JobStage {
     Merge,
     /// The export of the model to GGUF.
     Export,
+    /// The child's answers to the eval questions, for `overbrainer compare`.
+    Compare,
 }
 
 impl JobStage {
@@ -118,6 +120,7 @@ impl JobStage {
             Self::Train => "train",
             Self::Merge => "merge",
             Self::Export => "export",
+            Self::Compare => "compare",
         }
     }
 }

@@ -20,8 +20,10 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 pub use llama_cpp::{
-    MACOS_ARM64_SHA256, REPO_URL, SOURCE_SHA256, TAG as LLAMA_CPP_TAG, UBUNTU_ARM64_SHA256,
-    UBUNTU_X64_SHA256,
+    CUDA as LLAMA_CPP_CUDA, CUDART_ARM64_SHA256, CUDART_X64_SHA256, MACOS_ARM64_SHA256, REPO_URL,
+    ROCM as LLAMA_CPP_ROCM, SOURCE_SHA256, TAG as LLAMA_CPP_TAG, UBUNTU_ARM64_SHA256,
+    UBUNTU_CUDA_ARM64_SHA256, UBUNTU_CUDA_X64_SHA256, UBUNTU_ROCM_X64_SHA256, UBUNTU_X64_SHA256,
+    env as llama_cpp_env,
 };
 
 use crate::train::{
@@ -29,8 +31,9 @@ use crate::train::{
     top_level_scalar,
 };
 
-/// The export script, written into the job directory.
-pub const EXPORT_SCRIPT: &str = include_str!("export.sh");
+/// The export script, written into the job directory: the llama.cpp helpers
+/// it shares with the compare script, then its own code.
+pub const EXPORT_SCRIPT: &str = concat!(include_str!("llama_cpp.sh"), include_str!("export.sh"));
 
 /// The export script's file name, in the job directory.
 pub const SCRIPT_FILE: &str = "export.sh";
@@ -51,12 +54,12 @@ pub const MODELFILE: &str = "Modelfile";
 /// Starts the export script with the Python the runtime resolved (the virtual
 /// environment's, or the image's), its directory first on `PATH` so the
 /// script's `python3` and `axolotl` are that environment's too.
-const TRAMPOLINE: &str = "import os, sys; bin = os.path.dirname(sys.executable); \
+pub(crate) const TRAMPOLINE: &str = "import os, sys; bin = os.path.dirname(sys.executable); \
      os.environ['PATH'] = bin + os.pathsep + os.environ.get('PATH', ''); \
      os.execvp('sh', ['sh'] + sys.argv[1:])";
 
 /// The Python program the runtime resolves to start the export.
-const PYTHON: &str = "python3";
+pub(crate) const PYTHON: &str = "python3";
 
 /// Files and directories of a run's `output/` never staged for an export: the
 /// checkpoints, and the GGUF files of earlier exports.
@@ -211,7 +214,9 @@ pub fn gguf_name(name: &str, quantize: &str) -> String {
     format!("{name}-{quantize}.gguf")
 }
 
-fn train_io(path: &Path) -> impl FnOnce(io::Error) -> TrainError + '_ {
+/// Maps an I/O error on `path` to [`TrainError::Io`]: the export job's, and
+/// the compare job's.
+pub(crate) fn train_io(path: &Path) -> impl FnOnce(io::Error) -> TrainError + '_ {
     move |source| TrainError::Io {
         path: path.to_path_buf(),
         source,
@@ -311,7 +316,7 @@ fn link_tree(from: &Path, to: &Path) -> Result<(), TrainError> {
 
 /// `from` hard-linked at `to`, or copied there; whatever was at `to` is
 /// replaced.
-fn link_file(from: &Path, to: &Path) -> Result<(), TrainError> {
+pub(crate) fn link_file(from: &Path, to: &Path) -> Result<(), TrainError> {
     if let Some(dir) = to.parent() {
         fs::create_dir_all(dir).map_err(train_io(dir))?;
     }
@@ -476,7 +481,7 @@ fn remove_any(path: &Path) -> Result<(), ExportError> {
 }
 
 /// `sequence_len` of the Axolotl config at `path`, as `to_yaml` writes it.
-fn sequence_len(path: &Path) -> Option<u32> {
+pub(crate) fn sequence_len(path: &Path) -> Option<u32> {
     let text = fs::read_to_string(path).ok()?;
     top_level_scalar(&text, "sequence_len")?.parse().ok()
 }

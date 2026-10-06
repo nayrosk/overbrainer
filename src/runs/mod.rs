@@ -109,6 +109,57 @@ impl RunState {
     }
 }
 
+/// A job run for a run rather than as one: an export or a compare, each kept
+/// as a run of its own in `runs/<run-id>/<dir>/<job-id>/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobKind {
+    /// `overbrainer export`.
+    Export,
+    /// `overbrainer compare`.
+    Compare,
+}
+
+impl JobKind {
+    /// Every kind.
+    pub const ALL: [Self; 2] = [Self::Export, Self::Compare];
+
+    /// The directory of a run holding these jobs: `exports`, `compares`.
+    #[must_use]
+    pub const fn dir_name(self) -> &'static str {
+        match self {
+            Self::Export => crate::export::EXPORTS_DIR,
+            Self::Compare => crate::compare::COMPARES_DIR,
+        }
+    }
+
+    /// What messages call one: `export`, `compare`.
+    #[must_use]
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Compare => "compare",
+        }
+    }
+
+    /// The noun with its article: `an export`, `a compare`.
+    #[must_use]
+    pub const fn with_article(self) -> &'static str {
+        match self {
+            Self::Export => "an export",
+            Self::Compare => "a compare",
+        }
+    }
+
+    /// How to run it again for run `run`, as hints say it.
+    #[must_use]
+    pub fn retry(self, run: &str) -> String {
+        match self {
+            Self::Export => format!("export again with `overbrainer export {run}`"),
+            Self::Compare => format!("compare again with `overbrainer compare --run {run}`"),
+        }
+    }
+}
+
 /// `runs/<run-id>/run.json`: what is needed to find the job again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecord {
@@ -165,85 +216,113 @@ impl Runs {
         &self.dir
     }
 
-    /// The export jobs of run `id`, `runs/<id>/exports/`, kept as runs of
-    /// their own: each has its record, job log and metrics, and on Runpod its
-    /// pod, in `runs/<id>/exports/<export-id>/`.
+    /// The jobs of `kind` of run `id`, `runs/<id>/<kind dir>/`, kept as runs
+    /// of their own: each has its record, job log and metrics, and on Runpod
+    /// its pod, in `runs/<id>/<kind dir>/<job-id>/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunsError::InvalidId`] when `id` is not a valid run ID.
+    pub fn jobs(&self, id: &str, kind: JobKind) -> Result<Self, RunsError> {
+        Ok(Self {
+            dir: self.run_dir(id)?.join(kind.dir_name()),
+        })
+    }
+
+    /// The export jobs of run `id` (see [`Runs::jobs`]).
     ///
     /// # Errors
     ///
     /// Returns [`RunsError::InvalidId`] when `id` is not a valid run ID.
     pub fn exports(&self, id: &str) -> Result<Self, RunsError> {
-        Ok(Self {
-            dir: self.run_dir(id)?.join(crate::export::EXPORTS_DIR),
-        })
+        self.jobs(id, JobKind::Export)
     }
 
-    /// The run whose exports these are, when these are the exports of a run
-    /// (see [`Runs::exports`]).
+    /// The compare jobs of run `id` (see [`Runs::jobs`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunsError::InvalidId`] when `id` is not a valid run ID.
+    pub fn compares(&self, id: &str) -> Result<Self, RunsError> {
+        self.jobs(id, JobKind::Compare)
+    }
+
+    /// The run whose jobs these are, and their kind, when these are the jobs
+    /// of a run (see [`Runs::jobs`]).
     #[must_use]
-    pub fn export_of(&self) -> Option<String> {
-        if self.dir.file_name()? != crate::export::EXPORTS_DIR {
-            return None;
-        }
+    pub fn job_of(&self) -> Option<(String, JobKind)> {
+        let name = self.dir.file_name()?;
+        let kind = JobKind::ALL
+            .into_iter()
+            .find(|kind| name == kind.dir_name())?;
         let run = self.dir.parent()?;
-        let name = run.file_name()?.to_str()?;
-        (run.parent()?.file_name()? == RUNS_DIR && is_valid_run_id(name)).then(|| name.to_string())
+        let id = run.file_name()?.to_str()?;
+        (run.parent()?.file_name()? == RUNS_DIR && is_valid_run_id(id))
+            .then(|| (id.to_string(), kind))
     }
 
     /// What the record `id` of these runs is, as messages name it: `run <id>`,
-    /// or `export <id> of run <run-id>`.
+    /// `export <id> of run <run-id>` or `compare <id> of run <run-id>`.
     #[must_use]
     pub fn subject(&self, id: &str) -> String {
-        match self.export_of() {
-            Some(run) => format!("export {id} of run {run}"),
+        match self.job_of() {
+            Some((run, kind)) => format!("{} {id} of run {run}", kind.noun()),
             None => format!("run {id}"),
         }
     }
 
     /// The directory of the record `id`, relative to the project directory:
-    /// `runs/<id>`, or `runs/<run-id>/exports/<id>`.
+    /// `runs/<id>`, or `runs/<run-id>/<kind dir>/<id>`.
     #[must_use]
     pub fn relative_dir(&self, id: &str) -> String {
-        match self.export_of() {
-            Some(run) => format!("{RUNS_DIR}/{run}/{}/{id}", crate::export::EXPORTS_DIR),
+        match self.job_of() {
+            Some((run, kind)) => format!("{RUNS_DIR}/{run}/{}/{id}", kind.dir_name()),
             None => format!("{RUNS_DIR}/{id}"),
         }
     }
 
     /// How to go on with the record `id` once overbrainer stopped following
-    /// it: attach the run again, or export the run again.
+    /// it: attach the run again, or run its job again.
     #[must_use]
     pub fn follow_hint(&self, id: &str) -> String {
-        match self.export_of() {
-            Some(run) => format!(
-                "an export cannot be followed again: export again with `overbrainer export {run}`"
+        match self.job_of() {
+            Some((run, kind)) => format!(
+                "{} cannot be followed again: {}",
+                kind.with_article(),
+                kind.retry(&run)
             ),
             None => format!("follow it again with `overbrainer train attach {id}`"),
         }
     }
 
-    /// The runs holding `id`: these, unless `id` is not a run here but an
-    /// export of one of them, whose own runs hold it (see [`Runs::exports`]).
+    /// The runs holding `id`: these, unless `id` is not a run here but a job
+    /// of one of them, whose own runs hold it (see [`Runs::jobs`]).
     #[must_use]
     pub fn holding(&self, id: &str) -> Self {
         let here = self.run_dir(id).is_ok_and(|dir| dir.is_dir());
         if here {
             return self.clone();
         }
-        self.find_export(id).unwrap_or_else(|| self.clone())
+        self.find_job(id).unwrap_or_else(|| self.clone())
     }
 
-    /// The export jobs holding the export `id`, from any run, when one does.
+    /// The jobs holding the job `id`, an export or a compare of any run, when
+    /// one does.
     #[must_use]
-    pub fn find_export(&self, id: &str) -> Option<Self> {
+    pub fn find_job(&self, id: &str) -> Option<Self> {
         if !is_valid_run_id(id) {
             return None;
         }
         let entries = fs::read_dir(&self.dir).ok()?;
         entries
             .filter_map(Result::ok)
-            .filter_map(|entry| self.exports(&entry.file_name().to_string_lossy()).ok())
-            .find(|exports| exports.dir.join(id).join(RECORD_FILE).is_file())
+            .flat_map(|entry| {
+                let run = entry.file_name().to_string_lossy().into_owned();
+                JobKind::ALL
+                    .into_iter()
+                    .filter_map(move |kind| self.jobs(&run, kind).ok())
+            })
+            .find(|jobs| jobs.dir.join(id).join(RECORD_FILE).is_file())
     }
 
     /// Local directory of the run `id`.
@@ -443,12 +522,14 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> RunsError + '_ {
 pub(crate) mod tests {
     use super::*;
 
+    /// Messages name an export as a job of its run, and say to export again
+    /// rather than to attach.
     #[test]
     fn messages_name_an_export_and_how_to_redo_it() -> Result<(), RunsError> {
         let runs = Runs::new(Path::new("project"));
         let exports = runs.exports("r1")?;
-        assert_eq!(runs.export_of(), None);
-        assert_eq!(exports.export_of().as_deref(), Some("r1"));
+        assert_eq!(runs.job_of(), None);
+        assert_eq!(exports.job_of(), Some(("r1".to_string(), JobKind::Export)));
         assert_eq!(runs.subject("r1"), "run r1");
         assert_eq!(exports.subject("e1"), "export e1 of run r1");
         assert_eq!(runs.relative_dir("r1"), "runs/r1");
@@ -463,6 +544,8 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Exports are runs of their own inside their run, found by `find_job`
+    /// and `holding` once they have a record, and not listed as runs.
     #[test]
     fn exports_are_runs_of_their_own_inside_their_run() -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
@@ -472,22 +555,64 @@ pub(crate) mod tests {
         assert_eq!(exports.dir(), project.path().join("runs/r1/exports"));
         let (id, _) = exports.claim("export_20261001-120000", 0)?;
         assert_eq!(
-            runs.find_export(&id).map(|found| found.dir),
+            runs.find_job(&id).map(|found| found.dir),
             None,
             "no record yet"
         );
         fs::write(exports.run_dir(&id)?.join(RECORD_FILE), "{}")?;
         assert_eq!(
-            runs.find_export(&id).map(|found| found.dir),
+            runs.find_job(&id).map(|found| found.dir),
             Some(exports.dir().to_path_buf())
         );
-        assert!(runs.find_export("../r1").is_none());
+        assert!(runs.find_job("../r1").is_none());
         assert_eq!(runs.holding(&id).dir(), exports.dir());
         assert_eq!(runs.holding("r1").dir(), runs.dir());
         assert_eq!(runs.holding("elsewhere").dir(), runs.dir());
         assert!(
             runs.list()?.is_empty(),
             "an export is not a run of the project"
+        );
+        Ok(())
+    }
+
+    /// Compares are nested jobs of a run, like exports: their own records,
+    /// subject, directory and hint, found by `holding`.
+    #[test]
+    fn compares_are_nested_jobs_like_exports() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let compares = runs.compares("r1")?;
+        assert_eq!(compares.dir(), project.path().join("runs/r1/compares"));
+        assert_eq!(runs.job_of(), None);
+        assert_eq!(
+            compares.job_of(),
+            Some(("r1".to_string(), JobKind::Compare))
+        );
+        assert_eq!(
+            runs.exports("r1")?.job_of(),
+            Some(("r1".to_string(), JobKind::Export))
+        );
+        assert_eq!(compares.subject("c1"), "compare c1 of run r1");
+        assert_eq!(compares.relative_dir("c1"), "runs/r1/compares/c1");
+        assert_eq!(
+            compares.follow_hint("c1"),
+            "a compare cannot be followed again: compare again with `overbrainer compare --run r1`"
+        );
+        assert_eq!(
+            runs.exports("r1")?.follow_hint("e1"),
+            "an export cannot be followed again: export again with `overbrainer export r1`"
+        );
+        let (id, _) = compares.claim("compare_20261006-120000", 0)?;
+        assert!(runs.find_job(&id).is_none(), "no record yet");
+        fs::write(compares.run_dir(&id)?.join(RECORD_FILE), "{}")?;
+        assert_eq!(
+            runs.find_job(&id).map(|found| found.dir),
+            Some(compares.dir().to_path_buf())
+        );
+        assert_eq!(runs.holding(&id).dir(), compares.dir());
+        assert!(
+            runs.list()?.is_empty(),
+            "a compare is not a run of the project"
         );
         Ok(())
     }

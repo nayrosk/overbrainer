@@ -1,8 +1,7 @@
 ---
 source: src/tui/snapshots.rs
-assertion_line: 603
 ---
-" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  rust_ex… "
+" ⠿ 1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare  rust_expert "
 "╭ data ────────────────────────────────────────────────────────────────────────╮"
 "│ … reading data/                                                              │"
 "│                                                                              │"

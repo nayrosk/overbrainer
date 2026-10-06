@@ -143,9 +143,9 @@ pub enum Event {
     RunWatched {
         /// ID of the run.
         run_id: String,
-        /// Whether the job is an export (`run_id` is then the export's ID),
-        /// not a training job.
-        export: bool,
+        /// The kind of job when it is not a training job (`run_id` is then
+        /// the job's ID): an export or a compare.
+        job: Option<crate::runs::JobKind>,
     },
     /// A training or evaluation log of the running job.
     Metric(TrainMetric),
@@ -168,6 +168,15 @@ pub enum Event {
         /// Bytes uploaded.
         done: u64,
         /// Bytes to upload.
+        total: u64,
+    },
+    /// Questions of compare `compare_id` judged so far, of `total`.
+    Judged {
+        /// ID of the compare.
+        compare_id: String,
+        /// Questions with a verdict.
+        done: u64,
+        /// Questions to judge.
         total: u64,
     },
 }

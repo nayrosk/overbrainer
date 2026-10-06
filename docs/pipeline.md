@@ -101,6 +101,7 @@ Some parents never return their raw reasoning, whatever their responses claim: a
 | `prompts/subtopics.txt` | `topic`, `description` (may be empty), `count` |
 | `prompts/questions.txt` | `topic`, `description`, `subtopic`, `count`, `accepted` (list of questions) |
 | `prompts/answer_system.txt` | `topic`, `description` |
+| `prompts/judge.txt` | `question`, `answer_a`, `answer_b` (used by [`overbrainer compare`](compare.md)) |
 
 A missing file falls back to the built-in default.
 

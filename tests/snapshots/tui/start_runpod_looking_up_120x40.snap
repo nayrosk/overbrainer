@@ -1,8 +1,7 @@
 ---
 source: src/tui/snapshots.rs
-assertion_line: 602
 ---
-" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs                                       rust_expert "
+" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare                            rust_expert "
 "╭ runs ────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮"
 "│ No runs yet: press t to start one on gpu_cloud.                                                                      │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"

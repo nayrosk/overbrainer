@@ -101,6 +101,8 @@ A role also takes these request settings:
 
 The embedder must use the `openai` protocol: Anthropic has no embeddings endpoint. [The dataset pipeline](pipeline.md#reasoning) explains which parents return usable reasoning.
 
+`judge` is optional. `overbrainer compare` uses it to compare the child's answers with the parent's; the parent judges when it is unset. A judge distinct from the parent avoids the parent favoring its own answers.
+
 ## Topics
 
 ```toml
@@ -136,6 +138,21 @@ Retries wait with exponential backoff and jitter, or as long as the provider's `
 The optional `[export]` section (`after_training`, `quantize`, `ollama_name`) sets the export of a run's model to GGUF and its Ollama Modelfile, described in [Training](training.md#export-to-gguf-and-ollama), for example `OVERBRAINER_EXPORT__QUANTIZE=Q8_0` from the environment.
 
 The optional `[hub]` section (`repo`, `private`, `after_training`) sets the push of a run to Hugging Face, described in [Training](training.md#push-to-hugging-face), for example `OVERBRAINER_HUB__PRIVATE=false` from the environment. `training.hub_model_id` is deprecated in its favor: `train`, a training start in the TUI and `config check` warn about it, and `overbrainer migrate` moves it to `[hub] repo`.
+
+## Compare
+
+`[compare]` sets what `overbrainer compare` needs beyond the roles (see [compare.md](compare.md)).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `parent_price_in` | unset | Dollars per million input tokens of the parent. |
+| `parent_price_out` | unset | Dollars per million output tokens of the parent. |
+| `child_price_per_hour` | unset | Dollars per hour of the hardware serving the child. On Runpod, the pod's own price when unset. |
+| `max_tokens` | 4096 | Limit of each child answer. |
+| `temperature` | 0.0 | Sampling temperature of the child, in [0, 2]. |
+| `server_start_secs` | 300 | How long `llama-server` may take to be ready, 1 to 3600. |
+
+Without both parent prices, the report has no parent cost; without a child price (and off Runpod), no child cost.
 
 ## Metrics
 

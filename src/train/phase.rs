@@ -23,6 +23,13 @@ pub enum Phase {
     Merging,
     /// The model is exported to GGUF.
     Exporting,
+    /// The child answers the eval questions for `overbrainer compare`.
+    Comparing {
+        /// Questions answered.
+        step: u64,
+        /// Questions to answer, once the job said it.
+        total: Option<u64>,
+    },
     /// The job exited; its results are being retrieved.
     Retrieving,
 }
@@ -48,6 +55,11 @@ impl Phase {
             Self::Finalizing => "finalizing (saving model)".to_string(),
             Self::Merging => "merging adapter".to_string(),
             Self::Exporting => "exporting GGUF".to_string(),
+            Self::Comparing { total: None, .. } => "starting llama-server".to_string(),
+            Self::Comparing {
+                step,
+                total: Some(total),
+            } => format!("answering {step}/{total}"),
             Self::Retrieving => "retrieving results".to_string(),
         }
     }
@@ -61,17 +73,19 @@ impl Phase {
             Self::Finalizing => "finalizing",
             Self::Merging => "merging",
             Self::Exporting => "exporting",
+            Self::Comparing { .. } => "comparing",
             Self::Retrieving => "retrieving",
         }
     }
 
     /// Every [`Phase::name`].
-    pub const NAMES: [&'static str; 6] = [
+    pub const NAMES: [&'static str; 7] = [
         "training",
         "evaluating",
         "finalizing",
         "merging",
         "exporting",
+        "comparing",
         "retrieving",
     ];
 }
@@ -125,7 +139,7 @@ impl Phases {
     }
 
     /// The phase of a job still running, or one that `exited` while its run is
-    /// still recorded running. A merge or export stage wins; then an
+    /// still recorded running. A merge, export or compare stage wins; then an
     /// evaluation no log followed; then the end of the training loop, said by
     /// the plugin or read from the step count (runs from before these events);
     /// else training.
@@ -137,6 +151,10 @@ impl Phases {
         match self.stage {
             Some(JobStage::Merge) => return Phase::Merging,
             Some(JobStage::Export) => return Phase::Exporting,
+            Some(JobStage::Compare) => {
+                let (step, total) = self.eval.unwrap_or((0, None));
+                return Phase::Comparing { step, total };
+            },
             Some(JobStage::Train) | None => {},
         }
         let last = self.ended
@@ -247,5 +265,34 @@ mod tests {
             ]
         );
         assert!(Phase::NAMES.contains(&Phase::Exporting.name()));
+    }
+
+    /// A compare job: starting until its first progress line, then the
+    /// questions answered, from its eval lines.
+    #[test]
+    fn a_compare_job_shows_its_questions_answered() -> Result<(), serde_json::Error> {
+        let stage = r#"{"event":"stage","name":"compare","time":1}"#;
+        let starting = phases(&[stage])?.phase(false);
+        assert_eq!(
+            starting,
+            Phase::Comparing {
+                step: 0,
+                total: None
+            }
+        );
+        assert_eq!(starting.label(), "starting llama-server");
+        let answering = phases(&[stage, EVAL])?.phase(false);
+        assert_eq!(
+            answering,
+            Phase::Comparing {
+                step: 340,
+                total: Some(1200)
+            }
+        );
+        assert_eq!(answering.label(), "answering 340/1200");
+        assert_eq!(answering.name(), "comparing");
+        assert_eq!(phases(&[stage, EVAL])?.phase(true), Phase::Retrieving);
+        assert!(Phase::NAMES.contains(&"comparing"));
+        Ok(())
     }
 }

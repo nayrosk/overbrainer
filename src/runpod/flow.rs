@@ -968,12 +968,12 @@ fn unretrieved(ctx: &PodCtx<'_>, pod: &mut PodRecord, run_id: &str) -> Result<En
     Ok(ending)
 }
 
-/// The warning when the results of `run_id`, a run or an export of `runs`, were
-/// not retrieved from its pod `name`, which `stays`.
+/// The warning when the results of `run_id`, a run or a job (an export or a
+/// compare) of `runs`, were not retrieved from its pod `name`, which `stays`.
 fn unretrieved_line(runs: &Runs, run_id: &str, name: &str, stays: &str) -> String {
     let subject = runs.subject(run_id);
-    let retry = match runs.export_of() {
-        Some(run) => format!("export again with `overbrainer export {run}`"),
+    let retry = match runs.job_of() {
+        Some((run, kind)) => kind.retry(&run),
         None => format!("retrieve them with `overbrainer train attach {run_id}`"),
     };
     format!(

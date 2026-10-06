@@ -36,6 +36,10 @@ pub struct Settings {
     /// Export of a trained model to GGUF, and its Ollama Modelfile.
     #[serde(default)]
     pub export: Export,
+    /// `overbrainer compare`: the prices of its cost rows and the child's
+    /// generation limits.
+    #[serde(default)]
+    pub compare: Compare,
     /// Push of a run to the Hugging Face Hub.
     #[serde(default)]
     pub hub: Hub,
@@ -103,17 +107,30 @@ pub struct Roles {
     pub parent: RoleModel,
     /// Model used for deduplication embeddings, if enabled.
     pub embedder: Option<RoleModel>,
+    /// Model that compares child and parent answers in `overbrainer compare`.
+    /// The parent judges when it is unset.
+    pub judge: Option<RoleModel>,
 }
 
 impl Roles {
-    /// Every configured role with its name: `generator`, `parent`, then `embedder` when set.
+    /// Every configured role with its name: `generator`, `parent`, then
+    /// `embedder` and `judge` when set.
     #[must_use]
     pub fn all(&self) -> Vec<(&'static str, &RoleModel)> {
         let mut roles = vec![("generator", &self.generator), ("parent", &self.parent)];
         if let Some(embedder) = &self.embedder {
             roles.push(("embedder", embedder));
         }
+        if let Some(judge) = &self.judge {
+            roles.push(("judge", judge));
+        }
         roles
+    }
+
+    /// The model judging `overbrainer compare`: `judge`, else `parent`.
+    #[must_use]
+    pub fn judge_model(&self) -> &RoleModel {
+        self.judge.as_ref().unwrap_or(&self.parent)
     }
 }
 
@@ -777,6 +794,40 @@ impl Default for Export {
             after_training: false,
             quantize: default_quantize(),
             ollama_name: None,
+        }
+    }
+}
+
+/// `overbrainer compare`: the prices of its cost rows and the child's
+/// generation limits.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Compare {
+    /// Dollars per million input tokens of the parent; no parent cost without it.
+    pub parent_price_in: Option<f64>,
+    /// Dollars per million output tokens of the parent; no parent cost without it.
+    pub parent_price_out: Option<f64>,
+    /// Dollars per hour of the hardware serving the child; on Runpod, the
+    /// pod's own price when unset.
+    pub child_price_per_hour: Option<f64>,
+    /// Upper bound on the tokens of each child answer. Must be at least 1.
+    pub max_tokens: u32,
+    /// Sampling temperature of the child, in [0, 2].
+    pub temperature: f64,
+    /// How long `llama-server` may take to be ready, in seconds, 1 to 3600.
+    pub server_start_secs: u64,
+}
+
+impl Default for Compare {
+    /// No prices, 4096 tokens, temperature 0, and 300 seconds for the server.
+    fn default() -> Self {
+        Self {
+            parent_price_in: None,
+            parent_price_out: None,
+            child_price_per_hour: None,
+            max_tokens: 4096,
+            temperature: 0.0,
+            server_start_secs: 300,
         }
     }
 }

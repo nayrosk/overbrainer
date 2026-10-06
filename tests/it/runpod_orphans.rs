@@ -755,17 +755,51 @@ async fn the_sweep_deletes_the_secret_once_the_last_stray_is_gone() -> TestResul
 
 const EXPORT: &str = "export_20261001-120000";
 const GONE_EXPORT: &str = "export_20261001-130000";
+/// A compare of `RUN`.
+const COMPARE: &str = "compare_20261006-120000";
 
-/// The export `id` of `RUN`, in `state`, whose `pod.json` (in the export's own
-/// directory) records `pod_id` in `pod_state`.
-fn export_recorded(
-    exports: &Runs,
+/// A compare's pod is listed with its compare, its note naming the run, and
+/// warned about once its compare ended.
+#[tokio::test]
+async fn compare_pods_are_listed_with_their_compare() -> TestResult {
+    let harness = Harness::new(Account::default().with("c9", Some(COMPARE), true)).await?;
+    harness.recorded(RUN, RunState::Succeeded, "p1", PodState::Deleted)?;
+    let compares = harness.runs.compares(RUN)?;
+    job_recorded(
+        &compares,
+        COMPARE,
+        RunState::Succeeded,
+        "c9",
+        PodState::Running,
+    )?;
+    let rows = pod_rows(&harness.ctx()).await?;
+    let row = find(&rows, "c9")?;
+    assert_eq!((row.run.as_str(), row.kind), (COMPARE, RowKind::Ended));
+    assert_eq!(
+        row.note,
+        format!("compare of run {RUN}: succeeded, not deleted")
+    );
+    assert_eq!(
+        orphan_warnings(&rows),
+        vec![format!(
+            "pod c9 (compare of run {RUN}: succeeded, not deleted) is still on Runpod at \
+             $0.53/h: remove it with `overbrainer pod rm {COMPARE}`"
+        )]
+    );
+    Ok(())
+}
+
+/// The job `id` (an export or a compare) of `RUN` in `jobs`, in `state`,
+/// whose `pod.json` (in the job's own directory) records `pod_id` in
+/// `pod_state`.
+fn job_recorded(
+    jobs: &Runs,
     id: &str,
     state: RunState,
     pod_id: &str,
     pod_state: PodState,
 ) -> TestResult {
-    exports.save(&RunRecord {
+    jobs.save(&RunRecord {
         id: id.to_string(),
         target: "gpu_cloud".into(),
         created: "2026-10-01T12:00:00Z".into(),
@@ -782,23 +816,25 @@ fn export_recorded(
     record.begin_attempt("NVIDIA A40", SystemTime::now(), 6.0);
     record.created(&remote, AttemptResult::Created, SystemTime::now());
     record.state = pod_state;
-    record.save(exports)?;
+    record.save(jobs)?;
     Ok(())
 }
 
+/// Export pods are listed with their export, confirmed gone in the export's own
+/// `pod.json`, and removed by the export's ID through `find_job`.
 #[tokio::test]
 async fn export_pods_are_listed_with_their_export_and_removed_by_its_id() -> TestResult {
     let harness = Harness::new(Account::default().with("x1", Some(EXPORT), true)).await?;
     harness.recorded(RUN, RunState::Succeeded, "p1", PodState::Deleted)?;
     let exports = harness.runs.exports(RUN)?;
-    export_recorded(
+    job_recorded(
         &exports,
         EXPORT,
         RunState::Succeeded,
         "x1",
         PodState::Running,
     )?;
-    export_recorded(
+    job_recorded(
         &exports,
         GONE_EXPORT,
         RunState::Running,
@@ -827,7 +863,7 @@ async fn export_pods_are_listed_with_their_export_and_removed_by_its_id() -> Tes
     assert!(PodRecord::load(&harness.runs, GONE_EXPORT)?.is_none());
 
     // `pod rm <export-id>` works on the export's own runs.
-    let found = harness.runs.find_export(EXPORT).ok_or("export not found")?;
+    let found = harness.runs.find_job(EXPORT).ok_or("export not found")?;
     let ctx = PodCtx {
         runs: &found,
         ..harness.ctx()
@@ -854,21 +890,21 @@ async fn export_pod_secrets_follow_their_export() -> TestResult {
     let harness = Harness::new(account).await?;
     harness.recorded(RUN, RunState::Running, "p1", PodState::Running)?;
     let exports = harness.runs.exports(RUN)?;
-    export_recorded(
+    job_recorded(
         &exports,
         EXPORT,
         RunState::Succeeded,
         "x1",
         PodState::Running,
     )?;
-    export_recorded(
+    job_recorded(
         &exports,
         GONE_EXPORT,
         RunState::Running,
         "x2",
         PodState::Running,
     )?;
-    export_recorded(
+    job_recorded(
         &exports,
         SWEPT_EXPORT,
         RunState::Failed,
