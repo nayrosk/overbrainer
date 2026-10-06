@@ -25,22 +25,22 @@ overbrainer compare --rejudge COMPARE_ID  # judge again, without asking the chil
 | `--keep-pod` | Runpod target only: keep the pod once the job ends, with no time limit. `overbrainer pod rm COMPARE_ID` deletes it. |
 | `--rejudge COMPARE_ID` | Judge an earlier compare again. It cannot combine with `--limit` or `--keep-pod`. |
 
-stdout is the path of the report, `runs/RUN_ID/compares/COMPARE_ID/compare.md`. Progress goes to stderr. Only one overbrainer process writes to a project at a time, as for every command that does.
+stdout is the path of the report, `runs/RUN_ID/compares/COMPARE_ID/compare.md`. Progress goes to stderr. It takes the project lock, like every command that writes.
 
 ## How it works
 
 1. The compare runs on the target the run trained on: this machine, the SSH host, or a new Runpod pod. On a local or SSH target, overbrainer checks the run's GGUF there against the SHA-256 in `export.json`, and uploads it only when it is missing or different. On Runpod, the pod is new, so the GGUF is uploaded with the job and deleted, on the pod and here, once the job ends. The pod is deleted unless `--keep-pod` is set.
 2. Before a Runpod pod starts, stderr shows its GPU price per hour (the cheapest in-stock price of the catalog, else the cap `max_price_per_hour`) and the number of questions.
 3. A job downloads the pinned `llama-server` of llama.cpp, checks its SHA-256, caches it (the cache is shared with `export`) and serves the GGUF on `127.0.0.1`. Nothing listens on another address. Which build it gets depends on the machine:
-   - NVIDIA (`nvidia-smi` works): the CUDA 13.4 build, with its bundled CUDA runtime first on `LD_LIBRARY_PATH`. When the driver supports CUDA below 13, the CPU build runs instead, with a warning.
-   - AMD (Linux x86-64 with `/dev/kfd`): the ROCm build. It needs the system ROCm 7 runtime (`libamdhip64.so.7`, `librocblas.so.5`, `libhipblas.so.3`; on Ubuntu, `apt install libamdhip64-7 librocblas5 libhipblas3`) and read and write access to `/dev/kfd` (your user in the `render` group). Otherwise the CPU build runs, with a warning naming what to install.
+   - NVIDIA (`nvidia-smi` works): the CUDA 13.4 build. Its CUDA runtime is a separate archive, downloaded and verified like the build, and put first on `LD_LIBRARY_PATH`. When the driver supports CUDA below 13, the CPU build runs instead, with a warning.
+   - AMD (Linux x86-64 with `/dev/kfd`): the ROCm build. It needs the system ROCm 7 runtime (`libamdhip64.so.7`, `librocblas.so.5`, `libhipblas.so.3`; on Ubuntu, `apt install libamdhip64-7 librocblas5 libhipblas3`) and read and write access to `/dev/kfd` (your user in the `render` group). Otherwise the CPU build runs, with a warning that says why: a missing library, no access to `/dev/kfd` (the `render` group), or an arm64 host, which has no ROCm build.
    - macOS on Apple silicon: the Metal build.
-   - Anything else: the CPU build.
+   - A Linux host without a usable GPU: the CPU build. Any other platform fails, naming it.
 4. The job asks the child every question, one at a time, and records each answer with its time to first token, its total time and its tokens per second. The child gets the system message of the eval record, if it has one, and its user message.
 5. Back here, the judge sees each question with both answers, labelled A and B, with the order drawn per question (about half the questions show the child first). It answers `A`, `B` or `tie` with a one-sentence reason. Reasoning blocks are stripped from both answers first. A reply that does not parse is asked again once, then counted as unparsed. A question the child gave no answer to is not judged and counts as a loss.
 6. The report sums it up.
 
-Ctrl-C while the job runs cancels it, and deletes the Runpod pod. Ctrl-C while the judge runs stops it and keeps the verdicts so far in `verdicts-<key>.jsonl`; `overbrainer compare --rejudge COMPARE_ID` resumes from there. A rejudge with another `[roles] judge` or another `prompts/judge.txt` starts a new verdicts file and judges every question again.
+Ctrl-C while the job runs cancels it, and deletes the Runpod pod. Ctrl-C while the judge runs stops it and keeps the verdicts so far in `verdicts-<key>.jsonl`; `overbrainer compare --rejudge COMPARE_ID` resumes from there. A rejudge with another judge provider or model, or another `prompts/judge.txt`, starts a new verdicts file and judges every question again.
 
 Questions go one at a time: the numbers describe one user. Throughput under load is not measured.
 
@@ -75,6 +75,7 @@ In `runs/RUN_ID/compares/COMPARE_ID/`:
 |---|---|
 | `setup.json` | What is compared: the GGUF, the questions with the parent's answers, the order seed. A rejudge reads it, not a later `data/eval.jsonl`. |
 | `questions.jsonl` | What the child was asked. |
+| `compare.sh`, `compare_client.py` | The job's scripts. |
 | `child_answers.jsonl` | The child's answers and timings. |
 | `server.log` | What `llama-server` printed. Read it when a compare fails. |
 | `hardware.json` | The machine that served the child. |

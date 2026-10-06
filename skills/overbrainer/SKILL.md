@@ -103,7 +103,7 @@ Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.7
 | `overbrainer history [--all]` | Totals per stage (runs, items, tokens, cost), or every execution. |
 | `overbrainer migrate [--dry-run]` | Bring a project from before 0.4.0 up to date, once; `--dry-run` only lists the changes. |
 | `overbrainer pod ls` | List the Runpod pods overbrainer created. |
-| `overbrainer pod rm RUN_ID` | Delete the pods of a run, or of an export (`export_...`). |
+| `overbrainer pod rm RUN_ID` | Delete the pods of a run, of an export (`export_...`) or of a compare (`compare_...`). |
 | `overbrainer pod gpus` | List Runpod's Secure Cloud GPU types, cheapest first, with price, VRAM and stock. |
 | `overbrainer pod datacenters` | List Runpod's data centers with how many GPU types are in stock there. |
 | `overbrainer pod volumes` | List the account's network volumes. |
@@ -140,4 +140,4 @@ NO_COLOR=1 overbrainer answers > answers.log 2>&1
 - A run is `failed`: the reason is on the last line of the `train` or `train attach` output, and in the `message` field of `runs/RUN_ID/run.json`. The job's own output is in `runs/RUN_ID/job.log`.
 - `train` on Runpod warns about stray pods: report them to the user. Remove them with `overbrainer pod rm RUN_ID` only with the user's consent.
 - `this project predates overbrainer 0.4.0: run overbrainer migrate`: run `overbrainer migrate --dry-run`, show the user the changes, then `overbrainer migrate`. The line never stops the command it follows.
-- `another overbrainer (pid N) is using this project`: a command that writes to the project (a stage, `run`, `train`, `tui`, `pod rm`, `migrate`) is already running and holds `.overbrainer/lock`. Do not run a second one; wait for it to finish or ask the user. `train stop RUN_ID` is not refused: it only asks for the snapshot, which the running process collects. `overbrainer history`, `runs ls`, `runs logs`, `pod ls` and `config check` never hit this, since they only read.
+- `another overbrainer (pid N) is using this project`: a command that writes to the project (a stage, `run`, `train`, `export`, `compare`, `push`, `tui`, `pod rm`, `migrate`) is already running and holds `.overbrainer/lock`. Do not run a second one; wait for it to finish or ask the user. `train stop RUN_ID` is not refused: it only asks for the snapshot, which the running process collects. `overbrainer history`, `runs ls`, `runs logs`, `pod ls` and `config check` never hit this, since they only read.

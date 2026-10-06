@@ -224,11 +224,12 @@ impl Command {
 pub enum PodCommand {
     /// List the pods overbrainer created, with their run and what is known of it.
     Ls,
-    /// Delete every pod of a run, or of an export, and wait until Runpod no
-    /// longer shows them.
+    /// Delete every pod of a run, an export or a compare, and wait until Runpod
+    /// no longer shows them.
     Rm {
         /// ID of the run, as shown by `overbrainer runs ls` or `overbrainer pod
-        /// ls`, or of an export (`export_<date>-<time>`).
+        /// ls`, of an export (`export_<date>-<time>`) or of a compare
+        /// (`compare_<date>-<time>`).
         #[arg(add = ArgValueCandidates::new(complete::run_ids))]
         run_id: String,
         /// Delete even when the run's job is still running (the run is then failed).
