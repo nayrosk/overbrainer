@@ -201,7 +201,7 @@ impl Progress {
     }
 
     /// The followed run's phase, when it is to be told: at each change but the
-    /// first `training`, and while an evaluation of known length runs, at each
+    /// first `training`, and while an evaluation or a compare of known length runs, at each
     /// further tenth of it.
     fn phase_change(&mut self) -> Option<Phase> {
         let phase = self.phases.phase(self.exited);
@@ -216,14 +216,21 @@ impl Progress {
                 }),
                 Phase::Evaluating { step, last, .. },
             ) => step < before || last != was_last,
+            (Some(Phase::Comparing { step: before, .. }), Phase::Comparing { step, .. }) => {
+                step < before
+            },
             (Some(previous), phase) => previous.name() != phase.name(),
             (None, _) => true,
         };
-        let Phase::Evaluating {
+        let (Phase::Evaluating {
             step,
             total: Some(total),
             ..
-        } = phase
+        }
+        | Phase::Comparing {
+            step,
+            total: Some(total),
+        }) = phase
         else {
             return fresh.then_some(phase);
         };
