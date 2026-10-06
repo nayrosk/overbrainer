@@ -1,7 +1,7 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  rust_ex… "
+" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare"
 "  Pipeline                                          in flight  retries  failed  "
 "    subtopics                                                                   "
 "    questions                                                                   "
@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "                                                                                "
 "                                                                                "
 "                                                                                "
-" r run a stage · A auto · q quit · 1-5 views                     v#.#.#  ? help "
+" r run a stage · A auto · q quit · 1-6 views                     v#.#.#  ? help "

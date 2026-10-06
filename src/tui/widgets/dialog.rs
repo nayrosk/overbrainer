@@ -24,7 +24,7 @@ const PADDING: u16 = 2;
 const CHROME_ROWS: u16 = 6;
 
 /// Whether `y` on a dialog running `action` loses something: a deletion, a
-/// cancel (of a run or of auto mode), an abandon, a table deleted from the
+/// cancel (of a run, of auto mode or of a compare), an abandon, a table deleted from the
 /// configuration, or quitting while a stage runs
 /// (its requests in flight are lost). Its `y` is then drawn as an error.
 pub(in crate::tui) fn destructive(action: &Action, stage_running: bool) -> bool {
@@ -34,15 +34,17 @@ pub(in crate::tui) fn destructive(action: &Action, stage_running: bool) -> bool 
         | Action::Abandon(_)
         | Action::AbandonStart(_)
         | Action::Remove(_)
-        | Action::CancelAuto => true,
+        | Action::CancelAuto
+        | Action::CancelCompare(_) => true,
         Action::Quit => stage_running,
         // A stop keeps what the job did: its snapshot. A push only adds a
-        // commit to the repo.
+        // commit to the repo. A compare only adds a compare to a run.
         Action::Start(_)
         | Action::Auto(_)
         | Action::ClearFailed(_)
         | Action::Stop(_)
-        | Action::Push(_) => false,
+        | Action::Push(_)
+        | Action::Compare(_) => false,
     }
 }
 

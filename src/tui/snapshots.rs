@@ -410,6 +410,23 @@ pub(super) fn pipeline_running(app: &mut App) {
     }
 }
 
+/// A compare of run `demo_20261006-100000` with the eight questions of
+/// [`crate::compare::fixtures::sample_report`]: four wins, a tie, a loss, a
+/// child error and an unparsed verdict.
+pub(super) fn compare_entry() -> Result<crate::compare::CompareEntry, serde_json::Error> {
+    let mut record = run(
+        "compare_20261006-120000",
+        "gpu",
+        crate::runs::RunState::Succeeded,
+    );
+    record.created = "2026-10-06T12:00:00Z".into();
+    Ok(crate::compare::CompareEntry {
+        run: "demo_20261006-100000".into(),
+        record,
+        report: Some(crate::compare::fixtures::sample_report()?),
+    })
+}
+
 /// A run record of the fixtures.
 pub(super) fn run(id: &str, target: &str, state: crate::runs::RunState) -> crate::runs::RunRecord {
     crate::runs::RunRecord {
@@ -1844,7 +1861,7 @@ fn the_help_note_fits_every_view_at_80x24() -> TestResult {
         app.view = view;
         let rows = text(&draw(&mut app, 80, 24)?).join("\n");
         assert!(
-            rows.contains("e, d, r, A, t and h are refused"),
+            rows.contains("e, d, r, A, t, h, C and J are refused"),
             "{view:?}\n{rows}"
         );
         assert!(

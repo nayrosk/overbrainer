@@ -191,6 +191,88 @@ pub(crate) fn compare_vram_floor(spec: &RunpodTarget, bytes: u64) -> Option<u32>
         .then(|| super::runpod_train::gguf_vram_floor(bytes))
 }
 
+/// What a compare started now would do, for the TUI's confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Preview {
+    /// The run.
+    pub(crate) run: String,
+    /// The GGUF, relative to the run directory.
+    pub(crate) gguf: String,
+    /// Questions asked.
+    pub(crate) questions: usize,
+    /// The target's name.
+    pub(crate) target: String,
+    /// On a Runpod target, the pod and what it costs an hour, as a sentence.
+    pub(crate) runpod: Option<String>,
+}
+
+/// What a compare of run `run` (else the newest with a GGUF) would do, with
+/// the settings of `source`. The local files are read off the async
+/// threads; on a Runpod target the GPU catalog prices the pod.
+///
+/// # Errors
+///
+/// As [`plan`], and when the settings cannot be loaded or the run's target
+/// is gone from them.
+pub(crate) async fn preview(
+    project_dir: &Path,
+    source: &Source,
+    run: Option<&str>,
+) -> anyhow::Result<Preview> {
+    let (dir, source, run) = (
+        project_dir.to_path_buf(),
+        source.clone(),
+        run.map(str::to_string),
+    );
+    let (settings, plan) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let settings = source.load(&dir)?;
+        let plan = plan(&Runs::new(&dir), &dir, run.as_deref(), None)?;
+        Ok((settings, plan))
+    })
+    .await
+    .context("cannot read the run to compare")??;
+    let target = target_of(&settings, &plan.run)?;
+    let runpod = match RunpodTarget::from_target(target) {
+        Some(spec) => {
+            let client = super::pod::client(&settings).await;
+            Some(runpod_line(client, &spec, plan.export.size).await)
+        },
+        None => None,
+    };
+    Ok(Preview {
+        run: plan.run.id.clone(),
+        gguf: plan.export.file.clone(),
+        questions: plan.questions.len(),
+        target: plan.run.target.clone(),
+        runpod,
+    })
+}
+
+/// The preview's sentence on the pod of a compare on `spec`, of a GGUF of
+/// `gguf_bytes`: the cheapest GPU type in stock in the catalog of `client`;
+/// without one (no client, the catalog unread, none in stock with a price),
+/// the target's `max_price_per_hour`, else that the price is picked when the
+/// pod starts.
+async fn runpod_line(
+    client: anyhow::Result<RunpodClient>,
+    spec: &RunpodTarget,
+    gguf_bytes: u64,
+) -> String {
+    let price = match client {
+        Ok(client) => pod_price(&client, spec, compare_vram_floor(spec, gguf_bytes)).await,
+        Err(error) => {
+            tracing::debug!("cannot price the compare's pod: {error:#}");
+            spec.max_price_per_hour
+                .map_or(PodPrice::Unknown, PodPrice::Cap)
+        },
+    };
+    match price {
+        PodPrice::InStock(_) => format!("a new Runpod pod, {}", price.words()),
+        PodPrice::Cap(cap) => format!("a new Runpod pod, at most ${cap:.2}/h"),
+        PodPrice::Unknown => "a new Runpod pod, at the price picked when it starts".to_string(),
+    }
+}
+
 /// The target of `run` in `settings`.
 fn target_of<'a>(settings: &'a Settings, run: &RunRecord) -> anyhow::Result<&'a Target> {
     settings.targets.get(&run.target).with_context(|| {
@@ -624,6 +706,44 @@ mod tests {
         );
         let unknown = spec(ListOrAuto::List(vec!["NVIDIA H100".into()]), None);
         assert_eq!(pod_price(&client, &unknown, None).await, PodPrice::Unknown);
+        let line = runpod_line(Ok(client), &spec(ListOrAuto::Auto, None), 4).await;
+        assert_eq!(
+            line,
+            "a new Runpod pod, at about $0.40/h (NVIDIA A40, the cheapest GPU type in stock)"
+        );
+        Ok(())
+    }
+
+    /// Without a price in stock, because the catalog cannot be read or no
+    /// client can be made, the preview says the cap, else that the price is
+    /// picked when the pod starts.
+    #[tokio::test]
+    async fn the_preview_falls_back_to_the_cap() -> Result<(), Box<dyn std::error::Error>> {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = RunpodClient::new(
+            &format!("{}/v2", server.uri()),
+            &secrecy::SecretString::from("k"),
+        )?;
+        let capped = spec(ListOrAuto::Auto, Some(0.5));
+        assert_eq!(
+            runpod_line(Ok(client), &capped, 4).await,
+            "a new Runpod pod, at most $0.50/h"
+        );
+        let no_client = || Err(anyhow::anyhow!("no Runpod API key"));
+        assert_eq!(
+            runpod_line(no_client(), &capped, 4).await,
+            "a new Runpod pod, at most $0.50/h"
+        );
+        assert_eq!(
+            runpod_line(no_client(), &spec(ListOrAuto::Auto, None), 4).await,
+            "a new Runpod pod, at the price picked when it starts"
+        );
         Ok(())
     }
 }

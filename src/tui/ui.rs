@@ -53,6 +53,8 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
             None
         },
         View::Training => views::training::render(frame, body, app),
+        // Drawn from the next change on; the body stays empty until then.
+        View::Compare => None,
     };
     let toast = status::render(frame, footer, app);
     if app.overlay.is_some() {
@@ -175,7 +177,8 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    const TABS: &str = "1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs";
+    /// The tabs, as the header draws them.
+    const TABS: &str = "1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare";
 
     /// The header of `app` alone, drawn `width` columns wide.
     fn header(app: &App, width: u16) -> Result<String, Box<dyn std::error::Error>> {
@@ -184,6 +187,8 @@ mod tests {
         Ok(text(&terminal).concat())
     }
 
+    /// The brand and the six tabs fill 80 columns, so the name shows only
+    /// from wider, cut to what is left.
     #[test]
     fn a_long_project_name_is_cut_and_never_covers_the_tabs() -> TestResult {
         let mut app = app();
@@ -193,8 +198,12 @@ mod tests {
         let row = rows.first().ok_or("no header")?;
         assert_eq!(
             row,
-            &format!(" ⠿ overbrainer   {TABS}  a_proje… "),
-            "the brand and the five tabs fit 80 columns"
+            &format!(" ⠿ overbrainer   {TABS}"),
+            "the brand and the six tabs fit 80 columns"
+        );
+        assert_eq!(
+            header(&app, 100)?,
+            format!(" ⠿ overbrainer   {TABS}  a_project_name_f… ")
         );
         Ok(())
     }

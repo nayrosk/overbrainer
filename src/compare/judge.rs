@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::pin::Pin;
 
 use futures::stream::{self, StreamExt as _};
 use serde_json::Value;
@@ -16,6 +17,10 @@ use crate::config::RoleModel;
 use crate::events::{Event, EventBus};
 use crate::llm::{CompletionRequest, LlmClient, RetryPolicy, with_retry};
 use crate::prompts::{JUDGE, Prompts};
+
+/// One question being judged, boxed so the pool holds a concrete future
+/// type (see [`judge_all`]).
+type Judging<'a> = Pin<Box<dyn Future<Output = Result<VerdictLine, CompareError>> + Send + 'a>>;
 
 /// Times a reply that does not parse is asked for, in all.
 const ASKS: usize = 2;
@@ -171,16 +176,23 @@ pub async fn judge_all<C: LlmClient>(
         .iter()
         .partition(|question| done.contains_key(&question.id));
     let mut count = count_u64(judged_before.len());
-    let mut judged = stream::iter(todo)
+    // Boxed, and made before the pool, so the pool holds a concrete future
+    // type and no closure: a closure returning `impl Future` there made the
+    // compare's own future lose its `Send` bound (needed to spawn it, in the
+    // TUI) for a higher-ranked lifetime `rustc` cannot solve, as in the
+    // questions stage.
+    let judgings: Vec<Judging<'_>> = todo
+        .into_iter()
         .map(|question| {
             let child = by_id
                 .get(question.id.as_str())
                 .copied()
                 .filter(|answer| !answer.is_error())
                 .and_then(|answer| answer.answer.as_deref());
-            judge_one(run, setup.seed, question, child)
+            Box::pin(judge_one(run, setup.seed, question, child)) as Judging<'_>
         })
-        .buffer_unordered(run.concurrency.max(1));
+        .collect();
+    let mut judged = stream::iter(judgings).buffer_unordered(run.concurrency.max(1));
     while let Some(result) = judged.next().await {
         let line = result?;
         append_verdict(file, &line)?;

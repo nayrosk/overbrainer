@@ -12,6 +12,7 @@ use tracing::Level;
 
 use super::auto::Auto;
 use super::catalog::{CatalogKind, FitBy, Listed, Query};
+use super::compare::CompareView;
 use super::config_watch::ConfigWatch;
 use super::dataset::{DatasetView, Model, Node, TopicInfo};
 use super::editor::{self, Session, Target};
@@ -28,6 +29,7 @@ use super::training::TrainingView;
 use super::views::logs::{export_line, level_name};
 use super::widgets::form::{Input, InputOutcome};
 use super::widgets::picker::{Choice, Entry, Picker, PickerOutcome};
+use crate::cli::CompareArgs;
 use crate::cli::data::Command;
 use crate::cli::front::Report;
 use crate::config::edit::FieldPath;
@@ -117,7 +119,7 @@ pub(super) enum Effect {
     },
 }
 
-/// The five views, switched with `1` to `5`.
+/// The six views, switched with `1` to `6`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum View {
     /// The configuration and the project's stats.
@@ -130,16 +132,19 @@ pub(super) enum View {
     Training,
     /// Log lines.
     Logs,
+    /// The compares of the runs.
+    Compare,
 }
 
 impl View {
     /// Every view, in tab order.
-    pub(super) const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 6] = [
         Self::Project,
         Self::Dataset,
         Self::Pipeline,
         Self::Training,
         Self::Logs,
+        Self::Compare,
     ];
 
     /// The tab title.
@@ -150,6 +155,7 @@ impl View {
             Self::Pipeline => "Pipeline",
             Self::Training => "Training",
             Self::Logs => "Logs",
+            Self::Compare => "Compare",
         }
     }
 
@@ -161,6 +167,7 @@ impl View {
             Self::Pipeline => 2,
             Self::Training => 3,
             Self::Logs => 4,
+            Self::Compare => 5,
         }
     }
 
@@ -326,6 +333,12 @@ pub(super) enum Action {
     ClearFailed(Vec<String>),
     /// Pushing run `0` to the Hugging Face Hub, asked for with `h`.
     Push(String),
+    /// Running `overbrainer compare` with these options, asked for with `C`
+    /// or `J`.
+    Compare(CompareArgs),
+    /// Cancelling the compare task `0`, asked for with `c` in the Compare
+    /// view.
+    CancelCompare(TaskId),
     /// Deleting a topic, a provider or a target from `overbrainer.toml`.
     Remove(Removal),
 }
@@ -469,6 +482,10 @@ pub(super) struct App {
     pub(super) training: TrainingView,
     /// When `runs/` was last read.
     pub(super) refreshed: SystemTime,
+    /// The Compare view's state, with the compare running.
+    pub(super) compare: CompareView,
+    /// When the compares were last read.
+    pub(super) compares_refreshed: SystemTime,
     /// The task preparing a training start, if any.
     pub(super) prepare: Option<TaskId>,
     /// The task reading the GPU catalog of the start dialog, if any; an
@@ -567,6 +584,8 @@ impl App {
             pipeline_last: None,
             training: TrainingView::default(),
             refreshed: Self::never(),
+            compare: CompareView::default(),
+            compares_refreshed: Self::never(),
             prepare: None,
             start_catalog: None,
             start_gpus: None,
@@ -703,6 +722,12 @@ impl App {
         if self.training.pushing.is_some() {
             work.push("pushing".to_string());
         }
+        if self.compare.prepare.is_some() {
+            work.push("preparing a compare".to_string());
+        }
+        if let Some(running) = &self.compare.running {
+            work.push(format!("comparing: {}", running.label()));
+        }
         if let Some(Overlay::Picker(picking)) = &self.overlay
             && picking.picker.loading()
         {
@@ -782,6 +807,9 @@ impl App {
             Ok(Done::ConfigChecked(checked)) => self.config_checked(id, *checked),
             Ok(Done::PushPrepared(plan)) => self.push_prepared(id, plan),
             Ok(Done::Pushed(result)) => self.pushed(id, result),
+            Ok(Done::Compares(listing)) => self.compares_listed(id, listing),
+            Ok(Done::ComparePrepared(preview)) => self.compare_prepared(id, preview),
+            Ok(Done::Compared(result)) => self.compared(id, result),
             Ok(
                 Done::Prepared(_)
                 | Done::PreparedAuto(_)
@@ -837,8 +865,8 @@ impl App {
         self.pending_reload()
     }
 
-    /// Task `id` failed (a panic): an edit keeps its typed text, a load and a
-    /// stage show why.
+    /// Task `id` failed (a panic): an edit keeps its typed text, a load, a
+    /// stage, a push and a compare show why.
     fn failed(&mut self, id: TaskId, error: String) -> Vec<Effect> {
         tracing::error!("{error}");
         if self.edit == Some(id) {
@@ -861,6 +889,9 @@ impl App {
         }
         if self.training.push_prepare == Some(id) {
             return self.push_prepared(id, Err(error));
+        }
+        if let Some(effects) = self.compare_failed(id, &error) {
+            return effects;
         }
         if self.prepare == Some(id) {
             return self.prepared(Err(error));
@@ -948,9 +979,10 @@ impl App {
         effects
     }
 
-    /// A message of a task: the events, lag and lines of a training task, or of
-    /// the pipeline task running or the last one (a message handled after its
-    /// end); those of any other task are dropped.
+    /// A message of a task: the events, lag and lines of a training task, of
+    /// the push or the compare running, or of the pipeline task running or the
+    /// last one (a message handled after its end); those of any other task are
+    /// dropped.
     pub(super) fn on_message(&mut self, message: Msg) -> Vec<Effect> {
         self.dirty = true;
         let id = match &message {
@@ -979,6 +1011,9 @@ impl App {
         };
         if self.is_push(id) {
             return self.on_push_message(message);
+        }
+        if self.is_compare(id) {
+            return self.on_compare_message(message);
         }
         if self.training.is_training(id) {
             return self.on_training_message(id, message);
@@ -1191,7 +1226,8 @@ impl App {
             && self.project_view.save.is_none()
             && self.pipeline_task.is_none()
             && self.training.tasks.is_empty()
-            && self.training.pushing.is_none();
+            && self.training.pushing.is_none()
+            && self.compare.running.is_none();
         if self.leaving.is_some() && idle {
             self.exit = self.leaving;
         }
@@ -1372,6 +1408,9 @@ impl App {
             KeyCode::Char('R') => {
                 let mut effects = self.reload();
                 effects.extend(self.refresh_runs());
+                if self.view == View::Compare {
+                    effects.extend(self.refresh_compares());
+                }
                 return effects;
             },
             KeyCode::Char('r') => self.run_menu(),
@@ -1385,6 +1424,7 @@ impl App {
             KeyCode::Char('3') => return self.show(View::Pipeline),
             KeyCode::Char('4') => return self.show(View::Training),
             KeyCode::Char('5') => return self.show(View::Logs),
+            KeyCode::Char('6') => return self.show(View::Compare),
             KeyCode::Tab => return self.show(self.view.shifted(1)),
             KeyCode::BackTab => return self.show(self.view.shifted(View::ALL.len() - 1)),
             code => return self.on_view_key(code),
@@ -1438,14 +1478,20 @@ impl App {
         }
     }
 
-    /// Shows `view`; the Training view reads `runs/` again, and switching to the
-    /// Dataset view reads the data files again while a stage runs. Leaving a
-    /// view never touches a task.
+    /// Shows `view`; the Training view reads `runs/` and the compares again,
+    /// the Compare view the compares, and switching to the Dataset view reads
+    /// the data files again while a stage runs. Leaving a view never touches a
+    /// task.
     pub(super) fn show(&mut self, view: View) -> Vec<Effect> {
         let entered = self.view != view;
         self.view = view;
         match view {
-            View::Training => self.refresh_runs(),
+            View::Training => {
+                let mut effects = self.refresh_runs();
+                effects.extend(self.refresh_compares());
+                effects
+            },
+            View::Compare => self.refresh_compares(),
             View::Dataset if entered => self.reload_while_running(true),
             View::Project | View::Dataset | View::Pipeline | View::Logs => Vec::new(),
         }
@@ -1505,6 +1551,8 @@ impl App {
             Action::AbandonStart(task) => self.abandon_start(task),
             Action::ClearFailed(runs) => self.clear_failed(&runs),
             Action::Push(run) => self.confirm_push(run),
+            Action::Compare(args) => self.confirm_compare(args),
+            Action::CancelCompare(task) => vec![Effect::Abandon(task)],
             Action::Remove(removal) => self.remove(&removal),
             Action::Delete { deletion, counts } => {
                 if self.locked() {
@@ -1526,6 +1574,7 @@ impl App {
             View::Dataset => return self.on_dataset_key(code),
             View::Training => return self.on_training_key(code),
             View::Logs => return self.on_logs_key(code),
+            View::Compare => return self.on_compare_key(code),
             View::Pipeline => self.on_pipeline_key(code),
         }
         Vec::new()
@@ -1834,6 +1883,13 @@ impl App {
                 pushing.run
             ));
         }
+        if self.compare.running.is_some() {
+            text.push(
+                "A compare is running: its job is cancelled and its pod deleted; while it \
+                 judges, the verdicts so far are kept for `J`."
+                    .to_string(),
+            );
+        }
         if text.is_empty() {
             self.exit = Some(Exit::Quit);
             return Vec::new();
@@ -1848,10 +1904,11 @@ impl App {
         Vec::new()
     }
 
-    /// Ends the TUI for `why`: stops the pipeline task, detaches the followed
-    /// runs (abandons them on a signal), and waits for them, for cancels and for
-    /// an edit being saved: a run still starting is detached once its job
-    /// started, never before. A signal is never turned back into a plain quit.
+    /// Ends the TUI for `why`: stops the pipeline task and the push, abandons
+    /// the compare (its pod is deleted), detaches the followed runs (abandons
+    /// them on a signal), and waits for them, for cancels and for an edit
+    /// being saved: a run still starting is detached once its job started,
+    /// never before. A signal is never turned back into a plain quit.
     fn leave(&mut self, why: Exit) -> Vec<Effect> {
         if self.leaving != Some(Exit::Signal) {
             self.leaving = Some(why);
@@ -1863,6 +1920,12 @@ impl App {
                 .as_ref()
                 .map(|pushing| Effect::Cancel(pushing.task)),
         );
+        effects.extend(
+            self.compare
+                .running
+                .as_ref()
+                .map(|running| Effect::Abandon(running.task)),
+        );
         effects.extend(match self.leaving {
             Some(Exit::Signal) => self.abandon_all(),
             _ => self.detach_all(),
@@ -1872,8 +1935,8 @@ impl App {
     }
 
     /// What the TUI waits for once its loop ended, one line each: an edit or
-    /// `overbrainer.toml` being saved, the stage stopping, and each training
-    /// task.
+    /// `overbrainer.toml` being saved, the stage stopping, the push and the
+    /// compare stopping, and each training task.
     pub(super) fn waiting_for(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if self.edit.is_some() {
@@ -1894,6 +1957,9 @@ impl App {
                 "waiting for the push of run {} to stop...",
                 pushing.run
             ));
+        }
+        if self.compare.running.is_some() {
+            lines.push("waiting for the compare to stop...".to_string());
         }
         lines.extend(self.training.tasks.values().map(|follow| {
             let run = &follow.run_id;
@@ -1918,8 +1984,9 @@ impl App {
         lines
     }
 
-    /// `n` or Esc while quitting: stays. A stage stopped and a run detached
-    /// still end; a run waiting for its job to detach keeps being followed.
+    /// `n` or Esc while quitting: stays. A stage, a push or a compare stopped
+    /// and a run detached still end; a run waiting for its job to detach keeps
+    /// being followed.
     /// The exit notes stay: a run detached is no longer followed, a stage
     /// stopped stays stopped, until taken up again.
     fn stay(&mut self) {
@@ -1931,6 +1998,9 @@ impl App {
         }
         if self.training.pushing.is_some() {
             still.push("the push still stops".to_string());
+        }
+        if self.compare.running.is_some() {
+            still.push("the compare still stops".to_string());
         }
         let (detached, abandoned) = self.keep_following();
         if detached > 0 {
@@ -1960,9 +2030,9 @@ impl App {
     }
 
     /// SIGINT, SIGTERM or SIGHUP from outside: quits without asking, as Ctrl-C
-    /// does on the command line: the stage stops, the training tasks are
-    /// abandoned, an edit being saved and a cancel are waited for (they are never
-    /// cut, design 3.6).
+    /// does on the command line: the stage, the push and the compare stop, the
+    /// training tasks are abandoned, an edit being saved and a cancel are
+    /// waited for (they are never cut, design 3.6).
     pub(super) fn on_signal(&mut self) -> Vec<Effect> {
         self.close_overlay();
         let effects = self.leave(Exit::Signal);
@@ -1984,6 +2054,9 @@ impl App {
             if self.training.pushing.is_some() {
                 waited.push("the push stops".to_string());
             }
+            if self.compare.running.is_some() {
+                waited.push("the compare stops".to_string());
+            }
             self.say(
                 Severity::Warn,
                 format!("interrupted: exiting once {}", waited.join(" and ")),
@@ -1994,12 +2067,14 @@ impl App {
 
     /// Moves the clock to `now`: expires the status message and shows new log
     /// lines, and the newest warning or error on the status line; reads `runs/`
-    /// again when the Training view is shown and it is time, the data files
+    /// again when the Training view is shown and it is time, the compares when
+    /// the Training or Compare view is, the data files
     /// when the Dataset view is shown while a stage runs, and the configuration
     /// when its files changed.
     pub(super) fn on_tick(&mut self, now: SystemTime) -> Vec<Effect> {
         self.now = now;
         let mut effects = self.refresh_when_due();
+        effects.extend(self.compares_when_due());
         effects.extend(self.read_pod_log_when_due());
         effects.extend(self.reload_while_running(false));
         effects.extend(self.check_config());

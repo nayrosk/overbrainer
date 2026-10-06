@@ -1,7 +1,7 @@
 ---
 source: src/tui/snapshots.rs
 ---
-" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  rust_ex… "
+" ⠿ overbrainer   1 Project  2 Dataset  3 Pipeline  4 Training  5 Logs  6 Compare"
 "╭ data ────────────────────────────╮╭ topic ───────────────────────────────────╮"
 "│ ▼ ownership  2 sub, 5 q, 4 a     ││ old_topic                                │"
 "│   ▶ Borrowing  3 q, 2 a          ││ not in overbrainer.toml: split counts    │"

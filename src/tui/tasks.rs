@@ -16,6 +16,7 @@ use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::catalog::{Listed, Query, fetch};
+use super::compare::CompareListing;
 use super::cost::history_cost;
 use super::editor::Edited;
 use super::pod_logs::{PodLogRead, read_pod_log};
@@ -23,10 +24,11 @@ use super::project::ProjectConfig;
 use super::project_edit::{SaveRefusal, save_config};
 use super::start::{AutoPlan, Catalog, StartPlan, look_up, prepare, prepare_auto, prepare_resume};
 use super::training::{Listing, list_runs, read_series};
+use crate::cli::compare::Preview;
 use crate::cli::data::{Command, Load};
 use crate::cli::front::{Frontend, Report};
 use crate::cli::push::{self, PushOptions, PushPlan};
-use crate::cli::{StageArgs, TrainArgs, TrainCommand};
+use crate::cli::{CompareArgs, StageArgs, TrainArgs, TrainCommand};
 use crate::config::{DotenvKeys, EnvSource, ReloadError, Source, Stamp, reload, stamp};
 use crate::dataset::{Counts, DataFiles, Dataset, Deletion};
 use crate::events::{Event, EventBus, Observer, Stage};
@@ -85,6 +87,13 @@ pub(super) enum Task {
     PreparePush(String),
     /// `overbrainer push <run-id>`, with the default options.
     Push(String),
+    /// Reads the compares of every run, with their reports.
+    Compares,
+    /// What a compare of run `0`, else of the newest run with a GGUF, would
+    /// do: local files, and the GPU catalog on a Runpod target.
+    PrepareCompare(Option<String>),
+    /// `overbrainer compare` with these options.
+    Compare(CompareArgs),
     /// The Runpod GPU catalog for this many GPUs per pod, for the start
     /// dialog (list prices, VRAM and stock), and the VRAM the run needs.
     StartCatalog(u32),
@@ -244,6 +253,12 @@ pub(super) enum Done {
     PushPrepared(Result<PushPlan, String>),
     /// The commit URL of a push, or why it failed.
     Pushed(Result<String, String>),
+    /// The compares, or why they cannot be listed, and the warnings.
+    Compares(CompareListing),
+    /// What a compare would do, or why none can run.
+    ComparePrepared(Result<Preview, String>),
+    /// How a compare ended: written, or why it failed.
+    Compared(Result<(), String>),
     /// The GPU catalog of the start dialog and the VRAM the run needs, or
     /// why they cannot be read.
     StartCatalog(Catalog),
@@ -587,16 +602,7 @@ impl Tasks {
             Task::SaveConfig { text, base, env } => self.spawn_save(text, base, env),
             Task::Pipeline(command) => self.spawn_pipeline(id, command),
             Task::Train(job) => self.spawn_train(id, job),
-            Task::Runs => {
-                let dir = self.project_dir.clone();
-                self.set.spawn(async move {
-                    let listing = tokio::task::spawn_blocking(move || list_runs(&dir)).await;
-                    Done::Runs(listing.unwrap_or_else(|error| Listing {
-                        runs: Err(format!("cannot list the runs: {error}")),
-                        skipped: Vec::new(),
-                    }))
-                })
-            },
+            Task::Runs => self.spawn_runs(),
             Task::Series(run) => {
                 let dir = self.project_dir.clone();
                 self.set.spawn(async move {
@@ -629,6 +635,9 @@ impl Tasks {
             Task::PrepareAuto => self.spawn_prepare(true),
             Task::PreparePush(run) => self.spawn_prepare_push(run),
             Task::Push(run) => self.spawn_push(id, run),
+            Task::Compares => self.spawn_compares(),
+            Task::PrepareCompare(run) => self.spawn_prepare_compare(run),
+            Task::Compare(args) => self.spawn_compare(id, args),
             Task::StartCatalog(gpu_count) => {
                 let dir = self.project_dir.clone();
                 let source = self.source.clone();
@@ -774,6 +783,64 @@ impl Tasks {
             };
             forwarded(front, forwarder, "push").await;
             Done::Pushed(pushed)
+        })
+    }
+
+    /// Reads `runs/`, with the pod records, off the async threads.
+    fn spawn_runs(&mut self) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        self.set.spawn(async move {
+            let listing = tokio::task::spawn_blocking(move || list_runs(&dir)).await;
+            Done::Runs(listing.unwrap_or_else(|error| Listing {
+                runs: Err(format!("cannot list the runs: {error}")),
+                skipped: Vec::new(),
+            }))
+        })
+    }
+
+    /// Reads the compares of every run, off the async threads.
+    fn spawn_compares(&mut self) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        self.set.spawn(async move {
+            let listing = tokio::task::spawn_blocking(move || super::compare::list(&dir)).await;
+            Done::Compares(listing.unwrap_or_else(|error| CompareListing {
+                rows: Err(format!("cannot list the compares: {error}")),
+                skipped: Vec::new(),
+            }))
+        })
+    }
+
+    /// Prepares the confirmation of a compare of run `run`, else of the
+    /// newest run with a GGUF: its files are read off the async threads, and
+    /// the GPU catalog prices a Runpod pod.
+    fn spawn_prepare_compare(&mut self, run: Option<String>) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        let source = self.source.clone();
+        self.set.spawn(async move {
+            let preview = crate::cli::compare::preview(&dir, &source, run.as_deref())
+                .await
+                .map_err(|error| format!("{error:#}"));
+            Done::ComparePrepared(preview)
+        })
+    }
+
+    /// Starts `overbrainer compare` with `args` as `id`: its token cancels
+    /// it as Ctrl-C does on the command line, its abandon flag deletes a pod
+    /// still being prepared.
+    fn spawn_compare(&mut self, id: TaskId, args: CompareArgs) -> AbortHandle {
+        let dir = self.project_dir.clone();
+        let source = self.source.clone();
+        let token = CancellationToken::new();
+        let abandon = Arc::new(AtomicBool::new(false));
+        let (front, forwarder) =
+            front_end(id, &self.messages, &token, &abandon, self.observer.clone());
+        self.tokens.insert(id, token);
+        self.abandons.insert(id, abandon);
+        self.set.spawn(async move {
+            // Never aborted: the flow shields its start and its cancel.
+            let result = crate::cli::compare::run(&dir, &args, &front, &source).await;
+            forwarded(front, forwarder, "compare").await;
+            Done::Compared(result.map_err(|error| format!("{error:#}")))
         })
     }
 

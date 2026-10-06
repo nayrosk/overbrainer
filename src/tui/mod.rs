@@ -6,6 +6,7 @@
 mod app;
 mod auto;
 mod catalog;
+mod compare;
 mod config_watch;
 mod cost;
 mod dataset;

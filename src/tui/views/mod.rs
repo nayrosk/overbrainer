@@ -1,4 +1,4 @@
-//! The five views.
+//! The six views.
 
 pub(super) mod dataset;
 pub(super) mod logs;

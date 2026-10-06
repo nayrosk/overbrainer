@@ -453,7 +453,7 @@ impl App {
                 }
                 return targets;
             },
-            View::Project | View::Dataset | View::Logs => return targets,
+            View::Project | View::Dataset | View::Logs | View::Compare => return targets,
         }
         for (index, stage) in STAGES.iter().enumerate() {
             let row = self.pipeline.row(*stage);
