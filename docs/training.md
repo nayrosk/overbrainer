@@ -125,9 +125,9 @@ The export uses one pinned llama.cpp release, `b11320`: the source tarball of th
 Bumping llama.cpp, in `src/export/llama_cpp.rs`:
 
 1. Set `TAG` to the new release tag.
-2. Take the `digest` of `llama-<tag>-bin-ubuntu-x64.tar.gz`, `-ubuntu-arm64` and `-macos-arm64` from `gh api repos/ggml-org/llama.cpp/releases/tags/<tag>`, and set the three `*_SHA256` constants.
+2. Take the `digest` of `llama-<tag>-bin-ubuntu-x64.tar.gz`, `-ubuntu-arm64`, `-macos-arm64`, `-ubuntu-cuda-<cuda>-x64` and `-ubuntu-cuda-<cuda>-arm64`, and of `cudart-llama-<tag>-bin-ubuntu-cuda-<cuda>-x64.tar.gz` and `-arm64`, from `gh api repos/ggml-org/llama.cpp/releases/tags/<tag>`, and set the `*_SHA256` constants. Set `CUDA` to the CUDA version of those builds. The CUDA builds bundle their own runtime: the compare script puts the matching cudart archive's libraries first on `LD_LIBRARY_PATH` on every CUDA host, and falls back to the CPU build when the driver's CUDA version (from `nvidia-smi`) is below the major version of `CUDA`.
 3. Download `https://github.com/ggml-org/llama.cpp/archive/refs/tags/<tag>.tar.gz`, run `sha256sum` on it, and set `SOURCE_SHA256`.
-4. Check that the archives still hold `llama.cpp-<tag>/convert_hf_to_gguf.py` and `llama-<tag>/llama-quantize`, then export a small run on a GPU target and load it in Ollama.
+4. Check that the archives still hold `llama.cpp-<tag>/convert_hf_to_gguf.py`, `llama-<tag>/llama-quantize` and `llama-<tag>/llama-server`, and the cudart archives `libcudart.so.<major>`, then export a small run on a GPU target, load it in Ollama, and compare it.
 
 ## Push to Hugging Face
 
