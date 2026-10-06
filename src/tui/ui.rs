@@ -59,8 +59,10 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
             None
         },
         View::Training => views::training::render(frame, body, app),
-        // Drawn from the next change on; the body stays empty until then.
-        View::Compare => None,
+        View::Compare => {
+            views::compare::render(frame, body, app);
+            None
+        },
     };
     let toast = status::render(frame, footer, app);
     if app.overlay.is_some() {

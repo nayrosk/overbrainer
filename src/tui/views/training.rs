@@ -40,8 +40,27 @@ const STEP_BAR: u16 = 16;
 /// go to the chart.
 const GAPS_FROM: u16 = 28;
 
-/// Draws the Training view in `area`; returns the cell of the followed run's
-/// `●`, when it shows.
+/// How the latest compare of run `run` went, dim: `compare: 71% win or tie
+/// (compare_..., 8 questions)`; `None` without a compare report.
+fn compare_line(app: &App, run: &str) -> Option<Line<'static>> {
+    let row = app.compare.latest_for(run)?;
+    let report = row.report.as_ref()?;
+    let rate = report
+        .summary
+        .win_or_tie
+        .map_or_else(|| "-".to_string(), |rate| format!("{:.0}%", rate * 100.0));
+    Some(Line::styled(
+        format!(
+            "compare: {rate} win or tie ({}, {} questions)",
+            row.record.id, report.summary.questions
+        ),
+        app.theme.dim,
+    ))
+}
+
+/// Draws the Training view in `area`: the runs, then the selected run's
+/// detail, with the line of its latest compare when it has one; returns the
+/// cell of the followed run's `●`, when it shows.
 pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Option<Rect> {
     let view = &app.training;
     let theme = &app.theme;
@@ -94,7 +113,13 @@ pub(in crate::tui) fn render(frame: &mut Frame, area: Rect, app: &mut App) -> Op
         (activity, app.motion.spinner()),
         theme,
     );
-    let facts_rows = u16::from(!facts.spans.is_empty());
+    // The facts, then how the run's latest compare went.
+    let facts: Vec<Line> = (!facts.spans.is_empty())
+        .then_some(facts)
+        .into_iter()
+        .chain(compare_line(app, &row.record.id))
+        .collect();
+    let facts_rows = u16::try_from(facts.len()).unwrap_or(u16::MAX);
     let gap = u16::from(area.height >= GAPS_FROM);
     let [status, facts_area, _, pod_area, _, chart, lr, grad, notes] = Layout::vertical([
         Constraint::Length(head_rows),

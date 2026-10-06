@@ -2075,3 +2075,135 @@ fn no_secret_is_ever_drawn_in_the_project_view() -> TestResult {
     }
     Ok(())
 }
+
+/// The Compare view with nothing to show yet.
+#[test]
+fn compare_empty() -> TestResult {
+    let mut app = app();
+    app.view = View::Compare;
+    snapshot("compare_empty", &mut app)?;
+    Ok(())
+}
+
+/// A compare selected: the list, the summary, the questions and the first
+/// one's detail, stacked at 80 columns and side by side at 120.
+#[test]
+fn compare_with_a_report() -> TestResult {
+    let mut app = app();
+    app.view = View::Compare;
+    app.compare.rows = vec![compare_entry()?];
+    snapshot("compare_with_a_report", &mut app)?;
+    Ok(())
+}
+
+/// The losses only, the questions focused, the child error selected: why
+/// the child gave no answer, the parent's answer and no reason.
+#[test]
+fn compare_on_a_loss() -> TestResult {
+    let mut app = app();
+    app.view = View::Compare;
+    app.compare.rows = vec![compare_entry()?];
+    app.compare.filter = super::compare::Filter::Losses;
+    app.compare.focus = super::compare::Focus::Questions;
+    app.compare.question = 1;
+    snapshot("compare_on_a_loss", &mut app)?;
+    Ok(())
+}
+
+/// A compare running: its progress at the top of the summary pane.
+#[test]
+fn compare_running() -> TestResult {
+    let mut app = app();
+    app.view = View::Compare;
+    let task = app.task_id();
+    let mut running =
+        super::compare::Comparing::new(task, Some("demo_20261006-100000".into()), false);
+    running.compare = Some("compare_20261006-130000".into());
+    running.judged = Some((12, 100));
+    app.compare.running = Some(running);
+    app.compare.rows = vec![compare_entry()?];
+    snapshot("compare_running", &mut app)?;
+    Ok(())
+}
+
+/// The help overlay of the Compare view.
+#[test]
+fn compare_help() -> TestResult {
+    let mut app = app();
+    app.view = View::Compare;
+    app.compare.rows = vec![compare_entry()?];
+    app.overlay = Some(Overlay::Help);
+    snapshot("help_compare", &mut app)?;
+    Ok(())
+}
+
+/// The Training view's run detail says how the run's latest compare went.
+#[test]
+fn training_with_a_compare() -> TestResult {
+    let mut app = app();
+    app.view = View::Training;
+    let mut record = run("demo_20261006-100000", "gpu", RunState::Succeeded);
+    record.created = "2026-10-06T10:00:00Z".into();
+    app.training.runs = vec![super::training::RunRow { record, pod: None }];
+    app.compare.rows = vec![compare_entry()?];
+    snapshot("training_with_a_compare", &mut app)?;
+    Ok(())
+}
+
+/// An app on the Compare view whose first question has long answers, so its
+/// detail scrolls.
+fn long_compare_app() -> Result<App, serde_json::Error> {
+    let mut app = app();
+    app.view = View::Compare;
+    let mut entry = compare_entry()?;
+    if let Some(question) = entry
+        .report
+        .as_mut()
+        .and_then(|report| report.questions.first_mut())
+    {
+        let long = |who: &str| {
+            (1..=40)
+                .map(|i| format!("{who} line {i}."))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        question.child = Some(long("Child"));
+        question.parent = long("Parent");
+    }
+    app.compare.rows = vec![entry];
+    Ok(app)
+}
+
+/// At `width` by `height`, the detail has `parts` parts; `]` goes to each in
+/// turn and `[` back to the first.
+fn jumps_between(width: u16, height: u16, parts: usize) -> TestResult {
+    let mut app = long_compare_app()?;
+    draw(&mut app, width, height)?;
+    let sections = app.compare.sections.clone();
+    assert_eq!(sections.len(), parts, "{sections:?}");
+    for &at in sections.iter().skip(1) {
+        app.on_input(&key(KeyCode::Char(']')));
+        assert_eq!(app.compare.scroll, at, "{sections:?}");
+        draw(&mut app, width, height)?;
+    }
+    for &at in sections.iter().rev().skip(1) {
+        app.on_input(&key(KeyCode::Char('[')));
+        assert_eq!(app.compare.scroll, at, "{sections:?}");
+        draw(&mut app, width, height)?;
+    }
+    Ok(())
+}
+
+/// Stacked, `[` and `]` jump between the question, the child's answer, the
+/// parent's and the judge's reason.
+#[test]
+fn the_stacked_detail_jumps_between_its_parts() -> TestResult {
+    jumps_between(80, 24, 4)
+}
+
+/// Side by side, `[` and `]` jump between the question, the two answers
+/// (one row) and the judge's reason.
+#[test]
+fn the_side_by_side_detail_jumps_between_its_parts() -> TestResult {
+    jumps_between(120, 40, 3)
+}

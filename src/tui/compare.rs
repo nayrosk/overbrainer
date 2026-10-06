@@ -87,6 +87,17 @@ impl Filter {
         }
     }
 
+    /// Its name, as the questions pane's title shows it.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Losses => "losses",
+            Self::Ties => "ties",
+            Self::Wins => "wins",
+            Self::Errors => "errors",
+        }
+    }
+
     /// Whether a question with `verdict` is shown.
     pub(super) fn keeps(self, verdict: Verdict) -> bool {
         match self {
@@ -203,6 +214,18 @@ impl CompareView {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The selected question among the shown ones.
+    pub(super) fn selected_question(&self) -> Option<&QuestionResult> {
+        self.shown_questions().get(self.question).copied()
+    }
+
+    /// The newest compare of run `run` with a report.
+    pub(super) fn latest_for(&self, run: &str) -> Option<&CompareEntry> {
+        self.rows
+            .iter()
+            .find(|row| row.run == run && row.report.is_some())
     }
 
     /// Moves the focused list's selection by one, down or up; a new
