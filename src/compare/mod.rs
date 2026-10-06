@@ -8,7 +8,8 @@
 //!
 //! Files of a compare's directory:
 //! - `setup.json`: what is compared, written before the job ([`CompareSetup`]);
-//! - `questions.jsonl` and `model.gguf`: what the job gets (the GGUF is
+//! - `questions.jsonl`, `compare.sh`, `compare_client.py`, and `model.gguf`
+//!   when the GGUF is uploaded with the job: what the job gets (the GGUF is
 //!   removed once the job ended);
 //! - `child_answers.jsonl`, `server.log`, `hardware.json`: what the job gives back;
 //! - `verdicts-<key>.jsonl`: the verdicts of one judge, appended as they come;
@@ -18,6 +19,7 @@ mod cost;
 mod error;
 #[cfg(test)]
 pub(crate) mod fixtures;
+mod job;
 mod judge;
 mod report;
 mod stats;
@@ -26,6 +28,9 @@ mod types;
 
 pub use cost::{Costs, Prices, costs, prices};
 pub use error::CompareError;
+pub use job::{
+    CLIENT_FILE, ChildSettings, CompareJob, ModelSource, SCRIPT, SCRIPT_FILE, discard_model,
+};
 pub use judge::{
     Pick, child_first, judge_key, parse_reply, render_judge, verdict_of, verdicts_file,
 };
@@ -69,3 +74,6 @@ pub const REPORT_JSON: &str = "compare.json";
 
 /// The report, as Markdown.
 pub const REPORT_MD: &str = "compare.md";
+
+#[cfg(test)]
+mod tests;
