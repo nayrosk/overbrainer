@@ -113,6 +113,11 @@ impl Progress {
                 done,
                 total,
             } => pushed(run_id, *done, *total),
+            Event::Judged {
+                compare_id,
+                done,
+                total,
+            } => judged(compare_id, *done, *total),
             // Only the metrics and the TUI use them.
             Event::StageModel { .. } | Event::System(_) => {},
         }
@@ -344,6 +349,14 @@ pub fn pod_line(status: &PodStatus) -> String {
             format!("{pod_id} deleted{after}{spend}")
         },
         PodStatus::Kept { pod_id } => format!("{pod_id} kept (--keep-pod)"),
+    }
+}
+
+/// Logs the judge's progress on a compare at each tenth: `compare: <id> judged 30/100`.
+fn judged(compare_id: &str, done: u64, total: u64) {
+    let step = (total / 10).max(1);
+    if done == total || done.is_multiple_of(step) {
+        tracing::info!("compare: {compare_id} judged {done}/{total}");
     }
 }
 

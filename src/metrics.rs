@@ -393,7 +393,8 @@ impl Metrics {
             Event::ItemDone { .. }
             | Event::ItemFailed { .. }
             | Event::PodStatus(_)
-            | Event::Push { .. } => {},
+            | Event::Push { .. }
+            | Event::Judged { .. } => {},
         }
     }
 

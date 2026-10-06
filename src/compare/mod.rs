@@ -32,7 +32,8 @@ pub use job::{
     CLIENT_FILE, ChildSettings, CompareJob, ModelSource, SCRIPT, SCRIPT_FILE, discard_model,
 };
 pub use judge::{
-    Pick, child_first, judge_key, parse_reply, render_judge, verdict_of, verdicts_file,
+    JudgeRun, Pick, child_first, judge_all, judge_key, parse_reply, render_judge, verdict_of,
+    verdicts_file,
 };
 pub use report::{
     JudgeInfo, Parts, QuestionResult, Report, build as build_report, render_markdown,

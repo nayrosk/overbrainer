@@ -170,6 +170,15 @@ pub enum Event {
         /// Bytes to upload.
         total: u64,
     },
+    /// Questions of compare `compare_id` judged so far, of `total`.
+    Judged {
+        /// ID of the compare.
+        compare_id: String,
+        /// Questions with a verdict.
+        done: u64,
+        /// Questions to judge.
+        total: u64,
+    },
 }
 
 /// How an item ended, as its event says.

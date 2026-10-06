@@ -1,12 +1,24 @@
 //! The judge of a compare: the order it sees each pair in, its prompt, and
 //! what its reply says.
 
+use std::collections::HashMap;
+use std::path::Path;
+
+use futures::stream::{self, StreamExt as _};
 use serde_json::Value;
 use twox_hash::XxHash3_64;
 
-use super::{CompareError, EvalQuestion, Verdict};
+use super::{
+    ChildAnswer, CompareError, CompareSetup, EvalQuestion, Verdict, VerdictLine, append_verdict,
+    read_verdicts,
+};
 use crate::config::RoleModel;
+use crate::events::{Event, EventBus};
+use crate::llm::{CompletionRequest, LlmClient, RetryPolicy, with_retry};
 use crate::prompts::{JUDGE, Prompts};
+
+/// Times a reply that does not parse is asked for, in all.
+const ASKS: usize = 2;
 
 /// Whether the child's answer is shown first, as answer A, for question `id`:
 /// the low bit of its XXH3-64 with `seed`. About half the questions each way,
@@ -102,11 +114,157 @@ pub fn render_judge(
     )?)
 }
 
+/// What a judge run needs.
+pub struct JudgeRun<'a, C> {
+    /// The judge's client.
+    pub client: &'a C,
+    /// The judge's model and parameters.
+    pub role: &'a RoleModel,
+    /// The prompts, the judge's among them.
+    pub prompts: &'a Prompts,
+    /// Retries of a failed request.
+    pub policy: RetryPolicy,
+    /// Requests at once.
+    pub concurrency: usize,
+    /// Where the progress goes.
+    pub bus: &'a EventBus,
+    /// The compare's ID, for the progress events.
+    pub compare: &'a str,
+}
+
+/// `n` as a `u64`.
+fn count_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// Judges every question of `setup` that `file` has no verdict for yet,
+/// `run.concurrency` at once, appending each verdict to `file` as it comes:
+/// an interrupted run resumes where it stopped. A question the child has no
+/// answer to in `answers` gets [`Verdict::Error`] without asking the judge.
+/// Publishes [`Event::Judged`] after each verdict. Returns every verdict, in
+/// the order of `setup`; a verdict in `file` for a question not in `setup`
+/// is left out and not counted.
+///
+/// # Errors
+///
+/// Returns [`CompareError::Judge`] when a request fails for good (the
+/// verdicts before it stay in `file`), [`CompareError::Prompt`] when the
+/// prompt does not render, and [`CompareError::Io`] or
+/// [`CompareError::Dataset`] when `file` cannot be read or written.
+pub async fn judge_all<C: LlmClient>(
+    run: &JudgeRun<'_, C>,
+    setup: &CompareSetup,
+    answers: &[ChildAnswer],
+    file: &Path,
+) -> Result<Vec<VerdictLine>, CompareError> {
+    let mut done: HashMap<String, VerdictLine> = read_verdicts(file)?
+        .into_iter()
+        .map(|line| (line.id.clone(), line))
+        .collect();
+    let by_id: HashMap<&str, &ChildAnswer> = answers
+        .iter()
+        .map(|answer| (answer.id.as_str(), answer))
+        .collect();
+    let total = count_u64(setup.questions.len());
+    let (judged_before, todo): (Vec<&EvalQuestion>, Vec<&EvalQuestion>) = setup
+        .questions
+        .iter()
+        .partition(|question| done.contains_key(&question.id));
+    let mut count = count_u64(judged_before.len());
+    let mut judged = stream::iter(todo)
+        .map(|question| {
+            let child = by_id
+                .get(question.id.as_str())
+                .copied()
+                .filter(|answer| !answer.is_error())
+                .and_then(|answer| answer.answer.as_deref());
+            judge_one(run, setup.seed, question, child)
+        })
+        .buffer_unordered(run.concurrency.max(1));
+    while let Some(result) = judged.next().await {
+        let line = result?;
+        append_verdict(file, &line)?;
+        done.insert(line.id.clone(), line);
+        count += 1;
+        run.bus.publish(Event::Judged {
+            compare_id: run.compare.to_string(),
+            done: count,
+            total,
+        });
+    }
+    Ok(setup
+        .questions
+        .iter()
+        .filter_map(|question| done.remove(&question.id))
+        .collect())
+}
+
+/// The verdict of `question` against the child's answer `child`, its order
+/// from `seed`: [`Verdict::Error`] without an answer, [`Verdict::Unparsed`]
+/// when the reply does not parse, asked [`ASKS`] times.
+async fn judge_one<C: LlmClient>(
+    run: &JudgeRun<'_, C>,
+    seed: u64,
+    question: &EvalQuestion,
+    child: Option<&str>,
+) -> Result<VerdictLine, CompareError> {
+    let first = child_first(seed, &question.id);
+    let line = |verdict, reason| VerdictLine {
+        id: question.id.clone(),
+        verdict,
+        reason,
+        child_first: first,
+    };
+    let Some(child) = child else {
+        return Ok(line(Verdict::Error, None));
+    };
+    let child = super::strip_reasoning(child);
+    let parent = question.parent.as_str();
+    let pair = if first {
+        (child.as_str(), parent)
+    } else {
+        (parent, child.as_str())
+    };
+    let prompt = render_judge(run.prompts, question, pair)?;
+    let request = CompletionRequest::for_role(run.role, None, prompt);
+    for _ in 0..ASKS {
+        let completion = with_retry(
+            &run.policy,
+            || run.client.complete(request.clone()),
+            |error, wait| {
+                tracing::warn!(
+                    "compare: judging {} failed: {error}; retrying in {:.1}s",
+                    question.id,
+                    wait.as_secs_f64()
+                );
+            },
+        )
+        .await
+        .map_err(|source| CompareError::Judge {
+            id: question.id.clone(),
+            source,
+        })?;
+        if let Some((pick, reason)) = parse_reply(&completion.content) {
+            let reason = (!reason.is_empty()).then_some(reason);
+            return Ok(line(verdict_of(pick, first), reason));
+        }
+    }
+    Ok(line(Verdict::Unparsed, None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compare::{ChatMessage, EvalQuestion, Verdict};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::compare::{
+        ChatMessage, ChildAnswer, CompareSetup, EvalQuestion, Verdict, VerdictLine, append_verdict,
+        read_verdicts,
+    };
     use crate::config::RoleModel;
+    use crate::dataset::FinishReason;
+    use crate::events::{Event, EventBus};
+    use crate::llm::{Completion, LlmError, Reasoning, Usage};
     use crate::prompts::Prompts;
 
     /// Result type of the tests.
@@ -220,6 +378,246 @@ mod tests {
         settings.set_prepend_module_to_snapshot(false);
         settings.set_omit_expression(true);
         settings.bind(|| insta::assert_snapshot!("judge_prompt", text));
+        Ok(())
+    }
+
+    /// A judge that prefers the answer holding `good`; replies garbage to a
+    /// question holding `garbage`, and fails one holding `fail`.
+    struct FakeJudge {
+        /// Requests received.
+        calls: AtomicUsize,
+    }
+
+    impl FakeJudge {
+        /// A judge that has received nothing.
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        /// Its reply to `prompt`.
+        fn reply(prompt: &str) -> Result<String, LlmError> {
+            if prompt.contains("fail") {
+                return Err(LlmError::InvalidResponse("refused".into()));
+            }
+            if prompt.contains("garbage") {
+                return Ok("I cannot decide.".into());
+            }
+            let a = prompt.split("Answer A:\n").nth(1).unwrap_or_default();
+            let a = a.split("Answer B:\n").next().unwrap_or_default();
+            let pick = if a.contains("good") { "A" } else { "B" };
+            Ok(format!(
+                r#"{{"verdict": "{pick}", "reason": "{pick} is good."}}"#
+            ))
+        }
+    }
+
+    impl LlmClient for FakeJudge {
+        fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> impl std::future::Future<Output = Result<Completion, LlmError>> + Send {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let reply = Self::reply(&request.prompt);
+            std::future::ready(reply.map(|content| Completion {
+                content,
+                reasoning: Reasoning::none(),
+                usage: Usage::default(),
+                finish: FinishReason::Stop,
+            }))
+        }
+
+        fn embed(
+            &self,
+            _inputs: &[String],
+        ) -> impl std::future::Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send {
+            std::future::ready(Err(LlmError::Unsupported("embeddings")))
+        }
+    }
+
+    /// A setup of these questions; each parent answer is `Parent.`.
+    fn setup_of(texts: &[&str]) -> CompareSetup {
+        CompareSetup {
+            run: "r1".into(),
+            compare: "c1".into(),
+            gguf: "output/gguf/r1-Q4_K_M.gguf".into(),
+            gguf_sha256: "0".repeat(64),
+            quantize: "Q4_K_M".into(),
+            llama_cpp: "b11320".into(),
+            base_model: None,
+            seed: 7,
+            created: "2026-10-06T12:00:00Z".into(),
+            questions: texts
+                .iter()
+                .enumerate()
+                .map(|(i, text)| EvalQuestion {
+                    id: format!("q{i}"),
+                    topic: "t".into(),
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: (*text).to_string(),
+                    }],
+                    parent: "Parent.".into(),
+                    parent_input_tokens: 1,
+                    parent_output_tokens: 1,
+                })
+                .collect(),
+        }
+    }
+
+    /// The child's answer `answer` to question `i`, or a failed request.
+    fn child(i: usize, answer: Option<&str>) -> ChildAnswer {
+        ChildAnswer {
+            id: format!("q{i}"),
+            answer: answer.map(str::to_string),
+            error: answer.is_none().then(|| "timed out".to_string()),
+            ..ChildAnswer::default()
+        }
+    }
+
+    /// The judge's role.
+    fn role() -> Result<RoleModel, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({"provider": "p", "model": "j"}))
+    }
+
+    /// Wins, losses, a failed child and an unparsed reply; then a second run
+    /// asks the judge nothing.
+    #[tokio::test]
+    async fn every_question_is_judged_once_and_resumed() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let prompts = Prompts::load(dir.path())?;
+        let role = role()?;
+        let setup = setup_of(&["Q0?", "Q1?", "Q2?", "garbage Q3?"]);
+        // q1 is a Loss only because the child is shown first for this seed
+        // (the weak answer is then A, and the fake judge picks B, the
+        // parent). A change of the hash fails here, not in the verdicts.
+        assert!(child_first(setup.seed, "q1"));
+        let answers = [
+            child(0, Some("A good answer.")),
+            child(1, Some("<think>x</think>A weak answer.")),
+            child(2, None),
+            child(3, Some("Whatever.")),
+        ];
+        let judge = FakeJudge::new();
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let run = JudgeRun {
+            client: &judge,
+            role: &role,
+            prompts: &prompts,
+            policy: RetryPolicy::new(0),
+            concurrency: 2,
+            bus: &bus,
+            compare: "c1",
+        };
+        let file = dir.path().join("verdicts-x.jsonl");
+        let verdicts = judge_all(&run, &setup, &answers, &file).await?;
+        let got: Vec<(&str, Verdict)> = verdicts
+            .iter()
+            .map(|line| (line.id.as_str(), line.verdict))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("q0", Verdict::Win),
+                ("q1", Verdict::Loss),
+                ("q2", Verdict::Error),
+                ("q3", Verdict::Unparsed),
+            ]
+        );
+        // q0 and q1 once, q3 twice (asked again once), q2 never.
+        assert_eq!(judge.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(read_verdicts(&file)?.len(), 4);
+        let mut last = None;
+        while let Ok(event) = events.try_recv() {
+            if let Event::Judged { done, total, .. } = event {
+                last = Some((done, total));
+            }
+        }
+        assert_eq!(last, Some((4, 4)));
+        let again = judge_all(&run, &setup, &answers, &file).await?;
+        assert_eq!(again, verdicts);
+        assert_eq!(
+            judge.calls.load(Ordering::SeqCst),
+            4,
+            "nothing judged twice"
+        );
+        Ok(())
+    }
+
+    /// A verdict line for a question not in the setup stays out of the
+    /// result and of the progress count; nothing is written for it.
+    #[tokio::test]
+    async fn a_stray_verdict_is_ignored() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let prompts = Prompts::load(dir.path())?;
+        let role = role()?;
+        let setup = setup_of(&["Q0?", "Q1?"]);
+        let answers = [child(0, Some("good")), child(1, Some("good"))];
+        let file = dir.path().join("verdicts-x.jsonl");
+        let stray = VerdictLine {
+            id: "gone".into(),
+            verdict: Verdict::Win,
+            reason: None,
+            child_first: true,
+        };
+        append_verdict(&file, &stray)?;
+        let judge = FakeJudge::new();
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let run = JudgeRun {
+            client: &judge,
+            role: &role,
+            prompts: &prompts,
+            policy: RetryPolicy::new(0),
+            concurrency: 1,
+            bus: &bus,
+            compare: "c1",
+        };
+        let verdicts = judge_all(&run, &setup, &answers, &file).await?;
+        let ids: Vec<&str> = verdicts.iter().map(|line| line.id.as_str()).collect();
+        assert_eq!(ids, ["q0", "q1"]);
+        assert_eq!(judge.calls.load(Ordering::SeqCst), 2);
+        let mut last = None;
+        while let Ok(event) = events.try_recv() {
+            if let Event::Judged { done, total, .. } = event {
+                last = Some((done, total));
+            }
+        }
+        assert_eq!(last, Some((2, 2)));
+        Ok(())
+    }
+
+    /// A judge error stops the run; what was judged stays for the next one.
+    #[tokio::test]
+    async fn a_judge_error_keeps_what_was_judged() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let prompts = Prompts::load(dir.path())?;
+        let role = role()?;
+        let setup = setup_of(&["Q0?", "fail Q1?"]);
+        let answers = [child(0, Some("good")), child(1, Some("x"))];
+        let judge = FakeJudge::new();
+        let bus = EventBus::new();
+        let run = JudgeRun {
+            client: &judge,
+            role: &role,
+            prompts: &prompts,
+            policy: RetryPolicy::new(0),
+            concurrency: 1,
+            bus: &bus,
+            compare: "c1",
+        };
+        let file = dir.path().join("verdicts-x.jsonl");
+        let error = judge_all(&run, &setup, &answers, &file)
+            .await
+            .err()
+            .ok_or("judged despite the failure")?;
+        assert!(
+            matches!(error, CompareError::Judge { ref id, .. } if id == "q1"),
+            "{error}"
+        );
+        assert_eq!(read_verdicts(&file)?.len(), 1);
         Ok(())
     }
 }
