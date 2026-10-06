@@ -16,7 +16,10 @@
 
 mod cost;
 mod error;
+#[cfg(test)]
+pub(crate) mod fixtures;
 mod judge;
+mod report;
 mod stats;
 mod text;
 mod types;
@@ -25,6 +28,10 @@ pub use cost::{Costs, Prices, costs, prices};
 pub use error::CompareError;
 pub use judge::{
     Pick, child_first, judge_key, parse_reply, render_judge, verdict_of, verdicts_file,
+};
+pub use report::{
+    JudgeInfo, Parts, QuestionResult, Report, build as build_report, render_markdown,
+    write as write_report,
 };
 pub use stats::{Summary, count_f64, percentile, summarize};
 pub use text::strip_reasoning;

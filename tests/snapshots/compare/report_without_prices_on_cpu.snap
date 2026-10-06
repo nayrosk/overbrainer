@@ -1,0 +1,109 @@
+---
+source: src/compare/report.rs
+---
+# Compare of run demo_20261006-100000
+
+| | |
+|---|---|
+| Compare | compare_20261006-120000 |
+| Base model | Qwen/Qwen3-4B |
+| GGUF | Q4_K_M, llama.cpp b11320, SHA-256 abababababab |
+| Hardware | AMD EPYC 7413, CPU (ubuntu-x64) |
+| Judge | openrouter/deepseek/deepseek-r1 |
+| Questions | 8 |
+| Date | 2026-10-06T12:00:00Z |
+
+## Summary
+
+| Measure | Value |
+|---|---|
+| Win or tie | 71.4% |
+| Wins / ties / losses | 4 / 1 / 2 |
+| Unparsed verdicts (not counted) | 1 |
+| Child errors (counted as losses) | 1 |
+| Latency p50 / p95 | 1.00 s / 2.00 s |
+| Time to first token p50 | 0.05 s |
+| Output tokens per second | 60.0 |
+| Parent cost per 1,000 requests | not computed: set [compare] prices |
+| Child cost per 1,000 requests | not computed: set [compare] prices |
+| Child cost / parent cost | - |
+
+## Losses (first 2 of 2)
+
+### q7: Question 7: why does the borrow checker refuse this?
+
+Child:
+
+> (no answer: timed out)
+
+Parent:
+
+> Parent answer 7.
+
+### q6: Question 6: why does the borrow checker refuse this?
+
+Child:
+
+> Child answer 6.
+
+Parent:
+
+> Parent answer 6.
+
+Judge: Reason 6.
+
+## Wins (first 4 of 4)
+
+### q1: Question 1: why does the borrow checker refuse this?
+
+Child:
+
+> Child answer 1.
+
+Parent:
+
+> Parent answer 1.
+
+Judge: Reason 1.
+
+### q2: Question 2: why does the borrow checker refuse this?
+
+Child:
+
+> Child answer 2.
+
+Parent:
+
+> Parent answer 2.
+
+Judge: Reason 2.
+
+### q3: Question 3: why does the borrow checker refuse this?
+
+Child:
+
+> Child answer 3.
+
+Parent:
+
+> Parent answer 3.
+
+Judge: Reason 3.
+
+### q4: Question 4: why does the borrow checker refuse this?
+
+Child:
+
+> Child answer 4.
+
+Parent:
+
+> Parent answer 4.
+
+Judge: Reason 4.
+
+## Limits
+
+- 8 questions: a small sample, the rates move by several points from one set to another.
+- Requests were sent one at a time: the latency is that of one user, and the child cost an upper bound (a server under load answers several requests at once).
+- The child ran on a CPU.
