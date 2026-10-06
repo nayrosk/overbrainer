@@ -21,6 +21,7 @@ source: src/compare/report.rs
 | Wins / ties / losses | 4 / 1 / 2 |
 | Unparsed verdicts (not counted) | 1 |
 | Child errors (counted as losses) | 1 |
+| Child answers cut at the token limit | 0 |
 | Latency p50 / p95 | 1.00 s / 2.00 s |
 | Time to first token p50 | 0.05 s |
 | Output tokens per second | 60.0 |

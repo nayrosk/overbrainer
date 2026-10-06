@@ -37,6 +37,10 @@ pub struct Summary {
     pub unparsed: usize,
     /// Questions the child gave no answer to: counted as losses in the rate.
     pub errors: usize,
+    /// Child answers cut at the token limit (`finish` is `length`): the
+    /// judge sees them as they are, cut.
+    #[serde(default)]
+    pub truncated: usize,
     /// `(wins + ties) / (questions - unparsed)`, when any question counts.
     pub win_or_tie: Option<f64>,
     /// Median seconds per answer.
@@ -51,7 +55,8 @@ pub struct Summary {
     pub mean_seconds: Option<f64>,
 }
 
-/// Sums up `verdicts` and the timings of `answers` (failed answers have none).
+/// Sums up `verdicts`, the timings of `answers` (failed answers have none)
+/// and the answers cut at the token limit.
 #[must_use]
 pub fn summarize(verdicts: &[VerdictLine], answers: &[ChildAnswer]) -> Summary {
     let count = |verdict| {
@@ -88,6 +93,10 @@ pub fn summarize(verdicts: &[VerdictLine], answers: &[ChildAnswer]) -> Summary {
         losses,
         unparsed,
         errors,
+        truncated: answers
+            .iter()
+            .filter(|answer| !answer.is_error() && answer.finish.as_deref() == Some("length"))
+            .count(),
         win_or_tie: (counted > 0).then(|| count_f64(wins + ties) / count_f64(counted)),
         latency_p50: percentile(&seconds, 50),
         latency_p95: percentile(&seconds, 95),
@@ -171,6 +180,31 @@ mod tests {
         assert!(close(summary.latency_p95, 4.0));
         assert!(close(summary.mean_seconds, 2.5));
         assert!(close(summary.tokens_per_second, 50.0));
+    }
+
+    /// Child answers cut at the token limit (`finish` is `length`) are
+    /// counted; failed answers and other finish reasons are not.
+    #[test]
+    fn answers_cut_at_the_token_limit_are_counted() {
+        let cut = |id: &str, finish: &str| ChildAnswer {
+            finish: Some(finish.into()),
+            ..answer(id, 1.0)
+        };
+        let failed = ChildAnswer {
+            id: "q4".into(),
+            finish: Some("length".into()),
+            error: Some("timeout".into()),
+            ..ChildAnswer::default()
+        };
+        let answers = [
+            cut("q1", "length"),
+            cut("q2", "length"),
+            cut("q3", "stop"),
+            failed,
+        ];
+        let summary = summarize(&[line("q1", Verdict::Loss)], &answers);
+        assert_eq!(summary.truncated, 2);
+        assert_eq!(summarize(&[], &[]).truncated, 0);
     }
 
     /// Nothing judged: no rate, no latency.

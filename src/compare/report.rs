@@ -330,6 +330,10 @@ fn render_summary(text: &mut String, report: &Report) {
             summary.errors.to_string(),
         ),
         (
+            "Child answers cut at the token limit",
+            summary.truncated.to_string(),
+        ),
+        (
             "Latency p50 / p95",
             format!(
                 "{} / {}",
@@ -439,6 +443,17 @@ fn render_limits(text: &mut String, report: &Report) {
     if report.child_price_from_pod {
         limits.push("The child's hourly price is the Runpod pod's.".to_string());
     }
+    if summary.truncated > 0 {
+        let answers = if summary.truncated == 1 {
+            "child answer"
+        } else {
+            "child answers"
+        };
+        limits.push(format!(
+            "{} {answers} hit the token limit; raise [compare] max_tokens or the context.",
+            summary.truncated
+        ));
+    }
     if report
         .hardware
         .as_ref()
@@ -481,10 +496,18 @@ mod tests {
         Ok(())
     }
 
-    /// Without prices, on a CPU: the cost rows say why they are missing.
+    /// Without prices, on a CPU, with two child answers cut at the token
+    /// limit: the cost rows say why they are missing, and the limits name
+    /// the CPU and the cut answers.
     #[test]
     fn report_without_prices_on_cpu() -> TestResult {
-        let (setup, answers, verdicts, role) = (setup(), answers(), verdicts(), judge()?);
+        let (setup, mut answers, verdicts, role) = (setup(), answers(), verdicts(), judge()?);
+        for answer in answers
+            .iter_mut()
+            .filter(|answer| answer.id == "q5" || answer.id == "q6")
+        {
+            answer.finish = Some("length".into());
+        }
         let report = build(&Parts {
             setup: &setup,
             answers: &answers,
@@ -502,6 +525,7 @@ mod tests {
             prices: Prices::default(),
             child_price_from_pod: false,
         });
+        assert_eq!(report.summary.truncated, 2);
         snapshot("report_without_prices_on_cpu", &render_markdown(&report));
         Ok(())
     }
