@@ -1555,7 +1555,11 @@ impl App {
             Action::ClearFailed(runs) => self.clear_failed(&runs),
             Action::Push(run) => self.confirm_push(run),
             Action::Compare(args) => self.confirm_compare(args),
-            Action::CancelCompare(task) => vec![Effect::Abandon(task)],
+            Action::CancelCompare(task) if self.is_compare(task) => vec![Effect::Abandon(task)],
+            Action::CancelCompare(_) => {
+                self.say(Severity::Info, "the compare already ended");
+                Vec::new()
+            },
             Action::Remove(removal) => self.remove(&removal),
             Action::Delete { deletion, counts } => {
                 if self.locked() {

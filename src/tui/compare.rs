@@ -735,6 +735,22 @@ mod tests {
         assert_eq!(effects, vec![Effect::Abandon(task)]);
     }
 
+    /// A compare that ended while the dialog was open is not abandoned: the
+    /// status says it already ended.
+    #[test]
+    fn cancelling_an_ended_compare_only_says_so() {
+        let mut app = app();
+        app.view = View::Compare;
+        let task = app.task_id();
+        app.compare.running = Some(Comparing::new(task, None, false));
+        press(&mut app, &[KeyCode::Char('c')]);
+        app.compare.running = None;
+        let effects = press(&mut app, &[KeyCode::Char('y')]);
+        assert_eq!(effects, Vec::new());
+        let status = app.status.as_ref().map(|s| (s.severity, s.text.as_str()));
+        assert_eq!(status, Some((Severity::Info, "the compare already ended")));
+    }
+
     /// The progress reads the job's lines, then the judge's.
     #[test]
     fn the_progress_follows_the_job_then_the_judge() {
