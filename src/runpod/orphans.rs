@@ -159,8 +159,11 @@ struct Unlisted {
 /// What `runs/` holds, read once: the runs, and the jobs (exports and
 /// compares) inside them.
 struct Known<'a> {
+    /// The project's runs.
     runs: &'a Runs,
+    /// The run records of the runs and of their jobs, by ID.
     run_records: HashMap<String, RunRecord>,
+    /// The readable pod records of those runs and jobs, by ID.
     pod_records: HashMap<String, PodRecord>,
     /// The jobs, by ID: the run each is a job of, its kind, and the runs
     /// holding it (`runs/<run-id>/exports/` or `runs/<run-id>/compares/`).

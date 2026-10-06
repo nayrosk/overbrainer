@@ -150,6 +150,8 @@ mod tests {
 
     use super::*;
 
+    /// Each default prompt, the judge's included, renders with the variables
+    /// its docs name.
     #[test]
     fn defaults_render_with_their_documented_variables() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;

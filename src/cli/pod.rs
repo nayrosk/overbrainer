@@ -133,6 +133,8 @@ async fn ls(ctx: &PodCtx<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pod rm`: deletes the pods of run or job `run_id` and prints each one; a
+/// running export or compare is refused with how to stop it instead.
 async fn rm(ctx: &PodCtx<'_>, run_id: &str, force: bool) -> anyhow::Result<()> {
     let removal = remove_run_pods(ctx, run_id, force).await;
     if removal.removed.is_empty() && removal.result.is_ok() {

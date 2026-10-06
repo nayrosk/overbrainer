@@ -105,6 +105,7 @@ pub fn env() -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
+    /// Every pinned digest is 64 lowercase hex digits.
     #[test]
     fn every_digest_is_a_sha256_in_lowercase_hex() {
         for digest in [
@@ -128,6 +129,8 @@ mod tests {
         }
     }
 
+    /// The script's environment holds the release tag, the CUDA version and
+    /// every build's digest.
     #[test]
     fn the_script_gets_the_tag_and_every_digest() {
         let env = env();
