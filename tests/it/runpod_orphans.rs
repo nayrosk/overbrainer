@@ -786,6 +786,8 @@ fn export_recorded(
     Ok(())
 }
 
+/// Export pods are listed with their export, confirmed gone in the export's own
+/// `pod.json`, and removed by the export's ID through `find_job`.
 #[tokio::test]
 async fn export_pods_are_listed_with_their_export_and_removed_by_its_id() -> TestResult {
     let harness = Harness::new(Account::default().with("x1", Some(EXPORT), true)).await?;
@@ -827,7 +829,7 @@ async fn export_pods_are_listed_with_their_export_and_removed_by_its_id() -> Tes
     assert!(PodRecord::load(&harness.runs, GONE_EXPORT)?.is_none());
 
     // `pod rm <export-id>` works on the export's own runs.
-    let found = harness.runs.find_export(EXPORT).ok_or("export not found")?;
+    let found = harness.runs.find_job(EXPORT).ok_or("export not found")?;
     let ctx = PodCtx {
         runs: &found,
         ..harness.ctx()

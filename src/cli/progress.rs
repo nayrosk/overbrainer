@@ -80,8 +80,9 @@ struct Progress {
     phase: Option<Phase>,
     /// The next tenth of the evaluation told to tell.
     eval_tenth: u64,
-    /// Whether the followed job is an export: its lines say `export:`.
-    export: bool,
+    /// The kind of the followed job when it is not a training job: its lines
+    /// say `export:` or `compare:`.
+    job: Option<crate::runs::JobKind>,
 }
 
 impl Progress {
@@ -175,9 +176,9 @@ impl Progress {
     }
 
     /// What the followed job's lines start with: `export` for an export,
-    /// `train` otherwise.
+    /// `compare` for a compare, else `train`.
     fn subject(&self) -> &'static str {
-        if self.export { "export" } else { "train" }
+        self.job.map_or("train", crate::runs::JobKind::noun)
     }
 
     /// Takes `event` into account for the followed run's phase; returns the
@@ -187,8 +188,8 @@ impl Progress {
             Event::Metric(metric) => self.phases.metric(metric),
             Event::Mark(mark) => self.phases.mark(*mark),
             Event::JobStatus(status) => self.exited = status.is_finished(),
-            Event::RunWatched { export, .. } => {
-                self.export = *export;
+            Event::RunWatched { job, .. } => {
+                self.job = *job;
                 self.phases = Phases::default();
                 self.exited = false;
                 self.phase = None;
@@ -490,14 +491,17 @@ mod tests {
         assert_eq!(metric_line(&bare), "step 3, eval_loss 1.0000");
     }
 
+    /// An export's lines say `export:`, and the next training job followed
+    /// on the same bus says `train:` again.
     #[test]
     fn an_export_s_lines_say_export() {
+        use crate::runs::JobKind;
         use crate::train::{JobStage, Mark};
         let mut progress = Progress::default();
         assert_eq!(progress.subject(), "train");
-        let watched = |export| Event::RunWatched {
+        let watched = |export: bool| Event::RunWatched {
             run_id: "e1".into(),
-            export,
+            job: export.then_some(JobKind::Export),
         };
         progress.log(&watched(true));
         assert_eq!(progress.subject(), "export");
@@ -516,6 +520,8 @@ mod tests {
         );
     }
 
+    /// The phase of a followed run is told each time it changes, and the
+    /// evaluation by tenths.
     #[test]
     fn the_phase_is_told_as_it_changes() {
         use crate::train::{JobStage, Mark};
@@ -529,7 +535,7 @@ mod tests {
         let events = [
             Event::RunWatched {
                 run_id: "r1".into(),
-                export: false,
+                job: None,
             },
             Event::JobStatus(JobStatus::Running),
             Event::Mark(Mark::Stage(JobStage::Train)),

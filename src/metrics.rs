@@ -936,6 +936,8 @@ mod tests {
         Ok(())
     }
 
+    /// Training metrics are labelled with the run their bus watches, named by
+    /// the last [`Event::RunWatched`].
     #[test]
     fn training_metrics_carry_the_run_their_bus_watches() -> TestResult {
         let metrics = Metrics::new(&[]);
@@ -945,7 +947,7 @@ mod tests {
             2,
             &Event::RunWatched {
                 run_id: "20260928-100000-a1b2".into(),
-                export: false,
+                job: None,
             },
         );
         metrics.event(2, &Event::Metric(metric(5, Some(1.5), None)));
@@ -962,6 +964,7 @@ mod tests {
         Ok(())
     }
 
+    /// The phase of a followed run shows as a gauge until its bus closes.
     #[test]
     fn the_phase_of_a_followed_run_shows_until_its_bus_closes() -> TestResult {
         use crate::exec::JobStatus;
@@ -979,7 +982,7 @@ mod tests {
             4,
             &Event::RunWatched {
                 run_id: run.into(),
-                export: false,
+                job: None,
             },
         );
         metrics.event(
@@ -1053,6 +1056,7 @@ mod tests {
         crate::system::parse(&output, UNIX_EPOCH + Duration::from_secs(1000), None)
     }
 
+    /// The target machine's figures show in base units until the bus closes.
     #[test]
     fn the_target_machine_shows_in_base_units_until_the_bus_closes() -> TestResult {
         let metrics = Metrics::new(&[]);
@@ -1064,7 +1068,7 @@ mod tests {
             1,
             &Event::RunWatched {
                 run_id: run_id.into(),
-                export: false,
+                job: None,
             },
         );
         metrics.event(1, &Event::Metric(metric(5, Some(1.5), None)));

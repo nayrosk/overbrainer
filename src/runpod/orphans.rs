@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use crate::runs::{RECORD_FILE, RunRecord, RunState, Runs, RunsError};
+use crate::runs::{JobKind, RECORD_FILE, RunRecord, RunState, Runs, RunsError};
 
 use super::flow::{Look, look_up_all, mark_gone};
 use super::provision::{delete_confirmed, one_line};
@@ -156,14 +156,15 @@ struct Unlisted {
     stray: bool,
 }
 
-/// What `runs/` holds, read once: the runs, and the exports inside them.
+/// What `runs/` holds, read once: the runs, and the jobs (exports and
+/// compares) inside them.
 struct Known<'a> {
     runs: &'a Runs,
     run_records: HashMap<String, RunRecord>,
     pod_records: HashMap<String, PodRecord>,
-    /// The exports, by ID: the run each exports, and the runs holding it
-    /// (`runs/<run-id>/exports/`).
-    exports: HashMap<String, (String, Runs)>,
+    /// The jobs, by ID: the run each is a job of, its kind, and the runs
+    /// holding it (`runs/<run-id>/exports/` or `runs/<run-id>/compares/`).
+    jobs: HashMap<String, (String, JobKind, Runs)>,
 }
 
 impl<'a> Known<'a> {
@@ -176,21 +177,23 @@ impl<'a> Known<'a> {
             .into_iter()
             .map(|run| (run.id.clone(), run))
             .collect();
-        let mut exports = HashMap::new();
+        let mut jobs = HashMap::new();
         for run_id in run_records.keys() {
-            let held = runs.exports(run_id)?;
-            for export in held.list()? {
-                exports.insert(export.id.clone(), (run_id.clone(), held.clone()));
+            for kind in JobKind::ALL {
+                let held = runs.jobs(run_id, kind)?;
+                for job in held.list()? {
+                    jobs.insert(job.id.clone(), (run_id.clone(), kind, held.clone()));
+                }
             }
         }
-        for (id, (_, held)) in &exports {
+        for (id, (_, _, held)) in &jobs {
             if let Ok(record) = held.load(id) {
                 run_records.insert(id.clone(), record);
             }
         }
         let mut pod_records = HashMap::new();
         for id in run_records.keys() {
-            let home = exports.get(id).map_or(runs, |(_, held)| held);
+            let home = jobs.get(id).map_or(runs, |(_, _, held)| held);
             match PodRecord::load(home, id) {
                 Ok(Some(record)) => {
                     pod_records.insert(id.clone(), record);
@@ -205,13 +208,13 @@ impl<'a> Known<'a> {
             runs,
             run_records,
             pod_records,
-            exports,
+            jobs,
         })
     }
 
-    /// The runs holding the run or export `id`.
+    /// The runs holding the run or job `id`.
     fn home(&self, id: &str) -> &Runs {
-        self.exports.get(id).map_or(self.runs, |(_, held)| held)
+        self.jobs.get(id).map_or(self.runs, |(_, _, held)| held)
     }
 
     /// The rows of the pods of `pods` that overbrainer created: those with a run
@@ -304,10 +307,10 @@ impl<'a> Known<'a> {
             },
             (_, ended) => (RowKind::Ended, format!("run {}, not deleted", ended.name())),
         };
-        match self.exports.get(run) {
-            Some((parent, _)) => {
+        match self.jobs.get(run) {
+            Some((parent, job, _)) => {
                 let note = note.strip_prefix("run ").unwrap_or(&note);
-                (kind, format!("export of run {parent}: {note}"))
+                (kind, format!("{} of run {parent}: {note}", job.noun()))
             },
             None => (kind, note),
         }

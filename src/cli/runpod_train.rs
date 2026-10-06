@@ -836,16 +836,17 @@ fn pod_name(pod: &PodRecord) -> String {
         .map_or_else(|| "(none)".to_string(), ToString::to_string)
 }
 
+/// The warning of `--keep-pod` for the pod of `id`, a run or a job (an export
+/// or a compare) of `runs`: nothing deletes the pod once it ends.
 fn keep_warning(pod: &PodRecord, runs: &Runs, id: &str) -> String {
     let rate = pod.cost_per_hour.map_or_else(
         || "at an hourly rate Runpod did not give".to_string(),
         |rate| format!("at ${rate:.2}/h"),
     );
-    let ends = if runs.export_of().is_some() {
-        "the export"
-    } else {
-        "the run"
-    };
+    let ends = runs.job_of().map_or_else(
+        || "the run".to_string(),
+        |(_, kind)| format!("the {}", kind.noun()),
+    );
     format!(
         "--keep-pod: pod {} is kept with no time limit, {rate}, even once {ends} ends; \
          nothing deletes it but `overbrainer pod rm {id}`",
