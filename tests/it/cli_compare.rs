@@ -352,7 +352,8 @@ async fn a_failed_judge_keeps_its_verdicts_and_a_rejudge_resumes() -> TestResult
     let asked = prompts(&server).await;
     let resumed = asked.get(before..).unwrap_or_default();
     assert_eq!(resumed.len(), 1, "{resumed:?}");
-    assert!(resumed[0].contains("What is a lifetime?"), "{resumed:?}");
+    let first = resumed.first().ok_or("no prompt resumed")?;
+    assert!(first.contains("What is a lifetime?"), "{resumed:?}");
     let json: Value = serde_json::from_str(&fs::read_to_string(compare.join("compare.json"))?)?;
     assert_eq!(json["summary"]["wins"], 2);
     assert_eq!(json["summary"]["losses"], 1);
