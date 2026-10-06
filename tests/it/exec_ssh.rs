@@ -797,6 +797,26 @@ async fn builtin_child_under_a_broken_ssh() -> TestResult {
     Ok(())
 }
 
+/// Fails with a clear message when the target has no `python3`: the compare
+/// job runs through a Python trampoline, so without it the job only exits 127.
+async fn require_python3(executor: &SshExecutor) -> TestResult {
+    let dir = format!("{}/python3", executor.workdir());
+    let found = probe(
+        executor,
+        dir,
+        "if command -v python3 >/dev/null 2>&1; then echo found; else echo missing; fi\n",
+    )
+    .await?;
+    if found.lines().any(|line| line == "found") {
+        Ok(())
+    } else {
+        Err(
+            "the SSH test target has no python3, which the compare job needs: install it there"
+                .into(),
+        )
+    }
+}
+
 /// A compare job runs over SSH: the fake llama-server is put in the target's
 /// llama.cpp cache, the job answers, its answers come back.
 #[tokio::test]
@@ -811,6 +831,7 @@ async fn a_compare_job_answers_over_ssh() -> TestResult {
             skip();
             return Ok(());
         };
+        require_python3(&executor).await?;
         let cache = format!("{}/.cache/llama.cpp/{LLAMA_CPP_TAG}", executor.workdir());
         let install = format!(
             "mkdir -p {cache}\ncat > {cache}/fake-server <<'EOF'\n{FAKE_LLAMA_SERVER}EOF\n\
@@ -871,7 +892,8 @@ async fn a_compare_job_answers_over_ssh() -> TestResult {
         );
         let answers = overbrainer::compare::read_answers(&compares.run_dir(&outcome.record.id)?)?;
         assert_eq!(answers.len(), 1);
-        assert_eq!(answers[0].answer.as_deref(), Some("Child: Why?"));
+        let answer = answers.first().ok_or("no answer came back")?;
+        assert_eq!(answer.answer.as_deref(), Some("Child: Why?"));
         Ok(())
     })
     .await
