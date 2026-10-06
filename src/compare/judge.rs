@@ -221,7 +221,8 @@ pub async fn judge_all<C: LlmClient>(
 
 /// The verdict of `question` against the child's answer `child`, its order
 /// from `seed`: [`Verdict::Error`] without an answer, [`Verdict::Unparsed`]
-/// when the reply does not parse, asked [`ASKS`] times.
+/// when the reply, its reasoning blocks removed, does not parse, asked
+/// [`ASKS`] times.
 async fn judge_one<C: LlmClient>(
     run: &JudgeRun<'_, C>,
     seed: u64,
@@ -264,7 +265,9 @@ async fn judge_one<C: LlmClient>(
             id: question.id.clone(),
             source,
         })?;
-        if let Some((pick, reason)) = parse_reply(&completion.content) {
+        // A reasoning block may draft a verdict: only the reply after it counts.
+        let reply = super::strip_reasoning(&completion.content);
+        if let Some((pick, reason)) = parse_reply(&reply) {
             let reason = (!reason.is_empty()).then_some(reason);
             return Ok(line(verdict_of(pick, first), reason));
         }
@@ -449,9 +452,20 @@ mod tests {
             }
             let a = prompt.split("Answer A:\n").nth(1).unwrap_or_default();
             let a = a.split("Answer B:\n").next().unwrap_or_default();
-            let pick = if a.contains("good") { "A" } else { "B" };
+            let (pick, other) = if a.contains("good") {
+                ("A", "B")
+            } else {
+                ("B", "A")
+            };
+            // A question holding `thinks` gets the wrong verdict drafted in
+            // a reasoning block first.
+            let draft = if prompt.contains("thinks") {
+                format!(r#"<think>Maybe {{"verdict": "{other}"}}?</think>"#)
+            } else {
+                String::new()
+            };
             Ok(format!(
-                r#"{{"verdict": "{pick}", "reason": "{pick} is good."}}"#
+                r#"{draft}{{"verdict": "{pick}", "reason": "{pick} is good."}}"#
             ))
         }
     }
@@ -589,6 +603,33 @@ mod tests {
             4,
             "nothing judged twice"
         );
+        Ok(())
+    }
+
+    /// A verdict drafted in the judge's reasoning block is not taken for
+    /// its answer: only the reply after the block counts.
+    #[tokio::test]
+    async fn the_judge_reasoning_block_is_not_the_verdict() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let prompts = Prompts::load(dir.path())?;
+        let role = role()?;
+        let setup = setup_of(&["thinks Q0?", "thinks Q1?"]);
+        let answers = [child(0, Some("A good answer.")), child(1, Some("Weak."))];
+        let judge = FakeJudge::new();
+        let bus = EventBus::new();
+        let run = JudgeRun {
+            client: &judge,
+            role: &role,
+            prompts: &prompts,
+            policy: RetryPolicy::new(0),
+            concurrency: 1,
+            bus: &bus,
+            compare: "c1",
+        };
+        let file = dir.path().join("verdicts-x.jsonl");
+        let verdicts = judge_all(&run, &setup, &answers, &file).await?;
+        let got: Vec<Verdict> = verdicts.iter().map(|line| line.verdict).collect();
+        assert_eq!(got, [Verdict::Win, Verdict::Loss]);
         Ok(())
     }
 
