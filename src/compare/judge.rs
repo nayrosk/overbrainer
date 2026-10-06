@@ -46,14 +46,22 @@ pub enum Pick {
 
 /// The judge's reply parsed: its pick and its reason, trimmed. `None` when
 /// the reply holds no JSON object whose `verdict` is A, B or tie (any case).
+/// Each `{` is tried in order, so braces in the text around the object do
+/// not hide it: the first object with a valid verdict wins.
 #[must_use]
 pub fn parse_reply(reply: &str) -> Option<(Pick, String)> {
-    let start = reply.find('{')?;
-    let end = reply.rfind('}')?;
-    if end < start {
-        return None;
-    }
-    let value: Value = serde_json::from_str(&reply[start..=end]).ok()?;
+    reply
+        .match_indices('{')
+        .find_map(|(start, _)| parse_object(&reply[start..]))
+}
+
+/// The pick and reason of the JSON object `text` starts with, whatever
+/// follows it; `None` when it starts with no object with a valid verdict.
+fn parse_object(text: &str) -> Option<(Pick, String)> {
+    let value = serde_json::Deserializer::from_str(text)
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
     let pick = match value
         .get("verdict")?
         .as_str()?
@@ -334,6 +342,29 @@ mod tests {
         assert_eq!(parse_reply("} {"), None);
     }
 
+    /// Braces in the text before or after the JSON object do not hide it:
+    /// the first object with a valid verdict wins.
+    #[test]
+    fn replies_parse_with_braces_around_the_object() {
+        assert_eq!(
+            parse_reply(
+                "Answer A uses {braces} and a set {1, 2}.\n{\"verdict\": \"A\", \"reason\": \"Fuller.\"}"
+            ),
+            Some((Pick::A, "Fuller.".to_string()))
+        );
+        assert_eq!(
+            parse_reply("{\"verdict\": \"B\", \"reason\": \"Right.\"}\nNote: see {x}."),
+            Some((Pick::B, "Right.".to_string()))
+        );
+        assert_eq!(
+            parse_reply(
+                "Like {\"verdict\": \"C\"} is wrong; {\"verdict\": \"tie\", \"reason\": \"Same.\"} {end}"
+            ),
+            Some((Pick::Tie, "Same.".to_string()))
+        );
+        assert_eq!(parse_reply("{a} {\"verdict\": \"maybe\"} }"), None);
+    }
+
     /// A pick for A or B is mapped back to the child through the order.
     #[test]
     fn a_pick_maps_back_to_the_child() {
@@ -425,7 +456,9 @@ mod tests {
         }
     }
 
+    /// The fake judge as a client: completions only.
     impl LlmClient for FakeJudge {
+        /// Counts the call and answers with [`FakeJudge::reply`].
         fn complete(
             &self,
             request: CompletionRequest,
@@ -440,6 +473,7 @@ mod tests {
             }))
         }
 
+        /// Unsupported: the judge never embeds.
         fn embed(
             &self,
             _inputs: &[String],
