@@ -30,8 +30,9 @@ use crate::train::{
     top_level_scalar,
 };
 
-/// The export script, written into the job directory.
-pub const EXPORT_SCRIPT: &str = include_str!("export.sh");
+/// The export script, written into the job directory: the llama.cpp helpers
+/// it shares with the compare script, then its own code.
+pub const EXPORT_SCRIPT: &str = concat!(include_str!("llama_cpp.sh"), include_str!("export.sh"));
 
 /// The export script's file name, in the job directory.
 pub const SCRIPT_FILE: &str = "export.sh";

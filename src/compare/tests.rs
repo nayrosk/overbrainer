@@ -167,7 +167,7 @@ impl Fixture {
         } else {
             (ModelSource::Upload(gguf), MODEL_FILE.to_string())
         };
-        let job = CompareJob::new(source, questions(texts), SETTINGS);
+        let job = CompareJob::new(source, questions(texts), SETTINGS)?;
         let job_dir = path.join("job");
         job.prepare(&job_dir, &job_dir.to_string_lossy())?;
         Ok(Self {
@@ -235,8 +235,12 @@ fn a_prepared_job_holds_what_the_target_needs() -> TestResult {
     let gguf = dir.path().join("child.gguf");
     std::fs::write(&gguf, "gguf")?;
     let job_dir = dir.path().join("job");
-    CompareJob::new(ModelSource::Upload(gguf), questions(&["Why?"]), SETTINGS)
-        .prepare(&job_dir, "/w/job")?;
+    let job = CompareJob::new(ModelSource::Upload(gguf), questions(&["Why?"]), SETTINGS)?;
+    job.prepare(&job_dir, "/w/job")?;
+    assert!(job.env("/w/job").contains(&(
+        "OVERBRAINER_COMPARE_DISCARD_MODEL".to_string(),
+        "1".to_string()
+    )));
     for file in [SCRIPT_FILE, CLIENT_FILE, QUESTIONS_FILE, MODEL_FILE] {
         assert!(job_dir.join(file).is_file(), "{file} missing");
     }
@@ -260,8 +264,14 @@ fn a_job_with_its_model_on_the_target_uploads_none() -> TestResult {
         ModelSource::OnTarget("/w/r1/output/gguf/r1-Q4_K_M.gguf".into()),
         questions(&["Why?"]),
         SETTINGS,
-    );
+    )?;
     job.prepare(dir.path(), "/w/job")?;
+    assert!(
+        job.env("/w/job")
+            .iter()
+            .all(|(name, _)| name != "OVERBRAINER_COMPARE_DISCARD_MODEL"),
+        "a model on the target is never discarded"
+    );
     assert!(dir.path().join(SCRIPT_FILE).is_file());
     assert!(!dir.path().join(MODEL_FILE).exists());
     assert!(job.env("/w/job").contains(&(
@@ -269,6 +279,21 @@ fn a_job_with_its_model_on_the_target_uploads_none() -> TestResult {
         "/w/r1/output/gguf/r1-Q4_K_M.gguf".to_string()
     )));
     Ok(())
+}
+
+/// Checks that `answer` is the fake server's answer to `question`, with
+/// its tokens, finish reason and timings.
+fn assert_measured(answer: &ChildAnswer, question: &str) {
+    assert_eq!(
+        answer.answer.as_deref(),
+        Some(format!("Child says: {question}").as_str())
+    );
+    assert_eq!(answer.output_tokens, Some(3));
+    assert_eq!(answer.input_tokens, Some(7));
+    assert_eq!(answer.finish.as_deref(), Some("stop"));
+    assert!(answer.tokens_per_second.is_some_and(|rate| rate > 0.0));
+    assert!(answer.seconds.is_some_and(|seconds| seconds > 0.0));
+    assert!(answer.first_token_seconds.is_some());
 }
 
 /// Every question is answered and measured; progress lines go to the metrics
@@ -286,13 +311,8 @@ fn every_question_is_answered_and_measured() -> TestResult {
     let job_dir = fixture.job_dir();
     let answers = read_answers(&job_dir)?;
     assert_eq!(answers.len(), 2);
-    assert_eq!(
-        answers[0].answer.as_deref(),
-        Some("Child says: Why borrow?")
-    );
-    assert_eq!(answers[0].output_tokens, Some(3));
-    assert!(answers[0].seconds.is_some_and(|seconds| seconds > 0.0));
-    assert!(answers[0].first_token_seconds.is_some());
+    assert_measured(&answers[0], "Why borrow?");
+    assert_measured(&answers[1], "What is a lifetime?");
     let hardware = read_hardware(&job_dir).ok_or("no hardware.json")?;
     assert_eq!(hardware.build, "ubuntu-x64");
     assert!(hardware.gpus.is_empty(), "{:?}", hardware.gpus);
@@ -411,7 +431,12 @@ fn a_release_with_another_digest_is_never_used() -> TestResult {
     fixture.bin_sha = "0".repeat(64);
     let output = fixture.run("ok")?;
     assert!(!output.status.success());
-    assert!(text(&output).contains("not used"), "{}", text(&output));
+    let said = text(&output);
+    assert!(said.contains("compare: file://"), "{said}");
+    assert!(
+        said.contains(&format!("expected {}: not used", "0".repeat(64))),
+        "{said}"
+    );
     let cache = fixture
         .root
         .path()
@@ -470,12 +495,10 @@ fn pick_build(
     if let Some(body) = smi {
         stub(&stubs, "nvidia-smi", body)?;
     }
-    // The script's functions without its last line, which runs `main`.
-    let functions = SCRIPT
-        .strip_suffix("main \"$@\"\n")
-        .ok_or("compare.sh does not end with main \"$@\"")?;
+    // Sourced with OVERBRAINER_COMPARE_SOURCED set, the script defines its
+    // functions and does not run `main`.
     let library = dir.path().join("functions.sh");
-    std::fs::write(&library, functions)?;
+    std::fs::write(&library, SCRIPT)?;
     let output = Command::new("/bin/sh")
         .arg("-c")
         .arg(r#". "$1"; pick_build; printf '%s\n' "$asset" "$digest" "$cudart" "$cudart_digest""#)
@@ -483,6 +506,7 @@ fn pick_build(
         .arg(&library)
         .env_clear()
         .env("PATH", &stubs)
+        .env("OVERBRAINER_COMPARE_SOURCED", "1")
         .envs(crate::export::llama_cpp_env())
         .output()?;
     if !output.status.success() {
@@ -567,7 +591,7 @@ fn the_build_matches_the_platform_and_the_gpu() -> TestResult {
 
 /// The trainer side: its command, environment, stage and artifacts.
 #[test]
-fn the_job_runs_compare_sh_with_its_settings() {
+fn the_job_runs_compare_sh_with_its_settings() -> TestResult {
     let job = CompareJob::new(
         ModelSource::Upload(PathBuf::from("/m.gguf")),
         Vec::new(),
@@ -577,7 +601,7 @@ fn the_job_runs_compare_sh_with_its_settings() {
             server_start_secs: 120,
             context: 4096,
         },
-    );
+    )?;
     let env = job.env("/w/r1/compares/c1");
     let get = |name: &str| {
         env.iter()
@@ -606,6 +630,22 @@ fn the_job_runs_compare_sh_with_its_settings() {
     }
     assert!(job.caches_tools());
     assert!(!job.metrics_required());
+    Ok(())
+}
+
+/// A GGUF on the target is named by its absolute path: a relative one is
+/// refused, as the job could not tell where it is.
+#[test]
+fn a_relative_model_path_on_the_target_is_refused() {
+    let job = CompareJob::new(
+        ModelSource::OnTarget("output/gguf/r1-Q4_K_M.gguf".into()),
+        Vec::new(),
+        SETTINGS,
+    );
+    assert!(
+        matches!(job, Err(CompareError::RelativeModel(ref path)) if path == "output/gguf/r1-Q4_K_M.gguf"),
+        "{job:?}"
+    );
 }
 
 /// `[compare]` and the run's context give the child's settings.

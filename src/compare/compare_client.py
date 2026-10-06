@@ -5,6 +5,7 @@ job's runtime and its standard library only.
 """
 
 import argparse
+import http.client
 import json
 import os
 import platform
@@ -42,6 +43,8 @@ def alive(pid):
         with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as file:
             return file.read().rsplit(") ", 1)[-1][:1] not in ("Z", "X")
     except FileNotFoundError:
+        # No /proc (macOS): kill(pid, 0) succeeds on an unreaped zombie, so
+        # a dead server still looks alive there.
         pass
     except OSError:
         return True
@@ -203,7 +206,7 @@ def main():
         for step, question in enumerate(questions, 1):
             try:
                 line = ask(base, question, settings)
-            except (urllib.error.URLError, OSError, ValueError) as error:
+            except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as error:
                 if exited(args.server_pid):
                     fail("llama-server exited while answering:\n" + tail(LOG))
                 line = {"id": question["id"], "error": str(error)}

@@ -5,8 +5,9 @@
 # The job writes the compare's stage event before it starts.
 # Read from the environment:
 #   OVERBRAINER_COMPARE_MODEL        the GGUF: model.gguf when uploaded with the
-#                                    job (removed after the run), else an
-#                                    absolute path on the target (kept)
+#                                    job, else an absolute path on the target
+#   OVERBRAINER_COMPARE_DISCARD_MODEL set when the GGUF was uploaded with the
+#                                    job: it is removed once the job ends
 #   OVERBRAINER_COMPARE_CTX          context size of the server, 0 for the model's own
 #   OVERBRAINER_COMPARE_MAX_TOKENS   limit of each answer
 #   OVERBRAINER_COMPARE_TEMPERATURE  sampling temperature
@@ -15,18 +16,12 @@
 #   OVERBRAINER_CACHE                cache holding llama.cpp, shared by the runs
 #   OVERBRAINER_LLAMA_CPP*           the pinned llama.cpp release and its digests
 #
-# Everything is a function; the last line runs `main`.
+# overbrainer puts the helpers of llama_cpp.sh (fail, say, fetch, unpack)
+# before this code. Everything is a function; the last line runs `main`,
+# unless OVERBRAINER_COMPARE_SOURCED is set (the tests source the functions).
 set -eu
 
-fail() {
-    printf 'compare: %s\n' "$*" >&2
-    exit 1
-}
-
-say() {
-    printf 'compare: %s\n' "$*"
-}
-
+# Prints `compare: warning: $*` on stderr: the job goes on.
 warn() {
     printf 'compare: warning: %s\n' "$*" >&2
 }
@@ -35,8 +30,8 @@ server_pid=
 model=
 
 # Stops the server (TERM, then KILL after 10 s) and removes the GGUF uploaded
-# with the job: it never stays on the target after the job. A GGUF that was
-# on the target already is left where it is.
+# with the job (OVERBRAINER_COMPARE_DISCARD_MODEL set): it never stays on the
+# target after the job. A GGUF that was on the target already is left there.
 cleanup() {
     if [ -n "$server_pid" ]; then
         kill "$server_pid" 2>/dev/null || true
@@ -50,44 +45,9 @@ cleanup() {
             sleep 0.2
         done
     fi
-    if [ "$model" = model.gguf ]; then
-        rm -f model.gguf
+    if [ -n "${OVERBRAINER_COMPARE_DISCARD_MODEL:-}" ] && [ -n "$model" ]; then
+        rm -f -- "$model"
     fi
-}
-
-# Downloads $1 to $3 and checks its SHA-256 against $2 before anything uses it.
-fetch() {
-    python3 - "$1" "$2" "$3" <<'EOF'
-import hashlib
-import os
-import sys
-import urllib.request
-
-url, expected, path = sys.argv[1:4]
-digest = hashlib.sha256()
-with urllib.request.urlopen(url, timeout=120) as answer, open(path, "wb") as file:
-    while True:
-        chunk = answer.read(1 << 20)
-        if not chunk:
-            break
-        digest.update(chunk)
-        file.write(chunk)
-if digest.hexdigest() != expected:
-    os.remove(path)
-    sys.exit(f"compare: {url} has SHA-256 {digest.hexdigest()}, expected {expected}: not used")
-EOF
-}
-
-# Extracts the archive at $2, whose top directory is $3, into $1 through a
-# temporary directory, so a reader never sees half of it.
-unpack() {
-    rm -rf "$1.tmp"
-    mkdir -p "$1.tmp"
-    tar -xzf "$2" -C "$1.tmp"
-    [ -d "$1.tmp/$3" ] || fail "$2 has no $3 directory"
-    rm -rf "$1"
-    mv "$1.tmp/$3" "$1"
-    rm -rf "$1.tmp" "$2"
 }
 
 # Prints the CUDA version the NVIDIA driver supports, from the
@@ -196,4 +156,4 @@ main() {
     python3 compare_client.py --port "$port" --server-pid "$server_pid" --build "$asset"
 }
 
-main "$@"
+[ -n "${OVERBRAINER_COMPARE_SOURCED:-}" ] || main "$@"

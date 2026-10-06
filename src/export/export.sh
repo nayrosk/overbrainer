@@ -4,6 +4,8 @@
 #
 # It works in its own directory: model and config paths are relative to it.
 # The job writes the export's stage event before it starts.
+# overbrainer puts the helpers of llama_cpp.sh (fail, say, fetch, unpack)
+# before this code.
 # Read from the environment:
 #   OVERBRAINER_EXPORT_NAME      name of the GGUF file (the run ID)
 #   OVERBRAINER_EXPORT_QUANTIZE  llama-quantize type; F16 and BF16 skip it
@@ -14,15 +16,6 @@
 set -eu
 
 cd "$(dirname -- "$0")"
-
-fail() {
-    printf 'export: %s\n' "$*" >&2
-    exit 1
-}
-
-say() {
-    printf 'export: %s\n' "$*"
-}
 
 name=$OVERBRAINER_EXPORT_NAME
 quantize=$OVERBRAINER_EXPORT_QUANTIZE
@@ -71,41 +64,6 @@ elif [ -f "$model/config.json" ]; then
 else
     fail "$model holds neither an adapter nor a model"
 fi
-
-# Downloads $1 to $3 and checks its SHA-256 against $2 before anything uses it.
-fetch() {
-    python3 - "$1" "$2" "$3" <<'EOF'
-import hashlib
-import os
-import sys
-import urllib.request
-
-url, expected, path = sys.argv[1:4]
-digest = hashlib.sha256()
-with urllib.request.urlopen(url, timeout=120) as answer, open(path, "wb") as file:
-    while True:
-        chunk = answer.read(1 << 20)
-        if not chunk:
-            break
-        digest.update(chunk)
-        file.write(chunk)
-if digest.hexdigest() != expected:
-    os.remove(path)
-    sys.exit(f"export: {url} has SHA-256 {digest.hexdigest()}, expected {expected}: not used")
-EOF
-}
-
-# Extracts the archive at $2, whose top directory is $3, into $1 through a
-# temporary directory, so a reader never sees half of it.
-unpack() {
-    rm -rf "$1.tmp"
-    mkdir -p "$1.tmp"
-    tar -xzf "$2" -C "$1.tmp"
-    [ -d "$1.tmp/$3" ] || fail "$2 has no $3 directory"
-    rm -rf "$1"
-    mv "$1.tmp/$3" "$1"
-    rm -rf "$1.tmp" "$2"
-}
 
 source_dir=$cache/source
 if [ ! -f "$source_dir/convert_hf_to_gguf.py" ]; then

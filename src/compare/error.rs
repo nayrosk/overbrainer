@@ -40,6 +40,9 @@ pub enum CompareError {
     /// The eval set has no question to ask.
     #[error("{} has no question with an answer: run `overbrainer split` first", .0.display())]
     NoQuestions(PathBuf),
+    /// The GGUF on the target is not named by an absolute path.
+    #[error("the GGUF on the target must be an absolute path, not {0}")]
+    RelativeModel(String),
     /// No compare has this ID.
     #[error("no compare {0} in runs/")]
     NotFound(String),

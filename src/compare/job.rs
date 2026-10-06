@@ -13,8 +13,12 @@ use super::{
 use crate::export::{PYTHON, TRAMPOLINE, link_file, llama_cpp_env};
 use crate::train::{Artifacts, JobStage, METRICS_ENV, METRICS_FILE, TrainError, Trainer};
 
-/// The job script, written into the job directory.
-pub const SCRIPT: &str = include_str!("compare.sh");
+/// The job script, written into the job directory: the llama.cpp helpers
+/// it shares with the export script, then its own code.
+pub const SCRIPT: &str = concat!(
+    include_str!("../export/llama_cpp.sh"),
+    include_str!("compare.sh")
+);
 
 /// The script's file name, in the job directory.
 pub const SCRIPT_FILE: &str = "compare.sh";
@@ -56,10 +60,12 @@ impl ChildSettings {
 pub enum ModelSource {
     /// The local GGUF at this path, hard-linked into the job directory as
     /// `model.gguf` and uploaded with it; the script removes it on the
-    /// target once it ends, and [`discard_model`] the local link.
+    /// target once it ends (`OVERBRAINER_COMPARE_DISCARD_MODEL`), and
+    /// [`discard_model`] the local link.
     Upload(PathBuf),
     /// The absolute path of a GGUF already on the target: nothing is
-    /// uploaded, and the script leaves it there.
+    /// uploaded, and the script leaves it there. [`CompareJob::new`] refuses
+    /// a relative one.
     OnTarget(String),
 }
 
@@ -77,13 +83,26 @@ pub struct CompareJob {
 
 impl CompareJob {
     /// The compare of the GGUF `model` on `questions`.
-    #[must_use]
-    pub fn new(model: ModelSource, questions: Vec<EvalQuestion>, settings: ChildSettings) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompareError::RelativeModel`] when a GGUF on the target is
+    /// not named by an absolute path.
+    pub fn new(
+        model: ModelSource,
+        questions: Vec<EvalQuestion>,
+        settings: ChildSettings,
+    ) -> Result<Self, CompareError> {
+        if let ModelSource::OnTarget(path) = &model
+            && !path.starts_with('/')
+        {
+            return Err(CompareError::RelativeModel(path.clone()));
+        }
+        Ok(Self {
             model,
             questions,
             settings,
-        }
+        })
     }
 
     /// The GGUF as the script gets it: `model.gguf` in the job directory, or
@@ -164,6 +183,12 @@ impl Trainer for CompareJob {
                 self.settings.context.to_string(),
             ),
         ];
+        if matches!(self.model, ModelSource::Upload(_)) {
+            env.push((
+                "OVERBRAINER_COMPARE_DISCARD_MODEL".to_string(),
+                "1".to_string(),
+            ));
+        }
         env.extend(llama_cpp_env());
         env
     }
