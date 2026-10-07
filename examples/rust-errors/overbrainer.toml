@@ -1,0 +1,165 @@
+# overbrainer case study: a Rust compiler error explainer. See README.md next to this file.
+# URLs, hosts and secrets never go here: set them through OVERBRAINER_* env vars (see .env.example).
+
+[project]
+name = "rust_errors"
+
+[[topics]]
+name = "borrow_checker"
+description = "Rust borrow checker errors (E0499, E0502, E0505, E0506): what triggers each one and how to fix the code"
+subtopics = 4
+questions_per_subtopic = 55
+
+[[topics]]
+name = "moves"
+description = "Rust use-after-move and move-out-of-borrow errors (E0382, E0507, E0508): causes and fixes"
+subtopics = 4
+questions_per_subtopic = 55
+
+[[topics]]
+name = "lifetimes"
+description = "Rust lifetime errors (E0106, E0597, E0716, E0621, lifetime may not live long enough): causes and fixes"
+subtopics = 4
+questions_per_subtopic = 55
+
+[[topics]]
+name = "traits"
+description = "Rust trait bound and method resolution errors (E0277, E0599, E0038 object safety): causes and fixes"
+subtopics = 4
+questions_per_subtopic = 55
+
+[[topics]]
+name = "types"
+description = "Rust type mismatch and inference errors (E0308, E0282, E0283): causes and fixes"
+subtopics = 4
+questions_per_subtopic = 55
+
+[[topics]]
+name = "mutability"
+description = "Rust mutability errors (E0596, E0594, E0384) and interior mutability: causes and fixes"
+subtopics = 4
+questions_per_subtopic = 55
+
+[[topics]]
+name = "generics"
+description = "Rust generics and associated type errors (E0107, E0191, E0220, E0207): causes and fixes"
+subtopics = 4
+questions_per_subtopic = 55
+
+[[topics]]
+name = "async_send"
+description = "Rust async errors: futures that are not Send, holding guards across await, missing async runtime: causes and fixes"
+subtopics = 4
+questions_per_subtopic = 55
+
+[[topics]]
+name = "modules"
+description = "Rust visibility, import and module errors (E0603, E0432, E0433, E0425): causes and fixes"
+subtopics = 4
+questions_per_subtopic = 55
+
+[providers.nanogpt]
+protocol = "openai"
+
+[providers.local_ollama]        # a local Ollama; base_url from OVERBRAINER_PROVIDERS__LOCAL_OLLAMA__BASE_URL
+protocol = "openai"
+
+[roles]
+generator = { provider = "nanogpt", model = "deepseek/deepseek-v4-flash" }
+parent = { provider = "nanogpt", model = "deepseek/deepseek-v4-pro:thinking", reasoning = true }
+judge = { provider = "local_ollama", model = "qwen3.5:9b", max_tokens = 1024, reasoning_effort = "none" }
+
+[pipeline]
+concurrency = 2
+max_retries = 5
+dedup_threshold = 0.8
+eval_ratio = 0.1
+seed = 42
+include_system_prompt = false
+# embedding_threshold = 0.9     # used only when roles.embedder is set
+# question_batch_size = 10
+# request_timeout_secs = 600
+
+[training]
+target = "gpu_cloud"
+base_model = "Qwen/Qwen3-4B"   # Apache-2.0
+adapter = "qlora"              # lora | qlora | full
+# epochs = 3
+# learning_rate = 2e-4
+# lora_r = 16
+# lora_alpha = 32
+# lora_dropout = 0.05
+sequence_len = 4096
+# micro_batch_size = 2
+# gradient_accumulation_steps = 4
+# optimizer = "adamw_torch_fused"
+# lr_scheduler = "cosine"
+# sample_packing = true
+# evals_per_epoch = 4
+# saves_per_epoch = 1
+# merge = false                # also write a merged model (lora and qlora only)
+# hub_model_id = "user/model"  # (deprecated, use [hub]) push the adapter to a private Hub repo (needs OVERBRAINER_HF_TOKEN)
+[training.axolotl_extra]     # merged into the Axolotl YAML
+chat_template = "chatml"     # train on final answers only: chatml does not render reasoning_content
+# warmup_ratio = 0.1
+# attn_implementation = "flash_attention_2"
+
+[targets.local]
+kind = "local"
+runtime = "native"             # native | docker
+# venv = "~/.venvs/axolotl"    # native: directory holding bin/axolotl
+# engine = "docker"            # docker: docker | podman
+# image = "axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1@sha256:9de7c7a5b8830480a7d2eb3b6d49759586615f5f8eb1126d5df29f8bd9fa324b"
+# pin by digest: this container runs untrusted training code and receives secrets such as HF_TOKEN
+
+# [targets.homelab]
+# kind = "ssh"                 # host comes from OVERBRAINER_TARGETS__HOMELAB__HOST
+# runtime = "docker"
+# workdir = "overbrainer"      # on the remote machine, relative to its home directory
+# ssh_client = "openssh"       # openssh | builtin (builtin needs a build with the builtin-ssh feature; OVERBRAINER_SSH_CLIENT overrides it)
+
+[targets.gpu_cloud]
+kind = "runpod"              # needs OVERBRAINER_RUNPOD__API_KEY; Secure Cloud only
+gpu_types = "auto"
+min_vram_gb = 24
+max_price_per_hour = 0.8
+max_hours = 4
+max_cost_usd = 3.0             # stop and delete the pod past this spend, in USD
+ssh_client = "builtin"
+# gpu_types = ["NVIDIA GeForce RTX 4090", "NVIDIA RTX A6000", "NVIDIA A40"]  # tried in order
+# gpu_types = "auto"           # at start: every GPU type in stock for gpu_count, cheapest first
+# min_vram_gb = 48             # gpu_types = "auto" only: least VRAM per GPU
+# max_price_per_hour = 1.0     # gpu_types = "auto" only: highest list price of one GPU, USD
+# max_hours = 6                # the pod watchdog deletes the pod after this, whatever it is doing
+# max_cost_usd = 20           # stop with a snapshot at 95% of this spend in USD, delete at 100%
+# gpu_count = 1
+# image = "axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1@sha256:f7b94da82913920a003e28e091d8528f57f76da7360fca87e95faf62fa32a680"
+# venv = "/workspace/axolotl-venv"
+# container_disk_gb = 50
+# boot_grace_minutes = 30      # the watchdog deletes a pod whose job never started
+# retrieve_grace_minutes = 60  # the watchdog deletes a pod whose ended job was not retrieved
+# data_center_ids = ["EU-RO-1"]  # any when unset; "auto": those with a chosen GPU in stock
+# network_volume_id = "..."    # mounted at /workspace/data; needs exactly one data_center_ids entry, not "auto"
+# max_volume_gb = 200          # grow the network volume up to this size in GB when the run fills it (permanent, billed monthly)
+# ssh_client = "openssh"       # openssh | builtin (builtin needs a build with the builtin-ssh feature; OVERBRAINER_SSH_CLIENT overrides it)
+
+[export]                     # GGUF for llama.cpp and Ollama: `overbrainer export <run-id>`, or at the end of training
+after_training = true
+quantize = "Q4_K_M"          # Q4_K_M | Q4_K_S | Q5_K_M | Q5_K_S | Q6_K | Q8_0 | Q3_K_M | Q2_K | F16 | BF16
+# ollama_name = "rust-mentor"  # `ollama create` this model once an export in a training job is retrieved
+
+[compare]                      # overbrainer compare, see docs/compare.md
+parent_price_in = 1.1          # deepseek-v4-pro:thinking on NanoGPT list prices, 2026-10-07
+parent_price_out = 2.2        # dollars per million output tokens of the parent
+# child_price_per_hour = 0.40    # dollars per hour of the child's hardware; on Runpod, the pod's price
+max_tokens = 3072
+# temperature = 0.0
+# server_start_secs = 300        # how long llama-server may take to be ready
+
+# [hub]                          # overbrainer push RUN_ID, see docs/training.md
+# repo = "you/your-model"        # default: <your HF user>/<project name>
+# private = true
+# after_training = false
+
+# [metrics]
+# listen = "127.0.0.1:9464"    # serve Prometheus metrics at /metrics while a command holds the project; no authentication
