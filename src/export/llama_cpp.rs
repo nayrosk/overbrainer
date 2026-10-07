@@ -59,8 +59,14 @@ pub const ROCM: &str = "10.0";
 pub const UBUNTU_ROCM_X64_SHA256: &str =
     "d3f610c849bc8d365c31a62dba9c1a309a783202fe5d86d85f6a64b34cecb195";
 
+/// The oldest glibc the GPU builds run on: the CUDA builds (`x86_64` and
+/// `aarch64`) and the `ROCm` build all need `GLIBC_2.38` (Ubuntu 24.04), while
+/// the `x86_64` CPU build needs 2.34 only. A compare on an older glibc (Ubuntu
+/// 22.04 has 2.35) runs the CPU build instead, with a warning.
+pub const GPU_GLIBC: &str = "2.38";
+
 /// The environment the scripts read the pin from: the tag, the CUDA and `ROCm`
-/// versions, the repository, and each digest.
+/// versions, the glibc the GPU builds need, the repository, and each digest.
 #[must_use]
 pub fn env() -> Vec<(String, String)> {
     [
@@ -87,6 +93,7 @@ pub fn env() -> Vec<(String, String)> {
         ),
         ("OVERBRAINER_LLAMA_CPP_CUDART_X64_SHA256", CUDART_X64_SHA256),
         ("OVERBRAINER_LLAMA_CPP_ROCM", ROCM),
+        ("OVERBRAINER_LLAMA_CPP_GPU_GLIBC", GPU_GLIBC),
         (
             "OVERBRAINER_LLAMA_CPP_UBUNTU_ROCM_X64_SHA256",
             UBUNTU_ROCM_X64_SHA256,
@@ -129,8 +136,8 @@ mod tests {
         }
     }
 
-    /// The script's environment holds the release tag, the CUDA version and
-    /// every build's digest.
+    /// The script's environment holds the release tag, the CUDA version, the
+    /// glibc of the GPU builds and every build's digest.
     #[test]
     fn the_script_gets_the_tag_and_every_digest() {
         let env = env();
@@ -166,6 +173,7 @@ mod tests {
             get("OVERBRAINER_LLAMA_CPP_UBUNTU_ROCM_X64_SHA256"),
             Some(UBUNTU_ROCM_X64_SHA256)
         );
-        assert_eq!(env.len(), 13);
+        assert_eq!(get("OVERBRAINER_LLAMA_CPP_GPU_GLIBC"), Some(GPU_GLIBC));
+        assert_eq!(env.len(), 14);
     }
 }

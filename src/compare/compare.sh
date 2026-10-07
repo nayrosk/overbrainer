@@ -15,7 +15,8 @@
 #   OVERBRAINER_METRICS              the job's metrics file, for progress lines
 #   OVERBRAINER_CACHE                cache holding llama.cpp, shared by the runs
 #   OVERBRAINER_COMPARE_KFD          the AMD compute device, /dev/kfd by default
-#   OVERBRAINER_LLAMA_CPP*           the pinned llama.cpp release and its digests
+#   OVERBRAINER_LLAMA_CPP*           the pinned llama.cpp release, its digests and
+#                                    the glibc its GPU builds need
 #
 # overbrainer puts the helpers of llama_cpp.sh (fail, say, fetch, unpack)
 # before this code. Everything is a function; the last line runs `main`,
@@ -76,9 +77,56 @@ linker_libraries() {
     fi
 }
 
+# Prints the glibc version of this machine (2.35), from
+# `getconf GNU_LIBC_VERSION`, else from the first line of `ldd --version`;
+# prints nothing when neither says (musl, macOS).
+host_glibc() {
+    version=$(getconf GNU_LIBC_VERSION 2>/dev/null) || version=
+    case $version in
+    "glibc "[0-9]*)
+        printf '%s\n' "${version#glibc }"
+        return 0
+        ;;
+    esac
+    version=$(ldd --version 2>/dev/null) || version=
+    version=${version%%"
+"*}
+    case $version in
+    *GLIBC* | *"GNU libc"*) printf '%s\n' "${version##* }" ;;
+    esac
+}
+
+# Whether the version $1 (MAJOR.MINOR) is older than $2. A version that is not
+# MAJOR.MINOR is never older.
+version_older() {
+    have_major=${1%%.*} have_minor=${1#*.}
+    need_major=${2%%.*} need_minor=${2#*.}
+    have_minor=${have_minor%%.*} need_minor=${need_minor%%.*}
+    for part in "$have_major" "$have_minor" "$need_major" "$need_minor"; do
+        case $part in
+        '' | *[!0-9]*) return 1 ;;
+        esac
+    done
+    [ "$have_major" -lt "$need_major" ] ||
+        { [ "$have_major" -eq "$need_major" ] && [ "$have_minor" -lt "$need_minor" ]; }
+}
+
+# Whether this machine's glibc runs the GPU build $1, which needs
+# OVERBRAINER_LLAMA_CPP_GPU_GLIBC: when it is older, warns that the CPU build
+# $asset runs instead and fails. A glibc nothing says is taken as recent enough.
+gpu_glibc_fits() {
+    glibc=$(host_glibc)
+    needed=$OVERBRAINER_LLAMA_CPP_GPU_GLIBC
+    if [ -n "$glibc" ] && version_older "$glibc" "$needed"; then
+        warn "glibc $glibc is older than the glibc $needed the $1 build of llama.cpp $tag needs: using the CPU build $asset"
+        return 1
+    fi
+}
+
 # Picks the ROCm build for an AMD GPU, after pick_build chose the CPU build:
 # only a Linux x86_64 host with /dev/kfd, the ROCm 7 runtime in the linker's
-# cache and read and write access to the device gets it. When there is a
+# cache, read and write access to the device and a glibc the build runs on
+# gets it. When there is a
 # /dev/kfd and the build stays on the CPU, warns why. Does nothing, quietly,
 # on a host without /dev/kfd.
 pick_amd() {
@@ -110,15 +158,17 @@ pick_amd() {
         warn "AMD GPU found but $kfd is not readable and writable by this user (add it to the render group); using the CPU build $asset"
         return 0
     fi
+    gpu_glibc_fits "ubuntu-rocm-$rocm-x64" || return 0
     asset=ubuntu-rocm-$rocm-x64 digest=$OVERBRAINER_LLAMA_CPP_UBUNTU_ROCM_X64_SHA256
 }
 
 # Picks the llama.cpp build for this machine: sets asset and digest, and
 # cudart and cudart_digest (the CUDA runtime archive) for a CUDA build, empty
 # for a CPU or ROCm one. A Linux host with a working nvidia-smi gets the CUDA
-# build, unless its driver supports a CUDA major version below the pinned one:
-# then the CPU build, with a warning. Without nvidia-smi, an AMD host gets the
-# ROCm build (see pick_amd).
+# build, unless its driver supports a CUDA major version below the pinned one
+# or its glibc is older than the one the build needs: then the CPU build, with
+# a warning. Without nvidia-smi, an AMD host gets the ROCm build (see
+# pick_amd).
 pick_build() {
     tag=$OVERBRAINER_LLAMA_CPP
     cuda=$OVERBRAINER_LLAMA_CPP_CUDA
@@ -160,6 +210,7 @@ pick_build() {
         warn "the NVIDIA driver supports CUDA $driver, below the CUDA $cuda of llama.cpp $tag: using the CPU build $asset"
         return 0
     fi
+    gpu_glibc_fits "ubuntu-cuda-$cuda-$arch" || return 0
     asset=ubuntu-cuda-$cuda-$arch digest=$cuda_digest
     cudart=cudart-llama-$tag-bin-ubuntu-cuda-$cuda-$arch cudart_digest=$runtime_digest
 }
