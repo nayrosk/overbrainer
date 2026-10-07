@@ -617,11 +617,9 @@ fn recorded_reproduce_toml(settings: &Settings, input: &CardInput, config: &str)
             table["sequence_len"] = value(i64::from(len));
         }
         table.remove("axolotl_extra");
-        if let Some(training) = &settings.training {
-            let extra = recorded_extra_table(training, config);
-            if !extra.is_empty() {
-                table["axolotl_extra"] = Item::Table(extra);
-            }
+        let extra = recorded_extra_table(config);
+        if !extra.is_empty() {
+            table["axolotl_extra"] = Item::Table(extra);
         }
     }
     doc.to_string()
@@ -803,6 +801,20 @@ const PUBLIC_EXTRA_KEYS: [&str; 18] = [
     "weight_decay",
 ];
 
+/// Values the trainer writes into every run's `axolotl.yaml` for allowlisted
+/// keys (see `Axolotl::config`), as the config reads them back. A recorded
+/// value equal to its default is not published: a run without the key trains
+/// the same, so Reproduce leaves it out. A different value can only come from
+/// `axolotl_extra`, so it is.
+const GENERATED_DEFAULTS: [(&str, &str); 6] = [
+    ("val_set_size", "0"),
+    ("eval_sample_packing", "false"),
+    ("attn_implementation", "sdpa"),
+    ("warmup_ratio", "0.1"),
+    ("gradient_checkpointing", "true"),
+    ("lora_target_linear", "true"),
+];
+
 /// Longest string value of a published `axolotl_extra` key.
 const MAX_EXTRA_STRING: usize = 64;
 
@@ -818,23 +830,21 @@ fn axolotl_extra_table(training: &Training) -> Table {
     table
 }
 
-/// The `[training.axolotl_extra]` keys of `training` that are safe to publish,
-/// with the values the run recorded in `config` (its `axolotl.yaml`). A key
-/// the run did not record is left out. `chat_template` is also taken from the
-/// run when the config no longer sets it.
-fn recorded_extra_table(training: &Training, config: &str) -> Table {
+/// The `[training.axolotl_extra]` keys that are safe to publish, read from
+/// `config`, the run's recorded `axolotl.yaml`: every key of
+/// [`PUBLIC_EXTRA_KEYS`] the run recorded, whether or not `overbrainer.toml`
+/// still sets it, except a value equal to what the trainer generates anyway
+/// (see `GENERATED_DEFAULTS`).
+fn recorded_extra_table(config: &str) -> Table {
     let mut table = Table::new();
-    let keys = training
-        .axolotl_extra
-        .keys()
-        .map(String::as_str)
-        .chain(["chat_template"]);
-    for key in keys {
-        if table.contains_key(key) {
+    for key in PUBLIC_EXTRA_KEYS {
+        let Some(text) = top_level_scalar(config, key) else {
+            continue;
+        };
+        if GENERATED_DEFAULTS.contains(&(key, text.as_str())) {
             continue;
         }
-        let recorded = top_level_scalar(config, key).map(|text| scalar_value(&text));
-        if let Some(item) = recorded.and_then(|v| public_extra(key, &v)) {
+        if let Some(item) = public_extra(key, &scalar_value(&text)) {
             table[key] = item;
         }
     }
@@ -1135,6 +1145,66 @@ max_hours = 6
         Ok(())
     }
 
+    /// A key the run recorded is published even when the config no longer
+    /// sets it, but a value overbrainer generates into every run is not.
+    #[test]
+    fn recorded_keys_survive_a_config_edit_and_generated_defaults_do_not()
+    -> Result<(), Box<dyn Error>> {
+        let yaml = concat!(
+            "base_model: \"Qwen/Qwen3-0.6B\"\n",
+            "seed: 42\n",
+            "weight_decay: 0.01\n",
+            "val_set_size: 0\n",
+            "eval_sample_packing: false\n",
+            "attn_implementation: \"sdpa\"\n",
+            "warmup_ratio: 0.1\n",
+            "gradient_checkpointing: true\n",
+            "lora_target_linear: true\n",
+        );
+        let card = card_of_run(CARD_CONFIG, yaml, Some(WITH_REASONING))?;
+        assert!(card.contains("[training.axolotl_extra]\nseed = 42\n"));
+        assert!(card.contains("weight_decay = 0.01\n"));
+        for default in [
+            "val_set_size",
+            "eval_sample_packing",
+            "attn_implementation",
+            "warmup_ratio",
+            "gradient_checkpointing",
+            "lora_target_linear",
+        ] {
+            assert!(!card.contains(default), "a generated default is published");
+        }
+        Ok(())
+    }
+
+    /// A generated key the user changed differs from the default and is published.
+    #[test]
+    fn a_changed_generated_key_is_published() -> Result<(), Box<dyn Error>> {
+        let yaml = "base_model: \"m\"\nwarmup_ratio: 0.03\ngradient_checkpointing: false\n";
+        let card = card_of_run(CARD_CONFIG, yaml, None)?;
+        assert!(card.contains("warmup_ratio = 0.03\n"));
+        assert!(card.contains("gradient_checkpointing = false\n"));
+        Ok(())
+    }
+
+    /// `GENERATED_DEFAULTS` is what the trainer writes into every run's config.
+    #[test]
+    fn generated_defaults_match_the_trainer() -> Result<(), Box<dyn Error>> {
+        let settings = load_str(CARD_CONFIG, EnvSource::Vars(Vec::new()))?;
+        let training = settings.training.as_ref().ok_or("no training")?;
+        let files = crate::dataset::DataFiles::new(Path::new("."));
+        let config = crate::train::Axolotl::new(training, &files).config("/run", true);
+        let yaml = crate::train::to_yaml(&config);
+        for (key, default) in GENERATED_DEFAULTS {
+            assert_eq!(
+                top_level_scalar(&yaml, key).as_deref(),
+                Some(default),
+                "the trainer's value of a listed key changed"
+            );
+        }
+        Ok(())
+    }
+
     /// A custom template is read from the run: without `reasoning_content` it
     /// drops it, with it the use cannot be told.
     #[test]
@@ -1164,7 +1234,7 @@ max_hours = 6
             "wandb_url = \"https://wandb.example/me\"\n",
             "attn_implementation = \"/home/me/attn.py\"\n",
             "train_on_inputs = false\n",
-            "warmup_ratio = 0.1\n",
+            "warmup_ratio = 0.05\n",
             "weight_decay = \"two words\"\n",
             "lora_target_modules = [\"q_proj\"]\n",
         );
@@ -1178,7 +1248,7 @@ max_hours = 6
             "wandb_url: \"https://wandb.example/me\"\n",
             "attn_implementation: \"/home/me/attn.py\"\n",
             "train_on_inputs: false\n",
-            "warmup_ratio: 0.1\n",
+            "warmup_ratio: 0.05\n",
             "weight_decay: \"two words\"\n",
         );
         let card = card_of_run(&card_config_with(extra), yaml, Some(WITH_REASONING))?;
@@ -1197,7 +1267,7 @@ max_hours = 6
         }
         assert!(card.contains("chat_template = \"chatml\""));
         assert!(card.contains("train_on_inputs = false"));
-        assert!(card.contains("warmup_ratio = 0.1"));
+        assert!(card.contains("warmup_ratio = 0.05"));
         snapshot("secret_like_axolotl_extra_not_published", &card);
         Ok(())
     }
