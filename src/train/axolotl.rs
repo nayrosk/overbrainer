@@ -576,6 +576,45 @@ fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> TrainError + '_ {
     }
 }
 
+/// Whether a chat template renders `reasoning_content`, as far as it can be told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateReasoning {
+    /// A template Axolotl bundles and that is known to render it.
+    Renders,
+    /// A template that is known not to render it.
+    Drops,
+    /// The base model's own template, or one that cannot be told by name.
+    Unknown,
+}
+
+/// Whether the chat template named by a run's `chat_template` and
+/// `chat_template_jinja` renders `reasoning_content`.
+///
+/// Only an explicit choice is certain: a custom template that never mentions
+/// `reasoning_content` drops it, an Axolotl template in `REASONING_TEMPLATES`
+/// renders it, any other named template drops it. A custom template that
+/// mentions it may still use it conditionally, and the base model's own
+/// template (no name, or `tokenizer_default`) is only a name heuristic, so both
+/// give [`TemplateReasoning::Unknown`].
+#[must_use]
+pub fn template_reasoning(
+    chat_template: Option<&str>,
+    chat_template_jinja: Option<&str>,
+) -> TemplateReasoning {
+    if let Some(jinja) = chat_template_jinja {
+        return if jinja.contains("reasoning_content") {
+            TemplateReasoning::Unknown
+        } else {
+            TemplateReasoning::Drops
+        };
+    }
+    match chat_template.filter(|template| *template != "tokenizer_default") {
+        Some(template) if REASONING_TEMPLATES.contains(&template) => TemplateReasoning::Renders,
+        Some(_) => TemplateReasoning::Drops,
+        None => TemplateReasoning::Unknown,
+    }
+}
+
 /// A warning when the chat template in use may drop `reasoning_content`, which
 /// leaves the parent's reasoning out of training without any error.
 ///
@@ -635,6 +674,22 @@ pub fn reasoning_template_warning(training: &Training) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A named template is judged by Axolotl's reasoning list, a custom one by
+    /// its text, and the base model's own cannot be told.
+    #[test]
+    fn template_reasoning_is_certain_only_for_an_explicit_choice() {
+        use TemplateReasoning::{Drops, Renders, Unknown};
+        assert_eq!(template_reasoning(Some("qwen3"), None), Renders);
+        assert_eq!(template_reasoning(Some("chatml"), None), Drops);
+        assert_eq!(template_reasoning(Some("tokenizer_default"), None), Unknown);
+        assert_eq!(template_reasoning(None, None), Unknown);
+        assert_eq!(template_reasoning(Some("qwen3"), Some("{{ x }}")), Drops);
+        assert_eq!(
+            template_reasoning(None, Some("{{ reasoning_content }}")),
+            Unknown
+        );
+    }
 
     #[test]
     fn recorded_outputs_come_from_the_run_s_own_files() -> Result<(), Box<dyn std::error::Error>> {

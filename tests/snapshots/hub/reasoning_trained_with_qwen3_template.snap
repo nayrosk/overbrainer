@@ -3,14 +3,12 @@ source: src/hub/card.rs
 ---
 ---
 base_model: Qwen/Qwen3-0.6B
-base_model_relation: adapter
-library_name: peft
-license: apache-2.0
+base_model_relation: finetune
+library_name: transformers
 pipeline_tag: text-generation
 tags:
 - overbrainer
 - distillation
-- gguf
 ---
 
 [![overbrainer](https://raw.githubusercontent.com/nayrosk/overbrainer/main/docs/assets/hf-banner.webp)](https://github.com/nayrosk/overbrainer)
@@ -19,13 +17,14 @@ Distilled with [overbrainer](https://github.com/nayrosk/overbrainer) [![overbrai
 
 # nayrosk/rust-mentor
 
-Qwen/Qwen3-0.6B fine-tuned (QLoRA) on 412 questions answered by deepseek/deepseek-v4-flash:thinking.
+Qwen/Qwen3-0.6B fully fine-tuned on 1 questions answered by deepseek/deepseek-v4-flash:thinking.
 
 ## Use it
 
-```sh
-ollama run hf.co/nayrosk/rust-mentor:Q4_K_M
-llama-cli -hf nayrosk/rust-mentor:Q4_K_M
+```python
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("nayrosk/rust-mentor")
 ```
 
 ## How it was made
@@ -37,20 +36,13 @@ overbrainer wrote questions on the topics below with the generator model, kept t
 | Parent model | deepseek/deepseek-v4-flash:thinking |
 | Generator model | deepseek/deepseek-v4-flash |
 | Base model | Qwen/Qwen3-0.6B |
-| Adapter | QLoRA |
-| Examples | 412 train, 46 eval |
-| Epochs | 3 |
-| Learning rate | 0.0002 |
-| Sequence length | 4096 |
-| Final loss | 0.84 train, 0.91 eval |
-| Training time | 6 min |
+| Adapter | none (full fine-tune) |
+| Examples | 1 train, 0 eval |
 
 Topics:
 
 - **ownership**: Rust ownership, borrowing and lifetimes
 - **async**: Async Rust with tokio: futures, tasks and cancellation
-
-Trained on [Runpod](https://runpod.io?ref=ym24z23f) (NVIDIA GeForce RTX 4090) for about $0.01.
 
 ## Reproduce
 
@@ -87,7 +79,7 @@ max_tokens = 16384
 
 [training]
 base_model = "Qwen/Qwen3-0.6B"
-adapter = "qlora"
+adapter = "full"
 epochs = 3
 learning_rate = 0.0002
 lora_r = 16
@@ -102,6 +94,9 @@ sample_packing = true
 evals_per_epoch = 4
 saves_per_epoch = 1
 merge = false
+
+[training.axolotl_extra]
+chat_template = "qwen3"
 
 [pipeline]
 concurrency = 8

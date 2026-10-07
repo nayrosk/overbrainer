@@ -29,9 +29,7 @@ model = AutoModelForCausalLM.from_pretrained("nayrosk/rust-mentor")
 
 ## How it was made
 
-overbrainer wrote questions on the topics below with the generator model, kept the parent model's answers, then fine-tuned the base model on them with Axolotl.
-
-The parent model reasons, but the chat template of this run does not render reasoning_content, so the reasoning was left out of training.
+overbrainer wrote questions on the topics below with the generator model, kept the parent model's answers, and its reasoning where the chat template renders it, then fine-tuned the base model on them with Axolotl.
 
 | | |
 |---|---|
@@ -96,9 +94,6 @@ sample_packing = true
 evals_per_epoch = 4
 saves_per_epoch = 1
 merge = false
-
-[training.axolotl_extra]
-chat_template = "chatml"
 
 [pipeline]
 concurrency = 8
