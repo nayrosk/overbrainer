@@ -13,7 +13,10 @@ use crate::config::{Adapter, Pipeline, RoleModel, Settings, Training};
 use crate::runpod::PodRecord;
 use crate::runs::{MetricsSummary, RunRecord, Runs, RunsError};
 use crate::train::sizing::is_repo_id;
-use crate::train::{CONFIG_FILE, METRICS_FILE, MetricLine, Outputs, parse_line, top_level_scalar};
+use crate::train::{
+    CONFIG_FILE, METRICS_FILE, MetricLine, Outputs, parse_line, reasoning_template_warning,
+    top_level_scalar,
+};
 
 /// Last line of every card overbrainer writes: a remote card carrying it may be
 /// replaced.
@@ -55,6 +58,36 @@ pub enum CardError {
     },
 }
 
+/// What the run trained of the parent model's reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningTrained {
+    /// The parent reasons and the chat template in use renders the reasoning.
+    Yes,
+    /// The parent reasons but the chat template in use drops the reasoning.
+    LeftOut,
+    /// The parent does not reason, or the run has no training settings.
+    NoReasoning,
+}
+
+impl ReasoningTrained {
+    /// What `settings` say of the reasoning: the parent role's `reasoning`
+    /// flag and whether the chat template in use renders `reasoning_content`
+    /// (the check that warns at training start).
+    #[must_use]
+    pub fn of(settings: &Settings) -> Self {
+        match &settings.training {
+            Some(training) if settings.roles.parent.reasoning => {
+                if reasoning_template_warning(training).is_none() {
+                    Self::Yes
+                } else {
+                    Self::LeftOut
+                }
+            },
+            _ => Self::NoReasoning,
+        }
+    }
+}
+
 /// What the card says of a run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardInput {
@@ -70,6 +103,8 @@ pub struct CardInput {
     pub parent: String,
     /// The model that wrote the questions.
     pub generator: String,
+    /// Whether the run trained the parent model's reasoning.
+    pub reasoning: ReasoningTrained,
     /// Name and description, empty when the topic has none.
     pub topics: Vec<(String, String)>,
     /// Number of training examples, `None` when unknown.
@@ -202,10 +237,20 @@ fn use_it(out: &mut String, input: &CardInput) -> fmt::Result {
 /// Writes the "How it was made" section: the data and the training behind the model.
 fn how_it_was_made(out: &mut String, input: &CardInput) -> fmt::Result {
     writeln!(out, "## How it was made\n")?;
+    let kept = match input.reasoning {
+        ReasoningTrained::Yes => "answers and reasoning",
+        ReasoningTrained::LeftOut | ReasoningTrained::NoReasoning => "answers",
+    };
     writeln!(
         out,
-        "overbrainer wrote questions on the topics below with the generator model, kept the parent model's answers and reasoning, then fine-tuned the base model on them with Axolotl.\n"
+        "overbrainer wrote questions on the topics below with the generator model, kept the parent model's {kept}, then fine-tuned the base model on them with Axolotl.\n"
     )?;
+    if input.reasoning == ReasoningTrained::LeftOut {
+        writeln!(
+            out,
+            "The parent model reasons, but the chat template of this run does not render reasoning_content, so the reasoning was left out of training.\n"
+        )?;
+    }
     writeln!(out, "| | |\n|---|---|")?;
     for (name, value) in rows(input) {
         writeln!(out, "| {name} | {} |", cell(&value))?;
@@ -480,6 +525,7 @@ pub fn gather(
         license: None,
         parent: settings.roles.parent.model.clone(),
         generator: settings.roles.generator.model.clone(),
+        reasoning: ReasoningTrained::of(settings),
         topics: settings
             .topics
             .iter()
@@ -584,8 +630,9 @@ fn gguf_types(run_id: &str, files: &[UploadFile]) -> Vec<String> {
 
 /// The non-secret part of `settings`, as TOML: the topics, the roles (provider
 /// names, never provider sections), `[training]` without `target`,
-/// `hub_model_id` and `axolotl_extra`, and `[pipeline]`. Built key by key from
-/// an allowlist, so nothing else of the configuration can reach it.
+/// `hub_model_id`, its `axolotl_extra` keys that are safe to publish (see
+/// `axolotl_extra_table`), and `[pipeline]`. Built key by key from an
+/// allowlist, so nothing else of the configuration can reach it.
 #[must_use]
 pub fn reproduce_toml(settings: &Settings) -> String {
     reproduce_doc(settings).to_string()
@@ -671,7 +718,61 @@ fn training_table(training: &Training) -> Table {
     table["evals_per_epoch"] = value(i64::from(training.evals_per_epoch));
     table["saves_per_epoch"] = value(i64::from(training.saves_per_epoch));
     table["merge"] = value(training.merge);
+    let extra = axolotl_extra_table(training);
+    if !extra.is_empty() {
+        table["axolotl_extra"] = Item::Table(extra);
+    }
     table
+}
+
+/// Words that mark an `axolotl_extra` key as one that may hold a secret, a
+/// URL or a local path.
+const UNSAFE_KEY_WORDS: [&str; 10] = [
+    "token", "key", "secret", "path", "dir", "url", "password", "auth", "host", "endpoint",
+];
+
+/// The `[training.axolotl_extra]` keys that are safe to publish. A key whose
+/// name holds one of [`UNSAFE_KEY_WORDS`] is left out, and so is a value that
+/// is not a scalar, or a list of scalars, free of paths and URLs.
+fn axolotl_extra_table(training: &Training) -> Table {
+    let mut table = Table::new();
+    for (key, extra) in &training.axolotl_extra {
+        let lower = key.to_ascii_lowercase();
+        if UNSAFE_KEY_WORDS.iter().any(|word| lower.contains(word)) {
+            continue;
+        }
+        if let Some(item) = safe_extra_value(extra) {
+            table[key.as_str()] = item;
+        }
+    }
+    table
+}
+
+/// `extra` as a TOML value when it is a bool, a number, a string that is no
+/// path or URL, or a list of those; `None` otherwise.
+fn safe_extra_value(extra: &serde_json::Value) -> Option<Item> {
+    use serde_json::Value;
+    match extra {
+        Value::Bool(flag) => Some(value(*flag)),
+        Value::Number(number) => number
+            .as_i64()
+            .map(value)
+            .or_else(|| number.as_f64().map(value)),
+        Value::String(text) if !looks_like_path_or_url(text) => Some(value(text.as_str())),
+        Value::Array(items) => {
+            let mut array = toml_edit::Array::new();
+            for item in items {
+                array.push(safe_extra_value(item)?.into_value().ok()?);
+            }
+            Some(value(array))
+        },
+        _ => None,
+    }
+}
+
+/// Whether `text` looks like a local path or a URL.
+fn looks_like_path_or_url(text: &str) -> bool {
+    text.contains(['/', '\\', '@']) || text.starts_with(['~', '.'])
 }
 
 /// The `[pipeline]` settings that go in the reproduce config, as a TOML table.
@@ -781,6 +882,7 @@ max_hours = 6
             license: Some("apache-2.0".into()),
             parent: "deepseek/deepseek-v4-flash:thinking".into(),
             generator: "deepseek/deepseek-v4-flash".into(),
+            reasoning: ReasoningTrained::Yes,
             topics: vec![
                 (
                     "ownership".into(),
@@ -817,6 +919,80 @@ max_hours = 6
             ..qlora_on_runpod()
         };
         snapshot("qlora_with_gguf_on_runpod", &render(&input));
+        Ok(())
+    }
+
+    /// `CARD_CONFIG` with `extra` lines added under `[training]`.
+    fn card_config_with(extra: &str) -> String {
+        CARD_CONFIG.replace(
+            "sequence_len = 4096\n",
+            &format!("sequence_len = 4096\n{extra}\n"),
+        )
+    }
+
+    /// The card of a run made with `config`, as `gather` would build it.
+    fn card_of(config: &str) -> Result<String, Box<dyn Error>> {
+        let settings = load_str(config, EnvSource::Vars(Vec::new()))?;
+        let input = CardInput {
+            reasoning: ReasoningTrained::of(&settings),
+            reproduce_toml: reproduce_toml(&settings),
+            ..qlora_on_runpod()
+        };
+        Ok(render(&input))
+    }
+
+    /// A reasoning parent with a Qwen3 base model: the card says the reasoning was trained.
+    #[test]
+    fn reasoning_is_trained_with_the_qwen3_template() -> Result<(), Box<dyn Error>> {
+        let card = card_of(CARD_CONFIG)?;
+        assert!(card.contains("kept the parent model's answers and reasoning"));
+        assert!(!card.contains("left out of training"));
+        snapshot("reasoning_trained_with_qwen3_template", &card);
+        Ok(())
+    }
+
+    /// A reasoning parent with a template that drops reasoning: answers only,
+    /// and `axolotl_extra.chat_template` is in the Reproduce config.
+    #[test]
+    fn a_chatml_template_leaves_the_reasoning_out() -> Result<(), Box<dyn Error>> {
+        let card = card_of(&card_config_with(
+            "\n[training.axolotl_extra]\nchat_template = \"chatml\"",
+        ))?;
+        assert!(card.contains("kept the parent model's answers, then"));
+        assert!(!card.contains("answers and reasoning"));
+        assert!(card.contains("the reasoning was left out of training"));
+        assert!(card.contains("[training.axolotl_extra]\nchat_template = \"chatml\"\n"));
+        snapshot("reasoning_left_out_with_chatml_template", &card);
+        Ok(())
+    }
+
+    /// Keys that can hold secrets, URLs or local paths stay out of the card.
+    #[test]
+    fn secret_like_axolotl_extra_keys_are_not_published() -> Result<(), Box<dyn Error>> {
+        let card = card_of(&card_config_with(concat!(
+            "\n[training.axolotl_extra]\n",
+            "chat_template = \"chatml\"\n",
+            "hub_token = \"hf_secret_value\"\n",
+            "wandb_api_key = \"wandb_secret_value\"\n",
+            "cache_dir = \"/home/me/out\"\n",
+            "wandb_url = \"https://wandb.example/me\"\n",
+            "notes = \"/home/me/notes.txt\"\n",
+            "link = \"https://example.com/x\"\n",
+            "warmup_ratio = 0.1\n",
+        )))?;
+        for leaked in [
+            "hf_secret_value",
+            "wandb_secret_value",
+            "/home/me",
+            "wandb.example",
+            "example.com",
+            "hub_token",
+        ] {
+            assert!(!card.contains(leaked), "the card leaks a left-out value");
+        }
+        assert!(card.contains("chat_template = \"chatml\""));
+        assert!(card.contains("warmup_ratio = 0.1"));
+        snapshot("secret_like_axolotl_extra_not_published", &card);
         Ok(())
     }
 
