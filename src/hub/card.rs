@@ -13,7 +13,10 @@ use crate::config::{Adapter, Pipeline, RoleModel, Settings, Training};
 use crate::runpod::PodRecord;
 use crate::runs::{MetricsSummary, RunRecord, Runs, RunsError};
 use crate::train::sizing::is_repo_id;
-use crate::train::{CONFIG_FILE, METRICS_FILE, MetricLine, Outputs, parse_line, top_level_scalar};
+use crate::train::{
+    CONFIG_FILE, METRICS_FILE, MetricLine, Outputs, TemplateReasoning, parse_line,
+    template_reasoning, top_level_scalar,
+};
 
 /// Last line of every card overbrainer writes: a remote card carrying it may be
 /// replaced.
@@ -55,6 +58,78 @@ pub enum CardError {
     },
 }
 
+/// What the run trained of the parent model's reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningTrained {
+    /// The training data carries reasoning and the run's chat template is
+    /// known to render it.
+    Yes,
+    /// The training data carries reasoning but the run's chat template is
+    /// known to drop it.
+    LeftOut,
+    /// The training data carries no reasoning.
+    NoReasoning,
+    /// It cannot be told: the template is the base model's own or a custom one
+    /// that may use the reasoning, or the run's data or config is missing.
+    Unknown,
+}
+
+impl ReasoningTrained {
+    /// Classifies a run from its recorded data and chat template.
+    ///
+    /// `data_has_reasoning` is whether the run's training data carries
+    /// `reasoning_content` (`None` when it cannot be read or is empty).
+    #[must_use]
+    pub fn classify(data_has_reasoning: Option<bool>, template: TemplateReasoning) -> Self {
+        match (data_has_reasoning, template) {
+            (None, _) | (Some(true), TemplateReasoning::Unknown) => Self::Unknown,
+            (Some(false), _) => Self::NoReasoning,
+            (Some(true), TemplateReasoning::Renders) => Self::Yes,
+            (Some(true), TemplateReasoning::Drops) => Self::LeftOut,
+        }
+    }
+
+    /// Classifies the run whose `axolotl.yaml` is `config` and whose training
+    /// data is the file `train`.
+    fn of_run(config: &str, train: &Path) -> Self {
+        let has_reasoning = crate::dataset::read::<serde_json::Value>(train)
+            .ok()
+            .filter(|records| !records.is_empty())
+            .map(|records| records.iter().any(carries_reasoning));
+        Self::classify(has_reasoning, recorded_template(config))
+    }
+}
+
+/// Whether a training record has an assistant message with a non-empty
+/// `reasoning_content`.
+fn carries_reasoning(record: &serde_json::Value) -> bool {
+    record
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("reasoning_content")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+            })
+        })
+}
+
+/// What the run's recorded `axolotl.yaml` says of its chat template. A custom
+/// template written as a block, which cannot be read here, is `Unknown`.
+fn recorded_template(config: &str) -> TemplateReasoning {
+    let jinja = top_level_scalar(config, "chat_template_jinja");
+    let has_jinja_key = config
+        .lines()
+        .any(|line| line.starts_with("chat_template_jinja:"));
+    match jinja.as_deref() {
+        Some(text) if text.starts_with(['|', '>']) => TemplateReasoning::Unknown,
+        None if has_jinja_key => TemplateReasoning::Unknown,
+        jinja => template_reasoning(top_level_scalar(config, "chat_template").as_deref(), jinja),
+    }
+}
+
 /// What the card says of a run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardInput {
@@ -70,6 +145,9 @@ pub struct CardInput {
     pub parent: String,
     /// The model that wrote the questions.
     pub generator: String,
+    /// Whether the run trained the parent model's reasoning, from the run's own
+    /// data and chat template.
+    pub reasoning: ReasoningTrained,
     /// Name and description, empty when the topic has none.
     pub topics: Vec<(String, String)>,
     /// Number of training examples, `None` when unknown.
@@ -202,10 +280,23 @@ fn use_it(out: &mut String, input: &CardInput) -> fmt::Result {
 /// Writes the "How it was made" section: the data and the training behind the model.
 fn how_it_was_made(out: &mut String, input: &CardInput) -> fmt::Result {
     writeln!(out, "## How it was made\n")?;
+    let kept = match input.reasoning {
+        ReasoningTrained::Yes => "answers and reasoning",
+        ReasoningTrained::LeftOut | ReasoningTrained::NoReasoning => "answers",
+        ReasoningTrained::Unknown => {
+            "answers, and its reasoning where the chat template renders it"
+        },
+    };
     writeln!(
         out,
-        "overbrainer wrote questions on the topics below with the generator model, kept the parent model's answers and reasoning, then fine-tuned the base model on them with Axolotl.\n"
+        "overbrainer wrote questions on the topics below with the generator model, kept the parent model's {kept}, then fine-tuned the base model on them with Axolotl.\n"
     )?;
+    if input.reasoning == ReasoningTrained::LeftOut {
+        writeln!(
+            out,
+            "The parent model reasons, but the chat template of this run does not render reasoning_content, so the reasoning was left out of training.\n"
+        )?;
+    }
     writeln!(out, "| | |\n|---|---|")?;
     for (name, value) in rows(input) {
         writeln!(out, "| {name} | {} |", cell(&value))?;
@@ -480,6 +571,7 @@ pub fn gather(
         license: None,
         parent: settings.roles.parent.model.clone(),
         generator: settings.roles.generator.model.clone(),
+        reasoning: ReasoningTrained::of_run(&config, &dir.join("data").join("train.jsonl")),
         topics: settings
             .topics
             .iter()
@@ -497,15 +589,15 @@ pub fn gather(
         runpod,
         reproduce_toml: String::new(),
     };
-    input.reproduce_toml = recorded_reproduce_toml(settings, &input);
+    input.reproduce_toml = recorded_reproduce_toml(settings, &input, &config);
     Ok(input)
 }
 
 /// The reproduce config of `settings` with the `[training]` values the run
 /// recorded (`input`: base model, adapter, epochs, learning rate and sequence
-/// length) in place of the current config's, so the card never contradicts
+/// length, and `config`'s allowlisted `axolotl_extra` keys) in place of the current config's, so the card never contradicts
 /// itself when the config changed after the run.
-fn recorded_reproduce_toml(settings: &Settings, input: &CardInput) -> String {
+fn recorded_reproduce_toml(settings: &Settings, input: &CardInput, config: &str) -> String {
     let mut doc = reproduce_doc(settings);
     if let Some(table) = doc.get_mut("training").and_then(Item::as_table_mut) {
         table["base_model"] = value(shown_base(&input.base_model));
@@ -523,6 +615,11 @@ fn recorded_reproduce_toml(settings: &Settings, input: &CardInput) -> String {
         }
         if let Some(len) = input.sequence_len {
             table["sequence_len"] = value(i64::from(len));
+        }
+        table.remove("axolotl_extra");
+        let extra = recorded_extra_table(config);
+        if !extra.is_empty() {
+            table["axolotl_extra"] = Item::Table(extra);
         }
     }
     doc.to_string()
@@ -584,8 +681,9 @@ fn gguf_types(run_id: &str, files: &[UploadFile]) -> Vec<String> {
 
 /// The non-secret part of `settings`, as TOML: the topics, the roles (provider
 /// names, never provider sections), `[training]` without `target`,
-/// `hub_model_id` and `axolotl_extra`, and `[pipeline]`. Built key by key from
-/// an allowlist, so nothing else of the configuration can reach it.
+/// `hub_model_id`, its `axolotl_extra` keys that are safe to publish (the
+/// allowlist `PUBLIC_EXTRA_KEYS`), and `[pipeline]`. Built key by key from an
+/// allowlist, so nothing else of the configuration can reach it.
 #[must_use]
 pub fn reproduce_toml(settings: &Settings) -> String {
     reproduce_doc(settings).to_string()
@@ -671,7 +769,125 @@ fn training_table(training: &Training) -> Table {
     table["evals_per_epoch"] = value(i64::from(training.evals_per_epoch));
     table["saves_per_epoch"] = value(i64::from(training.saves_per_epoch));
     table["merge"] = value(training.merge);
+    let extra = axolotl_extra_table(training);
+    if !extra.is_empty() {
+        table["axolotl_extra"] = Item::Table(extra);
+    }
     table
+}
+
+/// The `axolotl_extra` keys that are published: known settings that hold no
+/// secret, token, URL or local path. Any other key, such as a credential or an
+/// output location, is left out, so a key nobody thought of cannot leak. Lists
+/// (`lora_target_modules`) and nested values are left out too.
+const PUBLIC_EXTRA_KEYS: [&str; 18] = [
+    "chat_template",
+    "attn_implementation",
+    "bf16",
+    "eval_sample_packing",
+    "flash_attention",
+    "fp16",
+    "gradient_checkpointing",
+    "group_by_length",
+    "lora_target_linear",
+    "max_grad_norm",
+    "neftune_noise_alpha",
+    "pad_to_sequence_len",
+    "seed",
+    "tf32",
+    "train_on_inputs",
+    "val_set_size",
+    "warmup_ratio",
+    "weight_decay",
+];
+
+/// Values the trainer writes into every run's `axolotl.yaml` for allowlisted
+/// keys (see `Axolotl::config`), as the config reads them back. A recorded
+/// value equal to its default is not published: a run without the key trains
+/// the same, so Reproduce leaves it out. A different value can only come from
+/// `axolotl_extra`, so it is.
+const GENERATED_DEFAULTS: [(&str, &str); 6] = [
+    ("val_set_size", "0"),
+    ("eval_sample_packing", "false"),
+    ("attn_implementation", "sdpa"),
+    ("warmup_ratio", "0.1"),
+    ("gradient_checkpointing", "true"),
+    ("lora_target_linear", "true"),
+];
+
+/// Longest string value of a published `axolotl_extra` key.
+const MAX_EXTRA_STRING: usize = 64;
+
+/// The `[training.axolotl_extra]` keys of `training` that are safe to publish
+/// (see [`PUBLIC_EXTRA_KEYS`]).
+fn axolotl_extra_table(training: &Training) -> Table {
+    let mut table = Table::new();
+    for (key, extra) in &training.axolotl_extra {
+        if let Some(item) = public_extra(key, extra) {
+            table[key.as_str()] = item;
+        }
+    }
+    table
+}
+
+/// The `[training.axolotl_extra]` keys that are safe to publish, read from
+/// `config`, the run's recorded `axolotl.yaml`: every key of
+/// [`PUBLIC_EXTRA_KEYS`] the run recorded, whether or not `overbrainer.toml`
+/// still sets it, except a value equal to what the trainer generates anyway
+/// (see `GENERATED_DEFAULTS`).
+fn recorded_extra_table(config: &str) -> Table {
+    let mut table = Table::new();
+    for key in PUBLIC_EXTRA_KEYS {
+        let Some(text) = top_level_scalar(config, key) else {
+            continue;
+        };
+        if GENERATED_DEFAULTS.contains(&(key, text.as_str())) {
+            continue;
+        }
+        if let Some(item) = public_extra(key, &scalar_value(&text)) {
+            table[key] = item;
+        }
+    }
+    table
+}
+
+/// `text` read as a bool, an integer, a float or else a string.
+fn scalar_value(text: &str) -> serde_json::Value {
+    if let Ok(flag) = text.parse::<bool>() {
+        serde_json::Value::Bool(flag)
+    } else if let Ok(whole) = text.parse::<i64>() {
+        serde_json::Value::from(whole)
+    } else if let Ok(float) = text.parse::<f64>() {
+        serde_json::Value::from(float)
+    } else {
+        serde_json::Value::String(text.to_string())
+    }
+}
+
+/// `extra` as a TOML value when `key` is in [`PUBLIC_EXTRA_KEYS`] and the
+/// value is a bool, a number, or a short string with no `/`, `\`, `@` or
+/// whitespace; `None` otherwise.
+fn public_extra(key: &str, extra: &serde_json::Value) -> Option<Item> {
+    use serde_json::Value;
+    if !PUBLIC_EXTRA_KEYS.contains(&key) {
+        return None;
+    }
+    match extra {
+        Value::Bool(flag) => Some(value(*flag)),
+        Value::Number(number) => number
+            .as_i64()
+            .map(value)
+            .or_else(|| number.as_f64().map(value)),
+        Value::String(text)
+            if !text.is_empty()
+                && text.len() <= MAX_EXTRA_STRING
+                && !text.contains(['/', '\\', '@'])
+                && !text.contains(char::is_whitespace) =>
+        {
+            Some(value(text.as_str()))
+        },
+        _ => None,
+    }
 }
 
 /// The `[pipeline]` settings that go in the reproduce config, as a TOML table.
@@ -781,6 +997,7 @@ max_hours = 6
             license: Some("apache-2.0".into()),
             parent: "deepseek/deepseek-v4-flash:thinking".into(),
             generator: "deepseek/deepseek-v4-flash".into(),
+            reasoning: ReasoningTrained::Yes,
             topics: vec![
                 (
                     "ownership".into(),
@@ -817,6 +1034,241 @@ max_hours = 6
             ..qlora_on_runpod()
         };
         snapshot("qlora_with_gguf_on_runpod", &render(&input));
+        Ok(())
+    }
+
+    /// `CARD_CONFIG` with `extra` lines added under `[training]`.
+    fn card_config_with(extra: &str) -> String {
+        CARD_CONFIG.replace(
+            "sequence_len = 4096\n",
+            &format!("sequence_len = 4096\n{extra}\n"),
+        )
+    }
+
+    /// A training record whose answer carries reasoning.
+    const WITH_REASONING: &str = "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"},{\"role\":\"assistant\",\"content\":\"a\",\"reasoning_content\":\"think\"}]}\n";
+
+    /// A training record whose answer carries no reasoning.
+    const WITHOUT_REASONING: &str = "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"},{\"role\":\"assistant\",\"content\":\"a\"}]}\n";
+
+    /// The card `gather` builds for a run of `config` whose recorded
+    /// `axolotl.yaml` is `yaml` and whose `train.jsonl` is `train` (`None`
+    /// for a run without one).
+    fn card_of_run(
+        config: &str,
+        yaml: &str,
+        train: Option<&str>,
+    ) -> Result<String, Box<dyn Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let id = "demo_20261004-150000";
+        let dir = runs.run_dir(id)?;
+        write(dir.join("axolotl.yaml"), yaml)?;
+        if let Some(train) = train {
+            write(dir.join("data/train.jsonl"), train)?;
+        }
+        let settings = load_str(config, EnvSource::Vars(Vec::new()))?;
+        let input = gather(&runs, &run_record(id), &settings, &repo(), &[])?;
+        Ok(render(&input))
+    }
+
+    /// A run of the Qwen3 template over reasoning data: the card says the reasoning was trained.
+    #[test]
+    fn reasoning_is_trained_with_the_qwen3_template() -> Result<(), Box<dyn Error>> {
+        let config = card_config_with("\n[training.axolotl_extra]\nchat_template = \"qwen3\"");
+        let yaml = "base_model: \"Qwen/Qwen3-0.6B\"\nchat_template: \"qwen3\"\n";
+        let card = card_of_run(&config, yaml, Some(WITH_REASONING))?;
+        assert!(card.contains("kept the parent model's answers and reasoning, then"));
+        assert!(!card.contains("left out of training"));
+        snapshot("reasoning_trained_with_qwen3_template", &card);
+        Ok(())
+    }
+
+    /// A chatml run over reasoning data: answers only, and `chat_template` is in Reproduce.
+    #[test]
+    fn a_chatml_template_leaves_the_reasoning_out() -> Result<(), Box<dyn Error>> {
+        let config = card_config_with("\n[training.axolotl_extra]\nchat_template = \"chatml\"");
+        let yaml = "base_model: \"Qwen/Qwen3-0.6B\"\nchat_template: \"chatml\"\n";
+        let card = card_of_run(&config, yaml, Some(WITH_REASONING))?;
+        assert!(card.contains("kept the parent model's answers, then"));
+        assert!(!card.contains("answers and reasoning"));
+        assert!(card.contains("the reasoning was left out of training"));
+        assert!(card.contains("[training.axolotl_extra]\nchat_template = \"chatml\"\n"));
+        snapshot("reasoning_left_out_with_chatml_template", &card);
+        Ok(())
+    }
+
+    /// Without a named template the base model's own is used, which cannot be
+    /// told: the card makes no definite claim.
+    #[test]
+    fn the_base_model_s_own_template_makes_no_claim() -> Result<(), Box<dyn Error>> {
+        let yaml = "base_model: \"Qwen/Qwen3-0.6B\"\n";
+        let card = card_of_run(CARD_CONFIG, yaml, Some(WITH_REASONING))?;
+        assert!(card.contains(
+            "kept the parent model's answers, and its reasoning where the chat template renders it, then"
+        ));
+        assert!(!card.contains("left out of training"));
+        snapshot("reasoning_unknown_with_the_base_template", &card);
+        Ok(())
+    }
+
+    /// Missing or empty training data gives no claim either.
+    #[test]
+    fn a_run_without_data_makes_no_claim() -> Result<(), Box<dyn Error>> {
+        let yaml = "base_model: \"Qwen/Qwen3-0.6B\"\nchat_template: \"qwen3\"\n";
+        for train in [None, Some("")] {
+            let card = card_of_run(CARD_CONFIG, yaml, train)?;
+            assert!(card.contains("where the chat template renders it"));
+        }
+        Ok(())
+    }
+
+    /// Data without reasoning says answers only, whatever the config says.
+    #[test]
+    fn data_without_reasoning_says_answers_only() -> Result<(), Box<dyn Error>> {
+        let yaml = "base_model: \"Qwen/Qwen3-0.6B\"\nchat_template: \"qwen3\"\n";
+        let card = card_of_run(CARD_CONFIG, yaml, Some(WITHOUT_REASONING))?;
+        assert!(card.contains("kept the parent model's answers, then"));
+        assert!(!card.contains("left out of training"));
+        Ok(())
+    }
+
+    /// The run's recorded template wins over the current config.
+    #[test]
+    fn the_recorded_run_wins_over_the_current_config() -> Result<(), Box<dyn Error>> {
+        let config = card_config_with("\n[training.axolotl_extra]\nchat_template = \"qwen3\"");
+        let yaml = "base_model: \"Qwen/Qwen3-0.6B\"\nchat_template: \"chatml\"\n";
+        let card = card_of_run(&config, yaml, Some(WITH_REASONING))?;
+        assert!(card.contains("the reasoning was left out of training"));
+        assert!(card.contains("chat_template = \"chatml\""));
+        assert!(!card.contains("chat_template = \"qwen3\""));
+        Ok(())
+    }
+
+    /// A key the run recorded is published even when the config no longer
+    /// sets it, but a value overbrainer generates into every run is not.
+    #[test]
+    fn recorded_keys_survive_a_config_edit_and_generated_defaults_do_not()
+    -> Result<(), Box<dyn Error>> {
+        let yaml = concat!(
+            "base_model: \"Qwen/Qwen3-0.6B\"\n",
+            "seed: 42\n",
+            "weight_decay: 0.01\n",
+            "val_set_size: 0\n",
+            "eval_sample_packing: false\n",
+            "attn_implementation: \"sdpa\"\n",
+            "warmup_ratio: 0.1\n",
+            "gradient_checkpointing: true\n",
+            "lora_target_linear: true\n",
+        );
+        let card = card_of_run(CARD_CONFIG, yaml, Some(WITH_REASONING))?;
+        assert!(card.contains("[training.axolotl_extra]\nseed = 42\n"));
+        assert!(card.contains("weight_decay = 0.01\n"));
+        for default in [
+            "val_set_size",
+            "eval_sample_packing",
+            "attn_implementation",
+            "warmup_ratio",
+            "gradient_checkpointing",
+            "lora_target_linear",
+        ] {
+            assert!(!card.contains(default), "a generated default is published");
+        }
+        Ok(())
+    }
+
+    /// A generated key the user changed differs from the default and is published.
+    #[test]
+    fn a_changed_generated_key_is_published() -> Result<(), Box<dyn Error>> {
+        let yaml = "base_model: \"m\"\nwarmup_ratio: 0.03\ngradient_checkpointing: false\n";
+        let card = card_of_run(CARD_CONFIG, yaml, None)?;
+        assert!(card.contains("warmup_ratio = 0.03\n"));
+        assert!(card.contains("gradient_checkpointing = false\n"));
+        Ok(())
+    }
+
+    /// `GENERATED_DEFAULTS` is what the trainer writes into every run's config.
+    #[test]
+    fn generated_defaults_match_the_trainer() -> Result<(), Box<dyn Error>> {
+        let settings = load_str(CARD_CONFIG, EnvSource::Vars(Vec::new()))?;
+        let training = settings.training.as_ref().ok_or("no training")?;
+        let files = crate::dataset::DataFiles::new(Path::new("."));
+        let config = crate::train::Axolotl::new(training, &files).config("/run", true);
+        let yaml = crate::train::to_yaml(&config);
+        for (key, default) in GENERATED_DEFAULTS {
+            assert_eq!(
+                top_level_scalar(&yaml, key).as_deref(),
+                Some(default),
+                "the trainer's value of a listed key changed"
+            );
+        }
+        Ok(())
+    }
+
+    /// A custom template is read from the run: without `reasoning_content` it
+    /// drops it, with it the use cannot be told.
+    #[test]
+    fn a_custom_template_is_read_from_the_run() {
+        use TemplateReasoning::{Drops, Unknown};
+        let jinja = |text: &str| format!("base_model: \"m\"\nchat_template_jinja: {text}\n");
+        assert_eq!(recorded_template(&jinja("\"{{ content }}\"")), Drops);
+        assert_eq!(
+            recorded_template(&jinja("\"{{ reasoning_content }}\"")),
+            Unknown
+        );
+        assert_eq!(recorded_template(&jinja("|")), Unknown);
+        assert_eq!(recorded_template("chat_template_jinja:\n  x\n"), Unknown);
+        assert_eq!(recorded_template("base_model: \"m\"\n"), Unknown);
+    }
+
+    /// Only allowlisted `axolotl_extra` keys with plain values are published.
+    #[test]
+    fn secret_like_axolotl_extra_keys_are_not_published() -> Result<(), Box<dyn Error>> {
+        let extra = concat!(
+            "\n[training.axolotl_extra]\n",
+            "chat_template = \"chatml\"\n",
+            "credentials = \"sk-live-example\"\n",
+            "hub_token = \"hf_secret_value\"\n",
+            "wandb_api_key = \"wandb_secret_value\"\n",
+            "cache_dir = \"/home/me/out\"\n",
+            "wandb_url = \"https://wandb.example/me\"\n",
+            "attn_implementation = \"/home/me/attn.py\"\n",
+            "train_on_inputs = false\n",
+            "warmup_ratio = 0.05\n",
+            "weight_decay = \"two words\"\n",
+            "lora_target_modules = [\"q_proj\"]\n",
+        );
+        let yaml = concat!(
+            "base_model: \"Qwen/Qwen3-0.6B\"\n",
+            "chat_template: \"chatml\"\n",
+            "credentials: \"sk-live-example\"\n",
+            "hub_token: \"hf_secret_value\"\n",
+            "wandb_api_key: \"wandb_secret_value\"\n",
+            "cache_dir: \"/home/me/out\"\n",
+            "wandb_url: \"https://wandb.example/me\"\n",
+            "attn_implementation: \"/home/me/attn.py\"\n",
+            "train_on_inputs: false\n",
+            "warmup_ratio: 0.05\n",
+            "weight_decay: \"two words\"\n",
+        );
+        let card = card_of_run(&card_config_with(extra), yaml, Some(WITH_REASONING))?;
+        for leaked in [
+            "sk-live-example",
+            "credentials",
+            "hf_secret_value",
+            "wandb_secret_value",
+            "/home/me",
+            "wandb.example",
+            "hub_token",
+            "two words",
+            "lora_target_modules",
+        ] {
+            assert!(!card.contains(leaked), "the card leaks a left-out value");
+        }
+        assert!(card.contains("chat_template = \"chatml\""));
+        assert!(card.contains("train_on_inputs = false"));
+        assert!(card.contains("warmup_ratio = 0.05"));
+        snapshot("secret_like_axolotl_extra_not_published", &card);
         Ok(())
     }
 

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 pub use axolotl::{
     Axolotl, CONFIG_FILE, MERGED_DIR, METRICS_FILE, OUTPUT_DIR, Outputs, RESUME_DIR, Resume,
-    reasoning_template_warning,
+    TemplateReasoning, reasoning_template_warning, template_reasoning,
 };
 pub use metrics::{
     JobStage, METRICS_ENV, METRICS_PLUGIN, Mark, MetricLine, PLUGIN_CLASS, PLUGIN_FILE, Pace,
