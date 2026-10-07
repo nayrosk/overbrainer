@@ -739,7 +739,7 @@ mod tests {
             max_price_per_hour: None,
             gpu_count: 1,
             image: "img".to_string(),
-            venv: "/venv".to_string(),
+            venv: Some("/venv".to_string()),
             container_disk_gb: 50,
             max_hours: 1.0,
             max_cost_usd: None,

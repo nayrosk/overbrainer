@@ -131,7 +131,7 @@ fn target(gpu_types: &[&str]) -> RunpodTarget {
         max_price_per_hour: None,
         gpu_count: 1,
         image: "img@sha256:abc".into(),
-        venv: "/workspace/axolotl-venv".into(),
+        venv: Some("/workspace/axolotl-venv".into()),
         container_disk_gb: 50,
         max_hours: 6.0,
         max_cost_usd: None,

@@ -563,6 +563,13 @@ pub enum Target {
 /// CUDA 13 (NVIDIA driver 580 or newer), pinned by its index digest.
 pub const DEFAULT_RUNPOD_IMAGE: &str = "axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1@sha256:f7b94da82913920a003e28e091d8528f57f76da7360fca87e95faf62fa32a680";
 
+/// Image of the pod of a Runpod compare when `[compare] image` sets none:
+/// Runpod's Ubuntu 24.04 base image for CUDA 13.0, pinned by its digest. Its
+/// glibc 2.39 runs the llama.cpp CUDA build, which needs 2.38, where
+/// [`DEFAULT_RUNPOD_IMAGE`] (Ubuntu 22.04, glibc 2.35) does not. It has what a
+/// compare pod needs: sshd, `curl`, `python3` and `tar`.
+pub const DEFAULT_COMPARE_IMAGE: &str = "runpod/base:1.4.0-cuda1300-ubuntu2404@sha256:7ae135e7245f01f41a294ab79280ef83974953fb8823512a69e9faf2b47201f4";
+
 /// Virtual environment holding Axolotl in [`DEFAULT_RUNPOD_IMAGE`].
 pub const DEFAULT_RUNPOD_VENV: &str = "/workspace/axolotl-venv";
 
@@ -798,8 +805,8 @@ impl Default for Export {
     }
 }
 
-/// `overbrainer compare`: the prices of its cost rows and the child's
-/// generation limits.
+/// `overbrainer compare`: the prices of its cost rows, the child's
+/// generation limits, and the image of a Runpod compare pod.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Compare {
@@ -816,10 +823,14 @@ pub struct Compare {
     pub temperature: f64,
     /// How long `llama-server` may take to be ready, in seconds, 1 to 3600.
     pub server_start_secs: u64,
+    /// Container image of the pod of a compare on a Runpod target. Defaults
+    /// to [`DEFAULT_COMPARE_IMAGE`]; pinning it by digest is recommended.
+    pub image: Option<String>,
 }
 
 impl Default for Compare {
-    /// No prices, 4096 tokens, temperature 0, and 300 seconds for the server.
+    /// No prices, 4096 tokens, temperature 0, 300 seconds for the server,
+    /// and the default compare image.
     fn default() -> Self {
         Self {
             parent_price_in: None,
@@ -828,6 +839,7 @@ impl Default for Compare {
             max_tokens: 4096,
             temperature: 0.0,
             server_start_secs: 300,
+            image: None,
         }
     }
 }
