@@ -371,9 +371,9 @@ const ROLE: &[FieldSpec] = &[
     ),
     spec(
         "reasoning_effort",
-        FieldKind::Choice(&["low", "medium", "high"]),
+        FieldKind::Choice(&["low", "medium", "high", "none"]),
         true,
-        "Reasoning effort, only with reasoning = true",
+        "Reasoning effort; none turns thinking off (openai only), the rest need reasoning = true",
     ),
     spec(
         "thinking_budget",

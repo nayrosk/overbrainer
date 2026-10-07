@@ -27,7 +27,8 @@ generator = { provider = "nanogpt", model = "qwen/qwen3-235b-a22b" }
 parent = { provider = "nanogpt", model = "deepseek/deepseek-r1", reasoning = true }
 # judge = { provider = "openrouter", model = "..." }   # overbrainer compare: defaults to the parent
 # Optional on every role: max_tokens (default 16384), temperature (0 to 2),
-# reasoning_effort ("low", "medium" or "high", only with reasoning = true).
+# reasoning_effort ("low", "medium" or "high" with reasoning = true; "none" turns thinking off
+# on an openai provider, without reasoning = true).
 # thinking_budget = 8000  # anthropic only; Claude Opus 4.5, Sonnet 4.5 and Haiku 4.5 need this
 # (fixed budget) instead of adaptive thinking; leave unset for newer Claude models.
 # embedder = { provider = "openrouter", model = "openai/text-embedding-3-small" }

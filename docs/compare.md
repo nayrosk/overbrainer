@@ -51,6 +51,8 @@ Questions go one at a time: the numbers describe one user. Throughput under load
 
 `prompts/judge.txt` is a template with the variables `question`, `answer_a` and `answer_b`. It must ask for a JSON object, `{"verdict": "A" or "B" or "tie", "reason": "one sentence"}`.
 
+A local thinking model as judge (for example `qwen3.5:9b` on Ollama) can spend its whole `max_tokens` thinking and return no verdict. Set `reasoning_effort = "none"` on the judge role, without `reasoning = true`, to turn thinking off: overbrainer then sends `reasoning_effort: "none"` and the model answers at once. This needs a provider with the `openai` protocol.
+
 ## The report
 
 `compare.md` has:

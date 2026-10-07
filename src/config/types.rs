@@ -150,7 +150,8 @@ pub struct RoleModel {
     pub max_tokens: u32,
     /// Sampling temperature in [0, 2]. The provider default applies when unset.
     pub temperature: Option<f64>,
-    /// Reasoning effort. Only valid with `reasoning = true`.
+    /// Reasoning effort. `low`, `medium` and `high` need `reasoning = true`. `none` turns
+    /// thinking off, needs the `openai` protocol and cannot combine with `reasoning = true`.
     pub reasoning_effort: Option<Effort>,
     /// Fixed extended-thinking token budget, for the `anthropic` protocol only. Only
     /// valid with `reasoning = true`, must be at least 1024 and less than `max_tokens`,
@@ -173,6 +174,8 @@ fn default_max_tokens() -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
+    /// No thinking. Only valid on the `openai` protocol, without `reasoning = true`.
+    None,
     /// Short reasoning.
     Low,
     /// Balanced reasoning. Sent to `openai` providers when no effort is configured.
@@ -182,10 +185,11 @@ pub enum Effort {
 }
 
 impl Effort {
-    /// The wire value: `low`, `medium` or `high`.
+    /// The wire value: `none`, `low`, `medium` or `high`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
