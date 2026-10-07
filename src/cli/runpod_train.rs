@@ -265,7 +265,9 @@ pub(super) async fn export(
 }
 
 /// `overbrainer compare` of `plan` on the Runpod target `spec`: a new pod
-/// with the target's GPU settings, the compare job uploaded with the run's
+/// with the target's GPU settings and the compare image (`[compare] image`,
+/// else [`DEFAULT_COMPARE_IMAGE`](crate::config::DEFAULT_COMPARE_IMAGE), its
+/// job run by the image's `python3`), the compare job uploaded with the run's
 /// GGUF and the questions, its answers retrieved, then the pod deleted (kept
 /// with `keep`), under the same lease, deadline and cost cap as a training
 /// job. The pod's price and the questions are said before it starts. The
@@ -285,6 +287,7 @@ pub(super) async fn compare(
     front: &Frontend,
 ) -> anyhow::Result<(Runs, String)> {
     let run = &plan.run;
+    let spec = &spec.for_compare(settings.compare.image.as_deref());
     let compares = Runs::new(project_dir).compares(&run.id)?;
     let trainer = super::compare::job_of(plan, settings, ModelSource::Upload(plan.gguf.clone()))?;
     let vram_floor_gb = super::compare::compare_vram_floor(spec, plan.export.size);
@@ -1226,7 +1229,7 @@ mod tests {
             max_price_per_hour: None,
             gpu_count: 1,
             image: "img".into(),
-            venv: "/venv".into(),
+            venv: Some("/venv".into()),
             container_disk_gb: 50,
             max_hours: 6.0,
             max_cost_usd: None,

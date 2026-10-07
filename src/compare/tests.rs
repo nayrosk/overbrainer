@@ -138,7 +138,8 @@ fn questions(texts: &[&str]) -> Vec<EvalQuestion> {
 }
 
 /// A fake release, a job directory prepared by a `CompareJob`, stub `uname`,
-/// `nvidia-smi` (no GPU) and `ldconfig` (no `ROCm`), no `/dev/kfd`, and a cache.
+/// `nvidia-smi` (no GPU), `ldconfig` (no `ROCm`) and `getconf` (glibc 2.39,
+/// whatever this machine has), no `/dev/kfd`, and a cache.
 struct Fixture {
     /// Holds everything.
     root: tempfile::TempDir,
@@ -184,6 +185,7 @@ impl Fixture {
         stub(&stubs, "uname", UNAME_LINUX_X64)?;
         stub(&stubs, "nvidia-smi", NO_GPU)?;
         stub(&stubs, "ldconfig", LDCONFIG_PLAIN)?;
+        Glibc::Getconf("2.39").stub_into(&stubs)?;
         let gguf = path.join("child.gguf");
         std::fs::write(&gguf, "gguf")?;
         let (source, model) = if on_target {
@@ -463,6 +465,31 @@ fn an_old_nvidia_driver_falls_back_to_the_cpu_and_says_so() -> TestResult {
     Ok(())
 }
 
+/// On an NVIDIA host whose driver supports CUDA 13 but whose glibc is
+/// Ubuntu 22.04's, the CPU build serves the child, with a warning in the
+/// job's output: hardware.json lists no GPU.
+#[test]
+fn an_old_glibc_serves_the_child_on_the_cpu() -> TestResult {
+    if !tools_available() {
+        eprintln!("skipped: needs sh, python3 and tar");
+        return Ok(());
+    }
+    let fixture = Fixture::new(&["Why?"], false)?;
+    stub(&fixture.stubs(), "nvidia-smi", &gpu("13.0"))?;
+    Glibc::Getconf("2.35").stub_into(&fixture.stubs())?;
+    let output = fixture.run("ok")?;
+    assert!(output.status.success(), "{}", text(&output));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("compare: warning: glibc 2.35 is older than the glibc 2.38"),
+        "{stderr}"
+    );
+    let hardware = read_hardware(&fixture.job_dir()).ok_or("no hardware.json")?;
+    assert_eq!(hardware.build, "ubuntu-x64");
+    assert!(!hardware.has_gpu(), "{:?}", hardware.gpus);
+    Ok(())
+}
+
 /// Runs the client's `write_hardware` for `build` in a fresh directory,
 /// with `nvidia-smi`, `rocm-smi`, `amd-smi`, `lspci` and `sysctl` stubbed
 /// (failing unless `tools` gives a body, each a name and its body), and
@@ -728,13 +755,51 @@ enum Amd {
     Unwritable,
 }
 
+/// How the host says which glibc it has, to `pick_build`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Glibc<'a> {
+    /// It does not: neither `getconf` nor `ldd`.
+    Unknown,
+    /// `getconf GNU_LIBC_VERSION` prints `glibc <version>`.
+    Getconf(&'a str),
+    /// Only `ldd --version` says it, as Ubuntu's does, on its first line.
+    Ldd(&'a str),
+}
+
+impl Glibc<'_> {
+    /// Writes the stub `getconf` or `ldd` saying the version into `stubs`.
+    fn stub_into(self, stubs: &Path) -> TestResult {
+        match self {
+            Self::Unknown => Ok(()),
+            Self::Getconf(version) => stub(
+                stubs,
+                "getconf",
+                &format!(
+                    "#!/bin/sh\n[ \"$1\" = GNU_LIBC_VERSION ] || exit 1\necho 'glibc {version}'\n"
+                ),
+            ),
+            Self::Ldd(version) => stub(
+                stubs,
+                "ldd",
+                &format!(
+                    "#!/bin/sh\n[ \"$1\" = --version ] || exit 1\n\
+                     echo 'ldd (Ubuntu GLIBC {version}-0ubuntu3.8) {version}'\n\
+                     echo 'Copyright (C) 2022 Free Software Foundation, Inc.'\n"
+                ),
+            ),
+        }
+    }
+}
+
 /// Runs the script's `pick_build` with `uname` printing `platform`,
-/// `nvidia-smi` as `smi` (absent when `None`) and the AMD host `amd`, on a
-/// `PATH` holding only those stubs: the build, and what it printed on stderr.
+/// `nvidia-smi` as `smi` (absent when `None`), the AMD host `amd` and the
+/// glibc `glibc`, on a `PATH` holding only those stubs: the build, and what
+/// it printed on stderr.
 fn pick_build(
     platform: &str,
     smi: Option<&str>,
     amd: Amd,
+    glibc: Glibc<'_>,
 ) -> Result<(Build, String), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let stubs = dir.path().join("stubs");
@@ -742,6 +807,7 @@ fn pick_build(
     if let Some(body) = smi {
         stub(&stubs, "nvidia-smi", body)?;
     }
+    glibc.stub_into(&stubs)?;
     let libs = match amd {
         Amd::WithoutRuntime => LDCONFIG_PLAIN,
         Amd::WithoutRocblas => LDCONFIG_NO_ROCBLAS,
@@ -787,8 +853,8 @@ fn pick_build(
     Ok((build, String::from_utf8(output.stderr)?))
 }
 
-/// One `pick_build` case: the platform, `nvidia-smi`, the AMD host, and the
-/// build and the one warning (a part of it) expected.
+/// One `pick_build` case: the platform, `nvidia-smi`, the AMD host, the
+/// glibc, and the build and the one warning (a part of it) expected.
 struct BuildCase<'a> {
     /// What `uname` prints.
     platform: &'a str,
@@ -796,6 +862,8 @@ struct BuildCase<'a> {
     smi: Option<&'a str>,
     /// The AMD host.
     amd: Amd,
+    /// The host's glibc.
+    glibc: Glibc<'a>,
     /// The build `pick_build` must choose.
     expected: Build,
     /// A part of the only warning it must print, none when it prints none.
@@ -810,10 +878,10 @@ impl BuildCase<'_> {
             eprintln!("skipped the unwritable case: the user can write anything");
             return Ok(());
         }
-        let (build, stderr) = pick_build(self.platform, self.smi, self.amd)?;
+        let (build, stderr) = pick_build(self.platform, self.smi, self.amd, self.glibc)?;
         let case = format!(
-            "{}, nvidia-smi {:?}, {:?}",
-            self.platform, self.smi, self.amd
+            "{}, nvidia-smi {:?}, {:?}, {:?}",
+            self.platform, self.smi, self.amd, self.glibc
         );
         assert_eq!(build, self.expected, "{case}");
         assert_eq!(
@@ -848,6 +916,7 @@ fn the_build_matches_the_platform_and_the_gpu() -> TestResult {
         platform,
         smi,
         amd: Amd::Absent,
+        glibc: Glibc::Unknown,
         expected,
         warning,
     };
@@ -885,7 +954,7 @@ fn the_build_matches_the_platform_and_the_gpu() -> TestResult {
     for case in cases {
         case.check()?;
     }
-    let other = pick_build("Linux riscv64", None, Amd::Absent);
+    let other = pick_build("Linux riscv64", None, Amd::Absent, Glibc::Unknown);
     assert!(
         other.is_err_and(|error| error
             .to_string()
@@ -913,6 +982,7 @@ fn an_amd_host_gets_the_rocm_build_or_the_reason_it_does_not() -> TestResult {
         platform,
         smi,
         amd,
+        glibc: Glibc::Unknown,
         expected,
         warning,
     };
@@ -966,18 +1036,107 @@ fn an_amd_host_gets_the_rocm_build_or_the_reason_it_does_not() -> TestResult {
     for case in cases {
         case.check()?;
     }
-    let (_, stderr) = pick_build("Linux x86_64", None, Amd::WithoutRuntime)?;
+    let (_, stderr) = pick_build("Linux x86_64", None, Amd::WithoutRuntime, Glibc::Unknown)?;
     assert!(
         stderr.contains("missing (libamdhip64.so.7, librocblas.so.5, libhipblas.so.3)"),
         "{stderr}"
     );
-    let (_, stderr) = pick_build("Linux x86_64", None, Amd::WithoutRocblas)?;
+    let (_, stderr) = pick_build("Linux x86_64", None, Amd::WithoutRocblas, Glibc::Unknown)?;
     for present in ["libamdhip64", "libhipblas"] {
         assert!(
             !stderr.contains(present),
             "only the missing library: {stderr}"
         );
     }
+    Ok(())
+}
+
+/// A GPU build needs a newer glibc than Ubuntu 22.04's 2.35: on an older
+/// one, said by `getconf` or by `ldd`, the CPU build runs with one warning
+/// naming both versions; on a recent enough one, or one nothing says, the GPU
+/// build runs as before.
+#[test]
+fn an_old_glibc_gets_the_cpu_build_and_says_so() -> TestResult {
+    use crate::export::{
+        CUDART_X64_SHA256, LLAMA_CPP_GPU_GLIBC, UBUNTU_CUDA_X64_SHA256, UBUNTU_ROCM_X64_SHA256,
+        UBUNTU_X64_SHA256,
+    };
+    if !crate::test_support::sh_available() {
+        eprintln!("skipped: needs sh");
+        return Ok(());
+    }
+    let driver_13 = gpu("13.0");
+    let nvidia = Some(driver_13.as_str());
+    let case = |smi, amd, glibc, expected, warning| BuildCase {
+        platform: "Linux x86_64",
+        smi,
+        amd,
+        glibc,
+        expected,
+        warning,
+    };
+    let cpu_x64 = || Build::cpu("ubuntu-x64", UBUNTU_X64_SHA256);
+    let cuda_x64 = || Build::cuda("x64", UBUNTU_CUDA_X64_SHA256, CUDART_X64_SHA256);
+    let too_old = format!(
+        "glibc 2.35 is older than the glibc {LLAMA_CPP_GPU_GLIBC} the ubuntu-cuda-{LLAMA_CPP_CUDA}-x64 build"
+    );
+    let rocm_too_old = format!(
+        "glibc 2.35 is older than the glibc {LLAMA_CPP_GPU_GLIBC} the ubuntu-rocm-{LLAMA_CPP_ROCM}-x64 build"
+    );
+    let cases = [
+        case(
+            nvidia,
+            Amd::Absent,
+            Glibc::Getconf("2.35"),
+            cpu_x64(),
+            Some(too_old.as_str()),
+        ),
+        case(
+            nvidia,
+            Amd::Absent,
+            Glibc::Ldd("2.35"),
+            cpu_x64(),
+            Some(too_old.as_str()),
+        ),
+        case(
+            None,
+            Amd::WithRuntime,
+            Glibc::Getconf("2.35"),
+            cpu_x64(),
+            Some(rocm_too_old.as_str()),
+        ),
+        case(
+            nvidia,
+            Amd::Absent,
+            Glibc::Getconf("2.39"),
+            cuda_x64(),
+            None,
+        ),
+        case(nvidia, Amd::Absent, Glibc::Ldd("2.39"), cuda_x64(), None),
+        case(
+            nvidia,
+            Amd::Absent,
+            Glibc::Getconf(LLAMA_CPP_GPU_GLIBC),
+            cuda_x64(),
+            None,
+        ),
+        case(nvidia, Amd::Absent, Glibc::Getconf("3.0"), cuda_x64(), None),
+        case(
+            None,
+            Amd::WithRuntime,
+            Glibc::Ldd("2.41"),
+            Build::rocm(UBUNTU_ROCM_X64_SHA256),
+            None,
+        ),
+    ];
+    for case in cases {
+        case.check()?;
+    }
+    let (_, stderr) = pick_build("Linux x86_64", nvidia, Amd::Absent, Glibc::Getconf("2.35"))?;
+    assert!(
+        stderr.contains("using the CPU build ubuntu-x64"),
+        "{stderr}"
+    );
     Ok(())
 }
 

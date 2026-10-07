@@ -146,7 +146,7 @@ fn target() -> RunpodTarget {
         max_price_per_hour: None,
         gpu_count: 1,
         image: "img".into(),
-        venv: "/venv".into(),
+        venv: Some("/venv".into()),
         container_disk_gb: 50,
         max_hours: 1.0,
         max_cost_usd: None,

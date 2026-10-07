@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use crate::config::{DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV, ListOrAuto, SshClient, Target};
+use crate::config::{
+    DEFAULT_COMPARE_IMAGE, DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV, ListOrAuto, SshClient, Target,
+};
 use crate::exec::JobRuntime;
 
 use super::JOB_ENV;
@@ -31,8 +33,9 @@ pub struct RunpodTarget {
     pub gpu_count: u32,
     /// Container image.
     pub image: String,
-    /// Virtual environment holding `bin/axolotl` on the pod.
-    pub venv: String,
+    /// Virtual environment holding `bin/axolotl` on the pod; `None` for a
+    /// job that runs the image's own `python3` (a compare).
+    pub venv: Option<String>,
     /// Container disk, in GB.
     pub container_disk_gb: u32,
     /// Hours after which the watchdog deletes the pod.
@@ -88,9 +91,10 @@ impl RunpodTarget {
             image: image
                 .clone()
                 .unwrap_or_else(|| DEFAULT_RUNPOD_IMAGE.to_string()),
-            venv: venv
-                .clone()
-                .unwrap_or_else(|| DEFAULT_RUNPOD_VENV.to_string()),
+            venv: Some(
+                venv.clone()
+                    .unwrap_or_else(|| DEFAULT_RUNPOD_VENV.to_string()),
+            ),
             container_disk_gb: *container_disk_gb,
             max_hours: *max_hours,
             max_cost_usd: *max_cost_usd,
@@ -113,13 +117,27 @@ impl RunpodTarget {
         }
     }
 
-    /// How jobs run on the pod: the image's virtual environment, after the
-    /// environment file the bootstrap writes.
+    /// How jobs run on the pod: the image's virtual environment (its `PATH`
+    /// without one), after the environment file the bootstrap writes.
     #[must_use]
     pub fn runtime(&self) -> JobRuntime {
         JobRuntime::Native {
-            venv: Some(self.venv.clone()),
+            venv: self.venv.clone(),
             env_file: Some(JOB_ENV.to_string()),
+        }
+    }
+
+    /// The same target for the pod of a compare: the image `image`, else
+    /// [`DEFAULT_COMPARE_IMAGE`], whose glibc runs the llama.cpp GPU builds,
+    /// and no virtual environment, since a compare needs no Axolotl: its job
+    /// runs the image's `python3`. Training and export pods keep the
+    /// target's image.
+    #[must_use]
+    pub fn for_compare(&self, image: Option<&str>) -> Self {
+        Self {
+            image: image.unwrap_or(DEFAULT_COMPARE_IMAGE).to_string(),
+            venv: None,
+            ..self.clone()
         }
     }
 }
@@ -155,7 +173,7 @@ mod tests {
     fn defaults_are_applied() -> Result<(), &'static str> {
         let target = RunpodTarget::from_target(&config_target(None)).ok_or("not runpod")?;
         assert_eq!(target.image, DEFAULT_RUNPOD_IMAGE);
-        assert_eq!(target.venv, "/workspace/axolotl-venv");
+        assert_eq!(target.venv.as_deref(), Some("/workspace/axolotl-venv"));
         assert_eq!(target.boot_grace, Duration::from_mins(30));
         assert_eq!(target.retrieve_grace, Duration::from_secs(3600));
         assert_eq!(target.workdir(), "/workspace/overbrainer");
@@ -169,6 +187,36 @@ mod tests {
         let on_volume =
             RunpodTarget::from_target(&config_target(Some("vol1"))).ok_or("not runpod")?;
         assert_eq!(on_volume.workdir(), "/workspace/data/overbrainer");
+        Ok(())
+    }
+
+    /// A compare pod runs on the compare image, the configured one or the
+    /// default, with the image's own Python: no Axolotl venv. The rest of the
+    /// target is kept.
+    #[test]
+    fn a_compare_pod_has_its_own_image_and_no_venv() -> Result<(), &'static str> {
+        let target = RunpodTarget::from_target(&config_target(None)).ok_or("not runpod")?;
+        let compare = target.for_compare(None);
+        assert_eq!(compare.image, DEFAULT_COMPARE_IMAGE);
+        assert_eq!(
+            compare.runtime(),
+            JobRuntime::Native {
+                venv: None,
+                env_file: Some("/etc/overbrainer/job.env".into()),
+            }
+        );
+        assert_eq!(compare.gpu_types, target.gpu_types);
+        assert_eq!(compare.workdir(), target.workdir());
+        let custom = target.for_compare(Some("me/llama:1@sha256:abc"));
+        assert_eq!(custom.image, "me/llama:1@sha256:abc");
+        assert_eq!(
+            target.runtime(),
+            JobRuntime::Native {
+                venv: Some("/workspace/axolotl-venv".into()),
+                env_file: Some("/etc/overbrainer/job.env".into()),
+            },
+            "the training target keeps its venv"
+        );
         Ok(())
     }
 }

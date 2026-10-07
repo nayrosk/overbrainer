@@ -760,7 +760,7 @@ pub(super) fn runpod_spec(gpus: ListOrAuto, count: u32) -> RunpodTarget {
         max_price_per_hour: None,
         gpu_count: count,
         image: crate::config::DEFAULT_RUNPOD_IMAGE.to_string(),
-        venv: crate::config::DEFAULT_RUNPOD_VENV.to_string(),
+        venv: Some(crate::config::DEFAULT_RUNPOD_VENV.to_string()),
         container_disk_gb: 50,
         max_hours: 6.0,
         max_cost_usd: None,

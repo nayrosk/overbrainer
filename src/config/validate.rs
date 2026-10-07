@@ -285,7 +285,8 @@ fn check_training(settings: &Settings, problems: &mut Vec<String>) {
     check_axolotl_extra(training, problems);
 }
 
-/// Prices are finite and not negative; the child's limits are in range.
+/// Prices are finite and not negative; the child's limits are in range; the
+/// image, when set, is checked like a target's.
 fn check_compare(settings: &Settings, problems: &mut Vec<String>) {
     let compare = &settings.compare;
     for (key, price) in [
@@ -308,6 +309,7 @@ fn check_compare(settings: &Settings, problems: &mut Vec<String>) {
     if !(1..=3600).contains(&compare.server_start_secs) {
         problems.push("compare.server_start_secs: must be between 1 and 3600".to_string());
     }
+    check_image("compare.image", compare.image.as_deref(), problems);
 }
 
 /// `quantize` is a llama-quantize type, and `ollama_name` an Ollama model name.
@@ -807,25 +809,31 @@ fn valid_tilde_placement(value: &str) -> bool {
     }
 }
 
-/// `image`, when set, must not be empty and must use only `[A-Za-z0-9._/:@-]` and not
-/// start with `-`. It reaches remote shell commands, so unsafe characters are
-/// rejected here in addition to callers quoting it.
+/// The `image` of target `name` (see [`check_image`]).
 fn check_target_image(name: &str, image: Option<&str>, problems: &mut Vec<String>) {
+    check_image(&format!("targets.{name}.image"), image, problems);
+}
+
+/// The image at `key`, when set, must not be empty and must use only
+/// `[A-Za-z0-9._/:@-]` and not start with `-`. It reaches remote shell
+/// commands, so unsafe characters are rejected here in addition to callers
+/// quoting it.
+fn check_image(key: &str, image: Option<&str>, problems: &mut Vec<String>) {
     let Some(image) = image else {
         return;
     };
     if image.trim().is_empty() {
-        problems.push(format!("targets.{name}.image: must not be empty"));
+        problems.push(format!("{key}: must not be empty"));
         return;
     }
     if !image.chars().all(is_image_char) {
         problems.push(format!(
-            "targets.{name}.image: only letters, digits and . _ / : @ - are allowed"
+            "{key}: only letters, digits and . _ / : @ - are allowed"
         ));
         return;
     }
     if image.starts_with('-') {
-        problems.push(format!("targets.{name}.image: must not start with -"));
+        problems.push(format!("{key}: must not start with -"));
     }
 }
 
@@ -1070,6 +1078,32 @@ mod tests {
         );
         let unknown = format!("{VALID}\n        [compare]\n        price = 1.0\n");
         assert!(settings(&unknown).is_err(), "unknown keys are refused");
+        Ok(())
+    }
+
+    /// `compare.image` is unset by default, and checked like a target's
+    /// `image` when set.
+    #[test]
+    fn the_compare_image_is_checked_like_a_target_image() -> Result<(), config::ConfigError> {
+        assert_eq!(settings(VALID)?.compare.image, None);
+        let image =
+            |value: &str| format!("{VALID}\n        [compare]\n        image = \"{value}\"\n");
+        let pinned = settings(&image("runpod/base:1.4.0@sha256:0123abcd"))?;
+        assert_eq!(
+            pinned.compare.image.as_deref(),
+            Some("runpod/base:1.4.0@sha256:0123abcd")
+        );
+        assert_eq!(check(&pinned), Vec::<String>::new());
+        for (value, problem) in [
+            (" ", "compare.image: must not be empty"),
+            (
+                "img;rm",
+                "compare.image: only letters, digits and . _ / : @ - are allowed",
+            ),
+            ("-img", "compare.image: must not start with -"),
+        ] {
+            assert_eq!(check(&settings(&image(value))?), vec![problem.to_string()]);
+        }
         Ok(())
     }
 

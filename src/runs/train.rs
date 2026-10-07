@@ -466,7 +466,8 @@ pub async fn watch<E: Executor, T: Trainer>(
         status = follow(ctx, &job, &mut stream, &mut summary) => status?,
         never = sampler => match never {},
     };
-    let (state, message) = outcome(status, &summary, &record.id, trainer.metrics_required());
+    let dir = ctx.runs.relative_dir(&record.id);
+    let (state, message) = outcome(status, &summary, &dir, trainer.metrics_required());
     // A job cancelled once its proof was written (a stop whose job did not
     // end in time) saved its checkpoint all the same: it is stopped too.
     let (state, message, snapshot) = if matches!(state, RunState::Succeeded | RunState::Cancelled) {
@@ -492,7 +493,7 @@ pub async fn watch<E: Executor, T: Trainer>(
             // still downloaded and verified: retrieved is still true.
             Ok(Retrieved::NoOutput) => (
                 RunState::Failed,
-                Some(no_output_message(&record.id, snapshot.as_ref())),
+                Some(no_output_message(&dir, snapshot.as_ref())),
                 true,
             ),
             Err(error) if kept => return Err(error.into()),
@@ -668,14 +669,15 @@ fn verify_error(message: String) -> ExecError {
 
 /// The message recorded when a succeeded job leaves no file in its required
 /// entry, or a stopped one no file in its checkpoint: a permanent condition,
-/// since a retry cannot make the target produce what was never written.
-fn no_output_message(id: &str, snapshot: Option<&Snapshot>) -> String {
+/// since a retry cannot make the target produce what was never written. `dir`
+/// is the run's directory relative to the project (see [`Runs::relative_dir`]).
+fn no_output_message(dir: &str, snapshot: Option<&Snapshot>) -> String {
     match snapshot {
         Some(snapshot) => format!(
-            "the job stopped with a snapshot but left no file in {} (see runs/{id}/{JOB_LOG})",
+            "the job stopped with a snapshot but left no file in {} (see {dir}/{JOB_LOG})",
             snapshot.checkpoint
         ),
-        None => format!("the job succeeded but left no output (see runs/{id}/{JOB_LOG})"),
+        None => format!("the job succeeded but left no output (see {dir}/{JOB_LOG})"),
     }
 }
 
@@ -876,14 +878,16 @@ fn unreachable_line(error: &ExecError, failures: u32) -> String {
     )
 }
 
-/// The final state of a run whose job ended with `status`.
+/// The final state of a run whose job ended with `status`; its messages name
+/// the job log in `dir`, the run's directory relative to the project (see
+/// [`Runs::relative_dir`]).
 fn outcome(
     status: JobStatus,
     summary: &MetricsSummary,
-    id: &str,
+    dir: &str,
     metrics_required: bool,
 ) -> (RunState, Option<String>) {
-    let log = format!("see runs/{id}/{JOB_LOG}");
+    let log = format!("see {dir}/{JOB_LOG}");
     match status {
         JobStatus::Exited(0) if summary.lines > 0 || !metrics_required => {
             (RunState::Succeeded, None)
@@ -1031,35 +1035,37 @@ mod tests {
     use crate::runs::RECORD_FILE;
     use crate::train::Artifacts;
 
+    /// The outcome follows the exit code and the metrics, and names the job
+    /// log in the run's directory.
     #[test]
     fn outcomes_follow_the_exit_code_and_the_metrics() {
         let mut summary = MetricsSummary::default();
-        let (state, message) = outcome(JobStatus::Exited(0), &summary, "r1", true);
+        let (state, message) = outcome(JobStatus::Exited(0), &summary, "runs/r1", true);
         assert_eq!(state, RunState::Failed);
         assert!(message.is_some_and(|message| message.contains("plugin was not loaded")));
         assert_eq!(
-            outcome(JobStatus::Exited(0), &summary, "r1", false),
+            outcome(JobStatus::Exited(0), &summary, "runs/r1", false),
             (RunState::Succeeded, None),
             "a job without metrics needs only its exit code"
         );
         summary.add(r#"{"event": "begin", "time": 1}"#);
         assert_eq!(
-            outcome(JobStatus::Exited(0), &summary, "r1", true),
+            outcome(JobStatus::Exited(0), &summary, "runs/r1", true),
             (RunState::Succeeded, None)
         );
         assert_eq!(
-            outcome(JobStatus::Exited(2), &summary, "r1", true),
+            outcome(JobStatus::Exited(2), &summary, "runs/r1", true),
             (
                 RunState::Failed,
                 Some("the job exited with code 2 (see runs/r1/job.log)".to_string())
             )
         );
         assert_eq!(
-            outcome(JobStatus::Cancelled, &summary, "r1", true),
+            outcome(JobStatus::Cancelled, &summary, "runs/r1", true),
             (RunState::Cancelled, None)
         );
         assert_eq!(
-            outcome(JobStatus::Lost, &summary, "r1", false).0,
+            outcome(JobStatus::Lost, &summary, "runs/r1", false).0,
             RunState::Failed
         );
     }
@@ -1454,6 +1460,31 @@ mod tests {
             .ok_or("the watch succeeded")?;
         assert!(error.to_string().contains("connection reset"), "{error}");
         assert_eq!(runs.load(&record.id)?, record);
+        Ok(())
+    }
+
+    /// A failed compare names its job log where it is: under the compares of
+    /// its run, not under `runs/` as a run of its own.
+    #[tokio::test]
+    async fn a_failed_compare_names_its_own_job_log() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let compares = Runs::new(project.path()).compares(RUN_ID)?;
+        let bus = EventBus::new();
+        let fake = Fake::new(JobStatus::Exited(1));
+        let record = RunRecord {
+            id: "compare_20261006-120000".to_string(),
+            ..running()?
+        };
+        compares.save(&record)?;
+        let outcome = watch(&ctx(&compares, &fake, &bus), &NoFiles, record).await?;
+        assert_eq!(outcome.record.state, RunState::Failed);
+        assert_eq!(
+            outcome.record.message.as_deref(),
+            Some(
+                "the job exited with code 1 \
+                 (see runs/20260922-143005-abcd/compares/compare_20261006-120000/job.log)"
+            )
+        );
         Ok(())
     }
 

@@ -151,6 +151,7 @@ The optional `[hub]` section (`repo`, `private`, `after_training`) sets the push
 | `max_tokens` | 4096 | Limit of each child answer. |
 | `temperature` | 0.0 | Sampling temperature of the child, in [0, 2]. |
 | `server_start_secs` | 300 | How long `llama-server` may take to be ready, 1 to 3600. |
+| `image` | `runpod/base:1.4.0-cuda1300-ubuntu2404`, pinned by digest | Pod image of a compare on a Runpod target, used instead of the target's `image`. It needs glibc 2.38 or newer for the CUDA build of `llama-server`, and `python3`; pin it by digest. Checked like a target's `image`. |
 
 Without both parent prices, the report has no parent cost; without a child price (and off Runpod), no child cost.
 
