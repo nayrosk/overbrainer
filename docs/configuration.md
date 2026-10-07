@@ -96,7 +96,7 @@ A role also takes these request settings:
 | `reasoning` | `false` | Ask the model for its reasoning. |
 | `max_tokens` | `16384` | Upper bound on generated tokens, reasoning included. |
 | `temperature` | provider default | Sampling temperature, 0 to 2. Not allowed with `reasoning = true` on the `anthropic` protocol, which rejects it. |
-| `reasoning_effort` | `medium` on `openai` | `low`, `medium` or `high`. Only with `reasoning = true`. |
+| `reasoning_effort` | `medium` on `openai` | `low`, `medium` or `high`, only with `reasoning = true`. `none` turns thinking off: `openai` protocol only, and not with `reasoning = true`. It sends `reasoning_effort: "none"`, which a local thinking model such as `qwen3.5:9b` on Ollama honors. |
 | `thinking_budget` | none (adaptive thinking) | `anthropic` protocol only. Fixed extended-thinking token budget, `[1024, max_tokens)`. Only with `reasoning = true`, and cannot combine with `reasoning_effort`. Required by Claude Opus 4.5, Sonnet 4.5 and Haiku 4.5; leave unset for newer Claude models. |
 
 The embedder must use the `openai` protocol: Anthropic has no embeddings endpoint. [The dataset pipeline](pipeline.md#reasoning) explains which parents return usable reasoning.

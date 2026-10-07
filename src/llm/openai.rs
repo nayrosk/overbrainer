@@ -65,9 +65,12 @@ impl OpenAiClient {
             messages,
             max_tokens: request.max_tokens,
             temperature: request.temperature,
-            reasoning: request.reasoning.then(|| ReasoningParam {
-                effort: request.effort.unwrap_or(Effort::Medium).as_str(),
+            reasoning: (request.reasoning && request.effort != Some(Effort::None)).then(|| {
+                ReasoningParam {
+                    effort: request.effort.unwrap_or(Effort::Medium).as_str(),
+                }
             }),
+            reasoning_effort: (request.effort == Some(Effort::None)).then_some("none"),
             response_format: request.json_list.then(string_list_format),
         };
         let response: ChatResponse = self.endpoint.post("chat/completions", &body).await?;
@@ -150,6 +153,9 @@ struct ChatRequest<'a> {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningParam>,
+    /// Top-level `reasoning_effort`, sent only as `"none"` to turn thinking off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
 }

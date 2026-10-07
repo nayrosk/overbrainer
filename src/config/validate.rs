@@ -1,6 +1,6 @@
 use super::types::{
-    Adapter, BUILTIN_SSH_REFUSED, HAS_BUILTIN_SSH, ListOrAuto, Protocol, QUANTIZE_TYPES, Runtime,
-    Settings, SshClient, Target, Training, is_ollama_name,
+    Adapter, BUILTIN_SSH_REFUSED, Effort, HAS_BUILTIN_SSH, ListOrAuto, Protocol, QUANTIZE_TYPES,
+    RoleModel, Runtime, Settings, SshClient, Target, Training, is_ollama_name,
 };
 
 /// Highest `pipeline.concurrency`: far above what providers allow, and well within
@@ -123,14 +123,44 @@ fn check_role_params(settings: &Settings, problems: &mut Vec<String>) {
         {
             problems.push(format!("roles.{role}.temperature: must be in [0, 2]"));
         }
-        if model.reasoning_effort.is_some() && !model.reasoning {
-            problems.push(format!(
-                "roles.{role}.reasoning_effort: requires reasoning = true"
-            ));
-        }
+        check_reasoning_effort(settings, role, model, problems);
     }
     check_thinking_temperature(settings, problems);
     check_thinking_budget(settings, problems);
+}
+
+/// `reasoning_effort` of `low`, `medium` or `high` requires reasoning. `none` turns
+/// thinking off: it excludes reasoning and needs the `openai` protocol.
+fn check_reasoning_effort(
+    settings: &Settings,
+    role: &str,
+    model: &RoleModel,
+    problems: &mut Vec<String>,
+) {
+    match model.reasoning_effort {
+        Some(Effort::None) => {
+            if model.reasoning {
+                problems.push(format!(
+                    "roles.{role}.reasoning_effort: \"none\" cannot be combined with reasoning = true"
+                ));
+            }
+            let anthropic = settings
+                .providers
+                .get(&model.provider)
+                .is_some_and(|provider| provider.protocol == Protocol::Anthropic);
+            if anthropic {
+                problems.push(format!(
+                    "roles.{role}.reasoning_effort: \"none\" is not available on the anthropic protocol"
+                ));
+            }
+        },
+        Some(_) if !model.reasoning => {
+            problems.push(format!(
+                "roles.{role}.reasoning_effort: requires reasoning = true"
+            ));
+        },
+        _ => {},
+    }
 }
 
 /// `thinking_budget` requires reasoning, a value in `[1024, max_tokens)`, no
@@ -1906,6 +1936,55 @@ mod tests {
                 "roles.generator.max_tokens: must be at least 1".to_string(),
                 "roles.generator.temperature: must be in [0, 2]".to_string(),
                 "roles.generator.reasoning_effort: requires reasoning = true".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Swaps the generator role of [`VALID`] for `role`.
+    fn with_generator(role: &str) -> String {
+        VALID.replace(r#"{ provider = "nanogpt", model = "m1" }"#, role)
+    }
+
+    #[test]
+    fn effort_none_is_valid_on_the_openai_protocol_without_reasoning()
+    -> Result<(), config::ConfigError> {
+        let toml =
+            with_generator(r#"{ provider = "nanogpt", model = "m1", reasoning_effort = "none" }"#);
+        assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn effort_none_cannot_combine_with_reasoning() -> Result<(), config::ConfigError> {
+        let toml = with_generator(
+            r#"{ provider = "nanogpt", model = "m1", reasoning = true, reasoning_effort = "none" }"#,
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "roles.generator.reasoning_effort: \"none\" cannot be combined with reasoning = true"
+                    .to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn effort_none_is_rejected_on_the_anthropic_protocol() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            "[roles]",
+            "[providers.claude]\nprotocol = \"anthropic\"\n[roles]",
+        );
+        let toml = toml.replace(
+            r#"{ provider = "nanogpt", model = "m1" }"#,
+            r#"{ provider = "claude", model = "m1", reasoning_effort = "none" }"#,
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "roles.generator.reasoning_effort: \"none\" is not available on the anthropic protocol"
+                    .to_string()
             ]
         );
         Ok(())

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use overbrainer::config::Effort;
 use overbrainer::dataset::{FinishReason, ReasoningKind};
 use overbrainer::llm::{
     CompletionRequest, LlmError, OpenAiClient, RetryPolicy, Retryable, with_retry,
@@ -111,6 +112,46 @@ async fn no_reasoning_parameter_when_not_requested() -> TestResult {
     client(&server)?.complete(&request(false)).await?;
     let body = last_body(&server).await?;
     assert!(body.get("reasoning").is_none(), "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn effort_none_sends_reasoning_effort_none_and_no_reasoning_object() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/chat/completions"))
+        .and(body_partial_json(json!({"reasoning_effort": "none"})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_body(&json!({"content": "ok"}), "stop")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let none_request = CompletionRequest {
+        effort: Some(Effort::None),
+        ..request(false)
+    };
+    client(&server)?.complete(&none_request).await?;
+    let body = last_body(&server).await?;
+    assert!(body.get("reasoning").is_none(), "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_reasoning_effort_without_an_effort_of_none() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_body(&json!({"content": "ok"}), "stop")),
+        )
+        .mount(&server)
+        .await;
+    for reasoning in [false, true] {
+        client(&server)?.complete(&request(reasoning)).await?;
+        let body = last_body(&server).await?;
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
     Ok(())
 }
 
