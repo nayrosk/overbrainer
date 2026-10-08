@@ -1,6 +1,6 @@
 # The README hero: a tour of `overbrainer tui` on a finished demo project.
 # Render with docs/assets/record.sh, which mounts the demo project at /demo.
-# It starts no paid work: no r, t, A, a, s or E. Every dialog is answered with
+# It starts no paid work: no r, t, A, a, s, E, C or J. Every dialog is answered with
 # its default, n, so the push dialog opened with h pushes nothing.
 
 Output tui-tour.gif
@@ -66,3 +66,18 @@ Type "4" Sleep 6s
 # Push: h shows what the run would push to Hugging Face; n cancels.
 Type "h" Sleep 3.5s
 Type "n" Sleep 2s
+
+# Compare: the compares of every run, newest first, with the selected one's
+# win or tie rate, latency and cost per 1,000 requests.
+Type "6" Sleep 4s
+
+# Its questions, filtered to the wins (f cycles all, losses, ties, wins),
+# then one question's detail: the child's and the parent's answers side by
+# side, then the judge's reason.
+Type "l" Sleep 600ms
+Type "f" Sleep 400ms
+Type "f" Sleep 400ms
+Type "f" Sleep 1.5s
+Type "j" Sleep 1.5s
+Type "]" Sleep 3.5s
+Type "]" Sleep 3s
