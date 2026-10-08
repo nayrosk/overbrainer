@@ -8,9 +8,9 @@ Distill a large "parent" LLM into a smaller open-weights "child" model, from the
 [![Latest release](https://img.shields.io/github/v/release/nayrosk/overbrainer?sort=semver)](https://github.com/nayrosk/overbrainer/releases)
 ![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/nayrosk/overbrainer?utm_source=oss&utm_medium=github&utm_campaign=nayrosk%2Foverbrainer&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 
-![overbrainer tui: the Project view and its stats, the dataset tree with a question's answer, a filter, the help, a training run's loss chart, the logs and a dialog](docs/assets/tui-tour.gif)
+![overbrainer tui on a finished project: the Project view and its stats, the dataset tree with a question's reasoning and answer, a filter, the help, a training run's loss chart and its Hugging Face push dialog, then the Compare view with each run's win or tie rate, latency and cost, a question the child won, its two answers side by side and the judge's reason](docs/assets/tui-tour.gif)
 
-overbrainer asks an LLM for questions on your topics, collects answers and their reasoning from a parent model, then fine-tunes a child model with Axolotl on this machine, over SSH or on Runpod. A terminal UI shows the dataset and the training runs as they progress.
+overbrainer asks an LLM for questions on your topics, collects answers and their reasoning from a parent model, then fine-tunes a child model with Axolotl on this machine, over SSH or on Runpod. `overbrainer compare` then measures the child against the parent: win or tie rate, latency and cost per 1,000 requests. A terminal UI shows the dataset, the training runs and the compares as they progress.
 
 Status: early development. Expect breaking changes between minor versions until 1.0.
 
@@ -31,6 +31,8 @@ flowchart LR
 ```
 
 A generator model writes the subtopics and questions, and drops near-duplicates. The parent model answers each question; answers that were truncated, refused or empty, or that lack the raw reasoning asked for, are kept for inspection and left out of training. `split` writes `data/train.jsonl` and `data/eval.jsonl` in Axolotl's chat format, and `train` fine-tunes the base model on them. `export` turns the result into a quantized GGUF with an Ollama Modelfile, on the same target. Once a run is exported, `overbrainer compare` measures the child against the parent on the eval set: win or tie rate, latency, cost per 1,000 requests (see [compare](docs/compare.md)).
+
+[examples/rust-errors](examples/rust-errors) is a full run on Rust compiler errors: its config, three children compared with the same parent, and what each one cost.
 
 ## Install
 
@@ -172,7 +174,9 @@ In a directory without `overbrainer.toml`, `overbrainer tui` opens an init wizar
 | `u` | In Project, undo the last write to `overbrainer.toml`. |
 | `r` | Run auto mode or a pipeline stage. |
 | `A` | Auto mode: every stage, then training (asks first). |
-| `t`, `c` | Start, or cancel a training run. |
+| `t`, `c` | Start, or cancel a training run; in Compare, `c` cancels the compare running. |
+| `C`, `J` | Compare a run's GGUF with the parent, or judge the selected compare again (asks first). |
+| `f` | In Logs, cycle the level shown; in Compare, cycle the questions shown (all, losses, ties, wins, errors). |
 | `x` | Export the Logs view to a file. |
 | `R` | Reload from disk. |
 | `h` | In Training, push the selected run to Hugging Face (asks first). |

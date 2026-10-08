@@ -63,10 +63,10 @@ Runpod in all, including a test run and two failed starts: about $3.10.
 
 ## Reproduce
 
-The config needs overbrainer 0.8.0 or later (for `reasoning_effort = "none"` on the local judge) built with the `builtin-ssh` feature (it sets `ssh_client = "builtin"`). Until 0.8.0 is out, install from git:
+The config needs overbrainer 0.8.0 or later (for `reasoning_effort = "none"` on the local judge) with the built-in SSH client (it sets `ssh_client = "builtin"`). The [release binaries](https://github.com/nayrosk/overbrainer/releases) include it; a build with cargo needs the `builtin-ssh` feature:
 
 ```sh
-cargo install --locked --git https://github.com/nayrosk/overbrainer --features builtin-ssh overbrainer
+cargo install --locked overbrainer --features builtin-ssh
 overbrainer init rust-errors && cd rust-errors   # writes overbrainer.toml, .env.example, .gitignore and the default prompts
 cp /path/to/examples/rust-errors/overbrainer.toml .   # replaces the example config
 cp .env.example .env
