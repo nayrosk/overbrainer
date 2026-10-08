@@ -7,19 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/nayrosk/overbrainer/compare/v0.7.0...v0.8.0) - 2026-10-08
+
+### Added
+
+- allow reasoning_effort = "none" to turn off thinking on an OpenAI-compatible role ([#141](https://github.com/nayrosk/overbrainer/pull/141))
+- compare a child model with its parent on the eval set ([#133](https://github.com/nayrosk/overbrainer/pull/133))
+
+### Documentation
+
+- add a reproducible Rust error explainer case study ([#143](https://github.com/nayrosk/overbrainer/pull/143))
+- add a commercial support section to the README ([#136](https://github.com/nayrosk/overbrainer/pull/136))
+
+### Fixed
+
+- say in the model card whether the reasoning was trained ([#144](https://github.com/nayrosk/overbrainer/pull/144))
+- run compare pods on an image whose glibc fits the CUDA build ([#139](https://github.com/nayrosk/overbrainer/pull/139))
+
 ## [0.7.0](https://github.com/nayrosk/overbrainer/compare/v0.6.1...v0.7.0) - 2026-10-05
 
 ### Added
 
 - optional pure-Rust SSH client so a sandboxed ssh binary is not needed ([#130](https://github.com/nayrosk/overbrainer/pull/130))
 - push a run to Hugging Face with a generated model card ([#126](https://github.com/nayrosk/overbrainer/pull/126))
-
-### Upgrade notes
-
-- The minimum supported Rust version is now 1.91, needed by the `hf-hub` crate.
-- `training.hub_model_id` is deprecated in favor of `[hub] repo`. `train`, the TUI and `config check` warn about it, and `overbrainer migrate` moves it.
-- The built-in SSH client is the optional `builtin-ssh` cargo feature. The release binaries have it; with `cargo install`, add `--features builtin-ssh`. The default client stays `openssh`; set `ssh_client = "builtin"` on a target, or `OVERBRAINER_SSH_CLIENT=builtin`, to use it.
-- Some SSH error messages changed wording. Scripts that match the OpenSSH text should match "host key verification failed", which is kept.
 
 ## [0.6.1](https://github.com/nayrosk/overbrainer/compare/v0.6.0...v0.6.1) - 2026-10-02
 
