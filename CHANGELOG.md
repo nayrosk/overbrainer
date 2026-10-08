@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/nayrosk/overbrainer/compare/v0.8.0...v0.8.1) - 2026-10-08
+
+### Documentation
+
+- refresh the README for v0.8 and tour the Compare view ([#147](https://github.com/nayrosk/overbrainer/pull/147))
+
 ## [0.8.0](https://github.com/nayrosk/overbrainer/compare/v0.7.0...v0.8.0) - 2026-10-08
 
 ### Added
