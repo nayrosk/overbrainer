@@ -49,7 +49,7 @@ It fails with the key and the reason when a value is invalid. A missing URL, key
 
 Every command also checks crates.io once a day for a newer overbrainer release and prints a note on stderr, but only when stderr is a terminal, so it never runs when you drive overbrainer as a subprocess.
 
-Details: [configuration](https://github.com/nayrosk/overbrainer/blob/v0.8.0/docs/configuration.md).
+Details: [configuration](https://github.com/nayrosk/overbrainer/blob/v0.8.1/docs/configuration.md).
 
 ## Build the dataset
 
@@ -76,14 +76,14 @@ split: 90 train, 10 eval, 3 excluded (truncated 3), 2 orphaned
 
 Answers from a parent that never returns raw reasoning are excluded as `no_raw_reasoning` when `reasoning = true` (see the rules above). overbrainer only warns about it once `answers` has started, and then keeps going.
 
-Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.8.0/docs/pipeline.md).
+Details: [the dataset pipeline](https://github.com/nayrosk/overbrainer/blob/v0.8.1/docs/pipeline.md).
 
 ## Train
 
 `[training]` needs `target`, `base_model` (a Hugging Face repo ID) and `adapter` (`lora`, `qlora` or `full`). Targets:
 
 - `kind = "local"`: this machine, `runtime = "native"` (Axolotl in `venv`) or `"docker"`.
-- `kind = "ssh"`: a machine reached with `ssh`, host from `OVERBRAINER_TARGETS__NAME__HOST`. If `ssh` is a sandbox wrapper such as firejail, or missing, `ssh_client = "builtin"` (or `OVERBRAINER_SSH_CLIENT=builtin`) uses the built-in client; see [Training](https://github.com/nayrosk/overbrainer/blob/v0.8.0/docs/training.md#built-in-ssh-client).
+- `kind = "ssh"`: a machine reached with `ssh`, host from `OVERBRAINER_TARGETS__NAME__HOST`. If `ssh` is a sandbox wrapper such as firejail, or missing, `ssh_client = "builtin"` (or `OVERBRAINER_SSH_CLIENT=builtin`) uses the built-in client; see [Training](https://github.com/nayrosk/overbrainer/blob/v0.8.1/docs/training.md#built-in-ssh-client).
 - `kind = "runpod"`: a pod created for the run and deleted afterwards. Needs `gpu_types` (a list, or `"auto"` to try every GPU type in stock, cheapest first, with at least the VRAM the model is estimated to need unless `min_vram_gb` is set; up to 3 cheaper types reported out of stock are tried first, and the catalog is read again after each refusal) and `max_hours`, and `OVERBRAINER_RUNPOD__API_KEY`. A watchdog on the pod deletes it at `max_hours` at the latest, after asking the job for a snapshot 15 minutes before when nothing follows it. An optional `max_cost_usd` stops the job with a snapshot at 95% of that spend and deletes the pod at 100%. A disk 92% full also stops the job with a snapshot, unless an optional `max_volume_gb` lets overbrainer grow the network volume first. `ssh_client` works here too.
 
 | Command | What it does |
@@ -113,13 +113,13 @@ The job runs detached. Ctrl-C, a closed terminal or a lost connection only stop 
 
 To get a model Ollama or llama.cpp can run, export it: `overbrainer export RUN_ID` (default `Q4_K_M`, or `--quantize Q8_0`, `F16`...), or set `[export] after_training = true` so every training job exports at its end. The GGUF and its `Modelfile` land in `runs/RUN_ID/output/gguf/`; `ollama create NAME -f Modelfile` there loads it (overbrainer runs it with `--ollama NAME` or `export.ollama_name`). Ctrl-C cancels an export.
 
-To know whether the child can replace the parent, run `overbrainer compare` after the export. Read the report's win or tie rate with its limits: a judge that is the parent favors its own answers (set `roles.judge`), and fewer than 100 questions move the rate by several points. The cost rows need `[compare]` prices. On Runpod it starts a new pod: tell the user its price before running it (stderr shows it first). Details: [compare](https://github.com/nayrosk/overbrainer/blob/v0.8.0/docs/compare.md).
+To know whether the child can replace the parent, run `overbrainer compare` after the export. Read the report's win or tie rate with its limits: a judge that is the parent favors its own answers (set `roles.judge`), and fewer than 100 questions move the rate by several points. The cost rows need `[compare]` prices. On Runpod it starts a new pod: tell the user its price before running it (stderr shows it first). Details: [compare](https://github.com/nayrosk/overbrainer/blob/v0.8.1/docs/compare.md).
 
 To publish a model, `overbrainer push RUN_ID`: it commits `output/` (GGUF files at the repo root, no checkpoints) and a generated model card to `NAMESPACE/NAME` (`--repo`, `[hub] repo`, else `<you>/<project>`), private unless `--public` or `[hub] private = false`; an existing public repo is refused unless one of those is set. Run `--dry-run` first: it writes the card to `runs/RUN_ID/hub/README.md` and sends nothing. The card names the topics and the parent model, and some providers' terms forbid training models on their outputs, so check them before making a repo public. `[hub] after_training = true` pushes each run that succeeded; a failed push leaves the run `succeeded`. Ctrl-C cancels a push before its commit, and a rerun resumes. `training.hub_model_id` is deprecated: `overbrainer migrate` moves it to `[hub]`.
 
 Once `train` has stopped following a run, only `overbrainer train attach RUN_ID` retrieves its results. On Runpod, the watchdog deletes the pod `retrieve_grace_minutes` (60 by default) after the job ends if its results were not retrieved, and the results are lost with it. Attach well before that.
 
-Details: [training](https://github.com/nayrosk/overbrainer/blob/v0.8.0/docs/training.md) and [Runpod](https://github.com/nayrosk/overbrainer/blob/v0.8.0/docs/runpod.md).
+Details: [training](https://github.com/nayrosk/overbrainer/blob/v0.8.1/docs/training.md) and [Runpod](https://github.com/nayrosk/overbrainer/blob/v0.8.1/docs/runpod.md).
 
 ## Follow long commands
 
