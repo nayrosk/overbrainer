@@ -273,3 +273,5 @@ Several model providers forbid using their outputs to train models that compete 
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
+
+<!-- GitAds-Verify: PX9N1YCY687H8A9PVAR69G9RQ3B3SG6S -->
