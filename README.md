@@ -1,3 +1,6 @@
+## GitAds Sponsored
+[![Sponsored by GitAds](https://gitads.dev/v1/ad-serve?source=nayrosk/overbrainer@github)](https://gitads.dev/v1/ad-track?source=nayrosk/overbrainer@github)
+
 # overbrainer
 
 Distill a large "parent" LLM into a smaller open-weights "child" model, from the command line.
