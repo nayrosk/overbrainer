@@ -1,3 +1,6 @@
+## GitAds Sponsored
+[![Sponsored by GitAds](https://gitads.dev/v1/ad-serve?source=nayrosk/overbrainer@github)](https://gitads.dev/v1/ad-track?source=nayrosk/overbrainer@github)
+
 # overbrainer
 
 Distill a large "parent" LLM into a smaller open-weights "child" model, from the command line.
@@ -273,3 +276,5 @@ Several model providers forbid using their outputs to train models that compete 
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
+
+<!-- GitAds-Verify: PX9N1YCY687H8A9PVAR69G9RQ3B3SG6S -->
