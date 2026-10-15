@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2](https://github.com/nayrosk/overbrainer/compare/v0.8.1...v0.8.2) - 2026-10-15
+
+### Documentation
+
+- add GitAds to the README ([#150](https://github.com/nayrosk/overbrainer/pull/150))
+
+### Fixed
+
+- *(deps)* update rustls to 0.23.46 for RUSTSEC-2026-0346 to 0349 ([#159](https://github.com/nayrosk/overbrainer/pull/159))
+
 ## [0.8.1](https://github.com/nayrosk/overbrainer/compare/v0.8.0...v0.8.1) - 2026-10-08
 
 ### Documentation
