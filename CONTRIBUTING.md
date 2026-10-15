@@ -24,6 +24,8 @@ Every change goes issue, branch, pull request. Nobody pushes to `main` directly,
 
 Dependabot pull requests and release pull requests (`chore/release-vX.Y.Z`) do not need an issue.
 
+Dependabot assigns its pull requests to the maintainer. The `advisories` workflow checks `main` against the RustSec database every Monday, because a RustSec advisory with no matching GitHub advisory never triggers a Dependabot security update. When it fails, open a `fix` issue and update the crate with `cargo update -p <crate>`.
+
 ## Commits
 
 - Commits follow [Conventional Commits](https://www.conventionalcommits.org): `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore` or `revert`, with an optional scope, for example `fix(runpod): stop the pod when the watchdog fires`. CI checks every commit subject.
