@@ -1,0 +1,27 @@
+name: advisories
+
+# Checks the lockfile on `main` against the RustSec advisory database every
+# week. A RustSec advisory with no GitHub advisory never triggers a Dependabot
+# security update, so this run is what reports it before a pull request fails
+# its `deny` check.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          arguments: --all-features
+          command-arguments: advisories
