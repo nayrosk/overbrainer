@@ -114,7 +114,7 @@ fn config_check_shows_a_runpod_target_with_its_defaults() -> Result<(), Box<dyn 
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "targets.gpu_cloud = runpod 1x [NVIDIA A40, NVIDIA L40S], max 6h, image axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1@sha256:",
+            "targets.gpu_cloud = runpod 1x [NVIDIA A40, NVIDIA L40S], max 6h, image axolotlai/axolotl-cloud-term:0.21.0-py3.12-cu130-2.14.1@sha256:",
         ))
         .stdout(predicate::str::contains(
             "venv /workspace/axolotl-venv, disk 50 GB, boot grace 30 min, retrieve grace 60 min, data centers any, network volume none",

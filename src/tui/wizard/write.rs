@@ -63,7 +63,7 @@ max_hours = 6                # the pod watchdog deletes the pod after this, what
 # min_vram_gb = 48             # gpu_types = \"auto\" only: least VRAM per GPU
 # max_price_per_hour = 1.0     # gpu_types = \"auto\" only: highest list price of one GPU, USD
 # gpu_count = 1
-# image = \"axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1@sha256:f7b94da82913920a003e28e091d8528f57f76da7360fca87e95faf62fa32a680\"
+# image = \"axolotlai/axolotl-cloud-term:0.21.0-py3.12-cu130-2.14.1@sha256:6dd02035f432a81725fc7405a525f6539a7bc9e40ac91702188170800b4415c1\"
 # venv = \"/workspace/axolotl-venv\"
 # container_disk_gb = 50
 # boot_grace_minutes = 30      # the watchdog deletes a pod whose job never started

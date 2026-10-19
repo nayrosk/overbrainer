@@ -73,7 +73,7 @@ fn may_differ(key: &str) -> bool {
         })
 }
 
-/// Chat templates bundled with Axolotl 0.19.0 that render `reasoning_content`.
+/// Chat templates bundled with Axolotl 0.21.0 that render `reasoning_content`.
 const REASONING_TEMPLATES: [&str; 5] = ["qwen3", "qwen3_5", "exaone4", "gemma4", "gemma4_unified"];
 /// Base model family whose own chat template is known to render `reasoning_content`.
 const REASONING_MODEL: &str = "qwen3";

@@ -1,6 +1,6 @@
 # Training
 
-`overbrainer train` fine-tunes `training.base_model` with [Axolotl](https://github.com/axolotl-ai-cloud/axolotl) 0.19 on `data/train.jsonl`, evaluating on `data/eval.jsonl`. It runs on the target named by `training.target`, or by `--target NAME`.
+`overbrainer train` fine-tunes `training.base_model` with [Axolotl](https://github.com/axolotl-ai-cloud/axolotl) 0.21 on `data/train.jsonl`, evaluating on `data/eval.jsonl`. It runs on the target named by `training.target`, or by `--target NAME`.
 
 | Command | What it does |
 |---|---|
@@ -187,7 +187,7 @@ venv = "~/.venvs/axolotl"      # native: directory holding bin/axolotl; otherwis
 kind = "ssh"                   # host from OVERBRAINER_TARGETS__HOMELAB__HOST (user@host or a ~/.ssh/config alias)
 runtime = "docker"
 engine = "podman"              # docker (default) | podman
-# image = "..."                # default: axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1, pinned by digest
+# image = "..."                # default: axolotlai/axolotl:0.21.0-py3.12-cu130-2.14.1, pinned by digest
 # workdir = "overbrainer"      # on the remote machine, relative to its home directory
 # ssh_client = "openssh"       # openssh (default) | builtin, see "Built-in SSH client" below
 ```

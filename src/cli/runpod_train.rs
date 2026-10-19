@@ -265,15 +265,15 @@ pub(super) async fn export(
 }
 
 /// `overbrainer compare` of `plan` on the Runpod target `spec`: a new pod
-/// with the target's GPU settings and the compare image (`[compare] image`,
-/// else [`DEFAULT_COMPARE_IMAGE`](crate::config::DEFAULT_COMPARE_IMAGE), its
-/// job run by the image's `python3`), the compare job uploaded with the run's
-/// GGUF and the questions, its answers retrieved, then the pod deleted (kept
-/// with `keep`), under the same lease, deadline and cost cap as a training
-/// job. The pod's price and the questions are said before it starts. The
-/// compare's record and pod live in `runs/<run-id>/compares/<compare-id>/`.
-/// Ctrl-C cancels the job and ends its pod. Returns the compares of the run
-/// and the compare's ID once its answers are back.
+/// with the target's GPU settings and image (`[compare] image` overrides
+/// the image; the job runs the image's `python3`), the compare job uploaded
+/// with the run's GGUF and the questions, its answers retrieved, then the pod
+/// deleted (kept with `keep`), under the same lease, deadline and cost cap as
+/// a training job. The pod's price and the questions are said before it
+/// starts. The compare's record and pod live in
+/// `runs/<run-id>/compares/<compare-id>/`. Ctrl-C cancels the job and ends its
+/// pod. Returns the compares of the run and the compare's ID once its answers
+/// are back.
 ///
 /// # Errors
 ///

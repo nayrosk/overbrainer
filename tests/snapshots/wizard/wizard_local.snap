@@ -72,7 +72,7 @@ kind = "local"
 runtime = "docker"             # native | docker
 # venv = "~/.venvs/axolotl"    # native: directory holding bin/axolotl
 # engine = "docker"            # docker: docker | podman
-# image = "axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1@sha256:9de7c7a5b8830480a7d2eb3b6d49759586615f5f8eb1126d5df29f8bd9fa324b"
+# image = "axolotlai/axolotl:0.21.0-py3.12-cu130-2.14.1@sha256:d08da8a5dd2b3223a49fb25cdadd85bdf0c5acee9c5de223bf6ab10d0b511e14"
 # pin by digest: this container runs untrusted training code and receives secrets such as HF_TOKEN
 
 # [targets.homelab]
@@ -90,7 +90,7 @@ runtime = "docker"             # native | docker
 # max_hours = 6                # the pod watchdog deletes the pod after this, whatever it is doing
 # max_cost_usd = 20           # stop with a snapshot at 95% of this spend in USD, delete at 100%
 # gpu_count = 1
-# image = "axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1@sha256:f7b94da82913920a003e28e091d8528f57f76da7360fca87e95faf62fa32a680"
+# image = "axolotlai/axolotl-cloud-term:0.21.0-py3.12-cu130-2.14.1@sha256:6dd02035f432a81725fc7405a525f6539a7bc9e40ac91702188170800b4415c1"
 # venv = "/workspace/axolotl-venv"
 # container_disk_gb = 50
 # boot_grace_minutes = 30      # the watchdog deletes a pod whose job never started
@@ -112,7 +112,7 @@ runtime = "docker"             # native | docker
 # max_tokens = 4096              # limit of each child answer
 # temperature = 0.0
 # server_start_secs = 300        # how long llama-server may take to be ready
-# image = "runpod/base:1.4.0-cuda1300-ubuntu2404@sha256:..."  # Runpod compare pod image (default: this one, pinned); needs glibc 2.38+
+# image = "..."                 # Runpod compare pod image (default: the target's image); needs glibc 2.38+
 
 # [hub]                          # overbrainer push RUN_ID, see docs/training.md
 # repo = "you/your-model"        # default: <your HF user>/<project name>
