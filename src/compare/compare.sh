@@ -91,11 +91,15 @@ gpu_caps() {
 }
 
 # Whether the CUDA build of CUDA version $1, with cubins for the compute
-# capabilities $2, runs on this driver (CUDA $driver) and these GPUs ($caps):
-# the driver supports CUDA $1 or newer, or the same major version and every
-# GPU has a cubin, so the driver never compiles the build's PTX, which a
-# driver older than the build cannot read.
+# capabilities $2 and PTX from compute capability $3 up, runs on this driver
+# (CUDA $driver) and these GPUs ($caps): no GPU is below $3, and the driver
+# supports CUDA $1 or newer, or the same major version and every GPU has a
+# cubin, so the driver never compiles the build's PTX, which a driver older
+# than the build cannot read.
 cuda_fits() {
+    for cap in $caps; do
+        version_older "$cap" "$3" && return 1
+    done
     version_older "$driver" "$1" || return 0
     [ "${driver%%.*}" = "${1%%.*}" ] || return 1
     [ -n "$caps" ] || return 1
@@ -247,9 +251,10 @@ pick_build() {
         ;;
     esac
     caps=$(gpu_caps)
-    if ! cuda_fits "$cuda" "$OVERBRAINER_LLAMA_CPP_CUDA_CUBINS"; then
+    if ! cuda_fits "$cuda" "$OVERBRAINER_LLAMA_CPP_CUDA_CUBINS" "$OVERBRAINER_LLAMA_CPP_CUDA_PTX_MIN"; then
         fallback=$OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK
-        if [ "$arch" != x64 ] || ! cuda_fits "$fallback" "$OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_CUBINS"; then
+        if [ "$arch" != x64 ] ||
+            ! cuda_fits "$fallback" "$OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_CUBINS" "$OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_PTX_MIN"; then
             builds="CUDA $cuda"
             [ "$arch" != x64 ] || builds="$builds, CUDA $fallback"
             seen= gpus=GPU
@@ -257,7 +262,7 @@ pick_build() {
                 [ -z "$seen" ] || gpus=GPUs
                 seen="${seen:+$seen, }$cap"
             done
-            warn "no CUDA build of llama.cpp $tag ($builds) runs on this NVIDIA driver (CUDA $driver) and $gpus (compute capability ${seen:-unknown}): a build needs a driver for its CUDA version, or for its major version on a GPU it has kernels for. Using the CPU build $asset"
+            warn "no CUDA build of llama.cpp $tag ($builds) runs on this NVIDIA driver (CUDA $driver) and $gpus (compute capability ${seen:-unknown}): a build needs a driver for its CUDA version, or for its major version on a GPU it has kernels for, and no GPU older than its PTX. Using the CPU build $asset"
             return 0
         fi
         cuda=$fallback

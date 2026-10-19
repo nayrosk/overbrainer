@@ -37,6 +37,10 @@ pub const CUDA: &str = "13.4";
 /// a driver for CUDA [`CUDA`] or newer.
 pub const CUDA_CUBINS: &str = "8.6 8.9 12.0 12.1";
 
+/// The lowest compute capability the [`CUDA`] builds hold PTX for (their
+/// lowest `-virtual` architecture): an older GPU cannot run them at all.
+pub const CUDA_PTX_MIN: &str = "7.5";
+
 /// The CUDA version of the older `x86_64` CUDA build, for a driver and GPUs
 /// the [`CUDA`] build does not fit (see `cuda_fits` in `compare.sh`): any
 /// driver for CUDA 12.8 or newer compiles its PTX.
@@ -44,6 +48,9 @@ pub const CUDA_FALLBACK: &str = "12.8";
 
 /// The compute capabilities the [`CUDA_FALLBACK`] build holds cubins for.
 pub const CUDA_FALLBACK_CUBINS: &str = "8.6 8.9 12.0";
+
+/// The lowest compute capability the [`CUDA_FALLBACK`] build holds PTX for.
+pub const CUDA_FALLBACK_PTX_MIN: &str = "5.0";
 
 /// SHA-256 of `llama-<TAG>-bin-ubuntu-cuda-<CUDA_FALLBACK>-x64.tar.gz`.
 pub const UBUNTU_CUDA_FALLBACK_X64_SHA256: &str =
@@ -115,7 +122,12 @@ pub fn env() -> Vec<(String, String)> {
         ),
         ("OVERBRAINER_LLAMA_CPP_CUDART_X64_SHA256", CUDART_X64_SHA256),
         ("OVERBRAINER_LLAMA_CPP_CUDA_CUBINS", CUDA_CUBINS),
+        ("OVERBRAINER_LLAMA_CPP_CUDA_PTX_MIN", CUDA_PTX_MIN),
         ("OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK", CUDA_FALLBACK),
+        (
+            "OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_PTX_MIN",
+            CUDA_FALLBACK_PTX_MIN,
+        ),
         (
             "OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_CUBINS",
             CUDA_FALLBACK_CUBINS,
@@ -187,6 +199,11 @@ mod tests {
             ),
             ("OVERBRAINER_LLAMA_CPP_CUDA", CUDA),
             ("OVERBRAINER_LLAMA_CPP_CUDA_CUBINS", CUDA_CUBINS),
+            ("OVERBRAINER_LLAMA_CPP_CUDA_PTX_MIN", CUDA_PTX_MIN),
+            (
+                "OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_PTX_MIN",
+                CUDA_FALLBACK_PTX_MIN,
+            ),
             ("OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK", CUDA_FALLBACK),
             (
                 "OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_CUBINS",
@@ -227,6 +244,6 @@ mod tests {
                 .map(|(_, value)| value.as_str());
             assert_eq!(got, Some(value), "{name}");
         }
-        assert_eq!(env.len(), 19);
+        assert_eq!(env.len(), 21);
     }
 }
