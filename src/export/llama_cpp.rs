@@ -1,6 +1,6 @@
 //! The llama.cpp release an export uses: one pinned tag, its source tarball and
 //! the prebuilt binaries for each platform (`llama-quantize` for an export,
-//! `llama-server` for a compare, with a CUDA build and its runtime for NVIDIA
+//! `llama-server` for a compare, with CUDA builds and their runtime for NVIDIA
 //! GPUs and a `ROCm` build for AMD GPUs), each with its SHA-256. The scripts
 //! download them on the target, check them against these digests before
 //! extracting anything, and cache them there.
@@ -29,8 +29,36 @@ pub const UBUNTU_ARM64_SHA256: &str =
 pub const MACOS_ARM64_SHA256: &str =
     "f6f337fc7d2ff9260f53177cf4fe6bbf6b0f7faa75a49fb224aaf66885a5c956";
 
-/// The CUDA version of the CUDA builds a compare runs on an NVIDIA GPU.
+/// The CUDA version of the CUDA builds a compare tries first on an NVIDIA GPU.
 pub const CUDA: &str = "13.4";
+
+/// The compute capabilities the [`CUDA`] builds hold real kernels (cubins)
+/// for. Any other GPU runs the build's PTX, compiled by the driver, which needs
+/// a driver for CUDA [`CUDA`] or newer.
+pub const CUDA_CUBINS: &str = "8.6 8.9 12.0 12.1";
+
+/// The lowest compute capability the [`CUDA`] builds hold PTX for (their
+/// lowest `-virtual` architecture): an older GPU cannot run them at all.
+pub const CUDA_PTX_MIN: &str = "7.5";
+
+/// The CUDA version of the older `x86_64` CUDA build, for a driver and GPUs
+/// the [`CUDA`] build does not fit (see `cuda_fits` in `compare.sh`): any
+/// driver for CUDA 12.8 or newer compiles its PTX.
+pub const CUDA_FALLBACK: &str = "12.8";
+
+/// The compute capabilities the [`CUDA_FALLBACK`] build holds cubins for.
+pub const CUDA_FALLBACK_CUBINS: &str = "8.6 8.9 12.0";
+
+/// The lowest compute capability the [`CUDA_FALLBACK`] build holds PTX for.
+pub const CUDA_FALLBACK_PTX_MIN: &str = "5.0";
+
+/// SHA-256 of `llama-<TAG>-bin-ubuntu-cuda-<CUDA_FALLBACK>-x64.tar.gz`.
+pub const UBUNTU_CUDA_FALLBACK_X64_SHA256: &str =
+    "0e1ff5490869eef0479f95df094bdc75d87890882f687d3d537192eefff87861";
+
+/// SHA-256 of `cudart-llama-<TAG>-bin-ubuntu-cuda-<CUDA_FALLBACK>-x64.tar.gz`.
+pub const CUDART_FALLBACK_X64_SHA256: &str =
+    "8c32c1c07568395f84bd8b308293c889bad775037f82a7423dede6900827e42a";
 
 /// SHA-256 of `llama-<TAG>-bin-ubuntu-cuda-<CUDA>-x64.tar.gz` (Linux `x86_64`, NVIDIA GPU).
 pub const UBUNTU_CUDA_X64_SHA256: &str =
@@ -66,7 +94,8 @@ pub const UBUNTU_ROCM_X64_SHA256: &str =
 pub const GPU_GLIBC: &str = "2.38";
 
 /// The environment the scripts read the pin from: the tag, the CUDA and `ROCm`
-/// versions, the glibc the GPU builds need, the repository, and each digest.
+/// versions, the cubins of the CUDA builds, the glibc the GPU builds need, the
+/// repository, and each digest.
 #[must_use]
 pub fn env() -> Vec<(String, String)> {
     [
@@ -92,6 +121,25 @@ pub fn env() -> Vec<(String, String)> {
             UBUNTU_CUDA_ARM64_SHA256,
         ),
         ("OVERBRAINER_LLAMA_CPP_CUDART_X64_SHA256", CUDART_X64_SHA256),
+        ("OVERBRAINER_LLAMA_CPP_CUDA_CUBINS", CUDA_CUBINS),
+        ("OVERBRAINER_LLAMA_CPP_CUDA_PTX_MIN", CUDA_PTX_MIN),
+        ("OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK", CUDA_FALLBACK),
+        (
+            "OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_PTX_MIN",
+            CUDA_FALLBACK_PTX_MIN,
+        ),
+        (
+            "OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_CUBINS",
+            CUDA_FALLBACK_CUBINS,
+        ),
+        (
+            "OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_FALLBACK_X64_SHA256",
+            UBUNTU_CUDA_FALLBACK_X64_SHA256,
+        ),
+        (
+            "OVERBRAINER_LLAMA_CPP_CUDART_FALLBACK_X64_SHA256",
+            CUDART_FALLBACK_X64_SHA256,
+        ),
         ("OVERBRAINER_LLAMA_CPP_ROCM", ROCM),
         ("OVERBRAINER_LLAMA_CPP_GPU_GLIBC", GPU_GLIBC),
         (
@@ -124,6 +172,8 @@ mod tests {
             UBUNTU_CUDA_ARM64_SHA256,
             CUDART_X64_SHA256,
             CUDART_ARM64_SHA256,
+            UBUNTU_CUDA_FALLBACK_X64_SHA256,
+            CUDART_FALLBACK_X64_SHA256,
             UBUNTU_ROCM_X64_SHA256,
         ] {
             assert_eq!(digest.len(), 64, "{digest}");
@@ -136,44 +186,64 @@ mod tests {
         }
     }
 
-    /// The script's environment holds the release tag, the CUDA version, the
-    /// glibc of the GPU builds and every build's digest.
+    /// The script's environment holds the release tag, the CUDA versions and
+    /// cubins, the glibc of the GPU builds and every build's digest.
     #[test]
     fn the_script_gets_the_tag_and_every_digest() {
         let env = env();
-        let get = |name: &str| {
-            env.iter()
+        let expected = [
+            ("OVERBRAINER_LLAMA_CPP", TAG),
+            (
+                "OVERBRAINER_LLAMA_CPP_MACOS_ARM64_SHA256",
+                MACOS_ARM64_SHA256,
+            ),
+            ("OVERBRAINER_LLAMA_CPP_CUDA", CUDA),
+            ("OVERBRAINER_LLAMA_CPP_CUDA_CUBINS", CUDA_CUBINS),
+            ("OVERBRAINER_LLAMA_CPP_CUDA_PTX_MIN", CUDA_PTX_MIN),
+            (
+                "OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_PTX_MIN",
+                CUDA_FALLBACK_PTX_MIN,
+            ),
+            ("OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK", CUDA_FALLBACK),
+            (
+                "OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_CUBINS",
+                CUDA_FALLBACK_CUBINS,
+            ),
+            (
+                "OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_FALLBACK_X64_SHA256",
+                UBUNTU_CUDA_FALLBACK_X64_SHA256,
+            ),
+            (
+                "OVERBRAINER_LLAMA_CPP_CUDART_FALLBACK_X64_SHA256",
+                CUDART_FALLBACK_X64_SHA256,
+            ),
+            (
+                "OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_X64_SHA256",
+                UBUNTU_CUDA_X64_SHA256,
+            ),
+            (
+                "OVERBRAINER_LLAMA_CPP_CUDART_ARM64_SHA256",
+                CUDART_ARM64_SHA256,
+            ),
+            (
+                "OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_ARM64_SHA256",
+                UBUNTU_CUDA_ARM64_SHA256,
+            ),
+            ("OVERBRAINER_LLAMA_CPP_CUDART_X64_SHA256", CUDART_X64_SHA256),
+            ("OVERBRAINER_LLAMA_CPP_ROCM", ROCM),
+            (
+                "OVERBRAINER_LLAMA_CPP_UBUNTU_ROCM_X64_SHA256",
+                UBUNTU_ROCM_X64_SHA256,
+            ),
+            ("OVERBRAINER_LLAMA_CPP_GPU_GLIBC", GPU_GLIBC),
+        ];
+        for (name, value) in expected {
+            let got = env
+                .iter()
                 .find(|(key, _)| key == name)
-                .map(|(_, value)| value.as_str())
-        };
-        assert_eq!(get("OVERBRAINER_LLAMA_CPP"), Some(TAG));
-        assert_eq!(
-            get("OVERBRAINER_LLAMA_CPP_MACOS_ARM64_SHA256"),
-            Some(MACOS_ARM64_SHA256)
-        );
-        assert_eq!(get("OVERBRAINER_LLAMA_CPP_CUDA"), Some(CUDA));
-        assert_eq!(
-            get("OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_X64_SHA256"),
-            Some(UBUNTU_CUDA_X64_SHA256)
-        );
-        assert_eq!(
-            get("OVERBRAINER_LLAMA_CPP_CUDART_ARM64_SHA256"),
-            Some(CUDART_ARM64_SHA256)
-        );
-        assert_eq!(
-            get("OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_ARM64_SHA256"),
-            Some(UBUNTU_CUDA_ARM64_SHA256)
-        );
-        assert_eq!(
-            get("OVERBRAINER_LLAMA_CPP_CUDART_X64_SHA256"),
-            Some(CUDART_X64_SHA256)
-        );
-        assert_eq!(get("OVERBRAINER_LLAMA_CPP_ROCM"), Some(ROCM));
-        assert_eq!(
-            get("OVERBRAINER_LLAMA_CPP_UBUNTU_ROCM_X64_SHA256"),
-            Some(UBUNTU_ROCM_X64_SHA256)
-        );
-        assert_eq!(get("OVERBRAINER_LLAMA_CPP_GPU_GLIBC"), Some(GPU_GLIBC));
-        assert_eq!(env.len(), 14);
+                .map(|(_, value)| value.as_str());
+            assert_eq!(got, Some(value), "{name}");
+        }
+        assert_eq!(env.len(), 21);
     }
 }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::*;
-use crate::export::{LLAMA_CPP_CUDA, LLAMA_CPP_ROCM, LLAMA_CPP_TAG};
+use crate::export::{LLAMA_CPP_CUDA, LLAMA_CPP_CUDA_FALLBACK, LLAMA_CPP_ROCM, LLAMA_CPP_TAG};
 use crate::test_support::{make_executable, tar, text, tools_available};
 use crate::train::{METRICS_FILE, Trainer as _};
 
@@ -91,11 +91,19 @@ const LDCONFIG_NO_ROCBLAS: &str = "#!/bin/sh\n\
 /// A stub `ldconfig -p` of a machine without the `ROCm` runtime.
 const LDCONFIG_PLAIN: &str = "#!/bin/sh\necho '\tlibc.so.6 (libc6,x86-64) => /usr/lib/libc.so.6'\n";
 
-/// A stub `nvidia-smi` of a driver supporting CUDA `version`: one GPU named
-/// `Fake GPU` for `--query-gpu`, the header line otherwise.
+/// A stub `nvidia-smi` of a driver supporting CUDA `version` on one GPU of
+/// compute capability 8.9, which every pinned CUDA build has kernels for.
 fn gpu(version: &str) -> String {
+    gpu_with(version, "8.9")
+}
+
+/// A stub `nvidia-smi` of a driver supporting CUDA `version`: one GPU named
+/// `Fake GPU` of compute capability `cap` for `--query-gpu`, the header line
+/// otherwise.
+fn gpu_with(version: &str, cap: &str) -> String {
     format!(
-        "#!/bin/sh\ncase \"$*\" in\n*query-gpu*) echo 'Fake GPU' ;;\n\
+        "#!/bin/sh\ncase \"$*\" in\n*compute_cap*) echo '{cap}' ;;\n\
+         *query-gpu*) echo 'Fake GPU' ;;\n\
          *) echo '| NVIDIA-SMI 580.00   Driver Version: 580.00   CUDA Version: {version}     |' ;;\n\
          esac\n"
     )
@@ -149,8 +157,10 @@ struct Fixture {
     model: String,
     /// SHA-256 of every llama.cpp archive.
     bin_sha: String,
-    /// SHA-256 of every cudart archive.
+    /// SHA-256 of the cudart archive of the pinned CUDA build.
     cudart_sha: String,
+    /// SHA-256 of the cudart archive of the fallback CUDA build.
+    fallback_cudart_sha: String,
 }
 
 impl Fixture {
@@ -169,6 +179,7 @@ impl Fixture {
         for asset in [
             "ubuntu-x64",
             &format!("ubuntu-cuda-{LLAMA_CPP_CUDA}-x64"),
+            &format!("ubuntu-cuda-{LLAMA_CPP_CUDA_FALLBACK}-x64"),
             &format!("ubuntu-rocm-{LLAMA_CPP_ROCM}-x64"),
         ] {
             std::fs::copy(
@@ -181,6 +192,12 @@ impl Fixture {
         std::fs::write(build.join(&cudart).join("libcudart.so.13"), "")?;
         let cudart_tar = download.join(format!("{cudart}.tar.gz"));
         tar(&build, &cudart_tar, &cudart)?;
+        let fallback =
+            format!("cudart-llama-{LLAMA_CPP_TAG}-bin-ubuntu-cuda-{LLAMA_CPP_CUDA_FALLBACK}-x64");
+        std::fs::create_dir_all(build.join(&fallback))?;
+        std::fs::write(build.join(&fallback).join("libcudart.so.12"), "")?;
+        let fallback_tar = download.join(format!("{fallback}.tar.gz"));
+        tar(&build, &fallback_tar, &fallback)?;
         let stubs = path.join("stubs");
         stub(&stubs, "uname", UNAME_LINUX_X64)?;
         stub(&stubs, "nvidia-smi", NO_GPU)?;
@@ -200,6 +217,7 @@ impl Fixture {
         Ok(Self {
             bin_sha: crate::exec::sha256_file(&bin_tar)?,
             cudart_sha: crate::exec::sha256_file(&cudart_tar)?,
+            fallback_cudart_sha: crate::exec::sha256_file(&fallback_tar)?,
             root,
             job,
             model,
@@ -261,13 +279,22 @@ impl Fixture {
                     std::env::var("PATH").unwrap_or_default()
                 ),
             );
-        for name in ["UBUNTU_X64", "UBUNTU_CUDA_X64", "UBUNTU_ROCM_X64"] {
+        for name in [
+            "UBUNTU_X64",
+            "UBUNTU_CUDA_X64",
+            "UBUNTU_CUDA_FALLBACK_X64",
+            "UBUNTU_ROCM_X64",
+        ] {
             command.env(
                 format!("OVERBRAINER_LLAMA_CPP_{name}_SHA256"),
                 &self.bin_sha,
             );
         }
         command.env("OVERBRAINER_LLAMA_CPP_CUDART_X64_SHA256", &self.cudart_sha);
+        command.env(
+            "OVERBRAINER_LLAMA_CPP_CUDART_FALLBACK_X64_SHA256",
+            &self.fallback_cudart_sha,
+        );
         command.output()
     }
 }
@@ -423,7 +450,41 @@ fn a_gpu_host_runs_the_cuda_build_with_its_runtime_first() -> TestResult {
     Ok(())
 }
 
-/// On an NVIDIA host whose driver supports CUDA 12 only, the CPU build
+/// On a GPU without kernels in the pinned CUDA build, whose driver is too old
+/// to compile that build's PTX, the fallback CUDA build runs with its own
+/// cudart libraries first on `LD_LIBRARY_PATH`.
+#[test]
+fn a_gpu_the_pinned_build_cannot_run_gets_the_fallback_build() -> TestResult {
+    if !tools_available() {
+        eprintln!("skipped: needs sh, python3 and tar");
+        return Ok(());
+    }
+    let fixture = Fixture::new(&["Why?"], false)?;
+    stub(&fixture.stubs(), "nvidia-smi", &gpu_with("13.0", "10.3"))?;
+    let output = fixture.run("ok")?;
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(!text(&output).contains("warning"), "{}", text(&output));
+    let hardware = read_hardware(&fixture.job_dir()).ok_or("no hardware.json")?;
+    assert_eq!(
+        hardware.build,
+        format!("ubuntu-cuda-{LLAMA_CPP_CUDA_FALLBACK}-x64")
+    );
+    assert_eq!(hardware.gpus, ["Fake GPU"]);
+    let seen: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        fixture.job_dir().join("server-env.json"),
+    )?)?;
+    let library_path = seen["LD_LIBRARY_PATH"]
+        .as_str()
+        .ok_or("no LD_LIBRARY_PATH")?;
+    let first = library_path.split(':').next().ok_or("empty")?;
+    let cudart =
+        format!("cudart-llama-{LLAMA_CPP_TAG}-bin-ubuntu-cuda-{LLAMA_CPP_CUDA_FALLBACK}-x64");
+    assert!(first.ends_with(&cudart), "{library_path}");
+    assert!(Path::new(first).join("libcudart.so.12").is_file());
+    Ok(())
+}
+
+/// On an NVIDIA host whose driver supports CUDA 11 only, the CPU build
 /// serves the child: hardware.json lists no GPU and the report says the
 /// child ran on a CPU.
 #[test]
@@ -433,7 +494,7 @@ fn an_old_nvidia_driver_falls_back_to_the_cpu_and_says_so() -> TestResult {
         return Ok(());
     }
     let fixture = Fixture::new(&["Why?"], false)?;
-    stub(&fixture.stubs(), "nvidia-smi", &gpu("12.8"))?;
+    stub(&fixture.stubs(), "nvidia-smi", &gpu("11.8"))?;
     let output = fixture.run("ok")?;
     assert!(output.status.success(), "{}", text(&output));
     let hardware = read_hardware(&fixture.job_dir()).ok_or("no hardware.json")?;
@@ -728,13 +789,19 @@ impl Build {
         Self::cpu(&format!("ubuntu-rocm-{LLAMA_CPP_ROCM}-x64"), digest)
     }
 
-    /// The CUDA build of `arch` (`x64` or `arm64`), of digest `digest`, with
-    /// its cudart archive of digest `cudart_digest`.
+    /// The pinned CUDA build of `arch` (`x64` or `arm64`), of digest `digest`,
+    /// with its cudart archive of digest `cudart_digest`.
     fn cuda(arch: &str, digest: &str, cudart_digest: &str) -> Self {
+        Self::cuda_of(LLAMA_CPP_CUDA, arch, digest, cudart_digest)
+    }
+
+    /// The CUDA `version` build of `arch`, of digest `digest`, with its
+    /// cudart archive of digest `cudart_digest`.
+    fn cuda_of(version: &str, arch: &str, digest: &str, cudart_digest: &str) -> Self {
         Self {
-            asset: format!("ubuntu-cuda-{LLAMA_CPP_CUDA}-{arch}"),
+            asset: format!("ubuntu-cuda-{version}-{arch}"),
             digest: digest.to_string(),
-            cudart: format!("cudart-llama-{LLAMA_CPP_TAG}-bin-ubuntu-cuda-{LLAMA_CPP_CUDA}-{arch}"),
+            cudart: format!("cudart-llama-{LLAMA_CPP_TAG}-bin-ubuntu-cuda-{version}-{arch}"),
             cudart_digest: cudart_digest.to_string(),
         }
     }
@@ -898,8 +965,8 @@ impl BuildCase<'_> {
 }
 
 /// Each platform and NVIDIA case gets its build: CUDA with its runtime on a
-/// driver supporting the pinned CUDA, the CPU build otherwise, with a warning
-/// when the driver is too old.
+/// driver and GPU it runs on, the CPU build otherwise, with a warning when
+/// the driver is too old.
 #[test]
 fn the_build_matches_the_platform_and_the_gpu() -> TestResult {
     use crate::export::{
@@ -911,7 +978,7 @@ fn the_build_matches_the_platform_and_the_gpu() -> TestResult {
         return Ok(());
     }
     let driver_13 = gpu("13.0");
-    let driver_12 = gpu("12.8");
+    let driver_11 = gpu("11.8");
     let case = |platform, smi, expected, warning| BuildCase {
         platform,
         smi,
@@ -940,9 +1007,9 @@ fn the_build_matches_the_platform_and_the_gpu() -> TestResult {
         ),
         case(
             "Linux x86_64",
-            Some(driver_12.as_str()),
+            Some(driver_11.as_str()),
             cpu_x64(),
-            Some("CUDA 12.8"),
+            Some("NVIDIA driver (CUDA 11.8)"),
         ),
         case(
             "Darwin arm64",
@@ -961,6 +1028,153 @@ fn the_build_matches_the_platform_and_the_gpu() -> TestResult {
             .contains("no prebuilt llama-server for Linux riscv64")),
         "an unknown platform fails"
     );
+    Ok(())
+}
+
+/// Runs `pick_build` on `platform` with the stub `nvidia-smi` `smi`, no AMD
+/// GPU and an unknown glibc, and checks the build and the warning.
+fn nvidia_case(platform: &str, smi: &str, expected: Build, warning: Option<&str>) -> TestResult {
+    BuildCase {
+        platform,
+        smi: Some(smi),
+        amd: Amd::Absent,
+        glibc: Glibc::Unknown,
+        expected,
+        warning,
+    }
+    .check()
+}
+
+/// The pinned CUDA build of Linux `x86_64`.
+fn pinned_x64() -> Build {
+    Build::cuda(
+        "x64",
+        crate::export::UBUNTU_CUDA_X64_SHA256,
+        crate::export::CUDART_X64_SHA256,
+    )
+}
+
+/// The fallback CUDA build of Linux `x86_64`.
+fn fallback_x64() -> Build {
+    Build::cuda_of(
+        LLAMA_CPP_CUDA_FALLBACK,
+        "x64",
+        crate::export::UBUNTU_CUDA_FALLBACK_X64_SHA256,
+        crate::export::CUDART_FALLBACK_X64_SHA256,
+    )
+}
+
+/// The CPU build of Linux `aarch64`.
+fn cpu_arm64() -> Build {
+    Build::cpu("ubuntu-arm64", crate::export::UBUNTU_ARM64_SHA256)
+}
+
+/// A stub `nvidia-smi` of a driver supporting CUDA `version` on two GPUs, of
+/// compute capabilities 8.9 and 9.0.
+fn two_gpus(version: &str) -> String {
+    format!(
+        "#!/bin/sh\ncase \"$*\" in\n*compute_cap*) printf '8.9\\n9.0\\n' ;;\n\
+         *query-gpu*) printf 'Fake GPU\\nFake GPU\\n' ;;\n\
+         *) echo '| NVIDIA-SMI 580.00   Driver Version: 580.00   CUDA Version: {version}     |' ;;\n\
+         esac\n"
+    )
+}
+
+/// The CUDA build fits the driver and the GPUs: the pinned build on a driver
+/// for its CUDA version, or for its major version on GPUs it has kernels
+/// for, and on no GPU older than its PTX; else, on `x86_64`, the fallback
+/// build under the same rule.
+#[test]
+fn the_cuda_build_fits_the_driver_and_the_gpus() -> TestResult {
+    if !crate::test_support::sh_available() {
+        eprintln!("skipped: needs sh");
+        return Ok(());
+    }
+    let x64 = "Linux x86_64";
+    let pinned_arm64 = Build::cuda(
+        "arm64",
+        crate::export::UBUNTU_CUDA_ARM64_SHA256,
+        crate::export::CUDART_ARM64_SHA256,
+    );
+    // A driver for the pinned CUDA runs it on any GPU, through its PTX.
+    nvidia_case(x64, &gpu_with(LLAMA_CPP_CUDA, "10.3"), pinned_x64(), None)?;
+    nvidia_case(x64, &gpu_with("13.9", "7.5"), pinned_x64(), None)?;
+    // A newer driver major runs the pinned build.
+    nvidia_case(x64, &gpu_with("14.0", "9.0"), pinned_x64(), None)?;
+    // An older driver of the same major version runs its cubins only.
+    nvidia_case(x64, &gpu_with("13.0", "12.0"), pinned_x64(), None)?;
+    nvidia_case(x64, &gpu_with("13.0", "10.3"), fallback_x64(), None)?;
+    nvidia_case(x64, &gpu_with("13.0", "9.0"), fallback_x64(), None)?;
+    nvidia_case(x64, &gpu_with("12.8", "8.0"), fallback_x64(), None)?;
+    nvidia_case(x64, &gpu_with("12.4", "8.6"), fallback_x64(), None)?;
+    nvidia_case(
+        "Linux aarch64",
+        &gpu_with("13.0", "12.1"),
+        pinned_arm64,
+        None,
+    )?;
+    // A GPU older than the pinned build's PTX cannot run it on any driver;
+    // the fallback build, with older PTX, can.
+    nvidia_case(x64, &gpu_with(LLAMA_CPP_CUDA, "7.0"), fallback_x64(), None)?;
+    // Without a compute capability, only the driver's version counts: none
+    // printed, [N/A], or a failing query, as on a driver without that field.
+    nvidia_case(x64, &gpu_with("13.0", ""), fallback_x64(), None)?;
+    nvidia_case(x64, &gpu_with("13.0", "[N/A]"), fallback_x64(), None)?;
+    let no_field = "#!/bin/sh\ncase \"$*\" in\n\
+                    *compute_cap*) echo 'Field \"compute_cap\" is not a valid field to query.'; exit 2 ;;\n\
+                    *query-gpu*) echo 'Fake GPU' ;;\n\
+                    *) echo '| NVIDIA-SMI 580.00   Driver Version: 580.00   CUDA Version: 13.0     |' ;;\n\
+                    esac\n";
+    nvidia_case(x64, no_field, fallback_x64(), None)?;
+    // Two GPUs: the one without kernels decides.
+    nvidia_case(x64, &two_gpus("13.0"), fallback_x64(), None)?;
+    Ok(())
+}
+
+/// When no CUDA build fits the driver and the GPUs, the CPU build runs, with
+/// one warning naming the builds, the driver's CUDA version and each GPU's
+/// compute capability.
+#[test]
+fn no_fitting_cuda_build_gets_the_cpu_build_and_says_why() -> TestResult {
+    if !crate::test_support::sh_available() {
+        eprintln!("skipped: needs sh");
+        return Ok(());
+    }
+    let x64 = "Linux x86_64";
+    let arm64 = "Linux aarch64";
+    let cpu_x64 = || Build::cpu("ubuntu-x64", crate::export::UBUNTU_X64_SHA256);
+    let none = format!(
+        "no CUDA build of llama.cpp {LLAMA_CPP_TAG} (CUDA {LLAMA_CPP_CUDA}, CUDA {LLAMA_CPP_CUDA_FALLBACK}) runs on this NVIDIA driver (CUDA 12.4) and GPU (compute capability 9.0)"
+    );
+    nvidia_case(x64, &gpu_with("12.4", "9.0"), cpu_x64(), Some(&none))?;
+    nvidia_case(
+        x64,
+        &two_gpus("12.4"),
+        cpu_x64(),
+        Some("(CUDA 12.4) and GPUs (compute capability 8.9, 9.0)"),
+    )?;
+    let arm = format!(
+        "no CUDA build of llama.cpp {LLAMA_CPP_TAG} (CUDA {LLAMA_CPP_CUDA}) runs on this NVIDIA driver (CUDA 13.0) and GPU (compute capability 9.0)"
+    );
+    nvidia_case(arm64, &gpu_with("13.0", "9.0"), cpu_arm64(), Some(&arm))?;
+    nvidia_case(
+        arm64,
+        &gpu_with("13.0", ""),
+        cpu_arm64(),
+        Some("compute capability unknown"),
+    )?;
+    nvidia_case(
+        arm64,
+        &gpu_with("12.8", "8.9"),
+        cpu_arm64(),
+        Some("NVIDIA driver (CUDA 12.8) and GPU (compute capability 8.9)"),
+    )?;
+    nvidia_case(
+        arm64,
+        &gpu_with(LLAMA_CPP_CUDA, "7.0"),
+        cpu_arm64(),
+        Some("no GPU older than its PTX"),
+    )?;
     Ok(())
 }
 

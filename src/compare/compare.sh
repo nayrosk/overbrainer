@@ -15,8 +15,9 @@
 #   OVERBRAINER_METRICS              the job's metrics file, for progress lines
 #   OVERBRAINER_CACHE                cache holding llama.cpp, shared by the runs
 #   OVERBRAINER_COMPARE_KFD          the AMD compute device, /dev/kfd by default
-#   OVERBRAINER_LLAMA_CPP*           the pinned llama.cpp release, its digests and
-#                                    the glibc its GPU builds need
+#   OVERBRAINER_LLAMA_CPP*           the pinned llama.cpp release, its digests, the
+#                                    cubins of its CUDA builds and the glibc its
+#                                    GPU builds need
 #
 # overbrainer puts the helpers of llama_cpp.sh (fail, say, fetch, unpack)
 # before this code. Everything is a function; the last line runs `main`,
@@ -65,6 +66,49 @@ driver_cuda() {
     version=${smi#*CUDA Version:}
     version=${version#"${version%%[! ]*}"}
     printf '%s\n' "${version%%[!0-9.]*}"
+}
+
+# Prints the compute capability of each NVIDIA GPU (8.9), separated by
+# spaces, from nvidia-smi; prints nothing when the driver does not say it for
+# every GPU: the query fails, or a value is not MAJOR.MINOR ([N/A], an error
+# message). Globbing is off while the values are split.
+gpu_caps() {
+    listed=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || return 0
+    set -f
+    valid=
+    for cap in $listed; do
+        case $cap in
+        [0-9]*.[0-9]*) ;;
+        *) valid= && break ;;
+        esac
+        case $cap in
+        *[!0-9.]* | *.*.*) valid= && break ;;
+        esac
+        valid="$valid$cap "
+    done
+    set +f
+    printf '%s\n' "$valid"
+}
+
+# Whether the CUDA build of CUDA version $1, with cubins for the compute
+# capabilities $2 and PTX from compute capability $3 up, runs on this driver
+# (CUDA $driver) and these GPUs ($caps): no GPU is below $3, and the driver
+# supports CUDA $1 or newer, or the same major version and every GPU has a
+# cubin, so the driver never compiles the build's PTX, which a driver older
+# than the build cannot read.
+cuda_fits() {
+    for cap in $caps; do
+        version_older "$cap" "$3" && return 1
+    done
+    version_older "$driver" "$1" || return 0
+    [ "${driver%%.*}" = "${1%%.*}" ] || return 1
+    [ -n "$caps" ] || return 1
+    for cap in $caps; do
+        case " $2 " in
+        *" $cap "*) ;;
+        *) return 1 ;;
+        esac
+    done
 }
 
 # Prints the output of `ldconfig -p`, the libraries the dynamic linker knows;
@@ -163,12 +207,12 @@ pick_amd() {
 }
 
 # Picks the llama.cpp build for this machine: sets asset and digest, and
-# cudart and cudart_digest (the CUDA runtime archive) for a CUDA build, empty
-# for a CPU or ROCm one. A Linux host with a working nvidia-smi gets the CUDA
-# build, unless its driver supports a CUDA major version below the pinned one
-# or its glibc is older than the one the build needs: then the CPU build, with
-# a warning. Without nvidia-smi, an AMD host gets the ROCm build (see
-# pick_amd).
+# cuda, cudart and cudart_digest (the CUDA runtime archive) for a CUDA build,
+# cudart empty for a CPU or ROCm one. A Linux host with a working nvidia-smi
+# gets the first CUDA build that fits its driver and GPUs (see cuda_fits):
+# the pinned one, then on x86_64 the fallback one. With none, or a glibc
+# older than the one the build needs, it gets the CPU build, with a warning.
+# Without nvidia-smi, an AMD host gets the ROCm build (see pick_amd).
 pick_build() {
     tag=$OVERBRAINER_LLAMA_CPP
     cuda=$OVERBRAINER_LLAMA_CPP_CUDA
@@ -206,9 +250,24 @@ pick_build() {
         return 0
         ;;
     esac
-    if [ "$driver_major" -lt "${cuda%%.*}" ]; then
-        warn "the NVIDIA driver supports CUDA $driver, below the CUDA $cuda of llama.cpp $tag: using the CPU build $asset"
-        return 0
+    caps=$(gpu_caps)
+    if ! cuda_fits "$cuda" "$OVERBRAINER_LLAMA_CPP_CUDA_CUBINS" "$OVERBRAINER_LLAMA_CPP_CUDA_PTX_MIN"; then
+        fallback=$OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK
+        if [ "$arch" != x64 ] ||
+            ! cuda_fits "$fallback" "$OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_CUBINS" "$OVERBRAINER_LLAMA_CPP_CUDA_FALLBACK_PTX_MIN"; then
+            builds="CUDA $cuda"
+            [ "$arch" != x64 ] || builds="$builds, CUDA $fallback"
+            seen= gpus=GPU
+            for cap in $caps; do
+                [ -z "$seen" ] || gpus=GPUs
+                seen="${seen:+$seen, }$cap"
+            done
+            warn "no CUDA build of llama.cpp $tag ($builds) runs on this NVIDIA driver (CUDA $driver) and $gpus (compute capability ${seen:-unknown}): a build needs a driver for its CUDA version, or for its major version on a GPU it has kernels for, and no GPU older than its PTX. Using the CPU build $asset"
+            return 0
+        fi
+        cuda=$fallback
+        cuda_digest=$OVERBRAINER_LLAMA_CPP_UBUNTU_CUDA_FALLBACK_X64_SHA256
+        runtime_digest=$OVERBRAINER_LLAMA_CPP_CUDART_FALLBACK_X64_SHA256
     fi
     gpu_glibc_fits "ubuntu-cuda-$cuda-$arch" || return 0
     asset=ubuntu-cuda-$cuda-$arch digest=$cuda_digest
