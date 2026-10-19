@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/nayrosk/overbrainer/compare/v0.8.2...v0.9.0) - 2026-10-19
+
+### Added
+
+- *(runpod)* run compare pods on the Axolotl 0.21.0 training image ([#163](https://github.com/nayrosk/overbrainer/pull/163))
+
+### Fixed
+
+- *(compare)* pick a llama.cpp CUDA build the driver and GPU can run ([#165](https://github.com/nayrosk/overbrainer/pull/165))
+
 ## [0.8.2](https://github.com/nayrosk/overbrainer/compare/v0.8.1...v0.8.2) - 2026-10-15
 
 ### Documentation
