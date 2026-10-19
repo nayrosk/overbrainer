@@ -450,9 +450,9 @@ pub fn effective_client(configured: SshClient, env: Option<&str>) -> Result<SshC
     Ok(client)
 }
 
-/// Image used by the `docker` runtime when a target sets none: Axolotl 0.19.0 for
+/// Image used by the `docker` runtime when a target sets none: Axolotl 0.21.0 for
 /// CUDA 13 (NVIDIA driver 580 or newer), pinned by digest.
-pub const DEFAULT_IMAGE: &str = "axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1@sha256:9de7c7a5b8830480a7d2eb3b6d49759586615f5f8eb1126d5df29f8bd9fa324b";
+pub const DEFAULT_IMAGE: &str = "axolotlai/axolotl:0.21.0-py3.12-cu130-2.14.1@sha256:d08da8a5dd2b3223a49fb25cdadd85bdf0c5acee9c5de223bf6ab10d0b511e14";
 
 /// Directory of an `ssh` target that holds the runs when `workdir` is unset,
 /// relative to the remote user's home directory.
@@ -563,16 +563,11 @@ pub enum Target {
     },
 }
 
-/// Image of a Runpod pod when a target sets none: Axolotl 0.19.0's cloud image for
-/// CUDA 13 (NVIDIA driver 580 or newer), pinned by its index digest.
-pub const DEFAULT_RUNPOD_IMAGE: &str = "axolotlai/axolotl-cloud-term:0.19.0-py3.12-cu130-2.12.1@sha256:f7b94da82913920a003e28e091d8528f57f76da7360fca87e95faf62fa32a680";
-
-/// Image of the pod of a Runpod compare when `[compare] image` sets none:
-/// Runpod's Ubuntu 24.04 base image for CUDA 13.0, pinned by its digest. Its
-/// glibc 2.39 runs the llama.cpp CUDA build, which needs 2.38, where
-/// [`DEFAULT_RUNPOD_IMAGE`] (Ubuntu 22.04, glibc 2.35) does not. It has what a
-/// compare pod needs: sshd, `curl`, `python3` and `tar`.
-pub const DEFAULT_COMPARE_IMAGE: &str = "runpod/base:1.4.0-cuda1300-ubuntu2404@sha256:7ae135e7245f01f41a294ab79280ef83974953fb8823512a69e9faf2b47201f4";
+/// Image of a Runpod pod when a target sets none: Axolotl 0.21.0's cloud image for
+/// CUDA 13 (NVIDIA driver 580 or newer), pinned by its index digest. It is
+/// Ubuntu 24.04, whose glibc 2.39 also runs the llama.cpp CUDA build of a
+/// compare pod, which needs 2.38.
+pub const DEFAULT_RUNPOD_IMAGE: &str = "axolotlai/axolotl-cloud-term:0.21.0-py3.12-cu130-2.14.1@sha256:6dd02035f432a81725fc7405a525f6539a7bc9e40ac91702188170800b4415c1";
 
 /// Virtual environment holding Axolotl in [`DEFAULT_RUNPOD_IMAGE`].
 pub const DEFAULT_RUNPOD_VENV: &str = "/workspace/axolotl-venv";
@@ -828,13 +823,13 @@ pub struct Compare {
     /// How long `llama-server` may take to be ready, in seconds, 1 to 3600.
     pub server_start_secs: u64,
     /// Container image of the pod of a compare on a Runpod target. Defaults
-    /// to [`DEFAULT_COMPARE_IMAGE`]; pinning it by digest is recommended.
+    /// to the target's image; pinning it by digest is recommended.
     pub image: Option<String>,
 }
 
 impl Default for Compare {
     /// No prices, 4096 tokens, temperature 0, 300 seconds for the server,
-    /// and the default compare image.
+    /// and the target's image for a Runpod compare pod.
     fn default() -> Self {
         Self {
             parent_price_in: None,

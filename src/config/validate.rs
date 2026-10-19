@@ -1756,7 +1756,7 @@ mod tests {
     fn target_image_accepts_a_reference_with_a_digest() -> Result<(), config::ConfigError> {
         let toml = VALID.replace(
             r#"runtime = "native""#,
-            "runtime = \"docker\"\nimage = \"axolotlai/axolotl:0.19.0-py3.12-cu130-2.12.1@sha256:9de7c7a5b8830480a7d2eb3b6d49759586615f5f8eb1126d5df29f8bd9fa324b\"",
+            "runtime = \"docker\"\nimage = \"axolotlai/axolotl:0.21.0-py3.12-cu130-2.14.1@sha256:d08da8a5dd2b3223a49fb25cdadd85bdf0c5acee9c5de223bf6ab10d0b511e14\"",
         );
         assert_eq!(check(&settings(&toml)?), Vec::<String>::new());
         Ok(())

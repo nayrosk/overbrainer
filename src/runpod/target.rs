@@ -2,9 +2,7 @@
 
 use std::time::Duration;
 
-use crate::config::{
-    DEFAULT_COMPARE_IMAGE, DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV, ListOrAuto, SshClient, Target,
-};
+use crate::config::{DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV, ListOrAuto, SshClient, Target};
 use crate::exec::JobRuntime;
 
 use super::JOB_ENV;
@@ -127,15 +125,14 @@ impl RunpodTarget {
         }
     }
 
-    /// The same target for the pod of a compare: the image `image`, else
-    /// [`DEFAULT_COMPARE_IMAGE`], whose glibc runs the llama.cpp GPU builds,
-    /// and no virtual environment, since a compare needs no Axolotl: its job
-    /// runs the image's `python3`. Training and export pods keep the
-    /// target's image.
+    /// The same target for the pod of a compare: the image `image`, else the
+    /// target's own image, and no virtual environment, since a compare needs
+    /// no Axolotl: its job runs the `python3` of the image's `PATH`. The
+    /// default image's glibc runs the llama.cpp GPU builds.
     #[must_use]
     pub fn for_compare(&self, image: Option<&str>) -> Self {
         Self {
-            image: image.unwrap_or(DEFAULT_COMPARE_IMAGE).to_string(),
+            image: image.map_or_else(|| self.image.clone(), str::to_string),
             venv: None,
             ..self.clone()
         }
@@ -190,14 +187,14 @@ mod tests {
         Ok(())
     }
 
-    /// A compare pod runs on the compare image, the configured one or the
-    /// default, with the image's own Python: no Axolotl venv. The rest of the
-    /// target is kept.
+    /// A compare pod runs on the configured compare image, else on the
+    /// target's image, with the image's own Python: no Axolotl venv. The rest
+    /// of the target is kept.
     #[test]
-    fn a_compare_pod_has_its_own_image_and_no_venv() -> Result<(), &'static str> {
+    fn a_compare_pod_runs_the_target_image_without_venv() -> Result<(), &'static str> {
         let target = RunpodTarget::from_target(&config_target(None)).ok_or("not runpod")?;
         let compare = target.for_compare(None);
-        assert_eq!(compare.image, DEFAULT_COMPARE_IMAGE);
+        assert_eq!(compare.image, DEFAULT_RUNPOD_IMAGE);
         assert_eq!(
             compare.runtime(),
             JobRuntime::Native {
@@ -209,6 +206,12 @@ mod tests {
         assert_eq!(compare.workdir(), target.workdir());
         let custom = target.for_compare(Some("me/llama:1@sha256:abc"));
         assert_eq!(custom.image, "me/llama:1@sha256:abc");
+        let mut own = config_target(None);
+        if let Target::Runpod { image, .. } = &mut own {
+            *image = Some("me/axolotl:1@sha256:def".into());
+        }
+        let own = RunpodTarget::from_target(&own).ok_or("not runpod")?;
+        assert_eq!(own.for_compare(None).image, "me/axolotl:1@sha256:def");
         assert_eq!(
             target.runtime(),
             JobRuntime::Native {

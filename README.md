@@ -76,7 +76,7 @@ The latest code from `main` installs with `cargo install --locked --git https://
 
 - Rust 1.91 or newer to build it. CI builds and tests on Linux, and checks that it builds on macOS.
 - `ssh` for SSH targets, and `ssh` with `ssh-keygen` for Runpod targets, unless you use the built-in SSH client.
-- For training on this machine: Axolotl 0.19 in a virtual environment or on `PATH`, or Docker or Podman with NVIDIA GPU access to run the Axolotl image.
+- For training on this machine: Axolotl 0.21 in a virtual environment or on `PATH`, or Docker or Podman with NVIDIA GPU access to run the Axolotl image.
 
 > [!TIP]
 > If `ssh` is a sandbox wrapper such as firejail, or missing, set `ssh_client = "builtin"` on the target (or `OVERBRAINER_SSH_CLIENT=builtin`) to use the built-in SSH client, which needs no `ssh` binary. See [Built-in SSH client](docs/training.md#built-in-ssh-client).
