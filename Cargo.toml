@@ -39,7 +39,7 @@ hf-hub = { version = "1.0.0", default-features = false, features = ["rustls-tls"
 hmac = { version = "0.13", optional = true }
 hyper = { version = "1.11.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
-minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "debug", "serde"] }
+minijinja = { version = "3.0.0", default-features = false, features = ["builtins", "debug", "serde"] }
 openssh = { version = "0.11.6", default-features = false, features = ["native-mux"] }
 prometheus-client = "0.25.1"
 rand = { version = "0.10", default-features = false, features = ["thread_rng"], optional = true }

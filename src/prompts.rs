@@ -3,6 +3,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use minijinja::value::Serde;
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use serde::Serialize;
 
@@ -128,7 +129,7 @@ impl Prompts {
         self.env
             .get_template(name)
             .map_err(error)?
-            .render(context)
+            .render(Serde(context))
             .map_err(error)
     }
 }
