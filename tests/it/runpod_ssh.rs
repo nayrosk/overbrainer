@@ -285,13 +285,15 @@ async fn write_verdict(
             container: None,
         })
         .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut status = JobStatus::Running;
-    for _ in 0..300 {
-        status = executor.status(&job).await?;
+    while let Ok(polled) = tokio::time::timeout_at(deadline, executor.status(&job)).await {
+        status = polled?;
         if status.is_finished() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let next = tokio::time::Instant::now() + Duration::from_millis(100);
+        tokio::time::sleep_until(next.min(deadline)).await;
     }
     if status == JobStatus::Exited(0) {
         Ok(())
