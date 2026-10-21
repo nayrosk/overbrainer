@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "│                                              ││                                                                      │"
 "│                                              ││                                                                      │"
 "╰──────────────────────────────────────────────╯╰──────────────────────────────────────────────────────────────────────╯"
-" j/k move · h/l focus · f filter · C compare · J rejudge · c cancel                                      v#.#.#  ? help "
+" j/k move · h/l focus · f filter · C compare · J rejudge · c cancel                                     v#.##.#  ? help "

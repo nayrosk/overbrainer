@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/nayrosk/overbrainer/compare/v0.9.0...v0.10.0) - 2026-10-21
+
+### Fixed
+
+- *(test)* wait for the verdict job to finish and name its status ([#175](https://github.com/nayrosk/overbrainer/pull/175))
+- *(deps)* bump rustls-webpki and webpki-root-certs for emSign advisories ([#172](https://github.com/nayrosk/overbrainer/pull/172))
+
 ## [0.9.0](https://github.com/nayrosk/overbrainer/compare/v0.8.2...v0.9.0) - 2026-10-19
 
 ### Added

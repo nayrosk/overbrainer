@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "│                              ││ ── judge ──                                  │"
 "│                              ││ Reason 1.                                    │"
 "╰──────────────────────────────╯╰─────────────────────────────────────── 12/13 ╯"
-" j/k move · h/l focus · f filter   … comparing: judging 12/100 · v#.#.#  ? help "
+" j/k move · h/l focus · f filter  … comparing: judging 12/100 · v#.##.#  ? help "

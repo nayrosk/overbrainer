@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "      out; cost $0.0123                                                         "
 "    ✗ 1 item failed                                                             "
 "                                                                                "
-" ✗ auto stopped at answers: 1 item failed; A resumes … loading · v#.#.#  ? help "
+" ✗ auto stopped at answers: 1 item failed; A resumes… loading · v#.##.#  ? help "

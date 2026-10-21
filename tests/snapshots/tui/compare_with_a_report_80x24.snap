@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "│                              ││ Reason 1.                                    │"
 "│                              ││                                              │"
 "╰──────────────────────────────╯╰─────────────────────────────────────── 13/13 ╯"
-" j/k move · h/l focus · f filter · C compare · J rejudge         v#.#.#  ? help "
+" j/k move · h/l focus · f filter · C compare · J rejudge        v#.##.#  ? help "

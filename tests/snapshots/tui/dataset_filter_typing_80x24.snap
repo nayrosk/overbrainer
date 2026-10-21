@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "│                                  ││                                          │"
 "│                                  ││                                          │"
 "╰ /bo ─────────────────────────────╯╰───────────────────────────────────── 6/6 ╯"
-" Enter keep · Esc clear                                          v#.#.#  ? help "
+" Enter keep · Esc clear                                         v#.##.#  ? help "
