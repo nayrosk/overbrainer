@@ -24,4 +24,4 @@ source: src/tui/snapshots.rs
 "│                                  ││ move out of the value because it is      │"
 "│                                  ││ borrowed.                                │"
 "╰ / filter ────────────────────────╯╰─────────────────────────────────── 20/23 ╯"
-" j/k move · l open · / filter · s stats · e edit · d delete      v#.#.#  ? help "
+" j/k move · l open · / filter · s stats · e edit · d delete     v#.##.#  ? help "

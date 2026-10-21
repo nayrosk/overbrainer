@@ -40,4 +40,4 @@ source: src/tui/snapshots.rs
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
-" ✗ auto stopped at answers: 1 item failed; A resumes it                                      … loading · v#.#.#  ? help "
+" ✗ auto stopped at answers: 1 item failed; A resumes it                                     … loading · v#.##.#  ? help "
