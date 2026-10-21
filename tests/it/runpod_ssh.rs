@@ -263,7 +263,8 @@ async fn stub(sshd: &Sshd, run_id: &str, dies_after: Option<usize>) -> (MockServ
 }
 
 /// Writes the watchdog's verdict for `run_id` under `workdir` on the test sshd,
-/// connecting with `client`.
+/// connecting with `client`. Waits up to 30 s for the writing job to finish,
+/// and names its last status when it did not exit with 0.
 async fn write_verdict(
     sshd: &Sshd,
     (workdir, run_id): (&str, &str),
@@ -284,13 +285,21 @@ async fn write_verdict(
             container: None,
         })
         .await?;
-    for _ in 0..100 {
-        if executor.status(&job).await? == JobStatus::Exited(0) {
-            return Ok(());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut status = JobStatus::Running;
+    while let Ok(polled) = tokio::time::timeout_at(deadline, executor.status(&job)).await {
+        status = polled?;
+        if status.is_finished() {
+            break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let next = tokio::time::Instant::now() + Duration::from_millis(100);
+        tokio::time::sleep_until(next.min(deadline)).await;
     }
-    Err("the verdict was not written".into())
+    if status == JobStatus::Exited(0) {
+        Ok(())
+    } else {
+        Err(format!("the verdict was not written: the job is {status:?}").into())
+    }
 }
 
 /// Provisions against the test sshd with `client` and `verdict` written (none
