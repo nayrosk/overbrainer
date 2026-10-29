@@ -85,8 +85,10 @@ pub(super) enum Task {
     /// What a push of run `0` to the Hugging Face Hub would send, read from
     /// its files: no network.
     PreparePush(String),
-    /// `overbrainer push <run-id>`, with the default options.
-    Push(String),
+    /// `overbrainer push <run-id>`, with the default options, of the run of
+    /// this confirmed plan: refused when the configuration no longer gives the
+    /// repo or the visibility the plan showed.
+    Push(PushPlan),
     /// Reads the compares of every run, with their reports.
     Compares,
     /// What a compare of run `0`, else of the newest run with a GGUF, would
@@ -634,7 +636,7 @@ impl Tasks {
             Task::PrepareResume(run) => self.spawn_prepare_resume(run),
             Task::PrepareAuto => self.spawn_prepare(true),
             Task::PreparePush(run) => self.spawn_prepare_push(run),
-            Task::Push(run) => self.spawn_push(id, run),
+            Task::Push(plan) => self.spawn_push(id, plan),
             Task::Compares => self.spawn_compares(),
             Task::PrepareCompare(run) => self.spawn_prepare_compare(run),
             Task::Compare(args) => self.spawn_compare(id, args),
@@ -758,9 +760,10 @@ impl Tasks {
         })
     }
 
-    /// Starts the push of run `run` as `id`: its token stops the push before
-    /// its commit, as Ctrl-C does on the command line.
-    fn spawn_push(&mut self, id: TaskId, run: String) -> AbortHandle {
+    /// Starts the push of the run of the confirmed `plan` as `id`: its token
+    /// stops the push before its commit, as Ctrl-C does on the command line.
+    /// The configuration read now must still match `plan`.
+    fn spawn_push(&mut self, id: TaskId, plan: PushPlan) -> AbortHandle {
         let dir = self.project_dir.clone();
         let source = self.source.clone();
         let token = CancellationToken::new();
@@ -770,8 +773,10 @@ impl Tasks {
         self.set.spawn(async move {
             let push = async {
                 let settings = source.load(&dir)?;
+                push::still_confirmed(&plan, &settings)?;
                 let opts = PushOptions::default();
-                push::push_with_token(&Runs::new(&dir), &settings, &run, &opts, &front).await
+                let runs = Runs::new(&dir);
+                push::push_with_token(&runs, &settings, &plan.run_id, &opts, &front).await
             };
             // A push whose commit is done wins over a cancel that came with it.
             let pushed = tokio::select! {
@@ -1151,7 +1156,16 @@ mod tests {
             error,
             format!("run {run} is running: only a succeeded or stopped run can be pushed")
         );
-        tasks.spawn(TaskId(2), Task::Push(run.into()));
+        let settings = crate::config::load(dir.path(), EnvSource::Vars(Vec::new()))?;
+        let (repo, private) = push::destination(&settings);
+        let plan = PushPlan {
+            run_id: run.into(),
+            repo,
+            private,
+            files: 1,
+            bytes: 1,
+        };
+        tasks.spawn(TaskId(2), Task::Push(plan.clone()));
         let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
         let Some((TaskId(2), Ok(Done::Pushed(Err(error))))) = next else {
             return Err(format!("unexpected end: {next:?}").into());
@@ -1161,6 +1175,57 @@ mod tests {
             "OVERBRAINER_HF_TOKEN is not set: a Hugging Face token with write access is needed \
              to push"
         );
+        assert!(tasks.is_empty());
+        Ok(())
+    }
+
+    /// A confirmed push whose repo or visibility the configuration no longer
+    /// matches, after a reload while the dialog was open, is refused before
+    /// the token is even read.
+    #[tokio::test]
+    async fn a_push_whose_settings_changed_since_its_confirmation_is_refused() -> TestResult {
+        let dir = project()?;
+        let settings = crate::config::load(dir.path(), EnvSource::Vars(Vec::new()))?;
+        let (repo, private) = push::destination(&settings);
+        let run = "20260921-133200-a1b2";
+        let mut tasks = Tasks::new(dir.path(), tokio::sync::mpsc::unbounded_channel().0);
+        tasks.use_config(Source::from(EnvSource::Vars(Vec::new())));
+        for (id, plan) in [
+            (
+                3,
+                PushPlan {
+                    run_id: run.into(),
+                    repo: repo.clone(),
+                    private: !private,
+                    files: 1,
+                    bytes: 1,
+                },
+            ),
+            (
+                4,
+                PushPlan {
+                    run_id: run.into(),
+                    repo: "someone/else".into(),
+                    private,
+                    files: 1,
+                    bytes: 1,
+                },
+            ),
+        ] {
+            tasks.spawn(TaskId(id), Task::Push(plan));
+            let next = tokio::time::timeout(LIMIT, tasks.next()).await?;
+            let Some((TaskId(done), Ok(Done::Pushed(Err(error))))) = next else {
+                return Err(format!("unexpected end: {next:?}").into());
+            };
+            assert_eq!(done, id);
+            assert_eq!(
+                error,
+                format!(
+                    "the [hub] settings changed since the push of run {run} was confirmed: \
+                     press h again"
+                )
+            );
+        }
         assert!(tasks.is_empty());
         Ok(())
     }

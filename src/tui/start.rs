@@ -265,7 +265,6 @@ fn plan(settings: &Settings, files: &DataFiles) -> Result<StartPlan, String> {
     let mut warnings: Vec<String> = reasoning_template_warning(training).into_iter().collect();
     warnings.extend(crate::config::validate::deprecations(settings));
     warnings.extend(crate::config::validate::hub_token_warning(settings));
-    warnings.extend(crate::config::validate::legacy_hub_token_warning(settings));
     Ok(StartPlan {
         target: training.target.clone(),
         kind: kind(target),

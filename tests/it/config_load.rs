@@ -605,6 +605,49 @@ kind = "ssh"
 runtime = "native"
 "#;
 
+/// The deprecated `training.hub_model_id` reads as `overbrainer migrate` would
+/// write it: the `[hub]` repo, private, pushed after training, unless the file
+/// or the environment sets those keys.
+#[test]
+fn a_legacy_hub_model_id_reads_as_the_hub_section() -> Result<(), Box<dyn std::error::Error>> {
+    let legacy = TRAINING.replace(
+        "adapter = \"qlora\"\n",
+        "adapter = \"qlora\"\nhub_model_id = \"me/legacy\"\n",
+    );
+    let dir = project(&format!("{BASE}{legacy}"))?;
+    let settings = load(dir.path(), env(&[]))?;
+    assert_eq!(settings.hub.repo.as_deref(), Some("me/legacy"));
+    assert!(settings.hub.private && settings.hub.after_training);
+
+    let dir = project(&format!(
+        "{BASE}{legacy}\n[hub]\nrepo = \"me/kept\"\nprivate = false\nafter_training = false\n"
+    ))?;
+    let settings = load(dir.path(), env(&[]))?;
+    assert_eq!(settings.hub.repo.as_deref(), Some("me/kept"));
+    assert!(!settings.hub.private && !settings.hub.after_training);
+
+    let dir = project(&format!("{BASE}{legacy}"))?;
+    let settings = load(
+        dir.path(),
+        env(&[("OVERBRAINER_HUB__AFTER_TRAINING", "false")]),
+    )?;
+    assert!(
+        !settings.hub.after_training,
+        "the environment's value stays"
+    );
+
+    let bare = legacy.replace("me/legacy", "bare");
+    let dir = project(&format!("{BASE}{bare}"))?;
+    match load(dir.path(), env(&[])) {
+        Err(ConfigError::Invalid(problems)) => assert_eq!(
+            problems,
+            ["training.hub_model_id must be NAMESPACE/NAME, got \"bare\""]
+        ),
+        other => return Err(format!("expected Invalid, got {other:?}").into()),
+    }
+    Ok(())
+}
+
 #[test]
 fn env_values_in_axolotl_extra_get_their_types() -> Result<(), Box<dyn std::error::Error>> {
     let dir = project(&format!("{BASE}{TRAINING}"))?;

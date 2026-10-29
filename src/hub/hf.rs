@@ -57,6 +57,23 @@ impl HfHub {
 }
 
 impl HfHub {
+    /// Whether model repo `repo` is private, `None` when it does not exist. A
+    /// visibility the Hub leaves out counts as public, so a private push is
+    /// refused rather than trusted.
+    async fn visibility(&self, repo: &RepoId) -> Result<Option<bool>, HubError> {
+        match self
+            .client
+            .model(&repo.namespace, &repo.name)
+            .info()
+            .send()
+            .await
+        {
+            Ok(info) => Ok(Some(info.private.unwrap_or(false))),
+            Err(HFError::RepoNotFound { .. }) => Ok(None),
+            Err(error) => Err(self.map(&error, &repo.namespace)),
+        }
+    }
+
     /// Maps a crate error. `namespace` names the owner for [`HubError::Forbidden`].
     /// The crate's `Display` carries the server's `error` field, which a server
     /// could fill with the token: such a message is withheld. `Debug` carries
@@ -115,34 +132,38 @@ impl Hub for HfHub {
     }
 
     /// Creates the repo when it is missing and says whether it existed and its visibility.
+    ///
+    /// `Created` is said only when this call created the repo: one created by
+    /// someone else between the lookup and the creation (a conflict) is read
+    /// again and reported `Existing` with its own visibility.
     async fn ensure_repo(&self, repo: &RepoId, private: bool) -> Result<RepoState, HubError> {
         let namespace = repo.namespace.as_str();
-        match self
-            .client
-            .model(&repo.namespace, &repo.name)
-            .info()
-            .send()
-            .await
-        {
-            Ok(info) => {
-                return Ok(RepoState::Existing {
-                    private: info.private.unwrap_or(true),
-                });
-            },
-            Err(HFError::RepoNotFound { .. }) => {},
-            Err(error) => return Err(self.map(&error, namespace)),
+        if let Some(kept) = Box::pin(self.visibility(repo)).await? {
+            return Ok(RepoState::Existing { private: kept });
         }
         let id = repo.to_string();
-        self.client
-            .create_repository()
-            .repo_id(id.as_str())
-            .repo_type(RepoTypeModel)
-            .private(private)
-            .exist_ok(true)
-            .send()
-            .await
-            .map_err(|error| self.map(&error, namespace))?;
-        Ok(RepoState::Created { private })
+        // Boxed, as the lookups are: the push after training awaits this
+        // inside a training flow whose future is already large.
+        let created = Box::pin(
+            self.client
+                .create_repository()
+                .repo_id(id.as_str())
+                .repo_type(RepoTypeModel)
+                .private(private)
+                .exist_ok(false)
+                .send(),
+        )
+        .await;
+        match created {
+            Ok(_) => Ok(RepoState::Created { private }),
+            Err(HFError::Conflict { .. }) => match Box::pin(self.visibility(repo)).await? {
+                Some(kept) => Ok(RepoState::Existing { private: kept }),
+                None => Err(HubError::Other(format!(
+                    "repo {repo} exists but cannot be read with this token"
+                ))),
+            },
+            Err(error) => Err(self.map(&error, namespace)),
+        }
     }
 
     /// Reads the repo's `README.md`; `None` when there is none.
@@ -465,6 +486,85 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"id": "me/x", "private": false})),
             )
+            .mount(&server)
+            .await;
+        let state = hub(&server)?.ensure_repo(&repo("me/x")?, true).await?;
+        assert_eq!(state, RepoState::Existing { private: false });
+        Ok(())
+    }
+
+    /// Mounts a lookup of `me/x` that finds nothing once, then finds `info`,
+    /// and a creation that answers 409: someone created the repo in between.
+    async fn created_in_between(server: &MockServer, info: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/api/models/me/x"))
+            .respond_with(not_found())
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/me/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(info))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/repos/create"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({"error": "exists"})))
+            .mount(server)
+            .await;
+    }
+
+    /// A repo created public by someone else between the lookup and the
+    /// creation is reported existing and public, not created private.
+    #[tokio::test]
+    async fn a_repo_created_in_between_reports_its_own_visibility() -> TestResult {
+        for (private, info) in [
+            (false, json!({"id": "me/x", "private": false})),
+            (true, json!({"id": "me/x", "private": true})),
+        ] {
+            let server = MockServer::start().await;
+            created_in_between(&server, info).await;
+            let state = hub(&server)?.ensure_repo(&repo("me/x")?, true).await?;
+            assert_eq!(state, RepoState::Existing { private });
+        }
+        Ok(())
+    }
+
+    /// A conflict on a repo the token cannot read says so, instead of a bare
+    /// conflict.
+    #[tokio::test]
+    async fn a_conflict_on_an_unreadable_repo_says_so() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/me/x"))
+            .respond_with(not_found())
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/repos/create"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({"error": "exists"})))
+            .mount(&server)
+            .await;
+        let error = hub(&server)?
+            .ensure_repo(&repo("me/x")?, true)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(
+            error.to_string(),
+            HubError::Other("repo me/x exists but cannot be read with this token".into())
+                .to_string()
+        );
+        Ok(())
+    }
+
+    /// An existing repo whose visibility the Hub leaves out counts as public.
+    #[tokio::test]
+    async fn an_unknown_visibility_counts_as_public() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/me/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "me/x"})))
             .mount(&server)
             .await;
         let state = hub(&server)?.ensure_repo(&repo("me/x")?, true).await?;

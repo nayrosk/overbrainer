@@ -140,18 +140,43 @@ pub(crate) struct PushPlan {
 /// Returns the same refusals as [`push_run`] for a run that cannot be pushed.
 pub(crate) fn plan(runs: &Runs, settings: &Settings, run_id: &str) -> anyhow::Result<PushPlan> {
     let (_, _, files) = pushable(runs, run_id)?;
+    let (repo, private) = destination(settings);
+    Ok(PushPlan {
+        run_id: run_id.to_string(),
+        repo,
+        private,
+        files: files.len(),
+        bytes: files.iter().map(|file| file.size).sum(),
+    })
+}
+
+/// The repo a push with the default options goes to, as [`PushPlan`] shows
+/// it, and whether it is created private.
+pub(crate) fn destination(settings: &Settings) -> (String, bool) {
     let repo = settings
         .hub
         .repo
         .clone()
         .unwrap_or_else(|| format!("<you>/{}", settings.project.name.replace('_', "-")));
-    Ok(PushPlan {
-        run_id: run_id.to_string(),
-        repo,
-        private: settings.hub.private,
-        files: files.len(),
-        bytes: files.iter().map(|file| file.size).sum(),
-    })
+    (repo, settings.hub.private)
+}
+
+/// Checks that `settings`, read when a confirmed push starts, still send it
+/// where `plan` showed, with the same visibility: the configuration can be
+/// reloaded while the confirmation is open.
+///
+/// # Errors
+///
+/// Returns an error when the repo or the visibility changed since `plan`.
+pub(crate) fn still_confirmed(plan: &PushPlan, settings: &Settings) -> anyhow::Result<()> {
+    let (repo, private) = destination(settings);
+    if repo != plan.repo || private != plan.private {
+        bail!(
+            "the [hub] settings changed since the push of run {} was confirmed: press h again",
+            plan.run_id
+        );
+    }
+    Ok(())
 }
 
 /// The record of run `run_id`, its directory and the files of its `output/`

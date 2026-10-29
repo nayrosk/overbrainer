@@ -284,9 +284,6 @@ impl<'a> Axolotl<'a> {
         if let Value::Object(map) = &mut config {
             self.adapter_keys(map);
             self.cadence_keys(map, root, has_eval);
-            if let Some(hub_model_id) = &training.hub_model_id {
-                map.insert("hub_model_id".into(), json!(hub_model_id));
-            }
             if let Some(resume) = &self.resume {
                 map.insert(
                     "resume_from_checkpoint".into(),

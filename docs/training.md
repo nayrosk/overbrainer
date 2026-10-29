@@ -140,7 +140,7 @@ Everything in `runs/<run-id>/output/` goes, except `checkpoint-*` directories, `
 - The files of `output/gguf/` go to the root of the repo, not into a `gguf/` directory. That is where `ollama run hf.co/<repo>:<quant>` and `llama-cli -hf <repo>:<quant>` look for them. The `Modelfile` goes with them.
 - `README.md` is the generated card.
 
-The repo is `--repo NAMESPACE/NAME`, else `[hub] repo`, else `<you>/<project.name>` with `_` replaced by `-`, where `<you>` is the account of the token. It is created private unless `--public` or `[hub] private = false`. Visibility only applies when the repo is created: an existing repo keeps its own, and the command says so (`repo me/my-demo exists and stays private`). The one exception is a private push into an existing public repo, which is refused before anything is read or uploaded: pass `--public` or set `[hub] private = false` to push to it. Pushing again adds a commit to the same repo.
+The repo is `--repo NAMESPACE/NAME`, else `[hub] repo`, else `<you>/<project.name>` with `_` replaced by `-`, where `<you>` is the account of the token. It is created private unless `--public` or `[hub] private = false`. Visibility only applies when the repo is created: an existing repo keeps its own, and the command says so (`repo me/my-demo exists and stays private`). The one exception is a private push into an existing public repo, which is refused before anything is read or uploaded: pass `--public` or set `[hub] private = false` to push to it. A repo someone else creates between the check and the creation counts as existing, and a repo whose visibility the Hub does not report counts as public, so a private push into it is refused. Pushing again adds a commit to the same repo.
 
 The card is replaced only when the repo has no `README.md`, or when its `README.md` carries the marker `<!-- overbrainer:card -->` that the generated card ends with. A card you wrote yourself is kept: the other files are pushed and the command says `kept the repo's own README.md (use --overwrite-card to replace it)`. `--overwrite-card` replaces it anyway.
 
@@ -238,7 +238,7 @@ The host key is checked against `UserKnownHostsFile` and `GlobalKnownHostsFile` 
 
 ## The Hugging Face token
 
-`OVERBRAINER_HF_TOKEN` (a literal or a `vault:` reference) is needed for gated or private base models, for the deprecated `hub_model_id`, which pushes the adapter (not the merged model) to a private Hub repository, and for [`overbrainer push`](#push-to-hugging-face), which needs a token with `write` access. `push` resolves it only when it pushes (not for `--dry-run`), and never prints it.
+`OVERBRAINER_HF_TOKEN` (a literal or a `vault:` reference) is needed for gated or private base models, and for [`overbrainer push`](#push-to-hugging-face), which needs a token with `write` access. `push` resolves it only when it pushes (not for `--dry-run`), and never prints it.
 
 It is resolved only when a run starts and reaches the job only as its `HF_TOKEN` environment variable. overbrainer never writes it to `axolotl.yaml`, `run.json` or any other file, never puts it on a command line, and sends it over SSH on the command's standard input. With the `docker` runtime it does reach one file overbrainer does not write: the container engine stores the environment it was started with in the container's own configuration, where `docker inspect` (or `podman inspect`) shows it until the container is removed.
 
@@ -269,7 +269,7 @@ The parent's reasoning is trained only if the chat template renders `reasoning_c
 | `evals_per_epoch` | `4` | Evaluations on `data/eval.jsonl` per epoch. |
 | `saves_per_epoch` | `1` | Checkpoints per epoch. |
 | `merge` | `false` | Also write the merged model (`lora` and `qlora` only). |
-| `hub_model_id` | none | Deprecated: use `[hub] repo`. Axolotl pushes the adapter to this private Hub repository. `overbrainer migrate` moves it. |
+| `hub_model_id` | none | Deprecated: use `[hub] repo`. It must be `NAMESPACE/NAME`. It reads as `[hub] repo` and `[hub] after_training = true` where those are unset, so overbrainer pushes each run after training as `overbrainer push` does. Axolotl does not push it. `overbrainer migrate` moves it. |
 
 overbrainer also sets `attn_implementation: sdpa` (no extra package needed), `gradient_checkpointing: true`, `warmup_ratio: 0.1`, `logging_steps: 1` and `save_total_limit: 2`: Axolotl keeps the two newest checkpoints and removes older ones, so saves do not pile up on the target's disk. A snapshot is always the newest checkpoint, so it is kept. Set `save_total_limit` in `[training.axolotl_extra]` to keep more.
 

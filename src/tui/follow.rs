@@ -281,24 +281,24 @@ impl App {
             ],
             yes: "push",
             no: "cancel",
-            action: Action::Push(plan.run_id),
+            action: Action::Push(plan),
         }));
         Vec::new()
     }
 
-    /// The push of run `run` was confirmed: starts it, unless it is refused
-    /// now.
-    pub(super) fn confirm_push(&mut self, run: String) -> Vec<Effect> {
+    /// The push of `plan` was confirmed: starts it, unless it is refused now.
+    /// The task checks that the configuration still matches `plan`.
+    pub(super) fn confirm_push(&mut self, plan: PushPlan) -> Vec<Effect> {
         if self.push_refused() {
             return Vec::new();
         }
         let task = self.task_id();
         self.training.pushing = Some(Pushing {
             task,
-            run: run.clone(),
+            run: plan.run_id.clone(),
             progress: None,
         });
-        vec![Effect::Spawn(task, Task::Push(run))]
+        vec![Effect::Spawn(task, Task::Push(plan))]
     }
 
     /// A message of the push task: its progress shows in the run's head
