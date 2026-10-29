@@ -140,8 +140,13 @@ fn a_delivered_export_lands_beside_its_modelfile() -> TestResult {
 fn only_a_gguf_file_name_is_delivered() -> TestResult {
     let run = tempfile::tempdir()?;
     let job_dir = run.path().join("exports/e1");
-    std::fs::create_dir_all(job_dir.join("output/gguf"))?;
-    std::fs::write(job_dir.join("x.gguf"), "GGUF")?;
+    let made = job_dir.join("output/gguf");
+    std::fs::create_dir_all(&made)?;
+    // What the refused names would reach: `./x.gguf` and `.gguf` in the job's
+    // GGUF directory, `../x.gguf` beside it.
+    for fixture in ["x.gguf", ".gguf", "x.bin", "../x.gguf"] {
+        std::fs::write(made.join(fixture), "GGUF")?;
+    }
     for file in [
         "../x.gguf",
         "/tmp/x.gguf",
@@ -157,7 +162,10 @@ fn only_a_gguf_file_name_is_delivered() -> TestResult {
             "{file}: {refused:?}"
         );
     }
-    assert!(job_dir.join("x.gguf").is_file(), "nothing was moved");
+    for fixture in ["x.gguf", ".gguf", "x.bin", "../x.gguf"] {
+        assert!(made.join(fixture).is_file(), "{fixture} was not moved");
+    }
+    assert!(!run.path().join("output").exists(), "nothing was delivered");
     Ok(())
 }
 

@@ -5,6 +5,7 @@ use config::{Config, Environment, File, FileFormat};
 use serde_json::Value;
 
 use super::{Settings, validate};
+use crate::logging::one_line;
 
 /// Name of the project-level configuration file, relative to the project directory.
 pub const CONFIG_FILE: &str = "overbrainer.toml";
@@ -300,7 +301,7 @@ fn is_not_config(key: &str) -> bool {
 }
 
 /// One problem per name that several `OVERBRAINER_*` variables spell with
-/// different cases, naming the variables but never their values.
+/// different cases, naming the variables, on one line, but never their values.
 ///
 /// `config::Environment` lower-cases keys, and the variables read outside the
 /// configuration are matched without regard to case too, so such variables would
@@ -320,6 +321,7 @@ fn ambiguous_keys<'a>(keys: impl Iterator<Item = &'a String>) -> Vec<String> {
         .filter(|names| names.len() > 1)
         .map(|mut names| {
             names.sort_unstable();
+            let names: Vec<String> = names.into_iter().map(one_line).collect();
             format!(
                 "{} set the same key: keep one spelling, in upper case",
                 names.join(", ")
@@ -429,6 +431,21 @@ fn looks_like_integer(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Colliding names are reported on one line, a line break in a name escaped.
+    #[test]
+    fn colliding_names_are_reported_on_one_line() {
+        let names = [
+            "OVERBRAINER_X\nNOTICE".to_string(),
+            "overbrainer_x\nnotice".to_string(),
+        ];
+        assert_eq!(
+            ambiguous_keys(names.iter()),
+            [
+                r"OVERBRAINER_X\nNOTICE, overbrainer_x\nnotice set the same key: keep one spelling, in upper case"
+            ]
+        );
+    }
 
     /// `redact` keeps the type's own text and never the quoted value, even
     /// when the value contains `expected`.

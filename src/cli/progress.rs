@@ -142,7 +142,7 @@ impl Progress {
     }
 
     fn done(&mut self, stage: Stage, id: &str) {
-        tracing::debug!("{stage}: {id} done");
+        tracing::debug!("{stage}: {} done", one_line(id));
         self.report(stage);
     }
 

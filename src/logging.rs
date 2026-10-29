@@ -25,8 +25,8 @@ pub const DEFAULT_FILTER: &str = "overbrainer=info,vaultrs=off,rustify=off,warn"
 pub const LOG_LINES: usize = 5000;
 
 /// `text` on one line. A newline becomes `\n` and a carriage return `\r`.
-/// Other control characters, except tab, and the bidirectional overrides and
-/// isolates become `\u{..}`.
+/// Other control characters, except tab, the Unicode line and paragraph
+/// separators, and the bidirectional overrides and isolates become `\u{..}`.
 #[must_use]
 pub fn one_line(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -35,7 +35,7 @@ pub fn one_line(text: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push('\t'),
-            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {
+            '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {
                 escaped.extend(c.escape_unicode());
             },
             c if c.is_control() => escaped.extend(c.escape_unicode()),
@@ -330,8 +330,8 @@ mod tests {
     #[test]
     fn one_line_escapes_what_would_break_or_restyle_a_line() {
         assert_eq!(
-            one_line("a\nb\rc\td\u{1b}[2J\u{202E}é"),
-            "a\\nb\\rc\td\\u{1b}[2J\\u{202e}é"
+            one_line("a\nb\rc\td\u{1b}[2J\u{202E}\u{2028}\u{2029}é"),
+            "a\\nb\\rc\td\\u{1b}[2J\\u{202e}\\u{2028}\\u{2029}é"
         );
     }
 
