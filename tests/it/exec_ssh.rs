@@ -469,7 +469,8 @@ async fn upload_and_download_move_trees_through_tar() -> TestResult {
     .await
 }
 
-/// A download into an unwritable directory reports the local tar's error and does not hang.
+/// A download into an unwritable directory reports the local error (its staging
+/// directory cannot be made) and does not hang.
 #[tokio::test]
 async fn a_download_into_an_unwritable_directory_reports_tar_and_does_not_hang() -> TestResult {
     each_ssh_client(|client| async move {
@@ -501,12 +502,10 @@ async fn a_download_into_an_unwritable_directory_reports_tar_and_does_not_hang()
         .await;
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))?;
         match result {
-            Err(_) => return Err("the download hung once the local tar died".into()),
-            Ok(Err(ExecError::Command { action, message })) => {
-                assert_eq!(action, "extract");
-                assert!(message.contains("Permission denied"), "{message}");
-            },
-            Ok(other) => return Err(format!("expected tar's own error, got {other:?}").into()),
+            Err(_) => return Err("the download hung once the local side failed".into()),
+            Ok(Err(ExecError::Io { source, .. }))
+                if source.kind() == std::io::ErrorKind::PermissionDenied => {},
+            Ok(other) => return Err(format!("expected the local error, got {other:?}").into()),
         }
         Ok(())
     })

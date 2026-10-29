@@ -1167,6 +1167,8 @@ mod tests {
             .spawn()?)
     }
 
+    /// Receives the archive `sender` sends into `local`, keeping every entry,
+    /// and the outcome a download reports from both sides.
     async fn download_from(
         mut sender: Child,
         local: &Path,

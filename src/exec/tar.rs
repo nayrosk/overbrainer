@@ -558,12 +558,10 @@ mod tests {
             if kind == "link" {
                 std::os::unix::fs::symlink("/etc/passwd", &member)?;
             } else {
-                rustix::fs::mknodat(
+                rustix::fs::mkfifoat(
                     rustix::fs::CWD,
                     &member,
-                    rustix::fs::FileType::Fifo,
                     rustix::fs::Mode::from_raw_mode(0o600),
-                    0,
                 )?;
             }
             let archive = archive_of(&source, &["output"]).await?;
@@ -617,12 +615,9 @@ mod tests {
         Ok(())
     }
 
-    /// Hard-linked files in an archive land as regular files, and a name that
-    /// is not UTF-8 fails the download with nothing kept.
+    /// Hard-linked files in an archive land as regular files.
     #[tokio::test]
-    async fn hard_links_land_and_non_utf8_names_fail() -> TestResult {
-        use std::os::unix::ffi::OsStrExt as _;
-
+    async fn hard_links_land_as_regular_files() -> TestResult {
         let root = tempdir()?;
         let source = root.path().join("source");
         fs::create_dir_all(source.join("output"))?;
@@ -633,6 +628,17 @@ mod tests {
         extract(&mut archive.as_slice(), &local, &["output".to_string()]).await?;
         assert_eq!(fs::read_to_string(local.join("output/b"))?, "same");
 
+        Ok(())
+    }
+
+    /// A name that is not UTF-8 fails the download with nothing kept. Linux
+    /// only: APFS refuses such a name before the test can make it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn non_utf8_names_fail_the_download() -> TestResult {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempdir()?;
         let odd = root.path().join("odd");
         fs::create_dir_all(odd.join("output"))?;
         let name = std::ffi::OsStr::from_bytes(b"bad\xff");
@@ -792,6 +798,8 @@ mod tests {
         fs::read_dir(locked).is_err()
     }
 
+    /// A tar that dies early, here on a directory it cannot enter, is reported
+    /// with its own error rather than the feeder's broken pipe.
     #[tokio::test]
     async fn extract_reports_the_tar_error_when_tar_dies_early() -> TestResult {
         let root = tempdir()?;
@@ -827,6 +835,8 @@ mod tests {
         Ok(())
     }
 
+    /// A flood of tar warnings never fills the error pipe and stalls the
+    /// extraction.
     #[tokio::test]
     async fn extract_survives_a_flood_of_tar_warnings() -> TestResult {
         let root = tempdir()?;
