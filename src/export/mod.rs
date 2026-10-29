@@ -407,8 +407,9 @@ pub struct Delivered {
 /// same name, `export.json` is written in `job_dir`, and the Modelfile in
 /// `output/gguf/`, with `num_ctx` from the run's own `axolotl.yaml`. What was
 /// staged in `job_dir` for the job is removed. The GGUF and the GGUF
-/// directories came from the target: a symbolic link at any of them counts as
-/// no GGUF, so nothing outside the run is hashed, named or written.
+/// directories came from the target: a symbolic link at any of them, or at
+/// their `output/`, counts as no GGUF, so nothing outside the run is hashed,
+/// named or written.
 ///
 /// # Errors
 ///
@@ -422,13 +423,13 @@ pub fn deliver(run_dir: &Path, job_dir: &Path, file: &str) -> Result<Delivered, 
     }
     let gguf_dir = run_dir.join(GGUF_DIR);
     let gguf = gguf_dir.join(file);
-    if is_link(&gguf_dir) {
+    if is_link(&run_dir.join(OUTPUT_DIR)) || is_link(&gguf_dir) {
         return Err(ExportError::NoGguf(gguf_dir));
     }
     if job_dir != run_dir {
         let made_dir = job_dir.join(GGUF_DIR);
         let made = made_dir.join(file);
-        if is_link(&made_dir) || !is_plain_file(&made) {
+        if is_link(&job_dir.join(OUTPUT_DIR)) || is_link(&made_dir) || !is_plain_file(&made) {
             return Err(ExportError::NoGguf(made_dir));
         }
         fs::create_dir_all(&gguf_dir).map_err(io_error(&gguf_dir))?;

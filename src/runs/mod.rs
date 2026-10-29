@@ -66,6 +66,14 @@ pub enum RunsError {
         /// The file.
         path: PathBuf,
     },
+    /// A record's snapshot names another checkpoint than its step's
+    /// `output/checkpoint-<step>`: the record was rewritten, and is not trusted,
+    /// so nothing is retrieved or deleted on its word.
+    #[error("{} names a snapshot checkpoint outside its run", path.display())]
+    InvalidSnapshot {
+        /// The file.
+        path: PathBuf,
+    },
     /// No run has this ID.
     #[error("no run `{0}` in runs/")]
     NotFound(String),
@@ -416,14 +424,15 @@ impl Runs {
         write_atomic(&dir, RECORD_FILE, &content)
     }
 
-    /// Reads the record of run `id`. A snapshot whose checkpoint path is not
-    /// the one its step gives ([`Snapshot::is_valid`]) is left out.
+    /// Reads the record of run `id`.
     ///
     /// # Errors
     ///
     /// Returns [`RunsError::InvalidId`] when `id` is not a valid run ID,
-    /// [`RunsError::NotFound`] when it is valid but has no record, and
-    /// [`RunsError::Io`] or [`RunsError::Invalid`] when the record cannot be read.
+    /// [`RunsError::NotFound`] when it is valid but has no record,
+    /// [`RunsError::Io`] or [`RunsError::Invalid`] when the record cannot be read,
+    /// and [`RunsError::InvalidSnapshot`] when its snapshot names another
+    /// checkpoint than its step's ([`Snapshot::is_valid`]).
     pub fn load(&self, id: &str) -> Result<RunRecord, RunsError> {
         let dir = self.run_dir(id)?;
         let path = dir.join(RECORD_FILE);
@@ -434,17 +443,17 @@ impl Runs {
             },
             Err(e) => return Err(io_error(&path)(e)),
         };
-        let mut record: RunRecord =
-            serde_json::from_slice(&content).map_err(|e| RunsError::invalid(path, &e))?;
-        // A forged checkpoint path must not name a directory outside the run.
+        let record: RunRecord =
+            serde_json::from_slice(&content).map_err(|e| RunsError::invalid(path.clone(), &e))?;
+        // A forged checkpoint path must not name a directory outside the run,
+        // nor be dropped quietly: a stopped run would then look like it has
+        // nothing to retrieve, and its pod could be deleted with the checkpoint.
         if record
             .snapshot
             .as_ref()
             .is_some_and(|snapshot| !snapshot.is_valid())
         {
-            // Debug only: listing the runs loads every record, again and again.
-            tracing::debug!("run {id}: its snapshot names an invalid checkpoint path; ignored");
-            record.snapshot = None;
+            return Err(RunsError::InvalidSnapshot { path });
         }
         Ok(record)
     }
@@ -653,7 +662,7 @@ pub(crate) mod tests {
     }
 
     /// A record whose snapshot names a checkpoint outside the run, absolute or
-    /// not of its step, loads without the snapshot.
+    /// not of its step, is refused rather than loaded without it.
     #[test]
     fn a_forged_checkpoint_path_is_left_out() -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
@@ -671,7 +680,13 @@ pub(crate) mod tests {
                 reason: SnapshotReason::Deadline,
             });
             runs.save(&stopped)?;
-            assert_eq!(runs.load(&stopped.id)?.snapshot, None, "{checkpoint}");
+            assert!(
+                matches!(
+                    runs.load(&stopped.id),
+                    Err(RunsError::InvalidSnapshot { .. })
+                ),
+                "{checkpoint}"
+            );
         }
         Ok(())
     }

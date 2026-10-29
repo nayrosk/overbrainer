@@ -658,8 +658,8 @@ async fn a_standalone_export_shows_as_exporting_gguf() -> TestResult {
     Ok(())
 }
 
-/// A GGUF, or a GGUF directory, that the target left as a link is not
-/// delivered: nothing outside the run is hashed or written.
+/// A GGUF, a GGUF directory or an `output/` that the target left as a link is
+/// not delivered: nothing outside the run is hashed or written.
 #[test]
 fn a_linked_gguf_or_gguf_directory_is_not_delivered() -> TestResult {
     let outside = tempfile::tempdir()?;
@@ -684,6 +684,16 @@ fn a_linked_gguf_or_gguf_directory_is_not_delivered() -> TestResult {
         matches!(refused, Err(ExportError::NoGguf(_))),
         "{refused:?}"
     );
+    let linked_output = tempfile::tempdir()?;
+    std::fs::create_dir_all(outside.path().join("gguf"))?;
+    std::fs::write(outside.path().join("gguf/r1-F16.gguf"), "private")?;
+    std::os::unix::fs::symlink(outside.path(), linked_output.path().join("output"))?;
+    let refused = deliver(linked_output.path(), linked_output.path(), "r1-F16.gguf");
+    assert!(
+        matches!(refused, Err(ExportError::NoGguf(_))),
+        "{refused:?}"
+    );
+    assert!(!outside.path().join("gguf").join(MODELFILE).exists());
     Ok(())
 }
 

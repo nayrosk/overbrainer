@@ -256,7 +256,7 @@ fn hub_model_id(project_dir: &Path) -> anyhow::Result<Option<Change>> {
 /// Parses the project's `overbrainer.toml`; `None` when the file is missing or does not parse.
 fn read_config(project_dir: &Path) -> anyhow::Result<Option<ConfigDoc>> {
     let path = project_dir.join(CONFIG_FILE);
-    match std::fs::read_to_string(&path) {
+    match crate::config::read_config(&path) {
         Ok(text) => Ok(ConfigDoc::parse(&text).ok()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
