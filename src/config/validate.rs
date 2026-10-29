@@ -1804,19 +1804,23 @@ mod tests {
         Ok(())
     }
 
+    /// `[export]` is optional, with its defaults, and every key reads from the
+    /// file.
     #[test]
     fn the_export_section_is_optional_with_defaults() -> Result<(), config::ConfigError> {
         let defaults = settings(VALID)?;
         assert!(!defaults.export.after_training);
         assert_eq!(defaults.export.quantize, "Q4_K_M");
         assert_eq!(defaults.export.ollama_name, None);
+        assert!(!defaults.export.trust_remote_code);
         let toml = format!(
-            "{VALID}\n[export]\nafter_training = true\nquantize = \"Q8_0\"\nollama_name = \"me/mentor:q8\"\n"
+            "{VALID}\n[export]\nafter_training = true\nquantize = \"Q8_0\"\nollama_name = \"me/mentor:q8\"\ntrust_remote_code = true\n"
         );
         let set = settings(&toml)?;
         assert_eq!(check(&set), Vec::<String>::new());
         assert!(set.export.after_training);
         assert_eq!(set.export.ollama_name.as_deref(), Some("me/mentor:q8"));
+        assert!(set.export.trust_remote_code);
         Ok(())
     }
 

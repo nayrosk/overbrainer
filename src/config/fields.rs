@@ -711,6 +711,12 @@ const EXPORT: &[FieldSpec] = &[
         true,
         "Ollama model created from an export in a training job, when ollama is on PATH",
     ),
+    spec(
+        "trust_remote_code",
+        BOOL,
+        true,
+        "Export a model that ships its own Python code, which the converter may run (default false)",
+    ),
 ];
 
 /// `[hub]`: the push of a run to the Hugging Face Hub.

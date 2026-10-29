@@ -11,6 +11,8 @@
 #   OVERBRAINER_EXPORT_QUANTIZE  llama-quantize type; F16 and BF16 skip it
 #   OVERBRAINER_EXPORT_MODEL     the adapter, or the whole model of a full fine-tune
 #   OVERBRAINER_EXPORT_CONFIG    the run's axolotl.yaml
+#   OVERBRAINER_EXPORT_TRUST_CODE  1 to export a model that ships its own Python
+#                                code (export.trust_remote_code), else 0
 #   OVERBRAINER_CACHE            cache holding llama.cpp, shared by the runs
 #   OVERBRAINER_LLAMA_CPP*       the pinned llama.cpp release and its digests
 set -eu
@@ -31,6 +33,44 @@ rm -rf "$work"
 trap 'rm -rf "$work" "$target.part"' EXIT
 mkdir -p "$work" "$out" "$cache"
 
+# Fails when the model directory $1 ships its own Python code, unless
+# export.trust_remote_code allows it: an `auto_map` in one of its configs, or
+# top-level `.py` files, which the converter may import.
+check_code() {
+    [ "${OVERBRAINER_EXPORT_TRUST_CODE:-0}" = 1 ] && return 0
+    python3 - "$1" <<'EOF'
+import json
+import os
+import sys
+
+model = sys.argv[1]
+found = []
+for name in (
+    "config.json",
+    "tokenizer_config.json",
+    "processor_config.json",
+    "preprocessor_config.json",
+    "image_processor_config.json",
+):
+    path = os.path.join(model, name)
+    if not os.path.isfile(path):
+        continue
+    try:
+        with open(path, encoding="utf-8") as file:
+            config = json.load(file)
+    except ValueError:
+        sys.exit(f"export: {path} is not valid JSON")
+    if isinstance(config, dict) and "auto_map" in config:
+        found.append(f"auto_map in {name}")
+found += sorted(name for name in os.listdir(model) if name.endswith(".py"))
+if found:
+    sys.exit(
+        f"export: {model} ships its own Python code ({', '.join(found)}), which the "
+        "converter may run: set export.trust_remote_code = true to export it anyway"
+    )
+EOF
+}
+
 # The Hugging Face model to convert: a merged copy the run already has, the
 # adapter merged into its base here, or the whole model of a full fine-tune.
 if [ -f "$model/merged/config.json" ]; then
@@ -38,6 +78,8 @@ if [ -f "$model/merged/config.json" ]; then
     say "converting the merged model in $hf"
 elif [ -f "$model/adapter_config.json" ]; then
     [ -f "$config" ] || fail "$config is missing: the adapter cannot be merged without it"
+    # Before the merge, which costs time: the adapter holds the tokenizer files.
+    check_code "$model"
     say "merging the adapter in $model into its base model"
     python3 - "$config" "$work" "$model" <<'EOF'
 import sys
@@ -64,6 +106,10 @@ elif [ -f "$model/config.json" ]; then
 else
     fail "$model holds neither an adapter nor a model"
 fi
+
+# The converter may run Python code that ships with the model (an `auto_map`,
+# with top-level `.py` files): refused unless export.trust_remote_code allows it.
+check_code "$hf"
 
 source_dir=$cache/source
 if [ ! -f "$source_dir/convert_hf_to_gguf.py" ]; then

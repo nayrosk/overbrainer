@@ -6,6 +6,24 @@ use crate::test_support::{make_executable, sh_available, tar, text, tools_availa
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+/// An export tells its script whether a model with its own code may be
+/// exported: not unless allowed.
+#[test]
+fn an_export_passes_whether_code_is_trusted() {
+    let flag = |job: ExportJob| {
+        job.script_env()
+            .into_iter()
+            .find(|(key, _)| key == "OVERBRAINER_EXPORT_TRUST_CODE")
+            .map(|(_, value)| value)
+    };
+    assert_eq!(
+        flag(ExportJob::in_job("r1", "Q4_K_M")).as_deref(),
+        Some("0")
+    );
+    let trusting = ExportJob::in_job("r1", "Q4_K_M").trusting_code(true);
+    assert_eq!(flag(trusting).as_deref(), Some("1"));
+}
+
 #[test]
 fn an_in_job_export_reads_the_run_s_output_and_config() {
     let job = ExportJob::in_job("r1", "Q4_K_M");
@@ -399,6 +417,56 @@ impl Fixture {
     }
 }
 
+/// A model that ships its own Python code, through an `auto_map` or a `.py`
+/// file, is refused before the converter runs, unless the job allows it; a
+/// config that is not JSON is named.
+#[test]
+fn a_model_that_ships_code_is_refused_unless_allowed() -> TestResult {
+    if !tools_available() || host_asset().is_none() {
+        eprintln!("skipped: needs sh, python3 and tar on a supported platform");
+        return Ok(());
+    }
+    for (file, content, named) in [
+        (
+            "config.json",
+            r#"{"auto_map": {"AutoModel": "x.Model"}}"#,
+            "auto_map in config.json",
+        ),
+        (
+            "tokenizer_config.json",
+            r#"{"auto_map": {"AutoTokenizer": "x.Tok"}}"#,
+            "auto_map in tokenizer_config.json",
+        ),
+        ("modeling_x.py", "print('code')", "modeling_x.py"),
+    ] {
+        let fixture = Fixture::new()?;
+        let run = fixture.run();
+        std::fs::write(run.join("output/config.json"), "{}")?;
+        std::fs::write(run.join("output").join(file), content)?;
+        let refused = fixture.export("F16", |_| {})?;
+        assert!(!refused.status.success(), "{file}: {}", text(&refused));
+        let said = text(&refused);
+        assert!(said.contains(named), "{said}");
+        assert!(said.contains("export.trust_remote_code = true"), "{said}");
+        assert!(!run.join("output/gguf/r1-F16.gguf").exists());
+        let allowed = fixture.export("F16", |command| {
+            command.env("OVERBRAINER_EXPORT_TRUST_CODE", "1");
+        })?;
+        assert!(allowed.status.success(), "{file}: {}", text(&allowed));
+        assert!(run.join("output/gguf/r1-F16.gguf").is_file());
+    }
+    let fixture = Fixture::new()?;
+    std::fs::write(fixture.run().join("output/config.json"), "{not json")?;
+    let broken = fixture.export("F16", |_| {})?;
+    assert!(!broken.status.success());
+    assert!(
+        text(&broken).contains("config.json is not valid JSON"),
+        "{}",
+        text(&broken)
+    );
+    Ok(())
+}
+
 #[test]
 fn a_full_model_is_converted_quantized_and_the_tools_cached() -> TestResult {
     if !tools_available() || host_asset().is_none() {
@@ -563,6 +631,7 @@ fn phase_of(path: &Path) -> Result<crate::train::Phase, Box<dyn std::error::Erro
     Ok(phases.phase(false))
 }
 
+/// An export in the training job shows as exporting the GGUF.
 #[test]
 fn an_export_in_the_training_job_shows_as_exporting_gguf() -> TestResult {
     if !sh_available() {
@@ -575,7 +644,7 @@ fn an_export_in_the_training_job_shows_as_exporting_gguf() -> TestResult {
     let project = tempfile::tempdir()?;
     let trainer =
         crate::train::Axolotl::new(&training, &crate::dataset::DataFiles::new(project.path()))
-            .exporting("r1", "Q4_K_M");
+            .exporting("r1", "Q4_K_M", false);
     let stages = trainer.stages();
     assert_eq!(stages.last(), Some(&JobStage::Export));
     // The job's own chain, each command standing in for the real one.

@@ -95,6 +95,7 @@ runtime = "native"             # native | docker
 # after_training = false       # export in the training job, after the merge
 # quantize = "Q4_K_M"          # Q4_K_M | Q4_K_S | Q5_K_M | Q5_K_S | Q6_K | Q8_0 | Q3_K_M | Q2_K | F16 | BF16
 # ollama_name = "rust-mentor"  # `ollama create` this model once an export in a training job is retrieved
+# trust_remote_code = false    # export a model that ships its own Python code, which the converter may run
 
 # [compare]                      # overbrainer compare, see docs/compare.md
 # parent_price_in = 0.55         # dollars per million input tokens of the parent

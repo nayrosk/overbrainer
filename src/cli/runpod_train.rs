@@ -232,7 +232,8 @@ pub(super) async fn export(
         Ok((secrets, floor, session?))
     })
     .await?;
-    let trainer = ExportJob::staged(&run.id, plan.quantize, &local_run, plan.model);
+    let trainer = ExportJob::staged(&run.id, plan.quantize, &local_run, plan.model)
+        .trusting_code(plan.trust_code);
     let file = trainer.file_name();
     let report =
         |exports: &Runs, id: &str, result: anyhow::Result<Option<Outcome>>, front: &Frontend| {

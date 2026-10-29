@@ -194,7 +194,9 @@ pub(super) fn exporting<'a>(
     export: &crate::config::Export,
 ) -> Axolotl<'a> {
     if export.after_training {
-        trainer.clone().exporting(run_id, &export.quantize)
+        trainer
+            .clone()
+            .exporting(run_id, &export.quantize, export.trust_remote_code)
     } else {
         trainer.clone()
     }

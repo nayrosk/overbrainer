@@ -792,6 +792,11 @@ pub struct Export {
     /// The Ollama model `ollama create` makes from the Modelfile once an
     /// export in a training job is retrieved, when `ollama` is on `PATH`.
     pub ollama_name: Option<String>,
+    /// Whether to export a model that ships its own Python code (an
+    /// `auto_map` in its config, or `.py` files), which the llama.cpp
+    /// converter may run. Off: such an export is refused.
+    #[serde(default)]
+    pub trust_remote_code: bool,
 }
 
 impl Default for Export {
@@ -800,6 +805,7 @@ impl Default for Export {
             after_training: false,
             quantize: default_quantize(),
             ollama_name: None,
+            trust_remote_code: false,
         }
     }
 }
