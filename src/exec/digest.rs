@@ -138,6 +138,13 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
+/// SHA-256 of `text`, 64 lowercase hexadecimal digits.
+#[must_use]
+pub fn sha256_text(text: &str) -> String {
+    hex(&Sha256::digest(text.as_bytes()))
+}
+
+/// `bytes` as lowercase hexadecimal digits.
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);

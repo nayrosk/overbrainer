@@ -4263,6 +4263,7 @@ mod tests {
             dir: running.remote_dir.clone(),
             pid: crate::exec::Pid::new(42)?,
             container: None,
+            markers: None,
         });
         runs.save(&running)?;
         let mut stopped =

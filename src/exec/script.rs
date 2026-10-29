@@ -24,18 +24,25 @@ pub fn quote(text: &str) -> String {
 pub const GROUP_SIGNAL: &str = "group_signal() { kill -s \"$1\" -- -\"$2\" 2>/dev/null || kill -s \"$1\" -\"$2\" 2>/dev/null; }\n";
 
 /// Wraps the job's `script` so that it records its process ID first and its exit
-/// code last, in the current directory. Both are written through a rename, so a
-/// reader never sees a partial file. The script runs in a subshell on lines of its
-/// own, so a trailing comment or heredoc terminator inside it cannot swallow the
-/// wrapper's closing parenthesis.
+/// code last, in the directory `markers` (`.` for the current one). Both are
+/// written through a rename, so a reader never sees a partial file. The script
+/// runs in a subshell on lines of its own, so a trailing comment or heredoc
+/// terminator inside it cannot swallow the wrapper's closing parenthesis.
 #[must_use]
-pub fn job_script(script: &str) -> String {
+pub fn job_script(script: &str, markers: &str) -> String {
+    let at = |name: &str| quote(&format!("{markers}/{name}"));
     format!(
-        "echo $$ > {PID_FILE}.tmp && mv -f {PID_FILE}.tmp {PID_FILE}\n(\n{script}\n)\ncode=$?\necho \"$code\" > {EXIT_FILE}.tmp && mv -f {EXIT_FILE}.tmp {EXIT_FILE}\nexit \"$code\"\n"
+        "echo $$ > {pid_tmp} && mv -f {pid_tmp} {pid}\n(\n{script}\n)\ncode=$?\necho \"$code\" > {exit_tmp} && mv -f {exit_tmp} {exit}\nexit \"$code\"\n",
+        pid_tmp = at(&format!("{PID_FILE}.tmp")),
+        pid = at(PID_FILE),
+        exit_tmp = at(&format!("{EXIT_FILE}.tmp")),
+        exit = at(EXIT_FILE),
     )
 }
 
-/// Prints one word describing the job in `dir` with session leader `pid`:
+/// Prints one word describing the job whose markers are in `dir` (its own
+/// directory, or its control directory, see [`JobId::markers`](super::JobId::markers))
+/// with session leader `pid`:
 /// `cancelled`, `exited <code>`, `running` or `lost`. Checks the whole process
 /// group, not only its leader, so a job whose leader has exited but whose children
 /// linger is still `running`.
@@ -120,7 +127,9 @@ pub fn parse_status(output: &str) -> Option<JobStatus> {
     }
 }
 
-/// Marks the job in `dir` as cancelled, stops its container, then its process group:
+/// Marks the job whose markers are in `dir` (its own directory, or its control
+/// directory, see [`JobId::markers`](super::JobId::markers)) as cancelled, stops its
+/// container, then its process group:
 /// `SIGTERM`, and `SIGKILL` if the group is still alive 10 seconds later.
 /// [`CANCELLING_FILE`] is written, atomically, before anything is signalled;
 /// [`CANCEL_FILE`] is written only once the group is confirmed gone. Together with
@@ -133,7 +142,7 @@ pub fn parse_status(output: &str) -> Option<JobStatus> {
 /// job already has an exit code or is already marked cancelled: a finished job keeps
 /// its real result, and a cancel is never sent to a process group whose ID may since
 /// have been recycled by the system. Exits `1` without signalling anything when
-/// `pid` is `0` or `1`, or when the job directory is gone.
+/// `pid` is `0` or `1`, or when that directory is gone.
 ///
 /// After the `SIGKILL`, it waits (up to 10 more seconds) until the group is really
 /// gone before writing [`CANCEL_FILE`]: a killed leader stays a member of its group
@@ -327,8 +336,8 @@ mod tests {
     #[test]
     fn job_script_wraps_the_script_and_records_pid_and_exit_code() {
         assert_eq!(
-            job_script("true && false"),
-            "echo $$ > job.pid.tmp && mv -f job.pid.tmp job.pid\n(\ntrue && false\n)\ncode=$?\necho \"$code\" > exit_code.tmp && mv -f exit_code.tmp exit_code\nexit \"$code\"\n"
+            job_script("true && false", "."),
+            "echo $$ > './job.pid.tmp' && mv -f './job.pid.tmp' './job.pid'\n(\ntrue && false\n)\ncode=$?\necho \"$code\" > './exit_code.tmp' && mv -f './exit_code.tmp' './exit_code'\nexit \"$code\"\n"
         );
     }
 
@@ -336,7 +345,7 @@ mod tests {
     fn job_script_runs_with_a_trailing_comment_in_the_script() -> TestResult {
         for &shell in shells() {
             let dir = tempdir()?;
-            let script = job_script("true # a trailing comment, not a closing paren");
+            let script = job_script("true # a trailing comment, not a closing paren", ".");
             let output = shell.run(&script).current_dir(dir.path()).output()?;
             assert!(
                 output.status.success(),
@@ -355,7 +364,7 @@ mod tests {
         for &shell in shells() {
             let dir = tempdir()?;
             let output = shell
-                .run(&job_script("exit 7"))
+                .run(&job_script("exit 7", "."))
                 .current_dir(dir.path())
                 .output()?;
             assert_eq!(output.status.code(), Some(7), "{shell}");

@@ -737,7 +737,7 @@ impl Tasks {
         self.set.spawn(async move {
             // Never aborted: the flow shields its starts and cancels, and only
             // its token detaches it.
-            let result = crate::cli::train::run(&dir, &job.args(), &front, &source).await;
+            let result = Box::pin(crate::cli::train::run(&dir, &job.args(), &front, &source)).await;
             forwarded(front, forwarder, "training").await;
             Done::Trained(result.map_err(|error| format!("{error:#}")))
         })

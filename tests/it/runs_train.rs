@@ -304,9 +304,10 @@ async fn a_running_job_can_be_cancelled() -> TestResult {
     Ok(())
 }
 
-/// The run's private SSH keys and its pod record never leave this machine: a
-/// Runpod run's directory holds them, and whatever reaches the pod may outlive
-/// it on a network volume. The local executor stands in for the pod.
+/// The run's private SSH keys, its pod record and its run record never leave
+/// this machine: a Runpod run's directory holds them, whatever reaches the pod
+/// may outlive it on a network volume, and the host trusts only its own
+/// records. The local executor stands in for the pod.
 #[tokio::test]
 async fn the_run_keys_and_the_pod_record_are_never_uploaded() -> TestResult {
     let fixture = Fixture::new("slow")?;
@@ -333,7 +334,14 @@ async fn the_run_keys_and_the_pod_record_are_never_uploaded() -> TestResult {
     fs::write(local.join("pod.json"), "{}")?;
     let record = start(&ctx, &trainer, launch, created).await?;
     let remote = Path::new(&record.remote_dir);
-    assert!(remote.join("run.json").is_file(), "nothing was uploaded");
+    assert!(
+        remote.join("axolotl.yaml").is_file(),
+        "nothing was uploaded"
+    );
+    assert!(
+        !remote.join("run.json").exists(),
+        "the run record was uploaded"
+    );
     assert!(!remote.join("ssh").exists(), "the keys were uploaded");
     assert!(!remote.join("pod.json").exists(), "pod.json was uploaded");
     assert!(local.join("ssh/id_ed25519").is_file());

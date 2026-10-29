@@ -19,7 +19,7 @@ use super::tar;
 use super::{
     CANCEL_FILE, CANCELLING_FILE, EXIT_FILE, ExecError, Executor, FileDigest, JOB_LOG, JobCommand,
     JobId, JobStatus, PID_FILE, Pid, cancel_script, check_job_env, claim_script, job_script,
-    manifest_script, parse_manifest, parse_status, quote, shell_path, status_script,
+    manifest_script, markers_dir, parse_manifest, parse_status, quote, shell_path, status_script,
 };
 use crate::config::SshClient;
 
@@ -90,7 +90,8 @@ impl SshExecutor {
     /// Starts `job` detached on the target, its secrets fed on the launcher's
     /// standard input, and returns its process ID.
     async fn start(&self, job: &JobCommand) -> Result<JobId, ExecError> {
-        let launcher = launcher(job)?;
+        let markers = markers_dir(&self.workdir, job);
+        let launcher = launcher(job, markers.as_deref())?;
         let all = Pipes {
             stdin: true,
             stdout: true,
@@ -122,6 +123,7 @@ impl SshExecutor {
             dir: job.dir.clone(),
             pid: Pid::new(raw)?,
             container: job.container.clone(),
+            markers,
         })
     }
 
@@ -227,7 +229,7 @@ impl Executor for SshExecutor {
 
     /// Asks the remote machine what `job` is doing, with [`status_script`].
     async fn status(&self, job: &JobId) -> Result<JobStatus, ExecError> {
-        let script = status_script(&job.dir, job.pid.get());
+        let script = status_script(job.markers(), job.pid.get());
         let output = run(&self.transport, &script, "status").await?;
         let text = String::from_utf8_lossy(&output);
         parse_status(&text)
@@ -236,7 +238,7 @@ impl Executor for SshExecutor {
 
     /// Stops `job` with [`cancel_script`].
     async fn cancel(&self, job: &JobId) -> Result<(), ExecError> {
-        let script = cancel_script(&job.dir, job.pid.get(), job.container.as_ref());
+        let script = cancel_script(job.markers(), job.pid.get(), job.container.as_ref());
         run(&self.transport, &script, "cancel").await.map(drop)
     }
 
@@ -474,23 +476,36 @@ fn put_script(path: &str, content: &str) -> String {
 
 /// The command starting `job` detached from the SSH session, printing its process ID.
 /// It first reads one line per secret from its standard input into the environment
-/// variable of that name: secret values are never written here.
+/// variable of that name: secret values are never written here. The job's
+/// markers go to `markers` when set, a directory made only its owner can enter
+/// (see [`markers_dir`]), else to the job's own directory.
 ///
 /// # Errors
 ///
 /// Returns [`ExecError::InvalidSecret`] when a secret cannot be passed to a job
 /// (see [`check_job_env`]).
-fn launcher(job: &JobCommand) -> Result<String, ExecError> {
+fn launcher(job: &JobCommand, markers: Option<&str>) -> Result<String, ExecError> {
     check_job_env(&job.secrets)?;
     let mut parts = Vec::new();
     for (name, _) in &job.secrets {
         parts.push(format!("IFS= read -r {name} && export {name}"));
     }
+    let marker_dir = markers.unwrap_or(&job.dir);
+    let private = markers.map_or_else(String::new, |markers| {
+        let markers = quote(markers);
+        format!(
+            "{{ mkdir -p -- {markers} && [ ! -L {markers} ] && [ -d {markers} ] && chmod 700 -- {markers} \
+             || {{ echo cannot make the control directory {markers} >&2; exit 1; }}; }} && "
+        )
+    });
+    let stale = [EXIT_FILE, CANCELLING_FILE, CANCEL_FILE, PID_FILE]
+        .map(|name| quote(&format!("{marker_dir}/{name}")))
+        .join(" ");
     parts.push(format!(
-        "mkdir -p -- {dir} && cd -- {dir} && rm -f {EXIT_FILE} {CANCELLING_FILE} {CANCEL_FILE} {PID_FILE} && \
+        "mkdir -p -- {dir} && {private}cd -- {dir} && rm -f {stale} && \
          {{ setsid nohup sh -c {inner} > {JOB_LOG} 2>&1 < /dev/null & }} && echo \"$!\"",
         dir = quote(&job.dir),
-        inner = quote(&job_script(&job.script)),
+        inner = quote(&job_script(&job.script, marker_dir)),
     ));
     Ok(parts.join(" && "))
 }
@@ -899,19 +914,23 @@ mod tests {
 
     #[test]
     fn the_launcher_reads_secrets_from_stdin() -> Result<(), ExecError> {
-        let launcher = launcher(&job("hf_value"))?;
+        let launcher = launcher(&job("hf_value"), None)?;
         assert!(
             launcher.starts_with("IFS= read -r HF_TOKEN && export HF_TOKEN && mkdir -p -- '/w/r1'")
         );
         assert!(!launcher.contains("hf_value"));
-        assert!(launcher.contains("rm -f exit_code cancelling cancelled job.pid"));
+        assert!(launcher.contains(
+            "rm -f '/w/r1/exit_code' '/w/r1/cancelling' '/w/r1/cancelled' '/w/r1/job.pid'"
+        ));
         Ok(())
     }
 
     #[test]
     fn multi_line_secrets_are_refused_without_their_value() {
         for value in ["line\nbreak", "line\rbreak", "nul\0byte"] {
-            let error = launcher(&job(value)).err().map(|error| error.to_string());
+            let error = launcher(&job(value), None)
+                .err()
+                .map(|error| error.to_string());
             assert_eq!(
                 error.as_deref(),
                 Some("HF_TOKEN cannot be passed to the job")
@@ -923,11 +942,14 @@ mod tests {
     fn secret_names_must_be_variable_names() {
         for name in ["", "1ABC", "A-B", "A B", "A;rm -rf /", "$(x)"] {
             assert!(
-                matches!(launcher(&with_name(name)), Err(ExecError::InvalidSecret(_))),
+                matches!(
+                    launcher(&with_name(name), None),
+                    Err(ExecError::InvalidSecret(_))
+                ),
                 "{name:?} was accepted"
             );
         }
-        assert!(launcher(&with_name("_A1")).is_ok());
+        assert!(launcher(&with_name("_A1"), None).is_ok());
     }
 
     /// Whether `setsid` (util-linux or busybox), which the launcher runs, is on `PATH`.
@@ -959,6 +981,82 @@ mod tests {
         Ok(output.stdout)
     }
 
+    /// Under `sh`, `dash` and `busybox sh`, a launcher with a control directory
+    /// keeps the job's markers there, closed to others, so links the job plants
+    /// at the markers' names in its own directory are never written through;
+    /// a control directory that is a link is refused, naming it.
+    #[tokio::test]
+    async fn the_launcher_keeps_markers_in_the_control_directory() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !setsid_available() {
+            eprintln!("skipped: setsid is not installed");
+            return Ok(());
+        }
+        let shells: Vec<Vec<&str>> = [vec!["sh"], vec!["dash"], vec!["busybox", "sh"]]
+            .into_iter()
+            .filter(|shell| {
+                StdCommand::new(shell[0])
+                    .args(&shell[1..])
+                    .args(["-c", ":"])
+                    .status()
+                    .is_ok_and(|status| status.success())
+            })
+            .collect();
+        for shell in shells {
+            let root = tempdir()?;
+            let dir = root.path().join("r1");
+            let outside = root.path().join("outside");
+            fs::write(&outside, "keep\n")?;
+            let markers = root.path().join(".ctl/overbrainer-r1-0123");
+            let job = JobCommand {
+                dir: dir.to_string_lossy().into_owned(),
+                script: format!(
+                    "ln -s {0} exit_code.tmp; ln -s {0} exit_code; exit 5",
+                    outside.display()
+                ),
+                secrets: Vec::new(),
+                container: None,
+            };
+            let script = launcher(&job, Some(&markers.to_string_lossy()))?;
+            let output = StdCommand::new(shell[0])
+                .args(&shell[1..])
+                .arg("-c")
+                .arg(&script)
+                .output()?;
+            assert!(output.status.success(), "{shell:?}");
+            for _ in 0..100 {
+                if markers.join(EXIT_FILE).exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(
+                fs::read_to_string(markers.join(EXIT_FILE))?.trim(),
+                "5",
+                "{shell:?}"
+            );
+            assert_eq!(fs::read_to_string(&outside)?, "keep\n", "{shell:?}");
+            let mode = fs::metadata(&markers)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{shell:?}");
+
+            let linked = root.path().join(".ctl/linked");
+            std::os::unix::fs::symlink(&outside, &linked)?;
+            let refused = StdCommand::new(shell[0])
+                .args(&shell[1..])
+                .arg("-c")
+                .arg(launcher(&job, Some(&linked.to_string_lossy()))?)
+                .output()?;
+            assert!(!refused.status.success(), "{shell:?}");
+            let said = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                said.contains("cannot make the control directory"),
+                "{shell:?}: {said}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn the_launcher_hands_secrets_to_the_job_verbatim() -> TestResult {
         if !setsid_available() {
@@ -978,7 +1076,7 @@ mod tests {
         };
         let mut stdin = Vec::new();
         feed_secrets(Some(&mut stdin), &job.secrets).await?;
-        let printed = sh(&launcher(&job)?, &stdin)?;
+        let printed = sh(&launcher(&job, None)?, &stdin)?;
         let pid: u32 = String::from_utf8(printed)?.trim().parse()?;
         assert!(pid > 1);
         for _ in 0..100 {

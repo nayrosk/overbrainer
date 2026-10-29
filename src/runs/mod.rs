@@ -30,6 +30,11 @@ use crate::exec::JobId;
 
 /// Directory holding the runs, in the project directory.
 pub const RUNS_DIR: &str = "runs";
+
+/// Directory of `runs/` where the jobs of a local target with the container
+/// runtime run, apart from their run directories: the container mounts only its
+/// job's own directory there, never `run.json`, `pod.json` or `ssh/`.
+pub const WORK_DIR: &str = ".work";
 /// Record of a run, in its directory.
 pub const RECORD_FILE: &str = "run.json";
 

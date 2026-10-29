@@ -16,7 +16,7 @@ use anyhow::{Context, bail};
 use super::CompareArgs;
 use super::export::{fail, holds_on_target, upload_stage};
 use super::front::Frontend;
-use super::train::{POLL, executor, prepare};
+use super::train::{POLL, executor, in_workdir, prepare};
 use crate::compare::{
     COMPARE_PREFIX, COMPARES_DIR, ChildSettings, CompareJob, CompareSetup, EvalQuestion, JudgeInfo,
     JudgeRun, ModelSource, Parts, SCRIPT_FILE, build_report, find_compare, judge_all, judge_key,
@@ -358,15 +358,23 @@ async fn on_target(
     plan: &Plan,
     front: &Frontend,
 ) -> anyhow::Result<(Runs, String)> {
-    let run = &plan.run;
     let runtime = JobRuntime::from_target(target)
-        .with_context(|| format!("target `{}` cannot run a compare", run.target))?;
+        .with_context(|| format!("target `{}` cannot run a compare", plan.run.target))?;
+    // Caught from before the preparation: Ctrl-C stops it without a compare.
+    let mut interrupt = front.interrupt();
+    let executor = prepare(
+        &mut interrupt,
+        executor(project_dir, &plan.run.target, target),
+    )
+    .await?;
+    let plan = &Plan {
+        run: in_workdir(&plan.run, executor.workdir()),
+        ..plan.clone()
+    };
+    let run = &plan.run;
     // The GGUF as the job sees it: the job's container mounts the run directory.
     let model = format!("{}/{}", runtime.root(&run.remote_dir), plan.export.file);
     let job = job_of(plan, settings, ModelSource::OnTarget(model))?;
-    // Caught from before the preparation: Ctrl-C stops it without a compare.
-    let mut interrupt = front.interrupt();
-    let executor = prepare(&mut interrupt, executor(project_dir, &run.target, target)).await?;
     let runs = Runs::new(project_dir);
     let compares = runs.compares(&run.id)?;
     let jobs = format!("{}/{COMPARES_DIR}", run.remote_dir);

@@ -6,7 +6,9 @@ use std::time::{Duration, SystemTime};
 use secrecy::SecretString;
 
 use super::snapshot::{Proof, Snapshot, read_proof};
-use super::{MetricsSummary, RunRecord, RunState, Runs, RunsError, new_run_id, rfc3339};
+use super::{
+    MetricsSummary, RECORD_FILE, RunRecord, RunState, Runs, RunsError, new_run_id, rfc3339,
+};
 use crate::events::{Event, EventBus};
 use crate::exec::{
     ExecError, Executor, FileDigest, JOB_LOG, JobId, JobRuntime, JobSpec, JobStatus, LineStream,
@@ -364,8 +366,13 @@ async fn launch_job<E: Executor, T: Trainer>(
     };
     trainer.prepare(&local, &root)?;
     // A Runpod run's private SSH keys and pod record never leave this machine:
-    // on a network volume, what the pod receives outlives the pod.
-    let local_only = [SSH_DIR.to_string(), POD_FILE.to_string()];
+    // on a network volume, what the pod receives outlives the pod. Nor does the
+    // run record: the job has no use for it, and the host only trusts its own.
+    let local_only = [
+        SSH_DIR.to_string(),
+        POD_FILE.to_string(),
+        RECORD_FILE.to_string(),
+    ];
     ctx.executor
         .upload(&local, &record.remote_dir, &local_only)
         .await?;
@@ -1179,6 +1186,7 @@ mod tests {
             dir: format!("/w/{RUN_ID}"),
             pid: Pid::new(42)?,
             container: None,
+            markers: None,
         })
     }
 
