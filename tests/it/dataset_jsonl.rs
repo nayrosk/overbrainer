@@ -285,3 +285,24 @@ fn a_rejected_record_with_an_unknown_field_is_refused() -> Result<(), Box<dyn st
     ));
     Ok(())
 }
+
+/// A link planted at the old fixed temporary names is never written through:
+/// the rewrite and a staged rewrite leave the link's target untouched.
+#[test]
+fn a_planted_temporary_link_is_not_written_through() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let outside = dir.path().join("outside");
+    fs::write(&outside, "keep\n")?;
+    let path = dir.path().join("subtopics.jsonl");
+    for name in [".subtopics.jsonl.tmp", ".subtopics.jsonl.staged.tmp"] {
+        std::os::unix::fs::symlink(&outside, dir.path().join(name))?;
+    }
+    rewrite(&path, &[subtopic("borrowing")])?;
+    let mut staged = Rewrite::default();
+    staged.stage(&path, &[subtopic("lifetimes")])?;
+    staged.commit()?;
+    assert_eq!(fs::read_to_string(&outside)?, "keep\n");
+    let items: Vec<Subtopic> = read(&path)?;
+    assert_eq!(items, [subtopic("lifetimes")]);
+    Ok(())
+}

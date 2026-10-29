@@ -28,10 +28,14 @@ pub fn latest_export(runs: &Runs, run_id: &str) -> Option<ExportRecord> {
         .max_by(|a, b| a.created.cmp(&b.created))
 }
 
-/// The export record at `path`, when it is there and parses.
+/// The export record at `path`, when it is there, parses and names its GGUF
+/// in the run's `output/gguf/` ([`ExportRecord::has_valid_file`]). It is read
+/// as a regular file only, never through a link, and at most 1 MiB.
 fn read_export(path: &Path) -> Option<ExportRecord> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let text = crate::files::read_regular_text(path, 1 << 20).ok()?;
+    serde_json::from_str::<ExportRecord>(&text)
+        .ok()
+        .filter(ExportRecord::has_valid_file)
 }
 
 /// The newest run with a GGUF ([`latest_export`]), if any.
@@ -141,6 +145,29 @@ mod tests {
             created: created.into(),
         };
         std::fs::write(dir.join(EXPORT_FILE), serde_json::to_string(&record)?)?;
+        Ok(())
+    }
+
+    /// A record that names a file outside the run's `output/gguf/`, even one
+    /// that exists, does not count.
+    #[test]
+    fn a_record_naming_a_file_outside_the_run_is_ignored() -> TestResult {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let run_dir = runs.run_dir("r1")?;
+        std::fs::create_dir_all(&run_dir)?;
+        let outside = project.path().join("outside.gguf");
+        std::fs::write(&outside, "gguf")?;
+        let record = ExportRecord {
+            quantize: "Q4_K_M".into(),
+            llama_cpp: "b11320".into(),
+            file: outside.to_string_lossy().into_owned(),
+            sha256: "0".repeat(64),
+            size: 4,
+            created: "2026-10-01T10:00:00Z".into(),
+        };
+        std::fs::write(run_dir.join(EXPORT_FILE), serde_json::to_string(&record)?)?;
+        assert!(latest_export(&runs, "r1").is_none());
         Ok(())
     }
 

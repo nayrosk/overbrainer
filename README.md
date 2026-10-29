@@ -229,7 +229,7 @@ overbrainer skill install --global   # every project: ~/.claude/skills/overbrain
 overbrainer skill install --dir DIR  # another agent's skills directory: DIR/overbrainer/SKILL.md
 ```
 
-An installed skill that was edited is only replaced with `--force`. In Claude Code, the skill is also a plugin:
+An installed skill that was edited, or is a symbolic link, is only replaced with `--force`. In Claude Code, the skill is also a plugin:
 
 ```
 /plugin marketplace add nayrosk/overbrainer

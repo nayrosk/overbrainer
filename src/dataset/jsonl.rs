@@ -206,11 +206,17 @@ fn is_json(line: &[u8]) -> bool {
 /// Returns [`DatasetError::Io`] if the temp file cannot be written or renamed.
 pub fn rewrite<T: Serialize>(path: &Path, items: &[T]) -> Result<(), DatasetError> {
     let tmp = write_temp(path, "tmp", items)?;
-    fs::rename(&tmp, path).map_err(io_error(path))
+    let renamed = fs::rename(&tmp, path).map_err(io_error(path));
+    if renamed.is_err() {
+        remove_temp(&tmp);
+    }
+    renamed
 }
 
-/// Writes `items` to `.<name>.<suffix>` next to `path` and syncs it. Returns the temp
-/// file's path.
+/// Writes `items` to a new `.<name>.<random>.<suffix>` next to `path` and syncs
+/// it. Returns the temp file's path. The name is unpredictable and the file is
+/// created exclusively, so a link planted in the directory is never written
+/// through.
 fn write_temp<T: Serialize>(
     path: &Path,
     suffix: &str,
@@ -221,17 +227,33 @@ fn write_temp<T: Serialize>(
     let name = path
         .file_name()
         .map_or_else(|| "data".into(), |name| name.to_string_lossy());
-    let tmp = dir.join(format!(".{name}.{suffix}"));
+    let tmp = dir.join(format!(".{name}.{:016x}.{suffix}", fastrand::u64(..)));
     let mut buffer = Vec::new();
     for item in items {
         serde_json::to_writer(&mut buffer, item).map_err(|e| io_error(&tmp)(e.into()))?;
         buffer.push(b'\n');
     }
-    let mut file = File::create(&tmp).map_err(io_error(&tmp))?;
-    file.write_all(&buffer)
-        .and_then(|()| file.sync_all())
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
         .map_err(io_error(&tmp))?;
-    Ok(tmp)
+    let written = file
+        .write_all(&buffer)
+        .and_then(|()| file.sync_all())
+        .map_err(io_error(&tmp));
+    if written.is_err() {
+        remove_temp(&tmp);
+    }
+    written.map(|()| tmp)
+}
+
+/// Removes the temp file `tmp` after a failure, logging what stops it: the
+/// error that matters is the one that made the write fail.
+fn remove_temp(tmp: &Path) {
+    if let Err(error) = fs::remove_file(tmp) {
+        tracing::warn!("cannot remove {}: {error}", tmp.display());
+    }
 }
 
 /// A change to several JSONL files: every new content is written and synced to a

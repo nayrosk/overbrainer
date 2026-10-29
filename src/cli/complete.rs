@@ -140,7 +140,7 @@ struct TopicName {
 }
 
 fn names(dir: &Path) -> Option<Names> {
-    let content = std::fs::read_to_string(dir.join(CONFIG_FILE)).ok()?;
+    let content = crate::config::read_config(&dir.join(CONFIG_FILE)).ok()?;
     Config::builder()
         .add_source(File::from_str(&content, FileFormat::Toml))
         .build()

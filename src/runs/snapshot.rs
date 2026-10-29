@@ -123,6 +123,16 @@ pub fn parse_proof(content: &[u8]) -> Proof {
     })
 }
 
+impl Snapshot {
+    /// Whether its checkpoint is the only one a snapshot at its step may
+    /// name, `output/checkpoint-<step>`: a record read back from a run
+    /// directory names no directory outside it.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.checkpoint == expected_checkpoint(self.step)
+    }
+}
+
 /// The only checkpoint a proof may name for a snapshot at `step`: where the
 /// trainer saves it, `output/checkpoint-<step>`.
 fn expected_checkpoint(step: u64) -> String {

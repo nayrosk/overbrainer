@@ -64,11 +64,20 @@ enum Outcome {
 }
 
 /// Writes [`SKILL`] to `<base>/overbrainer/SKILL.md`, atomically. An identical file
-/// is left alone; a different one is replaced only with `force`.
+/// is left alone; a different one is replaced only with `force`. What is there
+/// is read without following a link and only up to one byte more than
+/// [`SKILL`]: a link, a device or a longer file differs.
 fn install(base: &Path, force: bool) -> anyhow::Result<(PathBuf, Outcome)> {
     let dir = base.join(SKILL_DIR);
     let path = dir.join(SKILL_FILE);
-    let outcome = match std::fs::read(&path) {
+    let max = u64::try_from(SKILL.len()).unwrap_or(u64::MAX);
+    let existing = match crate::files::read_regular(&path, max) {
+        Err(e) if matches!(e.kind(), ErrorKind::InvalidInput | ErrorKind::FileTooLarge) => {
+            Ok(Vec::new())
+        },
+        read => read,
+    };
+    let outcome = match existing {
         Ok(existing) if existing == SKILL.as_bytes() => return Ok((path, Outcome::UpToDate)),
         Ok(_) if !force => bail!(
             "{} differs from the skill of overbrainer {}; use --force to replace it",
@@ -328,6 +337,29 @@ mod tests {
             error.to_string(),
             format!("cannot write {}", dir.join(SKILL_FILE).display())
         );
+        Ok(())
+    }
+
+    /// A skill file that is a link to an endless device is never read through:
+    /// it differs, and `--force` replaces the link itself.
+    #[test]
+    fn a_link_to_a_device_differs_and_is_replaced_with_force() -> anyhow::Result<()> {
+        let base = tempfile::tempdir()?;
+        let dir = base.path().join(SKILL_DIR);
+        std::fs::create_dir(&dir)?;
+        let path = dir.join(SKILL_FILE);
+        std::os::unix::fs::symlink("/dev/zero", &path)?;
+        let error = install(base.path(), false)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a link to /dev/zero was taken as the skill"))?;
+        assert!(
+            error.to_string().contains("differs from the skill"),
+            "{error}"
+        );
+        let (_, outcome) = install(base.path(), true)?;
+        assert!(matches!(outcome, Outcome::Replaced));
+        assert!(!std::fs::symlink_metadata(&path)?.file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&path)?, SKILL);
         Ok(())
     }
 

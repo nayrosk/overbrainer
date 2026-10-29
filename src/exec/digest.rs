@@ -24,7 +24,9 @@ pub struct FileDigest {
 /// pattern at any depth (the same rule as the `tar --exclude` of a download), or
 /// nothing when no entry exists. Fails, saying so, when `remote` itself is not a
 /// directory. Paths are printed with a leading `./`, so an entry can never read
-/// as an option.
+/// as an option. An entry that is a symbolic link, or has one in a parent
+/// directory (such as `output` for `output/gguf`), is skipped, so no file
+/// outside `remote` is hashed.
 ///
 /// Each file is hashed through `sha256sum`'s standard input, so a file name never
 /// reaches `sha256sum` and never has to survive its own escaping: GNU coreutils
@@ -52,6 +54,12 @@ pub fn manifest_script(remote: &str, entries: &[String], exclude: &[String]) -> 
          cd -- {dir} || exit 1\n\
          for entry in {candidates}; do\n\
          [ -e \"$entry\" ] || continue\n\
+         up=\"${{entry%/*}}\"; linked=0\n\
+         while [ \"$up\" != \"$entry\" ] && [ -n \"$up\" ]; do\n\
+         [ -L \"$up\" ] && linked=1\n\
+         case $up in */*) up=\"${{up%/*}}\" ;; *) break ;; esac\n\
+         done\n\
+         [ \"$linked\" -eq 0 ] || continue\n\
          find \"./$entry\" {prune}-type f -exec sh -c '\n\
          for f; do\n\
          hash=$(sha256sum < \"$f\") || exit 1\n\
@@ -143,7 +151,7 @@ fn hex(bytes: &[u8]) -> String {
 /// The manifest of the `entries` of the local directory `dir`, computed here with
 /// the same rules as [`manifest_script`]: regular files only (symbolic links are
 /// not followed), names matching an `exclude` pattern skipped at any depth,
-/// missing entries skipped.
+/// missing entries and entries reached through a symbolic link skipped.
 ///
 /// # Errors
 ///
@@ -166,10 +174,30 @@ pub fn local_manifest(
     }
     let mut digests = Vec::new();
     for entry in entries {
-        walk(dir, entry, exclude, &mut digests)?;
+        if !through_link(dir, entry) {
+            walk(dir, entry, exclude, &mut digests)?;
+        }
     }
     digests.sort();
     Ok(digests)
+}
+
+/// Whether a directory on the way from `root` to its entry `relative`, such as
+/// `output` for `output/gguf`, is a symbolic link: the entry is then skipped,
+/// as a link at the entry itself is, so nothing outside `root` is read.
+fn through_link(root: &Path, relative: &str) -> bool {
+    let mut path = root.to_path_buf();
+    let mut components = Path::new(relative).components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            return false;
+        }
+        path.push(component);
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Adds the regular files under `relative` (inside `root`) to `digests`.
@@ -426,6 +454,35 @@ mod tests {
                 available
             })
             .collect()
+    }
+
+    /// An entry whose parent directory is a link out of the root is skipped by
+    /// the local manifest and by the script under every shell, so the file it
+    /// reaches outside is never hashed.
+    #[test]
+    fn an_entry_through_a_linked_directory_is_skipped() -> TestResult {
+        let outside = tempfile::tempdir()?;
+        fs::create_dir_all(outside.path().join("gguf"))?;
+        fs::write(outside.path().join("gguf/secret"), "private")?;
+        let root = tempfile::tempdir()?;
+        std::os::unix::fs::symlink(outside.path(), root.path().join("output"))?;
+        fs::write(root.path().join("job.log"), "w")?;
+        let entries = vec!["output/gguf".to_string(), "job.log".to_string()];
+        let local = local_manifest(root.path(), &entries, &[])?;
+        let paths: Vec<&str> = local.iter().map(|digest| digest.path.as_str()).collect();
+        assert_eq!(paths, ["job.log"]);
+        let script = manifest_script(&root.path().to_string_lossy(), &entries, &[]);
+        for shell in shells() {
+            let output = Command::new(shell[0])
+                .args(&shell[1..])
+                .arg("-c")
+                .arg(&script)
+                .output()?;
+            assert!(output.status.success(), "{shell:?}");
+            let manifest = parse_manifest(&String::from_utf8(output.stdout)?)?;
+            assert_eq!(manifest, local, "{shell:?}");
+        }
+        Ok(())
     }
 
     #[test]

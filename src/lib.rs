@@ -8,6 +8,7 @@ pub mod dedup;
 pub mod events;
 pub mod exec;
 pub mod export;
+pub(crate) mod files;
 pub mod history;
 pub mod hub;
 pub mod llm;

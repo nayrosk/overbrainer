@@ -9,6 +9,27 @@ use crate::logging::one_line;
 
 /// Name of the project-level configuration file, relative to the project directory.
 pub const CONFIG_FILE: &str = "overbrainer.toml";
+/// Most bytes `overbrainer.toml` may hold: far above any real configuration.
+const CONFIG_MAX: u64 = 4 << 20;
+
+/// The text of the configuration file at `path`: a regular file of at most
+/// [`CONFIG_MAX`] bytes, which may be reached through a symbolic link, so a
+/// link to a device such as `/dev/zero` cannot make the read endless.
+///
+/// # Errors
+///
+/// Returns the error of reading `path`, `NotFound` when it does not exist,
+/// `InvalidInput` when it is not a regular file, `FileTooLarge` past
+/// [`CONFIG_MAX`] and `InvalidData` when it is not UTF-8.
+pub(crate) fn read_config(path: &Path) -> std::io::Result<String> {
+    String::from_utf8(crate::files::read_bounded(path, CONFIG_MAX)?).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8", path.display()),
+        )
+    })
+}
+
 /// Prefix required on every environment variable read into the configuration.
 pub const ENV_PREFIX: &str = "OVERBRAINER";
 /// The `OVERBRAINER_*` variables read outside the configuration, which [`load`]
@@ -177,7 +198,7 @@ fn redact(message: &str) -> String {
 /// only by case.
 pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError> {
     let path = project_dir.join(CONFIG_FILE);
-    let content = std::fs::read_to_string(&path).map_err(|error| ConfigError::Read {
+    let content = read_config(&path).map_err(|error| ConfigError::Read {
         path: path.clone(),
         error,
     })?;

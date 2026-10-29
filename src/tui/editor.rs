@@ -2,9 +2,9 @@
 //! edits, and what its edited text means.
 
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::dataset::{AnswerText, Id, LINE_BREAKS};
@@ -97,13 +97,43 @@ impl Refusal {
     }
 }
 
+/// Most bytes an edited file may hold when it is read back.
+const EDIT_MAX: u64 = 16 << 20;
+
+/// The name of the temp file in its session directory.
+const EDIT_FILE: &str = "edit.txt";
+
 /// An open edit: the temp file and what it edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Session {
-    /// The temp file, `data/.edit-<16 hex>.txt`.
+    /// The temp file, `data/.edit-<16 hex>/edit.txt`, in a directory only its
+    /// owner can enter.
     pub(super) path: PathBuf,
     /// What it edits.
     pub(super) target: Target,
+}
+
+impl Session {
+    /// The edited text, read back as a regular file only, never through a
+    /// link, from a session directory still ours and closed to others, and at
+    /// most [`EDIT_MAX`] bytes. An editor that saves by writing a new file and
+    /// renaming it over the old one is fine.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of reading the file.
+    pub(super) fn read(&self) -> io::Result<Vec<u8>> {
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        crate::files::read_private(dir, EDIT_FILE, EDIT_MAX)
+    }
+
+    /// Removes the temp file and its directory, with whatever the editor left
+    /// beside it (a backup, a swap file). Best effort: a leftover is harmless.
+    pub(super) fn remove(&self) {
+        if let Some(dir) = self.path.parent() {
+            fs::remove_dir_all(dir).ok();
+        }
+    }
 }
 
 /// The text of `target` in the temp file.
@@ -135,29 +165,35 @@ pub(super) fn text_of(target: &Target) -> Result<String, String> {
     }
 }
 
-/// Writes `text` to a new temp file in `data_dir`, readable by its owner only,
-/// never replacing an existing file.
+/// Writes `text` to a new temp file in a new directory of `data_dir` that only
+/// its owner can enter, so another writer of `data/` cannot swap the file for a
+/// link to one of the owner's files before it is read back.
 ///
 /// # Errors
 ///
-/// Returns the I/O error when the file cannot be created or written.
+/// Returns the I/O error when the directory or the file cannot be created or
+/// written.
 pub(super) fn open(data_dir: &Path, target: Target, text: &str) -> io::Result<Session> {
     fs::create_dir_all(data_dir)?;
     loop {
-        let path = data_dir.join(format!(".edit-{:016x}.txt", fastrand::u64(..)));
-        let file = OpenOptions::new()
+        let dir = data_dir.join(format!(".edit-{:016x}", fastrand::u64(..)));
+        match DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {},
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+        let path = dir.join(EDIT_FILE);
+        let written = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&path);
-        match file {
-            Ok(mut file) => {
-                file.write_all(text.as_bytes())?;
-                return Ok(Session { path, target });
-            },
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
-            Err(error) => return Err(error),
+            .open(&path)
+            .and_then(|mut file| file.write_all(text.as_bytes()));
+        if let Err(error) = written {
+            fs::remove_dir_all(&dir).ok();
+            return Err(error);
         }
+        return Ok(Session { path, target });
     }
 }
 
@@ -310,6 +346,35 @@ mod tests {
         })
     }
 
+    /// An edited file swapped for a link is not read back through it.
+    #[test]
+    fn a_session_file_swapped_for_a_link_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let outside = dir.path().join("private");
+        fs::write(&outside, "secret")?;
+        let session = open(&dir.path().join("data"), question().target, "Why?\n")?;
+        fs::remove_file(&session.path)?;
+        std::os::unix::fs::symlink(&outside, &session.path)?;
+        let error = session.read().err().ok_or("a link was read back")?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
+    }
+
+    /// An editor that saves by writing a new file and renaming it over the
+    /// edited one is read back.
+    #[test]
+    fn a_save_by_rename_is_read_back() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let session = open(&dir.path().join("data"), question().target, "Why?\n")?;
+        let saved = session.path.with_extension("swp");
+        fs::write(&saved, "Why borrow?\n")?;
+        fs::rename(&saved, &session.path)?;
+        assert_eq!(session.read()?, b"Why borrow?\n");
+        Ok(())
+    }
+
+    /// Each session is a new directory under `data/` only its owner enters,
+    /// holding a new file only its owner reads, and it is removed whole.
     #[test]
     fn a_temp_file_is_new_private_and_under_data() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
@@ -321,21 +386,19 @@ mod tests {
         let first = open(&data, target.clone(), "Borrowing\n")?;
         let second = open(&data, target, "Borrowing\n")?;
         assert_ne!(first.path, second.path);
-        let name = first
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
+        let dir = first.path.parent().ok_or("no session directory")?;
+        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
         let name = name.unwrap_or_default();
-        assert_eq!(
-            (name.get(..6), name.get(22..), name.len()),
-            (Some(".edit-"), Some(".txt"), 26)
-        );
-        assert_eq!(first.path.parent(), Some(data.as_path()));
+        assert_eq!((name.get(..6), name.len()), (Some(".edit-"), 22));
+        assert_eq!(dir.parent(), Some(data.as_path()));
+        assert_eq!(fs::metadata(dir)?.permissions().mode() & 0o777, 0o700);
         assert_eq!(
             fs::metadata(&first.path)?.permissions().mode() & 0o777,
             0o600
         );
-        assert_eq!(fs::read_to_string(&first.path)?, "Borrowing\n");
+        assert_eq!(first.read()?, b"Borrowing\n");
+        first.remove();
+        assert!(!dir.exists(), "the session directory is removed");
         Ok(())
     }
 

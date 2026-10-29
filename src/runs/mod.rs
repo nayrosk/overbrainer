@@ -416,7 +416,8 @@ impl Runs {
         write_atomic(&dir, RECORD_FILE, &content)
     }
 
-    /// Reads the record of run `id`.
+    /// Reads the record of run `id`. A snapshot whose checkpoint path is not
+    /// the one its step gives ([`Snapshot::is_valid`]) is left out.
     ///
     /// # Errors
     ///
@@ -433,7 +434,19 @@ impl Runs {
             },
             Err(e) => return Err(io_error(&path)(e)),
         };
-        serde_json::from_slice(&content).map_err(|e| RunsError::invalid(path, &e))
+        let mut record: RunRecord =
+            serde_json::from_slice(&content).map_err(|e| RunsError::invalid(path, &e))?;
+        // A forged checkpoint path must not name a directory outside the run.
+        if record
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.is_valid())
+        {
+            // Debug only: listing the runs loads every record, again and again.
+            tracing::debug!("run {id}: its snapshot names an invalid checkpoint path; ignored");
+            record.snapshot = None;
+        }
+        Ok(record)
     }
 
     /// Every run with a readable record, oldest first. Directories without
@@ -637,6 +650,30 @@ pub(crate) mod tests {
             resumed_from: None,
             snapshots: false,
         }
+    }
+
+    /// A record whose snapshot names a checkpoint outside the run, absolute or
+    /// not of its step, loads without the snapshot.
+    #[test]
+    fn a_forged_checkpoint_path_is_left_out() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        for checkpoint in [
+            "/etc",
+            "output/checkpoint-120/../../..",
+            "output/checkpoint-7",
+        ] {
+            let mut stopped = record("20260922-143005-bbbb");
+            stopped.state = RunState::Stopped;
+            stopped.snapshot = Some(Snapshot {
+                checkpoint: checkpoint.into(),
+                step: 120,
+                reason: SnapshotReason::Deadline,
+            });
+            runs.save(&stopped)?;
+            assert_eq!(runs.load(&stopped.id)?.snapshot, None, "{checkpoint}");
+        }
+        Ok(())
     }
 
     #[test]

@@ -164,7 +164,7 @@ fn reload_from(
     let current = read_dotenv(&project_dir.join(DOTENV_FILE))?;
     let env = merged_env(process, dotenv, current);
     let path = project_dir.join(CONFIG_FILE);
-    let text = std::fs::read_to_string(&path).map_err(|error| ConfigError::Read { path, error })?;
+    let text = super::read_config(&path).map_err(|error| ConfigError::Read { path, error })?;
     let settings = load_str(&text, env.clone())?;
     Ok(Reloaded {
         text,

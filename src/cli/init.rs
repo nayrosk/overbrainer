@@ -137,14 +137,20 @@ pub(crate) fn update_gitignore(path: &Path) -> anyhow::Result<()> {
     add_gitignore_entries(path, GITIGNORE_TEMPLATE)
 }
 
+/// Most bytes a `.gitignore` overbrainer adds to may hold.
+pub(crate) const GITIGNORE_MAX: u64 = 1 << 20;
+
 /// Creates `.gitignore` at `path` with `entries`, or appends the entries
-/// (non-empty lines) that an existing file lacks. Never rewrites the file.
+/// (non-empty lines) that an existing file lacks. Never rewrites the file. An
+/// existing one is read and appended to only as a regular file with a single
+/// link, never through a symbolic link: a project cannot point it at another
+/// file.
 ///
 /// # Errors
 ///
 /// Returns an error when the file cannot be read, created or appended to.
 pub(crate) fn add_gitignore_entries(path: &Path, entries: &str) -> anyhow::Result<()> {
-    let existing = match std::fs::read_to_string(path) {
+    let existing = match crate::files::read_regular_text(path, GITIGNORE_MAX) {
         Ok(existing) => existing,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return create_new(path, entries);
@@ -163,9 +169,7 @@ pub(crate) fn add_gitignore_entries(path: &Path, entries: &str) -> anyhow::Resul
         addition.push_str(entry);
         addition.push('\n');
     }
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(path)
+    let mut file = crate::files::open_append_regular(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
     file.write_all(addition.as_bytes())
         .with_context(|| format!("cannot write {}", path.display()))?;
@@ -187,7 +191,21 @@ fn missing_entries<'a>(existing: &str, template: &'a str) -> Vec<&'a str> {
 mod tests {
     use std::io::{self, Write as _};
 
-    use super::{create_private, kept_or_removed, missing_entries};
+    use super::{add_gitignore_entries, create_private, kept_or_removed, missing_entries};
+
+    /// A `.gitignore` that is a link to another file is refused, and the file
+    /// it points to is left as it was.
+    #[test]
+    fn a_linked_gitignore_is_not_written_through() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "keep\n")?;
+        let path = dir.path().join(".gitignore");
+        std::os::unix::fs::symlink(&outside, &path)?;
+        assert!(add_gitignore_entries(&path, "/data\n").is_err());
+        assert_eq!(std::fs::read_to_string(&outside)?, "keep\n");
+        Ok(())
+    }
 
     /// A file whose writes fail once opened, like a full disk.
     struct Full;

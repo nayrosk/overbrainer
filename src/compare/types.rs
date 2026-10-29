@@ -287,10 +287,16 @@ impl Hardware {
     }
 }
 
+/// Most bytes `hardware.json` may hold: a few hundred per GPU.
+const HARDWARE_MAX: u64 = 1 << 20;
+
 /// `hardware.json` of the compare directory `dir`, when it is there and parses.
+/// The job writes it on the target, so it is read as a regular file only,
+/// never through a link, and at most 1 MiB.
 #[must_use]
 pub fn read_hardware(dir: &Path) -> Option<Hardware> {
-    read_json(&dir.join(HARDWARE_FILE)).ok()
+    let text = crate::files::read_regular_text(&dir.join(HARDWARE_FILE), HARDWARE_MAX).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 /// How the child's answer fared against the parent's.
