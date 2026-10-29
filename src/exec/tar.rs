@@ -545,35 +545,52 @@ mod tests {
         Ok(())
     }
 
-    /// A symbolic link or a FIFO in a download is skipped, never kept, and the
-    /// rest of the download is.
+    /// A symbolic link in a download is skipped, never kept, and the rest of
+    /// the download is.
     #[tokio::test]
-    async fn a_link_or_a_fifo_is_skipped() -> TestResult {
+    async fn a_link_is_skipped() -> TestResult {
         let root = tempdir()?;
-        for kind in ["link", "fifo"] {
-            let source = root.path().join(format!("source-{kind}"));
-            fs::create_dir_all(source.join("output"))?;
-            fs::write(source.join("output/adapter.bin"), "w")?;
-            let member = source.join("output/member");
-            if kind == "link" {
-                std::os::unix::fs::symlink("/etc/passwd", &member)?;
-            } else {
-                rustix::fs::mkfifoat(
-                    rustix::fs::CWD,
-                    &member,
-                    rustix::fs::Mode::from_raw_mode(0o600),
-                )?;
-            }
-            let archive = archive_of(&source, &["output"]).await?;
-            let local = root.path().join(format!("run-{kind}"));
-            extract(&mut archive.as_slice(), &local, &["output".to_string()]).await?;
-            assert!(
-                fs::symlink_metadata(local.join("output/member")).is_err(),
-                "{kind}"
-            );
-            assert_eq!(fs::read_to_string(local.join("output/adapter.bin"))?, "w");
-            assert!(!staging_left(&local)?, "{kind}");
-        }
+        let member = prepare_member(root.path(), "link")?;
+        std::os::unix::fs::symlink("/etc/passwd", &member)?;
+        assert_member_skipped(root.path(), "link").await
+    }
+
+    /// A FIFO in a download is skipped, never kept, and the rest of the
+    /// download is. Linux only: `mkfifoat` is not available on macOS.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_fifo_is_skipped() -> TestResult {
+        let root = tempdir()?;
+        let member = prepare_member(root.path(), "fifo")?;
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &member,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )?;
+        assert_member_skipped(root.path(), "fifo").await
+    }
+
+    /// Writes `source-<kind>/output/adapter.bin` under `root` and returns the
+    /// path where the test plants its special `output/member`.
+    fn prepare_member(root: &Path, kind: &str) -> std::io::Result<PathBuf> {
+        let source = root.join(format!("source-{kind}"));
+        fs::create_dir_all(source.join("output"))?;
+        fs::write(source.join("output/adapter.bin"), "w")?;
+        Ok(source.join("output/member"))
+    }
+
+    /// Archives `source-<kind>/output`, extracts it into `run-<kind>` and checks
+    /// that the special member is gone while the regular file came through.
+    async fn assert_member_skipped(root: &Path, kind: &str) -> TestResult {
+        let archive = archive_of(&root.join(format!("source-{kind}")), &["output"]).await?;
+        let local = root.join(format!("run-{kind}"));
+        extract(&mut archive.as_slice(), &local, &["output".to_string()]).await?;
+        assert!(
+            fs::symlink_metadata(local.join("output/member")).is_err(),
+            "{kind}"
+        );
+        assert_eq!(fs::read_to_string(local.join("output/adapter.bin"))?, "w");
+        assert!(!staging_left(&local)?, "{kind}");
         Ok(())
     }
 
