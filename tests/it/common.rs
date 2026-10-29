@@ -126,6 +126,57 @@ impl Respond for SecretStore {
     }
 }
 
+/// The environment a mock pod answers with, as Runpod echoes the one a pod was
+/// created with: what a create sent (see [`PodCreated`]), or a run's marker set
+/// by the test. overbrainer deletes a pod only when it carries its run's marker.
+#[derive(Debug, Clone, Default)]
+pub struct MockPodEnv(Arc<Mutex<Option<Value>>>);
+
+impl MockPodEnv {
+    /// Sets the environment to the marker of run `run_id`.
+    pub fn mark(&self, run_id: &str) {
+        let env = json!({ "OVERBRAINER_RUN_ID": run_id });
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(env);
+    }
+
+    /// `body` with the environment, when one is known.
+    #[must_use]
+    pub fn on(&self, body: &Value) -> Value {
+        let mut body = body.clone();
+        if let (Some(env), Some(fields)) = (
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+            body.as_object_mut(),
+        ) {
+            fields.insert("env".into(), env);
+        }
+        body
+    }
+}
+
+/// `POST /pods`: answers 201 with `body` and keeps the `env` the create sent,
+/// so later looks at the pod carry its marker.
+pub struct PodCreated {
+    /// The pod created.
+    pub body: Value,
+    /// Where the create's environment is kept.
+    pub env: MockPodEnv,
+}
+
+impl Respond for PodCreated {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if let Some(env) = serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .and_then(|sent| sent.get("env").cloned())
+        {
+            *self.env.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(env);
+        }
+        ResponseTemplate::new(201).set_body_json(self.env.on(&self.body))
+    }
+}
+
 /// The SSH clients of this build: OpenSSH, then the built-in client when the
 /// `builtin-ssh` feature is on. `OVERBRAINER_TEST_SSH_CLIENT` (`openssh` or
 /// `builtin`) keeps only that one, for a run whose `PATH` suits one client.

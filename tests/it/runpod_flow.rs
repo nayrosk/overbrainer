@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-use crate::common::SecretStore;
+use crate::common::{MockPodEnv, PodCreated, SecretStore};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -37,6 +37,8 @@ const CAPACITY: &str = "There are no longer any instances available with the req
 struct Get {
     deleted: Arc<AtomicBool>,
     body: Value,
+    /// The run marker the pod carries.
+    env: MockPodEnv,
 }
 
 impl Respond for Get {
@@ -48,7 +50,7 @@ impl Respond for Get {
                 "title": "Not Found"
             }))
         } else {
-            ResponseTemplate::new(200).set_body_json(&self.body)
+            ResponseTemplate::new(200).set_body_json(self.env.on(&self.body))
         }
     }
 }
@@ -62,14 +64,17 @@ impl Respond for Delete {
     }
 }
 
-/// Serves pod `p1`, gone once deleted (or from the start with `gone`).
-async fn serve_p1(server: &MockServer, gone: bool) {
+/// Serves pod `p1`, gone once deleted (or from the start with `gone`). It
+/// carries the run marker the returned [`MockPodEnv`] is set to.
+async fn serve_p1(server: &MockServer, gone: bool) -> MockPodEnv {
     let deleted = Arc::new(AtomicBool::new(gone));
+    let env = MockPodEnv::default();
     Mock::given(method("GET"))
         .and(path("/v2/pods/p1"))
         .respond_with(Get {
             deleted: Arc::clone(&deleted),
             body: json!({"id": "p1", "status": "RUNNING", "cost": 0.5}),
+            env: env.clone(),
         })
         .mount(server)
         .await;
@@ -83,6 +88,7 @@ async fn serve_p1(server: &MockServer, gone: bool) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": []})))
         .mount(server)
         .await;
+    env
 }
 
 struct Harness {
@@ -303,19 +309,23 @@ async fn auto_keeps_the_estimated_vram_floor() -> TestResult {
 async fn a_failed_provisioning_keeps_the_client_key_while_a_pod_may_remain() -> TestResult {
     require_keygen()?;
     let harness = Harness::new().await?;
+    let env = MockPodEnv::default();
     Mock::given(method("POST"))
         .and(path("/v2/pods"))
-        .respond_with(
-            ResponseTemplate::new(201).set_body_json(json!({"id": "p1", "status": "RUNNING"})),
-        )
+        .respond_with(PodCreated {
+            body: json!({"id": "p1", "status": "RUNNING"}),
+            env: env.clone(),
+        })
         .mount(&harness.server)
         .await;
     // A dead pod that never goes away.
     Mock::given(method("GET"))
         .and(path("/v2/pods/p1"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"id": "p1", "status": "EXITED"})),
-        )
+        .respond_with(Get {
+            deleted: Arc::new(AtomicBool::new(false)),
+            body: json!({"id": "p1", "status": "EXITED"}),
+            env,
+        })
         .mount(&harness.server)
         .await;
     Mock::given(method("DELETE"))
@@ -548,9 +558,10 @@ fn pod_record(
 #[tokio::test]
 async fn the_client_deletes_a_pod_past_its_deadline() -> TestResult {
     let harness = Harness::new().await?;
-    serve_p1(&harness.server, false).await;
+    let env = serve_p1(&harness.server, false).await;
     let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
     let mut run = create(&harness.runs, "demo", executor.workdir(), "gpu_cloud")?;
+    env.mark(&run.id);
     let job = executor
         .spawn(&JobCommand {
             dir: run.remote_dir.clone(),
@@ -594,9 +605,10 @@ async fn the_client_deletes_a_pod_past_its_deadline() -> TestResult {
 #[tokio::test]
 async fn a_watch_past_its_deadline_deletes_nothing_until_settled() -> TestResult {
     let harness = Harness::new().await?;
-    serve_p1(&harness.server, false).await;
+    let env = serve_p1(&harness.server, false).await;
     let executor = LocalExecutor::new(&harness.project.path().join("pod"))?;
     let mut run = create(&harness.runs, "demo", executor.workdir(), "gpu_cloud")?;
+    env.mark(&run.id);
     let job = executor
         .spawn(&JobCommand {
             dir: run.remote_dir.clone(),

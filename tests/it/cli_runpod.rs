@@ -15,7 +15,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-use crate::common::SecretStore;
+use crate::common::{MockPodEnv, PodCreated, SecretStore};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -419,9 +419,13 @@ async fn serve_unreachable_pod(server: &MockServer) {
         "status": "RUNNING",
         "cost": 0.44
     });
+    let env = MockPodEnv::default();
     Mock::given(method("POST"))
         .and(path("/v2/pods"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(&body))
+        .respond_with(PodCreated {
+            body: body.clone(),
+            env: env.clone(),
+        })
         .mount(server)
         .await;
     Mock::given(method("GET"))
@@ -429,6 +433,7 @@ async fn serve_unreachable_pod(server: &MockServer) {
         .respond_with(Present {
             deleted: Arc::clone(&deleted),
             body,
+            env,
         })
         .mount(server)
         .await;
@@ -444,10 +449,13 @@ async fn serve_unreachable_pod(server: &MockServer) {
         .await;
 }
 
-/// `GET /pods/p1`: the pod until deleted, then Runpod's 404.
+/// `GET /pods/p1`: the pod, with the environment it was created with, until
+/// deleted, then Runpod's 404.
 struct Present {
     deleted: Arc<AtomicBool>,
     body: serde_json::Value,
+    /// The environment the pod was created with.
+    env: MockPodEnv,
 }
 
 impl Respond for Present {
@@ -455,7 +463,7 @@ impl Respond for Present {
         if self.deleted.load(Ordering::SeqCst) {
             not_found()
         } else {
-            ResponseTemplate::new(200).set_body_json(&self.body)
+            ResponseTemplate::new(200).set_body_json(self.env.on(&self.body))
         }
     }
 }

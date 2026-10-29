@@ -202,6 +202,17 @@ pub enum PodError {
     /// A deleted pod still shows in the API.
     #[error("pod {0} could not be confirmed deleted: check `overbrainer pod ls`")]
     NotDeleted(PodId),
+    /// A pod a run records does not carry that run's marker, so it was not
+    /// deleted: the record may have been rewritten, or the pod predates markers.
+    #[error(
+        "pod {pod_id} does not carry the marker of run {run_id}: not deleted; delete it from the Runpod console if it is yours"
+    )]
+    NotOwned {
+        /// The pod.
+        pod_id: PodId,
+        /// The run whose record names it.
+        run_id: String,
+    },
     /// Following the run failed.
     #[error(transparent)]
     Run(#[from] crate::runs::RunError),

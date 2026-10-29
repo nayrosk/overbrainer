@@ -194,6 +194,8 @@ engine = "podman"              # docker (default) | podman
 
 `venv` applies only with `runtime = "native"`, and `engine` and `image` only with `runtime = "docker"`. The third kind, `runpod`, has [its own page](runpod.md).
 
+On every target, the results of a run come back through a staging directory first. Only the requested regular files are kept, with their directories. A symbolic link, a FIFO or a device is skipped with a warning. A file that was not requested, such as a `pod.json`, fails the download, and nothing from it is kept. So does a directory of the run that is a symbolic link on the way to a file, such as `runs/<run-id>/output` linked to another disk.
+
 ### The docker runtime
 
 Each run gets one container, named `overbrainer-<run-id>`, with all GPUs, the host IPC namespace and the run directory mounted at `/workspace/run`. The Hugging Face cache is `runs/.hf-cache` (local) or `<workdir>/.hf-cache` (SSH), shared by the runs of the target, so a base model is downloaded once.

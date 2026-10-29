@@ -59,6 +59,13 @@ pub enum RunsError {
     /// An ID cannot name a run directory.
     #[error("{0} is not a valid run ID")]
     InvalidId(String),
+    /// A record names another run than the one whose directory holds it: it
+    /// was copied or rewritten, and is not trusted.
+    #[error("{} names another run than the one it belongs to", path.display())]
+    Foreign {
+        /// The file.
+        path: PathBuf,
+    },
     /// No run has this ID.
     #[error("no run `{0}` in runs/")]
     NotFound(String),

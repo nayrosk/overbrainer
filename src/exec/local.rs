@@ -42,6 +42,19 @@ pub struct LocalExecutor {
     children: Mutex<Vec<Child>>,
 }
 
+/// What a copy between two local directories copies, and how it lands.
+#[derive(Debug, Clone, Copy)]
+struct Transfer<'a> {
+    /// The entries of the source to copy.
+    entries: &'a [String],
+    /// Names left out at any depth.
+    exclude: &'a [String],
+    /// `true` for a download: only regular files and directories inside
+    /// `entries` are kept (see [`tar::extract`]). `false` for an upload this
+    /// side made, copied as is.
+    staged: bool,
+}
+
 impl LocalExecutor {
     /// Runs jobs under `workdir`, created if needed.
     ///
@@ -160,13 +173,12 @@ impl LocalExecutor {
         self.run_script(script, "cancel").await.map(drop)
     }
 
-    async fn copy(
-        &self,
-        from: &Path,
-        to: &Path,
-        entries: &[String],
-        exclude: &[String],
-    ) -> Result<(), ExecError> {
+    async fn copy(&self, from: &Path, to: &Path, what: Transfer<'_>) -> Result<(), ExecError> {
+        let Transfer {
+            entries,
+            exclude,
+            staged,
+        } = what;
         if same_dir(from, to) {
             return Ok(());
         }
@@ -195,7 +207,13 @@ impl LocalExecutor {
             .ok_or_else(|| ExecError::Protocol("tar has no output".into()))?;
         // Both run at once, so the archiving tar's error output is drained while its
         // archive is extracted. `stdout` is dropped once the extraction ends.
-        let extract = async move { tar::extract(&mut stdout, to).await };
+        let extract = async move {
+            if staged {
+                tar::extract(&mut stdout, to, &entries).await
+            } else {
+                tar::extract_raw(&mut stdout, to).await
+            }
+        };
         let (extracted, created) = tokio::join!(extract, tar::finish(create, "archive"));
         extracted.and(created)
     }
@@ -244,7 +262,12 @@ impl Executor for LocalExecutor {
                 source,
             });
         }
-        self.copy(local, Path::new(remote), &entries, &[]).await
+        let what = Transfer {
+            entries: &entries,
+            exclude: &[],
+            staged: false,
+        };
+        self.copy(local, Path::new(remote), what).await
     }
 
     fn spawn(&self, job: &JobCommand) -> impl Future<Output = Result<JobId, ExecError>> + Send {
@@ -282,7 +305,12 @@ impl Executor for LocalExecutor {
                 message: format!("{remote} does not exist"),
             });
         }
-        self.copy(from, local, entries, exclude).await
+        let what = Transfer {
+            entries,
+            exclude,
+            staged: true,
+        };
+        self.copy(from, local, what).await
     }
 
     fn put_file(
@@ -416,6 +444,31 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> ExecError + '_ {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A download keeps the requested regular files, and never a symbolic link
+    /// the job left among them.
+    #[tokio::test]
+    async fn a_download_skips_a_link_the_job_left() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let executor = LocalExecutor::new(&root.path().join("work"))?;
+        let remote = root.path().join("work/r1");
+        fs::create_dir_all(remote.join("output"))?;
+        fs::write(remote.join("output/adapter.bin"), "w")?;
+        let local = root.path().join("runs/r1");
+        let remote_text = remote.to_string_lossy().into_owned();
+        executor
+            .download(&remote_text, &local, &["output".to_string()], &[])
+            .await?;
+        assert_eq!(fs::read_to_string(local.join("output/adapter.bin"))?, "w");
+        std::os::unix::fs::symlink("/etc/passwd", remote.join("output/passwd"))?;
+        let back = root.path().join("runs/r2");
+        executor
+            .download(&remote_text, &back, &["output".to_string()], &[])
+            .await?;
+        assert!(fs::symlink_metadata(back.join("output/passwd")).is_err());
+        assert_eq!(fs::read_to_string(back.join("output/adapter.bin"))?, "w");
+        Ok(())
+    }
 
     #[test]
     fn only_overbrainer_and_vault_variables_are_private() {
