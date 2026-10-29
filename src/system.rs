@@ -14,6 +14,10 @@ use crate::exec::quote;
 /// Bytes in a MiB, the unit of `nvidia-smi`'s memory figures.
 const MIB: u64 = 1024 * 1024;
 
+/// GPUs kept from one sample, the first ones `nvidia-smi` lists. Far above any
+/// real machine; it bounds what a target answering garbage costs to follow.
+pub const MAX_GPUS: usize = 64;
+
 /// What the probe found on the target at one moment. A part the target does not
 /// have or would not tell (no GPU, no `/proc`) is empty or `None`.
 #[derive(Debug, Clone, PartialEq)]
@@ -232,7 +236,11 @@ pub fn parse(output: &str, at: SystemTime, previous: Option<&SystemSample>) -> S
         disks,
         cpu: cpu(&part, before),
         memory: memory(&part),
-        gpus: part("gpu").iter().filter_map(|line| gpu(line)).collect(),
+        gpus: part("gpu")
+            .iter()
+            .filter_map(|line| gpu(line))
+            .take(MAX_GPUS)
+            .collect(),
     }
 }
 
@@ -673,6 +681,23 @@ total_inactive_file 1073741824
         let output = V1_POD.replace("33285996544", "300000000000");
         let memory = parse(&output, at(0), None).memory;
         assert_eq!(memory.map(|m| m.limit_bytes), Some(263_671_875 * 1024));
+    }
+
+    /// A target listing more than [`MAX_GPUS`] GPUs has only the first ones kept.
+    #[test]
+    fn a_sample_keeps_at_most_max_gpus() {
+        use std::fmt::Write as _;
+        let mut output = String::from("@gpu\n");
+        for index in 0..1000 {
+            // Writing to a `String` cannot fail.
+            let _ = writeln!(output, "{index}, G, 50, 1024, 2048, 60, 300, 700");
+        }
+        let gpus = parse(&output, at(0), None).gpus;
+        assert_eq!(gpus.len(), MAX_GPUS);
+        assert_eq!(
+            gpus.last().map(|gpu| gpu.index),
+            u32::try_from(MAX_GPUS - 1).ok()
+        );
     }
 
     #[test]

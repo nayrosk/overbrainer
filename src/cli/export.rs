@@ -15,8 +15,8 @@ use super::train::{POLL, executor, prepare, secrets, warn};
 use crate::config::{EnvSource, Settings, Source, Target};
 use crate::exec::{Executor, JobRuntime, quote};
 use crate::export::{
-    Delivered, EXPORT_FILE, EXPORTS_DIR, ExportJob, ExportRecord, GGUF_DIR, Ollama, SCRIPT_FILE,
-    deliver, discard_staged, latest_gguf, ollama_command, ollama_create,
+    Delivered, EXPORT_FILE, EXPORTS_DIR, ExportJob, ExportRecord, GGUF_DIR, MODELFILE, Ollama,
+    SCRIPT_FILE, deliver, discard_staged, latest_gguf, ollama_command, ollama_create,
 };
 use crate::runpod::RunpodTarget;
 use crate::runs::{
@@ -454,21 +454,23 @@ pub(super) fn report_delivered(
     let gguf_dir = delivered.modelfile.parent().unwrap_or(Path::new("."));
     let Some(name) = ollama else {
         front.line(&format!(
-            "{label}: run it with Ollama after `{}`",
-            ollama_command(Path::new(&dir), "<name>")
+            "{label}: run it with Ollama after `cd {} && ollama create <name> -f {MODELFILE}`",
+            quote(&dir)
         ));
         return;
     };
     match ollama_create(OLLAMA, gguf_dir, name) {
         Ollama::Created => front.line(&format!(
-            "{label}: Ollama model {name} created: `ollama run {name}`"
+            "{label}: Ollama model {name} created: `ollama run {}`",
+            quote(name)
         )),
         Ollama::NotFound(_) => warn(&format!(
             "ollama is not on PATH: create the model with `{}`",
             ollama_command(Path::new(&dir), name)
         )),
         Ollama::Failed(message) => warn(&format!(
-            "ollama create {name} failed: {message}; create it with `{}`",
+            "ollama create {} failed: {message}; create it with `{}`",
+            quote(name),
             ollama_command(Path::new(&dir), name)
         )),
     }

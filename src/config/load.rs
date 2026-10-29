@@ -97,7 +97,8 @@ impl From<config::ConfigError> for ConfigError {
 ///
 /// Type errors keep their key and expected type. Custom messages from serde quote the
 /// value (`invalid value: string "..."`, `unknown variant ...`), so only the part from
-/// `expected` onward is kept. Unknown field names are keys, not values, and are kept.
+/// the last `, expected` onward is kept. Unknown field names are keys, not values, and
+/// are kept.
 /// TOML syntax errors are reported by location only, never with source snippets.
 fn describe(error: &config::ConfigError) -> String {
     match error {
@@ -130,15 +131,33 @@ fn redact_toml_error(error: &config::ConfigError) -> String {
 }
 
 /// Keeps what a serde message says was expected, dropping the value it quotes.
+///
+/// Only messages whose shape is known keep any text. `config` names the enum,
+/// then the rejected value, in `enum E does not have variant constructor ...`:
+/// only the enum is kept. Serde's `invalid type`, `invalid value`, `invalid
+/// length` and `unknown variant` messages quote the value first and end with the
+/// type's own `, expected ...` text: only what follows the last `, expected ` is
+/// kept, so a value that itself contains `expected` stays out. Any other message
+/// becomes `invalid value`.
 fn redact(message: &str) -> String {
     if message.starts_with("unknown field") || message.starts_with("missing field") {
         return message.to_string();
     }
-    if let Some(index) = message.find("expected") {
-        return format!("invalid value, {}", &message[index..]);
-    }
-    if let Some((head, _)) = message.split_once(" does not have variant constructor") {
+    if message.starts_with("enum ")
+        && let Some((head, _)) = message.split_once(" does not have variant constructor")
+    {
         return format!("{head}: unknown variant");
+    }
+    let serde = [
+        "invalid type: ",
+        "invalid value: ",
+        "invalid length ",
+        "unknown variant ",
+    ];
+    if serde.iter().any(|prefix| message.starts_with(prefix))
+        && let Some(index) = message.rfind(", expected ")
+    {
+        return format!("invalid value, {}", &message[index + 2..]);
     }
     "invalid value".to_string()
 }
@@ -152,8 +171,9 @@ fn redact(message: &str) -> String {
 ///
 /// Returns [`ConfigError::Read`] when the file cannot be read, [`ConfigError::Parse`]
 /// when the file or environment cannot be parsed into [`Settings`], and
-/// [`ConfigError::Invalid`] when the parsed settings fail semantic validation or
-/// when an env-only key is set in the file.
+/// [`ConfigError::Invalid`] when the parsed settings fail semantic validation, when
+/// an env-only key is set in the file, or when two `OVERBRAINER_*` variables differ
+/// only by case.
 pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError> {
     let path = project_dir.join(CONFIG_FILE);
     let content = std::fs::read_to_string(&path).map_err(|error| ConfigError::Read {
@@ -173,9 +193,15 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
 ///
 /// Returns [`ConfigError::Parse`] when `content` or the environment cannot be parsed
 /// into [`Settings`], and [`ConfigError::Invalid`] when the parsed settings fail
-/// semantic validation or when an env-only key is set in `content`.
+/// semantic validation, when an env-only key is set in `content`, or when two
+/// `OVERBRAINER_*` variables differ only by case.
 pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> {
-    let env: config::Map<String, String> = env_pairs(env)
+    let pairs = env_pairs(env);
+    let ambiguous = ambiguous_keys(pairs.iter().map(|(key, _)| key));
+    if !ambiguous.is_empty() {
+        return Err(ConfigError::Invalid(ambiguous));
+    }
+    let env: config::Map<String, String> = pairs
         .into_iter()
         .filter(|(key, _)| !is_not_config(key))
         .collect();
@@ -271,6 +297,35 @@ fn is_not_config(key: &str) -> bool {
             key == name
         }
     })
+}
+
+/// One problem per name that several `OVERBRAINER_*` variables spell with
+/// different cases, naming the variables but never their values.
+///
+/// `config::Environment` lower-cases keys, and the variables read outside the
+/// configuration are matched without regard to case too, so such variables would
+/// collide and one would win at random, while the shell's precedence over `.env`
+/// holds only for the exact same spelling.
+fn ambiguous_keys<'a>(keys: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let prefix = format!("{ENV_PREFIX}_").to_lowercase();
+    let mut spellings: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for key in keys {
+        let lower = key.to_lowercase();
+        if lower.starts_with(&prefix) {
+            spellings.entry(lower).or_default().push(key);
+        }
+    }
+    spellings
+        .into_values()
+        .filter(|names| names.len() > 1)
+        .map(|mut names| {
+            names.sort_unstable();
+            format!(
+                "{} set the same key: keep one spelling, in upper case",
+                names.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// The key-value pairs `env` provides: the process environment, or an explicit list.
@@ -374,6 +429,29 @@ fn looks_like_integer(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `redact` keeps the type's own text and never the quoted value, even
+    /// when the value contains `expected`.
+    #[test]
+    fn redact_keeps_only_the_expected_suffix() {
+        assert_eq!(
+            redact(r#"invalid type: string "x, expected sk-leak-7", expected u32"#),
+            "invalid value, expected u32"
+        );
+        assert_eq!(
+            redact("unknown variant `expected sk-leak-7`, expected one of `a`, `b`"),
+            "invalid value, expected one of `a`, `b`"
+        );
+        assert_eq!(
+            redact("enum Protocol does not have variant constructor x, expected sk-leak-7"),
+            "enum Protocol: unknown variant"
+        );
+        assert_eq!(redact("custom text, expected sk-leak-7"), "invalid value");
+        assert_eq!(
+            redact("unknown field `x`, expected `y`"),
+            "unknown field `x`, expected `y`"
+        );
+    }
 
     #[test]
     fn scalars_parse_only_plain_values() {

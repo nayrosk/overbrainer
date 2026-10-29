@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::events::{Event, Stage, StageStats};
 use crate::exec::JobStatus;
+use crate::logging::one_line;
 use crate::runpod::PodStatus;
 use crate::train::{Phase, Phases, TrainMetric};
 
@@ -266,12 +267,15 @@ fn step(stage: Stage, finished: usize, total: usize) {
     tracing::info!("{stage}: {finished}/{total}");
 }
 
+/// Logs that item `id` of `stage` is retried after `error`. Both come from the
+/// dataset or the provider, so they are written on one line.
 fn retrying(stage: Stage, id: &str, error: &str) {
-    tracing::warn!("{stage}: {id}: {error}");
+    tracing::warn!("{stage}: {}: {}", one_line(id), one_line(error));
 }
 
+/// Logs that item `id` of `stage` failed for good with `error`, on one line.
 fn gave_up(stage: Stage, id: &str, error: &str) {
-    tracing::error!("{stage}: {id} failed: {error}");
+    tracing::error!("{stage}: {} failed: {}", one_line(id), one_line(error));
 }
 
 fn finished(stage: Stage, stats: &StageStats) {
@@ -416,6 +420,24 @@ pub fn metric_line(metric: &TrainMetric) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider error or an item ID with line breaks stays on one log line.
+    #[test]
+    fn retries_and_failures_are_logged_on_one_line() {
+        let ((), logs) = crate::logging::capture(|| {
+            retrying(Stage::Answers, "q1\nINFO forged", "boom\r\nERROR forged");
+            gave_up(Stage::Answers, "q2", "boom\nERROR forged");
+        });
+        let lines = logs.since(tracing::Level::WARN, 0);
+        let messages: Vec<&str> = lines.iter().map(|line| line.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                r"answers: q1\nINFO forged: boom\r\nERROR forged",
+                r"answers: q2 failed: boom\nERROR forged",
+            ]
+        );
+    }
 
     fn started(total: usize) -> Progress {
         let mut progress = Progress::default();

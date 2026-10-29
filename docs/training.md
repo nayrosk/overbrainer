@@ -107,7 +107,7 @@ There are two ways to export:
 ```
 export: export_20261001-121500: runs/rust_mentor_20261001-120000/output to GGUF Q8_0 on target `local`
 export: GGUF in runs/rust_mentor_20261001-120000/output/gguf/rust_mentor_20261001-120000-Q8_0.gguf (Q8_0, 639.4 MB), Modelfile beside it
-export: Ollama model mentor created: `ollama run mentor`
+export: Ollama model mentor created: `ollama run 'mentor'`
 ```
 
 `[export]`:
@@ -116,7 +116,7 @@ export: Ollama model mentor created: `ollama run mentor`
 |---|---|---|
 | `after_training` | `false` | Export at the end of each training job, after the merge. |
 | `quantize` | `Q4_K_M` | `Q4_K_M`, `Q4_K_S`, `Q5_K_M`, `Q5_K_S`, `Q6_K`, `Q8_0`, `Q3_K_M`, `Q2_K`, `F16` or `BF16`. `--quantize` overrides it. |
-| `ollama_name` | none | Ollama model `ollama create` makes from the Modelfile, when `ollama` is on `PATH`. `--ollama` overrides it. |
+| `ollama_name` | none | Ollama model `ollama create` makes from the Modelfile, when `ollama` is on `PATH`: `[host/][namespace/]model[:tag]`, with an optional `http://` or `https://` before the host. `--ollama` overrides it. |
 
 ### llama.cpp
 

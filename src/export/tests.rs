@@ -134,6 +134,33 @@ fn a_delivered_export_lands_beside_its_modelfile() -> TestResult {
     Ok(())
 }
 
+/// A file name with a directory, a parent component or no `.gguf` extension
+/// is refused before anything is moved.
+#[test]
+fn only_a_gguf_file_name_is_delivered() -> TestResult {
+    let run = tempfile::tempdir()?;
+    let job_dir = run.path().join("exports/e1");
+    std::fs::create_dir_all(job_dir.join("output/gguf"))?;
+    std::fs::write(job_dir.join("x.gguf"), "GGUF")?;
+    for file in [
+        "../x.gguf",
+        "/tmp/x.gguf",
+        "a/x.gguf",
+        "x.bin",
+        ".gguf",
+        "",
+        "./x.gguf",
+    ] {
+        let refused = deliver(run.path(), &job_dir, file);
+        assert!(
+            matches!(refused, Err(ExportError::NotAFileName(_))),
+            "{file}: {refused:?}"
+        );
+    }
+    assert!(job_dir.join("x.gguf").is_file(), "nothing was moved");
+    Ok(())
+}
+
 #[test]
 fn an_in_job_export_is_delivered_where_it_is() -> TestResult {
     let run = tempfile::tempdir()?;
@@ -160,6 +187,18 @@ fn an_in_job_export_is_delivered_where_it_is() -> TestResult {
     Ok(())
 }
 
+/// The suggested `ollama create` keeps shell syntax in a name as one quoted word.
+#[test]
+fn ollama_command_quotes_the_name() {
+    let command = ollama_command(Path::new("runs/r1/output/gguf"), "a$(id)'b");
+    assert_eq!(
+        command,
+        r"cd 'runs/r1/output/gguf' && ollama create 'a$(id)'\''b' -f Modelfile"
+    );
+}
+
+/// `ollama create` runs in the GGUF directory, or its command is given when
+/// `ollama` is missing.
 #[test]
 fn ollama_is_run_in_the_gguf_directory_or_its_command_given() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -168,7 +207,7 @@ fn ollama_is_run_in_the_gguf_directory_or_its_command_given() -> TestResult {
         return Err(format!("{missing:?}").into());
     };
     assert!(
-        command.ends_with("&& ollama create mentor -f Modelfile"),
+        command.ends_with("&& ollama create 'mentor' -f Modelfile"),
         "{command}"
     );
     if !sh_available() {
