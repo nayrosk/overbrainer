@@ -198,7 +198,7 @@ fn checked_files(
         let Some(name) = name.to_str() else {
             return Err(ExecError::Protocol(format!(
                 "the copy sent a name that is not UTF-8 in {}: nothing was kept",
-                crate::runpod::one_line(if relative.is_empty() { "." } else { relative })
+                crate::logging::one_line(if relative.is_empty() { "." } else { relative })
             )));
         };
         let member = if relative.is_empty() {
@@ -211,7 +211,7 @@ fn checked_files(
         let refused = |why: &str| {
             ExecError::Protocol(format!(
                 "the copy sent {}, which is {why}: nothing was kept",
-                crate::runpod::one_line(&member)
+                crate::logging::one_line(&member)
             ))
         };
         if kind.is_dir() {
@@ -232,7 +232,7 @@ fn checked_files(
             };
             tracing::warn!(
                 "the copy sent {}, which is {what}: not kept",
-                crate::runpod::one_line(&member)
+                crate::logging::one_line(&member)
             );
         }
     }
@@ -298,7 +298,7 @@ fn promote(staging: &Path, dir: &Path, entries: &[String]) -> Result<(), ExecErr
 fn not_kept(path: &Path, is: &str) -> ExecError {
     ExecError::Protocol(format!(
         "{} {is}: the copy was not kept",
-        crate::runpod::one_line(&path.display().to_string())
+        crate::logging::one_line(&path.display().to_string())
     ))
 }
 
