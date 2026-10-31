@@ -197,6 +197,7 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
 /// semantic validation, when an env-only key is set in `content`, or when two
 /// `OVERBRAINER_*` variables differ only by case.
 pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> {
+    let from_env = env_keys(&env);
     let pairs = env_pairs(env);
     let ambiguous = ambiguous_keys(pairs.iter().map(|(key, _)| key));
     if !ambiguous.is_empty() {
@@ -229,12 +230,37 @@ pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> 
             file_only.get("training.axolotl_extra").unwrap_or_default();
         coerce_env_scalars(&mut training.axolotl_extra, &file_extra);
     }
+    let set = |key: &str| file_only.get::<config::Value>(key).is_ok() || from_env.contains(key);
+    legacy_hub(&mut settings, set);
 
     problems.extend(validate::check(&settings));
     if problems.is_empty() {
         Ok(settings)
     } else {
         Err(ConfigError::Invalid(problems))
+    }
+}
+
+/// Gives the deprecated `training.hub_model_id` the meaning `overbrainer migrate`
+/// gives it: `[hub] repo` when unset, and `[hub] after_training` on when `set`
+/// says neither the file nor the environment sets it; `[hub] private` keeps its
+/// value, on unless set otherwise. The run is then pushed by overbrainer after
+/// training, with the private-repo checks of `overbrainer push`, and Axolotl no
+/// longer pushes it itself.
+fn legacy_hub(settings: &mut Settings, set: impl Fn(&str) -> bool) {
+    // An invalid value is reported under its own name by validation.
+    let Some(value) = settings
+        .training
+        .as_ref()
+        .and_then(|training| training.hub_model_id.clone())
+        .filter(|value| validate::is_hub_repo(value))
+    else {
+        return;
+    };
+    let hub = &mut settings.hub;
+    hub.repo.get_or_insert(value);
+    if !set("hub.after_training") {
+        hub.after_training = true;
     }
 }
 

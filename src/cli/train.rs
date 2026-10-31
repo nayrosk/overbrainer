@@ -584,9 +584,6 @@ pub(super) async fn secrets(
     settings: &Settings,
 ) -> anyhow::Result<Vec<(String, secrecy::SecretString)>> {
     let Some(token) = &settings.hf_token else {
-        if let Some(warning) = crate::config::validate::legacy_hub_token_warning(settings) {
-            warn(&warning);
-        }
         return Ok(Vec::new());
     };
     let token = hf_token(token).await?;

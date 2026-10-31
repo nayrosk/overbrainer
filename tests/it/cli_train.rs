@@ -816,6 +816,9 @@ fn edit_config(dir: &Path, edit: impl FnOnce(String) -> String) -> TestResult {
     Ok(())
 }
 
+/// The deprecated `training.hub_model_id` turns the push after training on,
+/// so a missing token is warned about as for `[hub] after_training`, and the
+/// run still trains.
 #[test]
 fn a_hub_model_id_without_a_token_warns_and_still_trains() -> TestResult {
     let dir = project("ok")?;
@@ -831,7 +834,8 @@ fn a_hub_model_id_without_a_token_warns_and_still_trains() -> TestResult {
         .assert()
         .success()
         .stderr(predicate::str::contains(
-            "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail",
+            "[hub] after_training is on but OVERBRAINER_HF_TOKEN is not set: the push after \
+             training will fail",
         ))
         .stdout(predicate::str::contains("succeeded; step 2/2"));
     let run = only_run(dir.path())?;

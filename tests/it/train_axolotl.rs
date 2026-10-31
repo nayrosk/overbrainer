@@ -71,7 +71,6 @@ eval_sample_packing: false
 evals_per_epoch: 4
 gradient_accumulation_steps: 4
 gradient_checkpointing: true
-hub_model_id: "me/qwen3-rust"
 learning_rate: 0.0002
 load_in_4bit: true
 load_in_8bit: false

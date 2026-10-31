@@ -32,6 +32,7 @@ use super::widgets::picker::{Choice, Entry, Picker, PickerOutcome};
 use crate::cli::CompareArgs;
 use crate::cli::data::Command;
 use crate::cli::front::Report;
+use crate::cli::push::PushPlan;
 use crate::config::edit::FieldPath;
 use crate::config::{EnvSource, Settings, Source};
 use crate::dataset::{AnswerText, Counts, Dataset, Deletion, Id};
@@ -331,8 +332,9 @@ pub(super) enum Action {
     /// Leaving the failed runs `0` out of the Training view's list until the
     /// TUI restarts, asked for with `x`.
     ClearFailed(Vec<String>),
-    /// Pushing run `0` to the Hugging Face Hub, asked for with `h`.
-    Push(String),
+    /// Pushing the run of the plan `0`, as shown, to the Hugging Face Hub,
+    /// asked for with `h`.
+    Push(PushPlan),
     /// Running `overbrainer compare` with these options, asked for with `C`
     /// or `J`.
     Compare(CompareArgs),
@@ -1553,7 +1555,7 @@ impl App {
             Action::Abandon(tasks) => self.abandon(&tasks),
             Action::AbandonStart(task) => self.abandon_start(task),
             Action::ClearFailed(runs) => self.clear_failed(&runs),
-            Action::Push(run) => self.confirm_push(run),
+            Action::Push(plan) => self.confirm_push(plan),
             Action::Compare(args) => self.confirm_compare(args),
             Action::CancelCompare(task) if self.is_compare(task) => vec![Effect::Abandon(task)],
             Action::CancelCompare(_) => {
@@ -4502,7 +4504,7 @@ mod tests {
         assert_eq!((confirm.yes, confirm.no), ("push", "cancel"));
         let effects = keys(&mut app, &[KeyCode::Char('y')]);
         assert!(
-            matches!(effects.as_slice(), [Effect::Spawn(_, Task::Push(run))] if run == SECOND),
+            matches!(effects.as_slice(), [Effect::Spawn(_, Task::Push(plan))] if *plan == push_plan()),
             "{effects:?}"
         );
         Ok(())

@@ -47,6 +47,13 @@ pub fn deprecations(settings: &Settings) -> Vec<String> {
             "training.hub_model_id is deprecated, use [hub] repo (overbrainer migrate moves it)"
                 .to_string(),
         );
+        if settings.hub.after_training && !settings.hub.private {
+            found.push(
+                "training.hub_model_id pushes each run after training, and [hub] private = false \
+                 creates the repo public"
+                    .to_string(),
+            );
+        }
     }
     found
 }
@@ -57,20 +64,6 @@ pub fn hub_token_warning(settings: &Settings) -> Option<String> {
     (settings.hub.after_training && settings.hf_token.is_none()).then(|| {
         "[hub] after_training is on but OVERBRAINER_HF_TOKEN is not set: the push after \
          training will fail"
-            .to_string()
-    })
-}
-
-/// The warning of a push with the legacy `training.hub_model_id` bound to fail:
-/// it is set and no Hugging Face token is. `None` when [`hub_token_warning`]
-/// already applies, so the same missing token is not warned about twice.
-pub fn legacy_hub_token_warning(settings: &Settings) -> Option<String> {
-    let legacy = settings
-        .training
-        .as_ref()
-        .is_some_and(|training| training.hub_model_id.is_some());
-    (legacy && settings.hf_token.is_none() && hub_token_warning(settings).is_none()).then(|| {
-        "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail"
             .to_string()
     })
 }
@@ -268,7 +261,7 @@ fn check_pipeline(settings: &Settings, problems: &mut Vec<String>) {
 }
 
 /// Axolotl keys set from a typed `[training]` key, with the key to use instead.
-const TYPED_AXOLOTL_KEYS: [(&str, &str); 16] = [
+const TYPED_AXOLOTL_KEYS: [(&str, &str); 15] = [
     ("base_model", "base_model"),
     ("adapter", "adapter"),
     ("num_epochs", "epochs"),
@@ -284,7 +277,6 @@ const TYPED_AXOLOTL_KEYS: [(&str, &str); 16] = [
     ("sample_packing", "sample_packing"),
     ("evals_per_epoch", "evals_per_epoch"),
     ("saves_per_epoch", "saves_per_epoch"),
-    ("hub_model_id", "hub_model_id"),
 ];
 
 /// Axolotl keys that overbrainer manages: the run layout, the metrics plugin and
@@ -393,12 +385,14 @@ fn check_training_counts(training: &Training, problems: &mut Vec<String>) {
             problems.push(format!("training.{key}: must not be empty"));
         }
     }
-    if training
-        .hub_model_id
-        .as_ref()
-        .is_some_and(|id| id.trim().is_empty())
-    {
-        problems.push("training.hub_model_id: must not be empty".to_string());
+    match training.hub_model_id.as_deref() {
+        Some(id) if id.trim().is_empty() => {
+            problems.push("training.hub_model_id: must not be empty".to_string());
+        },
+        Some(id) if !is_hub_repo(id) => problems.push(format!(
+            "training.hub_model_id must be NAMESPACE/NAME, got \"{id}\""
+        )),
+        _ => {},
     }
 }
 
@@ -422,6 +416,14 @@ fn check_training_rates(training: &Training, problems: &mut Vec<String>) {
 /// overbrainer manages.
 fn check_axolotl_extra(training: &Training, problems: &mut Vec<String>) {
     for key in training.axolotl_extra.keys() {
+        // Axolotl's own push would skip the private-repo checks of `overbrainer push`.
+        if key == "hub_model_id" {
+            problems.push(
+                "training.axolotl_extra.hub_model_id: set [hub] repo and [hub] after_training \
+                 instead"
+                    .to_string(),
+            );
+        }
         if let Some((_, typed)) = TYPED_AXOLOTL_KEYS.iter().find(|(name, _)| name == key) {
             problems.push(format!(
                 "training.axolotl_extra.{key}: set training.{typed} instead"
@@ -722,10 +724,15 @@ fn check_runpod(settings: &Settings, problems: &mut Vec<String>) {
     );
 }
 
+/// Whether `repo` is a Hub repo ID `NAMESPACE/NAME`, as `[hub] repo` must be.
+pub(crate) fn is_hub_repo(repo: &str) -> bool {
+    repo.matches('/').count() == 1 && crate::train::sizing::is_repo_id(repo)
+}
+
 /// `hub.repo`, when set, is `NAMESPACE/NAME`; `hub.base_url` follows the runpod rule.
 fn check_hub(settings: &Settings, problems: &mut Vec<String>) {
     if let Some(repo) = &settings.hub.repo
-        && !(repo.matches('/').count() == 1 && crate::train::sizing::is_repo_id(repo))
+        && !is_hub_repo(repo)
     {
         problems.push(format!("hub.repo must be NAMESPACE/NAME, got \"{repo}\""));
     }
@@ -969,6 +976,44 @@ mod tests {
         Ok(())
     }
 
+    /// A bare `training.hub_model_id`, without a namespace, is refused under
+    /// its own name, and `axolotl_extra.hub_model_id` points to `[hub]`.
+    #[test]
+    fn a_hub_model_id_must_name_its_namespace() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            "adapter = \"qlora\"",
+            "adapter = \"qlora\"\nhub_model_id = \"bare\"\n[training.axolotl_extra]\nhub_model_id = \"me/x\"",
+        );
+        assert_eq!(
+            check(&settings(&toml)?),
+            vec![
+                "training.hub_model_id must be NAMESPACE/NAME, got \"bare\"".to_string(),
+                "training.axolotl_extra.hub_model_id: set [hub] repo and [hub] after_training \
+                 instead"
+                    .to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    /// A legacy `training.hub_model_id` pushed after training into a repo that
+    /// `[hub] private = false` creates public is warned about.
+    #[test]
+    fn a_public_legacy_push_is_warned_about() -> Result<(), config::ConfigError> {
+        let toml = VALID.replace(
+            "adapter = \"qlora\"",
+            "adapter = \"qlora\"\nhub_model_id = \"me/x\"",
+        ) + "\n[hub]\nprivate = false\nafter_training = true\n";
+        assert_eq!(
+            deprecations(&settings(&toml)?).get(1).map(String::as_str),
+            Some(
+                "training.hub_model_id pushes each run after training, and [hub] private = false \
+                 creates the repo public"
+            )
+        );
+        Ok(())
+    }
+
     /// `training.hub_model_id` is reported as deprecated.
     #[test]
     fn hub_model_id_is_reported_as_deprecated() -> Result<(), config::ConfigError> {
@@ -984,25 +1029,6 @@ mod tests {
                     .to_string()
             ]
         );
-        Ok(())
-    }
-
-    /// The legacy token warning stands down when the after-training one applies.
-    #[test]
-    fn the_legacy_token_warning_stands_down_for_the_hub_one() -> Result<(), config::ConfigError> {
-        let legacy = VALID.replace(
-            "adapter = \"qlora\"",
-            "adapter = \"qlora\"\nhub_model_id = \"me/x\"",
-        );
-        assert_eq!(
-            legacy_hub_token_warning(&settings(&legacy)?).as_deref(),
-            Some(
-                "training.hub_model_id is set but OVERBRAINER_HF_TOKEN is not: the push will fail"
-            )
-        );
-        let both = format!("{legacy}\n[hub]\nafter_training = true\n");
-        assert_eq!(legacy_hub_token_warning(&settings(&both)?), None);
-        assert_eq!(legacy_hub_token_warning(&settings(VALID)?), None);
         Ok(())
     }
 
