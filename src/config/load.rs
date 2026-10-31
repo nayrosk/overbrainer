@@ -215,9 +215,15 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
 ///
 /// Returns [`ConfigError::Parse`] when `content` or the environment cannot be parsed
 /// into [`Settings`], and [`ConfigError::Invalid`] when the parsed settings fail
-/// semantic validation, when an env-only key is set in `content`, or when two
-/// `OVERBRAINER_*` variables differ only by case.
+/// semantic validation, when an env-only key is set in `content`, when two
+/// `OVERBRAINER_*` variables differ only by case, or when `content` is larger
+/// than [`load`] reads, so a text that would not load again is never written.
 pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> {
+    if u64::try_from(content.len()).map_or(true, |len| len > CONFIG_MAX) {
+        return Err(ConfigError::Invalid(vec![format!(
+            "{CONFIG_FILE} would hold more than {CONFIG_MAX} bytes"
+        )]));
+    }
     let from_env = env_keys(&env);
     let pairs = env_pairs(env);
     let ambiguous = ambiguous_keys(pairs.iter().map(|(key, _)| key));
@@ -478,6 +484,22 @@ fn looks_like_integer(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A text larger than `load` reads is refused, so it is never written.
+    #[test]
+    fn a_text_past_the_read_limit_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let text = format!("# {}\n", "x".repeat(usize::try_from(CONFIG_MAX)?));
+        match load_str(&text, vars(&[])) {
+            Err(ConfigError::Invalid(problems)) => {
+                assert!(
+                    problems.iter().any(|p| p.contains("more than")),
+                    "{problems:?}"
+                );
+                Ok(())
+            },
+            other => Err(format!("expected a refusal, got {other:?}").into()),
+        }
+    }
 
     /// Colliding names are reported on one line, a line break in a name escaped.
     #[test]

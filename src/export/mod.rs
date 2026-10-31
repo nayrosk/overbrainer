@@ -378,6 +378,17 @@ impl ExportRecord {
             .and_then(|rest| rest.strip_prefix('/'))
             .is_some_and(is_gguf_name)
     }
+
+    /// Whether the GGUF `file` names is in `run_dir` as a regular file, with
+    /// neither it nor `output/` nor `output/gguf/` a symbolic link, so a record
+    /// read back never leads a consumer outside the run directory.
+    #[must_use]
+    pub fn is_delivered_in(&self, run_dir: &Path) -> bool {
+        self.has_valid_file()
+            && !is_link(&run_dir.join("output"))
+            && !is_link(&run_dir.join(GGUF_DIR))
+            && is_plain_file(&run_dir.join(&self.file))
+    }
 }
 
 /// Whether `path` is a symbolic link.

@@ -7,7 +7,8 @@ use super::{CompareError, Report};
 use crate::export::{EXPORT_FILE, ExportRecord};
 use crate::runs::{RECORD_FILE, RunRecord, Runs, RunsError};
 
-/// The newest export of run `run_id` whose GGUF is in its `output/gguf/`:
+/// The newest export of run `run_id` whose GGUF is a regular file in its
+/// `output/gguf/`, never reached through a link ([`ExportRecord::is_delivered_in`]):
 /// from `export.json` in the run directory (an export in the training job)
 /// and in each `exports/<id>/` (an export on its own), by `created`.
 #[must_use]
@@ -24,7 +25,7 @@ pub fn latest_export(runs: &Runs, run_id: &str) -> Option<ExportRecord> {
     }
     records
         .into_iter()
-        .filter(|record| run_dir.join(&record.file).is_file())
+        .filter(|record| record.is_delivered_in(&run_dir))
         .max_by(|a, b| a.created.cmp(&b.created))
 }
 
@@ -187,6 +188,28 @@ mod tests {
         std::fs::remove_file(run_dir.join("output/gguf/r1-Q8_0.gguf"))?;
         let latest = latest_export(&runs, "r1").ok_or("no export")?;
         assert_eq!(latest.file, "output/gguf/r1-Q4_K_M.gguf");
+        Ok(())
+    }
+
+    /// A GGUF reached through a link, as the file or as `output/gguf/`, does
+    /// not count, even when the link leads to a regular file.
+    #[test]
+    fn a_linked_gguf_is_not_an_export() -> TestResult {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let run_dir = runs.run_dir("r1")?;
+        exported(&run_dir, &run_dir, "r1-Q4_K_M.gguf", "2026-10-01T10:00:00Z")?;
+        let gguf = run_dir.join(GGUF_DIR).join("r1-Q4_K_M.gguf");
+        let outside = project.path().join("outside.gguf");
+        std::fs::rename(&gguf, &outside)?;
+        std::os::unix::fs::symlink(&outside, &gguf)?;
+        assert!(latest_export(&runs, "r1").is_none(), "linked file");
+        let elsewhere = project.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere)?;
+        std::fs::rename(&outside, elsewhere.join("r1-Q4_K_M.gguf"))?;
+        std::fs::remove_dir_all(run_dir.join(GGUF_DIR))?;
+        std::os::unix::fs::symlink(&elsewhere, run_dir.join(GGUF_DIR))?;
+        assert!(latest_export(&runs, "r1").is_none(), "linked directory");
         Ok(())
     }
 
