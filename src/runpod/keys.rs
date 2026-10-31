@@ -152,8 +152,17 @@ fn rust_keygen(path: &Path, comment: &str) -> Result<(), PodError> {
         .map_err(io_error(path))?;
     file.write_all(private.as_bytes()).map_err(io_error(path))?;
     let public_file = public_path(path);
-    fs::write(&public_file, format!("{public}\n")).map_err(io_error(&public_file))?;
+    replace(&public_file, format!("{public}\n").as_bytes())?;
     Ok(())
+}
+
+/// Writes `content` at `path` through a new file renamed over it, so a link
+/// that a downloaded artifact left there is replaced, never written through.
+fn replace(path: &Path, content: &[u8]) -> Result<(), PodError> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Err(io_error(path)(io::Error::from(io::ErrorKind::InvalidInput)));
+    };
+    crate::files::replace(dir, name, content).map_err(io_error(path))
 }
 
 /// Runs `ssh-keygen` to write a fresh ed25519 key pair at `path`.
@@ -260,7 +269,7 @@ pub fn write_known_hosts(dir: &Path, alias: &str, host_public: &str) -> Result<P
     valid_alias(alias)?;
     let path = dir.join(KNOWN_HOSTS);
     let line = format!("{alias} {}\n", key_fields(host_public));
-    fs::write(&path, line).map_err(io_error(&path))?;
+    replace(&path, line.as_bytes())?;
     Ok(path)
 }
 
@@ -285,7 +294,7 @@ pub fn write_config(
     let known_hosts = write_known_hosts(&dir, alias, &keys.host_public)?;
     let text = ssh_config(alias, endpoint, &keys.client_key, &known_hosts)?;
     let path = dir.join(SSH_CONFIG);
-    fs::write(&path, text).map_err(io_error(&path))?;
+    replace(&path, text.as_bytes())?;
     Ok(path)
 }
 
@@ -455,6 +464,24 @@ mod tests {
             text,
             "Host overbrainer-r1\n  HostName 203.0.113.7\n  Port 40122\n  User root\n  IdentityFile \"/p/a b%%c/runs/r1/ssh/id_ed25519\"\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile \"/p/a b%%c/runs/r1/ssh/known_hosts\"\n  GlobalKnownHostsFile /dev/null\n  HostKeyAlias overbrainer-r1\n  CheckHostIP no\n  StrictHostKeyChecking yes\n  UpdateHostKeys no\n  PasswordAuthentication no\n  KbdInteractiveAuthentication no\n"
         );
+        Ok(())
+    }
+
+    /// A `known_hosts` that a downloaded artifact left as a link is replaced,
+    /// and the file it pointed to is left as it was.
+    #[test]
+    fn a_planted_link_is_replaced_not_written_through() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let outside = dir.path().join("outside");
+        fs::write(&outside, "keep")?;
+        std::os::unix::fs::symlink(&outside, dir.path().join(KNOWN_HOSTS))?;
+        let path = write_known_hosts(
+            dir.path(),
+            "overbrainer-r1",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA root@pod",
+        )?;
+        assert_eq!(fs::read_to_string(&outside)?, "keep");
+        assert!(!fs::symlink_metadata(&path)?.file_type().is_symlink());
         Ok(())
     }
 

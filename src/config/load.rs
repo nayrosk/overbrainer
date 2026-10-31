@@ -9,6 +9,27 @@ use crate::logging::one_line;
 
 /// Name of the project-level configuration file, relative to the project directory.
 pub const CONFIG_FILE: &str = "overbrainer.toml";
+/// Most bytes `overbrainer.toml` may hold: far above any real configuration.
+const CONFIG_MAX: u64 = 4 << 20;
+
+/// The text of the configuration file at `path`: a regular file of at most
+/// [`CONFIG_MAX`] bytes, which may be reached through a symbolic link, so a
+/// link to a device such as `/dev/zero` cannot make the read endless.
+///
+/// # Errors
+///
+/// Returns the error of reading `path`, `NotFound` when it does not exist,
+/// `InvalidInput` when it is not a regular file, `FileTooLarge` past
+/// [`CONFIG_MAX`] and `InvalidData` when it is not UTF-8.
+pub(crate) fn read_config(path: &Path) -> std::io::Result<String> {
+    String::from_utf8(crate::files::read_bounded(path, CONFIG_MAX)?).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8", path.display()),
+        )
+    })
+}
+
 /// Prefix required on every environment variable read into the configuration.
 pub const ENV_PREFIX: &str = "OVERBRAINER";
 /// The `OVERBRAINER_*` variables read outside the configuration, which [`load`]
@@ -177,7 +198,7 @@ fn redact(message: &str) -> String {
 /// only by case.
 pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError> {
     let path = project_dir.join(CONFIG_FILE);
-    let content = std::fs::read_to_string(&path).map_err(|error| ConfigError::Read {
+    let content = read_config(&path).map_err(|error| ConfigError::Read {
         path: path.clone(),
         error,
     })?;
@@ -194,9 +215,15 @@ pub fn load(project_dir: &Path, env: EnvSource) -> Result<Settings, ConfigError>
 ///
 /// Returns [`ConfigError::Parse`] when `content` or the environment cannot be parsed
 /// into [`Settings`], and [`ConfigError::Invalid`] when the parsed settings fail
-/// semantic validation, when an env-only key is set in `content`, or when two
-/// `OVERBRAINER_*` variables differ only by case.
+/// semantic validation, when an env-only key is set in `content`, when two
+/// `OVERBRAINER_*` variables differ only by case, or when `content` is larger
+/// than [`load`] reads, so a text that would not load again is never written.
 pub fn load_str(content: &str, env: EnvSource) -> Result<Settings, ConfigError> {
+    if u64::try_from(content.len()).map_or(true, |len| len > CONFIG_MAX) {
+        return Err(ConfigError::Invalid(vec![format!(
+            "{CONFIG_FILE} would hold more than {CONFIG_MAX} bytes"
+        )]));
+    }
     let from_env = env_keys(&env);
     let pairs = env_pairs(env);
     let ambiguous = ambiguous_keys(pairs.iter().map(|(key, _)| key));
@@ -457,6 +484,22 @@ fn looks_like_integer(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A text larger than `load` reads is refused, so it is never written.
+    #[test]
+    fn a_text_past_the_read_limit_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let text = format!("# {}\n", "x".repeat(usize::try_from(CONFIG_MAX)?));
+        match load_str(&text, vars(&[])) {
+            Err(ConfigError::Invalid(problems)) => {
+                assert!(
+                    problems.iter().any(|p| p.contains("more than")),
+                    "{problems:?}"
+                );
+                Ok(())
+            },
+            other => Err(format!("expected a refusal, got {other:?}").into()),
+        }
+    }
 
     /// Colliding names are reported on one line, a line break in a name escaped.
     #[test]

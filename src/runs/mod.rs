@@ -66,6 +66,14 @@ pub enum RunsError {
         /// The file.
         path: PathBuf,
     },
+    /// A record's snapshot names another checkpoint than its step's
+    /// `output/checkpoint-<step>`: the record was rewritten, and is not trusted,
+    /// so nothing is retrieved or deleted on its word.
+    #[error("{} names a snapshot checkpoint outside its run", path.display())]
+    InvalidSnapshot {
+        /// The file.
+        path: PathBuf,
+    },
     /// No run has this ID.
     #[error("no run `{0}` in runs/")]
     NotFound(String),
@@ -421,8 +429,10 @@ impl Runs {
     /// # Errors
     ///
     /// Returns [`RunsError::InvalidId`] when `id` is not a valid run ID,
-    /// [`RunsError::NotFound`] when it is valid but has no record, and
-    /// [`RunsError::Io`] or [`RunsError::Invalid`] when the record cannot be read.
+    /// [`RunsError::NotFound`] when it is valid but has no record,
+    /// [`RunsError::Io`] or [`RunsError::Invalid`] when the record cannot be read,
+    /// and [`RunsError::InvalidSnapshot`] when its snapshot names another
+    /// checkpoint than its step's ([`Snapshot::is_valid`]).
     pub fn load(&self, id: &str) -> Result<RunRecord, RunsError> {
         let dir = self.run_dir(id)?;
         let path = dir.join(RECORD_FILE);
@@ -433,12 +443,25 @@ impl Runs {
             },
             Err(e) => return Err(io_error(&path)(e)),
         };
-        serde_json::from_slice(&content).map_err(|e| RunsError::invalid(path, &e))
+        let record: RunRecord =
+            serde_json::from_slice(&content).map_err(|e| RunsError::invalid(path.clone(), &e))?;
+        // A forged checkpoint path must not name a directory outside the run,
+        // nor be dropped quietly: a stopped run would then look like it has
+        // nothing to retrieve, and its pod could be deleted with the checkpoint.
+        if record
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.is_valid())
+        {
+            return Err(RunsError::InvalidSnapshot { path });
+        }
+        Ok(record)
     }
 
     /// Every run with a readable record, oldest first. Directories without
-    /// `run.json`, and records that fail to load ([`RunsError::Invalid`] or
-    /// [`RunsError::Io`]), are skipped and logged with `tracing::warn!`.
+    /// `run.json`, and records that fail to load ([`RunsError::Invalid`],
+    /// [`RunsError::Io`] or [`RunsError::InvalidSnapshot`]), are skipped and
+    /// logged with `tracing::warn!`.
     ///
     /// # Errors
     ///
@@ -477,7 +500,11 @@ impl Runs {
         for id in &ids {
             match self.load(id) {
                 Ok(record) => records.push(record),
-                Err(error @ (RunsError::Invalid { .. } | RunsError::Io { .. })) => {
+                Err(
+                    error @ (RunsError::Invalid { .. }
+                    | RunsError::Io { .. }
+                    | RunsError::InvalidSnapshot { .. }),
+                ) => {
                     skipped(id, &error);
                 },
                 Err(error) => return Err(error),
@@ -637,6 +664,59 @@ pub(crate) mod tests {
             resumed_from: None,
             snapshots: false,
         }
+    }
+
+    /// A record whose snapshot names a checkpoint outside the run, absolute or
+    /// not of its step, is refused rather than loaded without it.
+    #[test]
+    fn a_forged_checkpoint_path_is_left_out() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        for checkpoint in [
+            "/etc",
+            "output/checkpoint-120/../../..",
+            "output/checkpoint-7",
+        ] {
+            let mut stopped = record("20260922-143005-bbbb");
+            stopped.state = RunState::Stopped;
+            stopped.snapshot = Some(Snapshot {
+                checkpoint: checkpoint.into(),
+                step: 120,
+                reason: SnapshotReason::Deadline,
+            });
+            runs.save(&stopped)?;
+            assert!(
+                matches!(
+                    runs.load(&stopped.id),
+                    Err(RunsError::InvalidSnapshot { .. })
+                ),
+                "{checkpoint}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A record with a forged snapshot is skipped by the listing, which keeps
+    /// every other run.
+    #[test]
+    fn list_skips_a_record_with_a_forged_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        runs.save(&record("20260922-143005-aaaa"))?;
+        let mut forged = record("20260922-143005-bbbb");
+        forged.state = RunState::Stopped;
+        forged.snapshot = Some(Snapshot {
+            checkpoint: "/etc".into(),
+            step: 120,
+            reason: SnapshotReason::Deadline,
+        });
+        runs.save(&forged)?;
+        let mut skipped = Vec::new();
+        let listed = runs.list_with(|id, _| skipped.push(id.to_string()))?;
+        let ids: Vec<&str> = listed.iter().map(|record| record.id.as_str()).collect();
+        assert_eq!(ids, ["20260922-143005-aaaa"]);
+        assert_eq!(skipped, ["20260922-143005-bbbb"]);
+        Ok(())
     }
 
     #[test]

@@ -1398,7 +1398,7 @@ impl App {
         let failed = editor_failure(status);
         let path = self.project.dir.join(CONFIG_FILE);
         let read_at = stamp(&self.project.dir);
-        let read = std::fs::read_to_string(&path)
+        let read = crate::config::read_config(&path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))
             .and_then(|text| {
                 ProjectConfig::new(&text, &self.env).map_err(|error| {

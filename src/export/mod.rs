@@ -320,10 +320,18 @@ fn link_tree(from: &Path, to: &Path) -> Result<(), TrainError> {
 }
 
 /// `from` hard-linked at `to`, or copied there; whatever was at `to` is
-/// replaced.
+/// replaced. When `to` already is `from` (the same path, or a hard link to the
+/// same file), nothing is done: removing `to` first would delete `from`.
 pub(crate) fn link_file(from: &Path, to: &Path) -> Result<(), TrainError> {
+    use std::os::unix::fs::MetadataExt as _;
+
     if let Some(dir) = to.parent() {
         fs::create_dir_all(dir).map_err(train_io(dir))?;
+    }
+    if let (Ok(source), Ok(target)) = (fs::metadata(from), fs::symlink_metadata(to))
+        && (source.dev(), source.ino()) == (target.dev(), target.ino())
+    {
+        return Ok(());
     }
     match fs::remove_file(to) {
         Ok(()) => {},
@@ -359,6 +367,40 @@ pub struct ExportRecord {
     pub created: String,
 }
 
+impl ExportRecord {
+    /// Whether `file` has the only form [`deliver`] writes,
+    /// `output/gguf/<name>.gguf` with `<name>` a plain file name: a record read
+    /// back from a run directory names no file outside it.
+    #[must_use]
+    pub fn has_valid_file(&self) -> bool {
+        self.file
+            .strip_prefix(GGUF_DIR)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(is_gguf_name)
+    }
+
+    /// Whether the GGUF `file` names is in `run_dir` as a regular file, with
+    /// neither it nor `output/` nor `output/gguf/` a symbolic link, so a record
+    /// read back never leads a consumer outside the run directory.
+    #[must_use]
+    pub fn is_delivered_in(&self, run_dir: &Path) -> bool {
+        self.has_valid_file()
+            && !is_link(&run_dir.join("output"))
+            && !is_link(&run_dir.join(GGUF_DIR))
+            && is_plain_file(&run_dir.join(&self.file))
+    }
+}
+
+/// Whether `path` is a symbolic link.
+pub(crate) fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// Whether `path` is a regular file, not a symbolic link to one.
+fn is_plain_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// An export delivered into its run's `output/gguf/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivered {
@@ -375,28 +417,36 @@ pub struct Delivered {
 /// GGUF file `file` goes to `runs/<id>/output/gguf/`, replacing one of the
 /// same name, `export.json` is written in `job_dir`, and the Modelfile in
 /// `output/gguf/`, with `num_ctx` from the run's own `axolotl.yaml`. What was
-/// staged in `job_dir` for the job is removed.
+/// staged in `job_dir` for the job is removed. The GGUF and the GGUF
+/// directories came from the target: a symbolic link at any of them, or at
+/// their `output/`, counts as no GGUF, so nothing outside the run is hashed,
+/// named or written.
 ///
 /// # Errors
 ///
 /// Returns [`ExportError::NotAFileName`] when `file` is not a single `.gguf`
-/// file name, [`ExportError::NoGguf`] when the job left no `file`, and
-/// [`ExportError::Io`] when a file cannot be moved, read or written.
+/// file name, [`ExportError::NoGguf`] when the job left no `file`, or left it
+/// or its directory as a symbolic link, and [`ExportError::Io`] when a file
+/// cannot be moved, read or written.
 pub fn deliver(run_dir: &Path, job_dir: &Path, file: &str) -> Result<Delivered, ExportError> {
     if !is_gguf_name(file) {
         return Err(ExportError::NotAFileName(file.to_string()));
     }
     let gguf_dir = run_dir.join(GGUF_DIR);
     let gguf = gguf_dir.join(file);
+    if is_link(&run_dir.join(OUTPUT_DIR)) || is_link(&gguf_dir) {
+        return Err(ExportError::NoGguf(gguf_dir));
+    }
     if job_dir != run_dir {
-        let made = job_dir.join(GGUF_DIR).join(file);
-        if !made.is_file() {
-            return Err(ExportError::NoGguf(job_dir.join(GGUF_DIR)));
+        let made_dir = job_dir.join(GGUF_DIR);
+        let made = made_dir.join(file);
+        if is_link(&job_dir.join(OUTPUT_DIR)) || is_link(&made_dir) || !is_plain_file(&made) {
+            return Err(ExportError::NoGguf(made_dir));
         }
         fs::create_dir_all(&gguf_dir).map_err(io_error(&gguf_dir))?;
         fs::rename(&made, &gguf).map_err(io_error(&made))?;
         discard_staged(run_dir, job_dir)?;
-    } else if !gguf.is_file() {
+    } else if !is_plain_file(&gguf) {
         return Err(ExportError::NoGguf(gguf_dir));
     }
     let size = fs::metadata(&gguf).map_err(io_error(&gguf))?.len();
@@ -416,10 +466,17 @@ pub fn deliver(run_dir: &Path, job_dir: &Path, file: &str) -> Result<Delivered, 
         source: io::Error::other(error),
     })?;
     text.push('\n');
-    fs::write(&json, text).map_err(io_error(&json))?;
+    crate::files::replace(job_dir, EXPORT_FILE, text.as_bytes()).map_err(io_error(&json))?;
     let modelfile = gguf_dir.join(MODELFILE);
     let context = sequence_len(&run_dir.join(CONFIG_FILE));
-    fs::write(&modelfile, modelfile_text(file, context)).map_err(io_error(&modelfile))?;
+    // Replaced, not written through: the GGUF directory came from the target,
+    // and a link there must not redirect the write.
+    crate::files::replace(
+        &gguf_dir,
+        MODELFILE,
+        modelfile_text(file, context).as_bytes(),
+    )
+    .map_err(io_error(&modelfile))?;
     Ok(Delivered {
         gguf,
         modelfile,

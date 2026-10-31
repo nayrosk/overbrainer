@@ -169,6 +169,27 @@ fn only_a_gguf_file_name_is_delivered() -> TestResult {
     Ok(())
 }
 
+/// A Modelfile that the retrieved GGUF directory holds as a link is replaced,
+/// and the file it pointed to is left as it was.
+#[test]
+fn a_linked_modelfile_is_replaced_not_written_through() -> TestResult {
+    let run = tempfile::tempdir()?;
+    let gguf = run.path().join("output/gguf");
+    std::fs::create_dir_all(&gguf)?;
+    std::fs::write(gguf.join("r1-F16.gguf"), "gguf")?;
+    let outside = run.path().join("outside");
+    std::fs::write(&outside, "keep")?;
+    std::os::unix::fs::symlink(&outside, gguf.join(MODELFILE))?;
+    let delivered = deliver(run.path(), run.path(), "r1-F16.gguf")?;
+    assert_eq!(std::fs::read_to_string(&outside)?, "keep");
+    assert!(
+        !std::fs::symlink_metadata(&delivered.modelfile)?
+            .file_type()
+            .is_symlink()
+    );
+    Ok(())
+}
+
 #[test]
 fn an_in_job_export_is_delivered_where_it_is() -> TestResult {
     let run = tempfile::tempdir()?;
@@ -635,4 +656,85 @@ async fn a_standalone_export_shows_as_exporting_gguf() -> TestResult {
     assert_eq!(phase_of(&metrics)?.label(), "exporting GGUF");
     assert!(!Path::new(&run_dir).join(METRICS_FILE).exists());
     Ok(())
+}
+
+/// A GGUF, a GGUF directory or an `output/` that the target left as a link is
+/// not delivered: nothing outside the run is hashed or written.
+#[test]
+fn a_linked_gguf_or_gguf_directory_is_not_delivered() -> TestResult {
+    let outside = tempfile::tempdir()?;
+    std::fs::write(outside.path().join("r1-F16.gguf"), "private")?;
+    let run = tempfile::tempdir()?;
+    std::fs::create_dir_all(run.path().join("output"))?;
+    std::os::unix::fs::symlink(outside.path(), run.path().join("output/gguf"))?;
+    let refused = deliver(run.path(), run.path(), "r1-F16.gguf");
+    assert!(
+        matches!(refused, Err(ExportError::NoGguf(_))),
+        "{refused:?}"
+    );
+    assert!(!outside.path().join(MODELFILE).exists());
+    std::fs::remove_file(run.path().join("output/gguf"))?;
+    std::fs::create_dir(run.path().join("output/gguf"))?;
+    std::os::unix::fs::symlink(
+        outside.path().join("r1-F16.gguf"),
+        run.path().join("output/gguf/r1-F16.gguf"),
+    )?;
+    let refused = deliver(run.path(), run.path(), "r1-F16.gguf");
+    assert!(
+        matches!(refused, Err(ExportError::NoGguf(_))),
+        "{refused:?}"
+    );
+    let linked_output = tempfile::tempdir()?;
+    std::fs::create_dir_all(outside.path().join("gguf"))?;
+    std::fs::write(outside.path().join("gguf/r1-F16.gguf"), "private")?;
+    std::os::unix::fs::symlink(outside.path(), linked_output.path().join("output"))?;
+    let refused = deliver(linked_output.path(), linked_output.path(), "r1-F16.gguf");
+    assert!(
+        matches!(refused, Err(ExportError::NoGguf(_))),
+        "{refused:?}"
+    );
+    assert!(!outside.path().join("gguf").join(MODELFILE).exists());
+    Ok(())
+}
+
+/// Linking a file onto itself, by the same path or through a directory that
+/// aliases it, leaves the file in place instead of deleting it.
+#[test]
+fn linking_a_file_onto_itself_keeps_it() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("model.safetensors");
+    std::fs::write(&file, "weights")?;
+    link_file(&file, &file)?;
+    assert_eq!(std::fs::read_to_string(&file)?, "weights");
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(dir.path(), &alias)?;
+    link_file(&file, &alias.join("model.safetensors"))?;
+    assert_eq!(std::fs::read_to_string(&file)?, "weights");
+    Ok(())
+}
+
+/// Only `output/gguf/<name>.gguf` is a valid recorded export file.
+#[test]
+fn an_export_record_names_its_gguf_in_the_run() {
+    let record = |file: &str| ExportRecord {
+        quantize: "Q8_0".into(),
+        llama_cpp: LLAMA_CPP_TAG.into(),
+        file: file.into(),
+        sha256: String::new(),
+        size: 0,
+        created: String::new(),
+    };
+    assert!(record("output/gguf/r1-Q8_0.gguf").has_valid_file());
+    for file in [
+        "/etc/passwd",
+        "/tmp/x.gguf",
+        "output/gguf/../x.gguf",
+        "output/gguf/a/x.gguf",
+        "output/gguf/x.bin",
+        "output/gguf/.gguf",
+        "output/x.gguf",
+        "output/gguf/",
+    ] {
+        assert!(!record(file).has_valid_file(), "{file}");
+    }
 }

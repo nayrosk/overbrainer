@@ -7,31 +7,42 @@ use super::{CompareError, Report};
 use crate::export::{EXPORT_FILE, ExportRecord};
 use crate::runs::{RECORD_FILE, RunRecord, Runs, RunsError};
 
-/// The newest export of run `run_id` whose GGUF is in its `output/gguf/`:
+/// The newest export of run `run_id` whose GGUF is a regular file in its
+/// `output/gguf/`, never reached through a link ([`ExportRecord::is_delivered_in`]):
 /// from `export.json` in the run directory (an export in the training job)
-/// and in each `exports/<id>/` (an export on its own), by `created`.
+/// and in each `exports/<id>/` (an export on its own), by `created`. A linked
+/// `exports/` or `exports/<id>/` is skipped: its record could come from
+/// anywhere.
 #[must_use]
 pub fn latest_export(runs: &Runs, run_id: &str) -> Option<ExportRecord> {
     let run_dir = runs.run_dir(run_id).ok()?;
     let mut records = Vec::new();
     records.extend(read_export(&run_dir.join(EXPORT_FILE)));
     if let Ok(exports) = runs.exports(run_id)
+        && !crate::export::is_link(exports.dir())
         && let Ok(entries) = std::fs::read_dir(exports.dir())
     {
-        for entry in entries.filter_map(Result::ok) {
+        for entry in entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        {
             records.extend(read_export(&entry.path().join(EXPORT_FILE)));
         }
     }
     records
         .into_iter()
-        .filter(|record| run_dir.join(&record.file).is_file())
+        .filter(|record| record.is_delivered_in(&run_dir))
         .max_by(|a, b| a.created.cmp(&b.created))
 }
 
-/// The export record at `path`, when it is there and parses.
+/// The export record at `path`, when it is there, parses and names its GGUF
+/// in the run's `output/gguf/` ([`ExportRecord::has_valid_file`]). It is read
+/// as a regular file only, never through a link, and at most 1 MiB.
 fn read_export(path: &Path) -> Option<ExportRecord> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let text = crate::files::read_regular_text(path, 1 << 20).ok()?;
+    serde_json::from_str::<ExportRecord>(&text)
+        .ok()
+        .filter(ExportRecord::has_valid_file)
 }
 
 /// The newest run with a GGUF ([`latest_export`]), if any.
@@ -144,6 +155,29 @@ mod tests {
         Ok(())
     }
 
+    /// A record that names a file outside the run's `output/gguf/`, even one
+    /// that exists, does not count.
+    #[test]
+    fn a_record_naming_a_file_outside_the_run_is_ignored() -> TestResult {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let run_dir = runs.run_dir("r1")?;
+        std::fs::create_dir_all(&run_dir)?;
+        let outside = project.path().join("outside.gguf");
+        std::fs::write(&outside, "gguf")?;
+        let record = ExportRecord {
+            quantize: "Q4_K_M".into(),
+            llama_cpp: "b11320".into(),
+            file: outside.to_string_lossy().into_owned(),
+            sha256: "0".repeat(64),
+            size: 4,
+            created: "2026-10-01T10:00:00Z".into(),
+        };
+        std::fs::write(run_dir.join(EXPORT_FILE), serde_json::to_string(&record)?)?;
+        assert!(latest_export(&runs, "r1").is_none());
+        Ok(())
+    }
+
     /// The newest export wins, in the run directory or an export's; a record
     /// whose GGUF is gone does not count.
     #[test]
@@ -160,6 +194,63 @@ mod tests {
         std::fs::remove_file(run_dir.join("output/gguf/r1-Q8_0.gguf"))?;
         let latest = latest_export(&runs, "r1").ok_or("no export")?;
         assert_eq!(latest.file, "output/gguf/r1-Q4_K_M.gguf");
+        Ok(())
+    }
+
+    /// A GGUF reached through a link, as the file or as `output/gguf/`, does
+    /// not count, even when the link leads to a regular file.
+    #[test]
+    fn a_linked_gguf_is_not_an_export() -> TestResult {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let run_dir = runs.run_dir("r1")?;
+        exported(&run_dir, &run_dir, "r1-Q4_K_M.gguf", "2026-10-01T10:00:00Z")?;
+        let gguf = run_dir.join(GGUF_DIR).join("r1-Q4_K_M.gguf");
+        let outside = project.path().join("outside.gguf");
+        std::fs::rename(&gguf, &outside)?;
+        std::os::unix::fs::symlink(&outside, &gguf)?;
+        assert!(latest_export(&runs, "r1").is_none(), "linked file");
+        let elsewhere = project.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere)?;
+        std::fs::rename(&outside, elsewhere.join("r1-Q4_K_M.gguf"))?;
+        std::fs::remove_dir_all(run_dir.join(GGUF_DIR))?;
+        std::os::unix::fs::symlink(&elsewhere, run_dir.join(GGUF_DIR))?;
+        assert!(latest_export(&runs, "r1").is_none(), "linked directory");
+        Ok(())
+    }
+
+    /// A newer record behind a linked `exports/<id>/` or a linked `exports/`
+    /// is never picked over the run's own export.
+    #[test]
+    fn a_linked_export_directory_is_skipped() -> TestResult {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let run_dir = runs.run_dir("r1")?;
+        exported(&run_dir, &run_dir, "r1-Q4_K_M.gguf", "2026-10-01T10:00:00Z")?;
+        let elsewhere = project.path().join("elsewhere");
+        exported(
+            &run_dir,
+            &elsewhere.join("e1"),
+            "r1-Q8_0.gguf",
+            "2026-10-02T10:00:00Z",
+        )?;
+        let exports = run_dir.join("exports");
+        std::fs::create_dir_all(&exports)?;
+        std::os::unix::fs::symlink(elsewhere.join("e1"), exports.join("e1"))?;
+        let picked = latest_export(&runs, "r1").map(|record| record.file);
+        assert_eq!(
+            picked.as_deref(),
+            Some("output/gguf/r1-Q4_K_M.gguf"),
+            "linked job"
+        );
+        std::fs::remove_dir_all(&exports)?;
+        std::os::unix::fs::symlink(&elsewhere, &exports)?;
+        let picked = latest_export(&runs, "r1").map(|record| record.file);
+        assert_eq!(
+            picked.as_deref(),
+            Some("output/gguf/r1-Q4_K_M.gguf"),
+            "linked exports"
+        );
         Ok(())
     }
 

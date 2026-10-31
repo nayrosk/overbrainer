@@ -7,6 +7,7 @@ mod reload;
 mod types;
 pub(crate) mod validate;
 
+pub(crate) use load::read_config;
 pub use load::{
     CONFIG_FILE, ConfigError, ENV_PREFIX, EnvSource, Source, env_keys, load, load_str,
     process_client, ssh_client_env,

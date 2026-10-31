@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, bail};
 
-use super::init::{GITIGNORE, add_gitignore_entries};
+use super::init::{GITIGNORE, GITIGNORE_MAX, add_gitignore_entries};
 use crate::config::CONFIG_FILE;
 use crate::config::edit::{ConfigDoc, FieldPath};
 use crate::config::fields::FieldValue;
@@ -256,7 +256,7 @@ fn hub_model_id(project_dir: &Path) -> anyhow::Result<Option<Change>> {
 /// Parses the project's `overbrainer.toml`; `None` when the file is missing or does not parse.
 fn read_config(project_dir: &Path) -> anyhow::Result<Option<ConfigDoc>> {
     let path = project_dir.join(CONFIG_FILE);
-    match std::fs::read_to_string(&path) {
+    match crate::config::read_config(&path) {
         Ok(text) => Ok(ConfigDoc::parse(&text).ok()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
@@ -294,7 +294,7 @@ fn move_hub_model_id(project_dir: &Path) -> anyhow::Result<()> {
 /// Whether `.gitignore` at `path` has a line in [`STATE_ENTRIES`]; not when
 /// it does not exist.
 fn ignores_state(path: &Path) -> anyhow::Result<bool> {
-    match std::fs::read_to_string(path) {
+    match crate::files::read_regular_text(path, GITIGNORE_MAX) {
         Ok(text) => Ok(text
             .lines()
             .any(|line| STATE_ENTRIES.contains(&line.trim()))),

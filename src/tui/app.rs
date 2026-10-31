@@ -1239,7 +1239,7 @@ impl App {
     /// change did, and whether `split` failed after it.
     fn applied(&mut self, session: Option<&Session>, saved: Saved) {
         if let Some(session) = session {
-            std::fs::remove_file(&session.path).ok();
+            session.remove();
         }
         let (message, severity) = match &saved.split {
             Ok(_) => (saved.message, Severity::Info),
@@ -1294,7 +1294,7 @@ impl App {
         if let Some(message) = failed {
             return self.drop_edit(&session, Severity::Warn, message);
         }
-        let bytes = match std::fs::read(&session.path) {
+        let bytes = match session.read() {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.editing = None;
@@ -1319,7 +1319,7 @@ impl App {
 
     /// Ends an edit that changed nothing, removing its temp file.
     fn drop_edit(&mut self, session: &Session, severity: Severity, message: String) -> Vec<Effect> {
-        std::fs::remove_file(&session.path).ok();
+        session.remove();
         self.editing = None;
         self.say(severity, message);
         Vec::new()

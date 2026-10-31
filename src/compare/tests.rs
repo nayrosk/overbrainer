@@ -1464,3 +1464,12 @@ fn the_settings_come_from_the_config() {
         }
     );
 }
+
+/// A `hardware.json` that is a link, here to an endless device, is not read.
+#[test]
+fn a_hardware_link_is_not_followed() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    std::os::unix::fs::symlink("/dev/zero", dir.path().join(HARDWARE_FILE))?;
+    assert!(read_hardware(dir.path()).is_none());
+    Ok(())
+}
