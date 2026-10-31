@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/nayrosk/overbrainer/compare/v0.10.0...v0.11.0) - 2026-10-31
+
+### Added
+
+- refuse to export a model that ships its own code unless allowed ([#191](https://github.com/nayrosk/overbrainer/pull/191))
+
+### Fixed
+
+- keep host control state out of the workload mount ([#192](https://github.com/nayrosk/overbrainer/pull/192))
+- refuse links, bound reads and validate stored paths in local files ([#188](https://github.com/nayrosk/overbrainer/pull/188))
+- stage downloads and verify pod ownership before deleting ([#190](https://github.com/nayrosk/overbrainer/pull/190))
+- enforce private Hugging Face pushes against reload and creation races ([#186](https://github.com/nayrosk/overbrainer/pull/186))
+- validate and encode untrusted text in commands, logs and metrics ([#185](https://github.com/nayrosk/overbrainer/pull/185))
+- *(deps)* bump crypto-bigint and ctutils to clear RUSTSEC advisories ([#179](https://github.com/nayrosk/overbrainer/pull/179))
+
 ## [0.10.0](https://github.com/nayrosk/overbrainer/compare/v0.9.0...v0.10.0) - 2026-10-21
 
 ### Fixed
