@@ -807,7 +807,10 @@ async fn a_delete_is_confirmed_by_the_api_and_priced() -> TestResult {
 
     let stuck = Harness::new().await?;
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "p1"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": "p1", "env": {"OVERBRAINER_RUN_ID": RUN}})),
+        )
         .mount(&stuck.server)
         .await;
     Mock::given(method("DELETE"))
@@ -1622,5 +1625,115 @@ async fn a_listed_type_refused_reads_no_catalog_and_keeps_the_list() -> TestResu
     // it is.
     assert_eq!(sent_gpus(&harness).await, ["B", "A"]);
     assert_eq!(catalog_reads(&harness).await, 1);
+    Ok(())
+}
+
+/// A recorded pod and the run record holding it, ready for `remove`.
+fn recorded_p1() -> Result<PodRecord, Box<dyn std::error::Error>> {
+    let pod: overbrainer::runpod::Pod = serde_json::from_value(pod("p1", "n1", "RUNNING"))?;
+    let mut record = PodRecord::new(RUN, false, 1, "ssh-ed25519 AAAAhost");
+    record.begin_attempt("NVIDIA A40", SystemTime::now(), 6.0);
+    record.created(&pod, AttemptResult::Created, SystemTime::now());
+    Ok(record)
+}
+
+/// The DELETE requests the server received.
+async fn deletes(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.method.as_str() == "DELETE")
+        .count()
+}
+
+/// A pod answer without its environment is checked against the listing: the
+/// run's marker there allows the delete, another run's refuses it.
+#[tokio::test]
+async fn a_pod_without_env_is_checked_against_the_listing() -> TestResult {
+    for (marker, allowed) in [(RUN, true), ("20260101-000000-ffff", false)] {
+        let harness = Harness::new().await?;
+        serve_pod(
+            &harness.server,
+            "p1",
+            json!({"id": "p1", "name": "n1", "status": "RUNNING"}),
+        )
+        .await;
+        list(
+            &harness.server,
+            json!([{"id": "p1", "status": "RUNNING", "env": {"OVERBRAINER_RUN_ID": marker}}]),
+        )
+        .await;
+        let mut record = recorded_p1()?;
+        let before = record.state;
+        let result = remove(
+            &harness.ctx(),
+            &mut record,
+            DeleteReason::Requested,
+            DeletedBy::PodRm,
+        )
+        .await;
+        if allowed {
+            result?;
+            assert_eq!(record.state, PodState::Deleted);
+        } else {
+            assert!(
+                matches!(result, Err(PodError::NotOwned { .. })),
+                "{result:?}"
+            );
+            assert_eq!(deletes(&harness.server).await, 0);
+            assert_eq!(record.state, before, "the record is left as it was");
+        }
+    }
+    Ok(())
+}
+
+/// When the API cannot say whose pod it is, the delete still goes out, as
+/// before the check: a pod past its deadline must not keep billing.
+#[tokio::test]
+async fn an_api_failure_on_the_marker_does_not_keep_a_pod_billing() -> TestResult {
+    let harness = Harness::new().await?;
+    // One `get_pod` and its retry fail, then the pod answers.
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/p1"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(2)
+        .mount(&harness.server)
+        .await;
+    serve_pod(&harness.server, "p1", pod("p1", "n1", "RUNNING")).await;
+    let mut record = recorded_p1()?;
+    remove(
+        &harness.ctx(),
+        &mut record,
+        DeleteReason::Deadline,
+        DeletedBy::Client,
+    )
+    .await?;
+    assert_eq!(deletes(&harness.server).await, 1);
+    assert_eq!(record.state, PodState::Deleted);
+    Ok(())
+}
+
+/// A `pod.json` that names another run than its directory's is refused, so it
+/// cannot point a delete at that run's pod.
+#[tokio::test]
+async fn a_pod_record_naming_another_run_is_refused() -> TestResult {
+    let harness = Harness::new().await?;
+    let record = recorded_p1()?;
+    record.save(&harness.runs)?;
+    let other = "20260101-000000-ffff";
+    let dir = harness.runs.run_dir(other)?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::copy(
+        harness.runs.run_dir(RUN)?.join("pod.json"),
+        dir.join("pod.json"),
+    )?;
+    let loaded = PodRecord::load(&harness.runs, other);
+    assert!(
+        matches!(loaded, Err(overbrainer::runs::RunsError::Foreign { .. })),
+        "{loaded:?}"
+    );
+    assert!(PodRecord::load(&harness.runs, RUN)?.is_some());
     Ok(())
 }

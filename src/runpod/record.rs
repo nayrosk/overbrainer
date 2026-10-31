@@ -319,8 +319,10 @@ impl PodRecord {
     ///
     /// # Errors
     ///
-    /// Returns [`RunsError::InvalidId`] for an invalid run ID, and
-    /// [`RunsError::Io`] or [`RunsError::Invalid`] when the file cannot be read.
+    /// Returns [`RunsError::InvalidId`] for an invalid run ID,
+    /// [`RunsError::Io`] or [`RunsError::Invalid`] when the file cannot be read,
+    /// and [`RunsError::Foreign`] when it names another run than `id`, which
+    /// could make overbrainer act on that run's pod.
     pub fn load(runs: &Runs, id: &str) -> Result<Option<Self>, RunsError> {
         let path = runs.run_dir(id)?.join(POD_FILE);
         let content = match fs::read(&path) {
@@ -328,9 +330,12 @@ impl PodRecord {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(source) => return Err(RunsError::Io { path, source }),
         };
-        serde_json::from_slice(&content)
-            .map(Some)
-            .map_err(|e| RunsError::invalid(path, &e))
+        let record: Self =
+            serde_json::from_slice(&content).map_err(|e| RunsError::invalid(path.clone(), &e))?;
+        if record.run_id != id {
+            return Err(RunsError::Foreign { path });
+        }
+        Ok(Some(record))
     }
 
     /// Writes the record, replacing the file atomically.

@@ -942,3 +942,50 @@ async fn export_pod_secrets_follow_their_export() -> TestResult {
     );
     Ok(())
 }
+
+/// A recorded pod or a stray that does not carry its run's marker, because
+/// `pod.json` was rewritten or the pod is someone else's, is never deleted:
+/// it stays in the record and the removal says why.
+#[tokio::test]
+async fn pod_rm_deletes_only_pods_carrying_the_run_marker() -> TestResult {
+    const OTHER: &str = "20260101-000000-ffff";
+    for marker in [Some(OTHER), None] {
+        let account = Account::default()
+            .with("p1", Some(RUN), true)
+            .with("s9", marker, true);
+        let harness = Harness::new(account).await?;
+        harness.recorded(RUN, RunState::Succeeded, "p1", PodState::Running)?;
+        harness.strays(RUN, &["s9"])?;
+        let removal = remove_run_pods(&harness.ctx(), RUN, false).await;
+        let error = removal.result.err().ok_or("a foreign stray was accepted")?;
+        assert!(matches!(error, PodError::NotOwned { .. }), "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "pod s9 does not carry the marker of run {RUN}: not deleted; delete it from the Runpod console if it is yours"
+            )
+        );
+        assert_eq!(harness.deletes().await, vec!["p1"], "{marker:?}");
+        let strays: Vec<String> = harness
+            .pod_json(RUN)?
+            .stray_pods
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(strays, ["s9"], "{marker:?}");
+
+        let account = Account::default().with("p1", marker, true);
+        let harness = Harness::new(account).await?;
+        harness.recorded(RUN, RunState::Succeeded, "p1", PodState::Running)?;
+        let removal = remove_run_pods(&harness.ctx(), RUN, false).await;
+        let error = removal.result.err().ok_or("a foreign pod was accepted")?;
+        assert!(matches!(error, PodError::NotOwned { .. }), "{error}");
+        assert_eq!(harness.deletes().await, [] as [String; 0], "{marker:?}");
+        assert_eq!(
+            harness.pod_json(RUN)?.state,
+            PodState::Running,
+            "{marker:?}"
+        );
+    }
+    Ok(())
+}

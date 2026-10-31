@@ -178,7 +178,7 @@ impl SshExecutor {
             .await
             .map_err(ExecError::Ssh)?;
         let (extracted, errors) =
-            receive(process.stdout.take(), process.stderr.take(), local).await;
+            receive(process.stdout.take(), process.stderr.take(), local, entries).await;
         let sent = process
             .wait()
             .await
@@ -563,13 +563,15 @@ where
     tokio::join!(copy, drain(errors), tar::finish(create, "archive"))
 }
 
-/// Extracts the archive read from `archive` into `local` while reading the sender's
-/// error output `errors`, both at once. Returns the extraction's result and that
-/// output.
+/// Extracts the archive read from `archive` into `local`, keeping only the
+/// requested `entries` (see [`tar::extract`]), while reading the sender's
+/// error output `errors`, both at once. Returns the extraction's result and
+/// that output.
 async fn receive<R, E>(
     archive: Option<R>,
     errors: Option<E>,
     local: &Path,
+    entries: &[String],
 ) -> (Result<(), ExecError>, Vec<u8>)
 where
     R: AsyncRead + Unpin,
@@ -579,7 +581,7 @@ where
     // writing sees a broken pipe instead of blocking forever.
     let extract = async move {
         match archive {
-            Some(mut archive) => tar::extract(&mut archive, local).await,
+            Some(mut archive) => tar::extract(&mut archive, local, entries).await,
             None => Err(ExecError::Protocol("the remote tar has no output".into())),
         }
     };
@@ -1165,17 +1167,23 @@ mod tests {
             .spawn()?)
     }
 
+    /// Receives the archive `sender` sends into `local`, keeping every entry,
+    /// and the outcome a download reports from both sides.
     async fn download_from(
         mut sender: Child,
         local: &Path,
     ) -> Result<Result<(), ExecError>, Box<dyn std::error::Error>> {
-        let (extracted, errors) = receive(sender.stdout.take(), sender.stderr.take(), local).await;
+        let all = [".".to_string()];
+        let (extracted, errors) =
+            receive(sender.stdout.take(), sender.stderr.take(), local, &all).await;
         let sent = sender.wait().await?;
         Ok(download_outcome(extracted, Ok(sent), &errors))
     }
 
+    /// A download whose staging directory cannot be made reports that local
+    /// error, not the sender's broken pipe.
     #[tokio::test]
-    async fn a_download_reports_the_local_tar_error_not_the_broken_pipe() -> TestResult {
+    async fn a_download_reports_the_local_error_not_the_broken_pipe() -> TestResult {
         let root = tempdir()?;
         let source = big_source(root.path())?;
         let locked = root.path().join("locked");
@@ -1196,11 +1204,11 @@ mod tests {
         match result {
             Err(_) => return Err("the download hung once the extraction died".into()),
             Ok(outcome) => match outcome? {
-                Err(ExecError::Command { action, message }) => {
-                    assert_eq!(action, "extract");
-                    assert!(message.contains("Permission denied"), "{message}");
-                },
-                other => return Err(format!("expected tar's own error, got {other:?}").into()),
+                // The staging directory cannot be made in the locked directory:
+                // the local error is reported, not the sender's broken pipe.
+                Err(ExecError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::PermissionDenied => {},
+                other => return Err(format!("expected the local error, got {other:?}").into()),
             },
         }
         Ok(())
@@ -1230,6 +1238,38 @@ mod tests {
             Ok(outcome) => outcome??,
         }
         assert_eq!(fs::read_to_string(local.join("file"))?, "content\n");
+        Ok(())
+    }
+
+    /// A remote that sends more than the download asked for, here a forged
+    /// `pod.json`, has the download refused and nothing it sent kept.
+    #[tokio::test]
+    async fn a_download_keeps_nothing_past_the_requested_entries() -> TestResult {
+        let root = tempdir()?;
+        let source = root.path().join("source");
+        fs::create_dir(&source)?;
+        fs::write(source.join("file"), "content\n")?;
+        fs::write(source.join("pod.json"), "forged")?;
+        let script = archive_script(
+            &source.to_string_lossy(),
+            &["file".into(), "pod.json".into()],
+            &[],
+        );
+        let local = root.path().join("back");
+        let mut sender = sender(&script)?;
+        let (extracted, _) = receive(
+            sender.stdout.take(),
+            sender.stderr.take(),
+            &local,
+            &["file".to_string()],
+        )
+        .await;
+        sender.wait().await?;
+        assert!(
+            matches!(extracted, Err(ExecError::Protocol(_))),
+            "{extracted:?}"
+        );
+        assert!(!local.join("pod.json").exists() && !local.join("file").exists());
         Ok(())
     }
 

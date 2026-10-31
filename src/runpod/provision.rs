@@ -1068,7 +1068,9 @@ pub(super) fn one_line(text: &str, max: usize) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`PodError::NotDeleted`] when the pod still shows after
+/// Returns [`PodError::NotOwned`] when the pod does not carry the record's run
+/// marker (nothing is sent and the record stays as it was, see `owned`),
+/// [`PodError::NotDeleted`] when the pod still shows after
 /// [`Timing::delete_timeout`] (the record stays `Deleting`, with the pod), and
 /// another [`PodError`] when the API or `pod.json` fails.
 pub async fn remove(
@@ -1080,6 +1082,8 @@ pub async fn remove(
     let Some(id) = record.pod_id.clone() else {
         return Ok(());
     };
+    // Checked before anything changes, so a refused pod stays recorded as it was.
+    owned(ctx, &id, &record.run_id).await?;
     ctx.publish(PodStatus::Deleting {
         pod_id: id.clone(),
         reason,
@@ -1122,6 +1126,54 @@ pub async fn remove(
     recorded?;
     saved?;
     Ok(())
+}
+
+/// Checks that the pod `id`, which run `run_id` records, may be deleted on the
+/// record's word: it is gone, or it carries the run's marker. A record is a
+/// file a download or a job could have rewritten, so the pod itself must say
+/// it belongs to the run. An answer without the pod's environment is checked
+/// against the pod listing, which carries it. When the API cannot answer, the
+/// delete goes ahead with a warning, as it did before this check: a pod past
+/// its deadline must not keep billing through an outage, and an outage is not
+/// something a rewritten record can cause.
+///
+/// # Errors
+///
+/// Returns [`PodError::NotOwned`] when the pod carries another run's marker or
+/// none.
+pub(super) async fn owned(ctx: &PodCtx<'_>, id: &PodId, run_id: &str) -> Result<(), PodError> {
+    let marker = match ctx.client.get_pod(id).await {
+        Ok(None) => return Ok(()),
+        Ok(Some(pod)) if pod.env.is_some() => pod.run_id().map(str::to_string),
+        Ok(Some(_)) => match ctx.client.list_pods().await {
+            Ok(pods) => match pods.into_iter().find(|pod| pod.id == *id) {
+                Some(pod) => pod.run_id().map(str::to_string),
+                None => return Ok(()),
+            },
+            Err(error) => {
+                unverified(id, &error);
+                return Ok(());
+            },
+        },
+        Err(error) => {
+            unverified(id, &error);
+            return Ok(());
+        },
+    };
+    if marker.as_deref() == Some(run_id) {
+        Ok(())
+    } else {
+        Err(PodError::NotOwned {
+            pod_id: id.clone(),
+            run_id: run_id.to_string(),
+        })
+    }
+}
+
+/// Warns that the marker of pod `id` could not be read because of `error`, and
+/// that its delete goes ahead.
+fn unverified(id: &PodId, error: &ApiError) {
+    tracing::warn!("cannot read the run marker of pod {id} ({error}); deleting it as recorded");
 }
 
 /// Sends the delete of `id` and waits until the API no longer knows it. `true`

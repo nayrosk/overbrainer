@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use crate::runs::{JobKind, RECORD_FILE, RunRecord, RunState, Runs, RunsError};
 
 use super::flow::{Look, look_up_all, mark_gone};
-use super::provision::{delete_confirmed, one_line};
+use super::provision::{delete_confirmed, one_line, owned};
 use super::{
     DeleteReason, DeletedBy, Pod, PodCtx, PodError, PodId, PodRecord, PodState, Secret,
     forget_keys, host_key_run, remove,
@@ -717,19 +717,32 @@ async fn remove_strays(
     };
     for id in strays {
         tried.push(id.clone());
-        match delete_confirmed(ctx, &id).await {
-            Ok(_) => {
-                if let Err(error) = forget_stray(ctx.runs, run_id, &id) {
+        match remove_stray(ctx, run_id, &id).await {
+            Ok(forgotten) => {
+                if let Err(error) = forgotten {
                     failed.get_or_insert(error);
                 }
                 removed.push(Removed::unrecorded(id));
             },
             Err(error) => {
-                tracing::warn!("cannot confirm the deletion of stray pod {id}: {error}");
+                tracing::warn!("cannot delete stray pod {id}: {error}");
                 failed.get_or_insert(error);
             },
         }
     }
+}
+
+/// Deletes the stray pod `id` of run `run_id`, once the pod itself says it
+/// belongs to the run, then drops it from `stray_pods`. The outer error is the
+/// deletion's, the inner one dropping it from the record.
+async fn remove_stray(
+    ctx: &PodCtx<'_>,
+    run_id: &str,
+    id: &PodId,
+) -> Result<Result<(), PodError>, PodError> {
+    owned(ctx, id, run_id).await?;
+    delete_confirmed(ctx, id).await?;
+    Ok(forget_stray(ctx.runs, run_id, id))
 }
 
 /// Deletes every other listed pod carrying the run's marker, but those in
