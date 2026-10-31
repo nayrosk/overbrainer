@@ -14,7 +14,7 @@ use super::tar;
 use super::{
     CANCEL_FILE, CANCELLING_FILE, CLAIM_FILE, EXIT_FILE, ExecError, Executor, FileDigest, JOB_LOG,
     JobCommand, JobId, JobStatus, PID_FILE, Pid, cancel_script, check_job_env, job_script,
-    local_manifest, parse_status, status_script,
+    local_manifest, markers_dir, parse_status, status_script,
 };
 
 /// How often this process reaps its exited jobs while a status or cancel script runs.
@@ -82,8 +82,13 @@ impl LocalExecutor {
         check_job_env(&job.secrets)?;
         let dir = Path::new(&job.dir);
         fs::create_dir_all(dir).map_err(io_error(dir))?;
+        let markers = markers_dir(&self.workdir, job);
+        let marker_dir = match &markers {
+            Some(path) => private_dir(Path::new(path))?,
+            None => dir.to_path_buf(),
+        };
         for stale in [EXIT_FILE, CANCELLING_FILE, CANCEL_FILE, PID_FILE] {
-            remove(&dir.join(stale))?;
+            remove(&marker_dir.join(stale))?;
         }
         let log_path = dir.join(JOB_LOG);
         let log = File::create(&log_path).map_err(io_error(&log_path))?;
@@ -91,7 +96,7 @@ impl LocalExecutor {
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg(job_script(&job.script))
+            .arg(job_script(&job.script, &marker_dir.to_string_lossy()))
             .current_dir(dir)
             .stdin(Stdio::null())
             .stdout(log)
@@ -117,6 +122,7 @@ impl LocalExecutor {
             dir: job.dir.clone(),
             pid: Pid::new(raw)?,
             container: job.container.clone(),
+            markers,
         })
     }
 
@@ -161,7 +167,7 @@ impl LocalExecutor {
 
     async fn check(&self, job: &JobId) -> Result<JobStatus, ExecError> {
         let output = self
-            .run_script(status_script(&job.dir, job.pid.get()), "status")
+            .run_script(status_script(job.markers(), job.pid.get()), "status")
             .await?;
         let text = String::from_utf8_lossy(&output.stdout);
         parse_status(&text)
@@ -169,7 +175,7 @@ impl LocalExecutor {
     }
 
     async fn stop(&self, job: &JobId) -> Result<(), ExecError> {
-        let script = cancel_script(&job.dir, job.pid.get(), job.container.as_ref());
+        let script = cancel_script(job.markers(), job.pid.get(), job.container.as_ref());
         self.run_script(script, "cancel").await.map(drop)
     }
 
@@ -217,6 +223,28 @@ impl LocalExecutor {
         let (extracted, created) = tokio::join!(extract, tar::finish(create, "archive"));
         extracted.and(created)
     }
+}
+
+/// The directory `path`, created if needed with its parents, made only its
+/// owner can enter, and refused when it is a symbolic link: the job's markers
+/// go there, out of every container mount.
+fn private_dir(path: &Path) -> Result<PathBuf, ExecError> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .map_err(io_error(path))?;
+    let metadata = fs::symlink_metadata(path).map_err(io_error(path))?;
+    if !metadata.is_dir() {
+        return Err(ExecError::Command {
+            action: "spawn",
+            message: format!("{} is not a directory", path.display()),
+        });
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(io_error(path))?;
+    Ok(path.to_path_buf())
 }
 
 /// [`Executor::claim`] on this machine.

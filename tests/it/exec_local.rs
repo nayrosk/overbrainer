@@ -464,3 +464,65 @@ async fn private_parent_variables_child() -> TestResult {
     );
     Ok(())
 }
+
+/// A job in a container keeps its markers in `<workdir>/.ctl/<container>`, a
+/// directory only its owner enters, so a link the job plants at a marker's name
+/// in its own directory is never written through; status and cancel read them
+/// there, and a job recorded without that directory keeps reading its own.
+#[tokio::test]
+async fn a_container_job_keeps_its_markers_out_of_its_directory() -> TestResult {
+    use overbrainer::config::Engine;
+    use overbrainer::exec::Container;
+
+    let root = tempfile::tempdir()?;
+    let executor = LocalExecutor::new(root.path())?;
+    let dir = Path::new(executor.workdir()).join("r9");
+    let outside = root.path().join("outside");
+    fs::write(&outside, "keep\n")?;
+    let mut command = job(
+        &dir,
+        &format!(
+            "ln -s {0} exit_code.tmp; ln -s {0} job.pid.tmp; exit 4",
+            outside.display()
+        ),
+    );
+    command.container = Some(Container {
+        engine: Engine::Docker,
+        name: "overbrainer-r9".into(),
+    });
+    let started = executor.spawn(&command).await?;
+    let markers = Path::new(started.markers.as_deref().ok_or("no markers directory")?);
+    assert_eq!(
+        markers.parent(),
+        Some(&*Path::new(executor.workdir()).join(".ctl"))
+    );
+    let name = markers
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    assert!(name.is_some_and(|name| name.starts_with("overbrainer-r9-")));
+    assert_eq!(
+        wait_finished(&executor, &started).await?,
+        JobStatus::Exited(4)
+    );
+    assert_eq!(fs::read_to_string(&outside)?, "keep\n");
+    assert_eq!(fs::read_to_string(markers.join("exit_code"))?.trim(), "4");
+    assert_eq!(fs::metadata(markers)?.permissions().mode() & 0o777, 0o700);
+    assert!(!dir.join("exit_code").exists());
+
+    let old = JobId {
+        markers: None,
+        ..started
+    };
+    assert_eq!(executor.status(&old).await?, JobStatus::Lost);
+    Ok(())
+}
+
+/// A job recorded before markers moved, without `markers`, still reads back,
+/// and keeps its markers in its own directory.
+#[test]
+fn a_job_recorded_without_markers_reads_back() -> TestResult {
+    let job: JobId = serde_json::from_str(r#"{"dir": "/w/r1", "pid": 42, "container": null}"#)?;
+    assert_eq!(job.markers(), "/w/r1");
+    assert!(!serde_json::to_string(&job)?.contains("markers"));
+    Ok(())
+}

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 pub use digest::{
     FileDigest, glob_match, local_manifest, manifest_script, parse_manifest, sha256_file,
+    sha256_text,
 };
 pub use lines::{LineStream, MAX_TAIL_READ, complete_lines};
 pub use local::LocalExecutor;
@@ -211,6 +212,41 @@ pub struct JobId {
     pub pid: Pid,
     /// The container the job runs in, if any.
     pub container: Option<Container>,
+    /// Where the job's markers (`job.pid`, `exit_code`, `cancelling`,
+    /// `cancelled`) are, when not in `dir`: a directory the container never
+    /// mounts (see [`markers_dir`]). `None` for a job without a container, and
+    /// for one recorded before markers moved, which keeps them in `dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markers: Option<String>,
+}
+
+impl JobId {
+    /// The directory holding the job's markers.
+    #[must_use]
+    pub fn markers(&self) -> &str {
+        self.markers.as_deref().unwrap_or(&self.dir)
+    }
+}
+
+/// Directory of the work directory holding the markers of container jobs.
+pub const CONTROL_DIR: &str = ".ctl";
+
+/// Where the markers of `job`, started under the work directory `workdir`, go:
+/// for a job in a container, `<workdir>/.ctl/<container name>-<hash>`, out of
+/// every mount, so the job cannot plant a link where the host shell writes them.
+/// The hash, of the job's directory, keeps two jobs whose containers share a
+/// name (exports of two runs started in the same second) apart. `None` (its
+/// own directory) for a job without a container.
+#[must_use]
+pub fn markers_dir(workdir: &str, job: &JobCommand) -> Option<String> {
+    job.container.as_ref().map(|container| {
+        let hash = sha256_text(&job.dir);
+        format!(
+            "{workdir}/{CONTROL_DIR}/{}-{}",
+            container.name,
+            hash.get(..16).unwrap_or(&hash)
+        )
+    })
 }
 
 /// What a job is doing.

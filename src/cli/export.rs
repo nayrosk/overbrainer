@@ -11,7 +11,7 @@ use anyhow::{Context, bail};
 
 use super::ExportArgs;
 use super::front::Frontend;
-use super::train::{POLL, executor, prepare, secrets, warn};
+use super::train::{POLL, executor, in_workdir, prepare, secrets, warn};
 use crate::config::{EnvSource, Settings, Source, Target};
 use crate::exec::{Executor, JobRuntime, quote};
 use crate::export::{
@@ -189,17 +189,17 @@ async fn on_target(
     plan: &Plan<'_>,
     front: &Frontend,
 ) -> anyhow::Result<()> {
-    let run = plan.run;
     let runtime = JobRuntime::from_target(target)
-        .with_context(|| format!("target `{}` cannot run an export", run.target))?;
+        .with_context(|| format!("target `{}` cannot run an export", plan.run.target))?;
     // Caught from before the preparation: Ctrl-C stops it without an export.
     let mut interrupt = front.interrupt();
     let (secrets, executor) = prepare(&mut interrupt, async {
         let secrets = secrets(settings).await?;
-        let executor = executor(project_dir, &run.target, target).await?;
+        let executor = executor(project_dir, &plan.run.target, target).await?;
         Ok((secrets, executor))
     })
     .await?;
+    let run = &in_workdir(plan.run, &executor);
     let runs = Runs::new(project_dir);
     let exports = runs.exports(&run.id)?;
     let jobs = format!("{}/{EXPORTS_DIR}", run.remote_dir);

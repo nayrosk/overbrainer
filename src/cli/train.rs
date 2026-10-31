@@ -13,7 +13,7 @@ use super::reload::Reloader;
 use super::runpod_train::RunpodStart;
 use super::{TrainArgs, TrainCommand};
 use crate::config::{
-    DEFAULT_WORKDIR, Settings, Source, SshClient, Target, Training, process_client,
+    DEFAULT_WORKDIR, Runtime, Settings, Source, SshClient, Target, Training, process_client,
 };
 use crate::dataset::DataFiles;
 use crate::exec::{
@@ -22,8 +22,8 @@ use crate::exec::{
 use crate::hub::record::{HUB_DIR, PUSH_FILE};
 use crate::runpod::{PodRecord, RunpodTarget, connect_followed};
 use crate::runs::{
-    Launch, Outcome, REQUEST_POLL, RUNS_DIR, RunCtx, RunError, RunRecord, RunState, Runs,
-    STOP_LIMITS, SnapshotReason, cancel, create_on, request_snapshot, start, watch,
+    HF_CACHE_DIR, Launch, Outcome, REQUEST_POLL, RUNS_DIR, RunCtx, RunError, RunRecord, RunState,
+    Runs, STOP_LIMITS, SnapshotReason, WORK_DIR, cancel, create_on, request_snapshot, start, watch,
     with_request_watch, with_stop_fallback,
 };
 use crate::train::{Axolotl, OUTPUT_DIR, Outputs, Resume, reasoning_template_warning};
@@ -49,8 +49,12 @@ pub async fn run(
             let settings = source.load(project_dir)?;
             train(project_dir, &settings, args, front).await
         },
-        Some(TrainCommand::Attach { run_id }) => attach(project_dir, run_id, front, source).await,
-        Some(TrainCommand::Stop { run_id }) => stop(project_dir, run_id, front, source).await,
+        Some(TrainCommand::Attach { run_id }) => {
+            Box::pin(attach(project_dir, run_id, front, source)).await
+        },
+        Some(TrainCommand::Stop { run_id }) => {
+            Box::pin(stop(project_dir, run_id, front, source)).await
+        },
         Some(TrainCommand::Cancel { run_id }) => {
             cancel_run(project_dir, run_id, front, source).await
         },
@@ -606,7 +610,55 @@ pub(crate) async fn hf_token(
         .context("cannot resolve hf_token")
 }
 
-/// The executor of the local or SSH target `name`.
+/// `run` as an export or a compare of it sees it on the target of `executor`.
+/// A run on an SSH target keeps its recorded directory, even when the target's
+/// `workdir` changed since. A local run is moved by [`in_local_workdir`].
+pub(super) fn in_workdir(run: &RunRecord, executor: &AnyExecutor) -> RunRecord {
+    match executor {
+        AnyExecutor::Local(local) => in_local_workdir(run, local.workdir()),
+        AnyExecutor::Ssh(_) => run.clone(),
+    }
+}
+
+/// `run` on a local target whose executor works under `workdir`: as it is when
+/// its directory is under `workdir`, else with its directory moved to
+/// `<workdir>/<run-id>`. A local run recorded before local container jobs
+/// moved to `runs/.work/` has `runs/<run-id>` as its directory, which a
+/// container must not mount: its job then gets a directory of its own, where
+/// the model is uploaded first.
+fn in_local_workdir(run: &RunRecord, workdir: &str) -> RunRecord {
+    let mut run = run.clone();
+    if !Path::new(&run.remote_dir).starts_with(workdir) {
+        run.remote_dir = format!("{workdir}/{}", run.id);
+    }
+    run
+}
+
+/// Moves the Hugging Face cache of `runs/` into `work`, where a local container
+/// job now finds it, once, so base models are not downloaded again. Only
+/// containers use it; the tools cache stays, as native jobs still use it. A
+/// cache already in `work`, moved there meanwhile by another process too, stays;
+/// one that cannot move is filled again there, with a warning.
+fn move_caches(runs: &Path, work: &Path) {
+    let (from, to) = (runs.join(HF_CACHE_DIR), work.join(HF_CACHE_DIR));
+    if !from.is_dir() || to.exists() {
+        return;
+    }
+    match std::fs::create_dir_all(work).and_then(|()| std::fs::rename(&from, &to)) {
+        Ok(()) => {},
+        Err(_) if to.exists() => {},
+        Err(error) => warn(&format!(
+            "cannot move {} to {}: {error}; it is filled again there",
+            from.display(),
+            to.display()
+        )),
+    }
+}
+
+/// The executor of the local or SSH target `name`. A local target with the
+/// container runtime works under `runs/.work/` ([`WORK_DIR`]), so its jobs run
+/// apart from the run directories and their results come back through a
+/// verified download, as from an SSH target.
 ///
 /// # Errors
 ///
@@ -618,9 +670,18 @@ pub(super) async fn executor(
     target: &Target,
 ) -> anyhow::Result<AnyExecutor> {
     match target {
-        Target::Local { .. } => Ok(AnyExecutor::Local(LocalExecutor::new(
-            &project_dir.join(RUNS_DIR),
-        )?)),
+        Target::Local { runtime, .. } => {
+            let runs = project_dir.join(RUNS_DIR);
+            let workdir = match runtime {
+                Runtime::Docker => {
+                    let work = runs.join(WORK_DIR);
+                    move_caches(&runs, &work);
+                    work
+                },
+                Runtime::Native => runs,
+            };
+            Ok(AnyExecutor::Local(LocalExecutor::new(&workdir)?))
+        },
         Target::Ssh {
             host,
             workdir,
@@ -870,6 +931,51 @@ mod tests {
 
     /// `[hub]` section that turns the push after training on.
     const HUB_ON: &str = "\n[hub]\nafter_training = true\n";
+
+    /// The Hugging Face cache of `runs/` moves into `runs/.work/` once, a cache
+    /// already there is kept, and the tools cache stays for native jobs.
+    #[test]
+    fn the_hf_cache_moves_into_the_work_directory_once() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = project.path().join(RUNS_DIR);
+        let work = runs.join(WORK_DIR);
+        std::fs::create_dir_all(runs.join(HF_CACHE_DIR).join("models"))?;
+        std::fs::create_dir_all(runs.join(crate::runs::TOOLS_CACHE_DIR))?;
+        move_caches(&runs, &work);
+        assert!(work.join(HF_CACHE_DIR).join("models").is_dir());
+        assert!(!runs.join(HF_CACHE_DIR).exists());
+        assert!(runs.join(crate::runs::TOOLS_CACHE_DIR).is_dir());
+        std::fs::create_dir_all(runs.join(HF_CACHE_DIR).join("again"))?;
+        move_caches(&runs, &work);
+        assert!(
+            runs.join(HF_CACHE_DIR).join("again").is_dir(),
+            "the moved cache is kept"
+        );
+        Ok(())
+    }
+
+    /// An export or compare of a local run whose directory is outside the
+    /// executor's work directory gets `<workdir>/<run-id>`; one inside keeps
+    /// its own.
+    #[test]
+    fn a_job_of_an_old_local_run_gets_a_directory_in_the_workdir()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs_dir = project.path().join("runs");
+        let work = runs_dir.join(".work");
+        std::fs::create_dir_all(&work)?;
+        let runs_dir = runs_dir.to_string_lossy().into_owned();
+        let run = crate::runs::create(&Runs::new(project.path()), "demo", &runs_dir, "here")?;
+        let docker = AnyExecutor::Local(LocalExecutor::new(&work)?);
+        let moved = in_workdir(&run, &docker);
+        assert_eq!(
+            moved.remote_dir,
+            format!("{}/{}", work.to_string_lossy(), run.id)
+        );
+        let native = AnyExecutor::Local(LocalExecutor::new(Path::new(&runs_dir))?);
+        assert_eq!(in_workdir(&run, &native).remote_dir, run.remote_dir);
+        Ok(())
+    }
 
     /// [`push_after`] of [`RUN`] to `hub`: what it warns, and the lines said.
     async fn pushed_after_training(

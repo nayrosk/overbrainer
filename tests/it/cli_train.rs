@@ -31,6 +31,11 @@ if [ "$1" = merge-lora ]; then echo merged >> "$here/merged"; exit 0; fi
 [ "$1" = train ] || exit 0
 case "$mode" in
   fail) echo "boom" >&2; exit 1 ;;
+  tamper)
+    # A job that tries to rewrite what the host trusts, then trains.
+    echo '{"forged": true}' > run.json
+    ln -s "$here/outside" exit_code.tmp
+    ;;
   snapshot)
     printf '{"event": "begin", "time": 1, "max_steps": 2}\n' >> "$OVERBRAINER_METRICS"
     i=0
@@ -105,6 +110,109 @@ max_hours = 1.0
         ),
     )?;
     Ok(dir)
+}
+
+/// A `docker` that runs the container's command on the host: in the directory
+/// mounted at `/workspace/run`, with the `-e` values whose paths it rewrites
+/// from the container's to the host's. `stop` does nothing.
+const FAKE_DOCKER: &str = r#"#!/bin/sh
+[ "$1" = run ] || exit 0
+shift
+root=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --rm|--ipc=host) shift ;;
+    --name|--gpus|--ulimit|-w) shift 2 ;;
+    -v) case "$2" in *:/workspace/run) root=${2%:/workspace/run} ;; esac; shift 2 ;;
+    -e) case "$2" in *=*) export "$(printf '%s' "$2" | sed "s#/workspace/run#$root#g")" ;; esac; shift 2 ;;
+    sh) cmd=$3; break ;;
+    *) shift ;;
+  esac
+done
+cd "$root" && exec sh -c "$cmd"
+"#;
+
+/// The project of [`project`] training on a local target with the `docker`
+/// runtime, through [`FAKE_DOCKER`] and the fake `axolotl` on `PATH`.
+fn docker_project(mode: &str) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+    let dir = project(mode)?;
+    let bin = dir.path().join("venv/bin");
+    fs::write(bin.join("docker"), FAKE_DOCKER)?;
+    fs::set_permissions(bin.join("docker"), fs::Permissions::from_mode(0o755))?;
+    let config = fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+    let venv = format!("venv = \"{}\"\n", dir.path().join("venv").display());
+    fs::write(
+        dir.path().join("overbrainer.toml"),
+        config.replace(
+            &format!("runtime = \"native\"\n{venv}"),
+            "runtime = \"docker\"\n",
+        ),
+    )?;
+    Ok(dir)
+}
+
+/// [`overbrainer`] with the fake `docker` and `axolotl` of `dir` on `PATH`.
+fn overbrainer_docker(dir: &Path) -> Result<Command, Box<dyn std::error::Error>> {
+    let mut cmd = overbrainer(dir)?;
+    cmd.env("PATH", format!("{}:{PATH}", dir.join("venv/bin").display()));
+    Ok(cmd)
+}
+
+/// A local run with the `docker` runtime runs in `runs/.work/<id>`, apart from
+/// its run directory: its results come back into `runs/<id>`, its markers sit
+/// in `runs/.work/.ctl/`, and the container never sees `run.json`.
+#[test]
+fn a_local_docker_run_works_apart_from_its_run_directory() -> TestResult {
+    let dir = docker_project("ok")?;
+    overbrainer_docker(dir.path())?
+        .arg("train")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("succeeded; step 2/2"));
+    let run = only_run(dir.path())?;
+    let id = run_id(&run)?;
+    assert_eq!(
+        fs::read_to_string(run.join("output/adapter_model.safetensors"))?,
+        "adapter\n"
+    );
+    let work = dir.path().join("runs/.work").join(&id);
+    assert!(work.join("output/adapter_model.safetensors").is_file());
+    assert!(
+        !work.join("run.json").exists(),
+        "the container never sees run.json"
+    );
+    let prefix = format!("overbrainer-{id}-");
+    let markers = fs::read_dir(dir.path().join("runs/.work/.ctl"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .ok_or("no markers directory")?;
+    assert_eq!(fs::read_to_string(markers.join("exit_code"))?.trim(), "0");
+    assert!(!work.join("exit_code").exists());
+    Ok(())
+}
+
+/// A container job that rewrites `run.json` in its directory and plants links
+/// at the markers' names changes nothing the host trusts or writes.
+#[test]
+fn a_container_job_cannot_rewrite_host_state() -> TestResult {
+    let dir = docker_project("tamper")?;
+    let outside = dir.path().join("venv/outside");
+    fs::write(&outside, "keep\n")?;
+    overbrainer_docker(dir.path())?
+        .arg("train")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("succeeded; step 2/2"));
+    let run = only_run(dir.path())?;
+    assert_eq!(fs::read_to_string(&outside)?, "keep\n");
+    let record = fs::read_to_string(run.join("run.json"))?;
+    assert!(!record.contains("forged"), "the host record is untouched");
+    assert!(record.contains("\"state\": \"succeeded\""));
+    Ok(())
 }
 
 fn overbrainer(dir: &Path) -> Result<Command, Box<dyn std::error::Error>> {
