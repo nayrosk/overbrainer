@@ -125,10 +125,28 @@ pub(crate) async fn extract<R: AsyncRead + Unpin>(
     let result = extracted
         .and_then(|()| private())
         .and_then(|()| promote(&staging, dir, entries));
+    unlock_tree(&staging);
     if let Err(error) = fs::remove_dir_all(&staging) {
         tracing::warn!("cannot remove {}: {error}", staging.display());
     }
     result
+}
+
+/// Makes every directory under `root` owner-writable, as far as it can, so a
+/// mode the archive set cannot stop the removal of a staging tree that a
+/// failed extraction or a refusal left partly unvisited.
+fn unlock_tree(root: &Path) {
+    if owner_writable(root).is_err() {
+        return;
+    }
+    let Ok(read) = fs::read_dir(root) else {
+        return;
+    };
+    for child in read.filter_map(Result::ok) {
+        if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+            unlock_tree(&child.path());
+        }
+    }
 }
 
 /// A new staging directory in `dir`, `.incoming-<16 hex>`, only its owner can
@@ -592,6 +610,85 @@ mod tests {
         assert_eq!(fs::read_to_string(local.join("output/adapter.bin"))?, "w");
         assert!(!staging_left(&local)?, "{kind}");
         Ok(())
+    }
+
+    /// A refused read-only directory, which the walk never enters, leaves no
+    /// staging directory behind.
+    #[tokio::test]
+    async fn a_refused_read_only_directory_leaves_no_staging() -> TestResult {
+        let root = tempdir()?;
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("output"))?;
+        fs::write(source.join("output/f"), "f")?;
+        fs::create_dir_all(source.join("extra"))?;
+        fs::write(source.join("extra/f"), "f")?;
+        fs::set_permissions(source.join("extra"), fs::Permissions::from_mode(0o555))?;
+        let archive = archive_of(&source, &["extra", "output"]).await;
+        fs::set_permissions(source.join("extra"), fs::Permissions::from_mode(0o755))?;
+        let local = root.path().join("run");
+        let result = extract(&mut archive?.as_slice(), &local, &["output".to_string()]).await;
+        assert!(matches!(result, Err(ExecError::Protocol(_))), "{result:?}");
+        assert!(!staging_left(&local)?);
+        Ok(())
+    }
+
+    /// A hard link whose target climbs out of the staging directory, with or
+    /// without data of its own, fails the download without touching the file
+    /// it names: the local `tar` (GNU tar or bsdtar) refuses or rewrites such
+    /// a target.
+    #[tokio::test]
+    async fn a_hard_link_out_of_the_staging_directory_touches_nothing() -> TestResult {
+        let root = tempdir()?;
+        let local = root.path().join("run");
+        fs::create_dir_all(&local)?;
+        let pod = local.join("pod.json");
+        fs::write(&pod, "mine")?;
+        let mut archive = Vec::new();
+        archive.extend(ustar_header("output/", b'5', "", 0)?);
+        archive.extend(ustar_header("output/up", b'1', "../pod.json", 0)?);
+        archive.extend(ustar_header("output/data", b'1', "../pod.json", 5)?);
+        archive.extend(b"PWNED".iter().copied().chain(std::iter::repeat_n(0, 507)));
+        archive.extend(std::iter::repeat_n(0, 1024));
+        let result = extract(&mut archive.as_slice(), &local, &["output".to_string()]).await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(fs::read_to_string(&pod)?, "mine");
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::nlink(&fs::metadata(&pod)?),
+            1
+        );
+        assert!(!staging_left(&local)?);
+        Ok(())
+    }
+
+    /// A ustar header for the member `name` of type `kind`, linked to `link`,
+    /// with `size` bytes of data following it.
+    fn ustar_header(
+        name: &str,
+        kind: u8,
+        link: &str,
+        size: u64,
+    ) -> Result<[u8; 512], Box<dyn std::error::Error>> {
+        if name.len() > 100 || link.len() > 100 {
+            return Err(format!("{name} or its link is too long for a ustar header").into());
+        }
+        let mut header = [0_u8; 512];
+        let mut put = |at: usize, len: usize, value: &[u8]| {
+            let end = at + value.len().min(len);
+            header[at..end].copy_from_slice(&value[..end - at]);
+        };
+        put(0, 100, name.as_bytes());
+        put(100, 8, b"0000644\0");
+        put(108, 8, b"0000000\0");
+        put(116, 8, b"0000000\0");
+        put(124, 12, format!("{size:011o}\0").as_bytes());
+        put(136, 12, b"00000000000\0");
+        put(148, 8, b"        ");
+        put(156, 1, &[kind]);
+        put(157, 100, link.as_bytes());
+        put(257, 8, b"ustar\x0000");
+        let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        Ok(header)
     }
 
     /// A destination that is a directory, where the download sends a file,
