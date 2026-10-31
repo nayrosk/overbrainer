@@ -392,7 +392,7 @@ impl ExportRecord {
 }
 
 /// Whether `path` is a symbolic link.
-fn is_link(path: &Path) -> bool {
+pub(crate) fn is_link(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 

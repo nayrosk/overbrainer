@@ -10,16 +10,22 @@ use crate::runs::{RECORD_FILE, RunRecord, Runs, RunsError};
 /// The newest export of run `run_id` whose GGUF is a regular file in its
 /// `output/gguf/`, never reached through a link ([`ExportRecord::is_delivered_in`]):
 /// from `export.json` in the run directory (an export in the training job)
-/// and in each `exports/<id>/` (an export on its own), by `created`.
+/// and in each `exports/<id>/` (an export on its own), by `created`. A linked
+/// `exports/` or `exports/<id>/` is skipped: its record could come from
+/// anywhere.
 #[must_use]
 pub fn latest_export(runs: &Runs, run_id: &str) -> Option<ExportRecord> {
     let run_dir = runs.run_dir(run_id).ok()?;
     let mut records = Vec::new();
     records.extend(read_export(&run_dir.join(EXPORT_FILE)));
     if let Ok(exports) = runs.exports(run_id)
+        && !crate::export::is_link(exports.dir())
         && let Ok(entries) = std::fs::read_dir(exports.dir())
     {
-        for entry in entries.filter_map(Result::ok) {
+        for entry in entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        {
             records.extend(read_export(&entry.path().join(EXPORT_FILE)));
         }
     }
@@ -210,6 +216,41 @@ mod tests {
         std::fs::remove_dir_all(run_dir.join(GGUF_DIR))?;
         std::os::unix::fs::symlink(&elsewhere, run_dir.join(GGUF_DIR))?;
         assert!(latest_export(&runs, "r1").is_none(), "linked directory");
+        Ok(())
+    }
+
+    /// A newer record behind a linked `exports/<id>/` or a linked `exports/`
+    /// is never picked over the run's own export.
+    #[test]
+    fn a_linked_export_directory_is_skipped() -> TestResult {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        let run_dir = runs.run_dir("r1")?;
+        exported(&run_dir, &run_dir, "r1-Q4_K_M.gguf", "2026-10-01T10:00:00Z")?;
+        let elsewhere = project.path().join("elsewhere");
+        exported(
+            &run_dir,
+            &elsewhere.join("e1"),
+            "r1-Q8_0.gguf",
+            "2026-10-02T10:00:00Z",
+        )?;
+        let exports = run_dir.join("exports");
+        std::fs::create_dir_all(&exports)?;
+        std::os::unix::fs::symlink(elsewhere.join("e1"), exports.join("e1"))?;
+        let picked = latest_export(&runs, "r1").map(|record| record.file);
+        assert_eq!(
+            picked.as_deref(),
+            Some("output/gguf/r1-Q4_K_M.gguf"),
+            "linked job"
+        );
+        std::fs::remove_dir_all(&exports)?;
+        std::os::unix::fs::symlink(&elsewhere, &exports)?;
+        let picked = latest_export(&runs, "r1").map(|record| record.file);
+        assert_eq!(
+            picked.as_deref(),
+            Some("output/gguf/r1-Q4_K_M.gguf"),
+            "linked exports"
+        );
         Ok(())
     }
 

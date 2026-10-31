@@ -459,8 +459,9 @@ impl Runs {
     }
 
     /// Every run with a readable record, oldest first. Directories without
-    /// `run.json`, and records that fail to load ([`RunsError::Invalid`] or
-    /// [`RunsError::Io`]), are skipped and logged with `tracing::warn!`.
+    /// `run.json`, and records that fail to load ([`RunsError::Invalid`],
+    /// [`RunsError::Io`] or [`RunsError::InvalidSnapshot`]), are skipped and
+    /// logged with `tracing::warn!`.
     ///
     /// # Errors
     ///
@@ -499,7 +500,11 @@ impl Runs {
         for id in &ids {
             match self.load(id) {
                 Ok(record) => records.push(record),
-                Err(error @ (RunsError::Invalid { .. } | RunsError::Io { .. })) => {
+                Err(
+                    error @ (RunsError::Invalid { .. }
+                    | RunsError::Io { .. }
+                    | RunsError::InvalidSnapshot { .. }),
+                ) => {
                     skipped(id, &error);
                 },
                 Err(error) => return Err(error),
@@ -688,6 +693,29 @@ pub(crate) mod tests {
                 "{checkpoint}"
             );
         }
+        Ok(())
+    }
+
+    /// A record with a forged snapshot is skipped by the listing, which keeps
+    /// every other run.
+    #[test]
+    fn list_skips_a_record_with_a_forged_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let runs = Runs::new(project.path());
+        runs.save(&record("20260922-143005-aaaa"))?;
+        let mut forged = record("20260922-143005-bbbb");
+        forged.state = RunState::Stopped;
+        forged.snapshot = Some(Snapshot {
+            checkpoint: "/etc".into(),
+            step: 120,
+            reason: SnapshotReason::Deadline,
+        });
+        runs.save(&forged)?;
+        let mut skipped = Vec::new();
+        let listed = runs.list_with(|id, _| skipped.push(id.to_string()))?;
+        let ids: Vec<&str> = listed.iter().map(|record| record.id.as_str()).collect();
+        assert_eq!(ids, ["20260922-143005-aaaa"]);
+        assert_eq!(skipped, ["20260922-143005-bbbb"]);
         Ok(())
     }
 
