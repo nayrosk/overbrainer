@@ -610,13 +610,23 @@ pub(crate) async fn hf_token(
         .context("cannot resolve hf_token")
 }
 
-/// `run` as an export or a compare of it sees it on a target whose executor
-/// works under `workdir`: as it is when its directory is under `workdir`, else
-/// with its directory moved to `<workdir>/<run-id>`. A local run recorded
-/// before local container jobs moved to `runs/.work/` has `runs/<run-id>` as
-/// its directory, which a container must not mount: its job then gets a
-/// directory of its own, where the model is uploaded first.
-pub(super) fn in_workdir(run: &RunRecord, workdir: &str) -> RunRecord {
+/// `run` as an export or a compare of it sees it on the target of `executor`.
+/// A run on an SSH target keeps its recorded directory, even when the target's
+/// `workdir` changed since. A local run is moved by [`in_local_workdir`].
+pub(super) fn in_workdir(run: &RunRecord, executor: &AnyExecutor) -> RunRecord {
+    match executor {
+        AnyExecutor::Local(local) => in_local_workdir(run, local.workdir()),
+        AnyExecutor::Ssh(_) => run.clone(),
+    }
+}
+
+/// `run` on a local target whose executor works under `workdir`: as it is when
+/// its directory is under `workdir`, else with its directory moved to
+/// `<workdir>/<run-id>`. A local run recorded before local container jobs
+/// moved to `runs/.work/` has `runs/<run-id>` as its directory, which a
+/// container must not mount: its job then gets a directory of its own, where
+/// the model is uploaded first.
+fn in_local_workdir(run: &RunRecord, workdir: &str) -> RunRecord {
     let mut run = run.clone();
     if !Path::new(&run.remote_dir).starts_with(workdir) {
         run.remote_dir = format!("{workdir}/{}", run.id);
@@ -944,17 +954,26 @@ mod tests {
         Ok(())
     }
 
-    /// An export or compare of a run whose directory is outside the
+    /// An export or compare of a local run whose directory is outside the
     /// executor's work directory gets `<workdir>/<run-id>`; one inside keeps
     /// its own.
     #[test]
     fn a_job_of_an_old_local_run_gets_a_directory_in_the_workdir()
     -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
-        let run = crate::runs::create(&Runs::new(project.path()), "demo", "/p/runs", "here")?;
-        let moved = in_workdir(&run, "/p/runs/.work");
-        assert_eq!(moved.remote_dir, format!("/p/runs/.work/{}", run.id));
-        assert_eq!(in_workdir(&run, "/p/runs").remote_dir, run.remote_dir);
+        let runs_dir = project.path().join("runs");
+        let work = runs_dir.join(".work");
+        std::fs::create_dir_all(&work)?;
+        let runs_dir = runs_dir.to_string_lossy().into_owned();
+        let run = crate::runs::create(&Runs::new(project.path()), "demo", &runs_dir, "here")?;
+        let docker = AnyExecutor::Local(LocalExecutor::new(&work)?);
+        let moved = in_workdir(&run, &docker);
+        assert_eq!(
+            moved.remote_dir,
+            format!("{}/{}", work.to_string_lossy(), run.id)
+        );
+        let native = AnyExecutor::Local(LocalExecutor::new(Path::new(&runs_dir))?);
+        assert_eq!(in_workdir(&run, &native).remote_dir, run.remote_dir);
         Ok(())
     }
 

@@ -368,7 +368,7 @@ async fn on_target(
     )
     .await?;
     let plan = &Plan {
-        run: in_workdir(&plan.run, executor.workdir()),
+        run: in_workdir(&plan.run, &executor),
         ..plan.clone()
     };
     let run = &plan.run;

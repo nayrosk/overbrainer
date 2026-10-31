@@ -199,7 +199,7 @@ async fn on_target(
         Ok((secrets, executor))
     })
     .await?;
-    let run = &in_workdir(plan.run, executor.workdir());
+    let run = &in_workdir(plan.run, &executor);
     let runs = Runs::new(project_dir);
     let exports = runs.exports(&run.id)?;
     let jobs = format!("{}/{EXPORTS_DIR}", run.remote_dir);
