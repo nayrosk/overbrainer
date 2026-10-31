@@ -913,10 +913,10 @@ fn ollama_part(kind: OllamaPart, text: &str) -> bool {
 /// Whether `name` is a valid Ollama model name, `[host/][namespace/]model[:tag]`,
 /// split and checked as Ollama's `types/model/name.go` does: the tag after
 /// the last `:` when it comes after the last `/`, the model after the last
-/// `/`, then the namespace, then the host (an optional `scheme://` before it
-/// is dropped). Each part present must be valid (see `ollama_part`): an
-/// empty one, such as in `a//b` or `a/`, is refused. Such a name is also
-/// safe on a command line.
+/// `/`, then the namespace, then the host (an optional `http://` or `https://`
+/// before it is dropped; any other scheme is refused). Each part present must
+/// be valid (see `ollama_part`): an empty one, such as in `a//b` or `a/`, is
+/// refused. Such a name is also safe on a command line.
 #[must_use]
 pub fn is_ollama_name(name: &str) -> bool {
     let (rest, tag) = match (name.rfind(':'), name.rfind('/')) {
@@ -934,7 +934,12 @@ pub fn is_ollama_name(name: &str) -> bool {
         Some(None) => (None, rest),
         Some(Some((host, namespace))) => (Some(host), Some(namespace)),
     };
-    let host = host.map(|host| host.split_once("://").map_or(host, |(_, host)| host));
+    let host = match host.map(|host| host.split_once("://")) {
+        Some(Some(("http" | "https", host))) => Some(host),
+        Some(Some(_)) => return false,
+        Some(None) => host,
+        None => None,
+    };
     ollama_part(OllamaPart::Model, model)
         && tag.is_none_or(|tag| ollama_part(OllamaPart::Tag, tag))
         && namespace.is_none_or(|namespace| ollama_part(OllamaPart::Namespace, namespace))

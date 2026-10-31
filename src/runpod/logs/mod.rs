@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::logging::one_line;
+
 pub use self::kept::{
     Capture, keep_file, kept_cursor, kept_lines, open_kept, parse_kept_line, read_kept,
     read_kept_from,
@@ -166,27 +168,6 @@ fn valid_ts(ts: &str) -> bool {
     head && bytes[shape.len()..]
         .iter()
         .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b':' | b'+' | b'-' | b'Z'))
-}
-
-/// `text` on one line: a newline and a carriage return are written `\n` and
-/// `\r`, other control characters but tab, and the bidirectional overrides
-/// and isolates, `\u{..}`.
-#[must_use]
-pub fn one_line(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push('\t'),
-            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {
-                escaped.extend(c.escape_unicode());
-            },
-            c if c.is_control() => escaped.extend(c.escape_unicode()),
-            c => escaped.push(c),
-        }
-    }
-    escaped
 }
 
 /// What to ask of the log stream.

@@ -11,6 +11,7 @@ use crate::dataset::{Appender, Id, Question, Rejected, Subtopic, read, rewrite};
 use crate::dedup::Deduplicator;
 use crate::events::{Event, Stage, StageStats};
 use crate::llm::{LlmClient, LlmError, Usage};
+use crate::logging::one_line;
 use crate::prompts;
 
 /// One subtopic's fill, boxed so the pool holds a concrete future type (see
@@ -326,10 +327,12 @@ impl<C: LlmClient> Filler<'_, C> {
     }
 }
 
+/// Warns that the subtopic of `slot` stopped short of its target, its name, from
+/// the dataset, written on one line.
 fn short<D>(slot: &Slot<'_, D>) {
     tracing::warn!(
         "subtopic `{}`: stopped at {} of {} questions, the generator kept repeating itself",
-        slot.subtopic.name,
+        one_line(&slot.subtopic.name),
         slot.accepted.len(),
         slot.target
     );

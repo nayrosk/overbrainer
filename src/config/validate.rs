@@ -1815,6 +1815,8 @@ mod tests {
         Ok(())
     }
 
+    /// Ollama names follow Ollama's own rules, and only `http` and `https`
+    /// schemes are accepted before the host.
     #[test]
     fn ollama_names_follow_ollama_s_rules() {
         for name in [
@@ -1825,6 +1827,7 @@ mod tests {
             "_x",
             "registry.ollama.ai/library/mentor:q4",
             "https://localhost:11434/me/mentor:v1.2",
+            "http://localhost:11434/me/mentor",
         ] {
             assert!(is_ollama_name(name), "{name}");
         }
@@ -1844,6 +1847,10 @@ mod tests {
             "a/b/c/d",
             "my.ns/mentor",
             "a/b:c:d",
+            "$(id)://host/me/mentor",
+            "`id`://host/me/mentor",
+            "ftp://host/me/mentor",
+            "://host/me/mentor",
         ] {
             assert!(!is_ollama_name(name), "{name}");
         }

@@ -17,7 +17,7 @@ OVERBRAINER_PROVIDERS__OPENROUTER__API_KEY=sk-...
 OVERBRAINER_PIPELINE__CONCURRENCY=16
 ```
 
-Precedence: environment, then `overbrainer.toml`, then defaults. A `.env` file in the project directory is loaded if present; `init` adds it to `.gitignore`. A variable exported in the shell wins over the same key in `.env`. A syntax error in `.env` stops the command, naming the line only, never its content.
+Precedence: environment, then `overbrainer.toml`, then defaults. A `.env` file in the project directory is loaded if present; `init` adds it to `.gitignore`. A variable exported in the shell wins over a variable of the same name in `.env`. Names are matched without regard to case. Two variables for the same key spelled with different cases, such as `OVERBRAINER_PIPELINE__CONCURRENCY` and `overbrainer_pipeline__concurrency`, stop the command. Keep one spelling, in upper case. A syntax error in `.env` stops the command, naming the line only, never its content.
 
 These keys are accepted from the environment only, and `overbrainer.toml` is rejected if it sets them:
 

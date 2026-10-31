@@ -19,7 +19,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -55,23 +55,63 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 type FloatCounter = Counter<f64, AtomicU64>;
 type FloatGauge = Gauge<f64, AtomicU64>;
 
+/// A label value overbrainer does not choose (a model, a run ID, a GPU name, a
+/// mount), written escaped as the `OpenMetrics` text format requires: a backslash,
+/// a double quote and a newline become `\\`, `\"` and `\n`. `prometheus-client`
+/// writes a `String` label value as it is, so one such character would end the
+/// value early and break the scrape.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct Text(String);
+
+impl From<&str> for Text {
+    /// `text` as a label value.
+    fn from(text: &str) -> Self {
+        Self(text.to_string())
+    }
+}
+
+impl From<String> for Text {
+    /// `text` as a label value.
+    fn from(text: String) -> Self {
+        Self(text)
+    }
+}
+
+impl EncodeLabelValue for Text {
+    /// Writes the value escaped.
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), fmt::Error> {
+        use fmt::Write as _;
+        for c in self.0.chars() {
+            match c {
+                '\\' => encoder.write_str("\\\\")?,
+                '"' => encoder.write_str("\\\"")?,
+                '\n' => encoder.write_str("\\n")?,
+                c => encoder.write_char(c)?,
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ItemLabels {
     stage: &'static str,
     result: &'static str,
 }
 
+/// The labels of a token counter: the stage, the model and the direction.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct TokenLabels {
     stage: &'static str,
-    model: String,
+    model: Text,
     direction: &'static str,
 }
 
+/// The labels of a series per stage and model.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ModelLabels {
     stage: &'static str,
-    model: String,
+    model: Text,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -79,14 +119,16 @@ struct StageLabels {
     stage: &'static str,
 }
 
+/// The label of a series per run.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct RunLabels {
-    run_id: String,
+    run_id: Text,
 }
 
+/// The labels of a run phase series.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct PhaseLabels {
-    run_id: String,
+    run_id: Text,
     phase: &'static str,
 }
 
@@ -293,7 +335,7 @@ impl Metrics {
             self.tokens
                 .get_or_create(&TokenLabels {
                     stage,
-                    model: model.to_string(),
+                    model: model.into(),
                     direction,
                 })
                 .inc_by(count);
@@ -302,7 +344,7 @@ impl Metrics {
             self.cost
                 .get_or_create(&ModelLabels {
                     stage,
-                    model: model.to_string(),
+                    model: model.into(),
                 })
                 .inc_by(cost);
         }
@@ -404,9 +446,10 @@ impl Metrics {
         })
     }
 
+    /// Sets the training figures `metric` reports for run `run_id`.
     fn train(&self, run_id: &str, metric: &TrainMetric) {
         let labels = RunLabels {
-            run_id: run_id.to_string(),
+            run_id: run_id.into(),
         };
         self.train_step
             .get_or_create(&labels)
@@ -433,7 +476,7 @@ impl Metrics {
         for name in Phase::NAMES {
             self.train_phase
                 .get_or_create(&PhaseLabels {
-                    run_id: run_id.to_string(),
+                    run_id: run_id.into(),
                     phase: name,
                 })
                 .set(i64::from(name == phase.name()));
@@ -444,7 +487,7 @@ impl Metrics {
     fn forget_phase(&self, run_id: &str) {
         for name in Phase::NAMES {
             self.train_phase.remove(&PhaseLabels {
-                run_id: run_id.to_string(),
+                run_id: run_id.into(),
                 phase: name,
             });
         }
@@ -459,7 +502,11 @@ impl Metrics {
         // A run removed since the last scrape leaves no series behind.
         self.spend.clear();
         for (run_id, spend) in spends {
-            self.spend.get_or_create(&RunLabels { run_id }).set(spend);
+            self.spend
+                .get_or_create(&RunLabels {
+                    run_id: run_id.into(),
+                })
+                .set(spend);
         }
     }
 
@@ -1055,6 +1102,50 @@ mod tests {
              @df.root\nh\nnas:/export 10 5 5 50% /\n",
         );
         crate::system::parse(&output, UNIX_EPOCH + Duration::from_secs(1000), None)
+    }
+
+    /// A GPU name with a double quote or a backslash, as the target reports it,
+    /// is escaped in its label and leaves the exposition well formed.
+    #[test]
+    fn a_gpu_name_is_escaped_in_its_label() -> TestResult {
+        let metrics = Metrics::new(&[]);
+        metrics.event(
+            1,
+            &Event::RunWatched {
+                run_id: "r1".into(),
+                job: None,
+            },
+        );
+        let output = "@gpu\n0, A \"B\" \\ C, 50, 1024, 2048, 60, 300, 700\n";
+        let sample = crate::system::parse(output, UNIX_EPOCH, None);
+        metrics.event(1, &Event::System(sample));
+        let text = metrics.encode()?;
+        assert!(
+            text.contains(r#"overbrainer_gpu_info{run_id="r1",gpu="0",name="A \"B\" \\ C"} 1"#),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    /// A newline in a label value is written `\n`, so a series stays on one line.
+    #[test]
+    fn a_newline_in_a_label_is_escaped() -> TestResult {
+        let mut registry = Registry::default();
+        let family = Family::<ModelLabels, Gauge>::default();
+        registry.register("t", "test", family.clone());
+        family
+            .get_or_create(&ModelLabels {
+                stage: "answers",
+                model: "a\nb".into(),
+            })
+            .set(1);
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry)?;
+        assert!(
+            text.contains(r#"t{stage="answers",model="a\nb"} 1"#),
+            "{text}"
+        );
+        Ok(())
     }
 
     /// The target machine's figures show in base units until the bus closes.

@@ -81,6 +81,10 @@ pub enum ExportError {
     /// The job succeeded, but left no GGUF file.
     #[error("the export left no GGUF file in {}", .0.display())]
     NoGguf(PathBuf),
+    /// The GGUF file to deliver is not one `.gguf` file name: it holds a
+    /// directory, a parent component or is absolute.
+    #[error("{0:?} is not a GGUF file name")]
+    NotAFileName(String),
 }
 
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> ExportError + '_ {
@@ -375,9 +379,13 @@ pub struct Delivered {
 ///
 /// # Errors
 ///
-/// Returns [`ExportError::NoGguf`] when the job left no `file`, and
+/// Returns [`ExportError::NotAFileName`] when `file` is not a single `.gguf`
+/// file name, [`ExportError::NoGguf`] when the job left no `file`, and
 /// [`ExportError::Io`] when a file cannot be moved, read or written.
 pub fn deliver(run_dir: &Path, job_dir: &Path, file: &str) -> Result<Delivered, ExportError> {
+    if !is_gguf_name(file) {
+        return Err(ExportError::NotAFileName(file.to_string()));
+    }
     let gguf_dir = run_dir.join(GGUF_DIR);
     let gguf = gguf_dir.join(file);
     if job_dir != run_dir {
@@ -500,6 +508,18 @@ pub fn modelfile_text(file: &str, num_ctx: Option<u32>) -> String {
     text
 }
 
+/// Whether `file` is one `.gguf` file name: a single normal path component, so
+/// joining it to a directory stays in that directory.
+fn is_gguf_name(file: &str) -> bool {
+    let mut components = Path::new(file).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(name)), None) if name == file
+    ) && Path::new(file)
+        .extension()
+        .is_some_and(|extension| extension == "gguf")
+}
+
 /// What became of `ollama create`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ollama {
@@ -512,12 +532,14 @@ pub enum Ollama {
 }
 
 /// The command creating the Ollama model `name` from the Modelfile in the
-/// directory `gguf_dir`.
+/// directory `gguf_dir`. Both are shell-quoted, so the command is safe to paste
+/// whatever `name` holds.
 #[must_use]
 pub fn ollama_command(gguf_dir: &Path, name: &str) -> String {
     format!(
-        "cd {} && ollama create {name} -f {MODELFILE}",
-        crate::exec::quote(&gguf_dir.to_string_lossy())
+        "cd {} && ollama create {} -f {MODELFILE}",
+        crate::exec::quote(&gguf_dir.to_string_lossy()),
+        crate::exec::quote(name)
     )
 }
 

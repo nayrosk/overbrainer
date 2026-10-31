@@ -461,6 +461,72 @@ fn type_errors_name_the_key_but_not_the_value() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// A rejected value that itself contains `expected` stays out of the message,
+/// for an enum set from env and for a number set in the file.
+#[test]
+fn a_value_containing_expected_is_not_echoed() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TARGETS}"))?;
+    for value in [
+        "expectedsk-leak-7",
+        "x, expected sk-leak-7",
+        "expected , expected sk-leak-7",
+    ] {
+        let error = load(
+            dir.path(),
+            env(&[("OVERBRAINER_PROVIDERS__NANOGPT__PROTOCOL", value)]),
+        );
+        let Err(error @ ConfigError::Parse(_)) = error else {
+            return Err("expected a parse error".into());
+        };
+        assert!(
+            !error.to_string().contains("sk-leak-7"),
+            "the rejected value leaked into the message"
+        );
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "the message says what is wrong"
+        );
+    }
+    Ok(())
+}
+
+/// Two variables that differ only by case are refused, by name only, instead
+/// of one winning at random once their names are lower-cased, configuration
+/// keys and the variables read outside the configuration alike.
+#[test]
+fn variables_differing_only_by_case_are_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TARGETS}"))?;
+    let error = load(
+        dir.path(),
+        env(&[
+            ("OVERBRAINER_PIPELINE__CONCURRENCY", "4"),
+            ("overbrainer_pipeline__concurrency", "8"),
+        ]),
+    );
+    let Err(ConfigError::Invalid(problems)) = error else {
+        return Err("expected an invalid configuration".into());
+    };
+    assert_eq!(
+        problems,
+        [
+            "OVERBRAINER_PIPELINE__CONCURRENCY, overbrainer_pipeline__concurrency set the same \
+             key: keep one spelling, in upper case"
+        ]
+    );
+    let error = load(
+        dir.path(),
+        env(&[
+            ("OVERBRAINER_SSH_CLIENT", "openssh"),
+            ("Overbrainer_Ssh_Client", "builtin"),
+        ]),
+    );
+    assert!(
+        matches!(error, Err(ConfigError::Invalid(_))),
+        "a variable read outside the configuration is checked too"
+    );
+    Ok(())
+}
+
 #[test]
 fn toml_syntax_errors_never_echo_source() -> Result<(), Box<dyn std::error::Error>> {
     let malformed_toml = r#"

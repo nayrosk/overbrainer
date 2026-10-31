@@ -24,6 +24,27 @@ pub const DEFAULT_FILTER: &str = "overbrainer=info,vaultrs=off,rustify=off,warn"
 /// Lines the terminal UI keeps in memory; older ones are dropped.
 pub const LOG_LINES: usize = 5000;
 
+/// `text` on one line. A newline becomes `\n` and a carriage return `\r`.
+/// Other control characters, except tab, the Unicode line and paragraph
+/// separators, and the bidirectional overrides and isolates become `\u{..}`.
+#[must_use]
+pub fn one_line(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push('\t'),
+            '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {
+                escaped.extend(c.escape_unicode());
+            },
+            c if c.is_control() => escaped.extend(c.escape_unicode()),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 /// Where logs go.
 #[derive(Debug, Clone)]
 pub enum LogMode {
@@ -302,6 +323,16 @@ mod tests {
 
     fn messages(lines: &[LogLine]) -> Vec<&str> {
         lines.iter().map(|line| line.message.as_str()).collect()
+    }
+
+    /// `one_line` escapes line breaks, terminal controls and bidirectional
+    /// overrides, and keeps tabs and other text as they are.
+    #[test]
+    fn one_line_escapes_what_would_break_or_restyle_a_line() {
+        assert_eq!(
+            one_line("a\nb\rc\td\u{1b}[2J\u{202E}\u{2028}\u{2029}é"),
+            "a\\nb\\rc\td\\u{1b}[2J\\u{202e}\\u{2028}\\u{2029}é"
+        );
     }
 
     #[test]
