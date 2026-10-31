@@ -922,3 +922,18 @@ fn an_invalid_metrics_address_is_refused_with_its_path() -> Result<(), Box<dyn s
     }
     Ok(())
 }
+
+/// `export.trust_remote_code` can be turned on from the environment, its text
+/// read as a boolean.
+#[test]
+fn trust_remote_code_comes_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = project(&format!("{BASE}{TARGETS}"))?;
+    let settings = load(dir.path(), env(&[]))?;
+    assert!(!settings.export.trust_remote_code);
+    let settings = load(
+        dir.path(),
+        env(&[("OVERBRAINER_EXPORT__TRUST_REMOTE_CODE", "true")]),
+    )?;
+    assert!(settings.export.trust_remote_code);
+    Ok(())
+}

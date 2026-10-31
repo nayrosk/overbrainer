@@ -184,11 +184,12 @@ impl<'a> Axolotl<'a> {
 
     /// The same trainer exporting the model of run `run_id` to GGUF at the
     /// end of its job, quantized to `quantize`, after the merge (and, like
-    /// it, not once the job stopped with a snapshot).
+    /// it, not once the job stopped with a snapshot); `trust_code` allows a
+    /// model that ships its own Python code (`export.trust_remote_code`).
     #[must_use]
-    pub fn exporting(self, run_id: &str, quantize: &str) -> Self {
+    pub fn exporting(self, run_id: &str, quantize: &str, trust_code: bool) -> Self {
         Self {
-            export: Some(ExportJob::in_job(run_id, quantize)),
+            export: Some(ExportJob::in_job(run_id, quantize).trusting_code(trust_code)),
             ..self
         }
     }
@@ -715,6 +716,8 @@ mod tests {
         Ok(())
     }
 
+    /// An exporting trainer exports after the merge, and passes whether a model
+    /// with its own code may be exported.
     #[test]
     fn an_exporting_trainer_exports_after_the_merge() -> Result<(), Box<dyn std::error::Error>> {
         let training: Training = serde_json::from_value(json!({
@@ -727,7 +730,7 @@ mod tests {
         let plain = Axolotl::new(&training, &files);
         assert_eq!(plain.commands().len(), 2);
         assert!(!plain.caches_tools());
-        let trainer = plain.exporting("r1", "Q8_0");
+        let trainer = plain.exporting("r1", "Q8_0", false);
         let commands = trainer.commands();
         assert_eq!(commands.len(), 3);
         assert_eq!(commands[1][1], "merge-lora");
@@ -737,6 +740,10 @@ mod tests {
         let env = trainer.env("/w/r1");
         assert!(env.contains(&("OVERBRAINER_EXPORT_QUANTIZE".into(), "Q8_0".into())));
         assert!(env.contains(&(METRICS_ENV.into(), "/w/r1/metrics.jsonl".into())));
+        assert!(env.contains(&("OVERBRAINER_EXPORT_TRUST_CODE".into(), "0".into())));
+        let trusting = Axolotl::new(&training, &files).exporting("r1", "Q8_0", true);
+        let env = trusting.env("/w/r1");
+        assert!(env.contains(&("OVERBRAINER_EXPORT_TRUST_CODE".into(), "1".into())));
         let run = tempfile::tempdir()?;
         trainer.prepare(run.path(), "/w/r1")?;
         assert!(run.path().join(crate::export::SCRIPT_FILE).is_file());

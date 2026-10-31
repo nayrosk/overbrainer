@@ -42,6 +42,9 @@ pub(super) struct Plan<'a> {
     pub(super) quantize: &'a str,
     /// The Ollama model to create, if any.
     pub(super) ollama: Option<&'a str>,
+    /// Whether a model that ships its own Python code may be exported
+    /// (`export.trust_remote_code`).
+    pub(super) trust_code: bool,
 }
 
 /// Runs `overbrainer export`.
@@ -88,6 +91,7 @@ pub(super) async fn run(
         model: &model,
         quantize: &quantize,
         ollama: ollama.as_deref(),
+        trust_code: settings.export.trust_remote_code,
     };
     if let Some(spec) = RunpodTarget::from_target(target) {
         return Box::pin(super::runpod_train::export(
@@ -206,7 +210,8 @@ async fn on_target(
         "{}/{EXPORTS_DIR}/{id}/{SCRIPT_FILE}",
         runtime.root(&run.remote_dir)
     );
-    let job = ExportJob::in_place(&run.id, plan.quantize, plan.model, script);
+    let job = ExportJob::in_place(&run.id, plan.quantize, plan.model, script)
+        .trusting_code(plan.trust_code);
     let guard = front.open_bus();
     let ctx = RunCtx {
         runs: &exports,
@@ -656,6 +661,7 @@ mod tests {
         Ok(())
     }
 
+    /// A delivery that fails still removes what was staged for the job.
     #[test]
     fn a_delivery_that_fails_still_removes_what_was_staged()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -675,6 +681,7 @@ mod tests {
             model: "output",
             quantize: "Q4_K_M",
             ollama: None,
+            trust_code: false,
         };
         let delivery = Delivery {
             runs: &runs,

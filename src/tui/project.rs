@@ -675,6 +675,7 @@ fn export_value(export: &crate::config::Export, field: &str) -> Option<String> {
         "after_training" => Some(export.after_training.to_string()),
         "quantize" => Some(export.quantize.clone()),
         "ollama_name" => export.ollama_name.clone(),
+        "trust_remote_code" => Some(export.trust_remote_code.to_string()),
         _ => None,
     }
 }

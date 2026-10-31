@@ -112,6 +112,9 @@ pub struct ExportJob {
     /// into the job directory before it is uploaded, when the job runs where
     /// the run's files are not.
     stage: Option<(PathBuf, String)>,
+    /// Whether a model that ships its own Python code may be exported
+    /// (`export.trust_remote_code`).
+    trust_code: bool,
 }
 
 impl ExportJob {
@@ -126,6 +129,7 @@ impl ExportJob {
             config: CONFIG_FILE.to_string(),
             script: SCRIPT_FILE.to_string(),
             stage: None,
+            trust_code: false,
         }
     }
 
@@ -142,6 +146,7 @@ impl ExportJob {
             config: format!("../../{CONFIG_FILE}"),
             script,
             stage: None,
+            trust_code: false,
         }
     }
 
@@ -158,6 +163,17 @@ impl ExportJob {
             config: CONFIG_FILE.to_string(),
             script: SCRIPT_FILE.to_string(),
             stage: Some((run_dir.to_path_buf(), model.to_string())),
+            trust_code: false,
+        }
+    }
+
+    /// The same export, allowed or not (`trust`) to convert a model that ships
+    /// its own Python code, as `export.trust_remote_code` says.
+    #[must_use]
+    pub fn trusting_code(self, trust: bool) -> Self {
+        Self {
+            trust_code: trust,
+            ..self
         }
     }
 
@@ -197,6 +213,11 @@ impl ExportJob {
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.clone()))
         .collect();
+        let trust = if self.trust_code { "1" } else { "0" };
+        env.push((
+            "OVERBRAINER_EXPORT_TRUST_CODE".to_string(),
+            trust.to_string(),
+        ));
         env.extend(llama_cpp::env());
         env
     }
