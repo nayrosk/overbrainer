@@ -117,7 +117,7 @@ export: Ollama model mentor created: `ollama run 'mentor'`
 | `after_training` | `false` | Export at the end of each training job, after the merge. |
 | `quantize` | `Q4_K_M` | `Q4_K_M`, `Q4_K_S`, `Q5_K_M`, `Q5_K_S`, `Q6_K`, `Q8_0`, `Q3_K_M`, `Q2_K`, `F16` or `BF16`. `--quantize` overrides it. |
 | `ollama_name` | none | Ollama model `ollama create` makes from the Modelfile, when `ollama` is on `PATH`: `[host/][namespace/]model[:tag]`, with an optional `http://` or `https://` before the host. `--ollama` overrides it. |
-| `trust_remote_code` | `false` | Export a model that ships its own Python code (an `auto_map` in `config.json`, `tokenizer_config.json` or a processor config, or top-level `.py` files; for an adapter, checked before the merge). The converter may run that code, so such an export is refused unless this is on. |
+| `trust_remote_code` | `false` | Export a model that ships its own Python code (an `auto_map` in `config.json`, `tokenizer_config.json` or a processor config, or top-level `.py` files; for an adapter, checked before the merge). The converter may run that code, so such an export is refused unless this is on. The adapter merge also loads the base model with this value, not the training's `trust_remote_code`. |
 
 ### llama.cpp
 

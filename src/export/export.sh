@@ -81,12 +81,12 @@ elif [ -f "$model/adapter_config.json" ]; then
     # Before the merge, which costs time: the adapter holds the tokenizer files.
     check_code "$model"
     say "merging the adapter in $model into its base model"
-    python3 - "$config" "$work" "$model" <<'EOF'
+    python3 - "$config" "$work" "$model" "${OVERBRAINER_EXPORT_TRUST_CODE:-0}" <<'EOF'
 import sys
 
 import yaml
 
-source, work, adapter = sys.argv[1:4]
+source, work, adapter, trust = sys.argv[1:5]
 with open(source, encoding="utf-8") as file:
     config = yaml.safe_load(file)
 # Only the merge is run: no plugin, no resume, no push.
@@ -94,6 +94,9 @@ for key in ("plugins", "resume_from_checkpoint", "hub_model_id", "hub_strategy")
     config.pop(key, None)
 config["output_dir"] = work
 config["lora_model_dir"] = adapter
+# Loading the base model for the merge may run its code: export.trust_remote_code
+# decides, never the training's own setting.
+config["trust_remote_code"] = trust == "1"
 with open(f"{work}/merge.yaml", "w", encoding="utf-8") as file:
     yaml.safe_dump(config, file)
 EOF

@@ -498,6 +498,9 @@ fn a_full_model_is_converted_quantized_and_the_tools_cached() -> TestResult {
     Ok(())
 }
 
+/// An adapter is merged into its base before the conversion, with
+/// `trust_remote_code` from the export setting whatever the training had, and
+/// an F16 export is not quantized.
 #[test]
 fn an_adapter_is_merged_first_and_f16_is_not_quantized() -> TestResult {
     if !tools_available() {
@@ -509,7 +512,7 @@ fn an_adapter_is_merged_first_and_f16_is_not_quantized() -> TestResult {
     std::fs::write(run.join("output/adapter_config.json"), "{}")?;
     std::fs::write(
         run.join("axolotl.yaml"),
-        r#"{"base_model": "m", "plugins": ["p"], "output_dir": "/w/r1/output"}"#,
+        r#"{"base_model": "m", "plugins": ["p"], "output_dir": "/w/r1/output", "trust_remote_code": true}"#,
     )?;
     // F16 needs no llama-quantize: its digest is never checked.
     let output = fixture.export("F16", |command| {
@@ -528,9 +531,19 @@ fn an_adapter_is_merged_first_and_f16_is_not_quantized() -> TestResult {
             "base_model": "m",
             "output_dir": "export-work",
             "lora_model_dir": "output",
+            "trust_remote_code": false,
         })
     );
     assert!(!run.join("export-work").exists());
+    let trusted = fixture.export("F16", |command| {
+        command
+            .env("OVERBRAINER_LLAMA_CPP_UBUNTU_X64_SHA256", "0")
+            .env("OVERBRAINER_EXPORT_TRUST_CODE", "1");
+    })?;
+    assert!(trusted.status.success(), "{}", text(&trusted));
+    let merge: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run.join("seen-merge.yaml"))?)?;
+    assert_eq!(merge["trust_remote_code"], serde_json::json!(true));
     Ok(())
 }
 
