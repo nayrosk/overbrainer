@@ -184,7 +184,10 @@ pub(super) async fn train(
             report: &report,
             cancel_on_interrupt: false,
         };
-        anyhow::Ok((id, job.run(&mut interrupt, record, keep, secrets).await))
+        anyhow::Ok((
+            id,
+            Box::pin(job.run(&mut interrupt, record, keep, secrets)).await,
+        ))
     }
     .await;
     session.close().await;
@@ -258,7 +261,7 @@ pub(super) async fn export(
             report: &report,
             cancel_on_interrupt: true,
         };
-        job.run(&mut interrupt, record, keep, secrets).await
+        Box::pin(job.run(&mut interrupt, record, keep, secrets)).await
     }
     .await;
     session.close().await;
@@ -329,7 +332,7 @@ pub(super) async fn compare(
             report: &report,
             cancel_on_interrupt: true,
         };
-        let ran = job.run(&mut interrupt, record, keep, Vec::new()).await;
+        let ran = Box::pin(job.run(&mut interrupt, record, keep, Vec::new())).await;
         // The GGUF linked into the job directory for the upload is of no use now.
         if let Err(error) = discard_model(&dir) {
             warn(&format!("cannot clean the compare {id}: {error}"));
