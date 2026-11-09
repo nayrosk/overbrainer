@@ -19,7 +19,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
+use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -55,44 +55,6 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 type FloatCounter = Counter<f64, AtomicU64>;
 type FloatGauge = Gauge<f64, AtomicU64>;
 
-/// A label value overbrainer does not choose (a model, a run ID, a GPU name, a
-/// mount), written escaped as the `OpenMetrics` text format requires: a backslash,
-/// a double quote and a newline become `\\`, `\"` and `\n`. `prometheus-client`
-/// writes a `String` label value as it is, so one such character would end the
-/// value early and break the scrape.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct Text(String);
-
-impl From<&str> for Text {
-    /// `text` as a label value.
-    fn from(text: &str) -> Self {
-        Self(text.to_string())
-    }
-}
-
-impl From<String> for Text {
-    /// `text` as a label value.
-    fn from(text: String) -> Self {
-        Self(text)
-    }
-}
-
-impl EncodeLabelValue for Text {
-    /// Writes the value escaped.
-    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), fmt::Error> {
-        use fmt::Write as _;
-        for c in self.0.chars() {
-            match c {
-                '\\' => encoder.write_str("\\\\")?,
-                '"' => encoder.write_str("\\\"")?,
-                '\n' => encoder.write_str("\\n")?,
-                c => encoder.write_char(c)?,
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ItemLabels {
     stage: &'static str,
@@ -103,7 +65,7 @@ struct ItemLabels {
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct TokenLabels {
     stage: &'static str,
-    model: Text,
+    model: String,
     direction: &'static str,
 }
 
@@ -111,7 +73,7 @@ struct TokenLabels {
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ModelLabels {
     stage: &'static str,
-    model: Text,
+    model: String,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -122,13 +84,13 @@ struct StageLabels {
 /// The label of a series per run.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct RunLabels {
-    run_id: Text,
+    run_id: String,
 }
 
 /// The labels of a run phase series.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct PhaseLabels {
-    run_id: Text,
+    run_id: String,
     phase: &'static str,
 }
 
@@ -502,11 +464,7 @@ impl Metrics {
         // A run removed since the last scrape leaves no series behind.
         self.spend.clear();
         for (run_id, spend) in spends {
-            self.spend
-                .get_or_create(&RunLabels {
-                    run_id: run_id.into(),
-                })
-                .set(spend);
+            self.spend.get_or_create(&RunLabels { run_id }).set(spend);
         }
     }
 

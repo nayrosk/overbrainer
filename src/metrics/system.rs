@@ -9,29 +9,29 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 
-use super::{FloatGauge, RunLabels, Text, register};
+use super::{FloatGauge, RunLabels, register};
 use crate::system::{SystemSample, float};
 
 /// The labels of a file system figure of a run's target.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct MountLabels {
-    run_id: Text,
-    mount: Text,
+    run_id: String,
+    mount: String,
 }
 
 /// The labels of a GPU figure: the run and the GPU index.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct GpuLabels {
-    run_id: Text,
-    gpu: Text,
+    run_id: String,
+    gpu: String,
 }
 
 /// The labels of the info series of a GPU: the run, its index and its name.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct GpuInfoLabels {
-    run_id: Text,
-    gpu: Text,
-    name: Text,
+    run_id: String,
+    gpu: String,
+    name: String,
 }
 
 /// The series one sample of a run set, to remove them before the next one or
@@ -203,7 +203,7 @@ impl SystemFamilies {
             let index = gpu.index.to_string();
             let labels = GpuLabels {
                 run_id: run_id.into(),
-                gpu: index.clone().into(),
+                gpu: index.clone(),
             };
             for (family, value) in [
                 (&self.gpu_utilization, gpu.utilization),
@@ -218,8 +218,8 @@ impl SystemFamilies {
             self.gpu_info
                 .get_or_create(&GpuInfoLabels {
                     run_id: run_id.into(),
-                    gpu: index.clone().into(),
-                    name: gpu.name.clone().into(),
+                    gpu: index.clone(),
+                    name: gpu.name.clone(),
                 })
                 .set(1);
             series.gpus.push((index, gpu.name.clone()));
@@ -237,8 +237,8 @@ impl SystemFamilies {
                 if !named.contains(pair) {
                     self.gpu_info.remove(&GpuInfoLabels {
                         run_id: run_id.into(),
-                        gpu: gpu.clone().into(),
-                        name: name.clone().into(),
+                        gpu: gpu.clone(),
+                        name: name.clone(),
                     });
                 }
             }
@@ -249,7 +249,7 @@ impl SystemFamilies {
     /// Removes the series in `series`.
     pub(super) fn remove(&self, series: &SystemSeries) {
         let run = RunLabels {
-            run_id: series.run_id.clone().into(),
+            run_id: series.run_id.clone(),
         };
         for family in [
             &self.cpu_usage,
@@ -267,9 +267,9 @@ impl SystemFamilies {
         for (gpu, name) in &series.gpus {
             self.remove_gpu(&series.run_id, gpu);
             self.gpu_info.remove(&GpuInfoLabels {
-                run_id: series.run_id.clone().into(),
-                gpu: gpu.clone().into(),
-                name: name.clone().into(),
+                run_id: series.run_id.clone(),
+                gpu: gpu.clone(),
+                name: name.clone(),
             });
         }
     }
