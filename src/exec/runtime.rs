@@ -67,6 +67,23 @@ pub struct JobSpec<'a> {
     /// downloads none. A container mounts it; either runtime names it, as the
     /// job sees it, in [`TOOLS_ENV`].
     pub tools_dir: Option<&'a str>,
+    /// Checks run in order before `commands`, in the same environment but
+    /// without the secrets. They write no stage event, and the stop marker
+    /// still applies after the first of `commands`. The first that fails ends
+    /// the job with its [`Preflight::code`].
+    pub preflight: &'a [Preflight],
+}
+
+/// A check a job runs before its commands (see [`JobSpec::preflight`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preflight {
+    /// The arguments of the trainer's Python: the job's own Python in a
+    /// container, `<venv>/bin/python` in a native runtime with a virtual
+    /// environment, else the `python` beside the first command's program on
+    /// `PATH`, or `python3`.
+    pub args: Vec<String>,
+    /// The job's exit code when the check fails.
+    pub code: u8,
 }
 
 /// The stage events of a job: one line in `file` before each command.
@@ -102,6 +119,7 @@ impl JobRuntime {
                 engine,
                 image,
                 venv,
+                ..
             }
             | Target::Ssh {
                 runtime,
@@ -161,6 +179,9 @@ impl JobRuntime {
     }
 }
 
+/// The script running `spec` in one `engine` container of `image` named
+/// `name`: the run directory, the Hugging Face cache and the tools cache
+/// mounted, the environment and secret names passed, then [`chain`] under `sh`.
 fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>) -> String {
     let (gpus, run_label, cache_label) = match engine {
         Engine::Docker => (
@@ -214,7 +235,10 @@ fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>)
             .map(|(name, _)| format!("-e {}", quote(name))),
     );
     words.push(quote(image));
-    words.push(format!("sh -c {}", quote(&chain(spec, quote))));
+    words.push(format!(
+        "sh -c {}",
+        quote(&chain(spec, quote, &quote("python")))
+    ));
     let dirs: Vec<String> = std::iter::once(spec.cache_dir)
         .chain(spec.tools_dir)
         .map(quote)
@@ -222,6 +246,9 @@ fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>)
     format!("mkdir -p -- {} && {}", dirs.join(" "), words.join(" "))
 }
 
+/// The script running `spec` on the target itself: the env file sourced, the
+/// environment exported, the preflight's Python found when there is no `venv`,
+/// then [`chain`] with each program taken from `venv` or `PATH`.
 fn native_script(venv: Option<&str>, env_file: Option<&str>, spec: &JobSpec<'_>) -> String {
     let resolve = |program: &str| match venv {
         Some(venv) => shell_path(&format!("{}/bin/{program}", venv.trim_end_matches('/'))),
@@ -242,8 +269,29 @@ fn native_script(venv: Option<&str>, env_file: Option<&str>, spec: &JobSpec<'_>)
             .collect();
         parts.push(format!("export {}", exports.join(" ")));
     }
-    parts.push(chain(spec, resolve));
+    let python = if venv.is_some() {
+        resolve("python")
+    } else {
+        if !spec.preflight.is_empty() {
+            parts.push(python_beside(spec.commands));
+        }
+        "\"$py\"".to_string()
+    };
+    parts.push(chain(spec, resolve, &python));
     parts.join(" && ")
+}
+
+/// A shell command that sets `py` to the `python` in the directory of the first
+/// command's program on `PATH`, where a venv or conda install keeps both, or to
+/// `python3` when there is none. It always succeeds.
+fn python_beside(commands: &[Vec<String>]) -> String {
+    let program = commands
+        .first()
+        .and_then(|command| command.first())
+        .map_or_else(|| quote("python3"), |program| quote(program));
+    format!(
+        "{{ {{ py=$(command -v {program} 2>/dev/null) && py=\"${{py%/*}}/python\" && [ -x \"$py\" ]; }} || py=python3; }}"
+    )
 }
 
 /// One word passed to `export` for `name=value`. `PYTHONPATH` is prepended to the
@@ -261,11 +309,34 @@ fn export_word(name: &str, value: &str) -> String {
     }
 }
 
-/// The commands of `spec` joined with `&&`, each program resolved by `program`
-/// and each argument quoted, each after its stage event when `spec` has stages.
-/// With a stop marker, the commands after the first run only when that file
-/// does not exist once the first ended; the job then exits 0 without them.
-fn chain(spec: &JobSpec<'_>, program: impl Fn(&str) -> String) -> String {
+/// The preflight of `spec`, each check run by the shell word `python` without
+/// the job's secrets, then its commands joined with `&&`, each program resolved
+/// by `program` and each argument quoted, each after its stage event when
+/// `spec` has stages. A failed check exits with its code. With a stop marker,
+/// the commands after the first run only when that file does not exist once the
+/// first ended; the job then exits 0 without them.
+fn chain(spec: &JobSpec<'_>, program: impl Fn(&str) -> String, python: &str) -> String {
+    let unset = spec
+        .secrets
+        .iter()
+        .fold(String::new(), |mut unset, (name, _)| {
+            unset.push_str(" -u ");
+            unset.push_str(&quote(name));
+            unset
+        });
+    let env = if unset.is_empty() {
+        String::new()
+    } else {
+        format!("env{unset} ")
+    };
+    let checks = spec.preflight.iter().map(|check| {
+        let args: Vec<String> = check.args.iter().map(|arg| quote(arg)).collect();
+        format!(
+            "{{ {env}{python} {} || exit {}; }}",
+            args.join(" "),
+            check.code
+        )
+    });
     let lines: Vec<String> = spec
         .commands
         .iter()
@@ -284,14 +355,18 @@ fn chain(spec: &JobSpec<'_>, program: impl Fn(&str) -> String) -> String {
             })
         })
         .collect();
-    match (spec.stop_marker, lines.split_first()) {
+    let commands = match (spec.stop_marker, lines.split_first()) {
         (Some(marker), Some((first, rest))) if !rest.is_empty() => format!(
             "{first} && {{ [ -f {} ] || {{ {}; }}; }}",
             quote(marker),
             rest.join(" && ")
         ),
         _ => lines.join(" && "),
-    }
+    };
+    checks
+        .chain(std::iter::once(commands))
+        .collect::<Vec<_>>()
+        .join(" && ")
 }
 
 /// A path as a shell word, with a leading `~/` expanded to the target's home.
@@ -308,6 +383,7 @@ pub fn shell_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A job spec of `commands` with nothing else set.
     fn spec(commands: &[Vec<String>]) -> JobSpec<'_> {
         JobSpec {
             run_id: "r1",
@@ -319,6 +395,7 @@ mod tests {
             stages: None,
             secrets: Vec::new(),
             tools_dir: None,
+            preflight: &[],
         }
     }
 
@@ -668,6 +745,7 @@ mod tests {
         Ok(())
     }
 
+    /// A stage event whose file cannot be written leaves the job running.
     #[test]
     fn a_stage_event_that_cannot_be_written_does_not_stop_the_job()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -688,6 +766,130 @@ mod tests {
             .status()?;
         assert!(status.success(), "{script}");
         assert_eq!(std::fs::read_to_string(dir.path().join("trail"))?, "ran");
+        Ok(())
+    }
+
+    /// The checks of the preflight.
+    fn checks() -> Vec<Preflight> {
+        vec![Preflight {
+            args: vec![
+                "/w/r1/gpu_check.py".into(),
+                "/w/r1/gpu_check.json".into(),
+                "1".into(),
+            ],
+            code: 90,
+        }]
+    }
+
+    /// The preflight runs first with the venv's Python and without the
+    /// secrets, writes no stage event, and leaves the stop marker after the
+    /// first trainer command.
+    #[test]
+    fn the_preflight_runs_first_without_secrets_or_stage_events() {
+        let commands = commands();
+        let checks = checks();
+        let job = JobRuntime::Native {
+            venv: Some("/v".into()),
+            env_file: None,
+        }
+        .job(JobSpec {
+            stop_marker: Some("snapshot.json"),
+            secrets: vec![("HF_TOKEN".into(), SecretString::from("hf_x"))],
+            preflight: &checks,
+            ..spec(&commands)
+        });
+        assert_eq!(
+            job.script,
+            "{ env -u 'HF_TOKEN' '/v/bin/python' '/w/r1/gpu_check.py' '/w/r1/gpu_check.json' '1' || exit 90; } && '/v/bin/axolotl' 'train' 'axolotl.yaml' && { [ -f 'snapshot.json' ] || { '/v/bin/axolotl' 'merge-lora' 'axolotl.yaml'; }; }"
+        );
+        assert!(!job.script.contains("hf_x"));
+    }
+
+    /// A container runs the preflight with the image's own Python.
+    #[test]
+    fn a_container_runs_the_preflight_with_its_python() {
+        let commands = commands();
+        let checks = checks();
+        let script = JobRuntime::Container {
+            engine: Engine::Docker,
+            image: "img:1".into(),
+        }
+        .job(JobSpec {
+            preflight: &checks,
+            ..spec(&commands[..1])
+        })
+        .script;
+        let inner = "{ 'python' '/w/r1/gpu_check.py' '/w/r1/gpu_check.json' '1' || exit 90; } && 'axolotl' 'train' 'axolotl.yaml'";
+        assert!(
+            script.ends_with(&format!("sh -c {}", quote(inner))),
+            "{script}"
+        );
+    }
+
+    /// Without a venv, the preflight's Python is the one beside the trainer's
+    /// program on `PATH`; a failed check exits with its code before any
+    /// command runs, a passed one lets them run.
+    #[test]
+    fn without_a_venv_the_python_beside_the_program_runs_the_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !sh_available() {
+            eprintln!("skipped: sh is not installed");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let stub = |name: &str, body: &str| -> std::io::Result<()> {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        };
+        stub("trainer", "echo trained > trained")?;
+        stub("python", "echo \"$1\" > checked; exit 4")?;
+        let commands = vec![vec!["trainer".to_string()]];
+        let checks = vec![Preflight {
+            args: vec!["check.py".into()],
+            code: 90,
+        }];
+        let job = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        }
+        .job(JobSpec {
+            preflight: &checks,
+            ..spec(&commands)
+        });
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = || {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&job.script)
+                .current_dir(dir.path())
+                .env("PATH", &path)
+                .status()
+        };
+        assert_eq!(run()?.code(), Some(90));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("checked"))?,
+            "check.py\n"
+        );
+        assert!(
+            !dir.path().join("trained").exists(),
+            "the command never ran"
+        );
+
+        stub("python", "exit 0")?;
+        assert!(run()?.success());
+        assert!(
+            dir.path().join("trained").exists(),
+            "a passed check lets it run"
+        );
         Ok(())
     }
 

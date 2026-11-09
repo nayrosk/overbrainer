@@ -12,11 +12,13 @@ use super::{
 use crate::events::{Event, EventBus};
 use crate::exec::{
     ExecError, Executor, FileDigest, JOB_LOG, JobId, JobRuntime, JobSpec, JobStatus, LineStream,
-    Stages, local_manifest,
+    Preflight, Stages, local_manifest,
 };
 use crate::runpod::{POD_FILE, SSH_DIR, chain};
 use crate::system::{self, SystemSample, probe_script};
-use crate::train::{SNAPSHOT_FILE, TrainError, Trainer};
+use crate::train::{
+    GPU_CHECK_CODE, GPU_CHECK_RESULT, GpuCheck, SNAPSHOT_FILE, TrainError, Trainer, gpu_preflight,
+};
 
 /// Hugging Face cache on the target, under the executor's work directory. Shared
 /// by the runs of that target so a base model is downloaded once.
@@ -45,6 +47,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Start of the note added to a run's message when its artifacts could not be
 /// retrieved.
 const NOT_RETRIEVED: &str = "artifacts not retrieved: ";
+/// Most bytes read of the GPU check's result: a few hundred in practice.
+const GPU_RESULT_LIMIT: u64 = 64 * 1024;
 
 /// Errors of the train, attach and cancel flows.
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +108,9 @@ pub struct Launch<'a> {
     pub runtime: &'a JobRuntime,
     /// Secret env variables of the job (the Hugging Face token).
     pub secrets: Vec<(String, SecretString)>,
+    /// Least GPUs the trainer's `PyTorch` must see before a trainer that
+    /// [needs them](Trainer::needs_gpu) starts; `None` skips the check.
+    pub min_gpus: Option<u32>,
 }
 
 /// How a run ended.
@@ -384,6 +391,12 @@ async fn launch_job<E: Executor, T: Trainer>(
         None => trainer.metrics_file().to_string(),
         Some(_) => format!("{root}/{}", trainer.metrics_file()),
     };
+    let preflight: Vec<Preflight> = launch
+        .min_gpus
+        .filter(|_| trainer.needs_gpu())
+        .map(|min_gpus| gpu_preflight(&root, min_gpus))
+        .into_iter()
+        .collect();
     let mut job = launch.runtime.job(JobSpec {
         run_id: &record.id,
         run_dir,
@@ -397,6 +410,7 @@ async fn launch_job<E: Executor, T: Trainer>(
         }),
         secrets: launch.secrets,
         tools_dir: trainer.caches_tools().then_some(tools_dir.as_str()),
+        preflight: &preflight,
     });
     // Mounted or not, the job's own files are in its own directory.
     job.dir.clone_from(&record.remote_dir);
@@ -475,6 +489,9 @@ pub async fn watch<E: Executor, T: Trainer>(
     };
     let dir = ctx.runs.relative_dir(&record.id);
     let (state, message) = outcome(status, &summary, &dir, trainer.metrics_required());
+    let message = explain_gpu(ctx.executor, trainer, status, &record.remote_dir, &dir)
+        .await
+        .or(message);
     // A job cancelled once its proof was written (a stop whose job did not
     // end in time) saved its checkpoint all the same: it is stopped too.
     let (state, message, snapshot) = if matches!(state, RunState::Succeeded | RunState::Cancelled) {
@@ -914,6 +931,38 @@ fn outcome(
             RunState::Failed,
             Some(format!("the job stopped without an exit code ({log})")),
         ),
+    }
+}
+
+/// Why the GPU check of a job that [needs GPUs](Trainer::needs_gpu) failed,
+/// when it ended with `status` [`GPU_CHECK_CODE`]; `None` otherwise.
+async fn explain_gpu<E: Executor, T: Trainer>(
+    executor: &E,
+    trainer: &T,
+    status: JobStatus,
+    remote_dir: &str,
+    dir: &str,
+) -> Option<String> {
+    match status {
+        JobStatus::Exited(code) if trainer.needs_gpu() && code == i32::from(GPU_CHECK_CODE) => {
+            gpu_failure(executor, remote_dir, dir).await
+        },
+        _ => None,
+    }
+}
+
+/// Why the GPU check of the job in `remote_dir` failed, from its result on the
+/// target, as the run's message naming the job log in `dir`. `None` when the
+/// result cannot be read or names no failure: the job's exit code then says
+/// what is known.
+async fn gpu_failure<E: Executor>(executor: &E, remote_dir: &str, dir: &str) -> Option<String> {
+    let path = format!("{remote_dir}/{GPU_CHECK_RESULT}");
+    match executor.read_from(&path, 0, GPU_RESULT_LIMIT).await {
+        Ok(content) => GpuCheck::parse(&content)?.failure(&format!("see {dir}/{JOB_LOG}")),
+        Err(error) => {
+            tracing::warn!("cannot read the GPU check's result: {}", chain(&error));
+            None
+        },
     }
 }
 
@@ -1766,6 +1815,8 @@ mod tests {
         Ok(())
     }
 
+    /// A job whose run cannot be saved as started is cancelled, since nothing
+    /// could find it again.
     #[tokio::test]
     async fn a_job_whose_run_cannot_be_recorded_is_cancelled()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1781,6 +1832,7 @@ mod tests {
                 env_file: None,
             },
             secrets: Vec::new(),
+            min_gpus: None,
         };
         let result = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await;
         assert!(matches!(result, Err(RunError::Runs(_))), "{result:?}");
@@ -1788,6 +1840,8 @@ mod tests {
         Ok(())
     }
 
+    /// A job started in a mount sees its parent directory, while its own
+    /// files stay in its own directory.
     #[tokio::test]
     async fn a_mounted_job_sees_its_parent_but_keeps_its_own_directory()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1805,6 +1859,7 @@ mod tests {
         let launch = Launch {
             runtime: &runtime,
             secrets: Vec::new(),
+            min_gpus: None,
         };
         let started =
             start_mounted(&ctx(&runs, &fake, &bus), &NoFiles, launch, created, &mount).await?;
@@ -1827,6 +1882,7 @@ mod tests {
         let launch = Launch {
             runtime: &runtime,
             secrets: Vec::new(),
+            min_gpus: None,
         };
         start_mounted(&ctx(&runs, &fake, &bus), &export, launch, created, &mount).await?;
         let spawned = fake.spawned.lock().map_err(|_| "poisoned")?.clone();
@@ -1838,6 +1894,7 @@ mod tests {
         let launch = Launch {
             runtime: &runtime,
             secrets: Vec::new(),
+            min_gpus: None,
         };
         let refused =
             start_mounted(&ctx(&runs, &fake, &bus), &NoFiles, launch, outside, &mount).await;
@@ -1845,6 +1902,7 @@ mod tests {
         Ok(())
     }
 
+    /// A run whose trainer has a stop marker is recorded as able to snapshot.
     #[tokio::test]
     async fn a_started_run_is_recorded_as_able_to_snapshot()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1859,6 +1917,7 @@ mod tests {
         let launch = || Launch {
             runtime: &runtime,
             secrets: Vec::new(),
+            min_gpus: None,
         };
         let created = create(&runs, "demo", fake.workdir(), "box")?;
         assert!(!created.snapshots, "no job yet");
@@ -1872,6 +1931,8 @@ mod tests {
         Ok(())
     }
 
+    /// A start that fails returns its own error, even when the failure
+    /// cannot be recorded.
     #[tokio::test]
     async fn a_failed_start_returns_its_own_error_when_it_cannot_be_recorded()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1890,6 +1951,7 @@ mod tests {
                 env_file: None,
             },
             secrets: Vec::new(),
+            min_gpus: None,
         };
         let result = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await;
         assert!(

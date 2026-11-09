@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
+use super::gpu::{GPU_CHECK_FILE, GPU_CHECK_RESULT, GPU_CHECK_SCRIPT};
 use super::metrics::{
     JobStage, METRICS_ENV, METRICS_PLUGIN, PLUGIN_CLASS, PLUGIN_FILE, SNAPSHOT_ENV, SNAPSHOT_FILE,
     SNAPSHOT_REQUEST,
@@ -421,6 +422,8 @@ fn merge(config: &mut Value, key: &str, value: &Value) {
 }
 
 impl Trainer for Axolotl<'_> {
+    /// Copies the data, writes the metrics plugin, the GPU check, the Axolotl
+    /// config and, for an export, its script into `run_dir`.
     fn prepare(&self, run_dir: &Path, root: &str) -> Result<(), TrainError> {
         if file_size(&self.train)?.unwrap_or(0) == 0 {
             return Err(TrainError::NoTrainingData {
@@ -433,6 +436,7 @@ impl Trainer for Axolotl<'_> {
             copy(&self.eval, &run_dir.join(EVAL_FILE))?;
         }
         write(&run_dir.join(PLUGIN_DIR).join(PLUGIN_FILE), METRICS_PLUGIN)?;
+        write(&run_dir.join(GPU_CHECK_FILE), GPU_CHECK_SCRIPT)?;
         if self.export.is_some() {
             ExportJob::write_script(run_dir)?;
         }
@@ -487,14 +491,24 @@ impl Trainer for Axolotl<'_> {
         Some(SNAPSHOT_FILE)
     }
 
+    /// Axolotl trains on GPUs: its job checks them first.
+    fn needs_gpu(&self) -> bool {
+        true
+    }
+
     fn metrics_file(&self) -> &'static str {
         METRICS_FILE
     }
 
+    /// The output, the metrics and the GPU check's result, without checkpoints.
     fn artifacts(&self) -> Artifacts {
         // `output/` holds the GGUF of an export too, in `output/gguf/`.
         Artifacts {
-            entries: vec![OUTPUT_DIR.into(), METRICS_FILE.into()],
+            entries: vec![
+                OUTPUT_DIR.into(),
+                METRICS_FILE.into(),
+                GPU_CHECK_RESULT.into(),
+            ],
             exclude: vec!["checkpoint-*".into()],
             required: Some(OUTPUT_DIR.into()),
         }

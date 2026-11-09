@@ -397,6 +397,7 @@ async fn on_target(
     let launch = Launch {
         runtime: &runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     // Starting is never interrupted: a job spawned and not recorded could not
     // be found again.

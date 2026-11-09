@@ -1,6 +1,7 @@
 //! Fine-tuning: the `Trainer` trait and its Axolotl implementation.
 
 mod axolotl;
+mod gpu;
 mod metrics;
 mod phase;
 pub mod sizing;
@@ -11,6 +12,9 @@ use std::path::{Path, PathBuf};
 pub use axolotl::{
     Axolotl, CONFIG_FILE, MERGED_DIR, METRICS_FILE, OUTPUT_DIR, Outputs, RESUME_DIR, Resume,
     TemplateReasoning, reasoning_template_warning, template_reasoning,
+};
+pub use gpu::{
+    GPU_CHECK_CODE, GPU_CHECK_FILE, GPU_CHECK_RESULT, GPU_CHECK_SCRIPT, GpuCheck, gpu_preflight,
 };
 pub use metrics::{
     JobStage, METRICS_ENV, METRICS_PLUGIN, Mark, MetricLine, PLUGIN_CLASS, PLUGIN_FILE, Pace,
@@ -99,6 +103,13 @@ pub trait Trainer {
     /// the trainer never stops that way.
     fn stop_marker(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Whether the job trains on GPUs, so its `PyTorch` must see them before it
+    /// starts (see [`gpu_preflight`]). The trainer's
+    /// [`prepare`](Trainer::prepare) then writes [`GPU_CHECK_FILE`].
+    fn needs_gpu(&self) -> bool {
+        false
     }
 
     /// The stage of each command of [`Trainer::commands`], in order: the job

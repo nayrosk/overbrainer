@@ -68,12 +68,15 @@ mkdir -p output && echo adapter > output/adapter_model.safetensors
 exit 0
 "#;
 
+/// A project training on a local native target whose fake `axolotl` behaves
+/// as `mode` says, with a fake `python` that passes the GPU check.
 fn project(mode: &str) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let venv = dir.path().join("venv");
     fs::create_dir_all(venv.join("bin"))?;
     fs::write(venv.join("bin/axolotl"), FAKE_AXOLOTL)?;
     fs::set_permissions(venv.join("bin/axolotl"), fs::Permissions::from_mode(0o755))?;
+    crate::common::fake_python(&venv.join("bin"))?;
     fs::write(venv.join("mode"), mode)?;
     fs::create_dir_all(dir.path().join("data"))?;
     fs::write(dir.path().join("data/train.jsonl"), "{\"id\": 1}\n")?;
@@ -425,6 +428,7 @@ fn cancel_stops_the_job_of_a_run_already_recorded_as_failed() -> TestResult {
     Ok(())
 }
 
+/// A job that exits non zero fails the command with its exit code.
 #[test]
 fn a_failed_job_fails_the_command() -> TestResult {
     let dir = project("fail")?;
@@ -436,6 +440,44 @@ fn a_failed_job_fails_the_command() -> TestResult {
         .stderr(predicate::str::contains(
             "the job exited with code 1 (see runs/",
         ));
+    Ok(())
+}
+
+/// A trainer Python that sees no GPU stops the run before `axolotl` starts,
+/// with a message naming the cause; `require_gpu = false` lets it train.
+#[test]
+fn a_target_without_a_gpu_stops_before_training() -> TestResult {
+    let dir = project("ok")?;
+    let python = dir.path().join("venv/bin/python");
+    fs::write(
+        &python,
+        "#!/bin/sh\nprintf '{\"code\":4,\"backend\":\"cuda\",\"devices\":[]}\\n' > \"$2\"\nexit 4\n",
+    )?;
+    overbrainer(dir.path())?
+        .arg("train")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "the GPU check failed: PyTorch sees no CUDA or ROCm device",
+        ));
+    let run = only_run(dir.path())?;
+    assert!(!run.join("output").exists(), "axolotl never ran");
+    assert!(run.join("gpu_check.json").is_file(), "the result came back");
+
+    let config = fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+    fs::write(
+        dir.path().join("overbrainer.toml"),
+        config.replace(
+            "runtime = \"native\"\n",
+            "runtime = \"native\"\nrequire_gpu = false\n",
+        ),
+    )?;
+    fs::remove_dir_all(&run)?;
+    overbrainer(dir.path())?
+        .arg("train")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("succeeded; step 2/2"));
     Ok(())
 }
 

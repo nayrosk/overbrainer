@@ -18,6 +18,7 @@ mod dataset_jsonl;
 mod dedup;
 mod exec_local;
 mod exec_ssh;
+mod gpu_check;
 mod llm_anthropic;
 mod llm_openai;
 mod metrics_plugin;

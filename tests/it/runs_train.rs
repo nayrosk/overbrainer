@@ -145,6 +145,7 @@ async fn a_run_trains_merges_and_records_its_outcome() -> TestResult {
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: secrets(),
+        min_gpus: None,
     };
     let record = start(&ctx, &trainer, launch, created).await?;
     assert_eq!(record.state, RunState::Running);
@@ -217,6 +218,7 @@ fn walk(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
+/// Starts a run of the fake trainer in `mode` and follows it to its end.
 async fn run_to_end(mode: &str) -> Result<overbrainer::runs::Outcome, Box<dyn std::error::Error>> {
     let fixture = Fixture::new(mode)?;
     let runs = Runs::new(fixture.project());
@@ -233,6 +235,7 @@ async fn run_to_end(mode: &str) -> Result<overbrainer::runs::Outcome, Box<dyn st
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let record = start(
         &ctx,
@@ -262,6 +265,7 @@ async fn a_job_without_metrics_fails_the_run() -> TestResult {
     Ok(())
 }
 
+/// A running job can be cancelled, and its run is recorded cancelled.
 #[tokio::test]
 async fn a_running_job_can_be_cancelled() -> TestResult {
     let fixture = Fixture::new("slow")?;
@@ -281,6 +285,7 @@ async fn a_running_job_can_be_cancelled() -> TestResult {
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let record = start(
         &ctx,
@@ -326,6 +331,7 @@ async fn the_run_keys_and_the_pod_record_are_never_uploaded() -> TestResult {
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let created = create(&runs, "demo", executor.workdir(), "box")?;
     let local = runs.run_dir(&created.id)?;
@@ -350,6 +356,8 @@ async fn the_run_keys_and_the_pod_record_are_never_uploaded() -> TestResult {
     Ok(())
 }
 
+/// Cancelling a job that already ended leaves the run running, for a
+/// follow to record its outcome.
 #[tokio::test]
 async fn cancelling_an_ended_job_leaves_the_run_running() -> TestResult {
     let fixture = Fixture::new("silent")?;
@@ -367,6 +375,7 @@ async fn cancelling_an_ended_job_leaves_the_run_running() -> TestResult {
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let record = start(
         &ctx,
@@ -391,6 +400,7 @@ async fn cancelling_an_ended_job_leaves_the_run_running() -> TestResult {
     Ok(())
 }
 
+/// A run whose directory vanished on the target records why nothing came back.
 #[tokio::test]
 async fn a_run_whose_directory_vanished_records_why_nothing_was_retrieved() -> TestResult {
     let fixture = Fixture::new("silent")?;
@@ -408,6 +418,7 @@ async fn a_run_whose_directory_vanished_records_why_nothing_was_retrieved() -> T
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let record = start(
         &ctx,
@@ -440,6 +451,7 @@ async fn a_run_whose_directory_vanished_records_why_nothing_was_retrieved() -> T
     Ok(())
 }
 
+/// A start without training data is recorded as failed.
 #[tokio::test]
 async fn a_start_without_data_is_recorded_as_failed() -> TestResult {
     let fixture = Fixture::new("ok")?;
@@ -458,6 +470,7 @@ async fn a_start_without_data_is_recorded_as_failed() -> TestResult {
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let error = start(
         &ctx,

@@ -1064,6 +1064,7 @@ async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestRes
         let launch = Launch {
             runtime: &runtime,
             secrets: Vec::new(),
+            min_gpus: None,
         };
         let started = start(&run_ctx, &observer, launch, record).await?;
         assert_eq!(started.state, RunState::Running);

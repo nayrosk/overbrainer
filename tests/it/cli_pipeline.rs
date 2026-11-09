@@ -659,6 +659,7 @@ if [ "$1" = merge-lora ]; then
 fi
 "#;
 
+/// `run` trains once the split is written when `[training]` is set.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_trains_after_split_when_training_is_configured() -> TestResult {
     use std::os::unix::fs::PermissionsExt;
@@ -672,6 +673,7 @@ async fn run_trains_after_split_when_training_is_configured() -> TestResult {
         venv.join("bin/axolotl"),
         std::fs::Permissions::from_mode(0o755),
     )?;
+    crate::common::fake_python(&venv.join("bin"))?;
     let config = format!(
         "{PROJECT}\n[training]\ntarget = \"here\"\nbase_model = \"Qwen/Qwen3-4B\"\nadapter = \"lora\"\n\n[targets.here]\nkind = \"local\"\nruntime = \"native\"\nvenv = \"{}\"\n",
         venv.display()
@@ -696,6 +698,7 @@ async fn run_trains_after_split_when_training_is_configured() -> TestResult {
     Ok(())
 }
 
+/// `run` prints the merged model's path when `merge` is set.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_prints_the_merged_model_when_merge_is_set() -> TestResult {
     use std::os::unix::fs::PermissionsExt;
@@ -709,6 +712,7 @@ async fn run_prints_the_merged_model_when_merge_is_set() -> TestResult {
         venv.join("bin/axolotl"),
         std::fs::Permissions::from_mode(0o755),
     )?;
+    crate::common::fake_python(&venv.join("bin"))?;
     let config = format!(
         "{PROJECT}\n[training]\ntarget = \"here\"\nbase_model = \"Qwen/Qwen3-4B\"\nadapter = \"lora\"\nmerge = true\n\n[targets.here]\nkind = \"local\"\nruntime = \"native\"\nvenv = \"{}\"\n",
         venv.display()

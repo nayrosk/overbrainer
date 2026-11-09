@@ -1,4 +1,4 @@
-//! Helpers shared by the Runpod and SSH test files. Each file uses only some of them.
+//! Helpers shared by the test files. Each file uses only some of them.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -276,3 +276,20 @@ pub const LLAMA_ASSETS: [&str; 6] = [
     "ubuntu-cuda-13.4-arm64",
     "ubuntu-rocm-10.0-x64",
 ];
+
+/// A `python` that passes overbrainer's GPU check: it writes a passing result
+/// to its second argument, where it can, and exits 0.
+const FAKE_PYTHON: &str = "#!/bin/sh\n{ printf '{\"code\":0,\"devices\":[\"fake\"]}\\n' > \"$2\"; } 2>/dev/null || :\nexit 0\n";
+
+/// Writes [`FAKE_PYTHON`] as `bin/python`, executable, beside a fake `axolotl`.
+///
+/// # Errors
+///
+/// Returns the I/O error when the file cannot be written.
+pub fn fake_python(bin: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = bin.join("python");
+    std::fs::write(&path, FAKE_PYTHON)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+}

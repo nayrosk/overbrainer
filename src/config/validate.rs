@@ -454,6 +454,7 @@ fn check_targets(settings: &Settings, problems: &mut Vec<String>) {
                 engine,
                 image,
                 venv,
+                ..
             } => {
                 check_runtime(
                     name,

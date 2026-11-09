@@ -566,6 +566,12 @@ const LOCAL: &[FieldSpec] = &[
         true,
         "Virtual environment with bin/axolotl, native runtime only",
     ),
+    spec(
+        "require_gpu",
+        BOOL,
+        true,
+        "Stop before training when PyTorch sees no GPU (default true)",
+    ),
 ];
 
 /// The fields of an `ssh` target.
@@ -600,6 +606,12 @@ const SSH: &[FieldSpec] = &[
         SSH_CLIENTS,
         true,
         "SSH client: openssh (default) or builtin, which needs the builtin-ssh feature",
+    ),
+    spec(
+        "require_gpu",
+        BOOL,
+        true,
+        "Stop before training when PyTorch sees no GPU (default true)",
     ),
 ];
 
