@@ -693,6 +693,8 @@ fn an_export_in_the_training_job_shows_as_exporting_gguf() -> TestResult {
     Ok(())
 }
 
+/// A standalone export job reports the `Export` stage, so the run shows as
+/// exporting a GGUF.
 #[tokio::test]
 async fn a_standalone_export_shows_as_exporting_gguf() -> TestResult {
     use crate::exec::{Executor as _, JobRuntime, LocalExecutor};

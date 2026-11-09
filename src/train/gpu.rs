@@ -64,16 +64,21 @@ impl GpuCheck {
     #[must_use]
     pub fn failure(&self, log: &str) -> Option<String> {
         let why = match self.code {
-            IMPORT_FAILED => "the trainer's Python cannot import torch".to_string(),
+            IMPORT_FAILED => "the trainer's Python cannot import torch: install PyTorch in the \
+                              venv or image the trainer runs from"
+                .to_string(),
             NO_DEVICE if self.backend.as_deref() == Some("mps") => {
-                "PyTorch sees no MPS device".to_string()
+                "PyTorch sees no MPS device: use a PyTorch build with MPS on Apple silicon, \
+                 or set `require_gpu = false` for a CPU run"
+                    .to_string()
             },
             NO_DEVICE => "PyTorch sees no CUDA or ROCm device: check the image's CUDA version \
                           against the host driver, or set `require_gpu = false` on a local or \
                           SSH target for a CPU run"
                 .to_string(),
             TOO_FEW => format!(
-                "PyTorch sees {} GPU(s), the target asks for {}",
+                "PyTorch sees {} GPU(s), the target asks for {}: check `CUDA_VISIBLE_DEVICES` \
+                 and the GPUs the host gives the job",
                 self.devices.len(),
                 self.required.unwrap_or(1)
             ),
@@ -112,7 +117,7 @@ mod tests {
         assert_eq!(
             failure(r#"{"code":3,"error":"ModuleNotFoundError"}"#)?.as_deref(),
             Some(
-                "the GPU check failed: the trainer's Python cannot import torch (see runs/r1/job.log)"
+                "the GPU check failed: the trainer's Python cannot import torch: install PyTorch in the venv or image the trainer runs from (see runs/r1/job.log)"
             )
         );
         assert!(
@@ -122,13 +127,15 @@ mod tests {
         );
         assert_eq!(
             failure(r#"{"code":4,"backend":"mps","devices":[]}"#)?.as_deref(),
-            Some("the GPU check failed: PyTorch sees no MPS device (see runs/r1/job.log)")
+            Some(
+                "the GPU check failed: PyTorch sees no MPS device: use a PyTorch build with MPS on Apple silicon, or set `require_gpu = false` for a CPU run (see runs/r1/job.log)"
+            )
         );
         assert_eq!(
             failure(r#"{"code":5,"backend":"cuda","devices":["NVIDIA L4"],"required":2}"#)?
                 .as_deref(),
             Some(
-                "the GPU check failed: PyTorch sees 1 GPU(s), the target asks for 2 (see runs/r1/job.log)"
+                "the GPU check failed: PyTorch sees 1 GPU(s), the target asks for 2: check `CUDA_VISIBLE_DEVICES` and the GPUs the host gives the job (see runs/r1/job.log)"
             )
         );
         assert_eq!(failure(r#"{"code":0,"devices":["NVIDIA L4"]}"#)?, None);

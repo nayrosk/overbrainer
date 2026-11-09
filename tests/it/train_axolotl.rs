@@ -174,6 +174,7 @@ fn step_cadence_in_axolotl_extra_replaces_the_per_epoch_one() -> TestResult {
     Ok(())
 }
 
+/// The trainer's commands, environment, stages and artifacts.
 #[test]
 fn commands_env_and_artifacts() -> TestResult {
     let (dir, settings) = settings(QLORA)?;
@@ -220,6 +221,7 @@ fn commands_env_and_artifacts() -> TestResult {
     Ok(())
 }
 
+/// `prepare` writes the data, the plugin, the GPU check and the config.
 #[test]
 fn prepare_writes_the_run_files() -> TestResult {
     let (dir, settings) = settings(QLORA)?;

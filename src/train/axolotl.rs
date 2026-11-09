@@ -422,6 +422,8 @@ fn merge(config: &mut Value, key: &str, value: &Value) {
 }
 
 impl Trainer for Axolotl<'_> {
+    /// Copies the data, writes the metrics plugin, the GPU check, the Axolotl
+    /// config and, for an export, its script into `run_dir`.
     fn prepare(&self, run_dir: &Path, root: &str) -> Result<(), TrainError> {
         if file_size(&self.train)?.unwrap_or(0) == 0 {
             return Err(TrainError::NoTrainingData {
@@ -489,6 +491,7 @@ impl Trainer for Axolotl<'_> {
         Some(SNAPSHOT_FILE)
     }
 
+    /// Axolotl trains on GPUs: its job checks them first.
     fn needs_gpu(&self) -> bool {
         true
     }
@@ -497,6 +500,7 @@ impl Trainer for Axolotl<'_> {
         METRICS_FILE
     }
 
+    /// The output, the metrics and the GPU check's result, without checkpoints.
     fn artifacts(&self) -> Artifacts {
         // `output/` holds the GGUF of an export too, in `output/gguf/`.
         Artifacts {

@@ -1815,6 +1815,8 @@ mod tests {
         Ok(())
     }
 
+    /// A job whose run cannot be saved as started is cancelled, since nothing
+    /// could find it again.
     #[tokio::test]
     async fn a_job_whose_run_cannot_be_recorded_is_cancelled()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1838,6 +1840,8 @@ mod tests {
         Ok(())
     }
 
+    /// A job started in a mount sees its parent directory, while its own
+    /// files stay in its own directory.
     #[tokio::test]
     async fn a_mounted_job_sees_its_parent_but_keeps_its_own_directory()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1898,6 +1902,7 @@ mod tests {
         Ok(())
     }
 
+    /// A run whose trainer has a stop marker is recorded as able to snapshot.
     #[tokio::test]
     async fn a_started_run_is_recorded_as_able_to_snapshot()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1926,6 +1931,8 @@ mod tests {
         Ok(())
     }
 
+    /// A start that fails returns its own error, even when the failure
+    /// cannot be recorded.
     #[tokio::test]
     async fn a_failed_start_returns_its_own_error_when_it_cannot_be_recorded()
     -> Result<(), Box<dyn std::error::Error>> {

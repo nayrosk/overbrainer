@@ -68,6 +68,8 @@ mkdir -p output && echo adapter > output/adapter_model.safetensors
 exit 0
 "#;
 
+/// A project training on a local native target whose fake `axolotl` behaves
+/// as `mode` says, with a fake `python` that passes the GPU check.
 fn project(mode: &str) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let venv = dir.path().join("venv");
@@ -426,6 +428,7 @@ fn cancel_stops_the_job_of_a_run_already_recorded_as_failed() -> TestResult {
     Ok(())
 }
 
+/// A job that exits non zero fails the command with its exit code.
 #[test]
 fn a_failed_job_fails_the_command() -> TestResult {
     let dir = project("fail")?;

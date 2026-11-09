@@ -179,6 +179,9 @@ impl JobRuntime {
     }
 }
 
+/// The script running `spec` in one `engine` container of `image` named
+/// `name`: the run directory, the Hugging Face cache and the tools cache
+/// mounted, the environment and secret names passed, then [`chain`] under `sh`.
 fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>) -> String {
     let (gpus, run_label, cache_label) = match engine {
         Engine::Docker => (
@@ -243,6 +246,9 @@ fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>)
     format!("mkdir -p -- {} && {}", dirs.join(" "), words.join(" "))
 }
 
+/// The script running `spec` on the target itself: the env file sourced, the
+/// environment exported, the preflight's Python found when there is no `venv`,
+/// then [`chain`] with each program taken from `venv` or `PATH`.
 fn native_script(venv: Option<&str>, env_file: Option<&str>, spec: &JobSpec<'_>) -> String {
     let resolve = |program: &str| match venv {
         Some(venv) => shell_path(&format!("{}/bin/{program}", venv.trim_end_matches('/'))),
@@ -377,6 +383,7 @@ pub fn shell_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A job spec of `commands` with nothing else set.
     fn spec(commands: &[Vec<String>]) -> JobSpec<'_> {
         JobSpec {
             run_id: "r1",
@@ -738,6 +745,7 @@ mod tests {
         Ok(())
     }
 
+    /// A stage event whose file cannot be written leaves the job running.
     #[test]
     fn a_stage_event_that_cannot_be_written_does_not_stop_the_job()
     -> Result<(), Box<dyn std::error::Error>> {
