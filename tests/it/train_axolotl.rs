@@ -4,7 +4,8 @@ use std::process::Command;
 use overbrainer::config::{EnvSource, Settings, Training, load};
 use overbrainer::dataset::DataFiles;
 use overbrainer::train::{
-    Artifacts, Axolotl, JobStage, Resume, TrainError, Trainer, reasoning_template_warning, to_yaml,
+    Artifacts, Axolotl, GPU_CHECK_SCRIPT, JobStage, Resume, TrainError, Trainer,
+    reasoning_template_warning, to_yaml,
 };
 use serde_json::Value;
 
@@ -202,10 +203,16 @@ fn commands_env_and_artifacts() -> TestResult {
     assert_eq!(trainer.metrics_file(), "metrics.jsonl");
     // Each command writes its stage event first.
     assert_eq!(trainer.stages(), [JobStage::Train, JobStage::Merge]);
+    // The trainer runs on GPUs: its job checks them first.
+    assert!(trainer.needs_gpu());
     assert_eq!(
         trainer.artifacts(),
         Artifacts {
-            entries: vec!["output".into(), "metrics.jsonl".into()],
+            entries: vec![
+                "output".into(),
+                "metrics.jsonl".into(),
+                "gpu_check.json".into(),
+            ],
             exclude: vec!["checkpoint-*".into()],
             required: Some("output".into()),
         }
@@ -234,6 +241,10 @@ fn prepare_writes_the_run_files() -> TestResult {
     );
     assert!(!run.join("data/eval.jsonl").exists());
     assert!(run.join("plugin/overbrainer_metrics.py").is_file());
+    assert_eq!(
+        fs::read_to_string(run.join("gpu_check.py"))?,
+        GPU_CHECK_SCRIPT
+    );
     let yaml = fs::read_to_string(run.join("axolotl.yaml"))?;
     assert!(yaml.contains("base_model: \"Qwen/Qwen3-4B\""));
     assert!(!yaml.contains("test_datasets"));

@@ -19,7 +19,7 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 | `max_hours` | required | The pod's watchdog deletes the pod this long after it was created, unless overbrainer is following a job that still makes progress ([the watchdog](#the-watchdog)). At most 720. |
 | `ssh_client` | `openssh` | `openssh` or `builtin`; `OVERBRAINER_SSH_CLIENT` overrides it. See [Built-in SSH client](training.md#built-in-ssh-client). |
 | `max_cost_usd` | none | Most a run may spend on its pod, in USD, at the pod's hourly rate: at 95% the job is stopped with a snapshot, at 100% the watchdog deletes the pod ([automatic snapshots](#automatic-snapshots)). Greater than 0, and worth at least 30 minutes of the pod (a warning says so otherwise). Not applied with `--keep-pod`. |
-| `gpu_count` | `1` | GPUs per pod. |
+| `gpu_count` | `1` | GPUs per pod. The [GPU check](training.md#gpu-check) stops a run whose PyTorch sees fewer. |
 | `image` | `axolotlai/axolotl-cloud-term:0.21.0-py3.12-cu130-2.14.1`, pinned by digest | Image of training, export and compare pods (Ubuntu 24.04, CUDA 13, driver 580 or newer). |
 | `venv` | `/workspace/axolotl-venv` | Virtual environment holding `bin/axolotl` on the pod. Absolute. |
 | `container_disk_gb` | `50` | Container disk, at least 20. |

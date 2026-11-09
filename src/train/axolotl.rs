@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
+use super::gpu::{GPU_CHECK_FILE, GPU_CHECK_RESULT, GPU_CHECK_SCRIPT};
 use super::metrics::{
     JobStage, METRICS_ENV, METRICS_PLUGIN, PLUGIN_CLASS, PLUGIN_FILE, SNAPSHOT_ENV, SNAPSHOT_FILE,
     SNAPSHOT_REQUEST,
@@ -433,6 +434,7 @@ impl Trainer for Axolotl<'_> {
             copy(&self.eval, &run_dir.join(EVAL_FILE))?;
         }
         write(&run_dir.join(PLUGIN_DIR).join(PLUGIN_FILE), METRICS_PLUGIN)?;
+        write(&run_dir.join(GPU_CHECK_FILE), GPU_CHECK_SCRIPT)?;
         if self.export.is_some() {
             ExportJob::write_script(run_dir)?;
         }
@@ -487,6 +489,10 @@ impl Trainer for Axolotl<'_> {
         Some(SNAPSHOT_FILE)
     }
 
+    fn needs_gpu(&self) -> bool {
+        true
+    }
+
     fn metrics_file(&self) -> &'static str {
         METRICS_FILE
     }
@@ -494,7 +500,11 @@ impl Trainer for Axolotl<'_> {
     fn artifacts(&self) -> Artifacts {
         // `output/` holds the GGUF of an export too, in `output/gguf/`.
         Artifacts {
-            entries: vec![OUTPUT_DIR.into(), METRICS_FILE.into()],
+            entries: vec![
+                OUTPUT_DIR.into(),
+                METRICS_FILE.into(),
+                GPU_CHECK_RESULT.into(),
+            ],
             exclude: vec!["checkpoint-*".into()],
             required: Some(OUTPUT_DIR.into()),
         }

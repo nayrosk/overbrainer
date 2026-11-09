@@ -72,6 +72,7 @@ kind = "ssh"                   # host comes from OVERBRAINER_TARGETS__HOMELAB__H
 # workdir = "overbrainer"      # on the remote machine, relative to its home directory
 runtime = "docker"             # native | docker
 # venv = "~/.venvs/axolotl"    # native: directory holding bin/axolotl
+# require_gpu = true           # stop before training when PyTorch sees no GPU; false allows a CPU run
 # engine = "docker"            # docker: docker | podman
 # image = "axolotlai/axolotl:0.21.0-py3.12-cu130-2.14.1@sha256:d08da8a5dd2b3223a49fb25cdadd85bdf0c5acee9c5de223bf6ab10d0b511e14"
 # pin by digest: this container runs untrusted training code and receives secrets such as HF_TOKEN

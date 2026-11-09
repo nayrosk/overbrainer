@@ -161,6 +161,7 @@ fn target_summary(target: &Target) -> String {
             engine,
             image,
             venv,
+            ..
         } => format!(
             "local, {}",
             runtime_summary(*runtime, *engine, image.as_deref(), venv.as_deref())

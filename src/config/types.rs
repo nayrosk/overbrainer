@@ -473,6 +473,10 @@ pub enum Target {
         /// Virtual environment holding `bin/axolotl`, only with `runtime = "native"`.
         /// Without it, `axolotl` must be on `PATH`.
         venv: Option<String>,
+        /// Whether a run stops before training when the trainer's `PyTorch` sees
+        /// no GPU (default true). `false` allows a deliberate CPU run.
+        #[serde(default = "default_true")]
+        require_gpu: bool,
     },
     /// Runs on a remote machine reached over SSH.
     Ssh {
@@ -490,6 +494,10 @@ pub enum Target {
         /// Virtual environment holding `bin/axolotl`, only with `runtime = "native"`.
         /// Without it, `axolotl` must be on the remote `PATH`.
         venv: Option<String>,
+        /// Whether a run stops before training when the trainer's `PyTorch` sees
+        /// no GPU (default true). `false` allows a deliberate CPU run.
+        #[serde(default = "default_true")]
+        require_gpu: bool,
         /// The SSH client: `openssh` (default) or `builtin`, which needs a build with
         /// the `builtin-ssh` feature. `OVERBRAINER_SSH_CLIENT` overrides it.
         #[serde(default)]
@@ -744,6 +752,25 @@ where
     }
 
     deserializer.deserialize_any(NumberVisitor(PhantomData))
+}
+
+impl Target {
+    /// Least GPUs the trainer's `PyTorch` must see before a run trains: the pod's
+    /// `gpu_count` on Runpod, one on a local or SSH target, `None` when the
+    /// target sets `require_gpu = false`.
+    #[must_use]
+    pub const fn min_gpus(&self) -> Option<u32> {
+        match self {
+            Self::Local { require_gpu, .. } | Self::Ssh { require_gpu, .. } => {
+                if *require_gpu {
+                    Some(1)
+                } else {
+                    None
+                }
+            },
+            Self::Runpod { gpu_count, .. } => Some(*gpu_count),
+        }
+    }
 }
 
 fn default_gpu_count() -> u32 {

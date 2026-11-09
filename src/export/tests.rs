@@ -679,6 +679,7 @@ fn an_export_in_the_training_job_shows_as_exporting_gguf() -> TestResult {
         }),
         secrets: Vec::new(),
         tools_dir: None,
+        preflight: &[],
     });
     let dir = tempfile::tempdir()?;
     let status = Command::new("sh")
@@ -724,6 +725,7 @@ async fn a_standalone_export_shows_as_exporting_gguf() -> TestResult {
     let launch = Launch {
         runtime: &runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let started = start_mounted(&ctx, &job, launch, record, &run_dir).await?;
     let id = started.job.ok_or("no job")?;

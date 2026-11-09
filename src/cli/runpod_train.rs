@@ -535,6 +535,7 @@ impl<T: Trainer + Sync> Job<'_, T> {
         let launch = Launch {
             runtime: &runtime,
             secrets,
+            min_gpus: Some(self.spec.gpu_count),
         };
         // Starting is never interrupted: dropped after the job is spawned and
         // before its record is saved, it would leave a job nothing finds again.

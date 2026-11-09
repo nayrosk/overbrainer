@@ -880,6 +880,7 @@ async fn a_compare_job_answers_over_ssh() -> TestResult {
         let launch = Launch {
             runtime: &runtime,
             secrets: Vec::new(),
+            min_gpus: None,
         };
         let started = start(&ctx, &job, launch, record).await?;
         let outcome = watch(&ctx, &job, started).await?;

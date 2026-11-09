@@ -724,11 +724,13 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             engine: used,
             image,
             venv,
+            require_gpu,
         } => match field {
             "runtime" => Some(runtime(*run).to_string()),
             "engine" => engine(used),
             "image" => image.clone(),
             "venv" => venv.clone(),
+            "require_gpu" => Some(require_gpu.to_string()),
             _ => None,
         },
         Target::Ssh {
@@ -738,6 +740,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             image,
             venv,
             ssh_client,
+            require_gpu,
             ..
         } => match field {
             "runtime" => Some(runtime(*run).to_string()),
@@ -746,6 +749,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             "image" => image.clone(),
             "venv" => venv.clone(),
             "ssh_client" => Some(ssh_client.name().to_string()),
+            "require_gpu" => Some(require_gpu.to_string()),
             _ => None,
         },
         Target::Runpod {

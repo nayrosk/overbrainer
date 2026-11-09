@@ -27,7 +27,7 @@ pub use digest::{
 };
 pub use lines::{LineStream, MAX_TAIL_READ, complete_lines};
 pub use local::LocalExecutor;
-pub use runtime::{JobRuntime, JobSpec, Stages, TOOLS_ENV, shell_path, stage_command};
+pub use runtime::{JobRuntime, JobSpec, Preflight, Stages, TOOLS_ENV, shell_path, stage_command};
 pub use script::{
     GROUP_SIGNAL, cancel_script, claim_script, job_script, parse_status, quote, status_script,
 };

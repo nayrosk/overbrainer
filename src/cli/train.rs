@@ -160,6 +160,7 @@ async fn train(
     let launch = Launch {
         runtime: &runtime,
         secrets,
+        min_gpus: target.min_gpus(),
     };
     // Starting is never interrupted: dropping it after the job is spawned and
     // before its record is saved would leave a job nothing can find again.

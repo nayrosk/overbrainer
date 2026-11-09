@@ -145,6 +145,7 @@ async fn a_run_trains_merges_and_records_its_outcome() -> TestResult {
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: secrets(),
+        min_gpus: None,
     };
     let record = start(&ctx, &trainer, launch, created).await?;
     assert_eq!(record.state, RunState::Running);
@@ -233,6 +234,7 @@ async fn run_to_end(mode: &str) -> Result<overbrainer::runs::Outcome, Box<dyn st
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let record = start(
         &ctx,
@@ -281,6 +283,7 @@ async fn a_running_job_can_be_cancelled() -> TestResult {
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let record = start(
         &ctx,
@@ -326,6 +329,7 @@ async fn the_run_keys_and_the_pod_record_are_never_uploaded() -> TestResult {
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let created = create(&runs, "demo", executor.workdir(), "box")?;
     let local = runs.run_dir(&created.id)?;
@@ -367,6 +371,7 @@ async fn cancelling_an_ended_job_leaves_the_run_running() -> TestResult {
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let record = start(
         &ctx,
@@ -408,6 +413,7 @@ async fn a_run_whose_directory_vanished_records_why_nothing_was_retrieved() -> T
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let record = start(
         &ctx,
@@ -458,6 +464,7 @@ async fn a_start_without_data_is_recorded_as_failed() -> TestResult {
     let launch = Launch {
         runtime: &fixture.runtime,
         secrets: Vec::new(),
+        min_gpus: None,
     };
     let error = start(
         &ctx,

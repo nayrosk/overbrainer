@@ -1466,7 +1466,7 @@ exit 0
         let config = format!(
             "{}\n[training]\ntarget = \"here\"\nbase_model = \"Qwen/Qwen3-4B\"\n\
              adapter = \"qlora\"\n\n[targets.here]\nkind = \"local\"\nruntime = \"native\"\n\
-             venv = \"{}\"\n",
+             venv = \"{}\"\nrequire_gpu = false\n",
             crate::tui::snapshots::CONFIG,
             venv.display()
         );

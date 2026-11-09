@@ -672,6 +672,7 @@ async fn run_trains_after_split_when_training_is_configured() -> TestResult {
         venv.join("bin/axolotl"),
         std::fs::Permissions::from_mode(0o755),
     )?;
+    crate::common::fake_python(&venv.join("bin"))?;
     let config = format!(
         "{PROJECT}\n[training]\ntarget = \"here\"\nbase_model = \"Qwen/Qwen3-4B\"\nadapter = \"lora\"\n\n[targets.here]\nkind = \"local\"\nruntime = \"native\"\nvenv = \"{}\"\n",
         venv.display()
@@ -709,6 +710,7 @@ async fn run_prints_the_merged_model_when_merge_is_set() -> TestResult {
         venv.join("bin/axolotl"),
         std::fs::Permissions::from_mode(0o755),
     )?;
+    crate::common::fake_python(&venv.join("bin"))?;
     let config = format!(
         "{PROJECT}\n[training]\ntarget = \"here\"\nbase_model = \"Qwen/Qwen3-4B\"\nadapter = \"lora\"\nmerge = true\n\n[targets.here]\nkind = \"local\"\nruntime = \"native\"\nvenv = \"{}\"\n",
         venv.display()

@@ -183,6 +183,7 @@ Before you publish a repo, read its card. It names the topics with their descrip
 kind = "local"                 # this machine, in runs/<run-id>/
 runtime = "native"             # native | docker
 venv = "~/.venvs/axolotl"      # native: directory holding bin/axolotl; otherwise axolotl must be on PATH
+# require_gpu = true           # stop before training when PyTorch sees no GPU, see "GPU check" below
 
 [targets.homelab]
 kind = "ssh"                   # host from OVERBRAINER_TARGETS__HOMELAB__HOST (user@host or a ~/.ssh/config alias)
@@ -194,6 +195,16 @@ engine = "podman"              # docker (default) | podman
 ```
 
 `venv` applies only with `runtime = "native"`, and `engine` and `image` only with `runtime = "docker"`. The third kind, `runpod`, has [its own page](runpod.md).
+
+### GPU check
+
+Before `axolotl train` starts, the job checks that the trainer's PyTorch sees a GPU. Without one, PyTorch can fall back to the CPU and train for hours at a fraction of the speed. The check runs `gpu_check.py` from the run directory with the trainer's own Python: `python` in the image with the docker runtime, `<venv>/bin/python` with a venv, else the `python` next to `axolotl` on `PATH`, or `python3`. It never sees the job's secrets.
+
+- On Linux it needs at least one CUDA or ROCm device (`torch.cuda`), and on a Runpod target at least `gpu_count`. On macOS it needs an MPS device.
+- When it fails, the run stops before training with exit code 90 and a message that names the cause, for example `the GPU check failed: PyTorch sees no CUDA or ROCm device`. A Runpod pod is then deleted as after any failed job.
+- The result is in `runs/<run-id>/gpu_check.json` (devices, torch and CUDA or ROCm versions) and on one line of `job.log`.
+
+For a deliberate CPU run on a test machine, set `require_gpu = false` on a `local` or `ssh` target. A `runpod` target has no such field: a pod always has a GPU, so a failed check there means a broken image or driver.
 
 On every target, the results of a run come back through a staging directory first. Only the requested regular files are kept, with their directories. A symbolic link, a FIFO or a device is skipped with a warning. A file that was not requested, such as a `pod.json`, fails the download, and nothing from it is kept. So does a directory of the run that is a symbolic link on the way to a file, such as `runs/<run-id>/output` linked to another disk.
 
