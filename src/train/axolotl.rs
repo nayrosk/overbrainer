@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use super::gpu::{GPU_CHECK_FILE, GPU_CHECK_RESULT, GPU_CHECK_SCRIPT};
+use super::hook::{PRE_TRAIN_LOG, PRE_TRAIN_RESULT};
 use super::metrics::{
     JobStage, METRICS_ENV, METRICS_PLUGIN, PLUGIN_CLASS, PLUGIN_FILE, SNAPSHOT_ENV, SNAPSHOT_FILE,
     SNAPSHOT_REQUEST,
@@ -500,7 +501,8 @@ impl Trainer for Axolotl<'_> {
         METRICS_FILE
     }
 
-    /// The output, the metrics and the GPU check's result, without checkpoints.
+    /// The output, the metrics, the GPU check's result and the `pre_train`
+    /// hook's log and result, without checkpoints.
     fn artifacts(&self) -> Artifacts {
         // `output/` holds the GGUF of an export too, in `output/gguf/`.
         Artifacts {
@@ -508,6 +510,8 @@ impl Trainer for Axolotl<'_> {
                 OUTPUT_DIR.into(),
                 METRICS_FILE.into(),
                 GPU_CHECK_RESULT.into(),
+                PRE_TRAIN_LOG.into(),
+                PRE_TRAIN_RESULT.into(),
             ],
             exclude: vec!["checkpoint-*".into()],
             required: Some(OUTPUT_DIR.into()),

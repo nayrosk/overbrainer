@@ -1603,6 +1603,52 @@ mod tests {
             .ok_or_else(|| "nothing to undo".to_string())
     }
 
+    /// The `pre_train` fields of a target are typed as words and numbers and
+    /// written into its `pre_train` table; codes before a command are refused,
+    /// and an emptied command removes the table.
+    #[test]
+    fn the_pre_train_hook_is_edited_in_the_target_form() -> TestResult {
+        let (dir, mut app) = editing_app()?;
+        let at = |field: &str| format!("targets.gpu_cloud.pre_train.{field}");
+        set(&mut app, &at("ok_exit_codes"), "0, 1")?;
+        let Some(Form::Value { error, .. }) = &app.project_view.form else {
+            return Err("the form closed".into());
+        };
+        assert_eq!(
+            error.as_deref(),
+            Some("targets.gpu_cloud.pre_train.ok_exit_codes: needs pre_train.command first")
+        );
+        press(&mut app, &[KeyCode::Esc]);
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "nothing written");
+
+        set(
+            &mut app,
+            &at("command"),
+            r#"computefence doctor "--path=/my dir""#,
+        )?;
+        set(&mut app, &at("ok_exit_codes"), "0, 1")?;
+        set(&mut app, &at("timeout_seconds"), "60")?;
+        assert_eq!(app.project_view.form, None);
+        let text = written(dir.path())?;
+        assert!(
+            text.ends_with(
+                "[targets.gpu_cloud.pre_train]\n\
+                 command = [\"computefence\", \"doctor\", \"--path=/my dir\"]\n\
+                 ok_exit_codes = [0, 1]\ntimeout_seconds = 60\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            field(&mut app, &at("command"))?.shown.text(),
+            r#"computefence doctor "--path=/my dir""#
+        );
+
+        set(&mut app, &at("command"), "")?;
+        assert_eq!(app.project_view.form, None);
+        assert_eq!(written(dir.path())?, PROJECT_CONFIG, "the table is gone");
+        Ok(())
+    }
+
     #[test]
     fn a_number_out_of_bounds_is_refused_on_enter() -> TestResult {
         let (dir, mut app) = editing_app()?;

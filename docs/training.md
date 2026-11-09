@@ -206,6 +206,27 @@ Before `axolotl train` starts, the job checks that the trainer's PyTorch sees a 
 
 For a deliberate CPU run on a test machine, set `require_gpu = false` on a `local` or `ssh` target. A `runpod` target has no such field: a pod always has a GPU, so a failed check there means a broken image or driver.
 
+### pre_train hook
+
+A target can run a command of yours after the GPU check and before `axolotl train`, for example a pre-flight doctor such as ComputeFence (`pip install computefence`):
+
+```toml
+[targets.gpu_cloud.pre_train]
+command = ["computefence", "doctor", "--json"]   # program then arguments, never a shell string
+ok_exit_codes = [0, 1]                           # codes that let training go on (default [0])
+timeout_seconds = 120                            # 1 to 3600 (default 120)
+```
+
+- The command runs on the target, in the job's environment, from the run directory. The program is looked up on `PATH`. With the native runtime and a `venv`, `<venv>/bin` comes first, so a tool installed in the venv is found. With the docker runtime it runs in the job's container, so the tool must be in the image. overbrainer installs nothing; on a target with network access, `command = ["uvx", "computefence", "doctor", "--json"]` fetches it for the run.
+- It never sees the job's secrets: `HF_TOKEN` is removed from its environment.
+- It runs under `timeout` where the target has it. Where it does not, it runs without a limit and `job.log` says so.
+- Its output goes to `runs/<run-id>/pre_train.log` and to `job.log`. Its exit code is in `runs/<run-id>/pre_train.json`.
+- A code outside `ok_exit_codes` stops the run before training with exit code 91, for example `the pre_train hook exited with code 2 (allowed: 0, 1)`. Running past `timeout_seconds` stops it with exit code 92. A Runpod pod is then deleted as after any failed job.
+
+ComputeFence exits 1 on warnings and 2 on blockers, so `ok_exit_codes = [0, 1]` stops only on blockers. On a default overbrainer pod it warns by design: the Hugging Face cache is on the container disk, there is no network volume, no Accelerate config and no dataset path it knows.
+
+In the TUI Project view, the form of each target has three fields for the hook: `pre_train.command`, typed as one line of words, with double quotes around a word that holds spaces (`computefence doctor "--path=/my dir"`); `pre_train.ok_exit_codes`, comma-separated (`0, 1`); and `pre_train.timeout_seconds`. Set the command first. Emptying it removes the whole `[targets.<name>.pre_train]` table.
+
 On every target, the results of a run come back through a staging directory first. Only the requested regular files are kept, with their directories. A symbolic link, a FIFO or a device is skipped with a warning. A file that was not requested, such as a `pod.json`, fails the download, and nothing from it is kept. So does a directory of the run that is a symbolic link on the way to a file, such as `runs/<run-id>/output` linked to another disk.
 
 ### The docker runtime

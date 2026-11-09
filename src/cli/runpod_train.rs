@@ -536,6 +536,7 @@ impl<T: Trainer + Sync> Job<'_, T> {
             runtime: &runtime,
             secrets,
             min_gpus: Some(self.spec.gpu_count),
+            pre_train: self.spec.pre_train.as_ref(),
         };
         // Starting is never interrupted: dropped after the job is spawned and
         // before its record is saved, it would leave a job nothing finds again.
@@ -1244,6 +1245,7 @@ mod tests {
             network_volume_id: None,
             max_volume_gb: None,
             ssh_client: crate::config::SshClient::Openssh,
+            pre_train: None,
         }
     }
 

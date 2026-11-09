@@ -481,6 +481,90 @@ fn a_target_without_a_gpu_stops_before_training() -> TestResult {
     Ok(())
 }
 
+/// Adds `lines` to the `pre_train` table of the project's target `here`.
+fn with_pre_train(dir: &Path, lines: &str) -> TestResult {
+    let path = dir.join("overbrainer.toml");
+    let config = fs::read_to_string(&path)?;
+    let hook = format!("[targets.here.pre_train]\n{lines}\n\n[targets.gpu]\n");
+    fs::write(&path, config.replace("[targets.gpu]\n", &hook))?;
+    Ok(())
+}
+
+/// A `pre_train` command found in the venv that exits with a code the target
+/// does not allow stops the run before `axolotl` starts, its output kept in
+/// `pre_train.log` and never with the job's token; allowing its code lets the
+/// run train.
+#[test]
+fn a_failing_pre_train_hook_stops_before_training() -> TestResult {
+    let dir = project("ok")?;
+    let check = dir.path().join("venv/bin/check");
+    fs::write(
+        &check,
+        "#!/bin/sh\necho \"blocker: no network volume\"\n\
+         if [ -n \"$HF_TOKEN\" ]; then echo token seen; else echo token hidden; fi\nexit 2\n",
+    )?;
+    fs::set_permissions(&check, fs::Permissions::from_mode(0o755))?;
+    with_pre_train(dir.path(), "command = [\"check\", \"--json\"]")?;
+    overbrainer(dir.path())?
+        .arg("train")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "the pre_train hook exited with code 2 (allowed: 0)",
+        ));
+    let run = only_run(dir.path())?;
+    assert!(!run.join("output").exists(), "axolotl never ran");
+    let log = fs::read_to_string(run.join("pre_train.log"))?;
+    assert!(
+        log.contains("blocker: no network volume"),
+        "the hook's output came back"
+    );
+    assert!(log.contains("token hidden"), "the hook saw the job's token");
+    assert!(!log.contains(TOKEN), "the hook printed the job's token");
+
+    fs::remove_dir_all(&run)?;
+    let config = fs::read_to_string(dir.path().join("overbrainer.toml"))?;
+    fs::write(
+        dir.path().join("overbrainer.toml"),
+        config.replace(
+            "command = [\"check\", \"--json\"]",
+            "command = [\"check\", \"--json\"]\nok_exit_codes = [0, 2]",
+        ),
+    )?;
+    overbrainer(dir.path())?
+        .arg("train")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("succeeded; step 2/2"));
+    Ok(())
+}
+
+/// A `pre_train` command that runs past its limit stops the run before
+/// `axolotl` starts; skipped where `timeout` is not installed.
+#[test]
+fn a_pre_train_hook_past_its_limit_stops_before_training() -> TestResult {
+    if !PATH
+        .split(':')
+        .any(|dir| Path::new(dir).join("timeout").is_file())
+    {
+        eprintln!("skipped: timeout is not installed");
+        return Ok(());
+    }
+    let dir = project("ok")?;
+    with_pre_train(
+        dir.path(),
+        "command = [\"sleep\", \"30\"]\ntimeout_seconds = 1",
+    )?;
+    overbrainer(dir.path())?
+        .arg("train")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("the pre_train hook ran past 1 s"));
+    let run = only_run(dir.path())?;
+    assert!(!run.join("output").exists(), "axolotl never ran");
+    Ok(())
+}
+
 #[test]
 fn unusable_targets_are_refused() -> TestResult {
     let dir = project("ok")?;

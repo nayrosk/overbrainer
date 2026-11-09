@@ -9,6 +9,7 @@ use super::snapshot::{Proof, Snapshot, read_proof};
 use super::{
     MetricsSummary, RECORD_FILE, RunRecord, RunState, Runs, RunsError, new_run_id, rfc3339,
 };
+use crate::config::PreTrain;
 use crate::events::{Event, EventBus};
 use crate::exec::{
     ExecError, Executor, FileDigest, JOB_LOG, JobId, JobRuntime, JobSpec, JobStatus, LineStream,
@@ -17,7 +18,9 @@ use crate::exec::{
 use crate::runpod::{POD_FILE, SSH_DIR, chain};
 use crate::system::{self, SystemSample, probe_script};
 use crate::train::{
-    GPU_CHECK_CODE, GPU_CHECK_RESULT, GpuCheck, SNAPSHOT_FILE, TrainError, Trainer, gpu_preflight,
+    GPU_CHECK_CODE, GPU_CHECK_RESULT, GpuCheck, HookResult, PRE_TRAIN_CODE, PRE_TRAIN_LOG,
+    PRE_TRAIN_RESULT, PRE_TRAIN_TIMEOUT_CODE, SNAPSHOT_FILE, TrainError, Trainer, gpu_preflight,
+    pre_train_preflight,
 };
 
 /// Hugging Face cache on the target, under the executor's work directory. Shared
@@ -47,8 +50,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Start of the note added to a run's message when its artifacts could not be
 /// retrieved.
 const NOT_RETRIEVED: &str = "artifacts not retrieved: ";
-/// Most bytes read of the GPU check's result: a few hundred in practice.
-const GPU_RESULT_LIMIT: u64 = 64 * 1024;
+/// Most bytes read of the GPU check's or the `pre_train` hook's result: a few
+/// hundred in practice.
+const RESULT_LIMIT: u64 = 64 * 1024;
 
 /// Errors of the train, attach and cancel flows.
 #[derive(Debug, thiserror::Error)]
@@ -111,6 +115,9 @@ pub struct Launch<'a> {
     /// Least GPUs the trainer's `PyTorch` must see before a trainer that
     /// [needs them](Trainer::needs_gpu) starts; `None` skips the check.
     pub min_gpus: Option<u32>,
+    /// The command the target runs after the GPU check and before the trainer,
+    /// when it sets one.
+    pub pre_train: Option<&'a PreTrain>,
 }
 
 /// How a run ended.
@@ -396,6 +403,11 @@ async fn launch_job<E: Executor, T: Trainer>(
         .filter(|_| trainer.needs_gpu())
         .map(|min_gpus| gpu_preflight(&root, min_gpus))
         .into_iter()
+        .chain(
+            launch
+                .pre_train
+                .map(|pre_train| pre_train_preflight(&root, pre_train)),
+        )
         .collect();
     let mut job = launch.runtime.job(JobSpec {
         run_id: &record.id,
@@ -489,7 +501,7 @@ pub async fn watch<E: Executor, T: Trainer>(
     };
     let dir = ctx.runs.relative_dir(&record.id);
     let (state, message) = outcome(status, &summary, &dir, trainer.metrics_required());
-    let message = explain_gpu(ctx.executor, trainer, status, &record.remote_dir, &dir)
+    let message = explain_preflight(ctx.executor, trainer, status, &record.remote_dir, &dir)
         .await
         .or(message);
     // A job cancelled once its proof was written (a stop whose job did not
@@ -934,20 +946,41 @@ fn outcome(
     }
 }
 
-/// Why the GPU check of a job that [needs GPUs](Trainer::needs_gpu) failed,
-/// when it ended with `status` [`GPU_CHECK_CODE`]; `None` otherwise.
-async fn explain_gpu<E: Executor, T: Trainer>(
+/// Why the preflight of a job ended it, when it ended with `status`: the GPU
+/// check of a job that [needs GPUs](Trainer::needs_gpu) with
+/// [`GPU_CHECK_CODE`], the `pre_train` hook with [`PRE_TRAIN_CODE`] or
+/// [`PRE_TRAIN_TIMEOUT_CODE`]; `None` otherwise.
+async fn explain_preflight<E: Executor, T: Trainer>(
     executor: &E,
     trainer: &T,
     status: JobStatus,
     remote_dir: &str,
     dir: &str,
 ) -> Option<String> {
-    match status {
-        JobStatus::Exited(code) if trainer.needs_gpu() && code == i32::from(GPU_CHECK_CODE) => {
-            gpu_failure(executor, remote_dir, dir).await
+    let JobStatus::Exited(code) = status else {
+        return None;
+    };
+    if trainer.needs_gpu() && code == i32::from(GPU_CHECK_CODE) {
+        return gpu_failure(executor, remote_dir, dir).await;
+    }
+    if code == i32::from(PRE_TRAIN_CODE) || code == i32::from(PRE_TRAIN_TIMEOUT_CODE) {
+        return hook_failure(executor, remote_dir, dir).await;
+    }
+    None
+}
+
+/// Why the `pre_train` hook of the job in `remote_dir` stopped it, from its
+/// result on the target, as the run's message naming its log in `dir`. `None`
+/// when the result cannot be read: the job's exit code then says what is
+/// known.
+async fn hook_failure<E: Executor>(executor: &E, remote_dir: &str, dir: &str) -> Option<String> {
+    let path = format!("{remote_dir}/{PRE_TRAIN_RESULT}");
+    match executor.read_from(&path, 0, RESULT_LIMIT).await {
+        Ok(content) => HookResult::parse(&content)?.failure(&format!("see {dir}/{PRE_TRAIN_LOG}")),
+        Err(error) => {
+            tracing::warn!("cannot read the pre_train hook's result: {}", chain(&error));
+            None
         },
-        _ => None,
     }
 }
 
@@ -957,7 +990,7 @@ async fn explain_gpu<E: Executor, T: Trainer>(
 /// what is known.
 async fn gpu_failure<E: Executor>(executor: &E, remote_dir: &str, dir: &str) -> Option<String> {
     let path = format!("{remote_dir}/{GPU_CHECK_RESULT}");
-    match executor.read_from(&path, 0, GPU_RESULT_LIMIT).await {
+    match executor.read_from(&path, 0, RESULT_LIMIT).await {
         Ok(content) => GpuCheck::parse(&content)?.failure(&format!("see {dir}/{JOB_LOG}")),
         Err(error) => {
             tracing::warn!("cannot read the GPU check's result: {}", chain(&error));
@@ -1833,6 +1866,7 @@ mod tests {
             },
             secrets: Vec::new(),
             min_gpus: None,
+            pre_train: None,
         };
         let result = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await;
         assert!(matches!(result, Err(RunError::Runs(_))), "{result:?}");
@@ -1860,6 +1894,7 @@ mod tests {
             runtime: &runtime,
             secrets: Vec::new(),
             min_gpus: None,
+            pre_train: None,
         };
         let started =
             start_mounted(&ctx(&runs, &fake, &bus), &NoFiles, launch, created, &mount).await?;
@@ -1883,6 +1918,7 @@ mod tests {
             runtime: &runtime,
             secrets: Vec::new(),
             min_gpus: None,
+            pre_train: None,
         };
         start_mounted(&ctx(&runs, &fake, &bus), &export, launch, created, &mount).await?;
         let spawned = fake.spawned.lock().map_err(|_| "poisoned")?.clone();
@@ -1895,6 +1931,7 @@ mod tests {
             runtime: &runtime,
             secrets: Vec::new(),
             min_gpus: None,
+            pre_train: None,
         };
         let refused =
             start_mounted(&ctx(&runs, &fake, &bus), &NoFiles, launch, outside, &mount).await;
@@ -1918,6 +1955,7 @@ mod tests {
             runtime: &runtime,
             secrets: Vec::new(),
             min_gpus: None,
+            pre_train: None,
         };
         let created = create(&runs, "demo", fake.workdir(), "box")?;
         assert!(!created.snapshots, "no job yet");
@@ -1952,6 +1990,7 @@ mod tests {
             },
             secrets: Vec::new(),
             min_gpus: None,
+            pre_train: None,
         };
         let result = start(&ctx(&runs, &fake, &bus), &NoFiles, launch, created).await;
         assert!(

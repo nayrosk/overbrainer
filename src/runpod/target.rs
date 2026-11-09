@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use crate::config::{DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV, ListOrAuto, SshClient, Target};
+use crate::config::{
+    DEFAULT_RUNPOD_IMAGE, DEFAULT_RUNPOD_VENV, ListOrAuto, PreTrain, SshClient, Target,
+};
 use crate::exec::JobRuntime;
 
 use super::JOB_ENV;
@@ -55,6 +57,8 @@ pub struct RunpodTarget {
     /// The target's `ssh_client` as configured; `OVERBRAINER_SSH_CLIENT` is applied
     /// where the client is used (see [`effective_client`](crate::config::effective_client)).
     pub ssh_client: SshClient,
+    /// The command the pod runs before training, when the target sets one.
+    pub pre_train: Option<PreTrain>,
 }
 
 impl RunpodTarget {
@@ -77,6 +81,7 @@ impl RunpodTarget {
             network_volume_id,
             max_volume_gb,
             ssh_client,
+            pre_train,
         } = target
         else {
             return None;
@@ -102,6 +107,7 @@ impl RunpodTarget {
             network_volume_id: network_volume_id.clone(),
             max_volume_gb: *max_volume_gb,
             ssh_client: *ssh_client,
+            pre_train: pre_train.clone(),
         })
     }
 
@@ -162,6 +168,7 @@ mod tests {
             network_volume_id: volume.map(str::to_string),
             max_volume_gb: None,
             ssh_client: crate::config::SshClient::Openssh,
+            pre_train: None,
         }
     }
 

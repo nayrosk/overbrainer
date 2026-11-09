@@ -477,6 +477,9 @@ pub enum Target {
         /// no GPU (default true). `false` allows a deliberate CPU run.
         #[serde(default = "default_true")]
         require_gpu: bool,
+        /// A command run on the target before training, `[targets.<name>.pre_train]`.
+        #[serde(default)]
+        pre_train: Option<PreTrain>,
     },
     /// Runs on a remote machine reached over SSH.
     Ssh {
@@ -498,6 +501,9 @@ pub enum Target {
         /// no GPU (default true). `false` allows a deliberate CPU run.
         #[serde(default = "default_true")]
         require_gpu: bool,
+        /// A command run on the target before training, `[targets.<name>.pre_train]`.
+        #[serde(default)]
+        pre_train: Option<PreTrain>,
         /// The SSH client: `openssh` (default) or `builtin`, which needs a build with
         /// the `builtin-ssh` feature. `OVERBRAINER_SSH_CLIENT` overrides it.
         #[serde(default)]
@@ -568,6 +574,9 @@ pub enum Target {
         /// the `builtin-ssh` feature. `OVERBRAINER_SSH_CLIENT` overrides it.
         #[serde(default)]
         ssh_client: SshClient,
+        /// A command run on the pod before training, `[targets.<name>.pre_train]`.
+        #[serde(default)]
+        pre_train: Option<PreTrain>,
     },
 }
 
@@ -771,6 +780,16 @@ impl Target {
             Self::Runpod { gpu_count, .. } => Some(*gpu_count),
         }
     }
+
+    /// The command the target runs before training, when it sets one.
+    #[must_use]
+    pub const fn pre_train(&self) -> Option<&PreTrain> {
+        match self {
+            Self::Local { pre_train, .. }
+            | Self::Ssh { pre_train, .. }
+            | Self::Runpod { pre_train, .. } => pre_train.as_ref(),
+        }
+    }
 }
 
 fn default_gpu_count() -> u32 {
@@ -875,6 +894,37 @@ impl Default for Compare {
         }
     }
 }
+
+/// A command a target runs before training, after the GPU check: training goes
+/// on only when it exits with one of `ok_exit_codes` within `timeout_seconds`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PreTrain {
+    /// Program then arguments, never a shell string. Not empty.
+    pub command: Vec<String>,
+    /// Exit codes that let training go on, each from 0 to 255 (default `[0]`).
+    #[serde(default = "default_ok_exit_codes")]
+    pub ok_exit_codes: Vec<i64>,
+    /// Seconds the command may run, from 1 to 3600 (default 120). A string
+    /// from env is read as a number.
+    #[serde(default = "default_pre_train_timeout", deserialize_with = "number")]
+    pub timeout_seconds: u32,
+}
+
+/// The `ok_exit_codes` of a `pre_train` that sets none.
+fn default_ok_exit_codes() -> Vec<i64> {
+    vec![0]
+}
+
+/// The `timeout_seconds` of a `pre_train` that sets none.
+const fn default_pre_train_timeout() -> u32 {
+    DEFAULT_PRE_TRAIN_TIMEOUT
+}
+
+/// The `timeout_seconds` of a `pre_train` that sets none.
+pub const DEFAULT_PRE_TRAIN_TIMEOUT: u32 = 120;
+/// Longest `timeout_seconds` of a `pre_train`: one hour.
+pub const MAX_PRE_TRAIN_TIMEOUT: u32 = 3600;
 
 /// Push of a run to the Hugging Face Hub: `overbrainer push`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]

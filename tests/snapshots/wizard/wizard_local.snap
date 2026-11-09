@@ -75,6 +75,10 @@ runtime = "docker"             # native | docker
 # engine = "docker"            # docker: docker | podman
 # image = "axolotlai/axolotl:0.21.0-py3.12-cu130-2.14.1@sha256:d08da8a5dd2b3223a49fb25cdadd85bdf0c5acee9c5de223bf6ab10d0b511e14"
 # pin by digest: this container runs untrusted training code and receives secrets such as HF_TOKEN
+# [targets.local.pre_train]    # a command run before training, after the GPU check; any target
+# command = ["computefence", "doctor", "--json"]  # program then arguments, from PATH (<venv>/bin first)
+# ok_exit_codes = [0, 1]       # codes that let training go on (default [0])
+# timeout_seconds = 120        # 1 to 3600 (default 120)
 
 # [targets.homelab]
 # kind = "ssh"                 # host comes from OVERBRAINER_TARGETS__HOMELAB__HOST

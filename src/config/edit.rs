@@ -71,7 +71,8 @@ pub enum FieldPath {
     Target {
         /// Name of the target.
         name: String,
-        /// The key.
+        /// The key, or `<sub-table>.<key>` for a field of a sub-table such as
+        /// `pre_train.command`.
         field: &'static str,
     },
     /// `export.<field>`.
@@ -165,6 +166,24 @@ impl FieldPath {
         }
     }
 
+    /// The key of the field in the table holding it: the part after the dot of
+    /// a field in a sub-table.
+    #[must_use]
+    pub fn key(&self) -> &'static str {
+        let field = self.field();
+        field.rsplit_once('.').map_or(field, |(_, key)| key)
+    }
+
+    /// The sub-table of a target holding the field, such as `pre_train`, when
+    /// the field is in one.
+    #[must_use]
+    pub fn sub_table(&self) -> Option<&'static str> {
+        match self {
+            Self::Target { field, .. } => field.split_once('.').map(|(table, _)| table),
+            _ => None,
+        }
+    }
+
     /// The dotted path of the table holding the field, as `validate` names it.
     #[must_use]
     pub fn table(&self) -> String {
@@ -193,6 +212,10 @@ impl fmt::Display for FieldPath {
 const NEW_TOPIC_SUBTOPICS: i64 = 10;
 /// `questions_per_subtopic` of a topic added by [`ConfigDoc::add_topic`].
 const NEW_TOPIC_QUESTIONS: i64 = 30;
+/// The field a `[targets.<name>.pre_train]` table needs: the other fields mean
+/// nothing without it, and removing it removes the table.
+const PRE_TRAIN_COMMAND: &str = "pre_train.command";
+
 /// `max_hours` of a runpod target added by [`ConfigDoc::add_target`]: a safe cap.
 const NEW_RUNPOD_MAX_HOURS: f64 = 6.0;
 impl ConfigDoc {
@@ -214,12 +237,22 @@ impl ConfigDoc {
     }
 
     /// The value of an editable field in display form (strings unquoted, lists
-    /// comma-separated), or `None` when it is absent or not editable.
+    /// comma-separated, words as [`fields::show_words`] shows them), or `None`
+    /// when it is absent or not editable.
     #[must_use]
     pub fn get(&self, path: &FieldPath) -> Option<String> {
-        self.spec(path)?;
-        let value = self.entry(path)?.get(path.field())?.as_value()?;
-        Some(display(value))
+        let spec = self.spec(path)?;
+        let value = self.entry(path)?.get(path.key())?.as_value()?;
+        Some(match (spec.kind, value) {
+            (fields::FieldKind::Words, Value::Array(items)) => {
+                let words: Vec<String> = items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect();
+                fields::show_words(&words)
+            },
+            _ => display(value),
+        })
     }
 
     /// The spec of the field `path` names, when it is editable. A target's fields
@@ -231,26 +264,36 @@ impl ConfigDoc {
 
     /// Sets a field to a typed value, keeping the comment that follows the old value.
     /// An absent key is added at the end of its table; an absent `[project]`,
-    /// `[pipeline]`, `[training]`, `[roles]` or role is created.
+    /// `[pipeline]`, `[training]`, `[roles]`, role or target sub-table is created.
     ///
     /// # Errors
     ///
     /// Returns [`EditError::NotEditable`] for a field outside [`fields`],
-    /// [`EditError::Invalid`] when the value does not fit the field's kind, and
+    /// [`EditError::Invalid`] when the value does not fit the field's kind or
+    /// sets a `pre_train` field before `pre_train.command`, and
     /// [`EditError::Missing`] when the topic, provider or target does not exist.
     pub fn set(&mut self, path: &FieldPath, value: FieldValue) -> Result<(), EditError> {
         let spec = self.spec_of(path)?;
-        spec.kind
-            .check(&value)
-            .map_err(|reason| EditError::Invalid {
-                path: path.to_string(),
-                reason,
-            })?;
+        let invalid = |reason| EditError::Invalid {
+            path: path.to_string(),
+            reason,
+        };
+        spec.kind.check(&value).map_err(invalid)?;
+        if path.sub_table() == Some("pre_train")
+            && path.field() != PRE_TRAIN_COMMAND
+            && self
+                .entry(path)
+                .and_then(|table| table.get("command"))
+                .is_none()
+        {
+            return Err(invalid(FieldError::Needs(PRE_TRAIN_COMMAND)));
+        }
         self.raw_set(path, value)
     }
 
     /// Removes an optional field. Returns whether it was present. Comment lines
     /// above the key move to the next key, or the next table, or the end.
+    /// Removing `pre_train.command` removes the whole `pre_train` table.
     ///
     /// # Errors
     ///
@@ -268,7 +311,12 @@ impl ConfigDoc {
             Err(EditError::Missing(_)) => return Ok(false),
             Err(error) => return Err(error),
         }
-        let field = path.field();
+        if let FieldPath::Target { name, field } = path
+            && *field == PRE_TRAIN_COMMAND
+        {
+            return Ok(self.remove_sub_table(name, "pre_train"));
+        }
+        let field = path.key();
         let Some(entry) = self.entry_mut(path) else {
             return Ok(false);
         };
@@ -502,6 +550,27 @@ impl ConfigDoc {
         true
     }
 
+    /// Removes `[targets.<name>.<sub>]`, its comment lines kept before the next
+    /// table. Returns whether it existed.
+    fn remove_sub_table(&mut self, name: &str, sub: &str) -> bool {
+        let Some(target) = self
+            .doc
+            .get_mut("targets")
+            .and_then(|targets| targets.get_mut(name))
+            .and_then(Item::as_table_like_mut)
+        else {
+            return false;
+        };
+        match target.remove(sub) {
+            Some(Item::Table(removed)) => {
+                self.rehome(removed.position(), &comment_lines(removed.decor()));
+                true
+            },
+            Some(_) => true,
+            None => false,
+        }
+    }
+
     /// Puts the comment lines of a removed item before the first table after
     /// document position `after`, or at the end of the document.
     fn rehome(&mut self, after: Option<isize>, comments: &str) {
@@ -594,7 +663,11 @@ impl ConfigDoc {
             FieldPath::Hub(_) => Section::Hub,
             FieldPath::Metrics(_) => Section::Metrics,
             FieldPath::Target { name, .. } => {
-                if self.entry(path).is_none() {
+                let target = self
+                    .doc
+                    .get("targets")
+                    .and_then(|targets| targets.get(name));
+                if target.is_none() {
                     return Err(EditError::Missing(format!("targets.{name}")));
                 }
                 self.target_kind(name)
@@ -612,7 +685,7 @@ impl ConfigDoc {
         let entry = self.entry_or_create(path).ok_or_else(missing)?;
         let mut new = toml_value(value);
         if let Item::Value(Value::InlineTable(table)) = entry
-            && !table.contains_key(path.field())
+            && !table.contains_key(path.key())
         {
             // The space before `}` sits in the last value's suffix: hand it over.
             if let Some((_, last)) = table.iter_mut().last() {
@@ -622,11 +695,11 @@ impl ConfigDoc {
                     new.decor_mut().set_suffix(suffix);
                 }
             }
-            table.insert(path.field(), new);
+            table.insert(path.key(), new);
             return Ok(());
         }
         let table = entry.as_table_like_mut().ok_or_else(missing)?;
-        match table.get_mut(path.field()) {
+        match table.get_mut(path.key()) {
             Some(item) => {
                 if let Some(old) = item.as_value() {
                     *new.decor_mut() = old.decor().clone();
@@ -634,7 +707,7 @@ impl ConfigDoc {
                 *item = Item::Value(new);
             },
             None => {
-                table.insert(path.field(), Item::Value(new));
+                table.insert(path.key(), Item::Value(new));
             },
         }
         if created {
@@ -659,7 +732,13 @@ impl ConfigDoc {
             FieldPath::Export(_) => root.get("export"),
             FieldPath::Hub(_) => root.get("hub"),
             FieldPath::Metrics(_) => root.get("metrics"),
-            FieldPath::Target { name, .. } => root.get("targets")?.get(name.as_str()),
+            FieldPath::Target { name, .. } => {
+                let target = root.get("targets")?.get(name.as_str())?;
+                match path.sub_table() {
+                    Some(sub) => target.get(sub),
+                    None => Some(target),
+                }
+            },
         }
     }
 
@@ -679,13 +758,33 @@ impl ConfigDoc {
             FieldPath::Export(_) => root.get_mut("export"),
             FieldPath::Hub(_) => root.get_mut("hub"),
             FieldPath::Metrics(_) => root.get_mut("metrics"),
-            FieldPath::Target { name, .. } => root.get_mut("targets")?.get_mut(name.as_str()),
+            FieldPath::Target { name, .. } => {
+                let target = root.get_mut("targets")?.get_mut(name.as_str())?;
+                match path.sub_table() {
+                    Some(sub) => target.get_mut(sub),
+                    None => Some(target),
+                }
+            },
         }
     }
 
     /// The item of the table holding `path`'s field, creating a missing singleton
-    /// section or role.
+    /// section, role or target sub-table.
     fn entry_or_create(&mut self, path: &FieldPath) -> Option<&mut Item> {
+        if let (FieldPath::Target { name, .. }, Some(sub)) = (path, path.sub_table()) {
+            let item = self.doc.get_mut("targets")?.get_mut(name.as_str())?;
+            let inline = item.is_inline_table();
+            let target = item.as_table_like_mut()?;
+            if !target.contains_key(sub) {
+                let entry = if inline {
+                    Item::Value(Value::InlineTable(InlineTable::new()))
+                } else {
+                    Item::Table(Table::new())
+                };
+                target.insert(sub, entry);
+            }
+            return target.get_mut(sub);
+        }
         if matches!(
             path,
             FieldPath::Topic { .. } | FieldPath::Provider { .. } | FieldPath::Target { .. }
@@ -831,6 +930,8 @@ fn protocol_name(protocol: Protocol) -> &'static str {
     }
 }
 
+/// A typed value as the TOML value written for it: lists as arrays of strings
+/// or of integers.
 fn toml_value(value: FieldValue) -> Value {
     match value {
         FieldValue::Text(text) => Value::from(text),
@@ -838,6 +939,7 @@ fn toml_value(value: FieldValue) -> Value {
         FieldValue::Float(number) => Value::from(number),
         FieldValue::Bool(flag) => Value::from(flag),
         FieldValue::List(items) => Value::Array(items.into_iter().collect()),
+        FieldValue::Ints(numbers) => Value::Array(numbers.into_iter().collect()),
     }
 }
 
@@ -1499,10 +1601,98 @@ runtime = "native"
                 .flat_map(|end| [end - 0.5, end, end + 0.5])
                 .map(FieldValue::Float)
                 .collect(),
+            FieldKind::IntList { min, max } => [min - 1, min, max, max + 1]
+                .into_iter()
+                .map(|number| FieldValue::Ints(vec![number]))
+                .collect(),
             _ => Vec::new(),
         }
     }
 
+    /// A field of the target's `pre_train` table at `field`.
+    fn hook(field: &'static str) -> FieldPath {
+        FieldPath::Target {
+            name: "local".to_string(),
+            field,
+        }
+    }
+
+    /// Setting the command creates `[targets.local.pre_train]` after the
+    /// target, the other fields go in it, and the file keeps its comments.
+    #[test]
+    fn the_pre_train_fields_are_written_in_their_sub_table() -> TestResult {
+        let mut doc = ConfigDoc::parse(COMMENTED)?;
+        doc.set(
+            &hook("pre_train.command"),
+            FieldValue::List(vec![
+                "computefence".into(),
+                "doctor".into(),
+                "--path=/my dir".into(),
+            ]),
+        )?;
+        doc.set(
+            &hook("pre_train.ok_exit_codes"),
+            FieldValue::Ints(vec![0, 1]),
+        )?;
+        doc.set(&hook("pre_train.timeout_seconds"), FieldValue::Int(60))?;
+        validate(&doc)?;
+        let expected = format!(
+            "{COMMENTED}\n[targets.local.pre_train]\n\
+             command = [\"computefence\", \"doctor\", \"--path=/my dir\"]\n\
+             ok_exit_codes = [0, 1]\ntimeout_seconds = 60\n"
+        );
+        assert_eq!(doc.text(), expected);
+        assert_eq!(
+            doc.get(&hook("pre_train.command")).as_deref(),
+            Some(r#"computefence doctor "--path=/my dir""#)
+        );
+        assert_eq!(
+            doc.get(&hook("pre_train.ok_exit_codes")).as_deref(),
+            Some("0, 1")
+        );
+        assert_eq!(
+            hook("pre_train.command").to_string(),
+            "targets.local.pre_train.command"
+        );
+        Ok(())
+    }
+
+    /// Codes or a limit without a command are refused; removing the command
+    /// removes the table, its comments kept; removing another field keeps it.
+    #[test]
+    fn the_pre_train_table_lives_with_its_command() -> TestResult {
+        let mut doc = ConfigDoc::parse(COMMENTED)?;
+        assert_eq!(
+            doc.set(&hook("pre_train.timeout_seconds"), FieldValue::Int(60))
+                .map_err(|error| error.to_string()),
+            Err(
+                "targets.local.pre_train.timeout_seconds: needs pre_train.command first"
+                    .to_string()
+            )
+        );
+        assert_eq!(doc.text(), COMMENTED, "nothing written");
+        let text = format!(
+            "{COMMENTED}\n# checks the pod first\n[targets.local.pre_train]\n\
+             command = [\"computefence\"]\ntimeout_seconds = 60\n\n# exports\n[export]\n"
+        );
+        let mut doc = ConfigDoc::parse(&text)?;
+        assert!(doc.unset(&hook("pre_train.timeout_seconds"))?);
+        assert!(
+            doc.text()
+                .contains("[targets.local.pre_train]\ncommand = [\"computefence\"]\n")
+        );
+        assert!(doc.unset(&hook("pre_train.command"))?);
+        assert_eq!(
+            doc.text(),
+            format!("{COMMENTED}\n# checks the pod first\n# exports\n[export]\n")
+        );
+        assert!(!doc.unset(&hook("pre_train.command"))?);
+        validate(&doc)?;
+        Ok(())
+    }
+
+    /// Each number at, inside and outside its field's bounds is accepted by
+    /// the form exactly when `validate` accepts it, `pre_train` fields included.
     #[test]
     fn numeric_bounds_match_validate() -> TestResult {
         let mut doc = ConfigDoc::parse(COMMENTED)?;
@@ -1513,6 +1703,12 @@ runtime = "native"
         };
         // `auto`, so that min_vram_gb and max_price_per_hour are allowed.
         doc.set(&gpus, FieldValue::Text("auto".to_string()))?;
+        // A command, so that the other `pre_train` fields are allowed.
+        let command = FieldPath::Target {
+            name: "cloud".to_string(),
+            field: "pre_train.command",
+        };
+        doc.set(&command, FieldValue::List(vec!["true".to_string()]))?;
         validate(&doc)?;
         let sections = [
             Section::Topic,

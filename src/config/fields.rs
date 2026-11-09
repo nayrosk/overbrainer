@@ -90,6 +90,17 @@ pub enum FieldKind {
     /// `auto` (a [`FieldValue::Text`]) or a list of strings typed as
     /// comma-separated text; see [`ListOrAuto`].
     ListOrAuto,
+    /// A program and its arguments ([`FieldValue::List`]), typed as one line
+    /// of words split on spaces. Double quotes keep spaces in a word, and a
+    /// backslash takes the next character as it is.
+    Words,
+    /// Integers in `[min, max]` ([`FieldValue::Ints`]), typed comma-separated.
+    IntList {
+        /// Smallest accepted value.
+        min: i64,
+        /// Largest accepted value.
+        max: i64,
+    },
 }
 
 /// One end of a float range.
@@ -134,6 +145,8 @@ pub enum FieldValue {
     Bool(bool),
     /// A list of strings.
     List(Vec<String>),
+    /// A list of integers.
+    Ints(Vec<i64>),
 }
 
 /// Why a value does not fit a field. No message quotes the value.
@@ -160,6 +173,15 @@ pub enum FieldError {
     /// A required field cannot be removed.
     #[error("is required and cannot be removed")]
     Required,
+    /// A double quote opened in a list of words is never closed.
+    #[error("has a double quote that is not closed")]
+    UnclosedQuote,
+    /// A list of words with no word.
+    #[error("must name a program")]
+    NoWords,
+    /// A field of a sub-table set before the field the sub-table needs.
+    #[error("needs {0} first")]
+    Needs(&'static str),
 }
 
 impl FieldKind {
@@ -191,6 +213,14 @@ impl FieldKind {
                 ListOrAuto::Auto => FieldValue::Text(ListOrAuto::AUTO.to_string()),
                 ListOrAuto::List(items) => FieldValue::List(items),
             },
+            Self::Words => FieldValue::List(split_words(text)?),
+            Self::IntList { .. } => FieldValue::Ints(
+                text.split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(|item| item.parse().map_err(|_| FieldError::NotInt))
+                    .collect::<Result<_, _>>()?,
+            ),
         };
         self.check(&value)?;
         Ok(value)
@@ -207,6 +237,16 @@ impl FieldKind {
             | (Self::Bool, FieldValue::Bool(_))
             | (Self::ListOrAuto, FieldValue::List(_)) => Ok(()),
             (Self::ListOrAuto, FieldValue::Text(text)) if text == ListOrAuto::AUTO => Ok(()),
+            (Self::Words, FieldValue::List(words)) if !words.is_empty() => Ok(()),
+            (Self::Words, FieldValue::List(_)) => Err(FieldError::NoWords),
+            (Self::IntList { min, max }, FieldValue::Ints(numbers)) => {
+                if !numbers.is_empty() && numbers.iter().all(|number| (min..=max).contains(number))
+                {
+                    Ok(())
+                } else {
+                    Err(FieldError::OutOfRange(self.describe()))
+                }
+            },
             (Self::Int { min, max }, FieldValue::Int(number)) if (min..=max).contains(number) => {
                 Ok(())
             },
@@ -243,8 +283,70 @@ impl FieldKind {
             Self::Bool => "true or false".to_string(),
             Self::Choice(choices) => format!("one of {}", choices.join(", ")),
             Self::ListOrAuto => "auto or a comma-separated list".to_string(),
+            Self::Words => "a program and its arguments, separated by spaces".to_string(),
+            Self::IntList { min, max } => {
+                format!("one or more comma-separated whole numbers between {min} and {max}")
+            },
         }
     }
+}
+
+/// The words of `text` as [`FieldKind::Words`] reads them: split on
+/// whitespace, double quotes keeping spaces in a word, a backslash taking the
+/// next character as it is.
+///
+/// # Errors
+///
+/// Returns [`FieldError::UnclosedQuote`] when a double quote is not closed.
+fn split_words(text: &str) -> Result<Vec<String>, FieldError> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quoted = false;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let next = chars.next().unwrap_or('\\');
+                word.get_or_insert_with(String::new).push(next);
+            },
+            '"' => {
+                quoted = !quoted;
+                word.get_or_insert_with(String::new);
+            },
+            c if c.is_whitespace() && !quoted => words.extend(word.take()),
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    if quoted {
+        return Err(FieldError::UnclosedQuote);
+    }
+    words.extend(word);
+    Ok(words)
+}
+
+/// `words` as a [`FieldKind::Words`] field shows them, read back as the same
+/// words: a word that is empty or holds whitespace in double quotes, a double
+/// quote or a backslash after a backslash.
+#[must_use]
+pub fn show_words(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            let escaped: String = word
+                .chars()
+                .flat_map(|c| match c {
+                    '"' | '\\' => vec!['\\', c],
+                    c => vec![c],
+                })
+                .collect();
+            if word.is_empty() || word.chars().any(char::is_whitespace) {
+                format!("\"{escaped}\"")
+            } else {
+                escaped
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A float range in words: `in [0, 2]`, `in (0, 1)`, `greater than 0`.
@@ -313,6 +415,11 @@ const fn spec(
 const TEXT: FieldKind = FieldKind::Text;
 const BOOL: FieldKind = FieldKind::Bool;
 const LIST_OR_AUTO: FieldKind = FieldKind::ListOrAuto;
+const WORDS: FieldKind = FieldKind::Words;
+/// The exit codes of a process.
+const EXIT_CODES: FieldKind = FieldKind::IntList { min: 0, max: 255 };
+/// Longest `pre_train.timeout_seconds`, as in `validate.rs`.
+const MAX_PRE_TRAIN_TIMEOUT: i64 = crate::config::MAX_PRE_TRAIN_TIMEOUT as i64;
 const fn at_least(min: i64) -> FieldKind {
     FieldKind::Int { min, max: U32_MAX }
 }
@@ -572,6 +679,27 @@ const LOCAL: &[FieldSpec] = &[
         true,
         "Stop before training when PyTorch sees no GPU (default true)",
     ),
+    spec(
+        "pre_train.command",
+        WORDS,
+        true,
+        "Command run before training, program then arguments; empty removes pre_train",
+    ),
+    spec(
+        "pre_train.ok_exit_codes",
+        EXIT_CODES,
+        true,
+        "Exit codes of the pre_train command that let training go on (default 0)",
+    ),
+    spec(
+        "pre_train.timeout_seconds",
+        FieldKind::Int {
+            min: 1,
+            max: MAX_PRE_TRAIN_TIMEOUT,
+        },
+        true,
+        "Seconds the pre_train command may run (default 120)",
+    ),
 ];
 
 /// The fields of an `ssh` target.
@@ -612,6 +740,27 @@ const SSH: &[FieldSpec] = &[
         BOOL,
         true,
         "Stop before training when PyTorch sees no GPU (default true)",
+    ),
+    spec(
+        "pre_train.command",
+        WORDS,
+        true,
+        "Command run before training, program then arguments; empty removes pre_train",
+    ),
+    spec(
+        "pre_train.ok_exit_codes",
+        EXIT_CODES,
+        true,
+        "Exit codes of the pre_train command that let training go on (default 0)",
+    ),
+    spec(
+        "pre_train.timeout_seconds",
+        FieldKind::Int {
+            min: 1,
+            max: MAX_PRE_TRAIN_TIMEOUT,
+        },
+        true,
+        "Seconds the pre_train command may run (default 120)",
     ),
 ];
 
@@ -701,6 +850,27 @@ const RUNPOD: &[FieldSpec] = &[
         SSH_CLIENTS,
         true,
         "SSH client: openssh (default) or builtin, which needs the builtin-ssh feature",
+    ),
+    spec(
+        "pre_train.command",
+        WORDS,
+        true,
+        "Command run before training, program then arguments; empty removes pre_train",
+    ),
+    spec(
+        "pre_train.ok_exit_codes",
+        EXIT_CODES,
+        true,
+        "Exit codes of the pre_train command that let training go on (default 0)",
+    ),
+    spec(
+        "pre_train.timeout_seconds",
+        FieldKind::Int {
+            min: 1,
+            max: MAX_PRE_TRAIN_TIMEOUT,
+        },
+        true,
+        "Seconds the pre_train command may run (default 120)",
     ),
 ];
 
@@ -825,6 +995,9 @@ adapter = "qlora"
 kind = "local"
 runtime = "native"
 #ZZ local
+[targets.local.pre_train]
+command = ["true"]
+#ZZ pre_train
 [targets.box]
 kind = "ssh"
 runtime = "docker"
@@ -900,13 +1073,30 @@ max_hours = 6
         load_str(FIXTURE, EnvSource::Vars(Vec::new())).map(|_| ())
     }
 
+    /// Every field of every table is in the form or listed as not in it; the
+    /// fields of a target's `pre_train` sub-table are in each target's form.
     #[test]
     fn every_struct_field_is_editable_or_listed_as_not_in_the_form() -> Result<(), String> {
+        let hook = struct_fields("pre_train")?;
+        for kind in TargetKind::ALL {
+            let in_form: BTreeSet<String> = for_section(Section::Target(kind))
+                .iter()
+                .filter_map(|spec| spec.name.strip_prefix("pre_train."))
+                .map(str::to_string)
+                .collect();
+            assert_eq!(in_form, hook, "{} pre_train", kind.as_str());
+        }
         for (marker, section) in SECTIONS {
             let expected = struct_fields(marker)?;
+            // A field of a sub-table stands for the sub-table.
             let mut covered: BTreeSet<String> = for_section(section)
                 .iter()
-                .map(|spec| spec.name.to_string())
+                .map(|spec| {
+                    spec.name
+                        .split_once('.')
+                        .map_or(spec.name, |(table, _)| table)
+                        .to_string()
+                })
                 .collect();
             covered.extend(
                 NOT_IN_FORM
@@ -1109,6 +1299,87 @@ max_hours = 6
         for field in ["gpu_types", "data_center_ids"] {
             let spec = find(Section::Target(TargetKind::Runpod), field);
             assert_eq!(spec.map(|spec| spec.kind), Some(kind), "{field}");
+        }
+    }
+
+    /// A list of words splits on spaces, keeps quoted spaces and escaped
+    /// characters, and shows back as text that reads as the same words.
+    #[test]
+    fn words_round_trip_through_their_text() {
+        let words = |items: &[&str]| -> Vec<String> {
+            items.iter().map(|item| (*item).to_string()).collect()
+        };
+        let cases: [(&str, Vec<String>); 5] = [
+            (
+                "computefence doctor --json",
+                words(&["computefence", "doctor", "--json"]),
+            ),
+            ("  uvx   computefence  ", words(&["uvx", "computefence"])),
+            (
+                r#"run "--path=/my dir" x"#,
+                words(&["run", "--path=/my dir", "x"]),
+            ),
+            (
+                r#"echo --path="/my dir" """#,
+                words(&["echo", "--path=/my dir", ""]),
+            ),
+            (r#"say \"hi\" a\\b"#, words(&["say", "\"hi\"", "a\\b"])),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                FieldKind::Words.parse(text),
+                Ok(FieldValue::List(expected.clone())),
+                "{text}"
+            );
+            assert_eq!(
+                FieldKind::Words.parse(&show_words(&expected)),
+                Ok(FieldValue::List(expected.clone())),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            show_words(&words(&["run", "--path=/my dir", ""])),
+            r#"run "--path=/my dir" """#
+        );
+        assert_eq!(
+            FieldKind::Words.parse(r#"run "--path=/my dir"#),
+            Err(FieldError::UnclosedQuote)
+        );
+        assert_eq!(FieldKind::Words.parse("   "), Err(FieldError::NoWords));
+    }
+
+    /// A list of integers is typed comma-separated, each within the bounds.
+    #[test]
+    fn an_int_list_takes_comma_separated_numbers_within_its_bounds() {
+        let kind = FieldKind::IntList { min: 0, max: 255 };
+        assert_eq!(kind.parse(" 0, 1 ,2,"), Ok(FieldValue::Ints(vec![0, 1, 2])));
+        assert_eq!(kind.parse("0, one"), Err(FieldError::NotInt));
+        let refused = Err(FieldError::OutOfRange(
+            "one or more comma-separated whole numbers between 0 and 255".to_string(),
+        ));
+        assert_eq!(kind.parse("0, 256"), refused);
+        assert_eq!(kind.parse("-1"), refused);
+        assert_eq!(kind.parse(" , "), refused);
+        assert_eq!(kind.check(&FieldValue::Int(1)), Err(FieldError::WrongType));
+    }
+
+    /// Each kind of target edits the three fields of its `pre_train` hook.
+    #[test]
+    fn every_target_edits_its_pre_train_hook() {
+        for kind in TargetKind::ALL {
+            let section = Section::Target(kind);
+            assert_eq!(
+                find(section, "pre_train.command").map(|spec| spec.kind),
+                Some(FieldKind::Words)
+            );
+            assert_eq!(
+                find(section, "pre_train.ok_exit_codes").map(|spec| spec.kind),
+                Some(EXIT_CODES)
+            );
+            assert_eq!(
+                find(section, "pre_train.timeout_seconds").map(|spec| spec.kind),
+                Some(FieldKind::Int { min: 1, max: 3600 })
+            );
         }
     }
 

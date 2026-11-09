@@ -161,6 +161,7 @@ async fn train(
         runtime: &runtime,
         secrets,
         min_gpus: target.min_gpus(),
+        pre_train: target.pre_train(),
     };
     // Starting is never interrupted: dropping it after the job is spawned and
     // before its record is saved would leave a job nothing can find again.

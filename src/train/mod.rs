@@ -2,6 +2,7 @@
 
 mod axolotl;
 mod gpu;
+mod hook;
 mod metrics;
 mod phase;
 pub mod sizing;
@@ -15,6 +16,10 @@ pub use axolotl::{
 };
 pub use gpu::{
     GPU_CHECK_CODE, GPU_CHECK_FILE, GPU_CHECK_RESULT, GPU_CHECK_SCRIPT, GpuCheck, gpu_preflight,
+};
+pub use hook::{
+    HookResult, PRE_TRAIN_CODE, PRE_TRAIN_LOG, PRE_TRAIN_RESULT, PRE_TRAIN_TIMEOUT_CODE,
+    pre_train_preflight,
 };
 pub use metrics::{
     JobStage, METRICS_ENV, METRICS_PLUGIN, Mark, MetricLine, PLUGIN_CLASS, PLUGIN_FILE, Pace,
