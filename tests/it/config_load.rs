@@ -243,6 +243,26 @@ fn env_overrides_numeric_and_string_fields_of_targets() -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// The environment overrides the time limit of a target's `pre_train` hook
+/// from a string, as it does any number of a target.
+#[test]
+fn env_overrides_the_pre_train_timeout() -> Result<(), Box<dyn std::error::Error>> {
+    let hook = "\n[targets.box.pre_train]\ncommand = [\"computefence\", \"doctor\"]\n";
+    let dir = project(&format!("{BASE}{TARGETS}{hook}"))?;
+    let settings = load(
+        dir.path(),
+        env(&[("OVERBRAINER_TARGETS__BOX__PRE_TRAIN__TIMEOUT_SECONDS", "60")]),
+    )?;
+    let pre_train = settings
+        .targets
+        .get("box")
+        .and_then(Target::pre_train)
+        .ok_or("no pre_train")?;
+    assert_eq!(pre_train.timeout_seconds, 60);
+    assert_eq!(pre_train.command, ["computefence", "doctor"]);
+    Ok(())
+}
+
 #[test]
 fn target_numbers_from_the_file_and_defaults_still_apply() -> Result<(), Box<dyn std::error::Error>>
 {

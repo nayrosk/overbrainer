@@ -905,8 +905,9 @@ pub struct PreTrain {
     /// Exit codes that let training go on, each from 0 to 255 (default `[0]`).
     #[serde(default = "default_ok_exit_codes")]
     pub ok_exit_codes: Vec<i64>,
-    /// Seconds the command may run, from 1 to 3600 (default 120).
-    #[serde(default = "default_pre_train_timeout")]
+    /// Seconds the command may run, from 1 to 3600 (default 120). A string
+    /// from env is read as a number.
+    #[serde(default = "default_pre_train_timeout", deserialize_with = "number")]
     pub timeout_seconds: u32,
 }
 

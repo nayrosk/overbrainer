@@ -418,18 +418,20 @@ fn chain(
 /// words) and `path` (a `PATH=...` word, when set). Its output goes to its log,
 /// then to the job's; its result to its result file. A code `hook` does not
 /// allow exits the job with [`Hook::failed`], running out of time with
-/// [`Hook::timed_out`]. Without `timeout` the command runs with no limit, after
-/// a warning on stderr.
+/// [`Hook::timed_out`]: `timeout` exits 124, or 137 once the limit has passed
+/// when the command ignored SIGTERM and got SIGKILL. Without `timeout` the
+/// command runs with no limit, after a warning on stderr.
 fn hook_script(hook: &Hook, unset: &str, path: Option<&str>) -> String {
     let command: Vec<String> = hook.command.iter().map(|word| quote(word)).collect();
     let allowed: Vec<String> = hook.ok_exit_codes.iter().map(u8::to_string).collect();
     let path = path.map(|path| format!(" {path}")).unwrap_or_default();
     let (log, result, seconds) = (quote(&hook.log), quote(&hook.result), hook.timeout_seconds);
     format!(
-        "{{ if command -v timeout >/dev/null 2>&1; then t='timeout -k 5 {seconds}'; else t=; \
+        "{{ if command -v timeout >/dev/null 2>&1; then t='timeout -k 5 {seconds}'; s=$(date +%s); else t=; \
          echo 'overbrainer: timeout is not installed, the pre_train hook runs without a time limit' >&2; fi; \
          env{unset}{path} $t {command} > {log} 2>&1; code=$?; cat {log} || :; \
-         late=false; [ -n \"$t\" ] && [ \"$code\" = 124 ] && late=true; \
+         late=false; if [ -n \"$t\" ]; then case \"$code\" in 124) late=true;; \
+         137) [ \"$(( $(date +%s) - ${{s:-0}} ))\" -ge {seconds} ] && late=true;; esac; fi; \
          printf '{{\"code\":%s,\"allowed\":[{list}],\"timeout\":{seconds},\"timed_out\":%s}}\\n' \"$code\" \"$late\" > {result} || :; \
          case \"$code\" in {cases}) ;; *) [ \"$late\" = true ] && exit {timed_out}; exit {failed};; esac; }}",
         command = command.join(" "),
@@ -1025,11 +1027,12 @@ mod tests {
             preflight: &checks,
             ..spec(&commands[..1])
         });
-        let group = "{ if command -v timeout >/dev/null 2>&1; then t='timeout -k 5 120'; else t=; \
+        let group = "{ if command -v timeout >/dev/null 2>&1; then t='timeout -k 5 120'; s=$(date +%s); else t=; \
                      echo 'overbrainer: timeout is not installed, the pre_train hook runs without a time limit' >&2; fi; \
                      env -u 'HF_TOKEN' PATH=\"$HOME\"/'v/bin':\"$PATH\" $t 'computefence' 'doctor' > 'pre_train.log' 2>&1; \
                      code=$?; cat 'pre_train.log' || :; \
-                     late=false; [ -n \"$t\" ] && [ \"$code\" = 124 ] && late=true; \
+                     late=false; if [ -n \"$t\" ]; then case \"$code\" in 124) late=true;; \
+                     137) [ \"$(( $(date +%s) - ${s:-0} ))\" -ge 120 ] && late=true;; esac; fi; \
                      printf '{\"code\":%s,\"allowed\":[0,1],\"timeout\":120,\"timed_out\":%s}\\n' \"$code\" \"$late\" > 'pre_train.json' || :; \
                      case \"$code\" in 0|1) ;; *) [ \"$late\" = true ] && exit 92; exit 91;; esac; }";
         assert_eq!(
@@ -1130,6 +1133,41 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("pre_train.log"))?,
             "blocked\n"
+        );
+        Ok(())
+    }
+
+    /// A hook that ignores SIGTERM is killed 5 s after its limit and still
+    /// ends the job as out of time; skipped where `timeout` is not installed.
+    #[test]
+    fn a_hook_that_ignores_sigterm_still_runs_out_of_time() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let found = ["/usr/bin", "/bin"]
+            .iter()
+            .any(|dir| std::path::Path::new(dir).join("timeout").is_file());
+        if !found || !std::path::Path::new("/bin/sh").is_file() {
+            eprintln!("skipped: timeout or /bin/sh is not installed");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let commands = vec![vec!["true".to_string()]];
+        let checks = vec![hook(&["sh", "-c", "trap '' TERM; sleep 20"], 1)];
+        let job = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        }
+        .job(JobSpec {
+            preflight: &checks,
+            ..spec(&commands)
+        });
+        let output = run_in(
+            dir.path(),
+            std::path::Path::new("/usr/bin:/bin"),
+            &job.script,
+        )?;
+        assert_eq!(output.status.code(), Some(92), "{output:?}");
+        assert!(
+            std::fs::read_to_string(dir.path().join("pre_train.json"))?.contains("\"code\":137,")
         );
         Ok(())
     }
