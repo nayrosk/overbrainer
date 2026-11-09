@@ -141,6 +141,7 @@ fn target(gpu_types: &[&str]) -> RunpodTarget {
         network_volume_id: None,
         max_volume_gb: None,
         ssh_client: overbrainer::config::SshClient::Openssh,
+        pre_train: None,
     }
 }
 

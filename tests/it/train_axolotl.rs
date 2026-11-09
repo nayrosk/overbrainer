@@ -174,7 +174,8 @@ fn step_cadence_in_axolotl_extra_replaces_the_per_epoch_one() -> TestResult {
     Ok(())
 }
 
-/// The trainer's commands, environment, stages and artifacts.
+/// The trainer's commands, environment, stages and artifacts, the GPU
+/// check's result and the `pre_train` hook's files among them.
 #[test]
 fn commands_env_and_artifacts() -> TestResult {
     let (dir, settings) = settings(QLORA)?;
@@ -213,6 +214,8 @@ fn commands_env_and_artifacts() -> TestResult {
                 "output".into(),
                 "metrics.jsonl".into(),
                 "gpu_check.json".into(),
+                "pre_train.log".into(),
+                "pre_train.json".into(),
             ],
             exclude: vec!["checkpoint-*".into()],
             required: Some("output".into()),

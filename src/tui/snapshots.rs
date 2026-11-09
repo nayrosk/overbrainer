@@ -2046,6 +2046,40 @@ fn project_view_while_a_stage_uses_the_configuration() -> TestResult {
     Ok(())
 }
 
+/// The Project view walked down with `j` to the field `wanted`.
+fn project_at(mut app: App, wanted: &str) -> Result<App, Box<dyn std::error::Error>> {
+    for _ in 0..200 {
+        let listing = app.project_listing();
+        if listing
+            .field(app.project_view.selected)
+            .is_some_and(|field| field.key == wanted)
+        {
+            return Ok(app);
+        }
+        app.on_input(&key(KeyCode::Char('j')));
+    }
+    Err(format!("no row {wanted}").into())
+}
+
+/// A target's form shows the three `pre_train` fields after its own: unset
+/// without a hook, the command as words and the defaults with one.
+#[test]
+fn a_target_form_with_and_without_its_pre_train_hook() -> TestResult {
+    let command = "targets.gpu_cloud.pre_train.command";
+    let mut app = project_at(project_app()?, command)?;
+    snapshot("project_no_pre_train", &mut app)?;
+
+    let mut app = project_app()?;
+    let text = format!(
+        "{PROJECT_CONFIG}\n[targets.gpu_cloud.pre_train]\n\
+         command = [\"computefence\", \"doctor\", \"--path=/my dir\"]\n"
+    );
+    app.config = Some(ProjectConfig::new(&text, &project_env())?);
+    let mut app = project_at(app, command)?;
+    snapshot("project_pre_train", &mut app)?;
+    Ok(())
+}
+
 /// Every row of the Project view, drawn once each while `j` walks down,
 /// shows `set`, `unset` or `vault ref` for a secret, never its value.
 #[test]

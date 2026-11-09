@@ -162,6 +162,7 @@ fn target() -> RunpodTarget {
         network_volume_id: None,
         max_volume_gb: None,
         ssh_client: SshClient::Openssh,
+        pre_train: None,
     }
 }
 

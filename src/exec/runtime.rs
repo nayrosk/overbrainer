@@ -70,20 +70,49 @@ pub struct JobSpec<'a> {
     /// Checks run in order before `commands`, in the same environment but
     /// without the secrets. They write no stage event, and the stop marker
     /// still applies after the first of `commands`. The first that fails ends
-    /// the job with its [`Preflight::code`].
+    /// the job with its code: the `code` of a [`Preflight::Python`],
+    /// [`Hook::failed`] or [`Hook::timed_out`] of a [`Preflight::Hook`].
     pub preflight: &'a [Preflight],
 }
 
 /// A check a job runs before its commands (see [`JobSpec::preflight`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Preflight {
-    /// The arguments of the trainer's Python: the job's own Python in a
+pub enum Preflight {
+    /// A script run by the trainer's Python: the job's own Python in a
     /// container, `<venv>/bin/python` in a native runtime with a virtual
     /// environment, else the `python` beside the first command's program on
     /// `PATH`, or `python3`.
-    pub args: Vec<String>,
-    /// The job's exit code when the check fails.
-    pub code: u8,
+    Python {
+        /// The arguments of the trainer's Python.
+        args: Vec<String>,
+        /// The job's exit code when the script fails.
+        code: u8,
+    },
+    /// A command of the user's (see [`Hook`]).
+    Hook(Hook),
+}
+
+/// A command a job runs before its trainer, its output kept in a log, its
+/// exit code and whether it ran out of time in a result file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hook {
+    /// Program and arguments. The program is looked up on `PATH`, with
+    /// `<venv>/bin` first in a native runtime with a virtual environment.
+    pub command: Vec<String>,
+    /// Exit codes that let the job go on.
+    pub ok_exit_codes: Vec<u8>,
+    /// Seconds the command may run, where `timeout` is installed.
+    pub timeout_seconds: u32,
+    /// The file, as the job sees it, that gets the command's output, which the
+    /// job log gets too once it ended.
+    pub log: String,
+    /// The file, as the job sees it, that gets
+    /// `{"code":N,"allowed":[...],"timeout":S,"timed_out":B}`.
+    pub result: String,
+    /// The job's exit code when the command exits with a code it does not allow.
+    pub failed: u8,
+    /// The job's exit code when the command ran out of time.
+    pub timed_out: u8,
 }
 
 /// The stage events of a job: one line in `file` before each command.
@@ -237,7 +266,7 @@ fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>)
     words.push(quote(image));
     words.push(format!(
         "sh -c {}",
-        quote(&chain(spec, quote, &quote("python")))
+        quote(&chain(spec, quote, &quote("python"), None))
     ));
     let dirs: Vec<String> = std::iter::once(spec.cache_dir)
         .chain(spec.tools_dir)
@@ -248,7 +277,8 @@ fn container_script(engine: Engine, image: &str, name: &str, spec: &JobSpec<'_>)
 
 /// The script running `spec` on the target itself: the env file sourced, the
 /// environment exported, the preflight's Python found when there is no `venv`,
-/// then [`chain`] with each program taken from `venv` or `PATH`.
+/// then [`chain`] with each program taken from `venv` or `PATH`, and a hook's
+/// program from `PATH` with `<venv>/bin` first.
 fn native_script(venv: Option<&str>, env_file: Option<&str>, spec: &JobSpec<'_>) -> String {
     let resolve = |program: &str| match venv {
         Some(venv) => shell_path(&format!("{}/bin/{program}", venv.trim_end_matches('/'))),
@@ -272,12 +302,22 @@ fn native_script(venv: Option<&str>, env_file: Option<&str>, spec: &JobSpec<'_>)
     let python = if venv.is_some() {
         resolve("python")
     } else {
-        if !spec.preflight.is_empty() {
+        if spec
+            .preflight
+            .iter()
+            .any(|check| matches!(check, Preflight::Python { .. }))
+        {
             parts.push(python_beside(spec.commands));
         }
         "\"$py\"".to_string()
     };
-    parts.push(chain(spec, resolve, &python));
+    let path = venv.map(|venv| {
+        format!(
+            "PATH={}:\"$PATH\"",
+            shell_path(&format!("{}/bin", venv.trim_end_matches('/')))
+        )
+    });
+    parts.push(chain(spec, resolve, &python, path.as_deref()));
     parts.join(" && ")
 }
 
@@ -309,13 +349,19 @@ fn export_word(name: &str, value: &str) -> String {
     }
 }
 
-/// The preflight of `spec`, each check run by the shell word `python` without
-/// the job's secrets, then its commands joined with `&&`, each program resolved
+/// The preflight of `spec`, each check run without the job's secrets (a
+/// script by the shell word `python`, a hook with `path`, an assignment of
+/// `PATH`, when set), then its commands joined with `&&`, each program resolved
 /// by `program` and each argument quoted, each after its stage event when
 /// `spec` has stages. A failed check exits with its code. With a stop marker,
 /// the commands after the first run only when that file does not exist once the
 /// first ended; the job then exits 0 without them.
-fn chain(spec: &JobSpec<'_>, program: impl Fn(&str) -> String, python: &str) -> String {
+fn chain(
+    spec: &JobSpec<'_>,
+    program: impl Fn(&str) -> String,
+    python: &str,
+    path: Option<&str>,
+) -> String {
     let unset = spec
         .secrets
         .iter()
@@ -324,18 +370,17 @@ fn chain(spec: &JobSpec<'_>, program: impl Fn(&str) -> String, python: &str) -> 
             unset.push_str(&quote(name));
             unset
         });
-    let env = if unset.is_empty() {
-        String::new()
-    } else {
-        format!("env{unset} ")
-    };
-    let checks = spec.preflight.iter().map(|check| {
-        let args: Vec<String> = check.args.iter().map(|arg| quote(arg)).collect();
-        format!(
-            "{{ {env}{python} {} || exit {}; }}",
-            args.join(" "),
-            check.code
-        )
+    let checks = spec.preflight.iter().map(|check| match check {
+        Preflight::Python { args, code } => {
+            let env = if unset.is_empty() {
+                String::new()
+            } else {
+                format!("env{unset} ")
+            };
+            let args: Vec<String> = args.iter().map(|arg| quote(arg)).collect();
+            format!("{{ {env}{python} {} || exit {code}; }}", args.join(" "))
+        },
+        Preflight::Hook(hook) => hook_script(hook, &unset, path),
     });
     let lines: Vec<String> = spec
         .commands
@@ -367,6 +412,36 @@ fn chain(spec: &JobSpec<'_>, program: impl Fn(&str) -> String, python: &str) -> 
         .chain(std::iter::once(commands))
         .collect::<Vec<_>>()
         .join(" && ")
+}
+
+/// The shell group running `hook` under `env` with `unset` (its ` -u NAME`
+/// words) and `path` (a `PATH=...` word, when set). Its output goes to its log,
+/// then to the job's; its result to its result file. A code `hook` does not
+/// allow exits the job with [`Hook::failed`], running out of time with
+/// [`Hook::timed_out`]. Without `timeout` the command runs with no limit, after
+/// a warning on stderr.
+fn hook_script(hook: &Hook, unset: &str, path: Option<&str>) -> String {
+    let command: Vec<String> = hook.command.iter().map(|word| quote(word)).collect();
+    let allowed: Vec<String> = hook.ok_exit_codes.iter().map(u8::to_string).collect();
+    let path = path.map(|path| format!(" {path}")).unwrap_or_default();
+    let (log, result, seconds) = (quote(&hook.log), quote(&hook.result), hook.timeout_seconds);
+    format!(
+        "{{ if command -v timeout >/dev/null 2>&1; then t='timeout -k 5 {seconds}'; else t=; \
+         echo 'overbrainer: timeout is not installed, the pre_train hook runs without a time limit' >&2; fi; \
+         env{unset}{path} $t {command} > {log} 2>&1; code=$?; cat {log} || :; \
+         late=false; [ -n \"$t\" ] && [ \"$code\" = 124 ] && late=true; \
+         printf '{{\"code\":%s,\"allowed\":[{list}],\"timeout\":{seconds},\"timed_out\":%s}}\\n' \"$code\" \"$late\" > {result} || :; \
+         case \"$code\" in {cases}) ;; *) [ \"$late\" = true ] && exit {timed_out}; exit {failed};; esac; }}",
+        command = command.join(" "),
+        list = allowed.join(","),
+        cases = if allowed.is_empty() {
+            "0".to_string()
+        } else {
+            allowed.join("|")
+        },
+        timed_out = hook.timed_out,
+        failed = hook.failed,
+    )
 }
 
 /// A path as a shell word, with a leading `~/` expanded to the target's home.
@@ -771,7 +846,7 @@ mod tests {
 
     /// The checks of the preflight.
     fn checks() -> Vec<Preflight> {
-        vec![Preflight {
+        vec![Preflight::Python {
             args: vec![
                 "/w/r1/gpu_check.py".into(),
                 "/w/r1/gpu_check.json".into(),
@@ -849,7 +924,7 @@ mod tests {
         stub("trainer", "echo trained > trained")?;
         stub("python", "echo \"$1\" > checked; exit 4")?;
         let commands = vec![vec!["trainer".to_string()]];
-        let checks = vec![Preflight {
+        let checks = vec![Preflight::Python {
             args: vec!["check.py".into()],
             code: 90,
         }];
@@ -918,5 +993,144 @@ mod tests {
         }
         let output = command.output()?;
         Ok(String::from_utf8(output.stdout)?)
+    }
+
+    /// A hook running `command`, allowing 0 and 1 for `seconds`, its files in
+    /// the job's directory.
+    fn hook(command: &[&str], seconds: u32) -> Preflight {
+        Preflight::Hook(Hook {
+            command: command.iter().map(|word| (*word).to_string()).collect(),
+            ok_exit_codes: vec![0, 1],
+            timeout_seconds: seconds,
+            log: "pre_train.log".into(),
+            result: "pre_train.json".into(),
+            failed: 91,
+            timed_out: 92,
+        })
+    }
+
+    /// In a native runtime with a venv, the hook runs under `env` without the
+    /// secrets, `<venv>/bin` first on `PATH`, under `timeout` when there is
+    /// one, before the first trainer command; a container runs it as is.
+    #[test]
+    fn the_hook_runs_without_secrets_with_the_venv_first_on_path() {
+        let commands = commands();
+        let checks = vec![hook(&["computefence", "doctor"], 120)];
+        let job = JobRuntime::Native {
+            venv: Some("~/v".into()),
+            env_file: None,
+        }
+        .job(JobSpec {
+            secrets: vec![("HF_TOKEN".into(), SecretString::from("hf_x"))],
+            preflight: &checks,
+            ..spec(&commands[..1])
+        });
+        let group = "{ if command -v timeout >/dev/null 2>&1; then t='timeout -k 5 120'; else t=; \
+                     echo 'overbrainer: timeout is not installed, the pre_train hook runs without a time limit' >&2; fi; \
+                     env -u 'HF_TOKEN' PATH=\"$HOME\"/'v/bin':\"$PATH\" $t 'computefence' 'doctor' > 'pre_train.log' 2>&1; \
+                     code=$?; cat 'pre_train.log' || :; \
+                     late=false; [ -n \"$t\" ] && [ \"$code\" = 124 ] && late=true; \
+                     printf '{\"code\":%s,\"allowed\":[0,1],\"timeout\":120,\"timed_out\":%s}\\n' \"$code\" \"$late\" > 'pre_train.json' || :; \
+                     case \"$code\" in 0|1) ;; *) [ \"$late\" = true ] && exit 92; exit 91;; esac; }";
+        assert_eq!(
+            job.script,
+            format!("{group} && \"$HOME\"/'v/bin/axolotl' 'train' 'axolotl.yaml'")
+        );
+        assert!(!job.script.contains("hf_x"));
+        let script = JobRuntime::Container {
+            engine: Engine::Docker,
+            image: "img:1".into(),
+        }
+        .job(JobSpec {
+            preflight: &checks,
+            ..spec(&commands[..1])
+        })
+        .script;
+        assert!(script.contains("env $t"), "{script}");
+        assert!(!script.contains("PATH="), "{script}");
+    }
+
+    /// Runs `script` with `/bin/sh` in `dir`, `bin` alone on `PATH`.
+    fn run_in(
+        dir: &std::path::Path,
+        bin: &std::path::Path,
+        script: &str,
+    ) -> std::io::Result<std::process::Output> {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(dir)
+            .env_clear()
+            .env("PATH", bin)
+            .output()
+    }
+
+    /// A hook's code it allows lets the commands run, one it does not ends the
+    /// job with the hook's code; its output goes to its log and the job's, its
+    /// code to its result. Without `timeout`, it runs after a warning.
+    #[test]
+    fn the_hook_code_decides_whether_the_commands_run() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        if !std::path::Path::new("/bin/sh").is_file() {
+            eprintln!("skipped: /bin/sh is not installed");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin)?;
+        // Only what the job uses, so `timeout` is missing.
+        for tool in ["env", "cat"] {
+            let found = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|dir| std::path::Path::new(dir).join(tool))
+                .find(|path| path.is_file())
+                .ok_or("no such tool")?;
+            symlink(found, bin.join(tool))?;
+        }
+        let stub = |name: &str, body: &str| -> std::io::Result<()> {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        };
+        stub("trainer", "echo trained > trained")?;
+        let commands = vec![vec!["trainer".to_string()]];
+        let checks = vec![hook(&["check"], 5)];
+        let job = JobRuntime::Native {
+            venv: None,
+            env_file: None,
+        }
+        .job(JobSpec {
+            preflight: &checks,
+            ..spec(&commands)
+        });
+
+        stub("check", "echo warned; exit 1")?;
+        let output = run_in(dir.path(), &bin, &job.script)?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            dir.path().join("trained").exists(),
+            "an allowed code lets it run"
+        );
+        assert_eq!(String::from_utf8(output.stdout)?, "warned\n");
+        assert!(String::from_utf8(output.stderr)?.contains("runs without a time limit"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pre_train.json"))?,
+            "{\"code\":1,\"allowed\":[0,1],\"timeout\":5,\"timed_out\":false}\n"
+        );
+
+        std::fs::remove_file(dir.path().join("trained"))?;
+        stub("check", "echo blocked; exit 2")?;
+        let output = run_in(dir.path(), &bin, &job.script)?;
+        assert_eq!(output.status.code(), Some(91));
+        assert!(
+            !dir.path().join("trained").exists(),
+            "the command never ran"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pre_train.log"))?,
+            "blocked\n"
+        );
+        Ok(())
     }
 }

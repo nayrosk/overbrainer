@@ -983,6 +983,7 @@ fn a40_target(ssh_client: SshClient) -> RunpodTarget {
         network_volume_id: None,
         max_volume_gb: None,
         ssh_client,
+        pre_train: None,
     }
 }
 
@@ -1065,6 +1066,7 @@ async fn provision_saves_the_pod_id_before_runs_start_saves_running() -> TestRes
             runtime: &runtime,
             secrets: Vec::new(),
             min_gpus: None,
+            pre_train: None,
         };
         let started = start(&run_ctx, &observer, launch, record).await?;
         assert_eq!(started.state, RunState::Running);

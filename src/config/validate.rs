@@ -1,6 +1,7 @@
 use super::types::{
-    Adapter, BUILTIN_SSH_REFUSED, Effort, HAS_BUILTIN_SSH, ListOrAuto, Protocol, QUANTIZE_TYPES,
-    RoleModel, Runtime, Settings, SshClient, Target, Training, is_ollama_name,
+    Adapter, BUILTIN_SSH_REFUSED, Effort, HAS_BUILTIN_SSH, ListOrAuto, MAX_PRE_TRAIN_TIMEOUT,
+    PreTrain, Protocol, QUANTIZE_TYPES, RoleModel, Runtime, Settings, SshClient, Target, Training,
+    is_ollama_name,
 };
 
 /// Highest `pipeline.concurrency`: far above what providers allow, and well within
@@ -489,6 +490,39 @@ fn check_targets(settings: &Settings, problems: &mut Vec<String>) {
             },
             Target::Runpod { .. } => check_runpod_target(name, target, problems),
         }
+        if let Some(pre_train) = target.pre_train() {
+            check_pre_train(name, pre_train, problems);
+        }
+    }
+}
+
+/// A `pre_train` hook: a program to run, exit codes a process can return, and
+/// a time limit within an hour.
+fn check_pre_train(name: &str, pre_train: &PreTrain, problems: &mut Vec<String>) {
+    let at = format!("targets.{name}.pre_train");
+    if pre_train
+        .command
+        .first()
+        .is_none_or(|program| program.trim().is_empty())
+    {
+        problems.push(format!("{at}.command: must name a program"));
+    }
+    if pre_train.ok_exit_codes.is_empty() {
+        problems.push(format!("{at}.ok_exit_codes: must not be empty"));
+    }
+    if pre_train
+        .ok_exit_codes
+        .iter()
+        .any(|code| !(0..=255).contains(code))
+    {
+        problems.push(format!(
+            "{at}.ok_exit_codes: each must be between 0 and 255"
+        ));
+    }
+    if !(1..=MAX_PRE_TRAIN_TIMEOUT).contains(&pre_train.timeout_seconds) {
+        problems.push(format!(
+            "{at}.timeout_seconds: must be between 1 and {MAX_PRE_TRAIN_TIMEOUT}"
+        ));
     }
 }
 
@@ -527,6 +561,7 @@ fn check_runpod_target(name: &str, target: &Target, problems: &mut Vec<String>) 
         network_volume_id,
         max_volume_gb,
         ssh_client,
+        ..
     } = target
     else {
         return;
@@ -1534,6 +1569,79 @@ mod tests {
     /// `VALID` plus an ssh target `box` with `extra` lines.
     fn with_ssh(extra: &str) -> String {
         format!("{VALID}\n[targets.box]\nkind = \"ssh\"\nruntime = \"native\"\n{extra}\n")
+    }
+
+    /// A `pre_train` hook takes the default codes and limit, on every kind of
+    /// target.
+    #[test]
+    fn a_pre_train_hook_has_defaults_on_every_target() -> Result<(), Box<dyn std::error::Error>> {
+        let hook = "[targets.box.pre_train]\ncommand = [\"computefence\", \"doctor\"]";
+        let settings = settings(&with_ssh(hook))?;
+        assert_eq!(check(&settings), Vec::<String>::new());
+        assert_eq!(
+            settings.targets.get("box").and_then(Target::pre_train),
+            Some(&PreTrain {
+                command: vec!["computefence".into(), "doctor".into()],
+                ok_exit_codes: vec![0],
+                timeout_seconds: 120,
+            })
+        );
+        let settings = self::settings(&with_runpod(
+            "[targets.cloud.pre_train]\ncommand = [\"true\"]",
+        ))?;
+        assert_eq!(check(&settings), Vec::<String>::new());
+        assert!(
+            settings
+                .targets
+                .get("cloud")
+                .and_then(Target::pre_train)
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// An empty command, no code, a code a process cannot return and a limit
+    /// outside one hour are each a problem; a hook without a command does not
+    /// load.
+    #[test]
+    fn a_pre_train_hook_needs_a_program_codes_and_a_limit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cases = [
+            (
+                "command = []",
+                "targets.box.pre_train.command: must name a program",
+            ),
+            (
+                "command = [\" \"]",
+                "targets.box.pre_train.command: must name a program",
+            ),
+            (
+                "command = [\"x\"]\nok_exit_codes = []",
+                "targets.box.pre_train.ok_exit_codes: must not be empty",
+            ),
+            (
+                "command = [\"x\"]\nok_exit_codes = [0, 256]",
+                "targets.box.pre_train.ok_exit_codes: each must be between 0 and 255",
+            ),
+            (
+                "command = [\"x\"]\nok_exit_codes = [-1]",
+                "targets.box.pre_train.ok_exit_codes: each must be between 0 and 255",
+            ),
+            (
+                "command = [\"x\"]\ntimeout_seconds = 0",
+                "targets.box.pre_train.timeout_seconds: must be between 1 and 3600",
+            ),
+            (
+                "command = [\"x\"]\ntimeout_seconds = 3601",
+                "targets.box.pre_train.timeout_seconds: must be between 1 and 3600",
+            ),
+        ];
+        for (lines, problem) in cases {
+            let settings = settings(&with_ssh(&format!("[targets.box.pre_train]\n{lines}")))?;
+            assert_eq!(check(&settings), vec![problem.to_string()], "{lines}");
+        }
+        assert!(settings(&with_ssh("[targets.box.pre_train]\ntimeout_seconds = 5")).is_err());
+        Ok(())
     }
 
     /// SSH and Runpod targets use OpenSSH when `ssh_client` is unset.

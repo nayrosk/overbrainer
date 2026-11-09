@@ -728,6 +728,7 @@ async fn a_standalone_export_shows_as_exporting_gguf() -> TestResult {
         runtime: &runtime,
         secrets: Vec::new(),
         min_gpus: None,
+        pre_train: None,
     };
     let started = start_mounted(&ctx, &job, launch, record, &run_dir).await?;
     let id = started.job.ok_or("no job")?;

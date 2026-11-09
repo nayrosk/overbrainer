@@ -26,7 +26,7 @@ const TOO_FEW: u8 = 5;
 /// it: at least `min_gpus` devices.
 #[must_use]
 pub fn gpu_preflight(root: &str, min_gpus: u32) -> Preflight {
-    Preflight {
+    Preflight::Python {
         args: vec![
             format!("{root}/{GPU_CHECK_FILE}"),
             format!("{root}/{GPU_CHECK_RESULT}"),
@@ -95,16 +95,17 @@ mod tests {
     /// The preflight runs the script on the run directory with the GPU count.
     #[test]
     fn the_preflight_runs_the_script_with_the_gpu_count() {
-        let check = gpu_preflight("/workspace/run", 2);
         assert_eq!(
-            check.args,
-            [
-                "/workspace/run/gpu_check.py",
-                "/workspace/run/gpu_check.json",
-                "2"
-            ]
+            gpu_preflight("/workspace/run", 2),
+            Preflight::Python {
+                args: vec![
+                    "/workspace/run/gpu_check.py".into(),
+                    "/workspace/run/gpu_check.json".into(),
+                    "2".into(),
+                ],
+                code: GPU_CHECK_CODE,
+            }
         );
-        assert_eq!(check.code, GPU_CHECK_CODE);
     }
 
     /// Each failure code names its cause; a pass or an unknown code names none.

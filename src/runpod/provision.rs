@@ -1427,6 +1427,28 @@ mod tests {
         pod: Pod,
     }
 
+    /// The Runpod target of a [`Stub`]: one GPU type, the default venv.
+    fn stub_target() -> RunpodTarget {
+        RunpodTarget {
+            gpu_types: crate::config::ListOrAuto::List(vec!["A".into()]),
+            min_vram_gb: None,
+            max_price_per_hour: None,
+            gpu_count: 1,
+            image: "img@sha256:abc".into(),
+            venv: Some("/workspace/axolotl-venv".into()),
+            container_disk_gb: 50,
+            max_hours: 6.0,
+            max_cost_usd: None,
+            boot_grace: Duration::from_mins(30),
+            retrieve_grace: Duration::from_secs(3600),
+            data_center_ids: crate::config::ListOrAuto::default(),
+            network_volume_id: None,
+            max_volume_gb: None,
+            ssh_client: crate::config::SshClient::Openssh,
+            pre_train: None,
+        }
+    }
+
     impl Stub {
         /// `deletable`: the pod disappears once deleted, else it stays listed.
         async fn new(deletable: bool) -> Result<Self, Box<dyn std::error::Error>> {
@@ -1505,23 +1527,7 @@ mod tests {
                     gone_interval: Duration::from_millis(5),
                 },
                 interrupted: AtomicBool::new(false),
-                target: RunpodTarget {
-                    gpu_types: crate::config::ListOrAuto::List(vec!["A".into()]),
-                    min_vram_gb: None,
-                    max_price_per_hour: None,
-                    gpu_count: 1,
-                    image: "img@sha256:abc".into(),
-                    venv: Some("/workspace/axolotl-venv".into()),
-                    container_disk_gb: 50,
-                    max_hours: 6.0,
-                    max_cost_usd: None,
-                    boot_grace: Duration::from_mins(30),
-                    retrieve_grace: Duration::from_secs(3600),
-                    data_center_ids: crate::config::ListOrAuto::default(),
-                    network_volume_id: None,
-                    max_volume_gb: None,
-                    ssh_client: crate::config::SshClient::Openssh,
-                },
+                target: stub_target(),
                 keys: PodKeys::new(
                     std::path::PathBuf::from("/nonexistent/id_ed25519"),
                     "ssh-ed25519 AAAAclient overbrainer".into(),

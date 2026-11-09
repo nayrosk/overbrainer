@@ -749,6 +749,7 @@ mod tests {
             network_volume_id: None,
             max_volume_gb: None,
             ssh_client: crate::config::SshClient::Openssh,
+            pre_train: None,
         }
     }
 

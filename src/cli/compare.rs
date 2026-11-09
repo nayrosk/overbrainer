@@ -398,6 +398,7 @@ async fn on_target(
         runtime: &runtime,
         secrets: Vec::new(),
         min_gpus: None,
+        pre_train: None,
     };
     // Starting is never interrupted: a job spawned and not recorded could not
     // be found again.
@@ -613,6 +614,7 @@ mod tests {
             network_volume_id: None,
             max_volume_gb: None,
             ssh_client: crate::config::SshClient::Openssh,
+            pre_train: None,
         }
     }
 

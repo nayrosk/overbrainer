@@ -717,6 +717,22 @@ fn training_value(training: &Training, field: &str) -> Option<String> {
 /// The value of `field` in `target` as the Project view shows it, or `None`
 /// when unset or not a field of that kind of target.
 fn target_value(target: &Target, field: &str) -> Option<String> {
+    if let Some(key) = field.strip_prefix("pre_train.") {
+        let pre_train = target.pre_train()?;
+        return match key {
+            "command" => Some(fields::show_words(&pre_train.command)),
+            "ok_exit_codes" => Some(
+                pre_train
+                    .ok_exit_codes
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            "timeout_seconds" => Some(pre_train.timeout_seconds.to_string()),
+            _ => None,
+        };
+    }
     let engine = |engine: &Option<Engine>| engine.map(|engine| engine.command().to_string());
     match target {
         Target::Local {
@@ -725,6 +741,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             image,
             venv,
             require_gpu,
+            ..
         } => match field {
             "runtime" => Some(runtime(*run).to_string()),
             "engine" => engine(used),
@@ -768,6 +785,7 @@ fn target_value(target: &Target, field: &str) -> Option<String> {
             network_volume_id,
             max_volume_gb,
             ssh_client,
+            ..
         } => match field {
             "gpu_types" => Some(gpu_types.to_string()),
             "min_vram_gb" => min_vram_gb.map(|gb| gb.to_string()),

@@ -28,6 +28,7 @@ It needs `OVERBRAINER_RUNPOD__API_KEY` (a literal or a `vault:` reference), reso
 | `data_center_ids` | any | Data centers the pod may be placed in, for example `["EU-RO-1"]`, or `"auto"` for those with a chosen GPU type in stock when the run starts (see [`"auto"`](#auto) below). Cannot be `"auto"` together with `network_volume_id`: list the volume's data center instead. |
 | `network_volume_id` | none | Network volume mounted at `/workspace/data`; runs and the Hugging Face cache then live on it. Needs exactly one `data_center_ids` entry, the volume's data center, never `"auto"`. overbrainer never deletes anything on it. |
 | `max_volume_gb` | none | Largest size, in GB, overbrainer may grow the network volume to when the run fills it ([disk space](#disk-space)). A grow is permanent: a volume cannot shrink, it is billed per GB each month after the pod is gone, and every pod sharing it sees the new size. At least 1, and only with `network_volume_id`. Without it, a full disk stops the job with a snapshot. |
+| `pre_train` | none | A `[targets.<name>.pre_train]` table: a command run on the pod after the GPU check and before training, which stops the run when it fails. See [pre_train hook](training.md#pre_train-hook). |
 
 `gpu_type` became `gpu_types`: a configuration with the old key is rejected as `unknown field`.
 
